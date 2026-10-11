@@ -954,16 +954,21 @@ else:
             with self.assertRaisesRegex(JourneyError, 'index.beforeCommit'):
                 server.wait_checkpoint(timeout=0.01)
 
-    def run_case_on_a_virtual_clock(self, prepare_startup, verify_startup, act=20):
+    def run_case_on_a_virtual_clock(self, prepare_startup, verify_startup, act=20, reach_at=None):
         """Run index.embed through run_journey.main() with UI runs whose first test case starts after the given seconds.
 
-        Each UI run acts `act` seconds after its first test case started; None never starts a test case."""
+        Each UI run acts `act` seconds after its first test case started; None never starts a test case. With
+        `reach_at`, the old app reaches its checkpoint on its own that many seconds after the preparation launch."""
         clock = {'now': 0.0}
-        runs, events = [], []
+        runs, events, servers = [], [], []
 
         def advance(seconds):
             clock['now'] += seconds
+            if clock['now'] > 3600:
+                raise AssertionError('The journey kept waiting beyond every budget')
             for run in runs:
+                if run.reach_at is not None and clock['now'] >= run.reach_at:
+                    servers[-1].reached.set()
                 if run.start_at is not None and clock['now'] >= run.start_at and not run.announced:
                     run.announced = True
                     with open(run.log, 'a') as log:
@@ -975,9 +980,10 @@ else:
             sleep = staticmethod(advance)
 
         class Run:
-            def __init__(self, log, startup):
+            def __init__(self, log, startup, reach=None):
                 self.log, self.announced, self.stopped = log, False, False
                 self.start_at = None if startup is None else clock['now'] + startup
+                self.reach_at = None if reach is None else clock['now'] + reach
                 log.write_text('Running tests...\n')
 
             def remaining(self):
@@ -998,6 +1004,7 @@ else:
             def __init__(self, case, point):
                 self.reached = threading.Event()
                 self.requests = [{'phase': 'new', 'path': '/checkpoint/session.loaded'}]
+                servers.append(self)
 
             def __enter__(self):
                 return self
@@ -1006,6 +1013,8 @@ else:
                 pass
 
             def wait_checkpoint(self, timeout, preparing=None):
+                if self.reached.is_set():
+                    return
                 if preparing.remaining() > timeout:
                     advance(timeout)
                     raise JourneyError('The historical app did not reach index.embed')
@@ -1033,12 +1042,14 @@ else:
 
             def kill_app(self):
                 events.append('kill-old')
+                clock['killed'] = clock['now']
 
             def close(self):
                 pass
 
         def ui(runner, destination, point, phase, case, *_):
-            runs.append(Run(case / (phase + '-ui.log'), prepare_startup if phase == 'prepare' else verify_startup))
+            runs.append(Run(case / (phase + '-ui.log'), prepare_startup if phase == 'prepare' else verify_startup,
+                            reach_at if phase == 'prepare' else None))
             events.append('ui-' + phase)
             return runs[-1], io.StringIO()
 
@@ -1066,6 +1077,7 @@ else:
                 except JourneyError as failure:
                     error = failure
                 timing = next(root.glob('evidence/*/iOS/v1.0.5/index.embed/timing.json'), None)
+                self.killed_at = clock.get('killed')
                 return error, events, clock['now'], json.loads(timing.read_text()) if timing else None
 
     def test_slow_ui_runner_startup_keeps_the_full_preparation_and_verification_budgets(self):
@@ -1074,6 +1086,17 @@ else:
         self.assertIsNone(error)
         self.assertEqual(events, ['ui-prepare', 'kill-old', 'ui-verify'])
         self.assertEqual((timing['prepare_ui_startup_s'], timing['verify_ui_startup_s']), (170, 300))
+
+    def test_a_checkpoint_reached_before_the_ui_test_starts_ends_the_startup_wait(self):
+        # iOS thumbnail points reach their checkpoint without the UI test. The kill must follow while the server still
+        # holds that checkpoint (240 s), even when the UI runner starts late or never.
+        for startup in [None, 300]:
+            with self.subTest(prepare_startup=startup):
+                error, events, _, timing = self.run_case_on_a_virtual_clock(startup, verify_startup=1, reach_at=5)
+                self.assertIsNone(error)
+                self.assertEqual(events, ['ui-prepare', 'kill-old', 'ui-verify'])
+                self.assertEqual(timing['prepare_ui_startup_s'], 5)
+                self.assertLess(self.killed_at, 5 + 240)
 
     def test_ui_runner_budgets_stay_bounded(self):
         for prepare, verify, act, message, elapsed in [

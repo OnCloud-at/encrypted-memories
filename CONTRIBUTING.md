@@ -266,8 +266,12 @@ so distinct releases on one commit cannot reuse the wrong version or build numbe
 
 On the hosted runner one iOS case takes about seven minutes, so the iOS gate runs in two jobs.
 Each job tests every source with half of the interruption points; together they cover the same cases as one job.
-Each UI run gets up to 600 seconds to start its first test case. The 180-second preparation budget
-and the 240-second verification budget start only then, so a slow UI runner start on a loaded runner cannot use them up.
+Each UI run gets up to 600 seconds to start its first test case. The 180-second preparation budget starts
+when the first test case starts, when the old app reaches its checkpoint on its own, or when the UI run ends, whichever comes first.
+The 240-second verification budget starts with the first test case or the end of the run.
+A slow UI runner start on a loaded runner therefore cannot use up either budget.
+Each iOS job holds six points per source. With three sources, a job needs about 145 minutes of its 180;
+a fourth source needs a third iOS job.
 A failing case keeps the app's system log. The evidence also holds the runner load and the timing of each case,
 and a short step lists each case result, because GitHub cuts the journey step log inside the build output.
 

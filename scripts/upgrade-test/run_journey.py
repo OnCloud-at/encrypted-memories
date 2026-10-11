@@ -37,8 +37,9 @@ IOS_RUNTIME = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'ver
 
 # xcodebuild needs its own time to start the UI runner before XCTest starts a test case. On the loaded hosted
 # runner this startup took 160 s, nearly the whole former preparation budget, and the UI test never ran. The
-# preparation and verification budgets therefore start with the first test case; a runner that never starts a
-# test case still fails after UI_STARTUP_SECONDS.
+# preparation budget therefore starts with the first test case, the app's own arrival at its checkpoint, or the end
+# of the UI run, whichever comes first; the verification budget starts with the first test case or the end of the
+# run. A runner that never starts a test case still fails after UI_STARTUP_SECONDS.
 UI_TEST_STARTED = re.compile(r"^Test Case '[^']+' started\.$", re.M)
 UI_STARTUP_SECONDS = 600
 PREPARATION_SECONDS = 180

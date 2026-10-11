@@ -859,7 +859,8 @@ jobs:
       matrix:
         # One iOS case takes about 7 minutes on the hosted runner (run 38171860265: 13 cases in 95 minutes after
         # 19 minutes of builds), so all 24 iOS cases would exceed one 180-minute job. Each shard tests every
-        # source; together the shards of a platform cover every interruption point exactly once.
+        # source; together the shards of a platform cover every interruption point exactly once. A shard holds
+        # 6 points per source: 3 sources need about 145 minutes, so a fourth source needs a third iOS shard.
         include:
           - platform: iOS
             shard: backup-model
