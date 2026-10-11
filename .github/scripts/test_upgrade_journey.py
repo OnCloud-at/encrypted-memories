@@ -21,7 +21,7 @@ from contextlib import nullcontext
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/upgrade-test'))
-from build_apps import apply_overlay, Build
+from build_apps import apply_overlay, Build, PAYLOAD
 from journey import JourneyError, run_cases
 from server import FixtureServer
 import run_journey
@@ -818,6 +818,23 @@ else:
             with self.assertRaisesRegex(JourneyError, 'no reviewed overlay'):
                 apply_overlay(root, repo, 'v1.1.0-beta.3', 'a' * 40)
             apply_overlay(root, repo, 'v1.1.0', 'b' * 40)
+
+    def test_release_without_its_own_test_entry_receives_the_patch_and_the_test_entry(self):
+        repo = Path(__file__).resolve().parents[2]
+        sha = subprocess.check_output(['git', 'rev-parse', 'v1.0.5^{commit}'], cwd=repo, text=True).strip()
+        sources = Path('Packages/EncryptedMemoriesKit/Sources')
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            archive = subprocess.check_output(['git', 'archive', sha, str(sources)], cwd=repo)
+            with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+                tree.extractall(root, filter='data')
+            self.assertFalse((root / sources / 'PhotosCore/UpgradeTestProbe.swift').exists())
+            apply_overlay(root, repo, 'v1.0.5', sha)
+            for relative in PAYLOAD:
+                with self.subTest(file=relative):
+                    self.assertEqual((root / sources / relative).read_bytes(), (repo / sources / relative).read_bytes())
+            metal = (root / sources / 'MetalRenderingCore/Metal3RuntimeCapability.swift').read_text()
+            self.assertIn('#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)', metal)
 
     def test_unknown_predecessor_without_entry_fails(self):
         with tempfile.TemporaryDirectory() as root:
