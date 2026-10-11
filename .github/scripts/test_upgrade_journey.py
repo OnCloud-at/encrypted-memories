@@ -15,9 +15,11 @@ import signal
 import os
 import uuid
 import select
+import socket
 import time
 from contextlib import nullcontext
 
+from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/upgrade-test'))
@@ -840,6 +842,33 @@ else:
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(JourneyError, 'no reviewed overlay'):
                 apply_overlay(Path(root), Path(__file__).resolve().parents[2], 'v1.2.0', 'a' * 40)
+
+    def test_fixture_server_keeps_a_burst_of_connections_while_its_accept_loop_is_busy(self):
+        with tempfile.TemporaryDirectory() as root:
+            server = FixtureServer(Path(root), 'backup.claimed')
+            results = []
+            # A loaded runner accepts late: the app's parallel thumbnail requests wait in the listen backlog. Beyond
+            # it, macOS resets connections and Linux drops them, so every connection opens before the server accepts.
+            connections = []
+            for _ in range(40):
+                try:
+                    connection = socket.create_connection(('127.0.0.1', server.http.server_port), timeout=2)
+                    connection.settimeout(30)
+                    connections.append(connection)
+                except OSError as error:
+                    results.append(type(error).__name__)
+            with server:
+                for connection in connections:
+                    request = HTTPConnection('127.0.0.1', server.http.server_port)
+                    request.sock = connection
+                    try:
+                        request.request('GET', '/thumbnail/asset-1')
+                        results.append(request.getresponse().status)
+                    except OSError as error:
+                        results.append(type(error).__name__)
+                    finally:
+                        request.close()
+            self.assertEqual(results, [200] * 40)
 
     def test_upload_ledger_survives_app_replacement_and_exposes_duplicates(self):
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'backup.claimed') as server:

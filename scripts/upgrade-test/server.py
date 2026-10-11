@@ -23,6 +23,12 @@ def png(asset):
             + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
 
 
+class BurstHTTPServer(ThreadingHTTPServer):
+    # The app requests its synthetic thumbnails in parallel. On a loaded runner the accept loop falls behind, and
+    # macOS resets connections beyond the listen backlog; the default of 5 lost requests the server never saw.
+    request_queue_size = 128
+
+
 class FixtureServer:
     def __init__(self, directory, point):
         self.directory = Path(directory)
@@ -116,7 +122,7 @@ class FixtureServer:
                     fixture.save()
                 self.send(json.dumps(link).encode())
 
-        self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.http = BurstHTTPServer(("127.0.0.1", 0), Handler)
         self.http.daemon_threads = True
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         self.url = f"http://127.0.0.1:{self.http.server_port}"
