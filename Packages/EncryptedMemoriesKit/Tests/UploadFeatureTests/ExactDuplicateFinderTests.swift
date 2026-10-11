@@ -1647,13 +1647,13 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(server.readCounts, readsBefore, "no open merge, no read")
     }
 
-    func testEmptyingTheTrashWaitsWhileTheMergeJournalCannotBeRead() async throws {
+    func testEmptyingTheTrashWaitsOnceForADamagedMergeJournal() async throws {
         try Data("not a journal".utf8).write(
             to: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
 
         let confirmed = await finder.confirmNoPendingMerges()
 
-        XCTAssertFalse(confirmed, "an unreadable journal can hold open merges")
+        XCTAssertFalse(confirmed, "the attempt that finds a damaged journal keeps the trash")
     }
 
     func testTheSharedEmptyStepEmptiesOnlyAfterTheMergeCheck() async throws {
@@ -1720,6 +1720,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     func testAMergeJournalThatCannotBeReadKeepsTheTrashEveryTime() async throws {
+        try XCTSkipIf(getuid() == 0, "root reads a file without read permission")
         let kept = server.seedLink(digest: digest("a"))
         let duplicate = server.seedLink(digest: digest("a"))
         XCTAssertTrue(mergeJournal.record([pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)]))
