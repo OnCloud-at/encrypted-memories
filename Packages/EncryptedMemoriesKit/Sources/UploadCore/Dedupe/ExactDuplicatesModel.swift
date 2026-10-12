@@ -746,11 +746,12 @@ public final class ExactDuplicatesModel {
     /// index up to date at the same time. Reads the groups again when the index changed. A choice of the person and
     /// the ranking of a group with the same members stay, so a screen that opens again reads nothing for them.
     public func load(checkAllGroups: Bool = false) async {
-        guard !isRetired, !isMerging else { return }
+        guard !isRetired else { return }
         if checkAllGroups {
             checksAllGroups = true
             hasOpenedScreen = true
         }
+        guard !isMerging else { return }
         rankingFailed = false
         loadGeneration += 1
         let generation = loadGeneration
@@ -760,6 +761,7 @@ public final class ExactDuplicatesModel {
         checkInterrupted = false
         rescanAfterMerge = false
         stopRanking()
+        isCheckingGroups = checksAllGroups
         guard await scan(generation: generation) else { return }
         async let ranked: Void = rank(around: 0)
         async let built: Void = buildAndRescan(generation: generation)
@@ -808,11 +810,16 @@ public final class ExactDuplicatesModel {
     /// Reads the groups and shows them in the fallback order. A group with the same members keeps its ranking and the
     /// choice of the person. False when the read failed or a newer load replaced this one.
     private func scan(generation: Int) async -> Bool {
-        isCheckingGroups = checksAllGroups
         let report: @Sendable (ExactDuplicateScanProgress) async -> Void = { [weak self] progress in
             await self?.showScan(progress, generation: generation)
         }
-        defer { if generation == loadGeneration { scanProgress = nil } }
+        var published = false
+        defer {
+            if generation == loadGeneration {
+                scanProgress = nil
+                if !published, ranking == nil { isCheckingGroups = false }
+            }
+        }
         do {
             let scan = try await finder.duplicateGroups(progress: report)
             let fallback = await finder.fallbackMembers(of: scan.groups)
@@ -860,12 +867,18 @@ public final class ExactDuplicatesModel {
                 }
             }
             groups = shown
+            // A hash whose members changed needs another verdict, even if it was checked before this rescan.
+            rankingRequested.formIntersection(Set(rankingQueue).union(shown.filter(\.isRanked).map(\.id)))
             hasInvalidatedGroups = false
             coverage = scan.coverage
             phase = .loaded
+            // A background rescan keeps the checked list until it actually finds candidates that need checking.
+            isCheckingGroups = checksAllGroups && (ranking != nil || shown.contains { !$0.isRanked })
+            published = true
             return true
         } catch {
             guard generation == loadGeneration else { return false }
+            isCheckingGroups = false
             phase = .failed
             return false
         }
@@ -915,10 +928,11 @@ public final class ExactDuplicatesModel {
         // reads one page at a time, with the finder's unchanged concurrency.
         let pages = checksAllGroups ? Array(stride(from: 0, to: groups.count, by: 2 * size)) : indices
         var wanted: [String] = []
+        var wantedIDs: Set<String> = []
         for index in pages {
             let start = index / size * size
             for group in groups[start..<min(start + 2 * size, groups.count)]
-            where !group.isRanked && !rankingRequested.contains(group.id) && !wanted.contains(group.id) {
+            where !group.isRanked && !rankingRequested.contains(group.id) && wantedIDs.insert(group.id).inserted {
                 wanted.append(group.id)
             }
         }

@@ -330,6 +330,26 @@ final class MobileDuplicatesUITests: XCTestCase {
         waitUntilGone(group(1), "a refresh scans again and the fixture drops the last group")
     }
 
+    func testASlowPullToRefreshFinishesAfterTheListBecomesProgress() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture",
+            extra: ["-EncryptedMemoriesDuplicatesRescanDropsGroup", "-EncryptedMemoriesDuplicatesSlowScan"])
+        XCTAssertTrue(group(1).waitForExistence(timeout: 15))
+        let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 400)))
+
+        let progress = app.activityIndicators["duplicates.loading"].firstMatch
+        XCTAssertTrue(progress.waitForExistence(timeout: 3), "the refresh replaces the list while scanning")
+        XCTAssertFalse(group(0).exists)
+        keepScreenshot("duplicates-ios-slow-refresh-progress")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 15), "the cancellation-sensitive scan finishes")
+        XCTAssertFalse(group(1).exists, "the successful refresh publishes its new result")
+        XCTAssertFalse(app.staticTexts["The duplicates could not be loaded."].exists)
+        XCTAssertFalse(app.buttons["Retry"].exists)
+        XCTAssertFalse(progress.exists)
+        keepScreenshot("duplicates-ios-slow-refresh-complete")
+    }
+
     func testTheContextMenuKeepsAnotherPhoto() {
         openDuplicates()
         let other = member(0, 1)

@@ -116,7 +116,9 @@ import UploadCore
                         captureDates: Dictionary(
                             items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
                         rescanDropsLastGroup: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesRescanDropsGroup")))
+                            "-EncryptedMemoriesDuplicatesRescanDropsGroup"),
+                        scanDelay: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesLargeFixture") {
                 // 1,500 groups of two or three library photos, for the scrolling and memory measurement.
                 let items = sections.flatMap(\.items)

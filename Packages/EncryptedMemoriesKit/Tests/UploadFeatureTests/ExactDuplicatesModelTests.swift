@@ -207,6 +207,143 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.maximumConcurrentRankings, 1)
     }
 
+    func testAFailedPostMergeIndexRescanEndsTheScreenCheckAndOffersRetry() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.buildChanged = true
+        finder.buildGate.close()
+        finder.outcomes = ["A": .merged(kept: a1, trashed: [], keptDuplicates: [a2: .neededByLocalSource])]
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.buildGate.hasWaiters && model.canMerge }, "the screen check finishes before the build")
+        finder.mergeGate.close()
+        let merge = Task { await model.merge(groupID: "A") }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the merge holds the list")
+        finder.buildGate.open()
+        await load.value
+        XCTAssertEqual(finder.scanCalls, 1, "the completed index waits for the merge")
+        finder.scanError = URLError(.notConnectedToInternet)
+        finder.mergeGate.open()
+        await merge.value
+        XCTAssertEqual(finder.scanCalls, 2, "the merge attempts the deferred rescan")
+        XCTAssertFalse(model.isCheckingGroups, "a failed independent scan must end the waiting state")
+        XCTAssertNil(model.rankingProgress)
+        XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.load_failed"))
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+        finder.scanError = nil
+        await model.load()
+        XCTAssertNil(model.checkFailedNote)
+        XCTAssertFalse(model.isCheckingGroups)
+    }
+
+    func testAFailedIndexRescanEndsTheWaitingStateWhileTheMetadataWorkerIsHeld() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.buildChanged = true
+        finder.buildGate.close()
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.buildGate.hasWaiters && finder.rankGate.hasWaiters }, "the build and check wait")
+        XCTAssertTrue(model.isCheckingGroups)
+        finder.scanError = URLError(.notConnectedToInternet)
+        finder.buildGate.open()
+        await waitUntil({ model.checkFailedNote != nil }, "the independent rescan fails")
+        XCTAssertFalse(model.isCheckingGroups, "a failed scan must leave the failure and retry visible")
+        XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.load_failed"))
+        finder.rankGate.open()
+        await load.value
+        XCTAssertFalse(model.isCheckingGroups)
+    }
+
+    func testReopeningDuringAMergeKeepsTheAutomaticScreenCheckForItsStaleReload() async {
+        let expanded = [groupA] + manyGroups(60)
+        let finder = FakeDuplicateFinder(scans: [
+            .init(groups: [groupA], coverage: .complete), .init(groups: expanded, coverage: .complete),
+        ])
+        finder.outcomes = ["A": .skipped(.preselectionChanged)]
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "Merge All holds its running batch")
+        model.screenDisappeared()
+        await model.load(checkAllGroups: true)
+        XCTAssertEqual(finder.scanCalls, 1, "opening during a merge does not replace its list")
+        finder.mergeGate.open()
+        await merge.value
+        XCTAssertEqual(model.visibleGroups.count, expanded.count)
+        XCTAssertTrue(model.groups.allSatisfy(\.isRanked))
+        XCTAssertEqual(finder.rankedGroups.dropFirst().flatMap { $0 }, expanded.map(\.id))
+        XCTAssertNil(model.metadataCheckNote)
+        XCTAssertNil(model.checkFailedNote)
+        XCTAssertFalse(model.isCheckingGroups)
+    }
+
+    func testAnIndexRescanChecksNewMembersOfAnAlreadyRankedHash() async {
+        for duringRanking in [false, true] {
+            let a4 = PhotoUID(volumeID: "v", nodeID: "a4")
+            let expanded = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: [a1, a2, a3, a4])
+            let rest = duringRanking ? manyGroups(30) : []
+            let finder = FakeDuplicateFinder(scans: [
+                .init(groups: [groupA] + rest, coverage: .complete),
+                .init(groups: [expanded] + rest, coverage: .complete),
+            ])
+            finder.buildChanged = true
+            finder.buildGate.close()
+            let (model, _) = makeModel(finder)
+            if duringRanking { finder.afterRankingPage = { finder.rankGate.close() } }
+            let load = Task { await model.load(checkAllGroups: true) }
+            await waitUntil(
+                { finder.buildGate.hasWaiters && (duringRanking ? finder.rankGate.hasWaiters : model.canMerge) },
+                "the original hash is checked before the index rescan")
+            finder.buildGate.open()
+            await waitUntil(
+                { finder.scanCalls == 2 && model.groups.first?.members.contains(a4) == true }, "the hash gains a member"
+            )
+            finder.afterRankingPage = nil
+            finder.rankGate.open()
+            await load.value
+            XCTAssertEqual(
+                finder.rankedGroups.flatMap { $0 }.filter { $0 == "A" }, ["A", "A"],
+                "the changed hash needs a new verdict")
+            XCTAssertEqual(model.visibleGroups.first?.members, expanded.members)
+            XCTAssertEqual(model.visibleGroups.count, rest.count + 1, "queued candidates still finish")
+            XCTAssertTrue(model.groups.allSatisfy(\.isRanked))
+            XCTAssertFalse(model.isCheckingGroups)
+            XCTAssertNil(model.checkFailedNote, "a membership change is not a failed metadata read")
+        }
+    }
+
+    func testACompletedScreenKeepsItsListDuringAnIndexRescanUntilNewCandidatesArrive() async {
+        for addsCandidate in [false, true] {
+            let finder = FakeDuplicateFinder(scans: [
+                .init(groups: [groupA], coverage: .complete),
+                .init(groups: addsCandidate ? [groupA, groupB] : [groupA], coverage: .complete),
+            ])
+            finder.buildChanged = true
+            finder.buildGate.close()
+            let (model, _) = makeModel(finder)
+            let load = Task { await model.load(checkAllGroups: true) }
+            await waitUntil({ finder.buildGate.hasWaiters && model.canMerge }, "the initial check is complete")
+            finder.scanGate.close()
+            finder.rankGate.close()
+            finder.buildGate.open()
+            await waitUntil({ finder.scanGate.hasWaiters }, "the index scans behind the checked list")
+            XCTAssertFalse(model.isCheckingGroups, "a background scan has found no new candidate yet")
+            XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+            finder.scanGate.open()
+            if addsCandidate {
+                await waitUntil({ finder.rankGate.hasWaiters }, "new candidates are checked before presentation")
+                XCTAssertTrue(model.isCheckingGroups)
+                XCTAssertEqual(model.visibleGroups, [])
+            }
+            finder.rankGate.open()
+            await load.value
+            XCTAssertFalse(model.isCheckingGroups)
+            XCTAssertEqual(model.visibleGroups.map(\.id), addsCandidate ? ["A", "B"] : ["A"])
+            XCTAssertEqual(finder.rankedGroups, addsCandidate ? [["A"], ["B"]] : [["A"]])
+        }
+    }
+
     func testLoadingUntilTheFirstScanFinishes() async {
         let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)]))
         XCTAssertEqual(model.content, .loading)
