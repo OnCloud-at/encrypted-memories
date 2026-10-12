@@ -521,7 +521,7 @@ public final class ExactDuplicatesModel {
 
     /// The progress of an active metadata check, including the ranking that a merge waits for.
     public var rankingLine: ProgressLine? {
-        guard isRankingForMerge || !hasCheckedGroups, let rankingProgress else { return nil }
+        guard isRankingForMerge || (!hasInvalidatedGroups && !hasCheckedGroups), let rankingProgress else { return nil }
         let progress =
             isRankingForMerge
             ? rankingProgress
@@ -537,7 +537,9 @@ public final class ExactDuplicatesModel {
 
     /// The checked groups while the remaining pages wait for scrolling or Merge All. Nil during active ranking.
     public var metadataCheckNote: String? {
-        guard phase == .loaded, !groups.isEmpty, !hasCheckedGroups, rankingProgress == nil else { return nil }
+        guard phase == .loaded, !hasInvalidatedGroups, !groups.isEmpty, !hasCheckedGroups, rankingProgress == nil else {
+            return nil
+        }
         return L10n.string(
             "duplicates.groups_checked \(groups.filter(\.isRanked).count.formatted()) \(groups.count.formatted())")
     }

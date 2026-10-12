@@ -154,6 +154,57 @@ final class ExactDuplicatesModelTests: XCTestCase {
         }
     }
 
+    func testInvalidatedMergeHidesTheCheckedGroupsNoteUntilItsReload() async {
+        let smaller = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: [a1, a3])
+        let finder = FakeDuplicateFinder(scans: [
+            .init(groups: [groupA], coverage: .complete),
+            .init(groups: [smaller] + manyGroups(60), coverage: .complete),
+        ])
+        finder.outcomes = ["A": .merged(kept: a1, trashed: [a2], keptDuplicates: [a3: .differentDetails])]
+        let trashGate = BuildGate()
+        trashGate.close()
+        let model = ExactDuplicatesModel(finder: finder) { _ in await trashGate.pass() }
+        await model.load()
+        let merge = Task { await model.merge(groupID: "A") }
+        await waitUntil({ trashGate.hasWaiters }, "the invalidated merge waits before its reload")
+
+        XCTAssertNil(model.metadataCheckNote)
+        XCTAssertNil(model.rankingLine)
+        XCTAssertNil(model.knownDuplicateCount)
+        trashGate.open()
+        await merge.value
+
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 48)
+        XCTAssertEqual(
+            model.metadataCheckNote, L10n.string("duplicates.groups_checked \(48.formatted()) \(61.formatted())"))
+        XCTAssertNil(model.rankingLine)
+    }
+
+    func testInvalidatedMergeHidesAnActiveScrollRankingLine() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA] + manyGroups(100), coverage: .complete)])
+        finder.outcomes = ["A": .merged(kept: a1, trashed: [a2], keptDuplicates: [a3: .differentDetails])]
+        let trashGate = BuildGate()
+        trashGate.close()
+        let model = ExactDuplicatesModel(finder: finder) { _ in await trashGate.pass() }
+        await model.load()
+        finder.rankGate.close()
+        model.groupAppeared(model.groups[72].id)
+        await waitUntil({ finder.rankGate.hasWaiters }, "scroll ranking runs before the merge")
+        XCTAssertNotNil(model.rankingLine)
+        let merge = Task { await model.merge(groupID: "A") }
+        await waitUntil({ trashGate.hasWaiters }, "the invalidated merge waits while scrolling still ranks")
+
+        XCTAssertNotNil(model.rankingProgress, "the presentation does not stop scroll ranking")
+        XCTAssertNil(model.rankingLine)
+        finder.rankGate.open()
+        await waitUntil({ model.rankingProgress == nil }, "scroll ranking finishes while the merge waits")
+        XCTAssertNil(model.metadataCheckNote)
+        trashGate.open()
+        await merge.value
+
+        XCTAssertNotNil(model.metadataCheckNote, "the successful reload restores current checked-group progress")
+    }
+
     func testAFirstLoadHasNoCountWhileItsScanIsPending() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.scanGate.close()
