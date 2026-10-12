@@ -235,7 +235,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertFalse(model.isCheckingGroups)
     }
 
-    func testAFailedIndexRescanEndsTheWaitingStateWhileTheMetadataWorkerIsHeld() async {
+    func testAFailedIndexRescanKeepsTheScreenCheckUntilTheMetadataWorkerEnds() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.buildChanged = true
         finder.buildGate.close()
@@ -247,11 +247,15 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.scanError = URLError(.notConnectedToInternet)
         finder.buildGate.open()
         await waitUntil({ model.checkFailedNote != nil }, "the independent rescan fails")
-        XCTAssertFalse(model.isCheckingGroups, "a failed scan must leave the failure and retry visible")
-        XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.load_failed"))
+        XCTAssertTrue(model.isCheckingGroups, "the failed rescan must not expose the list while metadata are checked")
+        XCTAssertFalse(model.canMerge)
+        XCTAssertEqual(model.visibleGroups, [])
         finder.rankGate.open()
         await load.value
         XCTAssertFalse(model.isCheckingGroups)
+        XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.load_failed"))
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+        XCTAssertTrue(model.canMerge, "the checked list returns with the failure and Retry after the worker ends")
     }
 
     func testReopeningDuringAMergeKeepsTheAutomaticScreenCheckForItsStaleReload() async {

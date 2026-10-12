@@ -875,7 +875,7 @@ public final class ExactDuplicatesModel {
             return true
         } catch {
             guard generation == loadGeneration else { return false }
-            isCheckingGroups = false
+            isCheckingGroups = checksAllGroups && ranking != nil
             phase = .failed
             return false
         }
