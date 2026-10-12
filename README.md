@@ -49,8 +49,8 @@ Financial support helps cover Apple membership, test devices, infrastructure, an
 - Metal timeline with responsive grid densities, selection, transitions, and viewport-aware loading.
 - Full-screen image, video, Live Photo, and burst viewing.
 - Albums, trash, restore, sharing, and original-format export.
-- Duplicates: find identical photos and merge them. Merged copies move to Recently Deleted; storage is freed when Recently Deleted is emptied.
-- Photo Library backup on macOS, iOS, and iPadOS with persistent queues, streamed hashing, duplicate detection, crash recovery, album synchronization, and OS-scheduled background catch-up. The backup status shows which photos are not backed up yet, and why.
+- Duplicates: find identical photos and merge them. The app checks every group first and then shows only the final groups. Merged copies move to Recently Deleted. Storage is freed when Recently Deleted is emptied.
+- Photo Library backup on macOS, iOS, and iPadOS with persistent queues, streamed hashing, duplicate detection, crash recovery, album synchronization, and OS-scheduled background catch-up. The backup status shows which photos are not backed up yet, and why. Live Photos and edited photos back up with their extra files.
 - Privacy settings: location is removed from shared and exported copies, the app preview is blurred in the App Switcher on iPhone and iPad, and backups do not use cellular data unless you allow it. Map and Places has its own switch.
 - MapKit browsing with encrypted location metadata and adaptive clustering.
 - Encrypted thumbnail, preview, original, and offline caches.
@@ -113,7 +113,7 @@ These defaults apply whenever no choice is saved, including existing installatio
 
 - The app connects to Proton for sign-in and for Proton Drive.
 - When you turn on Smart Search, the app downloads the model catalog and the model from `models.oncloud.at`. These requests contain no photos and no search text. Smart Search runs on the device.
-- Map tiles and place names come from Apple Maps. Place names in the viewer and on the map send the photo's coordinates. Search suggestions send a location rounded to about 1 km.
+- Map tiles and place names come from Apple Maps. Place names in the viewer and on the map send the photo's coordinates. Search suggestions send a location rounded to about 1 km. Turn off Map and Places in Settings > Privacy to stop these requests. The Map tab (iPhone and iPad) and the Map item (Mac) disappear. Location data stays encrypted on the device.
 - There is no analytics, crash reporting, or tracking. The Proton Drive SDK's telemetry callback discards all events.
 
 **Build and platform**

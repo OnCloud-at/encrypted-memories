@@ -143,18 +143,22 @@ struct MobileViewerInfoSheet: View {
 
     @ViewBuilder
     private var locationSection: some View {
+        let location = ViewerInfoLocation(
+            metadata: metadata, placeName: placeName, mapAndPlacesEnabled: mapAndPlacesEnabled)
         if placeName != nil || metadata?.hasLocation == true {
             VStack(alignment: .leading, spacing: 10) {
-                if mapAndPlacesEnabled, let placeName = nonEmpty(placeName) {
+                if let placeName = location.placeName {
                     Label(placeName, systemImage: "mappin.and.ellipse")
                         .font(.headline)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                if let latitude = metadata?.latitude, let longitude = metadata?.longitude {
-                    if mapAndPlacesEnabled {
+                if let latitude = metadata?.latitude, let longitude = metadata?.longitude,
+                    let coordinates = location.coordinateText
+                {
+                    if location.showsMap {
                         let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
-                        let mapTitle = placeName ?? L10n.string("map.cluster_title")
+                        let mapTitle = location.markerTitle
                         Map(
                             initialPosition: .region(
                                 MKCoordinateRegion(
@@ -169,16 +173,16 @@ struct MobileViewerInfoSheet: View {
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel(
-                            Text("\(mapTitle), \(coordinateText(latitude: latitude, longitude: longitude))")
+                            Text("\(mapTitle), \(coordinates)")
                         )
                     }
 
-                    Text(coordinateText(latitude: latitude, longitude: longitude))
+                    Text(coordinates)
                         .font(.subheadline.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .accessibilityLabel(
-                            Text(coordinateText(latitude: latitude, longitude: longitude))
+                            Text(coordinates)
                         )
                 }
             }
@@ -254,9 +258,5 @@ struct MobileViewerInfoSheet: View {
     private func durationString(_ seconds: Double) -> String {
         let total = max(0, Int(seconds.rounded()))
         return String(format: "%d:%02d", total / 60, total % 60)
-    }
-
-    private func coordinateText(latitude: Double, longitude: Double) -> String {
-        PhotoCoordinateText.format(latitude: latitude, longitude: longitude)
     }
 }

@@ -8,6 +8,20 @@ import UploadCore
 
 /// The library after a merge of exact duplicates on iPhone and iPad.
 @MainActor @Suite struct MobileDuplicatesMergeTests {
+    @Test func theRescanFixtureDropsTheLastGroupOnTheFirstScreenRefresh() async {
+        let members = (0..<4).map { PhotoUID(volumeID: "fixture", nodeID: "copy-\($0)") }
+        let finder = MobileFixtureDuplicates(
+            groups: [Array(members.prefix(2)), Array(members.suffix(2))], rescanDropsLastGroup: true)
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.loadCountIfNeeded()
+        await model.load()
+        #expect(model.groups.count == 2)
+
+        await model.load()
+
+        #expect(model.groups.map(\.members) == [Array(members.prefix(2))])
+    }
+
     /// A library whose first two photos are one group of copies, with the first one as the favorite on the server.
     private func makeLibrary() async throws -> (MobileSignedInFixture, MobileLibraryModel, [PhotoUID]) {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 2)

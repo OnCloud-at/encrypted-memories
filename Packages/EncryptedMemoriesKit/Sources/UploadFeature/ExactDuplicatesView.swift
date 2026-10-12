@@ -39,11 +39,11 @@ public struct ExactDuplicatesView<Cover: View>: View {
 
     public var body: some View {
         content
-            // The copies are identical and the duplicates can be restored, so the confirmation is no warning.
-            .confirmationDialog(model.mergeAllTitle, isPresented: $confirmsMergeAll, titleVisibility: .visible) {
+            .alert(model.mergeAllTitle, isPresented: $confirmsMergeAll) {
                 Button(model.mergeAllConfirmTitle) {
                     Task { await model.mergeAll() }
                 }
+                .disabled(!model.canMerge)
                 .accessibilityIdentifier("duplicates.mergeAll.dialog")
                 Button(L10n.string("action.cancel"), role: .cancel) {}
             } message: {
@@ -57,7 +57,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
             } message: {
                 if let message = model.notice?.message, !message.isEmpty { Text(message) }
             }
-            .task { await model.load() }
+            .task { await model.load(checkAllGroups: true) }
             .onDisappear { model.screenDisappeared() }
     }
 
@@ -65,19 +65,17 @@ public struct ExactDuplicatesView<Cover: View>: View {
     private static var readableWidth: CGFloat { 600 }
 
     @ViewBuilder private var content: some View {
+        if model.isCheckingGroups {
+            loadingContent(model.checkingGroupsLine)
+        } else {
+            checkedContent
+        }
+    }
+
+    @ViewBuilder private var checkedContent: some View {
         switch model.content {
         case .loading:
-            let line = model.loadingLine
-            ContentUnavailableView {
-                Label(line.title, systemImage: "square.on.square")
-            } description: {
-                Text(L10n.string("duplicates.loading_message"))
-            } actions: {
-                progressRow(line, showsTitle: false)
-                    .frame(maxWidth: 320)
-            }
-            .frame(maxWidth: Self.readableWidth)
-            .accessibilityIdentifier("duplicates.loading")
+            loadingContent(model.loadingLine)
         case .failed(let message):
             ContentUnavailableView {
                 Label(message, systemImage: "exclamationmark.icloud")
@@ -113,8 +111,23 @@ public struct ExactDuplicatesView<Cover: View>: View {
         }
     }
 
+    private func loadingContent(_ line: ExactDuplicatesModel.ProgressLine) -> some View {
+        ContentUnavailableView {
+            Label(line.title, systemImage: "square.on.square")
+        } description: {
+            Text(L10n.string("duplicates.loading_message"))
+        } actions: {
+            progressRow(line, showsTitle: false)
+                .frame(maxWidth: 320)
+        }
+        .frame(maxWidth: Self.readableWidth)
+        .accessibilityIdentifier("duplicates.loading")
+    }
+
     private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {
-        ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent)
+        ExactDuplicatesWaitingProgressLayout {
+            ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent, alignment: .center)
+        }
     }
 
     @ViewBuilder private var retryButton: some View {
@@ -127,6 +140,26 @@ public struct ExactDuplicatesView<Cover: View>: View {
     }
 }
 
+/// Sizes the waiting indicator from its available action area without measuring and feeding a frame back into
+/// layout. The bar remains centered and fits even when a narrow window cannot provide the preferred minimum.
+private struct ExactDuplicatesWaitingProgressLayout: Layout {
+    private func lineWidth(in available: CGFloat) -> CGFloat {
+        min(available, max(120, available * 0.7))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let available = min(320, max(0, proposal.width ?? 320))
+        let line = subviews[0].sizeThatFits(ProposedViewSize(width: lineWidth(in: available), height: nil))
+        return CGSize(width: available, height: line.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews[0].place(
+            at: CGPoint(x: bounds.midX, y: bounds.minY), anchor: .top,
+            proposal: ProposedViewSize(width: lineWidth(in: bounds.width), height: nil))
+    }
+}
+
 /// One progress line of the screen. Without its title, the surrounding view shows the title. With `stop`, a Stop
 /// button follows the line; it stays disabled after the person stopped. `identifier` names the line only, so the Stop
 /// button keeps its own.
@@ -134,6 +167,7 @@ private struct ExactDuplicatesProgressRow: View {
     let line: ExactDuplicatesModel.ProgressLine
     var showsTitle = true
     let accent: Color
+    var alignment: HorizontalAlignment = .leading
     var identifier: String?
     var stop: (() -> Void)?
     var canStop = true
@@ -141,7 +175,7 @@ private struct ExactDuplicatesProgressRow: View {
     var body: some View {
         let row = ActivityProgressRow(
             title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
-            showsIndeterminateProgress: true
+            showsIndeterminateProgress: true, alignment: alignment
         )
         .tint(accent)
         .accessibilityIdentifier(identifier ?? "")
@@ -197,7 +231,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
 
     var body: some View {
         let canMerge = model.canMerge
-        let groups = IndexedGroups(base: model.groups)
+        let groups = IndexedGroups(base: model.visibleGroups)
         let list = ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 12) {
@@ -353,7 +387,7 @@ private struct ExactDuplicatesStatusRows: View {
 
     private var hasRows: Bool {
         model.mergeAllLine != nil || model.checkLine != nil || model.stillCheckingNote != nil
-            || model.rankingLine != nil
+            || model.rankingLine != nil || model.metadataCheckNote != nil
             || model.uncheckedNote != nil || model.checkFailedNote != nil
     }
 
@@ -397,6 +431,12 @@ private struct ExactDuplicatesStatusRows: View {
             ExactDuplicatesProgressRow(
                 line: line, accent: accent, identifier: "duplicates.rankingProgress", stop: stop,
                 canStop: model.canStopMergeAll)
+        }
+        if let note = model.metadataCheckNote {
+            Text(note)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("duplicates.metadataCheck")
         }
         if let note = model.uncheckedNote {
             Label(note, systemImage: "exclamationmark.circle")
@@ -447,7 +487,7 @@ private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
             && lhs.libraryRevision == rhs.libraryRevision
     }
 
-    /// The facts of a group arrive without a progress row; its badges, its reason, and a moved checkmark fade in.
+    /// As checked facts arrive, the group's badges, its reason, and a moved checkmark fade in.
     /// Without motion, they appear at once.
     private var factsAnimation: Animation? { reduceMotion ? nil : .default }
 

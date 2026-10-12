@@ -116,7 +116,9 @@ import UploadCore
                         captureDates: Dictionary(
                             items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
                         rescanDropsLastGroup: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesRescanDropsGroup")))
+                            "-EncryptedMemoriesDuplicatesRescanDropsGroup"),
+                        scanDelay: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesLargeFixture") {
                 // 1,500 groups of two or three library photos, for the scrolling and memory measurement.
                 let items = sections.flatMap(\.items)
@@ -128,6 +130,10 @@ import UploadCore
                         groups: groups,
                         captureDates: Dictionary(
                             items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
+                        scanDelay: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil,
+                        rankDelay: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesSlowCheck") ? .seconds(5) : nil,
                         // Each batch of Merge All takes a while, so a UI test can stop it.
                         mergeDelay: ProcessInfo.processInfo.arguments.contains(
                             "-EncryptedMemoriesDuplicatesSlowMerge") ? .milliseconds(500) : nil))
@@ -295,9 +301,12 @@ import UploadCore
         private var groups: [ExactDuplicateGroup]
         private let checking: Bool
         private let dates: [PhotoUID: Date]
-        /// A scan after the count of the Collections entry and the first load of the screen leaves out the last
-        /// group, so a UI test sees whether the screen scanned again.
+        /// A scan after the first load of the screen leaves out the last group, so a UI test sees whether the
+        /// screen scanned again. The Collections entry does not scan unchecked candidates.
         private let rescanDropsLastGroup: Bool
+        /// Holds the metadata check so the UI test can inspect its progress-only state.
+        private let rankDelay: Duration?
+        private let scanDelay: Duration?
         /// The time that each merge batch takes. Nil merges at once.
         private let mergeDelay: Duration?
         /// False stands for a merge whose check cannot run yet, which keeps Recently Deleted from being emptied.
@@ -306,7 +315,9 @@ import UploadCore
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
-            rescanDropsLastGroup: Bool = false, mergeDelay: Duration? = nil, confirmsNoPendingMerges: Bool = true
+            rescanDropsLastGroup: Bool = false, scanDelay: Duration? = nil, rankDelay: Duration? = nil,
+            mergeDelay: Duration? = nil,
+            confirmsNoPendingMerges: Bool = true
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -314,6 +325,8 @@ import UploadCore
             self.checking = checking
             dates = captureDates
             self.rescanDropsLastGroup = rescanDropsLastGroup
+            self.rankDelay = rankDelay
+            self.scanDelay = scanDelay
             self.mergeDelay = mergeDelay
             self.confirmsNoPendingMerges = confirmsNoPendingMerges
         }
@@ -323,9 +336,10 @@ import UploadCore
         func duplicateGroups(
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
         ) async throws -> ExactDuplicateScan {
+            if let scanDelay { try await Task.sleep(for: scanDelay) }
             let groups = lock.withLock {
                 scans += 1
-                return rescanDropsLastGroup && scans > 2 ? Array(groups.dropLast()) : groups
+                return rescanDropsLastGroup && scans > 1 ? Array(groups.dropLast()) : groups
             }
             let sizes: [Int64] = [5_200_000, 387_000]
             return ExactDuplicateScan(
@@ -348,6 +362,9 @@ import UploadCore
         func rankMembers(
             of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
         ) async {
+            if let rankDelay {
+                do { try await Task.sleep(for: rankDelay) } catch { return }
+            }
             let facts = groups.map { group in
                 let memberFacts = group.members.enumerated().map { index, member in
                     (

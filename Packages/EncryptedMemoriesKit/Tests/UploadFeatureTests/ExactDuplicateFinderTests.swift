@@ -398,7 +398,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     @MainActor
-    func testTheScreenShows1500GroupsAndTheirSizesBeforeAnyNodeLoadAndRanksOnlyTheShownPages() async throws {
+    func testTheScreenChecks1500GroupsBeforeShowingTheirSizesWithoutExtraNodeReads() async throws {
         let links = server.seedLinks(digests: (0..<1_500).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
         for index in 0..<1_500 {
             row("asset-\(index)", names: links[index * 2].nodeID, contentHash: hash("group-\(index)"), fileSize: 1_000)
@@ -412,7 +412,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let model = ExactDuplicatesModel(finder: finder)
         let clock = ContinuousClock()
         let start = clock.now
-        let load = Task { await model.load() }
+        let load = Task { await model.load(checkAllGroups: true) }
         for _ in 0..<5_000 {
             if await remote.gate.hasWaiters { break }
             try await Task.sleep(for: .milliseconds(1))
@@ -424,31 +424,32 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let beforeRanking = server.readCounts
         XCTAssertEqual(beforeRanking.albumMembers, 0, "no node load before the groups show")
         XCTAssertEqual(beforeRanking.sharingMembers, 0, "no node load before the groups show")
-        XCTAssertNil(model.rankingLine, "the ranking of the shown pages runs silently")
-        XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the manifest knows every size before any node load")
+        XCTAssertNotNil(model.rankingLine, "the metadata check of the shown pages shows progress")
+        XCTAssertEqual(model.visibleGroups, [])
+        XCTAssertEqual(model.totalFreedBytes, 0, "unchecked candidates claim no freed space")
 
         remote.gate.open()
         await load.value
         let reads = server.readCounts
-        let pages = 2 * ExactDuplicatesModel.rankingPageSize
-        XCTAssertEqual(model.groups.filter(\.isRanked).count, pages, "the shown page and the page after it")
+        let pages = 1_500
+        XCTAssertEqual(
+            model.groups.filter(\.isRanked).count, pages, "every candidate was checked without a row appearance")
         XCTAssertNil(model.rankingLine)
         XCTAssertEqual(reads.favorites, 1)
         XCTAssertEqual(reads.albumMembers, 0, "the node read gives the albums")
         XCTAssertEqual(reads.sharingMembers, pages * 2, "one node read for each member")
 
+        XCTAssertEqual(model.visibleGroups.count, pages)
+        XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the checked groups can show their known sizes")
         model.groupAppeared(model.groups[500].id)
-        for _ in 0..<5_000 where model.groups.filter(\.isRanked).count < 2 * pages {
-            try await Task.sleep(for: .milliseconds(1))
-        }
-        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages, "scrolling ranks two more pages")
+        try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(server.readCounts.favorites, 1, "one favorites listing serves every page")
-        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2)
+        XCTAssertEqual(server.readCounts.sharingMembers, pages * 2, "appearing rows reread no metadata")
 
-        await model.load()
-        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2, "an unchanged group keeps its facts")
+        await model.load(checkAllGroups: true)
+        XCTAssertEqual(server.readCounts.sharingMembers, pages * 2, "an unchanged group keeps its facts")
         XCTAssertEqual(server.readCounts.albumMembers, 0)
-        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages)
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, pages)
         print(
             "[Duplicates timing] firstGroups=\(start.duration(to: published)) "
                 + "ranking=\(published.duration(to: clock.now)) visibilityRequests=\(reads.visibility) "
@@ -1880,6 +1881,288 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(server.links.first { $0.linkID == different.nodeID }?.state, .active)
         XCTAssertEqual(store.record(for: videoRow)?.remoteLinkID, keptVideo.nodeID, "the related row moves to its twin")
         XCTAssertEqual(violations, [])
+    }
+
+    func testPreselectionKeepsTheCopyWithTheOriginalAndAdjustmentData() async throws {
+        let a = server.seedLink(digest: digest("a"))
+        let b = server.seedLink(digest: digest("a"))
+        let original = server.seedLink(digest: digest("original"), main: b)
+        let adjustment = server.seedLink(digest: digest("adjustment"), main: b)
+        let originalRow = row("original", names: original.nodeID, contentHash: hash("original"))
+        let adjustmentRow = row("adjustment", names: adjustment.nodeID, contentHash: hash("adjustment"))
+        indexServer()
+        let reads = server.readCounts.compound
+
+        let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: b, trashed: [a], keptDuplicates: [:]))
+        XCTAssertEqual(state(of: a), .trashed)
+        for uid in [b, original, adjustment] { XCTAssertEqual(state(of: uid), .active) }
+        XCTAssertEqual(store.record(for: originalRow)?.remoteLinkID, original.nodeID)
+        XCTAssertEqual(store.record(for: adjustmentRow)?.remoteLinkID, adjustment.nodeID)
+        XCTAssertEqual(server.readCounts.compound - reads, 2, "the swap adds no compound read")
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAChosenPoorerCopyNeverSwapsToTheRicherCopy() async throws {
+        let a = server.seedLink(digest: digest("a"))
+        let b = server.seedLink(digest: digest("a"))
+        _ = server.seedLink(digest: digest("original"), main: b)
+        indexServer()
+
+        let outcome = try await finder.merge(try await onlyGroup(), keeping: a)
+
+        XCTAssertEqual(outcome, .merged(kept: a, trashed: [], keptDuplicates: [b: .relatedFileWithoutTwin]))
+        XCTAssertEqual(state(of: a), .active)
+        XCTAssertEqual(state(of: b), .active)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testEqualRelatedSetsMergeInBothPreselectionOrders() async throws {
+        for keepSecond in [false, true] {
+            server = EditScenarioServer()
+            let a = server.seedLink(digest: digest("a"))
+            let b = server.seedLink(digest: digest("a"))
+            _ = server.seedLink(digest: digest("video"), main: a)
+            _ = server.seedLink(digest: digest("video"), main: b)
+            let kept = keepSecond ? b : a
+            let duplicate = keepSecond ? a : b
+            try await server.markFavorite([kept])
+            indexServer()
+
+            let results = await finder.merge(preselected(try await onlyGroup(), kept))
+
+            XCTAssertEqual(try results[0].get(), .merged(kept: kept, trashed: [duplicate], keptDuplicates: [:]))
+            XCTAssertEqual(violations, [])
+        }
+    }
+
+    func testConflictingRelatedFilesKeepBothPreselectedCopies() async throws {
+        let a = server.seedLink(digest: digest("a"))
+        let b = server.seedLink(digest: digest("a"))
+        _ = server.seedLink(digest: digest("x"), main: a)
+        _ = server.seedLink(digest: digest("y"), main: b)
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+        XCTAssertEqual(
+            try results[0].get(), .merged(kept: a, trashed: [], keptDuplicates: [b: .relatedFileWithoutTwin]))
+        XCTAssertEqual(state(of: a), .active)
+        XCTAssertEqual(state(of: b), .active)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testThreePreselectedCopiesKeepTheCoveringCopyAndMoveRelatedRows() async throws {
+        let a = server.seedLink(digest: digest("a"))
+        let b = server.seedLink(digest: digest("a"))
+        let c = server.seedLink(digest: digest("a"))
+        let bVideo = server.seedLink(digest: digest("video"), main: b)
+        let cVideo = server.seedLink(digest: digest("video"), main: c)
+        let original = server.seedLink(digest: digest("original"), main: c)
+        let aRow = row("a", names: a.nodeID, contentHash: hash("a"))
+        let bRow = row("b", names: b.nodeID, contentHash: hash("a"))
+        let videoRow = row("video", names: bVideo.nodeID, contentHash: hash("video"))
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: c, trashed: [a, b], keptDuplicates: [:]))
+        for source in [aRow, bRow] { XCTAssertEqual(store.record(for: source)?.remoteLinkID, c.nodeID) }
+        XCTAssertEqual(store.record(for: videoRow)?.remoteLinkID, cVideo.nodeID)
+        for uid in [c, cVideo, original] { XCTAssertEqual(state(of: uid), .active) }
+        for uid in [a, b] { XCTAssertEqual(state(of: uid), .trashed) }
+        XCTAssertEqual(violations, [])
+    }
+
+    func testCoveringKeeperUsesServerRankingInEverySeedAndMemberOrder() async throws {
+        let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+        for order in orders {
+            for membersOrder in orders {
+                server = EditScenarioServer()
+                var copies: [Int: PhotoUID] = [:]
+                for role in order {
+                    // Different device dates deliberately disagree with the server ranking. The fingerprints
+                    // have no capture time, so these dates must never rank the covering keepers.
+                    copies[role] = server.seedLink(digest: digest("a"), captureTime: date(Double(2 - role)))
+                }
+                let a = try XCTUnwrap(copies[0])
+                let b = try XCTUnwrap(copies[1])
+                let c = try XCTUnwrap(copies[2])
+                server.decorate(a)
+                try await server.addPhotos([b], toOwnAlbum: "own-album")
+                for uid in [b, c] { _ = server.seedLink(digest: digest("video"), main: uid) }
+                indexServer()
+                let group = ExactDuplicateGroup(
+                    contentHash: hash("a"), hashKeyEpoch: epoch, members: membersOrder.compactMap { copies[$0] })
+
+                let results = await finder.merge(preselected(group, a))
+
+                guard case .merged(let kept, let trashed, let remaining) = try results[0].get() else {
+                    return XCTFail("every order merges")
+                }
+                XCTAssertEqual(kept, b, "seed \(order), members \(membersOrder)")
+                XCTAssertEqual(Set(trashed), [a, c])
+                XCTAssertEqual(remaining, [:])
+                XCTAssertEqual(violations, [])
+            }
+        }
+    }
+
+    func testCoveringKeepersTieByLinkIDWithoutDeviceDatesAndUseFreshFavoriteTags() async throws {
+        for freshFavorite in [false, true] {
+            server = EditScenarioServer()
+            let a = server.seedLink(digest: digest("a"), captureTime: date(2))
+            let b = server.seedLink(digest: digest("a"), captureTime: date(1))
+            let c = server.seedLink(digest: digest("a"), captureTime: date(0))
+            server.decorate(a)
+            for uid in [b, c] { _ = server.seedLink(digest: digest("video"), main: uid) }
+            // The listing predates this tag, as in a Merge All run cached before another device changed it.
+            if freshFavorite { server.setTags([PhotoTag.favorites.rawValue], of: c) }
+            indexServer()
+            let kept = freshFavorite ? c : b
+            let trashed = freshFavorite ? [a, b] : [a, c]
+
+            let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+            XCTAssertEqual(try results[0].get(), .merged(kept: kept, trashed: trashed, keptDuplicates: [:]))
+            XCTAssertEqual(violations, [])
+        }
+    }
+
+    func testEqualRelatedSetsUseServerOrderEvenWhenThePreselectionCoversEveryone() async throws {
+        let c = server.seedLink(digest: digest("a"), captureTime: date(2))
+        let b = server.seedLink(digest: digest("a"), captureTime: date(1))
+        let k = server.seedLink(digest: digest("a"), captureTime: date(0))
+        for uid in [c, b, k] { _ = server.seedLink(digest: digest("video"), main: uid) }
+        indexServer()
+        let group = ExactDuplicateGroup(contentHash: hash("a"), hashKeyEpoch: epoch, members: [k, b, c])
+
+        let results = await finder.merge(preselected(group, k))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: c, trashed: [k, b], keptDuplicates: [:]))
+        XCTAssertEqual(state(of: c), .active)
+        XCTAssertEqual(state(of: k), .trashed)
+        XCTAssertEqual(state(of: b), .trashed)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testASharedKeeperMergesANonsharedPoorerCopyWithoutSwapping() async throws {
+        let poorer = server.seedLink(digest: digest("a"))
+        let kept = server.seedLink(digest: digest("a"))
+        server.share(kept)
+        let original = server.seedLink(digest: digest("original"), main: kept)
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), kept))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: kept, trashed: [poorer], keptDuplicates: [:]))
+        XCTAssertEqual(state(of: kept), .active)
+        XCTAssertEqual(state(of: original), .active)
+        XCTAssertEqual(state(of: poorer), .trashed)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testASharedKeeperNeverSwapsEvenWhenAnotherSharedMemberIsUnreadable() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let richer = server.seedLink(digest: digest("a"))
+        let shared = server.seedLink(digest: digest("a"))
+        server.share(kept)
+        server.share(shared)
+        let video = server.seedLink(digest: digest("video"), main: richer)
+        let unreadable = server.seedLink(digest: digest("original"), main: shared)
+        server.personTrash(unreadable)
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), kept))
+
+        XCTAssertEqual(
+            try results[0].get(),
+            .merged(kept: kept, trashed: [], keptDuplicates: [richer: .relatedFileWithoutTwin, shared: .shared]))
+        for uid in [kept, richer, shared, video] { XCTAssertEqual(state(of: uid), .active) }
+        XCTAssertEqual(violations, [])
+    }
+
+    func testASharedPoorerPreselectionNeverSwapsOrTrashes() async throws {
+        let a = server.seedLink(digest: digest("a"))
+        let b = server.seedLink(digest: digest("a"))
+        server.share(a)
+        server.share(b)
+        _ = server.seedLink(digest: digest("original"), main: b)
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: a, trashed: [], keptDuplicates: [b: .shared]))
+        XCTAssertEqual(state(of: a), .active)
+        XCTAssertEqual(state(of: b), .active)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testSwappedKeeperReceivesFavoriteAlbumCoverAndFailedTrashIntent() async throws {
+        let a = server.seedLink(digest: digest("a"))
+        let b = server.seedLink(digest: digest("a"))
+        _ = server.seedLink(digest: digest("original"), main: b)
+        server.decorate(a)
+        server.setAlbumCover("own-album", to: a)
+        let source = row("a", names: a.nodeID, contentHash: hash("a"))
+        indexServer()
+        server.applyNextTrashThenFail()
+        // Keep the intent open after the failed trash, as when its confirmation cannot be read.
+        server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
+
+        let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+        XCTAssertThrowsError(try results[0].get())
+        let keptLink = try XCTUnwrap(server.links.first { $0.linkID == b.nodeID })
+        XCTAssertTrue(keptLink.favorite)
+        XCTAssertEqual(keptLink.albums, [.init(volumeID: "vol", albumID: "own-album")])
+        XCTAssertEqual(server.albumCovers, ["own-album": b.nodeID])
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, b.nodeID)
+        XCTAssertEqual(mergeJournal.pendingMerges()?.first?.kept, b.nodeID)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testOtherMetadataNeverBecomeTheCoveringKeeper() async throws {
+        let a = server.seedLink(digest: digest("a"))
+        let b = server.seedLink(digest: digest("a"))
+        let c = server.seedLink(digest: digest("a"))
+        for uid in [b, c] { _ = server.seedLink(digest: digest("video"), main: uid) }
+        _ = server.seedLink(digest: digest("original"), main: b)
+        server.setFingerprint(.init(pixelWidth: 42), of: b)
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: c, trashed: [a], keptDuplicates: [b: .differentDetails]))
+        XCTAssertEqual(state(of: b), .active)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAnUnreadableActiveCompoundPreventsTheKeeperSwap() async throws {
+        for excludedMember in [false, true] {
+            server = EditScenarioServer()
+            let a = server.seedLink(digest: digest("a"))
+            let b = server.seedLink(digest: digest("a"))
+            let c = server.seedLink(digest: digest("a"))
+            _ = server.seedLink(digest: digest("video"), main: b)
+            let unreadableFile = server.seedLink(digest: digest("original"), main: c)
+            server.personTrash(unreadableFile)
+            if excludedMember {
+                server.setFingerprint(.init(pixelWidth: 42), of: c)
+            }
+            indexServer()
+
+            let results = await finder.merge(preselected(try await onlyGroup(), a))
+
+            XCTAssertEqual(
+                try results[0].get(),
+                .merged(
+                    kept: a, trashed: [],
+                    keptDuplicates: [b: .relatedFileWithoutTwin, c: excludedMember ? .differentDetails : .unreadable]))
+            for uid in [a, b, c] { XCTAssertEqual(state(of: uid), .active) }
+            XCTAssertEqual(violations, [])
+        }
     }
 
     func testMergeKeepsADuplicateThatAPendingEditReplacementNames() async throws {

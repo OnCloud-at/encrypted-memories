@@ -8,18 +8,21 @@ public struct ActivityProgressRow: View {
     private let detail: String?
     private let fraction: Double?
     private let showsIndeterminateProgress: Bool
+    private let alignment: HorizontalAlignment
 
     public init(
-        title: String?, detail: String? = nil, fraction: Double? = nil, showsIndeterminateProgress: Bool = false
+        title: String?, detail: String? = nil, fraction: Double? = nil, showsIndeterminateProgress: Bool = false,
+        alignment: HorizontalAlignment = .leading
     ) {
         self.title = title
         self.detail = detail
         self.fraction = fraction.map { min(max($0, 0), 1) }
         self.showsIndeterminateProgress = showsIndeterminateProgress
+        self.alignment = alignment
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: alignment, spacing: 6) {
             if title != nil || (fraction == nil && showsIndeterminateProgress) {
                 HStack(spacing: 8) {
                     if fraction == nil, showsIndeterminateProgress {

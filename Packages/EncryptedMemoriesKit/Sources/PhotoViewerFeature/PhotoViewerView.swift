@@ -247,6 +247,7 @@ public struct PhotoViewerView: View {
             InfoPanelView(
                 item: model.current,
                 metadataLoadState: model.metadataLoadState,
+                placeName: model.placeName,
                 albumTitles: model.albumTitles,
                 canLoadAlbumMemberships: model.canLoadAlbumMemberships,
                 isLoadingAlbumMemberships: model.isLoadingAlbumMemberships,
