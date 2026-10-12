@@ -50,6 +50,8 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].exists)
         let progress = app.progressIndicators["duplicates.checkProgress"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 5), "the check shows its progress")
+        XCTAssertGreaterThanOrEqual(progress.frame.width, 240)
+        XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertTrue(
             app.staticTexts.matching(NSPredicate(format: "label CONTAINS '1,234 of 15,000 photos'"))
                 .firstMatch.exists
@@ -145,7 +147,10 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
         XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == 'Checking duplicates'")).count, 1)
         XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
+        XCTAssertGreaterThanOrEqual(progress.frame.width, 240)
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
+        XCTAssertLessThanOrEqual(
+            progress.frame.width, app.staticTexts["Looking for identical copies in your library."].frame.width)
         keepScreenshot("duplicates-ios-slim-metadata-check")
     }
 

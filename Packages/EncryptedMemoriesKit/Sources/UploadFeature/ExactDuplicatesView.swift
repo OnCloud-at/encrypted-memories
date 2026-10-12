@@ -127,6 +127,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
 
     private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {
         ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent)
+            .frame(width: 240)
     }
 
     @ViewBuilder private var retryButton: some View {
