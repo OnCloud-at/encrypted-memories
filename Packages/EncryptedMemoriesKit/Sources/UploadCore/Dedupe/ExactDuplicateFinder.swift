@@ -650,12 +650,12 @@ public struct ExactDuplicateFinder: Sendable {
         guard active.contains(kept) else { return .skipped(.keptLeftLibrary) }
         guard active.count > 1 else { return .skipped(.noDuplicateLeft) }
         let volumeID = try await remote.ownPhotosVolumeID()
-        guard let keptCompound = try await checker.compound(ofMainLink: kept.nodeID),
+        guard var keptCompound = try await checker.compound(ofMainLink: kept.nodeID),
             keptCompound.main.contentHash == group.contentHash
         else { return .skipped(.keptUnreadable) }
 
+        var kept = kept
         var plan = PlannedMerge(kept: kept, contentHash: group.contentHash, epoch: epoch, volumeID: volumeID)
-        if keptCompound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(kept) }
         var compounds: [PhotoUID: UploadRemoteCompound?] = [:]
         // One node read for each member of this group gives the metadata and the sharing state.
         let facts = try await remote.nodeFacts(of: active)
@@ -691,7 +691,49 @@ public struct ExactDuplicateFinder: Sendable {
                     )
                 })
             guard Self.keepOrder(active, facts: ranking).first == kept else { return .skipped(.preselectionChanged) }
+            // A failed read must never pick another keeper. This check includes shared members and members with
+            // other metadata, even though neither can become the keeper or require related-file coverage.
+            let allReadable = active.allSatisfy { member in
+                guard let compound = fresh[member] ?? nil else { return false }
+                return compound.main.contentHash == group.contentHash
+            }
+            if allReadable {
+                let comparable = active.filter { member in
+                    facts[member]?.fingerprint == keptFingerprint && facts[member]?.isShared == false
+                }
+                let covers = { (candidate: PhotoUID) -> Bool in
+                    guard let compound = fresh[candidate] ?? nil else { return false }
+                    return comparable.allSatisfy { member in
+                        guard member != candidate else { return true }
+                        guard let other = fresh[member] ?? nil else { return false }
+                        return UploadRemoteReplacementSafety.relatedTwins(of: other, under: compound) != nil
+                    }
+                }
+                if comparable.contains(kept), !covers(kept) {
+                    // Equal fingerprints tie on server capture time. A date known only on this device must not
+                    // break that tie when choosing among the covering copies.
+                    let serverRanking = Dictionary(
+                        uniqueKeysWithValues: comparable.map {
+                            (
+                                $0,
+                                Self.keepFacts(
+                                    of: $0, node: facts[$0], ownVolumeID: volumeID,
+                                    favorites: favorites, knownDate: nil)
+                            )
+                        })
+                    if let covering = Self.keepOrder(comparable.filter(covers), facts: serverRanking).first,
+                        let compound = fresh[covering] ?? nil
+                    {
+                        compounds = fresh
+                        kept = covering
+                        keptCompound = compound
+                        plan = PlannedMerge(
+                            kept: kept, contentHash: group.contentHash, epoch: epoch, volumeID: volumeID)
+                    }
+                }
+            }
         }
+        if keptCompound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(kept) }
         // A trash ends the sharing of a photo, so a shared duplicate stays.
         let shared = Set(facts.filter(\.value.isShared).keys)
         for member in active where member != kept {

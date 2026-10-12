@@ -1691,6 +1691,21 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.content, .noDuplicates)
     }
 
+    func testAMergeThatSwapsThePreselectionRemovesTheGroupWithoutANotice() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupB], coverage: .complete)])
+        finder.outcomes["B"] = .merged(kept: b2, trashed: [b1], keptDuplicates: [:])
+        let (model, log) = makeModel(finder)
+        await model.load()
+        XCTAssertEqual(model.groups.first?.kept, b1)
+
+        await model.merge(groupID: "B")
+
+        XCTAssertEqual(model.groups, [])
+        XCTAssertEqual(model.content, .noDuplicates)
+        XCTAssertEqual(log.calls, [[b1]])
+        XCTAssertNil(model.notice)
+    }
+
     func testEveryKeptReasonHasItsOwnMessage() {
         let reasons: [ExactDuplicateKeepReason] = [
             .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .unreadable,
