@@ -656,11 +656,8 @@ public final class ExactDuplicatesModel {
             ? L10n.string("duplicates.merge_all_message \(duplicateCount)")
             : L10n.string("duplicates.merge_all_message_unchecked")
     }
-    /// The confirming button of the Merge All dialog.
-    public var mergeAllConfirmTitle: String {
-        hasCheckedGroups
-            ? L10n.string("duplicates.merge_all_confirm \(copyCount)") : L10n.string("duplicates.merge_all")
-    }
+    /// The short confirming button of the Merge All dialog; the title carries the count.
+    public var mergeAllConfirmTitle: String { mergeTitle }
 
     /// The group with `id`. Nil after a merge removed it.
     public func group(withID id: String) -> Group? { groups.first { $0.id == id } }

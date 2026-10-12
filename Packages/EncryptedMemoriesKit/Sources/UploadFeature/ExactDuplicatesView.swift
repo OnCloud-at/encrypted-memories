@@ -39,8 +39,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
 
     public var body: some View {
         content
-            // The copies are identical and the duplicates can be restored, so the confirmation is no warning.
-            .confirmationDialog(model.mergeAllTitle, isPresented: $confirmsMergeAll, titleVisibility: .visible) {
+            .alert(model.mergeAllTitle, isPresented: $confirmsMergeAll) {
                 Button(model.mergeAllConfirmTitle) {
                     Task { await model.mergeAll() }
                 }

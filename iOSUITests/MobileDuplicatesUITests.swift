@@ -17,15 +17,17 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(1).waitForExistence(timeout: 10))
     }
 
-    private func openDuplicates(fixture: String, dark: Bool = false, extra: [String] = []) {
+    private func openDuplicates(fixture: String, dark: Bool = false, extra: [String] = [], language: String = "en") {
         app.launchArguments =
             [
-                "-EncryptedMemoriesUITestFixture", fixture, "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+                "-EncryptedMemoriesUITestFixture", fixture, "-AppleLanguages", "(\(language))", "-AppleLocale",
+                language == "de" ? "de_AT" : "en_US",
             ] + (dark ? ["-EncryptedMemoriesDarkAppearance"] : []) + extra
         app.launch()
         // Native tabs use buttons; the expanded iPad sidebar uses cells. The role can change with orientation.
-        let collectionsButton = app.buttons["Collections"].firstMatch
-        let collectionsCell = app.cells["Collections"].firstMatch
+        let collectionsTitle = language == "de" ? "Sammlungen" : "Collections"
+        let collectionsButton = app.buttons[collectionsTitle].firstMatch
+        let collectionsCell = app.cells[collectionsTitle].firstMatch
         let collectionsReady = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in collectionsButton.exists || collectionsCell.exists }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [collectionsReady], timeout: 60), .completed)
@@ -193,15 +195,71 @@ final class MobileDuplicatesUITests: XCTestCase {
         keepScreenshot("duplicates-ios-slim-scan")
     }
 
+    func testMergeAllUsesAnAlertWithShortLocalizedActionsAndCancelKeepsTheGroups() {
+        for language in ["en", "de"] {
+            openDuplicates(fixture: "-EncryptedMemoriesDuplicatesFixture", language: language)
+            revealGroup(1)
+            app.buttons["duplicates.mergeAll"].tap()
+            let alert = app.alerts.firstMatch
+            XCTAssertTrue(alert.waitForExistence(timeout: 10), "Merge All uses a native alert")
+            let confirm = alert.buttons["duplicates.mergeAll.dialog"].firstMatch
+            let cancel = alert.buttons[language == "de" ? "Abbrechen" : "Cancel"].firstMatch
+            XCTAssertTrue(confirm.exists)
+            XCTAssertEqual(confirm.label, language == "de" ? "Zusammenführen" : "Merge")
+            XCTAssertTrue(confirm.isEnabled)
+            XCTAssertTrue(confirm.isHittable)
+            XCTAssertTrue(cancel.isHittable)
+            // SwiftUI exposes the Merge action and its same-frame child as two accessibility buttons.
+            let visibleActions = Set(
+                alert.buttons.allElementsBoundByIndex.map { "\($0.label)|\($0.frame)" })
+            XCTAssertEqual(visibleActions.count, 2)
+            XCTAssertTrue(
+                alert.staticTexts[language == "de" ? "4 exakte Kopien zusammenführen?" : "Merge 4 Exact Copies?"].exists
+            )
+            let message = alert.staticTexts[
+                language == "de"
+                    ? "Die Kopien sind identisch. Ein Foto jeder Gruppe bleibt, mit Favoriten und Alben. 2 Fotos kommen in „Zuletzt gelöscht“."
+                    : "The copies are identical. One photo of each group stays, with its favorites and albums. 2 photos move to Recently Deleted."
+            ]
+            XCTAssertTrue(message.exists)
+            XCTAssertEqual(alert.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 2)
+            print(
+                "[Duplicates alert] language=\(language) alert=\(alert.frame) confirm=\(confirm.frame) cancel=\(cancel.frame)"
+            )
+            keepScreenshot("duplicates-ios-merge-alert-\(language)")
+            let textRegion = alert.scrollViews.firstMatch
+            for _ in 0..<8 where message.frame.maxY > textRegion.frame.maxY + 2 { textRegion.swipeUp() }
+            XCTAssertLessThanOrEqual(message.frame.maxY, textRegion.frame.maxY + 2, "the entire message can be read")
+            XCTAssertTrue(confirm.isHittable)
+            XCTAssertTrue(cancel.isHittable)
+            keepScreenshot("duplicates-ios-merge-alert-message-end-\(language)")
+            cancel.tap()
+            waitUntilGone(alert, "Cancel dismisses the alert")
+            revealGroup(0, scrollingUp: false)
+            revealGroup(1)
+            app.terminate()
+        }
+    }
+
+    /// Large accessibility text can put a fixture group below the viewport; reach the real row by scrolling.
+    private func revealGroup(_ index: Int, scrollingUp: Bool = true) {
+        for _ in 0..<4 where !group(index).waitForExistence(timeout: 1) {
+            if scrollingUp { app.swipeUp() } else { app.swipeDown() }
+        }
+        XCTAssertTrue(group(index).waitForExistence(timeout: 10), "every fixture group remains in the list")
+    }
+
     func testMergeAllMergesEveryGroupAfterTheConfirmation() throws {
         openDuplicates()
         let mergeAll = app.buttons["duplicates.mergeAll"]
         XCTAssertTrue(mergeAll.waitForExistence(timeout: 5))
         mergeAll.tap()
 
-        let confirm = app.buttons["duplicates.mergeAll.dialog"].firstMatch
+        let alert = app.alerts.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 10))
+        let confirm = alert.buttons["duplicates.mergeAll.dialog"].firstMatch
         XCTAssertTrue(confirm.waitForExistence(timeout: 10))
-        try app.tapDialogButton("duplicates.mergeAll.dialog")
+        confirm.tap()
 
         waitUntilGone(group(0), "every group leaves the list")
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 5))
@@ -214,9 +272,11 @@ final class MobileDuplicatesUITests: XCTestCase {
         let mergeAll = app.buttons["duplicates.mergeAll"]
         XCTAssertTrue(mergeAll.waitForExistence(timeout: 5))
         mergeAll.tap()
-        let confirm = app.buttons["duplicates.mergeAll.dialog"].firstMatch
+        let alert = app.alerts.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 10))
+        let confirm = alert.buttons["duplicates.mergeAll.dialog"].firstMatch
         XCTAssertTrue(confirm.waitForExistence(timeout: 10))
-        try app.tapDialogButton("duplicates.mergeAll.dialog")
+        confirm.tap()
 
         XCTAssertTrue(app.staticTexts["Merging Duplicates"].waitForExistence(timeout: 30), "the progress row shows")
         let stop = app.buttons["duplicates.stopMerge"]

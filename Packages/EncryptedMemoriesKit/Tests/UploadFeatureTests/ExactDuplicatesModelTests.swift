@@ -455,14 +455,14 @@ final class ExactDuplicatesModelTests: XCTestCase {
             XCTAssertNil(model.copyCountText)
             XCTAssertEqual(model.mergeAllTitle, L10n.string("duplicates.merge_all_title_unchecked"))
             XCTAssertEqual(model.mergeAllMessage, L10n.string("duplicates.merge_all_message_unchecked"))
-            XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all"))
+            XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
             finder.scanError = URLError(.notConnectedToInternet)
             finder.scanGate.open()
             await merge.value
 
             XCTAssertNil(model.knownDuplicateCount)
             XCTAssertNil(model.copyCountText)
-            XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all"))
+            XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
             finder.scanError = nil
             await model.load()
 
@@ -1183,7 +1183,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await model.load()
         XCTAssertEqual(model.copyCount, 5)
         XCTAssertEqual(model.mergeAllTitle, L10n.string("duplicates.merge_all_title \(5)"))
-        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all_confirm \(5)"))
+        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
         XCTAssertEqual(model.mergeAllMessage, L10n.string("duplicates.merge_all_message \(3)"))
         XCTAssertEqual(model.keepTitle(for: a1), L10n.string("duplicates.kept"))
         XCTAssertEqual(model.keepTitle(for: a2), L10n.string("duplicates.keep_this_copy"))
@@ -1434,7 +1434,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(
             model.metadataCheckNote, L10n.string("duplicates.groups_checked \(48.formatted()) \(200.formatted())"))
         XCTAssertNil(model.copyCountText)
-        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all"))
+        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
         for index in stride(from: 48, to: 200, by: 48) {
             model.groupAppeared(groups[index].id)
             await waitUntil({ model.groups.filter(\.isRanked).count == min(index + 48, 200) }, "the next pages rank")
@@ -1492,7 +1492,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNotNil(model.rankingLine)
         XCTAssertEqual(model.mergeAllTitle, L10n.string("duplicates.merge_all_title_unchecked"))
         XCTAssertEqual(model.mergeAllMessage, L10n.string("duplicates.merge_all_message_unchecked"))
-        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all"))
+        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
 
         finder.rankGate.open()
         await load.value
@@ -1510,7 +1510,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.filter(\.isRanked).count, 48)
         XCTAssertNil(model.knownDuplicateCount)
         XCTAssertNil(model.copyCountText)
-        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all"))
+        XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
     }
 
     func testCheckedMetadataSplitsPublishOnlyTheRemainingCount() async {
