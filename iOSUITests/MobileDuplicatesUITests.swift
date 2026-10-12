@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 final class MobileDuplicatesUITests: XCTestCase {
@@ -22,10 +23,13 @@ final class MobileDuplicatesUITests: XCTestCase {
                 "-EncryptedMemoriesUITestFixture", fixture, "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
             ] + (dark ? ["-EncryptedMemoriesDarkAppearance"] : []) + extra
         app.launch()
-        // The iOS 26 and 27 tab bars do not always expose a tab bar element; the tab is a button in both.
-        let collections = app.buttons["Collections"].firstMatch
-        XCTAssertTrue(collections.waitForExistence(timeout: 60))
-        collections.tap()
+        // Native tabs use buttons; the expanded iPad sidebar uses cells. The role can change with orientation.
+        let collectionsButton = app.buttons["Collections"].firstMatch
+        let collectionsCell = app.cells["Collections"].firstMatch
+        let collectionsReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in collectionsButton.exists || collectionsCell.exists }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [collectionsReady], timeout: 60), .completed)
+        (collectionsButton.exists ? collectionsButton : collectionsCell).tap()
 
         // The list creates rows lazily; Utilities follows the Library rows below the fold on a phone.
         let entry = app.buttons["duplicates.entry"]
@@ -50,7 +54,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].exists)
         let progress = app.progressIndicators["duplicates.checkProgress"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 5), "the check shows its progress")
-        XCTAssertGreaterThanOrEqual(progress.frame.width, 240)
+        XCTAssertGreaterThanOrEqual(progress.frame.width, 120)
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertTrue(
             app.staticTexts.matching(NSPredicate(format: "label CONTAINS '1,234 of 15,000 photos'"))
@@ -142,16 +146,51 @@ final class MobileDuplicatesUITests: XCTestCase {
     func testTheInitialCheckUsesTheSlimLoadingLayout() {
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
+        assertWaitingLayout()
+    }
+
+    func testLandscapeIPadCheckKeepsItsPercentageCenteredAndCapped() throws {
+        try XCTSkipUnless(UIDevice.current.userInterfaceIdiom == .pad, "this probe covers a landscape iPad window")
+        XCUIDevice.shared.orientation = .landscapeLeft
+        defer { XCUIDevice.shared.orientation = .portrait }
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
+        XCTAssertGreaterThan(app.windows.firstMatch.frame.width, app.windows.firstMatch.frame.height)
+        assertWaitingLayout()
+    }
+
+    private func assertWaitingLayout() {
         let progress = app.progressIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
         XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == 'Checking duplicates'")).count, 1)
         XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
-        XCTAssertGreaterThanOrEqual(progress.frame.width, 240)
+        XCTAssertGreaterThanOrEqual(progress.frame.width, 120)
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertLessThanOrEqual(
             progress.frame.width, app.staticTexts["Looking for identical copies in your library."].frame.width)
+        let percent = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH '%'")).firstMatch
+        XCTAssertTrue(percent.exists)
+        XCTAssertEqual(percent.frame.midX, progress.frame.midX, accuracy: 1, "the percentage stays centered")
+        print(
+            "[Duplicates layout] window=\(app.windows.firstMatch.frame.width) bar=\(progress.frame.width) percentMidX=\(percent.frame.midX) barMidX=\(progress.frame.midX)"
+        )
         keepScreenshot("duplicates-ios-slim-metadata-check")
+    }
+
+    func testTheInitialScanUsesTheSameSlimLoadingLayout() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowScan"])
+        let progress = app.activityIndicators["duplicates.loading"].firstMatch
+        XCTAssertTrue(progress.waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
+        XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
+        XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
+        XCTAssertFalse(group(0).exists)
+        XCTAssertEqual(
+            progress.frame.midX, app.staticTexts["Looking for identical copies in your library."].frame.midX,
+            accuracy: 1)
+        keepScreenshot("duplicates-ios-slim-scan")
     }
 
     func testMergeAllMergesEveryGroupAfterTheConfirmation() throws {

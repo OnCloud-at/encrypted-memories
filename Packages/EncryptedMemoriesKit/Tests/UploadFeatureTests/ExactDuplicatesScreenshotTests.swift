@@ -61,6 +61,37 @@
             }
         }
 
+        func testRenderNarrowAndLargeWaitingWindows() async throws {
+            let directory = try outputDirectory()
+            let members = (0..<4).map { PhotoUID(volumeID: "v", nodeID: "waiting-\($0)") }
+            let groups = [
+                ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: Array(members.prefix(2))),
+                ExactDuplicateGroup(contentHash: "B", hashKeyEpoch: "e", members: Array(members.suffix(2))),
+            ]
+            for width in [CGFloat(240), 320, 480, 1600] {
+                for scan in [true, false] {
+                    let finder = ScreenshotFinder(
+                        groups: groups, coverage: .complete, build: .none, holdsRanking: true, holdsScan: scan)
+                    let model = ExactDuplicatesModel(finder: finder)
+                    let (window, host) = host(model: model, width: width, height: 1000)
+                    for _ in 0..<200 where !model.isCheckingGroups || (!scan && model.rankingLine == nil) {
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                    XCTAssertTrue(model.isCheckingGroups)
+                    XCTAssertFalse(model.canMerge)
+                    window.appearance = NSAppearance(named: .aqua)
+                    try await Task.sleep(for: .milliseconds(300))
+                    try capture(
+                        host,
+                        to: directory.appendingPathComponent(
+                            "duplicates-macos-waiting-\(Int(width))-\(scan ? "scan" : "ranking").png"))
+                    model.retire()
+                    window.orderOut(nil)
+                    window.contentView = nil
+                }
+            }
+        }
+
         /// The shared viewer of a group of duplicates with its filmstrip, next to the same viewer as the library opens
         /// it, and the viewer of a burst with the same filmstrip panel. The window toolbar with Keep This Copy and Merge
         /// belongs to the app and is not part of this render.
@@ -163,7 +194,9 @@
             return found.max { $0.frame.height < $1.frame.height }
         }
 
-        private func host(model: ExactDuplicatesModel) -> (NSWindow, NSView) {
+        private func host(
+            model: ExactDuplicatesModel, width: CGFloat = 1400, height: CGFloat = 900
+        ) -> (NSWindow, NSView) {
             let view = ExactDuplicatesView(
                 model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
                 onOpen: { _, _ in }
@@ -172,11 +205,11 @@
                     .fill(Color(hue: Self.hue(of: uid), saturation: 0.45, brightness: 0.8))
                     .frame(width: 132, height: 132)
             }
-            .frame(width: 1400, height: 900)
+            .frame(width: width, height: height)
             // The Mac route draws the window background behind the screen, as `MacDuplicatesView` does.
             .background(Color(nsColor: .windowBackgroundColor))
             let host = NSHostingView(rootView: view)
-            host.frame = NSRect(x: 0, y: 0, width: 1400, height: 900)
+            host.frame = NSRect(x: 0, y: 0, width: width, height: height)
             let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
             window.contentView = host
             window.orderFrontRegardless()
@@ -274,14 +307,17 @@
         let coverage: ExactDuplicateCoverage
         let build: Build
         let holdsRanking: Bool
+        let holdsScan: Bool
 
         init(
-            groups: [ExactDuplicateGroup], coverage: ExactDuplicateCoverage, build: Build, holdsRanking: Bool = false
+            groups: [ExactDuplicateGroup], coverage: ExactDuplicateCoverage, build: Build, holdsRanking: Bool = false,
+            holdsScan: Bool = false
         ) {
             self.groups = groups
             self.coverage = coverage
             self.build = build
             self.holdsRanking = holdsRanking
+            self.holdsScan = holdsScan
         }
 
         @MainActor func isSettled(_ model: ExactDuplicatesModel) -> Bool {
@@ -295,7 +331,8 @@
         func duplicateGroups(
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
         ) async throws -> ExactDuplicateScan {
-            ExactDuplicateScan(groups: groups, coverage: coverage, byteSizes: ["A": 4_200_000, "B": 18_400_000])
+            if holdsScan { try await Task.sleep(for: .seconds(3_600)) }
+            return ExactDuplicateScan(groups: groups, coverage: coverage, byteSizes: ["A": 4_200_000, "B": 18_400_000])
         }
 
         func prepareIndex(

@@ -126,8 +126,9 @@ public struct ExactDuplicatesView<Cover: View>: View {
     }
 
     private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {
-        ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent)
-            .frame(width: 240)
+        ExactDuplicatesWaitingProgressLayout {
+            ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent, alignment: .center)
+        }
     }
 
     @ViewBuilder private var retryButton: some View {
@@ -140,6 +141,26 @@ public struct ExactDuplicatesView<Cover: View>: View {
     }
 }
 
+/// Sizes the waiting indicator from its available action area without measuring and feeding a frame back into
+/// layout. The bar remains centered and fits even when a narrow window cannot provide the preferred minimum.
+private struct ExactDuplicatesWaitingProgressLayout: Layout {
+    private func lineWidth(in available: CGFloat) -> CGFloat {
+        min(available, max(120, available * 0.7))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let available = min(320, max(0, proposal.width ?? 320))
+        let line = subviews[0].sizeThatFits(ProposedViewSize(width: lineWidth(in: available), height: nil))
+        return CGSize(width: available, height: line.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews[0].place(
+            at: CGPoint(x: bounds.midX, y: bounds.minY), anchor: .top,
+            proposal: ProposedViewSize(width: lineWidth(in: bounds.width), height: nil))
+    }
+}
+
 /// One progress line of the screen. Without its title, the surrounding view shows the title. With `stop`, a Stop
 /// button follows the line; it stays disabled after the person stopped. `identifier` names the line only, so the Stop
 /// button keeps its own.
@@ -147,6 +168,7 @@ private struct ExactDuplicatesProgressRow: View {
     let line: ExactDuplicatesModel.ProgressLine
     var showsTitle = true
     let accent: Color
+    var alignment: HorizontalAlignment = .leading
     var identifier: String?
     var stop: (() -> Void)?
     var canStop = true
@@ -154,7 +176,7 @@ private struct ExactDuplicatesProgressRow: View {
     var body: some View {
         let row = ActivityProgressRow(
             title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
-            showsIndeterminateProgress: true
+            showsIndeterminateProgress: true, alignment: alignment
         )
         .tint(accent)
         .accessibilityIdentifier(identifier ?? "")
