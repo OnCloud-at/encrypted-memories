@@ -12,6 +12,12 @@ Encrypted Memories uses one shared backup engine across Mac, iPhone, and iPad. T
 
 The queue is durable. It includes streamed hashing, duplicate detection, retry state, crash recovery, and remote reconciliation.
 
+A Live Photo backs up as one photo. Its video is stored as an extra file of the photo.
+
+An edited photo backs up as the edited version. The original is stored as an extra file. After an edit, the app waits a few seconds for more edits. It then waits up to two minutes for the edited file.
+
+If you turn off the Live effect of a photo, the photo backs up as a still photo. Its video stays as an extra file.
+
 A photo that exists only in iCloud ("Optimize Storage") downloads once for its backup. A new photo that the
 camera still processes waits, without repeated checks, until Apple Photos reports the finished photo. If that
 report does not come, one check ten minutes after the shot backs up the version that exists. **Back up now**
@@ -35,15 +41,13 @@ When it is off and the device uses cellular data or Personal Hotspot, the backup
 
 ## Photos that are not backed up yet
 
-The Backup page shows how many photos are not backed up yet. Tap or click the line **N couldn’t be backed up** or **N waiting for Proton** to open **Photos not backed up**. The list names each photo and the reason, for example:
+The Backup page shows how many photos are not backed up yet. Tap or click the line **N couldn’t be backed up** or **N waiting for Proton** to open **Photos not backed up**. The list names each photo and the reason. The list has up to three sections:
 
-- **Not enough space on this device.**
-- **Your Proton storage is full. Free up space or upgrade your plan.**
-- **Connection interrupted.**
-- **The camera is still processing this photo.**
-- **This file type cannot be backed up.**
+- **Action needed**: you can fix the problem, or you must decide. Example: **Your Proton storage is full. Free up space or upgrade your plan.**
+- **Continues by itself**: the backup tries again later. Examples: **Not enough space on this device.**, **Connection interrupted.**, or **The camera is still processing this photo.**
+- **Not possible**: the backup cannot save the photo. Example: **This file type cannot be backed up.**
 
-Select **Try again** to retry the photos that you can fix. When nothing is left, the list shows **Nothing needs attention.**
+**Try again** appears only while the list shows a photo that you can fix. Select it to retry these photos. When nothing is left, the list shows **Nothing needs attention.**
 
 If the backup of a photo was removed from Proton Drive, select the photo in the list and choose what to do. **Back Up Again** uploads the photo again. **Keep Deleted** leaves it out of the backup.
 
