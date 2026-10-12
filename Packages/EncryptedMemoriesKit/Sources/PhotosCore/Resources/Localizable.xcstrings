@@ -6325,8 +6325,8 @@
     },
     "duplicates.kept_reason_related_file": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "A file exists only with a copy that stays." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Eine Datei gibt es nur bei einer Kopie, die bleibt." } }
+        "en": { "stringUnit": { "state": "translated", "value": "It has an extra file that would be lost." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es hat eine Zusatzdatei, die sonst verloren ginge." } }
       }
     },
     "duplicates.kept_reason_pending_edit": {
