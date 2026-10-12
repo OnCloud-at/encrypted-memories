@@ -363,6 +363,15 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var groupStorage: [Group] = []
     /// How many changes `groups` published. Tests read it.
     @ObservationIgnored private(set) var groupChanges = 0
+    /// The final checked groups that the screen can present as duplicates. Failed candidates remain hidden.
+    public var visibleGroups: [Group] {
+        isCheckingGroups || hasInvalidatedGroups ? [] : groups.filter(\.isRanked)
+    }
+    /// The screen waits for its scan and metadata check.
+    public private(set) var isCheckingGroups = false
+    public var checkingGroupsLine: ProgressLine {
+        rankingLine ?? ProgressLine(title: L10n.string("duplicates.ranking_title"), detail: nil, fraction: nil)
+    }
     /// How much of the library the content index covered at the last scan.
     public private(set) var coverage = ExactDuplicateCoverage.complete
     public private(set) var isMerging = false
@@ -416,6 +425,11 @@ public final class ExactDuplicatesModel {
     /// The one build of this model. A load while it runs waits for it, and a closed screen leaves it running: the
     /// backup uses the same build, and the build resumes from its checkpoint.
     @ObservationIgnored private var indexBuild: Task<Bool, any Error>?
+    /// A screen check requests every candidate once; closing the screen stops it.
+    @ObservationIgnored private var checksAllGroups = false
+    @ObservationIgnored private var hasOpenedScreen = false
+    private var rankingFailed = false
+    private var rankingFraction = 0.0
     /// The ranking of the last load. A new load cancels it.
     @ObservationIgnored private var ranking: Task<Void, Never>?
     /// The groups that wait for the ranking, in the order the screen showed them.
@@ -452,7 +466,8 @@ public final class ExactDuplicatesModel {
     private var isBuilding: Bool { checkProgress != nil }
 
     public var content: Content {
-        switch phase {
+        if isCheckingGroups { return .groups }
+        return switch phase {
         case .idle, .loading: groups.isEmpty ? .loading : .groups
         case .failed: groups.isEmpty ? .failed(L10n.string("duplicates.load_failed")) : .groups
         case .loaded:
@@ -522,22 +537,19 @@ public final class ExactDuplicatesModel {
     /// The progress of an active metadata check, including the ranking that a merge waits for.
     public var rankingLine: ProgressLine? {
         guard isRankingForMerge || (!hasInvalidatedGroups && !hasCheckedGroups), let rankingProgress else { return nil }
-        let progress =
-            isRankingForMerge
-            ? rankingProgress
-            : ExactDuplicateScanProgress(completed: groups.filter(\.isRanked).count, total: groups.count)
+        let progress = rankingProgress
         guard progress.total > 0 else { return nil }
-        let completed = progress.completed.formatted()
-        let total = progress.total.formatted()
-        return ProgressLine(
-            title: L10n.string("duplicates.ranking_title"),
-            detail: L10n.string("duplicates.ranking_progress \(completed) \(total)"),
-            fraction: Double(progress.completed) / Double(progress.total))
+        let current = Double(progress.completed) / Double(progress.total)
+        let fraction = isRankingForMerge ? current : max(rankingFraction, current)
+        let detail = fraction.formatted(.percent.precision(.fractionLength(0)))
+        return ProgressLine(title: L10n.string("duplicates.ranking_title"), detail: detail, fraction: fraction)
     }
 
     /// The checked groups while the remaining pages wait for scrolling or Merge All. Nil during active ranking.
     public var metadataCheckNote: String? {
-        guard phase == .loaded, !hasInvalidatedGroups, !groups.isEmpty, !hasCheckedGroups, rankingProgress == nil else {
+        guard phase == .loaded, !hasInvalidatedGroups, !rankingFailed, !groups.isEmpty, !hasCheckedGroups,
+            rankingProgress == nil
+        else {
             return nil
         }
         return L10n.string(
@@ -569,15 +581,18 @@ public final class ExactDuplicatesModel {
         return L10n.string("duplicates.unchecked \(count)")
     }
 
-    /// The check stopped without an index while groups are shown. A retry can finish it.
+    /// A scan, metadata read, or index build failed while groups are retained. A retry can finish the check.
     public var checkFailedNote: String? {
-        guard phase == .loaded, !isBuilding, buildFailed, case .indexing = coverage else { return nil }
+        if phase == .failed, !groups.isEmpty { return L10n.string("duplicates.load_failed") }
+        guard phase == .loaded, !isBuilding else { return nil }
+        if rankingFailed { return L10n.string("duplicates.check_failed") }
+        guard buildFailed, case .indexing = coverage else { return nil }
         return L10n.string("duplicates.check_failed")
     }
 
     /// The space that merging every group shown frees, counting the groups whose size is known. It grows while the
     /// check finds groups and while sizes become known.
-    public var totalFreedBytes: Int64 { groups.reduce(0) { $0 + ($1.freedBytes ?? 0) } }
+    public var totalFreedBytes: Int64 { visibleGroups.reduce(0) { $0 + ($1.freedBytes ?? 0) } }
 
     /// The short text of `totalFreedBytes`. Merged duplicates wait in Recently Deleted, so the line says that the
     /// space is free only after that. Nil while no size is known.
@@ -725,13 +740,19 @@ public final class ExactDuplicatesModel {
         groups = updated
     }
 
-    /// Reads the groups and shows them, then ranks the first two pages and builds the content index or brings it up
-    /// to date, both at once. Reads the groups again when the index changed. A choice of the person and the ranking of
-    /// a group with the same members stay, so a screen that opens again reads nothing for them.
-    public func load() async {
+    /// Reads the groups, then ranks the first two pages, or every page for an open screen, and brings the content
+    /// index up to date at the same time. Reads the groups again when the index changed. A choice of the person and
+    /// the ranking of a group with the same members stay, so a screen that opens again reads nothing for them.
+    public func load(checkAllGroups: Bool = false) async {
         guard !isRetired, !isMerging else { return }
+        if checkAllGroups {
+            checksAllGroups = true
+            hasOpenedScreen = true
+        }
+        rankingFailed = false
         loadGeneration += 1
         let generation = loadGeneration
+        defer { if generation == loadGeneration, ranking == nil { isCheckingGroups = false } }
         phase = .loading
         restartedAfterInterruption = false
         checkInterrupted = false
@@ -768,8 +789,10 @@ public final class ExactDuplicatesModel {
         _ = requestRanking(around: [first, last])
     }
 
-    /// The screen went away. Stops waiting for the groups shown and stops the scroll ranking; a merge keeps running.
+    /// The screen went away. Stops its metadata check and appearance follower; a merge keeps running.
     public func screenDisappeared() {
+        checksAllGroups = false
+        isCheckingGroups = false
         stopFollowingAppearances()
         ranking?.cancel()
     }
@@ -783,6 +806,7 @@ public final class ExactDuplicatesModel {
     /// Reads the groups and shows them in the fallback order. A group with the same members keeps its ranking and the
     /// choice of the person. False when the read failed or a newer load replaced this one.
     private func scan(generation: Int) async -> Bool {
+        isCheckingGroups = checksAllGroups
         let report: @Sendable (ExactDuplicateScanProgress) async -> Void = { [weak self] progress in
             await self?.showScan(progress, generation: generation)
         }
@@ -883,22 +907,28 @@ public final class ExactDuplicatesModel {
 
     /// Queues the unranked groups of two pages from the page of each of `indices`. Returns the ranking that reads them.
     private func requestRanking(around indices: [Int]) -> Task<Void, Never>? {
-        guard !isRetired else { return nil }
+        guard !isRetired, !hasOpenedScreen || checksAllGroups else { return nil }
         let size = Self.rankingPageSize
+        // The screen checks every page without needing an unchecked row to appear. The existing worker still
+        // reads one page at a time, with the finder's unchanged concurrency.
+        let pages = checksAllGroups ? Array(stride(from: 0, to: groups.count, by: 2 * size)) : indices
         var wanted: [String] = []
-        for index in indices {
+        for index in pages {
             let start = index / size * size
             for group in groups[start..<min(start + 2 * size, groups.count)]
             where !group.isRanked && !rankingRequested.contains(group.id) && !wanted.contains(group.id) {
                 wanted.append(group.id)
             }
         }
-        guard !wanted.isEmpty else { return ranking }
+        guard !wanted.isEmpty else {
+            if ranking == nil { isCheckingGroups = false }
+            return ranking
+        }
         rankingRequested.formUnion(wanted)
         rankingQueue += wanted
         // The oldest queued groups give way, never those of this request; the screen requests them again when it
         // shows them again.
-        let kept = max(Self.maximumQueuedPages * size, wanted.count)
+        let kept = checksAllGroups ? rankingQueue.count : max(Self.maximumQueuedPages * size, wanted.count)
         let dropped = rankingQueue.prefix(max(0, rankingQueue.count - kept))
         rankingRequested.subtract(dropped)
         rankingQueue.removeFirst(dropped.count)
@@ -914,7 +944,11 @@ public final class ExactDuplicatesModel {
         // During a merge its own progress row stays; the scroll ranking runs without one.
         if !isMerging {
             rankingToken = token
-            rankingProgress = ExactDuplicateScanProgress(completed: 0, total: wanted.count)
+            // Freeze the workload before splitting or dropping groups. Each attempted candidate counts once,
+            // including unreadable candidates; disappearing groups cannot move progress backwards.
+            let checked = checksAllGroups ? groups.filter(\.isRanked).count : 0
+            rankingFraction = 0
+            rankingProgress = ExactDuplicateScanProgress(completed: checked, total: checked + wanted.count)
         }
         let task = Task { [weak self] in
             guard let self else { return }
@@ -946,14 +980,19 @@ public final class ExactDuplicatesModel {
             let ranked = Set(groups.filter(\.isRanked).map(\.id))
             rankingRequested.formIntersection(ranked)
         }
+        if !Task.isCancelled {
+            rankingFailed = groups.contains { !$0.isRanked && rankingRequested.contains($0.id) }
+        }
         ranking = nil
         rankingQueue = []
         rankingWorkerToken = nil
+        isCheckingGroups = false
         if rankingToken == token { rankingProgress = nil }
     }
 
     /// Stops the ranking. A group that it did not read can be requested again.
     private func stopRanking() {
+        isCheckingGroups = false
         stopFollowingAppearances()
         ranking?.cancel()
         ranking = nil
@@ -971,6 +1010,12 @@ public final class ExactDuplicatesModel {
         if let token, token == rankingToken, let progress = rankingProgress {
             rankingProgress = ExactDuplicateScanProgress(
                 completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
+            if !isRankingForMerge, progress.total > 0 {
+                // An index rescan can add work to this worker; hold its displayed percentage until it catches up.
+                rankingFraction = max(
+                    rankingFraction,
+                    Double(min(progress.completed + page.groupCount, progress.total)) / Double(progress.total))
+            }
         }
         // The whole page is one change of the screen, not one change for each of its groups.
         var updated = groups

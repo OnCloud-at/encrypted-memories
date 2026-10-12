@@ -116,13 +116,20 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(0).exists, "the other group stays")
     }
 
-    func testAnUncheckedLargeLibraryShowsCheckedGroupsAndAnUnnumberedConfirmation() {
-        openDuplicates(fixture: "-EncryptedMemoriesDuplicatesLargeFixture")
-        XCTAssertTrue(group(0).waitForExistence(timeout: 30))
-        let checked = app.staticTexts["duplicates.metadataCheck"]
-        XCTAssertTrue(checked.waitForExistence(timeout: 10))
-        XCTAssertTrue(checked.label.hasSuffix("groups checked"))
+    func testTheInitialCheckHidesCandidatesAndKeepsTheConfirmationUnnumbered() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
+        let progress = app.progressIndicators["duplicates.rankingProgress"].firstMatch
+        XCTAssertTrue(progress.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
+        XCTAssertFalse(group(0).exists, "unchecked candidates have no rows or per-group merge")
+        XCTAssertFalse(app.staticTexts["No Duplicates"].exists)
         XCTAssertFalse(app.staticTexts["duplicates.copyCount"].exists)
+        XCTAssertFalse(app.staticTexts["duplicates.metadataCheck"].exists)
+        XCTAssertFalse(
+            app.staticTexts.matching(
+                NSPredicate(format: "label CONTAINS 'Merge frees' OR label CONTAINS 'Merging all frees'")
+            ).firstMatch.exists)
 
         app.buttons["duplicates.mergeAll"].tap()
         let confirm = app.buttons["duplicates.mergeAll.dialog"].firstMatch

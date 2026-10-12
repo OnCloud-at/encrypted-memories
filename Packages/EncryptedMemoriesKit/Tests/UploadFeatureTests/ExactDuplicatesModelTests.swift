@@ -27,6 +27,180 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
     // MARK: - States
 
+    func testTheScreenShowsOnlyProgressUntilEveryCandidateWasChecked() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.rankSizes = ["A": 1_000_000]
+        finder.scanGate.close()
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.scanGate.hasWaiters }, "the screen scan waits")
+        XCTAssertTrue(model.isCheckingGroups)
+        XCTAssertEqual(model.visibleGroups, [])
+        XCTAssertEqual(model.checkingGroupsLine.title, L10n.string("duplicates.ranking_title"))
+        XCTAssertNil(model.checkingGroupsLine.detail)
+        finder.scanGate.open()
+        await waitUntil({ finder.rankGate.hasWaiters }, "the screen checks metadata")
+        XCTAssertTrue(model.isCheckingGroups)
+        XCTAssertEqual(model.visibleGroups, [])
+        XCTAssertNil(model.totalFreedText)
+        XCTAssertNotEqual(model.content, .noDuplicates)
+        finder.rankGate.open()
+        await load.value
+        XCTAssertFalse(model.isCheckingGroups)
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["A", "B"])
+        XCTAssertNotNil(model.totalFreedText)
+    }
+
+    func testTheScreenChecksEveryPageWithoutAnyRowAppearance() async {
+        let candidates = manyGroups(200)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: candidates, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+        XCTAssertEqual(model.visibleGroups.count, 200)
+        XCTAssertTrue(model.visibleGroups.allSatisfy(\.isRanked))
+        XCTAssertEqual(finder.rankedGroups.flatMap { $0 }, candidates.map(\.id))
+        XCTAssertTrue(finder.rankedGroups.allSatisfy { $0.count <= ExactDuplicatesModel.rankingPageSize })
+        XCTAssertEqual(finder.maximumConcurrentRankings, 1)
+        XCTAssertNil(model.rankingProgress)
+    }
+
+    func testTheScreenProgressNeverCountsCandidatesAsDuplicatesOrMovesBackwards() async {
+        let candidates = manyGroups(100)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: candidates, coverage: .complete)])
+        for group in candidates {
+            for (index, member) in group.members.enumerated() {
+                finder.fingerprints[member] = ExactDuplicateFingerprint(
+                    captureTime: Date(timeIntervalSince1970: Double(index)))
+            }
+        }
+        let (model, _) = makeModel(finder)
+        var fractions: [Double] = []
+        finder.afterRankingPage = { [weak model] in
+            guard let model else { return }
+            XCTAssertTrue(model.isCheckingGroups)
+            XCTAssertEqual(model.visibleGroups, [])
+            let line = model.checkingGroupsLine
+            if let fraction = line.fraction {
+                fractions.append(fraction)
+                XCTAssertEqual(line.detail, fraction.formatted(.percent.precision(.fractionLength(0))))
+            }
+        }
+        await model.load(checkAllGroups: true)
+        XCTAssertEqual(fractions, [0.24, 0.48, 0.72, 0.96, 1])
+        XCTAssertEqual(fractions, fractions.sorted())
+        XCTAssertTrue(fractions.allSatisfy { (0...1).contains($0) })
+        XCTAssertEqual(model.content, .noDuplicates)
+        XCTAssertFalse(model.isCheckingGroups)
+        finder.afterRankingPage = nil
+    }
+
+    func testAnUnreadableCandidateStaysHiddenAndOffersRetryAfterTheWorkerFinishes() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.unreadableGroups = ["A"]
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+        XCTAssertFalse(model.isCheckingGroups)
+        XCTAssertNil(model.rankingProgress)
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["B"])
+        XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.check_failed"))
+        XCTAssertNil(model.metadataCheckNote)
+        XCTAssertEqual(finder.rankedGroups.flatMap { $0 }, ["A", "B"], "a failed read is attempted only once")
+        finder.unreadableGroups = []
+        await model.load()
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["A", "B"])
+        XCTAssertNil(model.checkFailedNote)
+        XCTAssertEqual(finder.rankedGroups.last, ["A"], "retry does not reread checked copies")
+    }
+
+    func testClosingTheScreenStopsItsCheckAndReopeningKeepsReadMetadata() async {
+        let candidates = manyGroups(100)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: candidates, coverage: .complete)])
+        finder.reportsNothingWhenCancelled = true
+        let (model, _) = makeModel(finder)
+        finder.afterRankingPage = { finder.rankGate.close() }
+        let firstLoad = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the next page waits after the first checked page")
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 24)
+        model.screenDisappeared()
+        finder.rankGate.open()
+        await firstLoad.value
+        XCTAssertFalse(model.isCheckingGroups)
+        XCTAssertEqual(finder.cancelledRankings, 1)
+        let attempts = finder.rankedGroups.count
+        finder.afterRankingPage = nil
+        await model.load(checkAllGroups: true)
+        XCTAssertEqual(model.visibleGroups.count, 100)
+        let resumed = finder.rankedGroups.dropFirst(attempts).flatMap { $0 }
+        XCTAssertEqual(resumed, candidates.dropFirst(24).map(\.id))
+        XCTAssertEqual(finder.maximumConcurrentRankings, 1)
+    }
+
+    func testAnInvalidatingMergeHidesTheListUntilTheAffectedGroupIsCheckedAgain() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.outcomes = ["A": .merged(kept: a1, trashed: [], keptDuplicates: [a3: .differentDetails])]
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+        finder.scanGate.close()
+        finder.rankGate.close()
+        let merge = Task { await model.merge(groupID: "A") }
+        await waitUntil({ finder.scanGate.hasWaiters }, "the invalidated merge reloads")
+        XCTAssertEqual(model.visibleGroups, [])
+        XCTAssertNil(model.knownDuplicateCount)
+        finder.scanGate.open()
+        await waitUntil({ finder.rankGate.hasWaiters }, "the affected group's metadata are checked again")
+        XCTAssertTrue(model.isCheckingGroups)
+        XCTAssertEqual(model.visibleGroups, [])
+        XCTAssertEqual(finder.rankedGroups.last, ["A"])
+        finder.rankGate.open()
+        await merge.value
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["A", "B"])
+        XCTAssertNotNil(model.knownDuplicateCount)
+    }
+
+    func testAnInvalidatedScreenScanFailureShowsRetryInsteadOfStaleRows() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.outcomes = ["A": .skipped(.preselectionChanged)]
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+        finder.scanError = URLError(.notConnectedToInternet)
+        await model.merge(groupID: "A")
+        XCTAssertFalse(model.isCheckingGroups)
+        XCTAssertEqual(model.visibleGroups, [])
+        XCTAssertNil(model.totalFreedText)
+        XCTAssertNotNil(model.checkFailedNote)
+        finder.scanError = nil
+        await model.load()
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+        XCTAssertNil(model.checkFailedNote)
+    }
+
+    func testAnIndexRescanKeepsEveryQueuedCandidateAndProgressDoesNotRestart() async throws {
+        let initial = manyGroups(200)
+        let expanded = manyGroups(250)
+        let finder = FakeDuplicateFinder(scans: [
+            .init(groups: initial, coverage: .complete), .init(groups: expanded, coverage: .complete),
+        ])
+        finder.buildChanged = true
+        finder.buildGate.close()
+        let (model, _) = makeModel(finder)
+        finder.afterRankingPage = { finder.rankGate.close() }
+        let load = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the next page waits after one completed page")
+        let beforeRescan = try XCTUnwrap(model.checkingGroupsLine.fraction)
+        finder.buildGate.open()
+        await waitUntil(
+            { finder.scanCalls == 2 && model.groups.count == 250 && model.rankingProgress?.total != 200 },
+            "the changed index adds candidates")
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(model.checkingGroupsLine.fraction), beforeRescan)
+        finder.afterRankingPage = nil
+        finder.rankGate.open()
+        await load.value
+        XCTAssertEqual(model.visibleGroups.count, 250, "no queued page needs a hidden row appearance")
+        XCTAssertEqual(finder.rankedGroups.flatMap { $0 }, expanded.map(\.id), "each candidate is read once")
+        XCTAssertEqual(finder.maximumConcurrentRankings, 1)
+    }
+
     func testLoadingUntilTheFirstScanFinishes() async {
         let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)]))
         XCTAssertEqual(model.content, .loading)
@@ -267,10 +441,11 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         finder.rankGate.open()
         await waitUntil({ model.groups.first { $0.id == groups[80].id }?.isRanked == true }, "the facts arrive")
+        await waitUntil({ model.rankingProgress == nil }, "the requested pages finish")
         XCTAssertNil(model.rankingLine)
     }
 
-    func testScrollRankingShowsTheOverallCheckedGroups() async {
+    func testScrollRankingShowsAPercentageWithoutCandidateCounts() async {
         let groups = manyGroups(200)
         let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
         let (model, _) = makeModel(finder)
@@ -283,8 +458,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.rankingLine?.detail,
-            L10n.string("duplicates.ranking_progress \(48.formatted()) \(200.formatted())"))
-        XCTAssertEqual(model.rankingLine?.fraction, 48.0 / 200.0)
+            0.0.formatted(.percent.precision(.fractionLength(0))))
+        XCTAssertEqual(model.rankingLine?.fraction, 0)
         XCTAssertNil(model.metadataCheckNote)
         XCTAssertNil(model.knownDuplicateCount)
         finder.rankGate.open()
@@ -1021,8 +1196,9 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await waitUntil({ finder.rankedGroups.count >= 3 }, "scrolling ranks beside the merge")
         XCTAssertEqual(
             model.rankingLine?.detail,
-            L10n.string("duplicates.ranking_progress \(0.formatted()) \(unranked.formatted())"),
+            0.0.formatted(.percent.precision(.fractionLength(0))),
             "the merge keeps its progress row")
+        XCTAssertEqual(model.rankingProgress?.total, unranked, "scrolling does not replace the merge workload")
         finder.rankGate.open()
         await merge.value
     }
@@ -1095,7 +1271,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.rankedGroups.last?.count, 60 - 2 * size)
         XCTAssertEqual(
             model.rankingLine?.detail,
-            L10n.string("duplicates.ranking_progress \(0.formatted()) \((60 - 2 * size).formatted())"))
+            0.0.formatted(.percent.precision(.fractionLength(0))))
+        XCTAssertEqual(model.rankingProgress?.total, 60 - 2 * size)
         finder.rankGate.open()
         await merge.value
         XCTAssertEqual(finder.batches.flatMap { $0 }.count, 60)
@@ -2104,7 +2281,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let load = Task { await model.load() }
         await waitUntil({ finder.rankGate.hasWaiters }, "the load ranks")
         XCTAssertEqual(model.copyCount, 5)
-        XCTAssertEqual(model.totalFreedBytes, 210)
+        XCTAssertEqual(model.totalFreedBytes, 0, "unchecked candidates claim no freed space")
         XCTAssertEqual(model.groups.first?.kept, a1)
         let before = model.groupChanges
 
@@ -2356,6 +2533,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var mergeErrors: [String: Error] = [:]
     var scanError: Error?
     var rankError: Error?
+    var afterRankingPage: (@MainActor @Sendable () -> Void)?
 
     init(scans: [ExactDuplicateScan]) { self.scans = scans }
 
@@ -2456,6 +2634,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
                 facts: pageFacts, memberByteSizes: pageSizes, fingerprints: pageFingerprints)
         }
         await report(page)
+        await afterRankingPage?()
     }
 
     func merge(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> ExactDuplicateMergeOutcome {

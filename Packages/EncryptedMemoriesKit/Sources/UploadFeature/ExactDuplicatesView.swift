@@ -57,7 +57,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
             } message: {
                 if let message = model.notice?.message, !message.isEmpty { Text(message) }
             }
-            .task { await model.load() }
+            .task { await model.load(checkAllGroups: true) }
             .onDisappear { model.screenDisappeared() }
     }
 
@@ -65,6 +65,19 @@ public struct ExactDuplicatesView<Cover: View>: View {
     private static var readableWidth: CGFloat { 600 }
 
     @ViewBuilder private var content: some View {
+        if model.isCheckingGroups {
+            ExactDuplicatesProgressRow(
+                line: model.checkingGroupsLine, accent: accent, identifier: "duplicates.rankingProgress"
+            )
+            .padding(24)
+            .frame(maxWidth: Self.readableWidth)
+            .duplicatesCard()
+        } else {
+            checkedContent
+        }
+    }
+
+    @ViewBuilder private var checkedContent: some View {
         switch model.content {
         case .loading:
             let line = model.loadingLine
@@ -197,7 +210,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
 
     var body: some View {
         let canMerge = model.canMerge
-        let groups = IndexedGroups(base: model.groups)
+        let groups = IndexedGroups(base: model.visibleGroups)
         let list = ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 12) {

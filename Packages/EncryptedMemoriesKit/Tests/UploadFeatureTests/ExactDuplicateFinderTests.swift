@@ -398,7 +398,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     @MainActor
-    func testTheScreenShows1500GroupsAndTheirSizesBeforeAnyNodeLoadAndRanksOnlyTheShownPages() async throws {
+    func testTheScreenChecks1500GroupsBeforeShowingTheirSizesWithoutExtraNodeReads() async throws {
         let links = server.seedLinks(digests: (0..<1_500).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
         for index in 0..<1_500 {
             row("asset-\(index)", names: links[index * 2].nodeID, contentHash: hash("group-\(index)"), fileSize: 1_000)
@@ -412,7 +412,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let model = ExactDuplicatesModel(finder: finder)
         let clock = ContinuousClock()
         let start = clock.now
-        let load = Task { await model.load() }
+        let load = Task { await model.load(checkAllGroups: true) }
         for _ in 0..<5_000 {
             if await remote.gate.hasWaiters { break }
             try await Task.sleep(for: .milliseconds(1))
@@ -425,30 +425,31 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(beforeRanking.albumMembers, 0, "no node load before the groups show")
         XCTAssertEqual(beforeRanking.sharingMembers, 0, "no node load before the groups show")
         XCTAssertNotNil(model.rankingLine, "the metadata check of the shown pages shows progress")
-        XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the manifest knows every size before any node load")
+        XCTAssertEqual(model.visibleGroups, [])
+        XCTAssertEqual(model.totalFreedBytes, 0, "unchecked candidates claim no freed space")
 
         remote.gate.open()
         await load.value
         let reads = server.readCounts
-        let pages = 2 * ExactDuplicatesModel.rankingPageSize
-        XCTAssertEqual(model.groups.filter(\.isRanked).count, pages, "the shown page and the page after it")
+        let pages = 1_500
+        XCTAssertEqual(
+            model.groups.filter(\.isRanked).count, pages, "every candidate was checked without a row appearance")
         XCTAssertNil(model.rankingLine)
         XCTAssertEqual(reads.favorites, 1)
         XCTAssertEqual(reads.albumMembers, 0, "the node read gives the albums")
         XCTAssertEqual(reads.sharingMembers, pages * 2, "one node read for each member")
 
+        XCTAssertEqual(model.visibleGroups.count, pages)
+        XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the checked groups can show their known sizes")
         model.groupAppeared(model.groups[500].id)
-        for _ in 0..<5_000 where model.groups.filter(\.isRanked).count < 2 * pages {
-            try await Task.sleep(for: .milliseconds(1))
-        }
-        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages, "scrolling ranks two more pages")
+        try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(server.readCounts.favorites, 1, "one favorites listing serves every page")
-        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2)
+        XCTAssertEqual(server.readCounts.sharingMembers, pages * 2, "appearing rows reread no metadata")
 
-        await model.load()
-        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2, "an unchanged group keeps its facts")
+        await model.load(checkAllGroups: true)
+        XCTAssertEqual(server.readCounts.sharingMembers, pages * 2, "an unchanged group keeps its facts")
         XCTAssertEqual(server.readCounts.albumMembers, 0)
-        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages)
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, pages)
         print(
             "[Duplicates timing] firstGroups=\(start.duration(to: published)) "
                 + "ranking=\(published.duration(to: clock.now)) visibilityRequests=\(reads.visibility) "
