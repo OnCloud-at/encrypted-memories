@@ -113,7 +113,7 @@ These defaults apply whenever no choice is saved, including existing installatio
 
 - The app connects to Proton for sign-in and for Proton Drive.
 - When you turn on Smart Search, the app downloads the model catalog and the model from `models.oncloud.at`. These requests contain no photos and no search text. Smart Search runs on the device.
-- Map tiles and place names come from Apple Maps. Place names in the viewer and on the map send the photo's coordinates. Search suggestions send a location rounded to about 1 km. Turn off Map and Places in Settings > Privacy to stop these requests. The Map tab disappears and location data stays encrypted on the device.
+- Map tiles and place names come from Apple Maps. Place names in the viewer and on the map send the photo's coordinates. Search suggestions send a location rounded to about 1 km. Turn off Map and Places in Settings > Privacy to stop these requests. The Map tab (iPhone and iPad) and the Map item (Mac) disappear. Location data stays encrypted on the device.
 - There is no analytics, crash reporting, or tracking. The Proton Drive SDK's telemetry callback discards all events.
 
 **Build and platform**

@@ -7,17 +7,17 @@ Duplicates finds identical copies of a photo or video in your library and merges
 - **iPhone and iPad:** Open **Collections**, then **Duplicates** in the **Utilities** section.
 - **Mac:** Select **Duplicates** in the sidebar, above **Recently Deleted**.
 
-The badge shows how many copies **Merge All** would move to Recently Deleted. The badge appears after the check of this launch has finished. Before that, there is no badge.
+The badge shows how many copies **Merge All** would move to Recently Deleted. The badge appears after the check of this launch has finished and every group passed the check. Before that, there is no badge.
 
 ## The check
 
-Duplicates checks every candidate group before it shows a result. While the check runs, the screen shows **Checking duplicates** and a progress bar with a percentage. The screen shows no group yet. **Merge All** is dimmed. When the check ends, the screen shows only the final groups.
+Duplicates checks every candidate group before it shows a result. While the check runs, the screen shows **Checking duplicates** and a progress indicator. After the first step, the indicator shows a percentage. The screen shows no group yet. **Merge All** is dimmed. When the check ends, the screen shows only the final groups.
 
 The app does not store the result of the check. After each launch, the first time that you open Duplicates, the app checks again. On a large library, this can take a while.
 
 If the app still builds its index of your library, the screen shows **Still checking your library. More duplicates can appear.** above the groups. If no group exists yet, the screen shows **Checking Your Library**.
 
-If the app cannot read some photos, the screen says how many photos could not be checked. If the check does not finish, the screen says **The library check did not finish.** and offers **Retry**.
+If the app cannot read some photos, the screen says how many photos could not be checked. If the check does not finish, the screen says **The library check did not finish.** and offers **Retry**. If the app cannot read the library, the screen says **The duplicates could not be loaded.** and offers **Retry**.
 
 ## Read a group
 
@@ -35,7 +35,7 @@ Tap or click a copy to open it in the viewer. The viewer shows the other copies 
 
 **Merge All** merges every group. It is dimmed while the check runs.
 
-Select **Merge All**. An alert asks you to confirm. The title shows the number of copies. Select **Merge** to continue or **Cancel** to stop.
+Select **Merge All**. An alert asks you to confirm. If every group was checked, the title shows the number of copies. If a group could not be checked, the title says **Merge Duplicates?** and shows no number. Merge All then checks that group first and shows **Checking duplicates** with **Stop**. Select **Merge** to continue or **Cancel** to stop.
 
 The app merges the groups in batches. The screen shows **Merging Duplicates** and a count, for example **320 of 1,404 groups**. Select **Stop** to stop after the batch that runs. The app then shows **Merging stopped. X of Y groups were merged.** The groups that were not merged stay in the list. Start Merge All again to merge them.
 

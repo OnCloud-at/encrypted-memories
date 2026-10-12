@@ -14,7 +14,7 @@ The queue is durable. It includes streamed hashing, duplicate detection, retry s
 
 A Live Photo backs up as one photo. Its video is stored as an extra file of the photo.
 
-An edited photo backs up as the edited version. The original is stored as an extra file. After an edit, the app waits a few seconds for more edits. It then waits up to two minutes for the edited file.
+An edited photo backs up as the edited version. The original is stored as an extra file. After an edit, the app waits briefly for more edits and for the edited file.
 
 If you turn off the Live effect of a photo, the photo backs up as a still photo. Its video stays as an extra file.
 
