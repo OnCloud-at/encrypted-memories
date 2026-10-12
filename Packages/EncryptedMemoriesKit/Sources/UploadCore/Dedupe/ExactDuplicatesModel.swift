@@ -402,6 +402,8 @@ public final class ExactDuplicatesModel {
     /// checkmark, so the screen shows the photo that the merge keeps.
     @ObservationIgnored private var mergingGroupIDs: Set<String> = []
     private var phase = Phase.idle
+    /// A merge invalidated displayed metadata; only a successful scan makes its groups current again.
+    private var hasInvalidatedGroups = false
     /// The last build failed, or it finished without an index.
     private var buildFailed = false
     /// The service stopped the last build, for example for a full refresh. The check restarts, after a merge at once.
@@ -601,7 +603,8 @@ public final class ExactDuplicatesModel {
     /// Every copy of every group shown, kept copies included.
     public var copyCount: Int { groups.reduce(0) { $0 + $1.members.count } }
 
-    /// The number of copies shown, for example "14 identical copies". Nil without a group.
+    /// The number of copies shown, for example "14 identical copies". Nil until every group is checked and current,
+    /// or while no groups remain.
     public var copyCountText: String? {
         hasCheckedGroups ? L10n.string("duplicates.copy_count \(copyCount)") : nil
     }
@@ -614,7 +617,7 @@ public final class ExactDuplicatesModel {
     public var duplicateCount: Int { groups.reduce(0) { $0 + $1.duplicateCount } }
 
     private var hasCheckedGroups: Bool {
-        !groups.isEmpty && groups.allSatisfy(\.isRanked)
+        !hasInvalidatedGroups && !groups.isEmpty && groups.allSatisfy(\.isRanked)
     }
 
     /// The count for the Duplicates entry. Nil until every remaining group passed the metadata check, or if empty.
@@ -829,6 +832,7 @@ public final class ExactDuplicatesModel {
                 }
             }
             groups = shown
+            hasInvalidatedGroups = false
             coverage = scan.coverage
             phase = .loaded
             return true
@@ -1354,6 +1358,7 @@ public final class ExactDuplicatesModel {
     }
 
     private func forgetFingerprints(of group: Group) {
+        hasInvalidatedGroups = true
         for member in group.scanGroup.members { knownFingerprints[member] = nil }
     }
 

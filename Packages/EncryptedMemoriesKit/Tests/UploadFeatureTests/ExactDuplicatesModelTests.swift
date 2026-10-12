@@ -117,6 +117,43 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.mergeAllConfirmTitle, confirm)
     }
 
+    func testInvalidatedMergeCountsStayHiddenUntilASuccessfulReload() async {
+        let smaller = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: [a1, a2])
+        for outcome: ExactDuplicateMergeOutcome in [
+            .merged(kept: a1, trashed: [], keptDuplicates: [a3: .differentDetails]),
+            .skipped(.preselectionChanged),
+        ] {
+            let finder = FakeDuplicateFinder(scans: [
+                .init(groups: [groupA], coverage: .complete), .init(groups: [smaller], coverage: .complete),
+            ])
+            finder.outcomes = ["A": outcome]
+            let (model, _) = makeModel(finder)
+            await model.load()
+            XCTAssertEqual(model.knownDuplicateCount, 2)
+            finder.scanGate.close()
+            let merge = Task { await model.mergeAll() }
+            await waitUntil({ finder.scanGate.hasWaiters }, "the merge reloads invalidated groups")
+
+            XCTAssertNil(model.knownDuplicateCount)
+            XCTAssertNil(model.copyCountText)
+            XCTAssertEqual(model.mergeAllTitle, L10n.string("duplicates.merge_all_title_unchecked"))
+            XCTAssertEqual(model.mergeAllMessage, L10n.string("duplicates.merge_all_message_unchecked"))
+            XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all"))
+            finder.scanError = URLError(.notConnectedToInternet)
+            finder.scanGate.open()
+            await merge.value
+
+            XCTAssertNil(model.knownDuplicateCount)
+            XCTAssertNil(model.copyCountText)
+            XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge_all"))
+            finder.scanError = nil
+            await model.load()
+
+            XCTAssertEqual(model.knownDuplicateCount, 1)
+            XCTAssertEqual(model.copyCountText, L10n.string("duplicates.copy_count \(2)"))
+        }
+    }
+
     func testAFirstLoadHasNoCountWhileItsScanIsPending() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.scanGate.close()

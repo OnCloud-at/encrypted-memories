@@ -17,6 +17,7 @@ final class ViewerInfoLocationTests: XCTestCase {
         for name: String? in [nil, ""] {
             let location = ViewerInfoLocation(metadata: metadata, placeName: name, mapAndPlacesEnabled: true)
             XCTAssertNil(location.placeName)
+            XCTAssertEqual(location.markerTitle, L10n.string("map.cluster_title"))
             XCTAssertTrue(location.showsMap)
             XCTAssertNotNil(location.coordinateText)
         }
