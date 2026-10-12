@@ -410,7 +410,6 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var restartedAfterInterruption = false
     /// The build finished during a merge with a changed index; the screen reads the groups again after the merge.
     @ObservationIgnored private var rescanAfterMerge = false
-    private var scannedDuplicateCount: Int?
     private var loadGeneration = 0
     /// The one build of this model. A load while it runs waits for it, and a closed screen leaves it running: the
     /// backup uses the same build, and the build resumes from its checkpoint.
@@ -518,15 +517,22 @@ public final class ExactDuplicatesModel {
         }
     }
 
-    /// The line of the ranking that a merge waits for, for example "40 of 1,545 groups". Nil while no merge waits.
+    /// The progress of an active metadata check, including the ranking that a merge waits for.
     public var rankingLine: ProgressLine? {
-        guard isRankingForMerge, let rankingProgress, rankingProgress.total > 0 else { return nil }
+        guard isRankingForMerge || !hasCheckedGroups, let rankingProgress, rankingProgress.total > 0 else { return nil }
         let completed = rankingProgress.completed.formatted()
         let total = rankingProgress.total.formatted()
         return ProgressLine(
             title: L10n.string("duplicates.ranking_title"),
             detail: L10n.string("duplicates.ranking_progress \(completed) \(total)"),
             fraction: Double(rankingProgress.completed) / Double(rankingProgress.total))
+    }
+
+    /// The checked groups while the remaining pages wait for scrolling or Merge All. Nil during active ranking.
+    public var metadataCheckNote: String? {
+        guard phase == .loaded, !groups.isEmpty, !hasCheckedGroups, rankingProgress == nil else { return nil }
+        return L10n.string(
+            "duplicates.groups_checked \(groups.filter(\.isRanked).count.formatted()) \(groups.count.formatted())")
     }
 
     /// The line of Merge All, for example "320 of 1,404 groups". Nil outside Merge All and while it still ranks.
@@ -592,7 +598,7 @@ public final class ExactDuplicatesModel {
 
     /// The number of copies shown, for example "14 identical copies". Nil without a group.
     public var copyCountText: String? {
-        groups.isEmpty ? nil : L10n.string("duplicates.copy_count \(copyCount)")
+        hasCheckedGroups ? L10n.string("duplicates.copy_count \(copyCount)") : nil
     }
 
     /// The title and the text of the explanation beside `copyCountText`.
@@ -602,17 +608,32 @@ public final class ExactDuplicatesModel {
     /// The photos that Merge All moves to Recently Deleted.
     public var duplicateCount: Int { groups.reduce(0) { $0 + $1.duplicateCount } }
 
-    /// The count for the Duplicates entry. Nil until a scan has finished.
+    private var hasCheckedGroups: Bool {
+        phase == .loaded && !groups.isEmpty && groups.allSatisfy(\.isRanked)
+    }
+
+    /// The count for the Duplicates entry. Nil until every remaining group passed the metadata check, or if empty.
     public var knownDuplicateCount: Int? {
-        phase == .loaded ? duplicateCount : scannedDuplicateCount
+        hasCheckedGroups ? duplicateCount : nil
     }
 
     public var canMerge: Bool { !isRetired && !isMerging && phase != .loading && !groups.isEmpty }
 
-    public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(copyCount)") }
-    public var mergeAllMessage: String { L10n.string("duplicates.merge_all_message \(duplicateCount)") }
+    public var mergeAllTitle: String {
+        hasCheckedGroups
+            ? L10n.string("duplicates.merge_all_title \(copyCount)")
+            : L10n.string("duplicates.merge_all_title_unchecked")
+    }
+    public var mergeAllMessage: String {
+        hasCheckedGroups
+            ? L10n.string("duplicates.merge_all_message \(duplicateCount)")
+            : L10n.string("duplicates.merge_all_message_unchecked")
+    }
     /// The confirming button of the Merge All dialog.
-    public var mergeAllConfirmTitle: String { L10n.string("duplicates.merge_all_confirm \(copyCount)") }
+    public var mergeAllConfirmTitle: String {
+        hasCheckedGroups
+            ? L10n.string("duplicates.merge_all_confirm \(copyCount)") : L10n.string("duplicates.merge_all")
+    }
 
     /// The group with `id`. Nil after a merge removed it.
     public func group(withID id: String) -> Group? { groups.first { $0.id == id } }
@@ -1048,14 +1069,8 @@ public final class ExactDuplicatesModel {
         L10n.string("duplicates.checking_progress \(completed.formatted()) \(total.formatted())")
     }
 
-    /// Counts the duplicates for the entry without ranking them, once, before the screen has loaded.
-    public func loadCountIfNeeded() async {
-        guard !isRetired, phase == .idle, scannedDuplicateCount == nil else { return }
-        guard let scan = try? await finder.duplicateGroups(progress: { _ in }), !isRetired, phase == .idle else {
-            return
-        }
-        scannedDuplicateCount = scan.groups.reduce(0) { $0 + $1.members.count - 1 }
-    }
+    /// Entry counts come from the checked screen state. An unchecked entry scan cannot supply a displayable count.
+    public func loadCountIfNeeded() async {}
 
     /// Keeps `uid` instead of the ranked photo when the group is merged.
     public func keep(_ uid: PhotoUID, inGroup groupID: String) {

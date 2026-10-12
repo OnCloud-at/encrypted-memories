@@ -295,8 +295,8 @@ import UploadCore
         private var groups: [ExactDuplicateGroup]
         private let checking: Bool
         private let dates: [PhotoUID: Date]
-        /// A scan after the count of the Collections entry and the first load of the screen leaves out the last
-        /// group, so a UI test sees whether the screen scanned again.
+        /// A scan after the first load of the screen leaves out the last group, so a UI test sees whether the
+        /// screen scanned again. The Collections entry does not scan unchecked candidates.
         private let rescanDropsLastGroup: Bool
         /// The time that each merge batch takes. Nil merges at once.
         private let mergeDelay: Duration?
@@ -325,7 +325,7 @@ import UploadCore
         ) async throws -> ExactDuplicateScan {
             let groups = lock.withLock {
                 scans += 1
-                return rescanDropsLastGroup && scans > 2 ? Array(groups.dropLast()) : groups
+                return rescanDropsLastGroup && scans > 1 ? Array(groups.dropLast()) : groups
             }
             let sizes: [Int64] = [5_200_000, 387_000]
             return ExactDuplicateScan(

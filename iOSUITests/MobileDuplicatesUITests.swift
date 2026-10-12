@@ -116,6 +116,21 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(0).exists, "the other group stays")
     }
 
+    func testAnUncheckedLargeLibraryShowsCheckedGroupsAndAnUnnumberedConfirmation() {
+        openDuplicates(fixture: "-EncryptedMemoriesDuplicatesLargeFixture")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 30))
+        let checked = app.staticTexts["duplicates.metadataCheck"]
+        XCTAssertTrue(checked.waitForExistence(timeout: 10))
+        XCTAssertTrue(checked.label.hasSuffix("groups checked"))
+        XCTAssertFalse(app.staticTexts["duplicates.copyCount"].exists)
+
+        app.buttons["duplicates.mergeAll"].tap()
+        let confirm = app.buttons["duplicates.mergeAll.dialog"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Merge Duplicates?"].exists)
+        XCTAssertEqual(confirm.label, "Merge All")
+    }
+
     func testMergeAllMergesEveryGroupAfterTheConfirmation() throws {
         openDuplicates()
         let mergeAll = app.buttons["duplicates.mergeAll"]

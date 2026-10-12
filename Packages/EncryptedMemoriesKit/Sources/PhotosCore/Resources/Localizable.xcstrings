@@ -5923,6 +5923,24 @@
         "de": { "stringUnit": { "state": "translated", "value": "Alle zusammenführen" } }
       }
     },
+    "duplicates.merge_all_title_unchecked": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merge Duplicates?" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate zusammenführen?" } }
+      }
+    },
+    "duplicates.merge_all_message_unchecked": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "One photo of each group stays, with its favorites and albums. Other copies move to Recently Deleted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein Foto jeder Gruppe bleibt, mit Favoriten und Alben. Andere Kopien kommen in „Zuletzt gelöscht“." } }
+      }
+    },
+    "duplicates.groups_checked %@ %@": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%1$@ of %2$@ groups checked" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$@ von %2$@ Gruppen geprüft" } }
+      }
+    },
     "duplicates.merge_all_title %lld": {
       "comment": "Confirmation title of Merge All. The count is every copy of every group, kept copies included.",
       "extractionState": "manual",
@@ -6094,8 +6112,8 @@
     "duplicates.ranking_title": {
       "comment": "Progress title while the screen reads the albums, favorites, and sharing state of the groups.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Checking albums and favorites" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Alben und Favoriten werden geprüft" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Checking duplicates" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate werden geprüft" } }
       }
     },
     "duplicates.ranking_progress %@ %@": {

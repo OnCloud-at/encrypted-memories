@@ -424,7 +424,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let beforeRanking = server.readCounts
         XCTAssertEqual(beforeRanking.albumMembers, 0, "no node load before the groups show")
         XCTAssertEqual(beforeRanking.sharingMembers, 0, "no node load before the groups show")
-        XCTAssertNil(model.rankingLine, "the ranking of the shown pages runs silently")
+        XCTAssertNotNil(model.rankingLine, "the metadata check of the shown pages shows progress")
         XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the manifest knows every size before any node load")
 
         remote.gate.open()

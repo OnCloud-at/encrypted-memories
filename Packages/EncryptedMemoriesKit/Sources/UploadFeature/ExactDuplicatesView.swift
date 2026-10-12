@@ -353,7 +353,7 @@ private struct ExactDuplicatesStatusRows: View {
 
     private var hasRows: Bool {
         model.mergeAllLine != nil || model.checkLine != nil || model.stillCheckingNote != nil
-            || model.rankingLine != nil
+            || model.rankingLine != nil || model.metadataCheckNote != nil
             || model.uncheckedNote != nil || model.checkFailedNote != nil
     }
 
@@ -397,6 +397,12 @@ private struct ExactDuplicatesStatusRows: View {
             ExactDuplicatesProgressRow(
                 line: line, accent: accent, identifier: "duplicates.rankingProgress", stop: stop,
                 canStop: model.canStopMergeAll)
+        }
+        if let note = model.metadataCheckNote {
+            Text(note)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("duplicates.metadataCheck")
         }
         if let note = model.uncheckedNote {
             Label(note, systemImage: "exclamationmark.circle")
