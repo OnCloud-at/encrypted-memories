@@ -251,6 +251,11 @@ def build_app(repo, automation, tag, platform, root, historical=True, working_co
     verify_bundle_metadata(apps[0], platform, metadata, 'built')
     app = publish_product(apps[0], product, {'identity': identity, 'commit': sha, 'app': apps[0].name,
                                              'source': str(source) if not historical else None, 'release': metadata})
+    if historical:
+        # A historical journey needs only its published app. Its source, SDK and derived data take several GiB on
+        # a hosted runner whose disk also holds every case's Simulator.
+        shutil.rmtree(scratch)
+        return Build(app, None, metadata, sha)
     return Build(app, source, metadata, sha)
 
 

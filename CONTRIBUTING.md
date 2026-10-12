@@ -272,8 +272,11 @@ The 240-second verification budget starts with the first test case or the end of
 A slow UI runner start on a loaded runner therefore cannot use up either budget.
 Each iOS job holds six points per source. With three sources, a job needs about 145 minutes of its 180;
 a fourth source needs a third iOS job.
-A failing case keeps the app's system log. The evidence also holds the runner load and the timing of each case,
-and a short step lists each case result, because GitHub cuts the journey step log inside the build output.
+A failing case keeps the app's system log. The evidence also holds the runner load, the free disk and the size of
+the large build and Simulator directories, and each case's timing and free disk.
+The job summary shows the free disk at the start and the end. The journey step prints only result, timing and disk
+lines, because GitHub cuts a step log at about 10 MB; the full output stays in the retained `release-upgrade.log`.
+A historical source keeps only its published app; its build scratch is deleted after the build.
 
 The iOS journey installs the new app with `simctl install` over the existing app.
 It never removes the app or resets its data between the old and new phases.

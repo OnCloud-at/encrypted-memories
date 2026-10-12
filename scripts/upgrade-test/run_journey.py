@@ -125,15 +125,39 @@ def stop_group(process):
             process.wait()
 
 
-def sample_load(path, interval=60):
-    # Runner load next to each case's timing shows whether a slow or failed case met an overloaded runner.
+def free_gib(path=Path.home()):
+    return shutil.disk_usage(path).free / 2**30
+
+
+def tree_gib(path):
+    if not path.exists():
+        return 0.0
+    try:
+        result = subprocess.run(['du', '-sk', str(path)], capture_output=True, text=True, timeout=300)
+        return int(result.stdout.split()[0]) / 2**20
+    except (subprocess.TimeoutExpired, ValueError, IndexError):
+        return float('nan')
+
+
+def sample_runner(path, root, interval=60):
+    # Load and free disk every minute, and the large trees every fifth minute, show what a slow or failed case met.
+    # A hosted iOS shard ran out of disk (rehearsal 38181793360) without any record of what filled it.
+    home = Path.home()
+    trees = {'evidence': path.parent, 'scratch': root / 'scratch', 'products': root / 'products',
+             'simulators': home / 'Library/Developer/CoreSimulator/Devices',
+             'simulator-logs': home / 'Library/Logs/CoreSimulator',
+             'derived-data': home / 'Library/Developer/Xcode/DerivedData'}
     def sample():
-        while True:
+        for count in range(sys.maxsize):
+            line = (time.strftime('%H:%M:%S') + ' load ' + ' '.join(f'{value:.2f}' for value in os.getloadavg())
+                    + f' free {free_gib():.1f} GiB')
+            if count % 5 == 0:
+                line += ' |' + ''.join(f' {name} {tree_gib(tree):.1f}' for name, tree in trees.items()) + ' GiB'
             try:
                 with open(path, 'a') as log:
-                    log.write(time.strftime('%H:%M:%S') + ' load ' + ' '.join(f'{value:.2f}' for value in os.getloadavg()) + '\n')
+                    log.write(line + '\n')
             except OSError:
-                return  # The evidence directory is gone; the journey has ended.
+                return  # The evidence directory is gone or the disk is full; the journey reports the failure itself.
             time.sleep(interval)
     threading.Thread(target=sample, daemon=True).start()
 
@@ -465,7 +489,8 @@ def main():
             name: {'source_commit': build.commit, 'release': build.metadata,
                    'built': verify_bundle_metadata(build.app, args.platform, build.metadata, 'built evidence')}
             for name, build in [('candidate', current), *predecessors.items()]}, indent=2) + '\n')
-        sample_load(evidence_root / 'runner-load.log')
+        print(f'Free disk after the builds: {free_gib():.1f} GiB', flush=True)
+        sample_runner(evidence_root / 'runner-load.log', args.root)
 
         def execute(tag, point):
             case = evidence_root / args.platform / tag / point
@@ -530,6 +555,8 @@ def main():
                         stop_group(preparing)
                     app.close()
                     timing['case_s'] = round(time.monotonic() - case_started)
+                    timing['free_gib'] = round(free_gib(), 1)
+                    print(f'{tag} / {point}: case took {timing["case_s"]} s, free disk {timing["free_gib"]} GiB', flush=True)
                     (case / 'timing.json').write_text(json.dumps(timing) + '\n')
                     if passed:
                         # Only a failing case keeps its app log; a full gate would otherwise retain hundreds of megabytes.

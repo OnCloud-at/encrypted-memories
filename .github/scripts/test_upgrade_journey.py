@@ -24,6 +24,7 @@ from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/upgrade-test'))
+import build_apps
 from build_apps import apply_overlay, Build, PAYLOAD, publish_product
 from journey import JourneyError, run_cases
 from server import FixtureServer
@@ -882,6 +883,31 @@ else:
             self.assertFalse((app / 'Contents/stale.txt').exists())
             self.assertEqual(json.loads((product / 'complete.json').read_text()), {'source': '/current'})
 
+    def test_only_the_candidate_keeps_its_build_scratch(self):
+        # Rehearsal 38181793360: an iOS shard ran out of disk. A historical journey needs only its published app.
+        def build(root, historical):
+            def command(args, cwd=None, env=None):
+                if args[:3] == ['xcrun', 'xcodebuild', 'build']:
+                    derived = Path(args[args.index('-derivedDataPath') + 1])
+                    (derived / 'Build/Products/Release-iphonesimulator/App.app').mkdir(parents=True)
+            with patch.object(build_apps, 'output', side_effect=lambda args, *rest: 'a' * 40 if args[1] == 'rev-parse' else 'value'), \
+                    patch.object(build_apps, 'command', side_effect=command), patch.object(build_apps, 'source_tree'), \
+                    patch.object(build_apps, 'apply_overlay'), patch.object(build_apps, 'test_project'), \
+                    patch.object(build_apps, 'verify_bundle_metadata'):
+                return build_apps.build_app(Path(root), Path(__file__).resolve().parents[2], 'v1.0.5', 'iOS', Path(root),
+                                            historical=historical, metadata={'commit': 'a' * 40, 'tag': 'v1.0.5', 'version': '1.0.5', 'build_number': '1'})
+        for historical in [True, False]:
+            with self.subTest(historical=historical), tempfile.TemporaryDirectory() as root:
+                (Path(root) / 'scratch').mkdir()
+                result = build(root, historical)
+                self.assertTrue((result.app).is_dir())
+                scratch = list((Path(root) / 'scratch').iterdir())
+                if historical:
+                    self.assertEqual(scratch, [])
+                    self.assertIsNone(result.source)
+                else:
+                    self.assertEqual([path.name for path in scratch], [result.source.parent.name])
+
     def test_unknown_predecessor_without_entry_fails(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(JourneyError, 'no reviewed overlay'):
@@ -1092,7 +1118,7 @@ else:
                     patch.object(run_journey, 'output', return_value='arm64'), patch.object(run_journey, 'verify_bundle_metadata', return_value={}), \
                     patch.object(run_journey, 'InstalledApp', App), patch.object(run_journey, 'FixtureServer', Server), \
                     patch.object(run_journey, 'ui_run', side_effect=ui), patch.object(run_journey, 'stop_group', lambda run: setattr(run, 'stopped', True)), \
-                    patch.object(run_journey, 'sample_load'), patch.object(run_journey, 'time', Clock), \
+                    patch.object(run_journey, 'sample_runner'), patch.object(run_journey, 'time', Clock), \
                     patch('keychain_entitlements.snapshot', return_value={}):
                 try:
                     run_journey.main()

@@ -50,6 +50,24 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     assert_includes artifact.dig("with", "name"), "${{ matrix.shard }}"
   end
 
+  def test_the_journey_keeps_its_full_log_and_prints_its_results_and_disk
+    upgrade = @jobs.fetch("upgrade")
+    steps = upgrade.fetch("steps")
+    run = steps.find { |step| step["name"] == "Test installed upgrades" }.fetch("run")
+    assert_includes run, 'tee "$RUNNER_TEMP/release-upgrade.log"'
+    assert_includes run, 'grep --line-buffered -aE "$JOURNEY_LINES" || true'
+    lines = Regexp.new(upgrade.fetch("env").fetch("JOURNEY_LINES"))
+    ["PASS iOS: v1.0.5 → abc, backup.claimed", "**Upgrade check failed:** The historical app did not reach x",
+     "v1.0.5 / x preparation: the UI run started its first test case after 9 s",
+     "v1.0.5 / x: case took 400 s, free disk 12.3 GiB", "Free disk after the builds: 20.0 GiB"].each do |line|
+      assert_match lines, line
+    end
+    refute_match lines, "SwiftCompile normal arm64 Compiling Errors.swift"
+    disk = steps.find { |step| step["name"] == "Report runner disk" }
+    assert_includes disk.fetch("run"), 'df -h "$HOME"'
+    assert_includes steps.find { |step| step["name"] == "List upgrade results" }.fetch("run"), 'df -h "$HOME"'
+  end
+
   def test_upgrade_gate_has_no_release_secrets_or_implicit_failure_override
     upgrade = @jobs.fetch("upgrade")
     refute upgrade.key?("environment")
