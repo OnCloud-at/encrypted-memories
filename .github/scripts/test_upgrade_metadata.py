@@ -120,7 +120,8 @@ class UpgradeMetadataTests(unittest.TestCase):
 
     def test_wrong_installed_values_stop_before_the_corresponding_phase_launch_or_ui_step(self):
         for wrong_phase in ['old', 'new']:
-            with self.subTest(phase=wrong_phase), tempfile.TemporaryDirectory() as directory:
+            # The journey's runner sampler can still write its load log while this directory is removed.
+            with self.subTest(phase=wrong_phase), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
                 root = Path(directory)
                 steps = []
                 source = root / 'source'
