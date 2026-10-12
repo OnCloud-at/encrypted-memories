@@ -249,12 +249,28 @@ def build_app(repo, automation, tag, platform, root, historical=True, working_co
     if len(apps) != 1:
         raise JourneyError(f'{tag}: expected one built app, found {len(apps)}')
     verify_bundle_metadata(apps[0], platform, metadata, 'built')
-    # Only finished products enter the historical cache. Source, SDK and partial builds remain separate.
-    product.mkdir(parents=True, exist_ok=True)
-    app = product / apps[0].name
-    shutil.copytree(apps[0], app, symlinks=True, dirs_exist_ok=True)
-    (product / 'complete.json').write_text(json.dumps({'identity': identity, 'commit': sha, 'app': app.name, 'source': str(source) if not historical else None, 'release': metadata}) + '\n')
+    app = publish_product(apps[0], product, {'identity': identity, 'commit': sha, 'app': apps[0].name,
+                                             'source': str(source) if not historical else None, 'release': metadata})
+    if historical:
+        # A historical journey needs only its published app. Its source, SDK and derived data take several GiB on
+        # a hosted runner whose disk also holds every case's Simulator.
+        shutil.rmtree(scratch)
+        return Build(app, None, metadata, sha)
     return Build(app, source, metadata, sha)
+
+
+def publish_product(built, product, record):
+    """Only finished products enter the historical cache. Source, SDK and partial builds remain separate."""
+    # A restored cache can already hold this product without its source, so the candidate is rebuilt. Copying over
+    # it fails on the framework symlinks of a macOS bundle; replace the old copy, and mark it complete only after.
+    product.mkdir(parents=True, exist_ok=True)
+    (product / 'complete.json').unlink(missing_ok=True)
+    app = product / built.name
+    if app.exists():
+        shutil.rmtree(app)
+    shutil.copytree(built, app, symlinks=True)
+    (product / 'complete.json').write_text(json.dumps(record) + '\n')
+    return app
 
 
 if __name__ == '__main__':

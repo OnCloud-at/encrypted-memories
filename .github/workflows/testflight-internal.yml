@@ -850,14 +850,33 @@ jobs:
         run: bash ./scripts/report-build-storage.sh
 
   upgrade:
-    name: Test installed upgrades on ${{ matrix.platform }}
+    name: Test installed upgrades on ${{ matrix.platform }} (${{ matrix.shard }})
     needs: [prepare, build]
     runs-on: xcode-27
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        platform: [iOS, macOS]
+        # One iOS case takes about 7 minutes on the hosted runner (run 38171860265: 13 cases in 95 minutes after
+        # 19 minutes of builds), so all 24 iOS cases would exceed one 180-minute job. Each shard tests every
+        # source; together the shards of a platform cover every interruption point exactly once. A shard holds
+        # 6 points per source: 3 sources need about 145 minutes, so a fourth source needs a third iOS shard.
+        include:
+          - platform: iOS
+            shard: backup-model
+            points: backup.claimed backup.remoteReceipt backup.localRecord model.partial model.installRecord model.promoted
+          - platform: iOS
+            shard: index-thumbnail
+            points: index.embed index.beforeCommit index.afterCommit thumbnail.beforeLoad thumbnail.afterLoad thumbnail.stored
+          - platform: macOS
+            shard: all
+            points: >-
+              backup.claimed backup.remoteReceipt backup.localRecord model.partial model.installRecord model.promoted
+              index.embed index.beforeCommit index.afterCommit thumbnail.beforeLoad thumbnail.afterLoad thumbnail.stored
+    env:
+      # The lines that tell each case's result, timing and free disk. GitHub cuts a step log at about 10 MB, so the
+      # journey step prints only these lines; the full output stays in the retained release-upgrade.log.
+      JOURNEY_LINES: '^(PASS |\*\*Upgrade check failed|(iOS|macOS) (old|new) bundle: |Free disk |Xcode toolchain: |Owned iOS Simulator: )|: the UI run |: case took | error: |\*\* (BUILD|TEST) (FAILED|INTERRUPTED) \*\*'
     steps:
       - name: Report upgrade check scope
         if: always()
@@ -899,6 +918,12 @@ jobs:
           set -euo pipefail
           echo "key=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)-$(uname -m)" >> "$GITHUB_OUTPUT"
 
+      - name: Report runner disk
+        if: needs.prepare.outputs.upgrade_overridden != 'true'
+        run: |
+          # An iOS shard ran out of disk (rehearsal 38181793360). The free space at the start bounds every case.
+          { echo '### Runner disk at job start'; echo '```'; df -h "$HOME"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Restore completed predecessor builds
         id: cache
         if: needs.prepare.outputs.upgrade_overridden != 'true'
@@ -918,6 +943,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           UPGRADE_SOURCES: ${{ needs.prepare.outputs.upgrade_sources }}
           UPGRADE_PLATFORM: ${{ matrix.platform }}
+          UPGRADE_POINTS: ${{ matrix.points }}
         run: |
           set -euo pipefail
           mapfile_path="$RUNNER_TEMP/upgrade-sources.txt"
@@ -925,7 +951,18 @@ jobs:
           sources=()
           while IFS= read -r tag; do [[ -z "$tag" ]] || sources+=("$tag"); done < "$mapfile_path"
           [[ "${#sources[@]}" -gt 0 ]] || { echo "::error::No supported upgrade source selected"; exit 1; }
-          bash scripts/test-release-upgrade.sh --target "$TARGET_COMMIT" --release-tag "$TARGET_RELEASE_TAG" --sources "${sources[@]}" --platform "$UPGRADE_PLATFORM" 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
+          read -ra points <<< "$UPGRADE_POINTS"
+          [[ "${#points[@]}" -gt 0 ]] || { echo "::error::No interruption point selected"; exit 1; }
+          bash scripts/test-release-upgrade.sh --target "$TARGET_COMMIT" --release-tag "$TARGET_RELEASE_TAG" --sources "${sources[@]}" --platform "$UPGRADE_PLATFORM" --points "${points[@]}" 2>&1 \
+            | tee "$RUNNER_TEMP/release-upgrade.log" | { grep --line-buffered -aE "$JOURNEY_LINES" || true; }
+
+      - name: List upgrade results
+        if: always() && needs.prepare.outputs.upgrade_overridden != 'true'
+        run: |
+          # GitHub cuts the journey step log at about 10 MB inside the build output. This short step keeps each
+          # case result, the UI runner startup times, and the failure cause readable.
+          grep -aE "$JOURNEY_LINES" "$RUNNER_TEMP/release-upgrade.log" || echo 'The journey recorded no case result.'
+          { echo '### Runner disk at job end'; echo '```'; df -h "$HOME"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Report blocked release
         if: failure() || cancelled()
@@ -951,7 +988,7 @@ jobs:
         if: always() && needs.prepare.outputs.upgrade_overridden != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-upgrade-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: release-upgrade-${{ matrix.platform }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ~/Developer/xcode/EncryptedMemories/UpgradeCheck/evidence
             ${{ runner.temp }}/release-upgrade.log

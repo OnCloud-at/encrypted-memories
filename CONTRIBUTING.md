@@ -264,6 +264,20 @@ A typical cold run needs two app builds per platform; cached historical products
 Release metadata also keys the cache,
 so distinct releases on one commit cannot reuse the wrong version or build number.
 
+On the hosted runner one iOS case takes about seven minutes, so the iOS gate runs in two jobs.
+Each job tests every source with half of the interruption points; together they cover the same cases as one job.
+Each UI run gets up to 600 seconds to start its first test case. The 180-second preparation budget starts
+when the first test case starts, when the old app reaches its checkpoint on its own, or when the UI run ends, whichever comes first.
+The 240-second verification budget starts with the first test case or the end of the run.
+A slow UI runner start on a loaded runner therefore cannot use up either budget.
+Each iOS job holds six points per source. With three sources, a job needs about 145 minutes of its 180;
+a fourth source needs a third iOS job.
+A failing case keeps the app's system log. The evidence also holds the runner load, the free disk and the size of
+the large build and Simulator directories, and each case's timing and free disk.
+The job summary shows the free disk at the start and the end. The journey step prints only result, timing and disk
+lines, because GitHub cuts a step log at about 10 MB; the full output stays in the retained `release-upgrade.log`.
+A historical source keeps only its published app; its build scratch is deleted after the build.
+
 The iOS journey installs the new app with `simctl install` over the existing app.
 It never removes the app or resets its data between the old and new phases.
 It runs on the Simulator runtime pinned in `IOS_RUNTIME` of `scripts/upgrade-test/run_journey.py` (iOS 27.0, build 24A434).

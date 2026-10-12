@@ -15,6 +15,7 @@ import signal
 import os
 import uuid
 import select
+import threading
 import socket
 import time
 from contextlib import nullcontext
@@ -23,7 +24,8 @@ from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/upgrade-test'))
-from build_apps import apply_overlay, Build, PAYLOAD
+import build_apps
+from build_apps import apply_overlay, Build, PAYLOAD, publish_product
 from journey import JourneyError, run_cases
 from server import FixtureServer
 import run_journey
@@ -468,22 +470,42 @@ with SigningIdentity(root) as signer:
                 devices['OWN-DEVICE'] = 'Shutdown'
             elif args[2] == 'delete':
                 del devices['OWN-DEVICE']
+        class LogStream:
+            def __init__(self, args, log):
+                self.args = args
+                operations.append(args)
+
+        def stop(stream):
+            operations.append(['stop-log-stream'])
+
         with tempfile.TemporaryDirectory() as directory, patch.object(run_journey, 'output', side_effect=output), \
-                patch.object(run_journey, 'command', side_effect=command), patch.object(run_journey.os, 'kill') as kill:
+                patch.object(run_journey, 'command', side_effect=command), patch.object(run_journey.os, 'kill') as kill, \
+                patch.object(run_journey, 'owned_process', LogStream), patch.object(run_journey, 'stop_group', stop):
+            bundles = {}
+            for name in ['old', 'new']:
+                bundles[name] = Path(directory) / (name + '.app')
+                bundles[name].mkdir()
+                (bundles[name] / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': 'App'}))
             app = run_journey.InstalledApp('iOS', Path(directory))
             runtime = json.loads((Path(directory) / 'simulator-runtime.json').read_text())
             self.assertEqual(runtime['identifier'], 'com.apple.CoreSimulator.SimRuntime.iOS-27-0')
             self.assertEqual(runtime['version'], '27.0')
             self.assertEqual(runtime['buildversion'], '24A434', 'The pin is the build measured on the hosted runner')
             self.assertEqual(app.destination, 'platform=iOS Simulator,id=OWN-DEVICE')
-            app.install(Path('/old.app'))
+            app.install(bundles['old'])
             app.launch(type('Server', (), {'url': 'http://127.0.0.1:1234'})(), seed=True)
             app.kill_app()
-            app.install(Path('/new.app'))
+            app.install(bundles['new'])
             app.close()
             kill.assert_called_once_with(42, signal.SIGKILL)
         self.assertEqual(devices, {'FOREIGN-DEVICE': 'Booted'})
-        self.assertEqual([args[2] for args in operations], ['boot', 'bootstatus', 'install', 'install', 'shutdown', 'delete'])
+        self.assertEqual([args[2] for args in operations if args[:2] == ['xcrun', 'simctl']],
+                         ['boot', 'bootstatus', 'install', 'spawn', 'install', 'shutdown', 'delete'])
+        # One app log stream runs inside the owned device for both phases and stops before the device shuts down.
+        streams = [args for args in operations if args[2:3] == ['spawn']]
+        self.assertEqual(streams, [['xcrun', 'simctl', 'spawn', 'OWN-DEVICE', 'log', 'stream', '--style', 'compact',
+                                    '--predicate', 'process == "App"']])
+        self.assertLess(operations.index(['stop-log-stream']), operations.index(next(a for a in operations if a[2:3] == ['shutdown'])))
 
     def test_ambiguous_selected_runtime_fails_before_creating_a_simulator(self):
         runtimes = {'runtimes': [
@@ -838,6 +860,54 @@ else:
             metal = (root / sources / 'MetalRenderingCore/Metal3RuntimeCapability.swift').read_text()
             self.assertIn('#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)', metal)
 
+    def test_a_rebuilt_product_replaces_its_restored_copy(self):
+        # Release run 38171860265 saved the macOS candidate product. A later gate restored it without its source,
+        # rebuilt the candidate, and copying over the restored framework symlinks failed with "File exists".
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def bundle(name, binary):
+                framework = root / name / 'Encrypted Memories.app/Contents/Frameworks/Sentry.framework'
+                (framework / 'Versions/A/Resources').mkdir(parents=True)
+                (framework / 'Versions/A/Sentry').write_text(binary)
+                os.symlink('A', framework / 'Versions/Current')
+                os.symlink('Versions/Current/Resources', framework / 'Resources')
+                os.symlink('Versions/Current/Sentry', framework / 'Sentry')
+                return root / name / 'Encrypted Memories.app'
+            product = root / 'products/macOS/identity'
+            restored = publish_product(bundle('first', 'restored'), product, {'source': '/gone'})
+            (restored / 'Contents/stale.txt').write_text('left by the restored copy')
+            app = publish_product(bundle('second', 'rebuilt'), product, {'source': '/current'})
+            framework = app / 'Contents/Frameworks/Sentry.framework'
+            self.assertEqual((framework / 'Sentry').read_text(), 'rebuilt')
+            self.assertEqual(os.readlink(framework / 'Versions/Current'), 'A')
+            self.assertFalse((app / 'Contents/stale.txt').exists())
+            self.assertEqual(json.loads((product / 'complete.json').read_text()), {'source': '/current'})
+
+    def test_only_the_candidate_keeps_its_build_scratch(self):
+        # Rehearsal 38181793360: an iOS shard ran out of disk. A historical journey needs only its published app.
+        def build(root, historical):
+            def command(args, cwd=None, env=None):
+                if args[:3] == ['xcrun', 'xcodebuild', 'build']:
+                    derived = Path(args[args.index('-derivedDataPath') + 1])
+                    (derived / 'Build/Products/Release-iphonesimulator/App.app').mkdir(parents=True)
+            with patch.object(build_apps, 'output', side_effect=lambda args, *rest: 'a' * 40 if args[1] == 'rev-parse' else 'value'), \
+                    patch.object(build_apps, 'command', side_effect=command), patch.object(build_apps, 'source_tree'), \
+                    patch.object(build_apps, 'apply_overlay'), patch.object(build_apps, 'test_project'), \
+                    patch.object(build_apps, 'verify_bundle_metadata'):
+                return build_apps.build_app(Path(root), Path(__file__).resolve().parents[2], 'v1.0.5', 'iOS', Path(root),
+                                            historical=historical, metadata={'commit': 'a' * 40, 'tag': 'v1.0.5', 'version': '1.0.5', 'build_number': '1'})
+        for historical in [True, False]:
+            with self.subTest(historical=historical), tempfile.TemporaryDirectory() as root:
+                (Path(root) / 'scratch').mkdir()
+                result = build(root, historical)
+                self.assertTrue((result.app).is_dir())
+                scratch = list((Path(root) / 'scratch').iterdir())
+                if historical:
+                    self.assertEqual(scratch, [])
+                    self.assertIsNone(result.source)
+                else:
+                    self.assertEqual([path.name for path in scratch], [result.source.parent.name])
+
     def test_unknown_predecessor_without_entry_fails(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(JourneyError, 'no reviewed overlay'):
@@ -932,6 +1002,160 @@ else:
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'index.beforeCommit') as server:
             with self.assertRaisesRegex(JourneyError, 'index.beforeCommit'):
                 server.wait_checkpoint(timeout=0.01)
+
+    def run_case_on_a_virtual_clock(self, prepare_startup, verify_startup, act=20, reach_at=None):
+        """Run index.embed through run_journey.main() with UI runs whose first test case starts after the given seconds.
+
+        Each UI run acts `act` seconds after its first test case started; None never starts a test case. With
+        `reach_at`, the old app reaches its checkpoint on its own that many seconds after the preparation launch."""
+        clock = {'now': 0.0}
+        runs, events, servers = [], [], []
+
+        def advance(seconds):
+            clock['now'] += seconds
+            if clock['now'] > 3600:
+                raise AssertionError('The journey kept waiting beyond every budget')
+            for run in runs:
+                if run.reach_at is not None and clock['now'] >= run.reach_at:
+                    servers[-1].reached.set()
+                if run.start_at is not None and clock['now'] >= run.start_at and not run.announced:
+                    run.announced = True
+                    with open(run.log, 'a') as log:
+                        log.write("Test Case '-[UpgradeJourneyUITests.UpgradeJourneyUITests testInstalledAppJourney]' started.\n")
+
+        class Clock:
+            strftime = staticmethod(time.strftime)
+            monotonic = staticmethod(lambda: clock['now'])
+            sleep = staticmethod(advance)
+
+        class Run:
+            def __init__(self, log, startup, reach=None):
+                self.log, self.announced, self.stopped = log, False, False
+                self.start_at = None if startup is None else clock['now'] + startup
+                self.reach_at = None if reach is None else clock['now'] + reach
+                log.write_text('Running tests...\n')
+
+            def remaining(self):
+                return float('inf') if self.start_at is None else max(0, self.start_at + act - clock['now'])
+
+            def poll(self):
+                return 0 if self.stopped else None
+
+            def wait(self, timeout):
+                if self.remaining() > timeout:
+                    advance(timeout)
+                    raise subprocess.TimeoutExpired('xcodebuild', timeout)
+                advance(self.remaining())
+                self.stopped = True
+                return 0
+
+        class Server:
+            def __init__(self, case, point):
+                self.reached = threading.Event()
+                self.requests = [{'phase': 'new', 'path': '/checkpoint/session.loaded'}]
+                servers.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def wait_checkpoint(self, timeout, preparing=None):
+                if self.reached.is_set():
+                    return
+                if preparing.remaining() > timeout:
+                    advance(timeout)
+                    raise JourneyError('The historical app did not reach index.embed')
+                advance(preparing.remaining())
+                self.reached.set()
+
+            def begin_upgrade(self):
+                pass
+
+        class App:
+            destination = 'platform=iOS Simulator,id=fixture'
+            launch_arguments = []
+
+            def __init__(self, *_):
+                pass
+
+            def install(self, bundle):
+                pass
+
+            def verify_metadata(self, *_):
+                pass
+
+            def launch(self, server, seed=False):
+                pass
+
+            def kill_app(self):
+                events.append('kill-old')
+                clock['killed'] = clock['now']
+
+            def close(self):
+                pass
+
+        def ui(runner, destination, point, phase, case, *_):
+            runs.append(Run(case / (phase + '-ui.log'), prepare_startup if phase == 'prepare' else verify_startup,
+                            reach_at if phase == 'prepare' else None))
+            events.append('ui-' + phase)
+            return runs[-1], io.StringIO()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            (source / 'UpgradeUITests').mkdir(parents=True)
+            products = root / 'build/DerivedData.noindex/Build/Products'
+            products.mkdir(parents=True)
+            (products / 'runner.xctestrun').touch()
+            builds = [Build(root / 'new.app', source, {'tag': 'v1.1.0'}, 'a' * 40), Build(root / 'old.app', None, {'tag': 'v1.0.5'}, 'b' * 40)]
+            arguments = ['run_journey', '--repo', str(root), '--automation', str(Path(__file__).resolve().parents[2]),
+                         '--root', str(root), '--target', 'HEAD', '--release-tag', 'v1.1.0', '--sources', 'v1.0.5',
+                         '--platform', 'iOS', '--points', 'index.embed']
+            with patch.object(sys, 'argv', arguments), patch.object(run_journey, 'release_metadata', return_value={'tag': 'v1.1.0'}), \
+                    patch.object(run_journey, 'build_app', side_effect=builds), patch.object(run_journey, 'command'), \
+                    patch.object(run_journey, 'output', return_value='arm64'), patch.object(run_journey, 'verify_bundle_metadata', return_value={}), \
+                    patch.object(run_journey, 'InstalledApp', App), patch.object(run_journey, 'FixtureServer', Server), \
+                    patch.object(run_journey, 'ui_run', side_effect=ui), patch.object(run_journey, 'stop_group', lambda run: setattr(run, 'stopped', True)), \
+                    patch.object(run_journey, 'sample_runner'), patch.object(run_journey, 'time', Clock), \
+                    patch('keychain_entitlements.snapshot', return_value={}):
+                try:
+                    run_journey.main()
+                    error = None
+                except JourneyError as failure:
+                    error = failure
+                timing = next(root.glob('evidence/*/iOS/v1.0.5/index.embed/timing.json'), None)
+                self.killed_at = clock.get('killed')
+                return error, events, clock['now'], json.loads(timing.read_text()) if timing else None
+
+    def test_slow_ui_runner_startup_keeps_the_full_preparation_and_verification_budgets(self):
+        # Release run 38171860265: the UI runner needed 160 s to start, and the 180 s budget expired before it acted.
+        error, events, _, timing = self.run_case_on_a_virtual_clock(prepare_startup=170, verify_startup=300)
+        self.assertIsNone(error)
+        self.assertEqual(events, ['ui-prepare', 'kill-old', 'ui-verify'])
+        self.assertEqual((timing['prepare_ui_startup_s'], timing['verify_ui_startup_s']), (170, 300))
+
+    def test_a_checkpoint_reached_before_the_ui_test_starts_ends_the_startup_wait(self):
+        # iOS thumbnail points reach their checkpoint without the UI test. The kill must follow while the server still
+        # holds that checkpoint (240 s), even when the UI runner starts late or never.
+        for startup in [None, 300]:
+            with self.subTest(prepare_startup=startup):
+                error, events, _, timing = self.run_case_on_a_virtual_clock(startup, verify_startup=1, reach_at=5)
+                self.assertIsNone(error)
+                self.assertEqual(events, ['ui-prepare', 'kill-old', 'ui-verify'])
+                self.assertEqual(timing['prepare_ui_startup_s'], 5)
+                self.assertLess(self.killed_at, 5 + 240)
+
+    def test_ui_runner_budgets_stay_bounded(self):
+        for prepare, verify, act, message, elapsed in [
+                (None, 1, 20, 'index.embed preparation: xcodebuild did not start the UI test within 600 s', 600),
+                (1, None, 20, 'index.embed verification: xcodebuild did not start the UI test within 600 s', 621),
+                (10, 1, 181, 'did not reach index.embed', 190)]:
+            with self.subTest(prepare=prepare, verify=verify, act=act):
+                error, events, now, _ = self.run_case_on_a_virtual_clock(prepare, verify, act)
+                self.assertRegex(str(error), message)
+                self.assertAlmostEqual(now, elapsed, delta=1)
 
 
 if __name__ == '__main__':

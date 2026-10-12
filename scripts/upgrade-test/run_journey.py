@@ -11,6 +11,7 @@ import signal
 import subprocess
 import tempfile
 import sys
+import threading
 import uuid
 import time
 
@@ -33,6 +34,16 @@ CONSENT_LIMITATION = ('The backup journey requires consent already saved on disk
 # this pin is updated deliberately.
 IOS_RUNTIME = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0',
                'buildversion': '24A434'}
+
+# xcodebuild needs its own time to start the UI runner before XCTest starts a test case. On the loaded hosted
+# runner this startup took 160 s, nearly the whole former preparation budget, and the UI test never ran. The
+# preparation budget therefore starts with the first test case, the app's own arrival at its checkpoint, or the end
+# of the UI run, whichever comes first; the verification budget starts with the first test case or the end of the
+# run. A runner that never starts a test case still fails after UI_STARTUP_SECONDS.
+UI_TEST_STARTED = re.compile(r"^Test Case '[^']+' started\.$", re.M)
+UI_STARTUP_SECONDS = 600
+PREPARATION_SECONDS = 180
+VERIFICATION_SECONDS = 240
 
 METADATA_SCOPE = ('The gate requires installed CFBundleShortVersionString and CFBundleVersion to equal '
                   'the published release data string-for-string before every old and new probe starts. '
@@ -114,6 +125,43 @@ def stop_group(process):
             process.wait()
 
 
+def free_gib(path=Path.home()):
+    return shutil.disk_usage(path).free / 2**30
+
+
+def tree_gib(path):
+    if not path.exists():
+        return 0.0
+    try:
+        result = subprocess.run(['du', '-sk', str(path)], capture_output=True, text=True, timeout=300)
+        return int(result.stdout.split()[0]) / 2**20
+    except (subprocess.TimeoutExpired, ValueError, IndexError):
+        return float('nan')
+
+
+def sample_runner(path, root, interval=60):
+    # Load and free disk every minute, and the large trees every fifth minute, show what a slow or failed case met.
+    # A hosted iOS shard ran out of disk (rehearsal 38181793360) without any record of what filled it.
+    home = Path.home()
+    trees = {'evidence': path.parent, 'scratch': root / 'scratch', 'products': root / 'products',
+             'simulators': home / 'Library/Developer/CoreSimulator/Devices',
+             'simulator-logs': home / 'Library/Logs/CoreSimulator',
+             'derived-data': home / 'Library/Developer/Xcode/DerivedData'}
+    def sample():
+        for count in range(sys.maxsize):
+            line = (time.strftime('%H:%M:%S') + ' load ' + ' '.join(f'{value:.2f}' for value in os.getloadavg())
+                    + f' free {free_gib():.1f} GiB')
+            if count % 5 == 0:
+                line += ' |' + ''.join(f' {name} {tree_gib(tree):.1f}' for name, tree in trees.items()) + ' GiB'
+            try:
+                with open(path, 'a') as log:
+                    log.write(line + '\n')
+            except OSError:
+                return  # The evidence directory is gone or the disk is full; the journey reports the failure itself.
+            time.sleep(interval)
+    threading.Thread(target=sample, daemon=True).start()
+
+
 class SigningIdentity:
     """One temporary identity signs both macOS installations. No release credential is used."""
     def __init__(self, root):
@@ -186,6 +234,7 @@ class InstalledApp:
         self.launch_arguments = []
         self.case_id = uuid.uuid4().hex
         self.simulator = None
+        self.app_log = None
         if platform == 'iOS':
             runtime = select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'])
             types = json.loads(output(['xcrun', 'simctl', 'list', 'devicetypes', '--json']))['devicetypes']
@@ -212,6 +261,19 @@ class InstalledApp:
     def destination(self):
         return 'platform=iOS Simulator,id=' + self.simulator if self.simulator else 'platform=macOS'
 
+    def stream_app_log(self, app):
+        # The app's own system log explains a failing case, for example a crash before the UI test acts.
+        if self.app_log:
+            return
+        if self.simulator:
+            executable = plistlib.loads((app / 'Info.plist').read_bytes())['CFBundleExecutable']
+            stream = ['xcrun', 'simctl', 'spawn', self.simulator, 'log', 'stream', '--style', 'compact',
+                      '--predicate', f'process == "{executable}"']
+        else:
+            stream = ['/usr/bin/log', 'stream', '--style', 'compact', '--predicate', f'processImagePath BEGINSWITH "{self.installed}/"']
+        self.app_log_file = open(self.directory / 'app.log', 'w')
+        self.app_log = owned_process(stream, self.app_log_file)
+
     def install(self, app):
         if self.simulator:
             # This always installs over the existing app. The upgrade phase never uninstalls or erases it.
@@ -227,6 +289,7 @@ class InstalledApp:
                 'com.apple.security.files.user-selected.read-write': True,
                 'com.apple.security.personal-information.photos-library': True}))
             self.signer.sign(self.installed, entitlements)
+        self.stream_app_log(app)
 
     def verify_metadata(self, release, phase, source_commit=None):
         bundle = Path(output(['xcrun', 'simctl', 'get_app_container', self.simulator, BUNDLE, 'app'])) if self.simulator else self.installed
@@ -285,6 +348,10 @@ class InstalledApp:
             os.kill(app_pid, signal.SIGKILL)
 
     def close(self):
+        if self.app_log:
+            stop_group(self.app_log)
+            self.app_log_file.close()
+            self.app_log = None
         if self.simulator:
             try:
                 command(['xcrun', 'simctl', 'shutdown', self.simulator])
@@ -330,6 +397,25 @@ def ui_run(runner, destination, point, phase, evidence, app_path=None, launch_ar
                              '-destination', destination, '-parallel-testing-enabled', 'NO',
                              '-resultBundlePath', str(evidence / (phase + '.xcresult'))], log)
     return process, log
+
+
+def wait_ui_test_start(process, log, label, reached=None, timeout=UI_STARTUP_SECONDS):
+    """Return the seconds until XCTest started a test case, the run exited, or the app reached its checkpoint."""
+    started = time.monotonic()
+    event = 'exited'
+    while process.poll() is None:
+        if reached is not None and reached.is_set():
+            event = 'reached its checkpoint'
+            break
+        if log.exists() and UI_TEST_STARTED.search(log.read_text(errors='replace')):
+            event = 'started its first test case'
+            break
+        if time.monotonic() - started >= timeout:
+            raise JourneyError(f'{label}: xcodebuild did not start the UI test within {timeout} s')
+        time.sleep(0.5)
+    elapsed = round(time.monotonic() - started)
+    print(f'{label}: the UI run {event} after {elapsed} s', flush=True)
+    return elapsed
 
 
 def main():
@@ -403,9 +489,15 @@ def main():
             name: {'source_commit': build.commit, 'release': build.metadata,
                    'built': verify_bundle_metadata(build.app, args.platform, build.metadata, 'built evidence')}
             for name, build in [('candidate', current), *predecessors.items()]}, indent=2) + '\n')
+        print(f'Free disk after the builds: {free_gib():.1f} GiB', flush=True)
+        sample_runner(evidence_root / 'runner-load.log', args.root)
+
         def execute(tag, point):
             case = evidence_root / args.platform / tag / point
             case.mkdir(parents=True, exist_ok=True)
+            timing = {'started': time.strftime('%H:%M:%S')}
+            case_started = time.monotonic()
+            passed = False
             with FixtureServer(case, point) as server:
                 app = InstalledApp(args.platform, case, signer)
                 preparing = None
@@ -413,8 +505,11 @@ def main():
                     app.install(predecessors[tag].app)
                     app.verify_metadata(predecessors[tag].metadata, 'old', predecessors[tag].commit)
                     app.launch(server, seed=True)
-                    preparation_deadline = time.monotonic() + 180
                     preparing, prepare_log = ui_run(runner, app.destination, point, 'prepare', case, getattr(app, 'installed', None), app.launch_arguments)
+                    timing['prepare_ui_startup_s'] = wait_ui_test_start(
+                        preparing, case / 'prepare-ui.log', f'{tag} / {point} preparation', server.reached)
+                    # The consent wait below also ends within this budget, before the server releases its held checkpoint.
+                    preparation_deadline = time.monotonic() + PREPARATION_SECONDS
                     server.wait_checkpoint(timeout=max(0, preparation_deadline - time.monotonic()), preparing=preparing)
                     saved_consent = None
                     consent_evidence = {}
@@ -434,7 +529,8 @@ def main():
                     app.launch(server)
                     verifying, verify_log = ui_run(runner, app.destination, point, 'verify', case, getattr(app, 'installed', None), app.launch_arguments)
                     try:
-                        code = verifying.wait(timeout=240)
+                        timing['verify_ui_startup_s'] = wait_ui_test_start(verifying, case / 'verify-ui.log', f'{tag} / {point} verification')
+                        code = verifying.wait(timeout=VERIFICATION_SECONDS)
                         if code:
                             raise JourneyError(f'{tag} / {point}: UI verification failed ({code})')
                     except subprocess.TimeoutExpired as error:
@@ -453,10 +549,18 @@ def main():
                     if any(r['path'] == '/checkpoint/network.denied' for r in server.requests):
                         raise JourneyError(f'{tag} / {point}: the app attempted an external request')
                     summary(f'PASS {args.platform}: {tag} → {args.target}, {point}')
+                    passed = True
                 finally:
                     if preparing:
                         stop_group(preparing)
                     app.close()
+                    timing['case_s'] = round(time.monotonic() - case_started)
+                    timing['free_gib'] = round(free_gib(), 1)
+                    print(f'{tag} / {point}: case took {timing["case_s"]} s, free disk {timing["free_gib"]} GiB', flush=True)
+                    (case / 'timing.json').write_text(json.dumps(timing) + '\n')
+                    if passed:
+                        # Only a failing case keeps its app log; a full gate would otherwise retain hundreds of megabytes.
+                        (case / 'app.log').unlink(missing_ok=True)
         run_cases(args.sources, args.points, execute)
     finally:
         if signer:
