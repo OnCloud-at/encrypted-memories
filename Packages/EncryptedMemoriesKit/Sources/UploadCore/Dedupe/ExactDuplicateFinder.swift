@@ -691,8 +691,8 @@ public struct ExactDuplicateFinder: Sendable {
                     )
                 })
             guard Self.keepOrder(active, facts: ranking).first == kept else { return .skipped(.preselectionChanged) }
-            // A failed read must never pick another keeper. This check includes shared members and members with
-            // other metadata, even though neither can become the keeper or require related-file coverage.
+            // Require every active compound to be readable with the group hash before considering a swap.
+            // The comparable set below separately filters sharing and metadata.
             let allReadable = active.allSatisfy { member in
                 guard let compound = fresh[member] ?? nil else { return false }
                 return compound.main.contentHash == group.contentHash

@@ -2062,7 +2062,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(violations, [])
     }
 
-    func testOnlyAnUnreadableSharedMemberLeavesThePreselectionAndRelatedFilesUntouched() async throws {
+    func testASharedKeeperNeverSwapsEvenWhenAnotherSharedMemberIsUnreadable() async throws {
         let kept = server.seedLink(digest: digest("a"))
         let richer = server.seedLink(digest: digest("a"))
         let shared = server.seedLink(digest: digest("a"))
