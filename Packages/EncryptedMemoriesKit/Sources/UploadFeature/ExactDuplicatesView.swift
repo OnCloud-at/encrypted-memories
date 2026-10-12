@@ -44,6 +44,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 Button(model.mergeAllConfirmTitle) {
                     Task { await model.mergeAll() }
                 }
+                .disabled(!model.canMerge)
                 .accessibilityIdentifier("duplicates.mergeAll.dialog")
                 Button(L10n.string("action.cancel"), role: .cancel) {}
             } message: {
@@ -66,12 +67,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
 
     @ViewBuilder private var content: some View {
         if model.isCheckingGroups {
-            ExactDuplicatesProgressRow(
-                line: model.checkingGroupsLine, accent: accent, identifier: "duplicates.rankingProgress"
-            )
-            .padding(24)
-            .frame(maxWidth: Self.readableWidth)
-            .duplicatesCard()
+            loadingContent(model.checkingGroupsLine)
         } else {
             checkedContent
         }
@@ -80,17 +76,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
     @ViewBuilder private var checkedContent: some View {
         switch model.content {
         case .loading:
-            let line = model.loadingLine
-            ContentUnavailableView {
-                Label(line.title, systemImage: "square.on.square")
-            } description: {
-                Text(L10n.string("duplicates.loading_message"))
-            } actions: {
-                progressRow(line, showsTitle: false)
-                    .frame(maxWidth: 320)
-            }
-            .frame(maxWidth: Self.readableWidth)
-            .accessibilityIdentifier("duplicates.loading")
+            loadingContent(model.loadingLine)
         case .failed(let message):
             ContentUnavailableView {
                 Label(message, systemImage: "exclamationmark.icloud")
@@ -124,6 +110,19 @@ public struct ExactDuplicatesView<Cover: View>: View {
             )
             .equatable()
         }
+    }
+
+    private func loadingContent(_ line: ExactDuplicatesModel.ProgressLine) -> some View {
+        ContentUnavailableView {
+            Label(line.title, systemImage: "square.on.square")
+        } description: {
+            Text(L10n.string("duplicates.loading_message"))
+        } actions: {
+            progressRow(line, showsTitle: false)
+                .frame(maxWidth: 320)
+        }
+        .frame(maxWidth: Self.readableWidth)
+        .accessibilityIdentifier("duplicates.loading")
     }
 
     private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {

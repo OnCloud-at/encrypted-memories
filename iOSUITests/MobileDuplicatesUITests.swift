@@ -116,10 +116,10 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(0).exists, "the other group stays")
     }
 
-    func testTheInitialCheckHidesCandidatesAndKeepsTheConfirmationUnnumbered() {
+    func testTheInitialCheckHidesCandidatesAndDisablesMergeAll() {
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
-        let progress = app.progressIndicators["duplicates.rankingProgress"].firstMatch
+        let progress = app.progressIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
         XCTAssertFalse(group(0).exists, "unchecked candidates have no rows or per-group merge")
@@ -131,11 +131,22 @@ final class MobileDuplicatesUITests: XCTestCase {
                 NSPredicate(format: "label CONTAINS 'Merge frees' OR label CONTAINS 'Merging all frees'")
             ).firstMatch.exists)
 
-        app.buttons["duplicates.mergeAll"].tap()
-        let confirm = app.buttons["duplicates.mergeAll.dialog"].firstMatch
-        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Merge Duplicates?"].exists)
-        XCTAssertEqual(confirm.label, "Merge All")
+        let mergeAll = app.buttons["duplicates.mergeAll"]
+        XCTAssertTrue(mergeAll.exists, "the toolbar action stays visible")
+        XCTAssertFalse(mergeAll.isEnabled, "the final checked list must arrive first")
+        XCTAssertFalse(app.buttons["duplicates.mergeAll.dialog"].exists)
+    }
+
+    func testTheInitialCheckUsesTheSlimLoadingLayout() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
+        let progress = app.progressIndicators["duplicates.loading"].firstMatch
+        XCTAssertTrue(progress.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
+        XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == 'Checking duplicates'")).count, 1)
+        XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
+        XCTAssertLessThanOrEqual(progress.frame.width, 320)
+        keepScreenshot("duplicates-ios-slim-metadata-check")
     }
 
     func testMergeAllMergesEveryGroupAfterTheConfirmation() throws {

@@ -642,7 +642,9 @@ public final class ExactDuplicatesModel {
         hasCheckedGroups ? duplicateCount : nil
     }
 
-    public var canMerge: Bool { !isRetired && !isMerging && phase != .loading && !groups.isEmpty }
+    public var canMerge: Bool {
+        !isRetired && !isMerging && !isCheckingGroups && !hasInvalidatedGroups && phase != .loading && !groups.isEmpty
+    }
 
     public var mergeAllTitle: String {
         hasCheckedGroups

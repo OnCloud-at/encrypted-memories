@@ -36,18 +36,22 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let load = Task { await model.load(checkAllGroups: true) }
         await waitUntil({ finder.scanGate.hasWaiters }, "the screen scan waits")
         XCTAssertTrue(model.isCheckingGroups)
+        XCTAssertFalse(model.canMerge, "the check has no final duplicate list")
         XCTAssertEqual(model.visibleGroups, [])
         XCTAssertEqual(model.checkingGroupsLine.title, L10n.string("duplicates.ranking_title"))
         XCTAssertNil(model.checkingGroupsLine.detail)
         finder.scanGate.open()
         await waitUntil({ finder.rankGate.hasWaiters }, "the screen checks metadata")
         XCTAssertTrue(model.isCheckingGroups)
+        XCTAssertFalse(model.canMerge, "the check has no final duplicate list")
         XCTAssertEqual(model.visibleGroups, [])
         XCTAssertNil(model.totalFreedText)
+        XCTAssertFalse(model.canMerge(containing: a1))
         XCTAssertNotEqual(model.content, .noDuplicates)
         finder.rankGate.open()
         await load.value
         XCTAssertFalse(model.isCheckingGroups)
+        XCTAssertTrue(model.canMerge, "the final checked list can be merged")
         XCTAssertEqual(model.visibleGroups.map(\.id), ["A", "B"])
         XCTAssertNotNil(model.totalFreedText)
     }
@@ -166,12 +170,14 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.scanError = URLError(.notConnectedToInternet)
         await model.merge(groupID: "A")
         XCTAssertFalse(model.isCheckingGroups)
+        XCTAssertFalse(model.canMerge, "the invalidated list remains hidden until a successful retry")
         XCTAssertEqual(model.visibleGroups, [])
         XCTAssertNil(model.totalFreedText)
         XCTAssertNotNil(model.checkFailedNote)
         finder.scanError = nil
         await model.load()
         XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+        XCTAssertTrue(model.canMerge)
         XCTAssertNil(model.checkFailedNote)
     }
 
