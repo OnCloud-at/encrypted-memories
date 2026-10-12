@@ -453,7 +453,7 @@ private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
             && lhs.libraryRevision == rhs.libraryRevision
     }
 
-    /// The facts of a group arrive without a progress row; its badges, its reason, and a moved checkmark fade in.
+    /// As checked facts arrive, the group's badges, its reason, and a moved checkmark fade in.
     /// Without motion, they appear at once.
     private var factsAnimation: Animation? { reduceMotion ? nil : .default }
 

@@ -383,8 +383,8 @@ public final class ExactDuplicatesModel {
     public private(set) var isStoppingMergeAll = false
     /// Account retirement permanently prevents a queued action from starting another merge.
     private var isRetired = false
-    /// A merge waits for the facts of groups that nobody scrolled to. Only this ranking shows its progress; the
-    /// ranking of the groups on screen runs silently, and its facts simply appear.
+    /// A merge waits for the facts of groups that nobody scrolled to. Its progress counts that run's groups;
+    /// the screen ranking shows the checked groups of the whole list.
     private var isRankingForMerge = false
     /// Merge All starts no further batch until `resumeMerging()`, for example while the app is in the background.
     @ObservationIgnored private var isMergePaused = false
@@ -519,13 +519,18 @@ public final class ExactDuplicatesModel {
 
     /// The progress of an active metadata check, including the ranking that a merge waits for.
     public var rankingLine: ProgressLine? {
-        guard isRankingForMerge || !hasCheckedGroups, let rankingProgress, rankingProgress.total > 0 else { return nil }
-        let completed = rankingProgress.completed.formatted()
-        let total = rankingProgress.total.formatted()
+        guard isRankingForMerge || !hasCheckedGroups, let rankingProgress else { return nil }
+        let progress =
+            isRankingForMerge
+            ? rankingProgress
+            : ExactDuplicateScanProgress(completed: groups.filter(\.isRanked).count, total: groups.count)
+        guard progress.total > 0 else { return nil }
+        let completed = progress.completed.formatted()
+        let total = progress.total.formatted()
         return ProgressLine(
             title: L10n.string("duplicates.ranking_title"),
             detail: L10n.string("duplicates.ranking_progress \(completed) \(total)"),
-            fraction: Double(rankingProgress.completed) / Double(rankingProgress.total))
+            fraction: Double(progress.completed) / Double(progress.total))
     }
 
     /// The checked groups while the remaining pages wait for scrolling or Merge All. Nil during active ranking.
@@ -609,7 +614,7 @@ public final class ExactDuplicatesModel {
     public var duplicateCount: Int { groups.reduce(0) { $0 + $1.duplicateCount } }
 
     private var hasCheckedGroups: Bool {
-        phase == .loaded && !groups.isEmpty && groups.allSatisfy(\.isRanked)
+        !groups.isEmpty && groups.allSatisfy(\.isRanked)
     }
 
     /// The count for the Duplicates entry. Nil until every remaining group passed the metadata check, or if empty.

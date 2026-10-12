@@ -83,6 +83,55 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.content, .groups, "a failed refresh must not hide the groups already shown")
     }
 
+    func testCheckedCountsStayVisibleDuringAReloadAndAfterItFails() async throws {
+        let finder = FakeDuplicateFinder(
+            scans: [.init(groups: [groupA, groupB], coverage: .complete, byteSizes: ["A": 1_000_000, "B": 10])])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let freed = try XCTUnwrap(model.totalFreedText)
+        let title = model.mergeAllTitle
+        let message = model.mergeAllMessage
+        let confirm = model.mergeAllConfirmTitle
+        finder.scanGate.close()
+        let reload = Task { await model.load() }
+        await waitUntil({ finder.scanGate.hasWaiters }, "the reload scans while checked groups stay")
+
+        XCTAssertFalse(model.canMerge, "the reload is still running")
+        XCTAssertEqual(model.knownDuplicateCount, 3)
+        XCTAssertEqual(model.copyCountText, L10n.string("duplicates.copy_count \(5)"))
+        XCTAssertEqual(model.totalFreedText, freed)
+        XCTAssertEqual(model.mergeAllTitle, title)
+        XCTAssertEqual(model.mergeAllMessage, message)
+        XCTAssertEqual(model.mergeAllConfirmTitle, confirm)
+
+        finder.scanError = URLError(.notConnectedToInternet)
+        finder.scanGate.open()
+        await reload.value
+
+        XCTAssertEqual(model.content, .groups, "a failed reload keeps the checked groups")
+        XCTAssertEqual(model.knownDuplicateCount, 3)
+        XCTAssertEqual(model.copyCountText, L10n.string("duplicates.copy_count \(5)"))
+        XCTAssertEqual(model.totalFreedText, freed)
+        XCTAssertEqual(model.mergeAllTitle, title)
+        XCTAssertEqual(model.mergeAllMessage, message)
+        XCTAssertEqual(model.mergeAllConfirmTitle, confirm)
+    }
+
+    func testAFirstLoadHasNoCountWhileItsScanIsPending() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.scanGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.scanGate.hasWaiters }, "the first load has no checked groups yet")
+
+        XCTAssertEqual(model.groups, [])
+        XCTAssertNil(model.knownDuplicateCount)
+        XCTAssertNil(model.copyCountText)
+        XCTAssertNil(model.totalFreedText)
+        finder.scanGate.open()
+        await load.value
+    }
+
     func testAFailedRankingKeepsTheFallbackOrderAndShowsTheGroups() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.rankError = URLError(.timedOut)
@@ -131,6 +180,31 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.rankGate.open()
         await waitUntil({ model.groups.first { $0.id == groups[80].id }?.isRanked == true }, "the facts arrive")
         XCTAssertNil(model.rankingLine)
+    }
+
+    func testScrollRankingShowsTheOverallCheckedGroups() async {
+        let groups = manyGroups(200)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        XCTAssertEqual(
+            model.metadataCheckNote, L10n.string("duplicates.groups_checked \(48.formatted()) \(200.formatted())"))
+        finder.rankGate.close()
+        model.groupAppeared(groups[48].id)
+        await waitUntil({ finder.rankGate.hasWaiters }, "scrolling checks the next pages")
+
+        XCTAssertEqual(
+            model.rankingLine?.detail,
+            L10n.string("duplicates.ranking_progress \(48.formatted()) \(200.formatted())"))
+        XCTAssertEqual(model.rankingLine?.fraction, 48.0 / 200.0)
+        XCTAssertNil(model.metadataCheckNote)
+        XCTAssertNil(model.knownDuplicateCount)
+        finder.rankGate.open()
+        await waitUntil({ model.rankingProgress == nil }, "the requested pages finish")
+
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 96)
+        XCTAssertEqual(
+            model.metadataCheckNote, L10n.string("duplicates.groups_checked \(96.formatted()) \(200.formatted())"))
     }
 
     func testAChosenCheckmarkStaysWhenTheFactsArrive() async {
@@ -1080,6 +1154,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.knownDuplicateCount, 3)
     }
 
+    /// The compatible Collections entry is a no-op; a late task also releases the retired model.
     func testALateCollectionsTaskDoesNotCountAfterAccountRetirement() async throws {
         for replacing in [false, true] {
             let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
@@ -1129,6 +1204,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
             XCTAssertEqual(finder.scanCalls, 1, "The admitted scan finishes")
             XCTAssertEqual(finder.rankCalls, 0)
             XCTAssertEqual(finder.buildCalls, 0)
+            XCTAssertEqual(model?.groups ?? [], [], "A late scan cannot publish retired-account groups")
             XCTAssertNil(model?.knownDuplicateCount, "A late scan cannot publish the retired account's count")
             model = nil
             XCTAssertNil(released, "The finished scan releases its retired model")
