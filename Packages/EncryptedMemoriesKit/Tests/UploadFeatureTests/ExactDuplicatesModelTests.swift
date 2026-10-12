@@ -1706,6 +1706,48 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.notice)
     }
 
+    func testAPartialMergeShowsTheReturnedKeeperWhenThePreselectionWasTrashed() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.memberSizes["A"] = [a1: 10, a2: 20, a3: 30]
+        finder.facts["A"] = [
+            a1: .init(isInOwnAlbum: false, isFavorite: false, isNamedByManifest: false, captureDate: nil),
+            a2: .init(isInOwnAlbum: false, isFavorite: false, isNamedByManifest: false, captureDate: nil),
+            a3: .init(isInOwnAlbum: false, isFavorite: true, isNamedByManifest: false, captureDate: nil),
+        ]
+        finder.outcomes["A"] = .merged(kept: a3, trashed: [a1], keptDuplicates: [a2: .neededByLocalSource])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        XCTAssertEqual(model.groups.first?.kept, a1)
+
+        await model.mergeAll()
+
+        let group = try XCTUnwrap(model.groups.first)
+        XCTAssertEqual(group.kept, a3)
+        XCTAssertEqual(group.members, [a2, a3])
+        XCTAssertEqual(group.keptReason, .neededByLocalSource)
+        XCTAssertFalse(group.isKeptChosen)
+        XCTAssertEqual(group.freedBytes, 20)
+        XCTAssertEqual(group.stayReason, .badge(.favorite))
+        XCTAssertEqual(group.keepTitle(for: a3), L10n.string("duplicates.kept"))
+        XCTAssertTrue(group.accessibilityLabel(of: a3).contains(L10n.string("duplicates.member_kept")))
+        XCTAssertFalse(group.accessibilityLabel(of: a2).contains(L10n.string("duplicates.member_kept")))
+    }
+
+    func testAPartialMergeShowsTheReturnedKeeperWhenThePreselectionStays() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.outcomes["A"] = .merged(kept: a3, trashed: [a2], keptDuplicates: [a1: .pendingEditReplacement])
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        await model.mergeAll()
+
+        let group = try XCTUnwrap(model.groups.first)
+        XCTAssertEqual(group.kept, a3)
+        XCTAssertEqual(group.members, [a1, a3])
+        XCTAssertEqual(group.keptReason, .pendingEditReplacement)
+        XCTAssertFalse(group.isKeptChosen)
+    }
+
     func testEveryKeptReasonHasItsOwnMessage() {
         let reasons: [ExactDuplicateKeepReason] = [
             .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .unreadable,

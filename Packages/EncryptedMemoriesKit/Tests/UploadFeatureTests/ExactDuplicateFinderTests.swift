@@ -2029,6 +2029,59 @@ final class ExactDuplicateFinderTests: XCTestCase {
         }
     }
 
+    func testEqualRelatedSetsUseServerOrderEvenWhenThePreselectionCoversEveryone() async throws {
+        let c = server.seedLink(digest: digest("a"), captureTime: date(2))
+        let b = server.seedLink(digest: digest("a"), captureTime: date(1))
+        let k = server.seedLink(digest: digest("a"), captureTime: date(0))
+        for uid in [c, b, k] { _ = server.seedLink(digest: digest("video"), main: uid) }
+        indexServer()
+        let group = ExactDuplicateGroup(contentHash: hash("a"), hashKeyEpoch: epoch, members: [k, b, c])
+
+        let results = await finder.merge(preselected(group, k))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: c, trashed: [k, b], keptDuplicates: [:]))
+        XCTAssertEqual(state(of: c), .active)
+        XCTAssertEqual(state(of: k), .trashed)
+        XCTAssertEqual(state(of: b), .trashed)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testASharedKeeperMergesANonsharedPoorerCopyWithoutSwapping() async throws {
+        let poorer = server.seedLink(digest: digest("a"))
+        let kept = server.seedLink(digest: digest("a"))
+        server.share(kept)
+        let original = server.seedLink(digest: digest("original"), main: kept)
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), kept))
+
+        XCTAssertEqual(try results[0].get(), .merged(kept: kept, trashed: [poorer], keptDuplicates: [:]))
+        XCTAssertEqual(state(of: kept), .active)
+        XCTAssertEqual(state(of: original), .active)
+        XCTAssertEqual(state(of: poorer), .trashed)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testOnlyAnUnreadableSharedMemberLeavesThePreselectionAndRelatedFilesUntouched() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let richer = server.seedLink(digest: digest("a"))
+        let shared = server.seedLink(digest: digest("a"))
+        server.share(kept)
+        server.share(shared)
+        let video = server.seedLink(digest: digest("video"), main: richer)
+        let unreadable = server.seedLink(digest: digest("original"), main: shared)
+        server.personTrash(unreadable)
+        indexServer()
+
+        let results = await finder.merge(preselected(try await onlyGroup(), kept))
+
+        XCTAssertEqual(
+            try results[0].get(),
+            .merged(kept: kept, trashed: [], keptDuplicates: [richer: .relatedFileWithoutTwin, shared: .shared]))
+        for uid in [kept, richer, shared, video] { XCTAssertEqual(state(of: uid), .active) }
+        XCTAssertEqual(violations, [])
+    }
+
     func testASharedPoorerPreselectionNeverSwapsOrTrashes() async throws {
         let a = server.seedLink(digest: digest("a"))
         let b = server.seedLink(digest: digest("a"))

@@ -709,9 +709,9 @@ public struct ExactDuplicateFinder: Sendable {
                         return UploadRemoteReplacementSafety.relatedTwins(of: other, under: compound) != nil
                     }
                 }
-                if comparable.contains(kept), !covers(kept) {
-                    // Equal fingerprints tie on server capture time. A date known only on this device must not
-                    // break that tie when choosing among the covering copies.
+                if comparable.contains(kept) {
+                    // Always choose the first covering copy by server facts, even when the preselection covers
+                    // everyone. A device date can have picked that preselection when the server capture time is nil.
                     let serverRanking = Dictionary(
                         uniqueKeysWithValues: comparable.map {
                             (
@@ -722,7 +722,7 @@ public struct ExactDuplicateFinder: Sendable {
                             )
                         })
                     if let covering = Self.keepOrder(comparable.filter(covers), facts: serverRanking).first,
-                        let compound = fresh[covering] ?? nil
+                        covering != kept, let compound = fresh[covering] ?? nil
                     {
                         compounds = fresh
                         kept = covering

@@ -1235,7 +1235,7 @@ public final class ExactDuplicatesModel {
             for (group, result) in zip(batch, results) {
                 do {
                     switch try result.get() {
-                    case .merged(_, let moved, let keptDuplicates):
+                    case .merged(let keptPhoto, let moved, let keptDuplicates):
                         mergedGroups += 1
                         trashed += moved
                         kept.merge(keptDuplicates) { first, _ in first }
@@ -1245,10 +1245,12 @@ public final class ExactDuplicatesModel {
                             stale = true
                         }
                         // A group with a duplicate left keeps its reason, so the person can keep another photo instead.
-                        if let index = updated.firstIndex(where: { $0.id == group.id }),
-                            !updated[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values))
-                        {
-                            updated.remove(at: index)
+                        if let index = updated.firstIndex(where: { $0.id == group.id }) {
+                            if updated[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values)) {
+                                if updated[index].members.contains(keptPhoto) { updated[index].kept = keptPhoto }
+                            } else {
+                                updated.remove(at: index)
+                            }
                         }
                     case .skipped(.keptUnreadable):
                         keptPhotoUnreadable = true

@@ -6307,8 +6307,8 @@
     },
     "duplicates.kept_reason_related_file": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "A file exists only with the other copy. Both stay." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Eine Datei gibt es nur bei der anderen Kopie. Beide bleiben." } }
+        "en": { "stringUnit": { "state": "translated", "value": "A file exists only with a copy that stays." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eine Datei gibt es nur bei einer Kopie, die bleibt." } }
       }
     },
     "duplicates.kept_reason_pending_edit": {
