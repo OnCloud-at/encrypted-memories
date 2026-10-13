@@ -132,6 +132,15 @@ public final class TimelineViewModel {
     /// The route state the grid shows. A library without Proton photos still shows its pending photos, and an
     /// empty Proton trash still shows photos deleted before upload.
     public var gridState: State {
+        if filter == .all, case .empty = state,
+            !LibraryEmptyPolicy.isCompletelyEmpty(
+                knownItemCount: allRouteSnapshot == nil ? nil : wholeLibrarySnapshot.count,
+                authority: wholeLibraryInventoryAuthority
+            )
+        {
+            if let failure = initialLibraryLoadState.failure { return .failed(failure.message) }
+            return .loading
+        }
         guard showsPendingPhotos || showsPendingTrash else { return state }
         switch state {
         case .loaded, .empty: return .loaded(pendingSections)
@@ -630,10 +639,9 @@ public final class TimelineViewModel {
             await applyAllContent(projection)
             initialLibraryChangeToken = refreshed.validationToken ?? cacheValidation.monitorBaseline
             authoritativeLoadSucceeded = true
-        } catch is CancellationError {
-            // ignore
         } catch {
-            guard filter == .all else { return }
+            // A cancelled owner cannot publish. A backend cancellation of an active read is a load failure.
+            guard !Task.isCancelled, filter == .all else { return }
             initialLoadFailureReason = error is any LibraryChangeTerminalError ? .scopeAccessLost : .other
             applyInitialLoad(.failed(message: error.localizedDescription, retryable: true))
             // Keep showing the cached timeline on a refresh error; surface failure only if we have

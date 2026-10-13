@@ -168,6 +168,13 @@ final class MobileLibraryModel {
 
     /// Shared onboarding and loading policy. See `LibraryLoadState`.
     private(set) var loadState: LibraryLoadState = .initial
+
+    var isCompletelyEmpty: Bool {
+        loadState.isCompletelyEmpty
+            && LibraryEmptyPolicy.isCompletelyEmpty(
+                knownItemCount: snapshot.count, authority: primaryInventoryAuthority
+            )
+    }
     /// Immutable timeline snapshot prepared off the main actor. Its index provides O(1) and O(k) lookups
     /// for viewer, share, and trash actions without scanning the library.
     private(set) var snapshot = TimelineSnapshot() {
@@ -350,7 +357,7 @@ final class MobileLibraryModel {
     /// Wakes analysis-only presentation after a source inventory becomes readable.
     private(set) var sourceAnalysisRevision: UInt64 = 0
     private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
-    @ObservationIgnored private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
+    private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
     /// Successful trash and restore mutations of this session, laid over every later listing.
     @ObservationIgnored private var timelineRemovals = TimelineRemovalOverlay()
     @ObservationIgnored private var timelineMutationGeneration = 0
@@ -1738,10 +1745,8 @@ final class MobileLibraryModel {
                     resetBaseline: true,
                     initialToken: refreshed.validationToken ?? cacheValidation.monitorBaseline
                 )
-            } catch is CancellationError {
-                // A newer session/configuration replaced this task.
             } catch let error as any LibraryChangeTerminalError {
-                guard loadGeneration == self.loadToken, self.session == session else { return }
+                guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 DebugLog.log("timeline: terminal scope failure during initial load - \(error)")
                 // The recovery task must not join the load task that schedules it. Remove this completed owner
                 // first, then synchronously register recovery before this main-actor turn ends.
@@ -1752,7 +1757,7 @@ final class MobileLibraryModel {
                     failedLoadGeneration: loadGeneration
                 )
             } catch {
-                guard loadGeneration == self.loadToken, self.session == session else { return }
+                guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }
@@ -2011,7 +2016,11 @@ final class MobileLibraryModel {
             // Unread favorites, so the first library refresh reads them like a signed-in account.
             favoriteState.reset(keepingFavorites: false)
             timelineRevision &+= 1
-            loadState = .contentReady(count: projection.snapshot.items.count)
+            primaryInventoryAuthority = .authoritative
+            loadState = LibraryLoadPolicy.reduce(
+                .initial, .authoritativeInventoryResolved(count: projection.snapshot.count, requiresNewFrame: true)
+            )
+            loadState = LibraryLoadPolicy.reduce(loadState, .firstContentReady)
         }
 
         /// Settles the installed library like a completed initial load and reads its favorites, so search
@@ -2023,6 +2032,11 @@ final class MobileLibraryModel {
 
         func installIsolatedDuplicatesForTesting(_ finder: any ExactDuplicateMerging) {
             replaceDuplicates(using: finder)
+        }
+
+        /// Replays first-load outcomes through the shipping reducer without a real account request.
+        func applyIsolatedLibraryLoadEventsForTesting(_ events: [LibraryLoadEvent]) {
+            loadState = events.reduce(.initial) { LibraryLoadPolicy.reduce($0, $1) }
         }
 
         /// Stands for an initial library load that runs until `load` returns and settles then.

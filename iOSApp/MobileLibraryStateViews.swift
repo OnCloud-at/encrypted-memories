@@ -121,23 +121,6 @@ final class MobileFrostedBackdropView: UIVisualEffectView {
     }
 }
 
-/// Shown only when the library truly holds no photos - the one case where a blank grid is acceptable.
-struct MobileEmptyLibraryView: View {
-    var body: some View {
-        let copy = PhotoFilter.all.emptyStateCopy
-        ContentUnavailableView {
-            Label {
-                Text(copy.title)
-            } icon: {
-                MemoriesBrandMark(height: 40)
-                    .accessibilityLabel(ProductBrand.displayName)
-            }
-        } description: {
-            Text(copy.description)
-        }
-    }
-}
-
 /// Shown when the first load fails; offers a retry when the failure is retryable.
 struct MobileLibraryErrorView: View {
     let message: String

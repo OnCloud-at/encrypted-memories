@@ -31,8 +31,9 @@ struct SettingsView: View {
     let signOut: () -> Void
 
     var body: some View {
+        @Bindable var appModel = appModel
         VStack(spacing: 0) {
-            MacSettingsTabs(tabs: tabs)
+            MacSettingsTabs(tabs: tabs, selectedTab: $appModel.selectedSettingsTab)
             Divider()
             AppBuildInfoLabel()
                 .frame(maxWidth: .infinity)

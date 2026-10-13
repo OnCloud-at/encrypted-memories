@@ -15,6 +15,7 @@ public struct TimelineView: View {
     /// itself, but the SwiftUI placeholder/empty/error states are plain centered views - without this they'd
     /// center over the full detail width (which runs under the sidebar) and read as shifted too far left.
     @Environment(\.gridLeadingEventInset) private var leadingInset: CGFloat
+    private let emptyLibraryBackupAction: LibraryEmptyBackupAction?
     private let onOpen: (PhotoItem, [PhotoItem]) -> Void
     private let proxy: GridProxy<PhotoUID>?
     private let routeScrollGeneration: Int
@@ -70,6 +71,7 @@ public struct TimelineView: View {
         isOffline: Bool = false,
         dragOutProvider: (any OriginalFileProvider)? = nil,
         onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil,
+        emptyLibraryBackupAction: LibraryEmptyBackupAction? = nil,
         onSelectionChange: @escaping (Set<PhotoUID>) -> Void = { _ in },
         onOpen: @escaping (PhotoItem, [PhotoItem]) -> Void = { _, _ in }
     ) {
@@ -98,6 +100,7 @@ public struct TimelineView: View {
         self.dragOutProvider = dragOutProvider
         self.onDragOutFailed = onDragOutFailed
         self.onSelectionChange = onSelectionChange
+        self.emptyLibraryBackupAction = emptyLibraryBackupAction
         self.onOpen = onOpen
         _searchProjection = State(initialValue: nil)
         _searchCoordinator = State(initialValue: TimelineSearchProjectionCoordinator())
@@ -199,18 +202,8 @@ public struct TimelineView: View {
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label(emptyStateCopy.title, systemImage: emptyStateCopy.systemImage)
-        } description: {
-            Text(emptyStateCopy.description)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(timelineSurfaceBackground)
-    }
-
-    private var emptyStateCopy: (title: String, description: String, systemImage: String) {
-        let copy = model.filter.emptyStateCopy
-        return (copy.title, copy.description, copy.systemImage)
+        LibraryEmptyView(filter: model.filter, backupAction: emptyLibraryBackupAction)
+            .background(timelineSurfaceBackground)
     }
 
     private func errorState(_ message: String) -> some View {

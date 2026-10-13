@@ -427,12 +427,7 @@ private struct MobileFilterGridScreen: View {
             }
         case .loaded:
             if isRouteEmpty {
-                let copy = filter.emptyStateCopy
-                ContentUnavailableView {
-                    Label(copy.title, systemImage: copy.systemImage)
-                } description: {
-                    Text(copy.description)
-                }
+                LibraryEmptyView(filter: filter)
             } else if let feed = model.thumbnailFeed {
                 UIKitTimelineGrid(
                     items: displayedItems,

@@ -3140,6 +3140,22 @@
         }
       }
     },
+    "empty.set_up_backup" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup einrichten"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Set Up Backup"
+          }
+        }
+      }
+    },
     "empty.trash_title": {
       "extractionState": "manual",
       "comment": "Empty trash route title.",

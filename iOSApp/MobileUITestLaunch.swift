@@ -15,6 +15,14 @@ import SwiftUI
             ProcessInfo.processInfo.arguments.contains(fixtureArgument)
         }
 
+        static var libraryLoadScenario: String? {
+            let arguments = ProcessInfo.processInfo.arguments
+            guard let index = arguments.firstIndex(of: "-EncryptedMemoriesLibraryLoadFixture"),
+                arguments.indices.contains(index + 1)
+            else { return nil }
+            return arguments[index + 1]
+        }
+
         /// Dark with `-EncryptedMemoriesDarkAppearance`, so a UI test can render both appearances. XCTest on iOS has
         /// no appearance switch.
         nonisolated static var preferredColorScheme: ColorScheme? {
@@ -32,7 +40,11 @@ import SwiftUI
                 break
             }
             guard fixture == nil,
-                let installed = try? await MobileSignedInFixture(runtime: runtime, includesVideo: true)
+                let installed = try? await MobileSignedInFixture(
+                    runtime: runtime,
+                    itemsPerSection: libraryLoadScenario == nil || libraryLoadScenario == "later" ? 36 : 0,
+                    includesVideo: libraryLoadScenario == nil
+                )
             else { return }
             fixture = installed
             installed.install()
