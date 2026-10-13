@@ -104,18 +104,15 @@ import UniformTypeIdentifiers
     @Test func diskFullDuringAWriteStopsFurtherAdmission() async throws {
         let root = try root()
         defer { try? FileManager.default.removeItem(at: root) }
-        let backend = TemporaryExportBackend(blocked: ["blocked"])
-        let task = Task {
-            await TemporaryOriginalExporter(exportRoot: root).exportOriginals(
-                [item("full"), item("blocked"), item("later")], backend: backend,
-                availableCapacity: { _ in 1 << 40 }, removeLocationWhenSharing: { false })
-        }
-        #expect(await backend.waitForWrites(2))
-        // Hold the other admitted item until the parent has consumed the full-disk result.
-        await backend.release()
-        let result = await task.value
+        let backend = TemporaryExportBackend()
+        // Both admitted items fail with full disk, so either completion order stops further admission.
+        let result = await TemporaryOriginalExporter(exportRoot: root).exportOriginals(
+            [item("full-a"), item("full-b"), item("later")], backend: backend,
+            availableCapacity: { _ in 1 << 40 }, removeLocationWhenSharing: { false })
         #expect(result.ranOutOfSpace)
-        #expect(result.failed == 2)
+        #expect(result.urls.isEmpty)
+        #expect(result.failed == 3)
+        #expect(await backend.writes.count == 2)
         #expect(await !backend.writes.keys.contains("later"))
     }
 
@@ -291,7 +288,7 @@ private actor TemporaryExportBackend: OriginalFileProvider, PhotoMetadataProvide
         writes[uid.nodeID] = destination
         try (payload ?? Data(uid.nodeID.utf8)).write(to: destination)
         if uid.nodeID == "fail" { throw CocoaError(.fileWriteUnknown) }
-        if uid.nodeID == "full" { throw CocoaError(.fileWriteOutOfSpace) }
+        if uid.nodeID.hasPrefix("full-") { throw CocoaError(.fileWriteOutOfSpace) }
         if blocked.contains(uid.nodeID), !released { await withCheckedContinuation { waiters.append($0) } }
         try Task.checkCancellation()
         onProgress(1)
