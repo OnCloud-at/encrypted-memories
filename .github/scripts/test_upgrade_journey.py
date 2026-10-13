@@ -31,6 +31,14 @@ from server import FixtureServer
 import run_journey
 
 
+def _temporary_directory():
+    # A late write by the code under test can race the cleanup (OSError 39, Directory not empty).
+    # The directory holds only synthetic files, so a failed cleanup must not fail the test.
+    if sys.version_info >= (3, 10):
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    return tempfile.TemporaryDirectory()
+
+
 class UpgradeJourneyTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'darwin', 'Native Settings controls require macOS')
     def test_native_macos_settings_pane_retries_only_unacknowledged_clicks(self):
@@ -262,7 +270,7 @@ with SigningIdentity(root) as signer:
 
     def test_cached_ui_runner_refreshes_support_files_before_each_compile(self):
         repo = Path(__file__).resolve().parents[2]
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             automation = root / 'automation'
             inputs = automation / 'scripts/upgrade-test/UITests'
