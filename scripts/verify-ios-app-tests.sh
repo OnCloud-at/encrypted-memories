@@ -58,27 +58,67 @@ print(max(names, key=rank) if names else "")
 '
 }
 
-# The device that `OS=latest` selects: the simulator with this name on the newest installed iOS runtime.
+# Resolve the requested runtime, or the newest installed iOS runtime for `OS=latest`.
 resolve_simulator_udid() {
   xcrun simctl list devices available --json | python3 -c '
 import json, re, sys
 
 name = sys.argv[1]
+requested_os = sys.argv[2]
+devices_by_runtime = json.load(sys.stdin)["devices"]
+if requested_os != "latest" and not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", requested_os):
+    print("[ios-tests] simulator OS must be latest or a numeric version.", file=sys.stderr)
+    raise SystemExit(64)
+requested_version = tuple(int(part) for part in requested_os.split(".")) if requested_os != "latest" else None
 best = None
-for runtime, devices in json.load(sys.stdin)["devices"].items():
+for runtime, devices in devices_by_runtime.items():
     match = re.search(r"\.iOS-([0-9-]+)$", runtime)
     if not match:
         continue
     version = tuple(int(part) for part in match.group(1).split("-"))
+    if requested_version is not None and (version + (0, 0, 0))[:3] != (requested_version + (0, 0, 0))[:3]:
+        continue
     for device in devices:
         if device.get("isAvailable") and device["name"] == name and (best is None or version > best[0]):
             best = (version, device["udid"])
 print(best[1] if best else "")
-' "$1"
+' "$1" "${2:-latest}"
 }
 
 if [[ -n "${IOS_TEST_DESTINATION:-}" ]]; then
   DESTINATION="$IOS_TEST_DESTINATION"
+  SIMULATOR_UDID=""
+  SIMULATOR_NAME=""
+  SIMULATOR_OS="latest"
+  DESTINATION_PLATFORM=""
+  IFS=',' read -r -a DESTINATION_FIELDS <<< "$DESTINATION"
+  for field in "${DESTINATION_FIELDS[@]}"; do
+    case "$field" in
+      platform=*) DESTINATION_PLATFORM="${field#platform=}" ;;
+      id=*) SIMULATOR_UDID="${field#id=}" ;;
+      name=*) SIMULATOR_NAME="${field#name=}" ;;
+      OS=*) SIMULATOR_OS="${field#OS=}" ;;
+    esac
+  done
+  if [[ "$DESTINATION_PLATFORM" == "iOS Simulator" ]]; then
+    if [[ -z "$SIMULATOR_UDID" && -n "$SIMULATOR_NAME" ]]; then
+      SIMULATOR_UDID="$(resolve_simulator_udid "$SIMULATOR_NAME" "$SIMULATOR_OS")"
+      if [[ -z "$SIMULATOR_UDID" ]]; then
+        echo "[ios-tests] no available simulator for $SIMULATOR_NAME with OS=$SIMULATOR_OS." >&2
+        exit 69
+      fi
+      # Pin xcodebuild to the same device that bootstatus waits for; preserve other destination fields.
+      DESTINATION=""
+      for field in "${DESTINATION_FIELDS[@]}"; do
+        case "$field" in name=*|OS=*) continue ;; esac
+        DESTINATION="${DESTINATION:+$DESTINATION,}$field"
+      done
+      DESTINATION="$DESTINATION,id=$SIMULATOR_UDID"
+    fi
+    SIMULATOR_NAME="${SIMULATOR_NAME:-$SIMULATOR_UDID}"
+  else
+    SIMULATOR_UDID=""
+  fi
 else
   SIMULATOR_NAME="$(resolve_iphone_simulator)"
   if [[ -z "$SIMULATOR_NAME" ]]; then
@@ -157,11 +197,11 @@ if [[ -n "${IOS_TEST_RESULT_BUNDLE_PATH:-}" ]]; then
   set -- "$@" -resultBundlePath "$IOS_TEST_RESULT_BUNDLE_PATH"
 fi
 if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_DIAGNOSTICS_PATH:-}" ]]; then
-  if [[ "${IOS_TEST_PARALLEL_WORKERS:-1}" != "1" || "$DESTINATION" != *",id="* ]]; then
+  if [[ "${IOS_TEST_PARALLEL_WORKERS:-1}" != "1" || -z "${SIMULATOR_UDID:-}" ]]; then
     echo "[ios-tests] diagnostics require one simulator with an explicit device ID." >&2
     exit 64
   fi
-  DIAGNOSTIC_SIMULATOR="${DESTINATION##*,id=}"
+  DIAGNOSTIC_SIMULATOR="$SIMULATOR_UDID"
   python3 "$ROOT/.github/scripts/collect_ui_wait_diagnostics.py" \
     --simulator "$DIAGNOSTIC_SIMULATOR" --output "$IOS_TEST_DIAGNOSTICS_PATH" -- \
     "$@" -parallel-testing-enabled NO "$ACTION"
