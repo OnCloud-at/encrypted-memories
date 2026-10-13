@@ -267,6 +267,84 @@ import Testing
         #expect(await terminalCallbacks.value == 1)
         await monitor.stop()
     }
+
+    @Test(.timeLimit(.minutes(1)))
+    func unconfirmableRefreshIsNotRepeatedForTheSameTokenAndKeepsTheBaseline() async throws {
+        let provider = TokenProvider("a")
+        let refreshes = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+            initialToken: "a"
+        ) {
+            await refreshes.increment()
+            return .refreshedWithoutRevision
+        }
+
+        await provider.set("b")
+        await refreshes.waitUntil { $0 >= 1 }
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 1)
+        #expect(await monitor.testingBaseline() == "a")
+
+        await provider.set("c")
+        await refreshes.waitUntil { $0 >= 2 }
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 2)
+        #expect(await monitor.testingBaseline() == "a")
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func resumeRefreshesTheDeferredTokenAgainAndConfirmsIt() async throws {
+        let provider = TokenProvider("a")
+        let refreshes = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+            initialToken: "a"
+        ) {
+            await refreshes.increment()
+            return await refreshes.value == 1 ? .refreshedWithoutRevision : .refreshed(token: "b")
+        }
+
+        await provider.set("b")
+        await refreshes.waitUntil { $0 >= 1 }
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 1)
+
+        await monitor.resumeDeferredRefresh()
+        await monitor.waitUntilBaseline("b")
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 2)
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func resumeDuringARefreshKeepsTheTokenPendingForAnotherRefresh() async throws {
+        let provider = TokenProvider("a")
+        let refreshes = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+            initialToken: "a"
+        ) {
+            await refreshes.increment()
+            if await refreshes.value == 1 {
+                await monitor.resumeDeferredRefresh()
+                return .refreshedWithoutRevision
+            }
+            return .refreshed(token: "b")
+        }
+
+        await provider.set("b")
+        await monitor.waitUntilBaseline("b")
+        #expect(await refreshes.value == 2)
+        await monitor.stop()
+    }
 }
 
 private actor TokenProvider: LibraryChangeTokenProvider {
@@ -307,6 +385,19 @@ private actor TokenProvider: LibraryChangeTokenProvider {
 private actor Counter {
     private(set) var value = 0
     func increment() { value += 1 }
+
+    /// Bounded, so a regression fails an expectation instead of hanging the run.
+    func waitUntil(_ condition: (Int) -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(value), ContinuousClock.now < deadline { await Task.yield() }
+    }
+}
+
+extension LibraryChangeMonitor {
+    fileprivate func waitUntilBaseline(_ token: String) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while testingBaseline() != token, ContinuousClock.now < deadline { await Task.yield() }
+    }
 }
 
 private actor BlockingTokenProvider: LibraryChangeTokenProvider {

@@ -16,6 +16,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
     public let addedUIDs: [PhotoUID]
     /// Revision paired with the whole-library projection this refresh published. Nil for filtered routes.
     public let publishedLibraryChangeToken: String?
+    /// False when the refresh loaded a filtered route, which can never confirm a whole-library revision.
+    public let coversWholeLibrary: Bool
 
     public var found: Bool { foundItem != nil }
 
@@ -29,7 +31,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         errorMessage: String? = nil,
         failureReason: TimelineRefreshFailureReason? = nil,
         addedUIDs: [PhotoUID] = [],
-        publishedLibraryChangeToken: String? = nil
+        publishedLibraryChangeToken: String? = nil,
+        coversWholeLibrary: Bool = true
     ) {
         self.uploadedUID = uploadedUID
         self.foundItem = foundItem
@@ -41,6 +44,12 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         self.failureReason = failureReason
         self.addedUIDs = addedUIDs
         self.publishedLibraryChangeToken = publishedLibraryChangeToken
+        self.coversWholeLibrary = coversWholeLibrary
+    }
+
+    /// The change monitor's outcome for a refresh that succeeded.
+    public var refreshedOutcome: LibraryChangeRefreshOutcome {
+        coversWholeLibrary ? .refreshed(token: publishedLibraryChangeToken) : .refreshedWithoutRevision
     }
 }
 
@@ -762,7 +771,8 @@ public final class TimelineViewModel {
                     timelineCountAfter: allItems.count,
                     filterDescription: Self.describe(filter),
                     elapsedMs: elapsedMilliseconds(since: start),
-                    publishedLibraryChangeToken: loaded.validationToken
+                    publishedLibraryChangeToken: loaded.validationToken,
+                    coversWholeLibrary: f == .all
                 )
             }
             let items = sections.flatMap(\.items)
@@ -795,7 +805,8 @@ public final class TimelineViewModel {
                 filterDescription: Self.describe(filter),
                 elapsedMs: elapsedMilliseconds(since: start),
                 addedUIDs: addedUIDs,
-                publishedLibraryChangeToken: loaded.validationToken
+                publishedLibraryChangeToken: loaded.validationToken,
+                coversWholeLibrary: f == .all
             )
         } catch is CancellationError {
             return TimelineRefreshResult(

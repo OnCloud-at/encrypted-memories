@@ -70,6 +70,9 @@ struct LibraryChangeRetryCount: Equatable {
 public enum LibraryChangeRefreshOutcome: Sendable, Equatable {
     /// Only this revision belongs to the published projection. Nil leaves monitoring unacknowledged.
     case refreshed(token: String?)
+    /// The refresh succeeded on a route that cannot confirm a whole-library revision (a filtered route).
+    /// The monitor leaves its baseline and backoff alone and waits for a newer token or `resumeDeferredRefresh()`.
+    case refreshedWithoutRevision
     case retry
     case terminal
 }
@@ -99,6 +102,10 @@ public actor LibraryChangeMonitor {
     private var nextTaskID: UInt64 = 0
     private var desiredLifecycle: DesiredLifecycle = .stopped(resetBaseline: false)
     private var lastToken: String?
+    /// The token whose refresh succeeded on a route that could not confirm it. It is not refreshed again.
+    private var deferredToken: String?
+    /// Counts host resumes, so a resume during a refresh keeps that refresh's token pending.
+    private var resumeGeneration: UInt64 = 0
 
     public init() {}
 
@@ -131,7 +138,10 @@ public actor LibraryChangeMonitor {
     }
 
     private func launch(_ request: StartRequest) {
-        if request.resetBaseline { lastToken = nil }
+        if request.resetBaseline {
+            lastToken = nil
+            deferredToken = nil
+        }
         // A startup seed fills only an unknown baseline. Reappearing views must not overwrite a newer token the
         // same monitor already observed while the app was running.
         if lastToken == nil, let initialToken = request.initialToken { lastToken = initialToken }
@@ -162,9 +172,21 @@ public actor LibraryChangeMonitor {
                     let token = try await request.provider.libraryChangeToken()
                     try Task.checkCancellation()
                     if let lastToken, token != lastToken {
+                        // A filtered route already refreshed for this token. Wait for a newer token or a resume.
+                        if token == deferredToken {
+                            try await Task.sleep(for: request.policy.interval)
+                            continue
+                        }
+                        let generation = resumeGeneration
                         switch await request.onChange() {
+                        case .refreshedWithoutRevision:
+                            try Task.checkCancellation()
+                            if generation == resumeGeneration { deferredToken = token }
+                            try await Task.sleep(for: request.policy.interval)
+                            continue
                         case .refreshed(let publishedToken):
                             try Task.checkCancellation()
+                            deferredToken = nil
                             if let publishedToken { self.lastToken = publishedToken }
                             guard publishedToken == token else {
                                 try? await Task.sleep(for: retryCount.nextDelay(for: token, policy: request.policy))
@@ -205,6 +227,13 @@ public actor LibraryChangeMonitor {
                 }
             }
         }
+    }
+
+    /// Lets the next probe refresh again for a token that a route-limited refresh deferred. A host calls this
+    /// when its route can confirm whole-library revisions again.
+    public func resumeDeferredRefresh() {
+        deferredToken = nil
+        resumeGeneration &+= 1
     }
 
     public func stop() async {
@@ -250,6 +279,7 @@ public actor LibraryChangeMonitor {
         task = nil
         activeTaskID = nil
         lastToken = nil
+        deferredToken = nil
         desiredLifecycle = .stopped(resetBaseline: false)
         await onTerminal(error)
     }
@@ -281,7 +311,10 @@ public actor LibraryChangeMonitor {
         guard task == nil, retiringTaskID == nil else { return }
         switch desiredLifecycle {
         case .stopped(let resetBaseline):
-            if resetBaseline { lastToken = nil }
+            if resetBaseline {
+                lastToken = nil
+                deferredToken = nil
+            }
             desiredLifecycle = .stopped(resetBaseline: false)
         case .start(let request):
             launch(request)

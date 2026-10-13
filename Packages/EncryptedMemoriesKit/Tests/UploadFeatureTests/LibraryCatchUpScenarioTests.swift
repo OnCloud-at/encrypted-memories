@@ -144,6 +144,7 @@ final class LibraryCatchUpScenarioTests: XCTestCase {
             let observed9 = await repository.filteredListings
             XCTAssertEqual(observed9, 2, "One filter selection and one changed-token refresh")
             await model.select(.all)
+            await monitor.resumeDeferredRefresh()
             await repository.releaseProbe()
             await repository.waitForProbes(5)
             await monitor.stop()
@@ -159,6 +160,53 @@ final class LibraryCatchUpScenarioTests: XCTestCase {
             XCTAssertEqual(observed13, 2)
             await feed.stopPrefetch()
         }
+
+        @MainActor
+        func testRemoteChangesOnAFilteredRouteRefreshOncePerTokenAndConfirmOnAllPhotos() async throws {
+            let harness = try EditScenarioHarness()
+            defer { try? harness.cleanup() }
+            _ = harness.server.seedLink(digest: Data("first-photo".utf8))
+            let repository = CatchUpEditRepository(server: harness.server)
+            let feed = makeFeed(directory: harness.directory)
+            let model = TimelineViewModel(repository: repository, feed: feed.feedCore, library: repository)
+            await model.load()
+            let baseline = model.initialLibraryChangeToken
+            await model.select(.tag(.favorites))
+            _ = harness.server.seedLink(digest: Data("first-remote-photo".utf8))
+            let monitor = LibraryChangeMonitor()
+            await monitor.start(provider: repository, policy: policy, initialToken: baseline) {
+                await Self.refresh(model)
+            }
+            await repository.waitForProbes(8)
+            let firstFiltered = await repository.filteredListings
+            XCTAssertEqual(firstFiltered, 2, "One filter selection and exactly one refresh for the first change")
+            let firstBaseline = await monitor.testingBaseline()
+            XCTAssertEqual(firstBaseline, baseline, "A filtered route never installs a baseline")
+
+            _ = harness.server.seedLink(digest: Data("second-remote-photo".utf8))
+            await repository.waitForProbes(16)
+            let secondFiltered = await repository.filteredListings
+            XCTAssertEqual(secondFiltered, 3, "A newer token refreshes exactly once more, then stays quiet")
+            let quietBaseline = await monitor.testingBaseline()
+            XCTAssertEqual(quietBaseline, baseline)
+            let quietFull = await repository.fullListings
+            XCTAssertEqual(quietFull, 1, "A filtered route never lists the whole library")
+
+            await model.select(.all)
+            await monitor.resumeDeferredRefresh()
+            await repository.waitForBaseline(of: monitor)
+            let confirmed = await monitor.testingBaseline()
+            let cursor = await repository.currentCursor
+            XCTAssertEqual(confirmed, cursor, "Returning to All Photos confirms the whole-library revision")
+            await repository.waitForProbes(await repository.probeCount + 6)
+            await monitor.stop()
+            let fullListings = await repository.fullListings
+            XCTAssertEqual(
+                fullListings, 3, "Initial, return to All Photos and one confirmation; later probes do not list")
+            let filteredListings = await repository.filteredListings
+            XCTAssertEqual(filteredListings, 3)
+            await feed.stopPrefetch()
+        }
     #endif
 
     @MainActor
@@ -166,7 +214,7 @@ final class LibraryCatchUpScenarioTests: XCTestCase {
         let result = await model.refreshLibrary()
         if result.failureReason == .scopeAccessLost { return .terminal }
         guard result.failureReason == nil else { return .retry }
-        return .refreshed(token: result.publishedLibraryChangeToken)
+        return result.refreshedOutcome
     }
 
     private var policy: LibraryChangePollingPolicy {
@@ -194,7 +242,7 @@ private actor CatchUpEditRepository: PhotosRepository, PhotoLibraryProvider, Lib
     private var holdsNextListing = false
     private var listingHeld = false
     private var heldListing: CheckedContinuation<Void, Never>?
-    private var probes = 0
+    private(set) var probes = 0
     private var holdsSecondProbe = false
     private var heldProbe: CheckedContinuation<Void, Never>?
     init(server: EditScenarioServer) { base = EditLibraryRepository(server: server) }
@@ -265,6 +313,13 @@ private actor CatchUpEditRepository: PhotosRepository, PhotoLibraryProvider, Lib
         holdsSecondProbe = false
         heldProbe?.resume()
         heldProbe = nil
+    }
+    var probeCount: Int { probes }
+    func waitForBaseline(of monitor: LibraryChangeMonitor) async {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while await monitor.testingBaseline() != currentCursor, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
     }
     func waitForProbes(_ count: Int) async {
         let deadline = ContinuousClock.now + .seconds(3)

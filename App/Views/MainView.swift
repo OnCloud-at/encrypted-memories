@@ -295,7 +295,11 @@ struct MainView: View {
                 // placement when geometry is valid.
                 routeInitialScrollAnchor = routeScrollPositions[newValue]
                 routeScrollGeneration += 1
-                Task { await timelineModel.select(newValue) }
+                Task {
+                    await timelineModel.select(newValue)
+                    // All Photos loads the whole library, so the monitor can confirm a deferred revision again.
+                    if newValue == .all { await libraryChangeMonitor.resumeDeferredRefresh() }
+                }
             }
             .onChange(of: model.pendingTrash.localUIDs) { _, _ in
                 timelineModel.setPendingTrash(model.pendingTrash)
