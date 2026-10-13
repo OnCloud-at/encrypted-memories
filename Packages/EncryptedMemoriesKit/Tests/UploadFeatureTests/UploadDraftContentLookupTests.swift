@@ -486,6 +486,93 @@ final class UploadDraftContentLookupTests: XCTestCase {
         }
     }
 
+    func testTypedVisibilityCancellationPropagatesBehindADraft() async throws {
+        let errors: [any Error] = [UploadError.cancelled, URLError(.cancelled)]
+        for error in errors {
+            let server = EditScenarioServer()
+            let (pipeline, descriptor, draft) = fixture(server: server)
+            let active = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+            server.setVisibilityError(error, whenAskingFor: active.nodeID)
+            do {
+                _ = try await pipeline.resolve(descriptor)
+                XCTFail("A typed visibility cancellation must escape the optional content pass")
+            } catch {
+                XCTAssertTrue((error as? UploadError) == .cancelled || (error as? URLError)?.code == .cancelled)
+            }
+            let record = await pipeline.identityRecord(for: descriptor.source)
+            XCTAssertNil(record?.remoteLinkID)
+            XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft)
+            server.setVisibilityError(nil, whenAskingFor: active.nodeID)
+            await pipeline.invalidateCachedRemoteState()
+            let retried = try await resolveBeforeTimeout(pipeline, descriptor: descriptor)
+            XCTAssertEqual(retried.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+        }
+    }
+
+    func testCancelledCallerWithVisibilityFailurePropagatesBehindADraft() async throws {
+        let server = EditScenarioServer()
+        let (pipeline, descriptor, draft) = fixture(server: server)
+        let active = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        server.cancelCallerAtContentLookup(true)
+        server.setVisibilityError(UploadError.backend("Visibility failed after Stop"), whenAskingFor: active.nodeID)
+        let task = Task { try await pipeline.resolve(descriptor) }
+        do {
+            _ = try await task.value
+            XCTFail("Stop must propagate out of the optional visibility pass")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected task cancellation instead of a visibility error: \(error)")
+        }
+        let record = await pipeline.identityRecord(for: descriptor.source)
+        XCTAssertNil(record?.remoteLinkID)
+        XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft)
+        server.cancelCallerAtContentLookup(false)
+        server.setVisibilityError(nil, whenAskingFor: active.nodeID)
+        await pipeline.invalidateCachedRemoteState()
+        let retried = try await resolveBeforeTimeout(pipeline, descriptor: descriptor)
+        XCTAssertEqual(retried.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+    }
+
+    func testFirstBatchVisibilityFailureKeepsTheDraftInsteadOfAdoptingTheSecondBatch() async throws {
+        try await assertBatchedVisibilityFailure(blocked: true)
+    }
+
+    func testNormalContentPassKeepsItsFailOpenVisibilityBehaviorAcrossBatches() async throws {
+        try await assertBatchedVisibilityFailure(blocked: false)
+    }
+
+    private func assertBatchedVisibilityFailure(blocked: Bool) async throws {
+        let server = EditScenarioServer()
+        let (_, descriptor, _) = fixture(server: EditScenarioServer())
+        let store = FakeIdentityStore()
+        let pipeline = UploadDedupePipeline(store: store, checker: server, currentClientUID: "this-uploader")
+        let draft =
+            blocked
+            ? server.seedDraft(
+                name: descriptor.filename, digest: Data(repeating: 3, count: 20), clientUID: "other-uploader")
+            : nil
+        let other = server.seedLink(digest: Data(repeating: 2, count: 20))
+        let related = (0..<8).map { _ in server.seedLink(digest: descriptor.precomputedSHA1Digest!, main: other) }
+        let active = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let rows = (related + [active]).map { uid in server.links.first { $0.uid == uid }!.duplicate }
+        server.setContentLookupRows(rows)
+        server.setVisibilityError(
+            UploadError.backend("First batch visibility failed"), whenAskingFor: related[0].nodeID)
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(
+            result.decision,
+            blocked
+                ? .skip(.draftExists, remoteLinkID: draft?.nodeID)
+                : .skip(.activeDuplicate, remoteLinkID: related[0].nodeID))
+        XCTAssertEqual(store.record(for: descriptor.source)?.remoteLinkID, blocked ? nil : related[0].nodeID)
+        XCTAssertEqual(store.record(for: descriptor.source)?.outcome, blocked ? nil : "duplicateActive")
+        XCTAssertEqual(server.contentLookupCount, 1)
+        XCTAssertEqual(server.uploadRequestCount, 0)
+        if let draft { XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft) }
+    }
+
     private func resolveBeforeTimeout(
         _ pipeline: UploadDedupePipeline, descriptor: UploadResourceDescriptor
     ) async throws -> UploadPreflightResult {

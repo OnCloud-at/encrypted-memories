@@ -330,7 +330,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     for start in stride(from: 0, to: found.count, by: Self.rootMatchBatchSize) {
                         let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
                         let contentCandidates = try await candidates(
-                            batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
+                            batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement,
+                            requiresActiveMain: blockedByDraft)
                         provesLive = provesLive || contentCandidates.provesLive
                         let excluded =
                             blockedByDraft
@@ -604,7 +605,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         _ remoteItems: [RemotePhotoDuplicate],
         contentHash: String,
         descriptor: UploadResourceDescriptor,
-        replacement: UploadReplacementScope
+        replacement: UploadReplacementScope,
+        requiresActiveMain: Bool = false
     ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
         if descriptor.source.resource.isBurstMember {
             return (
@@ -626,7 +628,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             guard descriptor.source.resource == .primary, descriptor.mainRemoteLinkID == nil else {
                 return (remoteItems, false)
             }
-            return (try await rootEligible(remoteItems, contentHash: contentHash), false)
+            return (
+                try await rootEligible(remoteItems, contentHash: contentHash, requiresActiveMain: requiresActiveMain),
+                false
+            )
         }
         // Only the state of a photo shows that it is still in the library: its current upload is active, the
         // person restored an earlier version, or an active main photo holds these bytes.
@@ -712,12 +717,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// under an edited photo, or a paired video. Those bytes do not make a photo of their own, so the primary
     /// uploads as its own photo. With a replacement, `candidates` already counts only live main photos.
     private func rootEligible(
-        _ remoteItems: [RemotePhotoDuplicate], contentHash: String
+        _ remoteItems: [RemotePhotoDuplicate], contentHash: String, requiresActiveMain: Bool
     ) async throws -> [RemotePhotoDuplicate] {
         let matches = Set(
             remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }.compactMap(\.linkID))
         guard !matches.isEmpty else { return remoteItems }
-        let related = try await relatedLinks(among: matches)
+        let related = try await relatedLinks(among: matches, requiresActiveMain: requiresActiveMain)
         guard !related.isEmpty else { return remoteItems }
         return remoteItems.filter { item in item.linkID.map { !related.contains($0) } ?? true }
     }
@@ -777,6 +782,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                guard !requiresActiveMain else { throw error }
                 try Task.checkCancellation()
             }
             // A view invalidated while this read ran stays invalidated; the answer still serves this resolve.
