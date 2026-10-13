@@ -324,3 +324,47 @@ A maintainer can retry the run after fixing the cause.
 To deliberately override the gate, dispatch `Apple release` from `main` with an existing published
 `release_tag`, the same value in `upgrade_override_tag`, and a nonempty `upgrade_override_reason`.
 The summary records the override and its reason. Automatic release events cannot override the gate.
+
+## iPhone Duo verification
+
+Build with Xcode 27.1 or newer and install the iOS 27.1 simulator runtime before selecting iPhone Duo.
+`project.yml` keeps the existing deployment targets. The selected Xcode supplies the SDK;
+do not pin a versioned `SDKROOT` or a machine-specific Xcode path.
+
+Select the full Xcode toolchain with `DEVELOPER_DIR`, then use the existing test scripts:
+
+```bash
+export IOS_TEST_DESTINATION="platform=iOS Simulator,name=iPhone Duo,OS=latest"
+./scripts/verify-ios-app-tests.sh
+./scripts/verify-ios-app-tests.sh ui
+unset IOS_TEST_DESTINATION
+```
+
+The override is optional. Without it, the scripts keep selecting an installed iPhone simulator.
+A named override selects the newest matching runtime. `OS=27` matches 27.x; `OS=27.1` matches
+27.1 and 27.1.x. A three-component value such as `OS=27.1.0` matches exactly, with missing runtime
+components treated as zero. An omitted OS or `OS=latest` selects the newest runtime.
+OS values must use `latest` or one to three numeric components. Invalid OS values, empty `id=` or
+`OS=` fields, and fields without `=` fail with exit 64. Simulator names containing a comma are not
+supported; use `id=` for those devices. An `id=` override selects an existing simulator directly.
+Both test modes wait for that simulator
+to boot and pass the same device ID to Xcode. `build-for-testing` does not boot a simulator.
+Command tests cover these choices in `.github/scripts/test_ios_test_commands.py`.
+
+The Duo simulator starts on its outer display. Set the fully open, book, and tabletop poses in
+Device Hub before their runs. XCTest and `simctl` have no fold or pose command in Xcode 27.1.
+Rotation uses the documented `XCUIDevice.orientation` property; rotation does not open the inner display.
+Record the actual pose and orientation for each result. Do not label a window resize as a display handoff.
+Fold and unfold during grid, viewer, selection, and search flows remain manual checks.
+
+An explicit Duo baseline can expose existing failures without changing the default simulator run.
+List each failure, its evidence, and its owning issue in the pull request. Keep every existing assertion;
+correct the underlying behavior or test assumption in its owning change.
+
+Hosted CI uses the Xcode installed on its runner image. A Duo run needs Xcode 27.1, the matching
+simulator runtime, and a Duo simulator. A workflow change must select the installed toolchain and
+update the expected Xcode version together. Keep the merge queue and required checks unchanged.
+
+References: [Preparing your app for iPhone Duo](https://developer.apple.com/documentation/technologyoverviews/preparing-your-app-for-iphone-duo),
+[Device Hub interaction](https://developer.apple.com/documentation/xcode/interacting-with-your-app-in-device-hub),
+and [XCUIDevice.orientation](https://developer.apple.com/documentation/xcuiautomation/xcuidevice/orientation).
