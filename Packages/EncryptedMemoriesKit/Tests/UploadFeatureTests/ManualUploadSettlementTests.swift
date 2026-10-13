@@ -494,9 +494,8 @@ final class ManualUploadSettlementTests: XCTestCase {
         let ids = await manager.enqueueFiles([try file()], destination: .library)
         let id = try XCTUnwrap(ids.first)
         _ = await waitUntil(manager) { items in
-            guard let state = items.first?.state else { return false }
-            if case .failed = state { return true }
-            return false
+            guard case .failed(let message) = items.first?.state else { return false }
+            return message == "Durable manual upload settlement could not be read."
         }
 
         for _ in 0..<3 {
@@ -510,7 +509,9 @@ final class ManualUploadSettlementTests: XCTestCase {
             return XCTFail(
                 "a settlement read failure must remain visibly failed: \(String(describing: visible.first?.state))")
         }
-        XCTAssertTrue(message.localizedCaseInsensitiveContains("read"), "failure must identify the store read failure")
+        XCTAssertTrue(
+            message.localizedCaseInsensitiveContains("read"),
+            "failure must identify the store read failure; actual: \(message)")
         await manager.shutdown()
     }
 

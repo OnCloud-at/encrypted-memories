@@ -331,8 +331,15 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     let contentCandidates = try await candidates(
                         batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
                     provesLive = provesLive || contentCandidates.provesLive
+                    let excluded =
+                        blockedByDraft
+                        ? try await relatedLinks(
+                            among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true)
+                        : []
                     if let remoteContent = contentCandidates.items.first(where: {
-                        !blockedByDraft || $0.linkState == .active
+                        guard blockedByDraft else { return true }
+                        guard $0.linkState == .active, let linkID = $0.linkID else { return false }
+                        return !excluded.contains(linkID)
                     }) {
                         decision = decisionForRemoteContent(
                             remoteContent,
@@ -742,8 +749,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// The links that the server names as a related file of a main photo. The name and duplicate rows carry no
     /// role, so the visibility read proves it. `prime` normally read it already; only a link that it did not
     /// cover costs one read here. A link that the server no longer names, or a failed read, proves nothing: the
-    /// rows stay as listed, as before this check.
-    private func relatedLinks(among linkIDs: Set<String>) async throws -> Set<String> {
+    /// rows stay as listed, as before this check. A blocked name instead requires positive active-main proof:
+    /// strict callers also exclude unknown and inactive links.
+    private func relatedLinks(
+        among linkIDs: Set<String>, requiresActiveMain: Bool = false
+    ) async throws -> Set<String> {
         var known = rootVisibility
         let unasked = linkIDs.subtracting(rootVisibilityAsked)
         if !unasked.isEmpty {
@@ -763,7 +773,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             known = rootVisibility.merging(read) { _, new in new }
         }
-        return linkIDs.filter { known[$0]?.mainPhotoLinkID != nil }
+        return linkIDs.filter {
+            if requiresActiveMain {
+                return known[$0]?.isActiveMain != true
+            }
+            return known[$0]?.mainPhotoLinkID != nil
+        }
     }
 
     /// An earlier version that the person restored is the photo again: it leaves the retired list.

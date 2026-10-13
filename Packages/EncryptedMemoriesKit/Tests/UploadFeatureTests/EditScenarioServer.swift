@@ -72,6 +72,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var incompleteLineageRead: LineageRead?
     private var failLineageRead = false
     private var failVisibilityRead = false
+    private var omittedVisibilityLinks: Set<String> = []
     private var failCompoundRead = false
     private var cancelCompoundRead = false
     private var failRelatedLookupForTrashedMain = false
@@ -95,6 +96,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     var uploadRequestCount: Int { lock.withLock { uploadRequests } }
 
     func setContentLookupError(_ error: Error?) { lock.withLock { contentLookupError = error } }
+    func omitVisibility(of linkIDs: Set<String>) { lock.withLock { omittedVisibilityLinks = linkIDs } }
     func returnInactiveContentFromStaleIndex() { lock.withLock { includeInactiveContent = true } }
     var personDeletedAssets: [String: Set<String>] { lock.withLock { deletedAssets } }
     var steps: [Step] { lock.withLock { history } }
@@ -507,7 +509,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             }
             var result: [String: RemoteLinkVisibility] = [:]
             for linkID in linkIDs {
-                guard let link = table[linkID], link.state != .deleted else { continue }
+                guard !omittedVisibilityLinks.contains(linkID), let link = table[linkID], link.state != .deleted else {
+                    continue
+                }
                 result[linkID] = RemoteLinkVisibility(
                     isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID,
                     trashTime: link.state == .trashed || staleTrashTime ? link.trashTime : nil)
