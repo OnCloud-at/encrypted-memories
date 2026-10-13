@@ -114,6 +114,40 @@ final class MobileDuplicatesUITests: XCTestCase {
         add(attachment)
     }
 
+    func testRetryReloadsDuplicatesAfterAnInvalidatingMergeFailedToReload() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesReloadFailure"])
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+        app.buttons["duplicates.merge.0"].tap()
+        let retry = app.buttons["Retry"].firstMatch
+        XCTAssertTrue(retry.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
+        XCTAssertFalse(group(0).exists, "invalidated rows stay hidden")
+        XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
+        keepScreenshot("duplicates-ios-reload-failed")
+
+        retry.tap()
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10), "Retry restores the checked list")
+        XCTAssertTrue(app.buttons["duplicates.mergeAll"].isEnabled)
+        XCTAssertFalse(retry.exists)
+        XCTAssertTrue(app.staticTexts["4 identical copies"].exists)
+    }
+
+    func testRetryRestartsTheLibraryCheckAfterTwoServiceInterruptions() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesCheckingFixture",
+            extra: ["-EncryptedMemoriesDuplicatesInterruptedCheck"])
+        let retry = app.buttons["Retry"].firstMatch
+        XCTAssertTrue(retry.waitForExistence(timeout: 10), "two interruptions must end waiting")
+        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
+        XCTAssertFalse(app.staticTexts["Duplicates appear here when it is done."].exists)
+        keepScreenshot("duplicates-ios-interrupted-check")
+
+        retry.tap()
+        XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 10))
+        XCTAssertFalse(retry.exists)
+    }
+
     func testMergeRemovesTheGroupFromDuplicates() {
         openDuplicates()
         let merge = app.buttons["duplicates.merge.0"]

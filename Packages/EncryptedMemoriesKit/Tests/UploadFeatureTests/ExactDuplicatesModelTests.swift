@@ -140,6 +140,78 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.maximumConcurrentRankings, 1)
     }
 
+    func testALateRankingPageCannotCheckAGroupAfterAnInvalidatingMergeReload() async {
+        let initial = manyGroups(60)
+        let affected = initial[48]
+        for outcome: ExactDuplicateMergeOutcome in [
+            .merged(kept: affected.members[0], trashed: [], keptDuplicates: [affected.members[1]: .differentDetails]),
+            .skipped(.preselectionChanged),
+        ] {
+            let finder = FakeDuplicateFinder(scans: [
+                .init(groups: initial, coverage: .complete), .init(groups: [affected], coverage: .complete),
+            ])
+            finder.outcomes[affected.id] = outcome
+            let (model, _) = makeModel(finder)
+            await model.load()
+            let delivery = BuildGate()
+            delivery.close()
+            finder.beforeRankingPage = { _ in await delivery.pass() }
+            model.groupAppeared(affected.id)
+            await waitUntil({ delivery.hasWaiters }, "a scroll page has read its old metadata")
+            finder.beforeRankingPage = nil
+            finder.mergeGate.close()
+            let merge = Task { await model.mergeAll() }
+            await waitUntil({ finder.mergeGate.hasWaiters }, "Merge All accepts its current ranking")
+            finder.rankGate.close()
+            finder.fingerprints[affected.members[1]] = ExactDuplicateFingerprint(pixelWidth: 42)
+            finder.mergeGate.open()
+            await waitUntil({ finder.scanCalls == 2 && finder.rankGate.hasWaiters }, "the reload checks fresh metadata")
+            XCTAssertFalse(model.groups[0].isRanked)
+            delivery.open()
+            await waitUntil({ finder.activeRankings == 1 }, "the cancelled scroll callback finishes")
+
+            XCTAssertFalse(model.groups[0].isRanked, "old metadata cannot mark the replacement group checked")
+            XCTAssertNil(model.knownDuplicateCount)
+            XCTAssertEqual(model.visibleGroups, [])
+            finder.rankGate.open()
+            await merge.value
+            XCTAssertEqual(model.groups, [], "fresh metadata shows that these copies have different details")
+            XCTAssertNil(model.knownDuplicateCount)
+        }
+    }
+
+    func testAnInvalidatedFailedReloadOffersRetryAndRejectsAnotherMergeAll() async {
+        for outcome: ExactDuplicateMergeOutcome in [
+            .merged(kept: a1, trashed: [], keptDuplicates: [a3: .differentDetails]),
+            .skipped(.preselectionChanged),
+        ] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+            finder.outcomes["A"] = outcome
+            let (model, _) = makeModel(finder)
+            await model.load(checkAllGroups: true)
+            finder.scanError = URLError(.notConnectedToInternet)
+            await model.mergeAll()
+
+            XCTAssertEqual(model.content, .groups)
+            XCTAssertEqual(model.groups.map(\.id), ["A"], "the model retains the group for a retry")
+            XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.load_failed"))
+            XCTAssertFalse(model.canMerge)
+            XCTAssertNil(model.knownDuplicateCount)
+            XCTAssertNil(model.metadataCheckNote)
+            XCTAssertNil(model.rankingLine)
+            let batches = finder.batches
+            await model.mergeAll()
+            XCTAssertEqual(finder.batches, batches, "invalidated groups cannot start another merge")
+            XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.load_failed"))
+
+            finder.scanError = nil
+            await model.load()
+            XCTAssertNil(model.checkFailedNote)
+            XCTAssertTrue(model.canMerge)
+            XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+        }
+    }
+
     func testAnInvalidatingMergeHidesTheListUntilTheAffectedGroupIsCheckedAgain() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         finder.outcomes = ["A": .merged(kept: a1, trashed: [], keptDuplicates: [a3: .differentDetails])]
@@ -1369,6 +1441,32 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.mergeGate.open()
         await merge.value
         XCTAssertEqual(model.groups.map(\.id).contains("B"), true, "the groups of the new index show after the merge")
+    }
+
+    func testTwoServiceInterruptionsOfferRetryInsteadOfWaitingWithoutABuild() async {
+        for candidates in [[], [groupA]] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: candidates, coverage: .indexing)])
+            finder.buildError = CancellationError()
+            let (model, _) = makeModel(finder)
+            await model.load(checkAllGroups: true)
+
+            XCTAssertEqual(finder.buildCalls, 2, "the load restarts only once")
+            XCTAssertNil(model.checkProgress)
+            XCTAssertFalse(model.isCheckingGroups)
+            if candidates.isEmpty {
+                XCTAssertEqual(model.content, .failed(L10n.string("duplicates.load_failed")))
+            } else {
+                XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.check_failed"))
+            }
+            finder.buildError = nil
+            finder.buildChanged = true
+            finder.replaceScans([.init(groups: candidates, coverage: .complete)])
+            await model.load()
+            XCTAssertEqual(finder.buildCalls, 3, "Retry can start a fresh build")
+            XCTAssertNil(model.checkFailedNote)
+            XCTAssertNotEqual(model.content, .stillChecking)
+            XCTAssertTrue(model.isComplete)
+        }
     }
 
     func testAServiceStopOfTheCheckDuringAMergeRestartsTheCheckAfterTheMerge() async {
@@ -2680,9 +2778,12 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var mergeErrors: [String: Error] = [:]
     var scanError: Error?
     var rankError: Error?
+    var beforeRankingPage: (@Sendable (ExactDuplicateRankingPage) async -> Void)?
     var afterRankingPage: (@MainActor @Sendable () -> Void)?
 
     init(scans: [ExactDuplicateScan]) { self.scans = scans }
+
+    func replaceScans(_ replacement: [ExactDuplicateScan]) { lock.withLock { scans = replacement } }
 
     var scanCalls: Int { lock.withLock { _scanCalls } }
     var rankCalls: Int { lock.withLock { _rankCalls } }
@@ -2780,6 +2881,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
                 members: members, groupCount: groups.count, byteSizes: sizes, shared: sharedMembers,
                 facts: pageFacts, memberByteSizes: pageSizes, fingerprints: pageFingerprints)
         }
+        let beforeReport = lock.withLock { beforeRankingPage }
+        await beforeReport?(page)
         await report(page)
         await afterRankingPage?()
     }

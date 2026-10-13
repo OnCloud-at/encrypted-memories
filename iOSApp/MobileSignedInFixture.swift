@@ -118,7 +118,9 @@ import UploadCore
                         rescanDropsLastGroup: ProcessInfo.processInfo.arguments.contains(
                             "-EncryptedMemoriesDuplicatesRescanDropsGroup"),
                         scanDelay: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil))
+                            "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil,
+                        invalidatingMergeReloadFails: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesReloadFailure")))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesLargeFixture") {
                 // 1,500 groups of two or three library photos, for the scrolling and memory measurement.
                 let items = sections.flatMap(\.items)
@@ -139,7 +141,10 @@ import UploadCore
                             "-EncryptedMemoriesDuplicatesSlowMerge") ? .milliseconds(500) : nil))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesCheckingFixture") {
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
-                    MobileFixtureDuplicates(groups: [], checking: true))
+                    MobileFixtureDuplicates(
+                        groups: [], checking: true,
+                        buildInterruptions: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesInterruptedCheck") ? 2 : 0))
             }
             runtime.sessionModel.installIsolatedSession(session)
         }
@@ -312,12 +317,18 @@ import UploadCore
         /// False stands for a merge whose check cannot run yet, which keeps Recently Deleted from being emptied.
         private let confirmsNoPendingMerges: Bool
         private var scans = 0
+        private let invalidatingMergeReloadFails: Bool
+        private var reloadMustFail = false
+        private let buildInterruptions: Int
+        private var buildCalls = 0
+        private var indexComplete = false
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
             rescanDropsLastGroup: Bool = false, scanDelay: Duration? = nil, rankDelay: Duration? = nil,
             mergeDelay: Duration? = nil,
-            confirmsNoPendingMerges: Bool = true
+            confirmsNoPendingMerges: Bool = true, invalidatingMergeReloadFails: Bool = false,
+            buildInterruptions: Int = 0
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -329,6 +340,8 @@ import UploadCore
             self.scanDelay = scanDelay
             self.mergeDelay = mergeDelay
             self.confirmsNoPendingMerges = confirmsNoPendingMerges
+            self.invalidatingMergeReloadFails = invalidatingMergeReloadFails
+            self.buildInterruptions = buildInterruptions
         }
 
         func confirmNoPendingMerges() async -> Bool { confirmsNoPendingMerges }
@@ -337,13 +350,20 @@ import UploadCore
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
         ) async throws -> ExactDuplicateScan {
             if let scanDelay { try await Task.sleep(for: scanDelay) }
-            let groups = lock.withLock {
+            let (groups, coverage) = try lock.withLock {
+                if reloadMustFail {
+                    reloadMustFail = false
+                    throw MobileFixtureError.unavailable
+                }
                 scans += 1
-                return rescanDropsLastGroup && scans > 1 ? Array(groups.dropLast()) : groups
+                return (
+                    rescanDropsLastGroup && scans > 1 ? Array(groups.dropLast()) : groups,
+                    checking && !indexComplete ? ExactDuplicateCoverage.indexing : .complete
+                )
             }
             let sizes: [Int64] = [5_200_000, 387_000]
             return ExactDuplicateScan(
-                groups: groups, coverage: checking ? .indexing : .complete,
+                groups: groups, coverage: coverage,
                 byteSizes: Dictionary(
                     groups.enumerated().map { ($1.id, sizes[$0 % sizes.count]) },
                     uniquingKeysWith: { first, _ in first }))
@@ -391,6 +411,14 @@ import UploadCore
             progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
         ) async throws -> Bool {
             guard checking else { return false }
+            if buildInterruptions > 0 {
+                return try lock.withLock {
+                    buildCalls += 1
+                    if buildCalls <= buildInterruptions { throw CancellationError() }
+                    indexComplete = true
+                    return true
+                }
+            }
             await progress(.init(phase: .indexing, completed: 1_234, total: 15_000))
             try await Task.sleep(for: .seconds(3_600))
             return false
@@ -398,6 +426,10 @@ import UploadCore
 
         func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
             if let mergeDelay { try? await Task.sleep(for: mergeDelay) }
+            if invalidatingMergeReloadFails {
+                lock.withLock { reloadMustFail = true }
+                return requests.map { _ in .success(.skipped(.preselectionChanged)) }
+            }
             lock.withLock { groups.removeAll { group in requests.contains { $0.group.id == group.id } } }
             return requests.map { request in
                 .success(
