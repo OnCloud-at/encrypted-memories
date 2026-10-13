@@ -151,6 +151,15 @@ final class BackupWaitingForWiFiTests: XCTestCase {
         XCTAssertFalse(other.endsWiFiWait(for: inputs(expensive: false, usesMobileData: true)))
     }
 
+    func testAnOfflinePathDoesNotEndTheWiFiWait() {
+        let waiting = BackupStatus(progress: waitingProgress(running: false, waitsForWiFi: true), isScanning: false)
+        for usesMobileData in [false, true] {
+            XCTAssertFalse(
+                waiting.endsWiFiWait(for: inputs(expensive: false, usesMobileData: usesMobileData, available: false)),
+                "A returned path must be reachable before it can end the Wi-Fi wait")
+        }
+    }
+
     // MARK: - Shared wording and symbol
 
     func testPresentationHasItsOwnHeadlineAccessoryAndReason() {

@@ -1389,7 +1389,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             signals.resetReads()
 
             let waiting = await waitUntil {
-                if returnsDuringScan { return scans.count == 1 && signals.hasBeenRead }
+                if returnsDuringScan { return scans.count == 1 && owners.values == [.manual] && signals.hasBeenRead }
                 return controller.status.phase == .waitingForWiFi && !controller.isSyncing
             }
             XCTAssertTrue(waiting, "The manual pass must reach the policy wait before the network returns")
@@ -1485,6 +1485,54 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let finished = await waitUntil { scans.count == 1 && !controller.isSyncing }
             XCTAssertTrue(finished, "A declined admission must not consume the person's retry intent")
             XCTAssertEqual(owners.values, [.manual])
+            await controller.shutdown()
+        }
+
+        func testManualRetrySurvivesAnOfflinePathBetweenCellularAndWiFi() async throws {
+            try await assertManualRetrySurvivesOffline(retryWhileOffline: false)
+        }
+
+        func testManualRetrySurvivesAnotherRetryWhileThePathIsOffline() async throws {
+            try await assertManualRetrySurvivesOffline(retryWhileOffline: true)
+        }
+
+        private func assertManualRetrySurvivesOffline(retryWhileOffline: Bool) async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-manual-offline-wifi", source: signals.source)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                _ = scans.increment()
+            }
+            await controller.retryUserResolvableWork()
+            let waiting = await waitUntil { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(waiting)
+            XCTAssertEqual(controller.status.phase, .waitingForWiFi)
+
+            signals.setNetworkAvailable(false)
+            signals.announceChange()
+            if retryWhileOffline {
+                await controller.retryUserResolvableWork()
+            } else {
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+            }
+            let offlinePassEnded = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(offlinePassEnded)
+            let offlinePassCount = retryWhileOffline ? 2 : 1
+            XCTAssertEqual(
+                scans.count, offlinePassCount, "An offline snapshot must not consume the pending manual retry")
+
+            signals.setNetworkAvailable(true)
+            signals.setWaitsForWiFi(false)
+            signals.announceChange()
+
+            let resumed = await waitUntil { scans.count > offlinePassCount && !controller.isSyncing }
+            XCTAssertTrue(resumed, "The retry survives the offline path and resumes without the index backoff")
+            XCTAssertEqual(owners.values, Array(repeating: .manual, count: offlinePassCount + 1))
             await controller.shutdown()
         }
 
@@ -2038,6 +2086,7 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
     private let lock = NSLock()
     private var waitsForWiFi: Bool
     private var networkDetermined: Bool
+    private var networkAvailable = true
     private var reads = 0
     private var continuations: [AsyncStream<LibraryRuntimeSnapshot>.Continuation] = []
 
@@ -2054,6 +2103,8 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
     }
 
     func setWaitsForWiFi(_ value: Bool) { lock.withLock { waitsForWiFi = value } }
+
+    func setNetworkAvailable(_ value: Bool) { lock.withLock { networkAvailable = value } }
 
     var hasBeenRead: Bool { lock.withLock { reads > 0 } }
 
@@ -2077,7 +2128,8 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
         lock.withLock {
             reads += 1
             return BackupThrottleInputs(
-                isNetworkExpensive: waitsForWiFi, usesMobileData: false, isNetworkDetermined: networkDetermined)
+                isNetworkAvailable: networkAvailable, isNetworkExpensive: waitsForWiFi, usesMobileData: false,
+                isNetworkDetermined: networkDetermined)
         }
     }
 }

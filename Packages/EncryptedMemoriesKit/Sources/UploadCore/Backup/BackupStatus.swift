@@ -343,10 +343,9 @@ public struct BackupStatus: Sendable, Equatable {
         }
     }
 
-    /// True when a pass should start because the Wi-Fi wait no longer holds: the device left the expensive network,
-    /// or the person turned mobile data on. The pass then derives the honest state again.
+    /// A reachable permitted path ends the Wi-Fi wait, including an expensive path when mobile data is on.
     public func endsWiFiWait(for inputs: BackupThrottleInputs) -> Bool {
-        phase == .waitingForWiFi && !inputs.waitsForWiFi
+        phase == .waitingForWiFi && inputs.canEndWiFiWait
     }
 
     /// Scaled units let a continued-processing task advance within one large item while preserving
