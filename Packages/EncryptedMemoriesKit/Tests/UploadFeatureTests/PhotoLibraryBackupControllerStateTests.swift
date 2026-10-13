@@ -1400,6 +1400,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             if !returnsDuringScan {
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                XCTAssertFalse(controller.isSyncing, "An expensive path cannot start the pending manual retry")
                 XCTAssertEqual(scans.count, 1, "An expensive path must not consume the pending manual retry")
             }
             signals.setNetworkDetermined(true)

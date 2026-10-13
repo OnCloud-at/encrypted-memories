@@ -194,7 +194,7 @@ public final class PhotoLibraryBackupController {
     /// The runner ended the current pass waiting for Wi-Fi. Reset when a pass starts.
     private var passWaitedForWiFi = false
     private var passPausedByPolicy = false
-    /// A manual pass that ended before index preparation keeps its retry intent until the resumed pass gets past its policy pause.
+    /// A manual Wi-Fi retry stays pending until the resumed pass gets past its policy pause.
     private var manualWiFiRetryPending = false
     /// The owner of a foreground or explicit pass that did not start because no network path had arrived yet. The
     /// first path, the setting, or the end of `firstNetworkPathWait` starts it. An explicit action outranks an
