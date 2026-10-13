@@ -590,7 +590,7 @@ public final class ExactDuplicatesModel {
         if phase == .failed, !groups.isEmpty { return L10n.string("duplicates.load_failed") }
         guard phase == .loaded, !isBuilding else { return nil }
         if rankingFailed { return L10n.string("duplicates.check_failed") }
-        guard buildFailed, case .indexing = coverage else { return nil }
+        guard buildFailed, !isComplete else { return nil }
         return L10n.string("duplicates.check_failed")
     }
 

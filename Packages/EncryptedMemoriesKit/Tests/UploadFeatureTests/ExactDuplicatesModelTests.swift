@@ -1481,6 +1481,56 @@ final class ExactDuplicatesModelTests: XCTestCase {
         }
     }
 
+    func testTwoServiceInterruptionsOfferRetryWithRetainedGroupsFromAnIncompleteIndex() async {
+        for coverage: ExactDuplicateCoverage in [.incomplete(unresolvedCount: 3), .complete] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: coverage)])
+            finder.buildError = CancellationError()
+            finder.buildGate.close()
+            let (model, _) = makeModel(finder)
+            let load = Task { await model.load(checkAllGroups: true) }
+            await waitUntil(
+                { finder.buildGate.hasWaiters && model.groups.allSatisfy(\.isRanked) },
+                "the published group is ranked before the service interrupts preparation")
+            finder.buildGate.open()
+            await load.value
+
+            XCTAssertEqual(finder.buildCalls, 2, "only one automatic restart runs")
+            XCTAssertEqual(model.content, .groups)
+            XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+            XCTAssertTrue(model.visibleGroups.allSatisfy(\.isRanked))
+            XCTAssertFalse(model.isCheckingGroups)
+            XCTAssertNil(model.checkProgress)
+            XCTAssertEqual(
+                model.checkFailedNote, coverage.isComplete ? nil : L10n.string("duplicates.check_failed"),
+                "an interrupted incomplete check offers Retry beside retained checked groups")
+
+            finder.buildError = nil
+            finder.buildChanged = true
+            finder.replaceScans([.init(groups: [groupA, groupB], coverage: .complete)])
+            await model.load()
+            XCTAssertEqual(finder.buildCalls, 3, "Retry starts a fresh preparation")
+            XCTAssertEqual(model.visibleGroups.map(\.id), ["A", "B"])
+            XCTAssertTrue(model.visibleGroups.allSatisfy(\.isRanked))
+            XCTAssertEqual(model.knownDuplicateCount, 3)
+            XCTAssertTrue(model.isComplete)
+            XCTAssertNil(model.checkFailedNote)
+        }
+    }
+
+    func testAFinishedDegradedCheckShowsNoRetryWithRetainedRankedGroups() async {
+        let finder = FakeDuplicateFinder(
+            scans: [.init(groups: [groupA], coverage: .incomplete(unresolvedCount: 3))])
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+
+        XCTAssertEqual(finder.buildCalls, 1)
+        XCTAssertEqual(model.visibleGroups.map(\.id), ["A"])
+        XCTAssertTrue(model.visibleGroups.allSatisfy(\.isRanked))
+        XCTAssertNil(model.checkProgress)
+        XCTAssertNil(model.checkFailedNote, "a successfully finished degraded check has no useful Retry")
+        XCTAssertEqual(model.uncheckedNote, L10n.string("duplicates.unchecked \(3)"))
+    }
+
     func testTwoServiceInterruptionsOfferRetryInsteadOfWaitingWithoutABuild() async {
         for candidates in [[], [groupA]] {
             let finder = FakeDuplicateFinder(scans: [.init(groups: candidates, coverage: .indexing)])
