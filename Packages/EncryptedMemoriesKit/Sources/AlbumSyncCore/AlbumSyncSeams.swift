@@ -66,7 +66,13 @@ public protocol AlbumSyncBackupExecuting: Sendable {
         localIdentifiers: [String],
         onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport
+    /// Resolves only settled assets whose upload manifest has no link. The proof stays transient.
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink]
     func stop() async
+}
+
+public extension AlbumSyncBackupExecuting {
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] { [:] }
 }
 
 /// Remote (Proton) album operations the sync engine needs. Implemented by the backend package;

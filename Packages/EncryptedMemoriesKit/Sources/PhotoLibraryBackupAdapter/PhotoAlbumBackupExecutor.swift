@@ -216,6 +216,18 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         )
     }
 
+    public func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        guard
+            let queue = UploadBackupSyncQueueManifestStore(
+                url: accountDataDirectory.appendingPathComponent(Self.queueDatabaseFileName),
+                policy: databasePolicy)
+        else { throw AlbumSyncError.mappingStoreUnavailable }
+        defer { queue.close() }
+        return try await AlbumSyncRemoteProofLookup.remoteLinks(
+            for: localIdentifiers, catalog: PhotoLibraryBackupCatalog(localIdentifiers: localIdentifiers),
+            queue: queue, resolver: identityResolver)
+    }
+
     public func stop() async {
         let (operation, runner) = lock.withLock {
             stopOwnerCount += 1

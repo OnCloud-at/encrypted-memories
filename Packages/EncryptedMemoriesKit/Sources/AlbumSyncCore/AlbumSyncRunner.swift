@@ -172,7 +172,12 @@ public actor AlbumSyncRunner {
         // Build the pure, idempotent attach plan from current members and manifest links.
         progress.phase = .checkingAlbum
         publish()
-        let links = await linkLookup.remoteLinks(for: identifiers)
+        var links = await linkLookup.remoteLinks(for: identifiers)
+        let missing = identifiers.filter { links[$0] == nil }
+        if !missing.isEmpty {
+            let proven = try await backup.remoteProofLinks(for: missing)
+            links.merge(proven) { existing, _ in existing }
+        }
         try await ensureAlbumPresent(albumID: album.id)
         let children = try await remoteOps.childMainLinkIDs(albumID: remoteAlbumID)
         let plan = AlbumSyncPlanner.plan(

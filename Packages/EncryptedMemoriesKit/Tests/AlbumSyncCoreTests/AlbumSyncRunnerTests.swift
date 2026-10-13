@@ -49,6 +49,13 @@ private final class FakeBackupExecutor: AlbumSyncBackupExecuting, @unchecked Sen
     private let lock = NSLock()
     private var _runs: [[String]] = []
     var runs: [[String]] { lock.withLock { _runs } }
+    var proofLinks: [String: AlbumSyncRemoteLink] = [:]
+    private var _proofRuns: [[String]] = []
+    var proofRuns: [[String]] { lock.withLock { _proofRuns } }
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        lock.withLock { _proofRuns.append(localIdentifiers) }
+        return proofLinks
+    }
     var stopped = false
     /// The unresolved scratch-queue rows and filenames the next run reports.
     var problems: [String: BackupFailedItem] = [:]
@@ -158,6 +165,26 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
     }
 
     private let album = LocalAlbumSummary(id: "local-1", title: "Urlaub", assetCount: 3)
+
+    @Test func asksProofOnlyForMissingManifestLinksAndKeepsExistingAndTrashedLinks() async throws {
+        let backup = FakeBackupExecutor()
+        backup.proofLinks = ["known": link("wrong"), "missing": link("proven"), "trashed": link("wrong-trash")]
+        let (runner, remote, _, _) = makeRunner(
+            contents: ["album": ["known", "missing", "trashed"]],
+            links: ["known": link("existing"), "trashed": link("deleted", trashed: true)], backup: backup)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+        #expect(backup.proofRuns == [["missing"]])
+        #expect(remote.attachedBatches.flatMap { $0 } == ["existing", "proven"])
+        #expect(report.attached == 2)
+        #expect(report.trashedSkipped == 1)
+        #expect(report.unattachable == 0)
+    }
+
+    @Test func skipsProofLookupWhenEveryManifestLinkExists() async throws {
+        let (runner, _, backup, _) = makeRunner(contents: ["album": ["known"]], links: ["known": link("existing")])
+        _ = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(backup.proofRuns.isEmpty)
+    }
 
     @Test func firstSyncCreatesAlbumBacksUpAndAttaches() async throws {
         let (runner, remote, backup, store) = makeRunner(
