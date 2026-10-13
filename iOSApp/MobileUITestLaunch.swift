@@ -24,6 +24,8 @@ import SwiftUI
         /// Waits for the session check at launch, so it cannot replace the fixture session afterward.
         static func installFixtureIfRequested(into runtime: MobileAccountRuntime) async {
             guard isRequested, fixture == nil else { return }
+            UserDefaults.standard.removeObject(forKey: AppSettingsKey.blurAppPreview)
+            UserDefaults.standard.removeObject(forKey: AppSettingsKey.removeLocationWhenSharing)
             UserDefaults.standard.removeObject(forKey: AppSettingsKey.mapAndPlacesEnabled)
             UserDefaults.standard.removeObject(forKey: AppSettingsKey.backupUsesMobileData)
             for await isChecking in runtime.sessionModel.$isCheckingSession.values where !isChecking {
