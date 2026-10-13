@@ -646,7 +646,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             visibility = try await checker.linkVisibility(of: asked.sorted())
         }
         func isLiveMain(_ linkID: String) -> Bool {
-            visibility[linkID]?.isActiveMain ?? false
+            guard !requiresActiveMain || visibility[linkID]?.hasExplicitPhotoState == true else { return false }
+            return visibility[linkID]?.isActiveMain ?? false
         }
         let ownMatches = Set(matches.filter(isLiveMain)).filter {
             !replacement.knownForeignLinks.contains($0)

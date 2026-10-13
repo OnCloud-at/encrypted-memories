@@ -70,6 +70,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var contentQueries = 0
     private var visibilityErrors: [String: any Error] = [:]
     private var visibilityOverrides: [String: RemoteLinkVisibility] = [:]
+    private var visibilityAfterContentLookup: [String: RemoteLinkVisibility] = [:]
     private var cancelContentCaller = false
     private var includeInactiveContent = false
     private var failTrash = false
@@ -104,6 +105,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func setContentLookupRows(_ rows: [RemotePhotoDuplicate]) { lock.withLock { contentLookupRows = rows } }
     func setVisibility(_ visibility: RemoteLinkVisibility, for linkID: String) {
         lock.withLock { visibilityOverrides[linkID] = visibility }
+    }
+    func setVisibilityAfterContentLookup(_ visibility: RemoteLinkVisibility, for linkID: String) {
+        lock.withLock { visibilityAfterContentLookup[linkID] = visibility }
     }
     func cancelCallerAtContentLookup(_ enabled: Bool) { lock.withLock { cancelContentCaller = enabled } }
     var contentLookupCount: Int { lock.withLock { contentQueries } }
@@ -484,6 +488,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         let rows = try lock.withLock { () throws -> [RemotePhotoDuplicate]? in
             contentQueries += 1
             if let contentLookupError { throw contentLookupError }
+            visibilityOverrides.merge(visibilityAfterContentLookup) { _, new in new }
             return contentLookupRows.map { Array($0.prefix(limit)) }
         }
         if let rows { return rows }

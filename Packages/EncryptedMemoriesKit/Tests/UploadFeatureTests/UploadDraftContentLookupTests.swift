@@ -573,6 +573,67 @@ final class UploadDraftContentLookupTests: XCTestCase {
         if let draft { XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft) }
     }
 
+    func testBlockedContentDoesNotRestoreJournalLinksWithoutExplicitPhotoState() async throws {
+        try await assertScopedContentJournalProof(blocked: true)
+    }
+
+    func testNormalContentKeepsJournalUpdatesWithLegacyVisibilityDefaults() async throws {
+        try await assertScopedContentJournalProof(blocked: false)
+    }
+
+    private func assertScopedContentJournalProof(blocked: Bool) async throws {
+        let harness = try EditScenarioHarness()
+        defer { try? harness.cleanup() }
+        let source = try XCTUnwrap(harness.library.snapshot.first).source
+        let descriptor = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/fixture/current.heic"), filename: "current.heic",
+            fileSize: 20, modificationDate: harness.clock.now, precomputedSHA1Digest: Data(repeating: 1, count: 20))
+        let retired = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
+        try harness.journal.addSuperseded(retired, for: source)
+        try harness.journal.settle([retired.nodeID], related: [], trashed: true, for: source)
+        try harness.journal.keepDeleted(for: source)
+        let before = harness.journal.entry(for: source)
+        harness.server.setVisibility(.init(isActive: false, mainPhotoLinkID: nil), for: retired.nodeID)
+        let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let unproven = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+        harness.server.setVisibilityAfterContentLookup(unproven, for: retired.nodeID)
+        harness.server.setVisibilityAfterContentLookup(unproven, for: active.nodeID)
+        let draft =
+            blocked
+            ? harness.server.seedDraft(
+                name: descriptor.filename, digest: Data(repeating: 3, count: 20), clientUID: "other-uploader")
+            : nil
+        let pipeline = UploadDedupePipeline(
+            store: harness.identities, checker: harness.server, currentClientUID: "this-uploader",
+            replacementJournal: harness.journal)
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(
+            result.decision,
+            blocked
+                ? .skip(.draftExists, remoteLinkID: draft?.nodeID)
+                : .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+        XCTAssertEqual(harness.server.contentLookupCount, 1)
+        let journal = harness.journal.entry(for: source)
+        if blocked {
+            XCTAssertEqual(journal.keptDeleted, before.keptDeleted)
+            XCTAssertEqual(journal.retired, before.retired)
+            XCTAssertEqual(journal.superseded, before.superseded)
+            XCTAssertNil(harness.identities.record(for: source)?.remoteLinkID)
+            XCTAssertNil(harness.identities.record(for: source)?.outcome)
+        } else {
+            XCTAssertNil(journal.keptDeleted)
+            XCTAssertTrue(journal.retired.isEmpty)
+            XCTAssertEqual(journal.superseded, [PhotoUID(volumeID: "", nodeID: retired.nodeID)])
+            XCTAssertEqual(harness.identities.record(for: source)?.remoteLinkID, active.nodeID)
+        }
+        if let draft { XCTAssertEqual(harness.server.links.first { $0.uid == draft }?.state, .draft) }
+        XCTAssertEqual(harness.server.uploadRequestCount, 0)
+        try harness.relaunch()
+        XCTAssertEqual(harness.journal.entry(for: source), journal)
+    }
+
     private func resolveBeforeTimeout(
         _ pipeline: UploadDedupePipeline, descriptor: UploadResourceDescriptor
     ) async throws -> UploadPreflightResult {
