@@ -193,6 +193,8 @@ public final class PhotoLibraryBackupController {
     @ObservationIgnored var onLibraryChange: (@MainActor () -> Void)?
     /// The runner ended the current pass waiting for Wi-Fi. Reset when a pass starts.
     private var passWaitedForWiFi = false
+    /// A manual pass that ended before index preparation keeps its retry intent until a resumed pass is admitted.
+    private var manualWiFiRetryPending = false
     /// The owner of a foreground or explicit pass that did not start because no network path had arrived yet. The
     /// first path, the setting, or the end of `firstNetworkPathWait` starts it. An explicit action outranks an
     /// automatic foreground start.
@@ -737,6 +739,17 @@ public final class PhotoLibraryBackupController {
             startFirstNetworkPathWait()
             return nil
         }
+        if deferredStartOwner != nil {
+            // The snapshot can arrive before its observer. A window must still yield to the deferred session pass.
+            if owner == .manual { deferredStartOwner = .manual }
+            let run = startAfterFirstNetworkPath()
+            return owner == .foreground || owner == .manual ? run : nil
+        }
+        if manualWiFiRetryPending, !runtimeSignals.current().waitsForWiFi, owner != .manual {
+            let run = startSync(owner: .manual)
+            // A window cannot own or expire the person's resumed retry.
+            return owner == .foreground ? run : nil
+        }
         if owner != .manual,
             let retryAt = queueStore.runtimeIssue(for: .remoteIndexPreparation)?.nextAttemptAt,
             retryAt > Date()
@@ -773,6 +786,7 @@ public final class PhotoLibraryBackupController {
             return nil
         }
         activeRunID = runID
+        if owner == .manual { manualWiFiRetryPending = false }
 
         // Retry previously failed items once per launch.
         if !didAutoRetryFailedThisLaunch {
@@ -1247,6 +1261,7 @@ public final class PhotoLibraryBackupController {
     /// Sign-out must await this before removing `accountDataDirectory`.
     public func shutdown() async {
         isShuttingDown = true
+        manualWiFiRetryPending = false
         pendingSyncAfterStop = false
         monitor.stopObserving()
         changeDebounceTask?.cancel()
@@ -1371,9 +1386,10 @@ public final class PhotoLibraryBackupController {
         }
     }
 
-    private func startAfterFirstNetworkPath() {
+    @discardableResult
+    private func startAfterFirstNetworkPath() -> StartedBackupRun? {
         guard !isShuttingDown, deferredStartOwner != nil || deferredBackgroundOwner != nil, !waitsForFirstNetworkPath
-        else { return }
+        else { return nil }
         let sessionOwner = deferredStartOwner
         let backgroundOwner = deferredBackgroundOwner
         deferredStartOwner = nil
@@ -1382,11 +1398,14 @@ public final class PhotoLibraryBackupController {
         firstNetworkPathWaitTask = nil
         if let sessionOwner {
             // The foreground or explicit pass runs on its own; a waiting window ends without owning it.
-            _ = startSync(owner: sessionOwner)
+            let run = startSync(owner: sessionOwner)
+            if run == nil { deferredStartOwner = sessionOwner }
             resumeDeferredStartWaiters(with: nil)
+            return run
         } else if let backgroundOwner {
             resumeDeferredStartWaiters(with: startSync(owner: backgroundOwner))
         }
+        return nil
     }
 
     /// Waits for the deferred pass of a background window. Cancellation, for example at the OS expiration, ends the
@@ -1669,6 +1688,11 @@ public final class PhotoLibraryBackupController {
         let stopTask = runnerStopRunID == runID ? runnerStopTask : nil
         await stopTask?.value
         guard activeRunID == runID else { return }
+        if !isShuttingDown, passWaitedForWiFi,
+            let lock = lockStore?.currentLock(), lock.runID == runID, lock.owner == .manual
+        {
+            manualWiFiRetryPending = true
+        }
         heartbeatTask?.cancel()
         heartbeatTask = nil
         lockStore?.release(runID: runID)
