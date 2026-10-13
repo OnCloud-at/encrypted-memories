@@ -160,9 +160,8 @@ private final class ScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Se
             failed: 0, sourceMissing: 0, skippedRemoteDeletion: 0)
     }
     func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
-        let resolver = UploadDedupePipeline(store: device.identities, checker: device.index)
-        return try await AlbumSyncRemoteProofLookup.remoteLinks(
-            for: localIdentifiers, catalog: device.library, queue: device.queue, resolver: resolver)
+        try await AlbumSyncRemoteProofLookup.remoteLinks(
+            for: localIdentifiers, catalog: device.library, queue: device.queue, resolver: device.identityResolver)
     }
     func stop() async {}
 }
