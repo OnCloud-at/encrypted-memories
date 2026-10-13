@@ -178,7 +178,15 @@ public actor AlbumSyncRunner {
         try checkStop()
         let missing = identifiers.filter { links[$0] == nil }
         if !missing.isEmpty {
-            let proven = try await backup.remoteProofLinks(for: missing)
+            let proven: [String: AlbumSyncRemoteLink]
+            do {
+                proven = try await backup.remoteProofLinks(for: missing)
+            } catch {
+                try checkStop()
+                if error is CancellationError { throw error }
+                if (error as? AlbumSyncError) == .stopped { throw error }
+                proven = [:]
+            }
             try checkStop()
             links.merge(proven) { existing, _ in existing }
         }
