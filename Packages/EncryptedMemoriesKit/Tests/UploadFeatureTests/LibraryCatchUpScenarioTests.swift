@@ -184,7 +184,7 @@ final class LibraryCatchUpScenarioTests: XCTestCase {
             XCTAssertEqual(firstBaseline, baseline, "A filtered route never installs a baseline")
 
             _ = harness.server.seedLink(digest: Data("second-remote-photo".utf8))
-            await repository.waitForProbes(16)
+            await repository.waitForProbes(await repository.probeCount + 8)
             let secondFiltered = await repository.filteredListings
             XCTAssertEqual(secondFiltered, 3, "A newer token refreshes exactly once more, then stays quiet")
             let quietBaseline = await monitor.testingBaseline()

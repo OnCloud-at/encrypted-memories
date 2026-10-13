@@ -298,7 +298,8 @@ struct MainView: View {
                 Task {
                     await timelineModel.select(newValue)
                     // All Photos loads the whole library, so the monitor can confirm a deferred revision again.
-                    if newValue == .all { await libraryChangeMonitor.resumeDeferredRefresh() }
+                    // A newer selection can replace this one while it loads: check the route that ended up shown.
+                    if timelineModel.filter == .all { await libraryChangeMonitor.resumeDeferredRefresh() }
                 }
             }
             .onChange(of: model.pendingTrash.localUIDs) { _, _ in
