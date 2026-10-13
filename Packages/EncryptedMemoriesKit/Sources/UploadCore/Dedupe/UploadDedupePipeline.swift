@@ -323,31 +323,44 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         do {
             // A name draft can hide an active copy under another name. Only active content may
             // settle that block; a miss or an inactive copy leaves the draft protected.
-            if nameDecision.uploadsBytes || blockedByDraft {
-                let limit = isRoot && replacement.isEmpty ? Self.rootMatchBound : 1
-                let found = try await checker.findDuplicates(contentHash: contentHash, limit: limit)
-                for start in stride(from: 0, to: found.count, by: Self.rootMatchBatchSize) {
-                    let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
-                    let contentCandidates = try await candidates(
-                        batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
-                    provesLive = provesLive || contentCandidates.provesLive
-                    let excluded =
-                        blockedByDraft
-                        ? try await relatedLinks(
-                            among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true)
-                        : []
-                    if let remoteContent = contentCandidates.items.first(where: {
-                        guard blockedByDraft else { return true }
-                        guard $0.linkState == .active, let linkID = $0.linkID else { return false }
-                        return !excluded.contains(linkID)
-                    }) {
-                        decision = decisionForRemoteContent(
-                            remoteContent,
-                            replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
-                        break
+            if nameDecision.uploadsBytes || (blockedByDraft && isRoot && !isBurstMember && !requiresRelatedMatch) {
+                do {
+                    let limit = isRoot && replacement.isEmpty ? Self.rootMatchBound : 1
+                    let found = try await checker.findDuplicates(contentHash: contentHash, limit: limit)
+                    for start in stride(from: 0, to: found.count, by: Self.rootMatchBatchSize) {
+                        let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
+                        let contentCandidates = try await candidates(
+                            batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
+                        provesLive = provesLive || contentCandidates.provesLive
+                        let excluded =
+                            blockedByDraft
+                            ? try await relatedLinks(
+                                among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true)
+                            : []
+                        if let remoteContent = contentCandidates.items.first(where: {
+                            guard blockedByDraft else { return true }
+                            guard $0.linkState == .active, $0.contentHash == contentHash,
+                                let linkID = $0.linkID, !linkID.isEmpty
+                            else { return false }
+                            return !excluded.contains(linkID)
+                        }) {
+                            decision = decisionForRemoteContent(
+                                remoteContent,
+                                replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
+                            break
+                        }
                     }
+                    try Task.checkCancellation()
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard blockedByDraft else { throw error }
+                    if (error as? UploadError) == .cancelled || (error as? URLError)?.code == .cancelled {
+                        throw error
+                    }
+                    try Task.checkCancellation()
+                    decision = nameDecision
                 }
-                try Task.checkCancellation()
             }
             if decision.uploadsBytes, !replacement.isEmpty, !provesLive,
                 descriptor.source.kind == .photoLibraryAsset, descriptor.source.resource == .primary,
@@ -775,7 +788,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         return linkIDs.filter {
             if requiresActiveMain {
-                return known[$0]?.isActiveMain != true
+                return known[$0].map { $0.hasExplicitPhotoState && $0.isActiveMain } != true
             }
             return known[$0]?.mainPhotoLinkID != nil
         }

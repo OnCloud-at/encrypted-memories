@@ -66,6 +66,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var nextID = 1
     private var uploadRequests = 0
     private var contentLookupError: Error?
+    private var contentLookupRows: [RemotePhotoDuplicate]?
+    private var contentQueries = 0
+    private var visibilityErrors: [String: any Error] = [:]
+    private var visibilityOverrides: [String: RemoteLinkVisibility] = [:]
+    private var cancelContentCaller = false
     private var includeInactiveContent = false
     private var failTrash = false
     enum LineageRead: Sendable, Equatable { case identity, successors, ancestry, external }
@@ -96,6 +101,15 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     var uploadRequestCount: Int { lock.withLock { uploadRequests } }
 
     func setContentLookupError(_ error: Error?) { lock.withLock { contentLookupError = error } }
+    func setContentLookupRows(_ rows: [RemotePhotoDuplicate]) { lock.withLock { contentLookupRows = rows } }
+    func setVisibility(_ visibility: RemoteLinkVisibility, for linkID: String) {
+        lock.withLock { visibilityOverrides[linkID] = visibility }
+    }
+    func cancelCallerAtContentLookup(_ enabled: Bool) { lock.withLock { cancelContentCaller = enabled } }
+    var contentLookupCount: Int { lock.withLock { contentQueries } }
+    func setVisibilityError(_ error: (any Error)?, whenAskingFor linkID: String) {
+        lock.withLock { visibilityErrors[linkID] = error }
+    }
     func omitVisibility(of linkIDs: Set<String>) { lock.withLock { omittedVisibilityLinks = linkIDs } }
     func returnInactiveContentFromStaleIndex() { lock.withLock { includeInactiveContent = true } }
     var personDeletedAssets: [String: Set<String>] { lock.withLock { deletedAssets } }
@@ -465,6 +479,17 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
+        if lock.withLock({ cancelContentCaller }) { withUnsafeCurrentTask { $0?.cancel() } }
+        let rows = try lock.withLock { () throws -> [RemotePhotoDuplicate]? in
+            contentQueries += 1
+            if let contentLookupError { throw contentLookupError }
+            return contentLookupRows.map { Array($0.prefix(limit)) }
+        }
+        if let rows { return rows }
+        return try await findDuplicate(contentHash: contentHash).map { [$0] } ?? []
+    }
+
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
         try lock.withLock {
             if let contentLookupError { throw contentLookupError }
@@ -502,6 +527,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         guard !linkIDs.isEmpty else { return [:] }
         return try lock.withLock {
             counted.visibility += 1
+            for linkID in linkIDs {
+                if let error = visibilityErrors[linkID] { throw error }
+            }
             if failVisibilityRead { throw UploadError.backend("The scenario visibility read failed") }
             if armedVisibilityFailures > 0 {
                 armedVisibilityFailures -= 1
@@ -509,6 +537,10 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             }
             var result: [String: RemoteLinkVisibility] = [:]
             for linkID in linkIDs {
+                if let override = visibilityOverrides[linkID] {
+                    result[linkID] = override
+                    continue
+                }
                 guard !omittedVisibilityLinks.contains(linkID), let link = table[linkID], link.state != .deleted else {
                     continue
                 }

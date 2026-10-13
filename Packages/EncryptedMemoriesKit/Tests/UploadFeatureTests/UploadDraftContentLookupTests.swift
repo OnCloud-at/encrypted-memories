@@ -120,7 +120,7 @@ final class UploadDraftContentLookupTests: XCTestCase {
         server.setContentLookupError(nil)
         let active = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
 
-        let retried = try await pipeline.resolve(descriptor)
+        let retried = try await resolveBeforeTimeout(pipeline, descriptor: descriptor)
 
         XCTAssertEqual(retried.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
         XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft)
@@ -238,6 +238,265 @@ final class UploadDraftContentLookupTests: XCTestCase {
         try harness.relaunch()
         XCTAssertEqual(harness.journal.entry(for: source), journal)
         XCTAssertEqual(harness.identities.record(for: source)?.remoteLinkID, active.nodeID)
+    }
+
+    func testActiveIndexRowWithTrashedVisibilityKeepsTheDraftBlock() async throws {
+        let server = EditScenarioServer()
+        let (pipeline, descriptor, draft) = fixture(server: server)
+        let old = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let row = try XCTUnwrap(server.links.first { $0.uid == old }).duplicate
+        server.personTrash(old)
+        server.setContentLookupRows([row])
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(row.linkState, .active)
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+        XCTAssertEqual(server.links.first { $0.uid == old }?.state, .trashed)
+    }
+
+    func testContentBatchSkipsRelatedFileAndAdoptsTheFollowingMain() async throws {
+        let server = EditScenarioServer()
+        let (pipeline, descriptor, draft) = fixture(server: server)
+        let other = server.seedLink(digest: Data(repeating: 2, count: 20))
+        let related = server.seedLink(digest: descriptor.precomputedSHA1Digest!, main: other)
+        let active = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let rows = [related, active].map { uid in server.links.first { $0.uid == uid }!.duplicate }
+        server.setContentLookupRows(rows)
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+        XCTAssertEqual(server.contentLookupCount, 1)
+        XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft)
+    }
+
+    func testForeignDraftForLiveVideoDoesNotAdoptAnUnrelatedMain() async throws {
+        let server = EditScenarioServer()
+        let url = URL(fileURLWithPath: "/fixture/current.mov")
+        let main = server.seedLink(digest: Data(repeating: 2, count: 20))
+        let descriptor = UploadResourceDescriptor(
+            source: .file(url, resource: .livePairedVideo), fileURL: url, filename: "current.mov", fileSize: 20,
+            modificationDate: Date(timeIntervalSince1970: 1_720_000_000),
+            precomputedSHA1Digest: Data(repeating: 1, count: 20), mainRemoteLinkID: main.nodeID)
+        let draft = server.seedDraft(
+            name: descriptor.filename, digest: Data(repeating: 3, count: 20),
+            clientUID: "other-uploader")
+        _ = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let pipeline = UploadDedupePipeline(
+            store: FakeIdentityStore(), checker: server, currentClientUID: "this-uploader")
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+        XCTAssertEqual(server.contentLookupCount, 0)
+        XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft)
+    }
+
+    func testBurstAndRelatedMatchDraftsDoNotQueryContent() async throws {
+        for (resource, requiresRelated) in [
+            (UploadSourceIdentity.Resource.burstMember(ordinal: 0), false),
+            (.livePairedVideo, true),
+        ] {
+            let server = EditScenarioServer()
+            let url = URL(fileURLWithPath: "/fixture/secondary.heic")
+            let main = server.seedLink(digest: Data(repeating: 2, count: 20))
+            let descriptor = UploadResourceDescriptor(
+                source: .file(url, resource: resource), fileURL: url, filename: "secondary.heic", fileSize: 20,
+                modificationDate: Date(timeIntervalSince1970: 1_720_000_000),
+                precomputedSHA1Digest: Data(repeating: 1, count: 20), mainRemoteLinkID: main.nodeID,
+                requiresRelatedMatch: requiresRelated)
+            let draft = server.seedDraft(
+                name: descriptor.filename, digest: Data(repeating: 3, count: 20),
+                clientUID: "other-uploader")
+            _ = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+            let pipeline = UploadDedupePipeline(
+                store: FakeIdentityStore(), checker: server, currentClientUID: "this-uploader")
+
+            let result = try await pipeline.resolve(descriptor)
+
+            XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+            XCTAssertEqual(server.contentLookupCount, 0)
+        }
+    }
+
+    func testContentIndexFailureKeepsTheDraftDecision() async throws {
+        let server = EditScenarioServer()
+        let (pipeline, descriptor, draft) = fixture(server: server)
+        server.setContentLookupError(UploadError.backend("The content index is unavailable"))
+        do {
+            let result = try await pipeline.resolve(descriptor)
+            XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+        } catch {
+            XCTFail("An optional content lookup must keep the draft decision: \(error)")
+        }
+        server.setContentLookupError(nil)
+        let result = try await resolveBeforeTimeout(pipeline, descriptor: descriptor)
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+    }
+
+    func testContentIndexFailureStillThrowsWithoutADraftBlock() async throws {
+        try await assertNormalContentFailure(cancelledTask: false)
+    }
+
+    func testCancelledNormalLookupKeepsTheExistingBackendFailure() async throws {
+        try await assertNormalContentFailure(cancelledTask: true)
+    }
+
+    private func assertNormalContentFailure(cancelledTask: Bool) async throws {
+        let server = EditScenarioServer()
+        let (_, descriptor, _) = fixture(server: server)
+        let normal = EditScenarioServer()
+        normal.setContentLookupError(UploadError.backend("The content index is unavailable"))
+        normal.cancelCallerAtContentLookup(cancelledTask)
+        let pipeline = UploadDedupePipeline(store: FakeIdentityStore(), checker: normal)
+        let task = Task { try await pipeline.resolve(descriptor) }
+        do {
+            _ = try await task.value
+            XCTFail("The normal content lookup must still throw")
+        } catch is CancellationError {
+            XCTFail("Expected the backend failure, not cancellation")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("content index"))
+        }
+    }
+
+    func testScopedContentVisibilityFailureKeepsTheDraftAndNamePassJournal() async throws {
+        try await assertScopedContentFailure(cancelled: false)
+    }
+
+    func testScopedContentVisibilityCancellationPropagatesAndReleasesClaims() async throws {
+        try await assertScopedContentFailure(cancelled: true)
+    }
+
+    private func assertScopedContentFailure(cancelled: Bool) async throws {
+        let harness = try EditScenarioHarness()
+        defer { try? harness.cleanup() }
+        let source = try XCTUnwrap(harness.library.snapshot.first).source
+        let descriptor = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/fixture/current.heic"), filename: "current.heic",
+            fileSize: 20, modificationDate: harness.clock.now, precomputedSHA1Digest: Data(repeating: 1, count: 20))
+        let restored = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
+        try harness.journal.addSuperseded(restored, for: source)
+        try harness.journal.settle([restored.nodeID], related: [], trashed: true, for: source)
+        try harness.journal.keepDeleted(for: source)
+        let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let draft = harness.server.seedDraft(
+            name: descriptor.filename, digest: Data(repeating: 3, count: 20),
+            clientUID: "other-uploader")
+        let failure: any Error = cancelled ? CancellationError() : UploadError.backend("Content visibility failed")
+        harness.server.setVisibilityError(failure, whenAskingFor: active.nodeID)
+        let pipeline = UploadDedupePipeline(
+            store: harness.identities, checker: harness.server, currentClientUID: "this-uploader",
+            replacementJournal: harness.journal)
+        do {
+            let result = try await pipeline.resolve(descriptor)
+            XCTAssertFalse(cancelled, "Cancellation must propagate")
+            XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+        } catch is CancellationError {
+            XCTAssertTrue(cancelled)
+        } catch {
+            XCTFail("A failed content visibility read must retain the draft decision: \(error)")
+        }
+        let journal = harness.journal.entry(for: source)
+        XCTAssertNil(journal.keptDeleted)
+        XCTAssertTrue(journal.retired.isEmpty)
+        XCTAssertEqual(journal.superseded, [PhotoUID(volumeID: "", nodeID: restored.nodeID)])
+        XCTAssertNil(harness.identities.record(for: source)?.remoteLinkID)
+        XCTAssertNil(harness.identities.record(for: source)?.outcome)
+        XCTAssertEqual(harness.server.uploadRequestCount, 0)
+        XCTAssertEqual(harness.server.links.first { $0.uid == draft }?.state, .draft)
+        harness.server.setVisibilityError(nil, whenAskingFor: active.nodeID)
+        let retried = try await resolveBeforeTimeout(pipeline, descriptor: descriptor)
+        XCTAssertEqual(retried.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+    }
+
+    func testDifferentContentHashCannotSettleAScopedDraft() async throws {
+        try await assertMalformedContentKeepsScopedDraft(emptyLink: false)
+    }
+
+    func testEmptyContentLinkCannotSettleAScopedDraft() async throws {
+        try await assertMalformedContentKeepsScopedDraft(emptyLink: true)
+    }
+
+    private func assertMalformedContentKeepsScopedDraft(emptyLink: Bool) async throws {
+        let harness = try EditScenarioHarness()
+        defer { try? harness.cleanup() }
+        let source = try XCTUnwrap(harness.library.snapshot.first).source
+        let descriptor = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/fixture/current.heic"), filename: "current.heic",
+            fileSize: 20, modificationDate: harness.clock.now, precomputedSHA1Digest: Data(repeating: 1, count: 20))
+        let current = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
+        try harness.journal.addSuperseded(current, for: source)
+        let unrelated = harness.server.seedLink(digest: Data(repeating: 3, count: 20))
+        let draft = harness.server.seedDraft(
+            name: descriptor.filename, digest: Data(repeating: 4, count: 20), clientUID: "other-uploader")
+        let hash = EditScenarioServer.contentHash(descriptor.precomputedSHA1Digest!)
+        let row = RemotePhotoDuplicate(
+            nameHash: "another-name", contentHash: emptyLink ? hash : "different-content", linkState: .active,
+            linkID: emptyLink ? "" : unrelated.nodeID)
+        harness.server.setContentLookupRows([row])
+        if emptyLink { harness.server.setVisibility(.init(isActive: true, mainPhotoLinkID: nil), for: "") }
+        let pipeline = UploadDedupePipeline(
+            store: harness.identities, checker: harness.server, currentClientUID: "this-uploader",
+            replacementJournal: harness.journal)
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+        XCTAssertNil(harness.identities.record(for: source)?.remoteLinkID)
+        XCTAssertNil(harness.identities.record(for: source)?.outcome)
+        XCTAssertEqual(harness.server.links.first { $0.uid == draft }?.state, .draft)
+    }
+
+    func testCancelledTaskWithContentBackendFailureStillPropagatesCancellation() async throws {
+        let server = EditScenarioServer()
+        let (pipeline, descriptor, draft) = fixture(server: server)
+        server.cancelCallerAtContentLookup(true)
+        server.setContentLookupError(UploadError.backend("Content lookup failed after cancellation"))
+        let task = Task { try await pipeline.resolve(descriptor) }
+        do {
+            _ = try await task.value
+            XCTFail("A cancelled task must not settle the draft")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("The cancellation must propagate instead of a backend failure: \(error)")
+        }
+        server.cancelCallerAtContentLookup(false)
+        server.setContentLookupError(nil)
+        let result = try await resolveBeforeTimeout(pipeline, descriptor: descriptor)
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+    }
+
+    func testTypedContentCancellationStillThrowsWithoutCancellingTheCallerTask() async throws {
+        let errors: [any Error] = [UploadError.cancelled, URLError(.cancelled)]
+        for error in errors {
+            let server = EditScenarioServer()
+            let (pipeline, descriptor, draft) = fixture(server: server)
+            server.setContentLookupError(error)
+            do {
+                _ = try await pipeline.resolve(descriptor)
+                XCTFail("A typed cancellation must not settle the draft")
+            } catch {
+                XCTAssertTrue((error as? UploadError) == .cancelled || (error as? URLError)?.code == .cancelled)
+            }
+            server.setContentLookupError(nil)
+            let result = try await resolveBeforeTimeout(pipeline, descriptor: descriptor)
+            XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+        }
+    }
+
+    private func resolveBeforeTimeout(
+        _ pipeline: UploadDedupePipeline, descriptor: UploadResourceDescriptor
+    ) async throws -> UploadPreflightResult {
+        let finished = expectation(description: "resolve releases both claims and finishes")
+        let task = Task {
+            defer { finished.fulfill() }
+            return try await pipeline.resolve(descriptor)
+        }
+        await fulfillment(of: [finished], timeout: 2)
+        await pipeline.uploadDidFail(descriptor)
+        return try await task.value
     }
 
     private func fixture(
