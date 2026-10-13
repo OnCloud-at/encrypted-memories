@@ -1,3 +1,4 @@
+import AlbumSyncCore
 import Foundation
 import PhotosCore
 
@@ -1120,5 +1121,33 @@ final class EditScenarioDeviceRemote: PhotoUploading, EditReplacementRemote, @un
             }
         }
         try await server.trashReplaced(uids)
+    }
+}
+
+extension EditScenarioServer: AlbumSyncRemoteAlbumOps {
+    func listAlbums() async throws -> [AlbumSyncRemoteAlbum] {
+        [.init(id: "own-album", title: "Scenario album")]
+    }
+
+    func createAlbum(name: String) async throws -> String {
+        throw UploadError.backend("The scenario uses an existing album")
+    }
+
+    func childMainLinkIDs(albumID: String) async throws -> Set<String> {
+        Set(
+            links.filter {
+                $0.mainLinkID == nil && $0.state == .active
+                    && $0.albums.contains(.init(volumeID: "vol", albumID: albumID))
+            }.map(\.linkID))
+    }
+
+    func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
+        let existing = try await childMainLinkIDs(albumID: albumID)
+        let new = photos.filter { !existing.contains($0.uid.nodeID) }
+        try await addPhotos(new.map(\.uid), toOwnAlbum: albumID)
+        var result = AlbumSyncAttachResult()
+        result.attached = new.count
+        result.alreadyMember = photos.count - new.count
+        return result
     }
 }

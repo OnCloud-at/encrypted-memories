@@ -20,6 +20,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
     private let identityResolver: any UploadIdentityResolving
     private let uploader: any PhotoUploading
     private let injectedResourceResolver: (any BackupResourceResolving)?
+    private let injectedProofCatalog: (any UploadBackupAssetCatalog)?
     private let stopFenceAcquired: (@Sendable () async -> Void)?
     private let stopFenceBarrier: (@Sendable () async -> Void)?
     private let runtimeSignals: BackupRuntimeSignalSource
@@ -27,7 +28,8 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
     private let lock = NSLock()
     private struct ActiveOperation {
         let id: UUID
-        let task: Task<AlbumSyncBackupReport, any Error>
+        let cancel: @Sendable () -> Void
+        let wait: @Sendable () async -> Void
     }
     private var activeOperation: ActiveOperation?
     private var activeRunner: BackupSyncRunner?
@@ -44,6 +46,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         self.identityResolver = identityResolver
         self.uploader = uploader
         injectedResourceResolver = nil
+        injectedProofCatalog = nil
         stopFenceAcquired = nil
         stopFenceBarrier = nil
         runtimeSignals = .apple
@@ -55,6 +58,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         identityResolver: any UploadIdentityResolving,
         uploader: any PhotoUploading,
         resourceResolver: any BackupResourceResolving,
+        proofCatalog: (any UploadBackupAssetCatalog)? = nil,
         stopFenceAcquired: (@Sendable () async -> Void)? = nil,
         stopFenceBarrier: (@Sendable () async -> Void)? = nil,
         runtimeSignals: BackupRuntimeSignalSource = .apple
@@ -64,6 +68,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         self.identityResolver = identityResolver
         self.uploader = uploader
         injectedResourceResolver = resourceResolver
+        injectedProofCatalog = proofCatalog
         self.stopFenceAcquired = stopFenceAcquired
         self.stopFenceBarrier = stopFenceBarrier
         self.runtimeSignals = runtimeSignals
@@ -73,24 +78,30 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         localIdentifiers: [String],
         onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport {
+        try await withOperation { [self] in
+            try await performEnsureBackedUp(localIdentifiers: localIdentifiers, onProgress: onProgress)
+        }
+    }
+
+    private func withOperation<Value: Sendable>(
+        _ operation: @Sendable @escaping () async throws -> Value
+    ) async throws -> Value {
         try Task.checkCancellation()
 
         let operationID = UUID()
         let startGate = PhotoAlbumBackupExecutorStartGate()
-        var operationTask: Task<AlbumSyncBackupReport, any Error>?
+        var operationTask: Task<Value, any Error>?
         let admitted = lock.withLock {
             guard activeOperation == nil, stopOwnerCount == 0 else { return false }
             let task = Task { [self] in
                 await startGate.wait()
                 defer { finishOperation(id: operationID) }
                 try Task.checkCancellation()
-                return try await performEnsureBackedUp(
-                    localIdentifiers: localIdentifiers,
-                    onProgress: onProgress
-                )
+                return try await operation()
             }
             operationTask = task
-            activeOperation = ActiveOperation(id: operationID, task: task)
+            activeOperation = ActiveOperation(
+                id: operationID, cancel: { task.cancel() }, wait: { _ = await task.result })
             return true
         }
         guard admitted, let operationTask else {
@@ -216,6 +227,25 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         )
     }
 
+    public func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        try await withOperation { [self] in
+            try await performRemoteProofLinks(for: localIdentifiers)
+        }
+    }
+
+    private func performRemoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        guard
+            let queue = UploadBackupSyncQueueManifestStore(
+                url: accountDataDirectory.appendingPathComponent(Self.queueDatabaseFileName),
+                policy: databasePolicy)
+        else { throw AlbumSyncError.mappingStoreUnavailable }
+        defer { queue.close() }
+        return try await AlbumSyncRemoteProofLookup.remoteLinks(
+            for: localIdentifiers,
+            catalog: injectedProofCatalog ?? PhotoLibraryBackupCatalog(localIdentifiers: localIdentifiers),
+            queue: queue, resolver: identityResolver)
+    }
+
     public func stop() async {
         let (operation, runner) = lock.withLock {
             stopOwnerCount += 1
@@ -228,11 +258,9 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
             }
         }
         await stopFenceAcquired?()
-        operation?.task.cancel()
+        operation?.cancel()
         await runner?.stop()
-        if let operation {
-            _ = await operation.task.result
-        }
+        await operation?.wait()
         await stopFenceBarrier?()
     }
 

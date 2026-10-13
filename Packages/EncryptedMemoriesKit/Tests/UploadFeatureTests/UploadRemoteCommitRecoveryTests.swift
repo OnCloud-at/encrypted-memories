@@ -152,6 +152,38 @@ private final class BlockingRecoveryIdentityRecorder: UploadIdentityResolving, @
 
     var writeCount: Int { lock.withLock { writes } }
 
+    private var proofRequests: [Int] = []
+    var proofRequestSizes: [Int] { lock.withLock { proofRequests } }
+    var onProofCancellation: (@Sendable () -> Void)?
+
+    func remoteAssetProofs(
+        for identities: [UploadBackupExternalIdentity]
+    ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
+        let first = lock.withLock {
+            proofRequests.append(identities.count)
+            return proofRequests.count == 1
+        }
+        if first {
+            entered.signal()
+            await withTaskCancellationHandler {
+                await release.wait()
+            } onCancel: {
+                cancellationObserved.signal()
+                onProofCancellation?()
+            }
+            completed.signal()
+        }
+        return Dictionary(
+            uniqueKeysWithValues: identities.map {
+                (
+                    $0,
+                    .init(
+                        externalIdentity: $0, resourceCount: 1, remoteLinkIDs: ["proof-\($0.identifier)"],
+                        hashKeyEpoch: "epoch")
+                )
+            })
+    }
+
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         throw UploadError.backend("normal dedupe resolution must not run during receipt settlement")
     }
@@ -923,6 +955,238 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertEqual(try receiptCount(in: "backup_sync_queue", at: url), 1)
     }
 
+    func testAlbumExecutorScratchProofPathAttachesSharedServerPhotoWithoutChangingRows() async throws {
+        let deviceA = try EditScenarioHarness()
+        defer { try? deviceA.cleanup() }
+        try await deviceA.enqueue()
+        await deviceA.drain()
+        let original = try deviceA.liveMain()
+        let deviceB = try EditScenarioHarness(server: deviceA.server, library: deviceA.library)
+        defer { try? deviceB.cleanup() }
+        let settled = try await deviceB.enqueue()
+        XCTAssertEqual(deviceB.state(of: settled), .alreadyBackedUp)
+        let candidate = try deviceB.library.candidate()
+        let queueURL = deviceB.directory.appendingPathComponent(PhotoAlbumBackupExecutor.queueDatabaseFileName)
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
+        XCTAssertTrue(queue.upsert(settled))
+        queue.close()
+        let resolutions = deviceB.library.resolutions.count
+        let uploads = deviceB.server.steps.filter { $0.action.hasPrefix("upload") }.count
+        let uploader = MockUploader()
+        let executor = PhotoAlbumBackupExecutor(
+            accountDataDirectory: deviceB.directory, databasePolicy: .conservative,
+            identityResolver: deviceB.identityResolver, uploader: uploader,
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            proofCatalog: RecoveryProofCatalog(assets: [candidate]), runtimeSignals: .wiFiWithMobileDataOff)
+        let mapping = try XCTUnwrap(
+            AlbumSyncMappingStore(url: deviceB.directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName))
+        )
+        defer { mapping.close() }
+        let runner = AlbumSyncRunner(
+            localSource: RecoveryProofAlbumSource(identifiers: [candidate.snapshot.source.identifier]),
+            backup: RecoveryProofOnlyAlbumBackup(executor: executor), remoteOps: deviceB.server,
+            linkLookup: RecoveryMissingAlbumLinks(), mappingStore: mapping)
+        let report = try await runner.sync(
+            album: .init(id: "local-album", title: "Scenario album", assetCount: 1),
+            resolution: .attachToExisting(remoteAlbumID: "own-album"))
+        XCTAssertEqual(report.attached, 1)
+        XCTAssertEqual(report.unattachable, 0)
+        let members = try await deviceB.server.childMainLinkIDs(albumID: "own-album")
+        XCTAssertEqual(members, [original.nodeID])
+        let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.entry(for: settled.source, revision: settled.revision), settled)
+        XCTAssertNil(deviceB.identities.record(for: candidate.snapshot.source))
+        XCTAssertEqual(deviceB.library.resolutions.count, resolutions)
+        XCTAssertEqual(deviceB.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testAlbumExecutorStopDuringEmptyCatalogKeepsRunnerStoppedError() async throws {
+        try await assertRunnerStoppedDuringProofEnumeration(count: 0)
+    }
+
+    func testAlbumExecutorStoppedEmptyProofLookupReturnsNoLinks() async throws {
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: albumQueueURL()))
+        queue.close()
+        let catalog = RecoveryPartialProofCatalog(assets: [])
+        let executor = PhotoAlbumBackupExecutor(
+            accountDataDirectory: tempDirectory, databasePolicy: .conservative,
+            identityResolver: RecoveryIdentityRecorder(), uploader: MockUploader(),
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            proofCatalog: catalog, runtimeSignals: .wiFiWithMobileDataOff)
+        let lookup = Task { try await executor.remoteProofLinks(for: ["missing-proof"]) }
+        await catalog.nextEntered.wait()
+        await executor.stop()
+        let links = try await lookup.value
+        XCTAssertTrue(links.isEmpty, "Empty enumeration must retain its normal return for the runner's Stop fence")
+    }
+
+    func testAlbumExecutorStopDuringNonemptyCatalogKeepsRunnerStoppedError() async throws {
+        for count in [1, 127] { try await assertRunnerStoppedDuringProofEnumeration(count: count) }
+    }
+
+    private func assertRunnerStoppedDuringProofEnumeration(count: Int) async throws {
+        let assets = (0..<count).map { index in
+            UploadBackupAssetCandidate(
+                snapshot: .init(
+                    source: .init(kind: .photoLibraryAsset, identifier: "missing-proof-\(index)"),
+                    revision: .init(rawValue: 100), resourceCount: 1,
+                    externalIdentity: .init(identifier: "cloud-\(index)", revision: .init(rawValue: 100))),
+                originalFilename: "Photo.HEIC")
+        }
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: albumQueueURL()))
+        XCTAssertTrue(
+            queue.upsertBatch(
+                assets.map {
+                    .init(
+                        source: $0.snapshot.source, revision: $0.snapshot.revision,
+                        originalFilename: $0.originalFilename, state: .alreadyBackedUp,
+                        updatedAt: Date(timeIntervalSince1970: 100))
+                }))
+        queue.close()
+        let catalog = RecoveryPartialProofCatalog(assets: assets)
+        let recorder = BlockingRecoveryIdentityRecorder()
+        recorder.release.signal()
+        let executor = PhotoAlbumBackupExecutor(
+            accountDataDirectory: tempDirectory, databasePolicy: .conservative,
+            identityResolver: recorder, uploader: MockUploader(),
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            proofCatalog: catalog, runtimeSignals: .wiFiWithMobileDataOff)
+        let mapping = try XCTUnwrap(
+            AlbumSyncMappingStore(url: tempDirectory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)))
+        defer { mapping.close() }
+        let runner = AlbumSyncRunner(
+            localSource: RecoveryProofAlbumSource(
+                identifiers: count == 0 ? ["missing-proof"] : assets.map { $0.snapshot.source.identifier }),
+            backup: RecoveryProofOnlyAlbumBackup(executor: executor),
+            remoteOps: EditScenarioServer(), linkLookup: RecoveryMissingAlbumLinks(), mappingStore: mapping)
+        let pass = Task {
+            try await runner.sync(
+                album: .init(id: "local-album", title: "Scenario album", assetCount: 1),
+                resolution: .attachToExisting(remoteAlbumID: "own-album"))
+        }
+        await catalog.nextEntered.wait()
+        await runner.stop()
+        XCTAssertTrue(catalog.cancellationObserved.isSignaled)
+        // Empty enumeration cannot issue a proof request; exercise the request assertion only for real candidates.
+        if count > 0 { XCTAssertEqual(recorder.proofRequestSizes, []) }
+        XCTAssertEqual(mapping.mapping(localAlbumID: "local-album")?.remoteAlbumID, "own-album")
+        do {
+            _ = try await pass.value
+            XCTFail("Stop must keep the runner's stopped result for \(count) candidates")
+        } catch let error as AlbumSyncError {
+            XCTAssertEqual(error, .stopped)
+        } catch {
+            XCTFail("Stop with \(count) candidates must preserve .stopped, not \(error)")
+        }
+    }
+
+    func testAlbumExecutorStopDuringCatalogNextPreventsPartialProofBatch() async throws {
+        for count in [1, 127] {
+            let assets = (0..<count).map { index in
+                UploadBackupAssetCandidate(
+                    snapshot: .init(
+                        source: .init(kind: .photoLibraryAsset, identifier: "partial-\(count)-\(index)"),
+                        revision: .init(rawValue: 100), resourceCount: 1,
+                        externalIdentity: .init(identifier: "cloud-\(count)-\(index)", revision: .init(rawValue: 100))),
+                    originalFilename: "Photo.HEIC")
+            }
+            let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: albumQueueURL()))
+            XCTAssertTrue(
+                queue.upsertBatch(
+                    assets.map {
+                        .init(
+                            source: $0.snapshot.source, revision: $0.snapshot.revision,
+                            originalFilename: $0.originalFilename, state: .alreadyBackedUp,
+                            updatedAt: Date(timeIntervalSince1970: 100))
+                    }))
+            queue.close()
+            let catalog = RecoveryPartialProofCatalog(assets: assets)
+            let recorder = BlockingRecoveryIdentityRecorder()
+            recorder.release.signal()
+            let executor = PhotoAlbumBackupExecutor(
+                accountDataDirectory: tempDirectory, databasePolicy: .conservative,
+                identityResolver: recorder, uploader: MockUploader(),
+                resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+                proofCatalog: catalog, runtimeSignals: .wiFiWithMobileDataOff)
+            let lookup = Task { try await executor.remoteProofLinks(for: assets.map { $0.snapshot.source.identifier }) }
+            await catalog.nextEntered.wait()
+            await executor.stop()
+            XCTAssertTrue(catalog.cancellationObserved.isSignaled)
+            XCTAssertEqual(
+                recorder.proofRequestSizes, [],
+                "Stop during catalog.next must reject the \(count)-candidate partial batch")
+            do {
+                _ = try await lookup.value
+                XCTFail("Stop must surface cancellation without an attachable proof")
+            } catch is CancellationError {}
+        }
+    }
+
+    func testAlbumExecutorStopCancelsAndJoinsProofLookupBeforeAnotherBatch() async throws {
+        let assets = (0..<257).map { index in
+            UploadBackupAssetCandidate(
+                snapshot: .init(
+                    source: .init(kind: .photoLibraryAsset, identifier: "proof-\(index)"),
+                    revision: .init(rawValue: 100), resourceCount: 1,
+                    externalIdentity: .init(identifier: "cloud-\(index)", revision: .init(rawValue: 100))),
+                originalFilename: "Photo.HEIC")
+        }
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: albumQueueURL()))
+        XCTAssertTrue(
+            queue.upsertBatch(
+                assets.map {
+                    .init(
+                        source: $0.snapshot.source, revision: $0.snapshot.revision,
+                        originalFilename: $0.originalFilename, state: .alreadyBackedUp,
+                        updatedAt: Date(timeIntervalSince1970: 100))
+                }))
+        queue.close()
+        let blocker = BlockingRecoveryIdentityRecorder()
+        let cancellation = expectation(description: "Stop cancels the proof request")
+        blocker.onProofCancellation = { cancellation.fulfill() }
+        let executor = PhotoAlbumBackupExecutor(
+            accountDataDirectory: tempDirectory, databasePolicy: .conservative,
+            identityResolver: blocker, uploader: MockUploader(),
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            proofCatalog: RecoveryProofCatalog(assets: assets), runtimeSignals: .wiFiWithMobileDataOff)
+        let lookup = Task { try await executor.remoteProofLinks(for: assets.map { $0.snapshot.source.identifier }) }
+        await blocker.entered.wait()
+        do {
+            _ = try await executor.remoteProofLinks(for: [assets[0].snapshot.source.identifier])
+            XCTFail("The in-flight proof request must reject another operation")
+        } catch let error as AlbumSyncError {
+            XCTAssertEqual(error, .alreadyRunning)
+        }
+        let cancelledAdmission = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            do {
+                _ = try await executor.remoteProofLinks(for: [])
+                return false
+            } catch is CancellationError { return true } catch { return false }
+        }
+        let cancelledBeforeAdmission = await cancelledAdmission.value
+        XCTAssertTrue(cancelledBeforeAdmission, "Caller cancellation must take precedence over operation admission")
+        let stopReturned = RecoveryTestLatch()
+        let stop = Task {
+            await executor.stop()
+            stopReturned.signal()
+        }
+        await fulfillment(of: [cancellation], timeout: 5)
+        XCTAssertFalse(
+            stopReturned.isSignaled, "Stop must join a proof request that ignores cancellation until release")
+        blocker.release.signal()
+        await stop.value
+        XCTAssertTrue(blocker.cancellationObserved.isSignaled)
+        XCTAssertTrue(blocker.completed.isSignaled)
+        XCTAssertEqual(blocker.proofRequestSizes, [128], "Stop must prevent every later proof batch")
+        do {
+            _ = try await lookup.value
+            XCTFail("Stop must surface cancellation without an attachable proof")
+        } catch is CancellationError {}
+    }
+
     func testAlbumExecutorStopCancelsAndJoinsRecoveryBeforeClosingStores() async throws {
         let source = source("stop")
         let descriptor = descriptor(source: source, filename: "stop.heic", fileExists: false)
@@ -996,6 +1260,13 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         do {
             _ = try await executor.ensureBackedUp(localIdentifiers: [], onProgress: { _ in })
             XCTFail("stop fence must reject admission after the captured operation has joined")
+        } catch let error as AlbumSyncError {
+            XCTAssertEqual(error, .alreadyRunning)
+        }
+
+        do {
+            _ = try await executor.remoteProofLinks(for: [])
+            XCTFail("The proof lookup must retain the Stop admission fence")
         } catch let error as AlbumSyncError {
             XCTAssertEqual(error, .alreadyRunning)
         }
@@ -1257,4 +1528,64 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
         return Int(sqlite3_column_int(statement, 0))
     }
+}
+
+private struct RecoveryProofCatalog: UploadBackupAssetCatalog {
+    let assets: [UploadBackupAssetCandidate]
+    func candidates() -> AsyncThrowingStream<UploadBackupAssetCandidate, any Error> {
+        AsyncThrowingStream { continuation in
+            for asset in assets { continuation.yield(asset) }
+            continuation.finish()
+        }
+    }
+}
+
+private final class RecoveryPartialProofCatalog: UploadBackupAssetCatalog, @unchecked Sendable {
+    let nextEntered = RecoveryTestLatch()
+    let cancellationObserved = RecoveryTestLatch()
+    private let lock = NSLock()
+    private let assets: [UploadBackupAssetCandidate]
+    private var nextIndex = 0
+
+    init(assets: [UploadBackupAssetCandidate]) { self.assets = assets }
+
+    func candidates() -> AsyncThrowingStream<UploadBackupAssetCandidate, any Error> {
+        AsyncThrowingStream(unfolding: { [self] in
+            let candidate = lock.withLock { () -> UploadBackupAssetCandidate? in
+                guard nextIndex < assets.count else { return nil }
+                defer { nextIndex += 1 }
+                return assets[nextIndex]
+            }
+            if let candidate { return candidate }
+            let pending = AsyncThrowingStream<UploadBackupAssetCandidate, any Error> { continuation in
+                continuation.onTermination = { [self] _ in cancellationObserved.signal() }
+            }
+            var iterator = pending.makeAsyncIterator()
+            nextEntered.signal()
+            return try await iterator.next()
+        })
+    }
+}
+
+private struct RecoveryProofAlbumSource: AlbumSyncLocalAlbumSource {
+    var identifiers: [String] = ["missing-proof"]
+    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(identifiers) }
+}
+
+private struct RecoveryMissingAlbumLinks: AlbumSyncRemoteLinkLookup {
+    func remoteLinks(for localIdentifiers: [String]) async -> [String: AlbumSyncRemoteLink] { [:] }
+}
+
+private struct RecoveryProofOnlyAlbumBackup: AlbumSyncBackupExecuting {
+    let executor: PhotoAlbumBackupExecutor
+    func ensureBackedUp(
+        localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
+    ) async throws -> AlbumSyncBackupReport {
+        .init(total: 1, backedUp: 1, failed: 0, sourceMissing: 0, skippedRemoteDeletion: 0)
+    }
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        try await executor.remoteProofLinks(for: localIdentifiers)
+    }
+    func stop() async { await executor.stop() }
 }

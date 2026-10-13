@@ -313,6 +313,7 @@ final class EditScenarioHarness {
     /// Survives a relaunch, so rule U6 still knows which links this device uploaded.
     let deviceRemote: EditScenarioDeviceRemote
     private var pipeline: UploadDedupePipeline!
+    var identityResolver: any UploadIdentityResolving { pipeline }
     private var runner: BackupSyncRunner!
     private var engine: UploadBackupSyncEngine!
     private(set) var catalog: PhotoLibraryCatalogManifestStore!

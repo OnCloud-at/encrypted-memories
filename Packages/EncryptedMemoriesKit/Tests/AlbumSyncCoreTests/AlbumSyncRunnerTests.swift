@@ -49,6 +49,17 @@ private final class FakeBackupExecutor: AlbumSyncBackupExecuting, @unchecked Sen
     private let lock = NSLock()
     private var _runs: [[String]] = []
     var runs: [[String]] { lock.withLock { _runs } }
+    var proofLinks: [String: AlbumSyncRemoteLink] = [:]
+    var proofError: (any Error)?
+    var cancelsProofCaller = false
+    private var _proofRuns: [[String]] = []
+    var proofRuns: [[String]] { lock.withLock { _proofRuns } }
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        lock.withLock { _proofRuns.append(localIdentifiers) }
+        if cancelsProofCaller { withUnsafeCurrentTask { $0?.cancel() } }
+        if let proofError { throw proofError }
+        return proofLinks
+    }
     var stopped = false
     /// The unresolved scratch-queue rows and filenames the next run reports.
     var problems: [String: BackupFailedItem] = [:]
@@ -82,6 +93,8 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
     private var _created: [String] = []
     private var _attached: [[String]] = []
     private var _listCount = 0
+    private var _childCount = 0
+    var childCount: Int { lock.withLock { _childCount } }
     var createdNames: [String] { lock.withLock { _created } }
     var attachedBatches: [[String]] { lock.withLock { _attached } }
     var listCount: Int { lock.withLock { _listCount } }
@@ -97,7 +110,10 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
         return nextAlbumID
     }
 
-    func childMainLinkIDs(albumID: String) async throws -> Set<String> { children }
+    func childMainLinkIDs(albumID: String) async throws -> Set<String> {
+        lock.withLock { _childCount += 1 }
+        return children
+    }
 
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
         lock.withLock { _attached.append(photos.map(\.uid.nodeID)) }
@@ -158,6 +174,221 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
     }
 
     private let album = LocalAlbumSummary(id: "local-1", title: "Urlaub", assetCount: 3)
+
+    @Test func asksProofOnlyForMissingManifestLinksAndKeepsExistingAndTrashedLinks() async throws {
+        let backup = FakeBackupExecutor()
+        backup.proofLinks = ["known": link("wrong"), "missing": link("proven"), "trashed": link("wrong-trash")]
+        let (runner, remote, _, _) = makeRunner(
+            contents: ["album": ["known", "missing", "trashed"]],
+            links: ["known": link("existing"), "trashed": link("deleted", trashed: true)], backup: backup)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+        #expect(backup.proofRuns == [["missing"]])
+        #expect(remote.attachedBatches.flatMap { $0 } == ["existing", "proven"])
+        #expect(report.attached == 2)
+        #expect(report.trashedSkipped == 1)
+        #expect(report.unattachable == 0)
+    }
+
+    @Test func skipsProofLookupWhenEveryManifestLinkExists() async throws {
+        let (runner, _, backup, _) = makeRunner(contents: ["album": ["known"]], links: ["known": link("existing")])
+        _ = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(backup.proofRuns.isEmpty)
+    }
+
+    @Test(arguments: ["queue", "catalog", "admission"])
+    func proofLookupFailureKeepsManifestPhotosAttachable(failure: String) async throws {
+        let backup = FakeBackupExecutor()
+        backup.proofError =
+            failure == "catalog"
+            ? UploadError.backend("catalog failed")
+            : (failure == "queue" ? AlbumSyncError.mappingStoreUnavailable : AlbumSyncError.alreadyRunning)
+        let (runner, remote, _, _) = makeRunner(
+            contents: ["album": ["known", "missing"]], links: ["known": link("existing")], backup: backup)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 2))
+        #expect(backup.proofRuns == [["missing"]])
+        #expect(remote.childCount == 1)
+        #expect(remote.attachedBatches == [["existing"]])
+        #expect(report.attached == 1)
+        #expect(report.unattachable == 1)
+        #expect(report.problems.map { $0.source?.identifier } == ["missing"])
+        #expect(report.problems.allSatisfy { $0.isRetryable })
+    }
+
+    @Test func cancelledProofCallerWithOrdinaryErrorAdmitsNoFurtherWork() async throws {
+        let backup = FakeBackupExecutor()
+        backup.cancelsProofCaller = true
+        backup.proofError = UploadError.backend("catalog failed")
+        let (runner, remote, _, _) = makeRunner(
+            contents: ["album": ["known", "missing"]], links: ["known": link("existing")], backup: backup)
+        let sync = Task {
+            try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 2))
+        }
+        await #expect(throws: (any Error).self) { try await sync.value }
+        #expect(remote.childCount == 0)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func proofLookupCancellationWithoutStopStillPropagates() async throws {
+        let backup = FakeBackupExecutor()
+        backup.proofError = CancellationError()
+        let (runner, remote, _, _) = makeRunner(
+            contents: ["album": ["known", "missing"]], links: ["known": link("existing")], backup: backup)
+        await #expect(throws: CancellationError.self) {
+            try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 2))
+        }
+        #expect(remote.childCount == 0)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func proofLookupStoppedErrorWithoutLocalStopStillPropagates() async throws {
+        let backup = FakeBackupExecutor()
+        backup.proofError = AlbumSyncError.stopped
+        let (runner, remote, _, _) = makeRunner(
+            contents: ["album": ["known", "missing"]], links: ["known": link("existing")], backup: backup)
+        await #expect(throws: AlbumSyncError.stopped) {
+            try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 2))
+        }
+        #expect(remote.childCount == 0)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func stopDuringProofFailurePreventsFallbackAttachment() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let remote = FakeRemoteOps()
+        let runner = AlbumSyncRunner(
+            localSource: FakeLocalSource(contents: ["local-1": .present(["known", "missing"])]),
+            backup: GatedProofExecutor(
+                entered: entered, release: release, failure: UploadError.backend("catalog failed")),
+            remoteOps: remote, linkLookup: FakeLinkLookup(), mappingStore: makeStore())
+        let albumToSync = album
+        let sync = Task { try await runner.sync(album: albumToSync) }
+        await entered.wait()
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(remote.childCount == 0)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func stopDuringCreateSavesMappingAndRetryCreatesNoSecondAlbum() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let remote = FakeRemoteOps()
+        let store = makeStore()
+        let lookup = FakeLinkLookup()
+        lookup.links = ["a": link("known")]
+        let runner = AlbumSyncRunner(
+            localSource: FakeLocalSource(contents: ["local-1": .present(["a"])]),
+            backup: FakeBackupExecutor(),
+            remoteOps: GatedCreateRemoteOps(base: remote, entered: entered, release: release),
+            linkLookup: lookup, mappingStore: store)
+        let albumToSync = album
+        let sync = Task { try await runner.sync(album: albumToSync) }
+        await entered.wait()
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        let mapping = try #require(store.mapping(localAlbumID: album.id))
+        #expect(mapping.remoteAlbumID == remote.nextAlbumID)
+        #expect(remote.createdNames.count == 1)
+        #expect(remote.attachedBatches.isEmpty)
+        let retry = try await runner.sync(album: album)
+        #expect(retry.remoteAlbumID == mapping.remoteAlbumID)
+        #expect(retry.attached == 1)
+        #expect(remote.createdNames.count == 1)
+    }
+
+    @Test func stopDuringManifestLookupPreventsProofAdmission() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let backup = FakeBackupExecutor()
+        backup.proofLinks = ["a": link("proven")]
+        let remote = FakeRemoteOps()
+        let runner = AlbumSyncRunner(
+            localSource: FakeLocalSource(contents: ["local-1": .present(["a"])]),
+            backup: backup,
+            remoteOps: remote,
+            linkLookup: GatedLinkLookup(entered: entered, release: release),
+            mappingStore: makeStore()
+        )
+        let albumToSync = album
+        let sync = Task { try await runner.sync(album: albumToSync) }
+        await entered.wait()
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(backup.proofRuns.isEmpty)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test(arguments: 1...7) func stopDuringAlbumExistenceCheckPreventsNextWork(check: Int) async throws {
+        let entered = Gate()
+        let release = Gate()
+        let local = GatedAlbumSource(check: check > 5 ? 2 : check, entered: entered, release: release)
+        let resolution: AlbumSyncResolution =
+            check == 6 ? .attachToExisting(remoteAlbumID: "existing") : (check == 7 ? .createNew : .automatic)
+        let remote = FakeRemoteOps()
+        let backup = FakeBackupExecutor()
+        let store = makeStore()
+        let lookup = FakeLinkLookup()
+        lookup.links = ["a": link("known")]
+        let runner = AlbumSyncRunner(
+            localSource: local, backup: backup, remoteOps: remote, linkLookup: lookup, mappingStore: store)
+        let albumToSync = album
+        let sync = Task { try await runner.sync(album: albumToSync, resolution: resolution) }
+        await entered.wait()
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(remote.listCount == (check == 1 || check > 5 ? 0 : 1))
+        #expect(remote.createdNames.count == (check <= 2 || check > 5 ? 0 : 1))
+        #expect(backup.runs.count == (check <= 3 || check > 5 ? 0 : 1))
+        #expect(remote.childCount == (check <= 4 || check > 5 ? 0 : 1))
+        #expect(remote.attachedBatches.isEmpty)
+        if check <= 2 || check > 5 { #expect(store.mapping(localAlbumID: album.id) == nil) }
+    }
+
+    @Test func stopDuringAlbumListPreventsNextWork() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let local = GatedAlbumSource(check: 0, entered: entered, release: release)
+        let remote = FakeRemoteOps()
+        let backup = FakeBackupExecutor()
+        let runner = AlbumSyncRunner(
+            localSource: local, backup: backup,
+            remoteOps: GatedRemoteOps(base: remote, entered: entered, release: release),
+            linkLookup: FakeLinkLookup(), mappingStore: makeStore())
+        let albumToSync = album
+        let sync = Task { try await runner.sync(album: albumToSync) }
+        await entered.wait()
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(await local.checkCount == 1)
+        #expect(remote.createdNames.isEmpty)
+        #expect(backup.runs.isEmpty)
+    }
+
+    @Test func stopDuringProofLookupPreventsMemberRead() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let remote = FakeRemoteOps()
+        let local = GatedAlbumSource(check: 0, entered: entered, release: release)
+        let runner = AlbumSyncRunner(
+            localSource: local,
+            backup: GatedProofExecutor(entered: entered, release: release), remoteOps: remote,
+            linkLookup: FakeLinkLookup(), mappingStore: makeStore())
+        let albumToSync = album
+        let sync = Task { try await runner.sync(album: albumToSync) }
+        await entered.wait()
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(await local.checkCount == 3)
+        #expect(remote.childCount == 0)
+        #expect(remote.attachedBatches.isEmpty)
+    }
 
     @Test func firstSyncCreatesAlbumBacksUpAndAttaches() async throws {
         let (runner, remote, backup, store) = makeRunner(
@@ -517,6 +748,72 @@ private actor Gate {
     }
 }
 
+private actor GatedAlbumSource: AlbumSyncLocalAlbumSource {
+    let check: Int
+    let entered: Gate
+    let release: Gate
+    private(set) var checkCount = 0
+    init(check: Int, entered: Gate, release: Gate) {
+        self.check = check
+        self.entered = entered
+        self.release = release
+    }
+    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(["a"]) }
+    func albumExists(albumID: String) async throws -> Bool {
+        checkCount += 1
+        if checkCount == check {
+            await entered.open()
+            await release.wait()
+        }
+        return true
+    }
+}
+
+private struct GatedRemoteOps: AlbumSyncRemoteAlbumOps {
+    let base: FakeRemoteOps
+    let entered: Gate
+    let release: Gate
+    func listAlbums() async throws -> [AlbumSyncRemoteAlbum] {
+        await entered.open()
+        await release.wait()
+        return []
+    }
+    func createAlbum(name: String) async throws -> String { try await base.createAlbum(name: name) }
+    func childMainLinkIDs(albumID: String) async throws -> Set<String> {
+        try await base.childMainLinkIDs(albumID: albumID)
+    }
+    func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
+        try await base.attach(photos, albumID: albumID)
+    }
+}
+
+private struct GatedProofExecutor: AlbumSyncBackupExecuting {
+    let entered: Gate
+    let release: Gate
+    var failure: (any Error)? = nil
+    func ensureBackedUp(
+        localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
+    ) async throws -> AlbumSyncBackupReport { AlbumSyncBackupReport() }
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        await entered.open()
+        await release.wait()
+        if let failure { throw failure }
+        return ["a": link("proven")]
+    }
+    func stop() async {}
+}
+
+private struct GatedLinkLookup: AlbumSyncRemoteLinkLookup {
+    let entered: Gate
+    let release: Gate
+    func remoteLinks(for localIdentifiers: [String]) async -> [String: AlbumSyncRemoteLink] {
+        await entered.open()
+        await release.wait()
+        return [:]
+    }
+}
+
 private struct GatedBackupExecutor: AlbumSyncBackupExecuting {
     let gate: Gate
     func ensureBackedUp(
@@ -663,5 +960,24 @@ private final class ProgressBox: @unchecked Sendable {
         #expect(progress.localizedTitle == L10n.string("backup.phase_waiting_wifi"))
         progress.phase = .attaching
         #expect(progress.localizedTitle == L10n.string("albumsync.phase_attaching"))
+    }
+}
+
+private struct GatedCreateRemoteOps: AlbumSyncRemoteAlbumOps {
+    let base: FakeRemoteOps
+    let entered: Gate
+    let release: Gate
+    func listAlbums() async throws -> [AlbumSyncRemoteAlbum] { try await base.listAlbums() }
+    func createAlbum(name: String) async throws -> String {
+        let id = try await base.createAlbum(name: name)
+        await entered.open()
+        await release.wait()
+        return id
+    }
+    func childMainLinkIDs(albumID: String) async throws -> Set<String> {
+        try await base.childMainLinkIDs(albumID: albumID)
+    }
+    func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
+        try await base.attach(photos, albumID: albumID)
     }
 }

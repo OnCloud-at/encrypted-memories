@@ -311,7 +311,7 @@ let package = Package(
         .testTarget(
             name: "UploadFeatureTests",
             dependencies: [
-                "UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter",
+                "UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter", "AlbumSyncCore",
                 // The Duplicates screenshots render the shared viewer with its merge tools.
                 "PhotoViewerFeature", "MediaCache", "MediaByteCache", "ProtonDriveBackend",
                 .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
