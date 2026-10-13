@@ -153,6 +153,7 @@ public actor AlbumSyncRunner {
         // Resolve the Proton album first and persist the mapping. Fail fast on conflicts so a crash
         // cannot create a second album later.
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
         let remoteAlbumID = try await resolveRemoteAlbum(
             album: album, resolution: resolution, mappingStore: mappingStore)
         try checkStop()
@@ -160,6 +161,7 @@ public actor AlbumSyncRunner {
         // Back up every album asset through the standard pipeline. The dedupe manifest remains the
         // single duplicate authority, so already-backed-up assets cost one preflight lookup.
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
         progress.phase = .backingUp
         publish()
         let updateBackupProgress: @Sendable (BackupSyncProgress) -> Void = { [weak self] snapshot in
@@ -173,12 +175,15 @@ public actor AlbumSyncRunner {
         progress.phase = .checkingAlbum
         publish()
         var links = await linkLookup.remoteLinks(for: identifiers)
+        try checkStop()
         let missing = identifiers.filter { links[$0] == nil }
         if !missing.isEmpty {
             let proven = try await backup.remoteProofLinks(for: missing)
+            try checkStop()
             links.merge(proven) { existing, _ in existing }
         }
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
         let children = try await remoteOps.childMainLinkIDs(albumID: remoteAlbumID)
         let plan = AlbumSyncPlanner.plan(
             orderedLocalIdentifiers: identifiers,
@@ -200,6 +205,7 @@ public actor AlbumSyncRunner {
         while index < plan.toAttach.count {
             try checkStop()
             try await ensureAlbumPresent(albumID: album.id)
+            try checkStop()
             let chunk = Array(plan.toAttach[index..<min(index + attachChunkSize, plan.toAttach.count)])
             let result = try await remoteOps.attach(chunk, albumID: remoteAlbumID)
             attachResult += result
@@ -277,14 +283,18 @@ public actor AlbumSyncRunner {
         switch resolution {
         case .automatic:
             let twins = try await nameTwins(of: album.title)
+            try checkStop()
             guard twins.isEmpty else { throw AlbumSyncError.nameConflict(existing: twins) }
             try await ensureAlbumPresent(albumID: album.id)
+            try checkStop()
             remoteAlbumID = try await remoteOps.createAlbum(name: name)
         case .attachToExisting(let existingID):
             try await ensureAlbumPresent(albumID: album.id)
+            try checkStop()
             remoteAlbumID = existingID
         case .createNew:
             try await ensureAlbumPresent(albumID: album.id)
+            try checkStop()
             remoteAlbumID = try await remoteOps.createAlbum(name: name)
         }
         guard
