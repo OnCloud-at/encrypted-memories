@@ -1443,6 +1443,44 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.map(\.id).contains("B"), true, "the groups of the new index show after the merge")
     }
 
+    func testTwoServiceInterruptionsOfferRetryAfterTheLastCandidateIsRejected() async {
+        for coverage: ExactDuplicateCoverage in [.indexing, .complete] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: coverage)])
+            finder.buildError = CancellationError()
+            finder.rankGate.close()
+            finder.fingerprints = [
+                a1: ExactDuplicateFingerprint(pixelWidth: 1),
+                a2: ExactDuplicateFingerprint(pixelWidth: 2),
+                a3: ExactDuplicateFingerprint(pixelWidth: 3),
+            ]
+            let (model, _) = makeModel(finder)
+            let load = Task { await model.load(checkAllGroups: true) }
+            await waitUntil(
+                { finder.rankGate.hasWaiters && finder.buildCalls == 2 && model.checkProgress == nil },
+                "both service interruptions finish while the candidate still waits for metadata")
+            XCTAssertTrue(model.isCheckingGroups, "an active metadata check keeps its waiting screen")
+            XCTAssertEqual(model.groups.count, 1)
+            finder.rankGate.open()
+            await load.value
+
+            XCTAssertEqual(model.groups, [], "the different details reject the last byte-equal candidate")
+            XCTAssertFalse(model.isCheckingGroups)
+            XCTAssertNil(model.checkProgress)
+            XCTAssertEqual(
+                model.content,
+                coverage.isComplete ? .noDuplicates : .failed(L10n.string("duplicates.load_failed")),
+                "an unfinished failed library check offers Retry even when ranking removed its final candidate")
+
+            finder.buildError = nil
+            finder.buildChanged = true
+            finder.replaceScans([.init(groups: [], coverage: .complete)])
+            await model.load()
+            XCTAssertEqual(finder.buildCalls, 3)
+            XCTAssertEqual(model.content, .noDuplicates)
+            XCTAssertNil(model.checkFailedNote)
+        }
+    }
+
     func testTwoServiceInterruptionsOfferRetryInsteadOfWaitingWithoutABuild() async {
         for candidates in [[], [groupA]] {
             let finder = FakeDuplicateFinder(scans: [.init(groups: candidates, coverage: .indexing)])

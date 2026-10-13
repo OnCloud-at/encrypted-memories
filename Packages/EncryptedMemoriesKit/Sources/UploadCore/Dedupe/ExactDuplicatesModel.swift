@@ -475,6 +475,8 @@ public final class ExactDuplicatesModel {
         case .loaded:
             if !groups.isEmpty {
                 .groups
+            } else if buildFailed, !isBuilding, !isMerging, !isComplete {
+                .failed(L10n.string("duplicates.load_failed"))
             } else if case .indexing = coverage {
                 .stillChecking
             } else if !isComplete, isBuilding {
