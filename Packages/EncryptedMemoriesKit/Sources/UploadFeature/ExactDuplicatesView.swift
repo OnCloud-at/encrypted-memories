@@ -3,10 +3,10 @@ import PhotosCore
 import SwiftUI
 import UploadCore
 
-/// The Duplicates route of macOS, iOS, and iPadOS: groups of exact copies, one section per group, like Duplicates in
-/// Apple Photos. The shared `ExactDuplicatesModel` owns the groups, the photo to keep, and the merges; this view
-/// renders them with a native list and dialogs. The host owns the Merge All toolbar button and sets
-/// `confirmsMergeAll`, draws each photo, and opens a photo of a group in its viewer.
+/// The Duplicates route of macOS, iOS, and iPadOS: groups of exact copies, one section per group. The shared
+/// `ExactDuplicatesModel` owns the groups, the photo to keep, and the merges; this view renders them with a native
+/// list and dialogs. The host owns the Merge All toolbar button and sets `confirmsMergeAll`, draws each photo, and
+/// opens a photo of a group in its viewer.
 public struct ExactDuplicatesView<Cover: View>: View {
     private let model: ExactDuplicatesModel
     @Binding private var confirmsMergeAll: Bool
@@ -510,7 +510,7 @@ private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
         }
     }
 
-    /// The capture date of the group and its Merge button, like a group of Duplicates in Apple Photos.
+    /// The capture date of the group and its Merge button.
     private var header: some View {
         HStack(alignment: .center) {
             Text(group.title)
@@ -632,7 +632,7 @@ private struct ExactDuplicateMembers<Cover: View>: View {
     }
 }
 
-/// One copy: equal to the others, its size at the bottom right and its badges at the bottom left, like Apple Photos.
+/// One copy: equal to the others, its size at the bottom right and its badges at the bottom left.
 /// The copy that a merge keeps carries a checkmark and a thin accent border.
 private struct ExactDuplicateTile<Cover: View>: View {
     let group: ExactDuplicatesModel.Group
@@ -643,7 +643,7 @@ private struct ExactDuplicateTile<Cover: View>: View {
     let isReady: Bool
     let cover: Cover
 
-    /// Apple Photos shows at most two badges on a small thumbnail; the rest is a count.
+    /// A small thumbnail shows at most two badges; the rest is a count.
     private static var visibleBadges: Int { 2 }
 
     var body: some View {
@@ -712,7 +712,7 @@ private struct ExactDuplicateTile<Cover: View>: View {
     }
 }
 
-/// White text on a photo with a subtle shadow, as Apple Photos prints the size on a thumbnail.
+/// White text on a photo with a subtle shadow, so the size stays readable on a thumbnail.
 private struct ThumbnailText: ViewModifier {
     func body(content: Content) -> some View {
         content

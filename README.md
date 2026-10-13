@@ -35,7 +35,7 @@ Encrypted Memories is not affiliated with or endorsed by Proton AG.
 
 ## Support Encrypted Memories
 
-Encrypted Memories is free and open source.
+Encrypted Memories is open source under the AGPL-3.0 license.
 
 **[Sponsor Encrypted Memories through GitHub Sponsors](https://github.com/sponsors/traktuner)**
 

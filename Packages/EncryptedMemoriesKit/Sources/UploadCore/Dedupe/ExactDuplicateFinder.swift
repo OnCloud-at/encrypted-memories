@@ -209,7 +209,7 @@ public struct ExactDuplicateKeepFacts: Sendable, Equatable {
     }
 }
 
-/// Finds exact duplicates in the own Proton library and merges them, like Duplicates in Apple Photos.
+/// Finds exact duplicates in the own Proton library and merges them.
 ///
 /// A group holds two or more active main photos with the same content hash in the current key epoch. The content
 /// index of the backup dedupe supplies the hashes, so the scan reads no media bytes. The node reads of the ranking add
