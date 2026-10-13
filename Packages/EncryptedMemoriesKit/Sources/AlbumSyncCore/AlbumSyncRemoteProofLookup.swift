@@ -29,6 +29,7 @@ public enum AlbumSyncRemoteProofLookup {
             }
         }
         if !batch.isEmpty {
+            try Task.checkCancellation()
             result.merge(try await links(in: batch, resolver: resolver)) { existing, _ in existing }
         }
         return result
