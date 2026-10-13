@@ -1692,7 +1692,7 @@ public final class PhotoLibraryBackupController {
         if !isShuttingDown,
             let lock = lockStore?.currentLock(), lock.runID == runID, lock.owner == .manual
         {
-            manualWiFiRetryPending = passWaitedForWiFi || (manualWiFiRetryPending && passPausedByPolicy)
+            manualWiFiRetryPending = passPausedByPolicy
         }
         heartbeatTask?.cancel()
         heartbeatTask = nil
