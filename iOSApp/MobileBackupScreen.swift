@@ -557,7 +557,8 @@ struct MobileFailedBackupSheet: View {
             }
             .mobileNavigationTitle(
                 controller == nil
-                    ? L10n.string("albumsync.problem_sheet_title") : L10n.string("backup.failed_sheet_title")
+                    ? AlbumSyncController.SelectedAlbum.localizedProblemSheetTitle(for: items)
+                    : L10n.string("backup.failed_sheet_title")
             )
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

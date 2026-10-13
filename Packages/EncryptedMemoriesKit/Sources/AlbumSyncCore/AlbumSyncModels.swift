@@ -190,13 +190,16 @@ public struct AlbumSyncProgress: Sendable, Equatable {
     public var unattachable = 0
     /// Local assets whose only remote copy the user trashed on Proton - respected, not attached.
     public var trashedSkipped = 0
+    /// Local assets that are in the Proton album, but whose backup is not complete, for example a Live Photo
+    /// whose video stays blocked behind a draft.
+    public var incomplete = 0
     public var message: String?
     /// The backup phase waits because mobile data is off for backups on an expensive network.
     public var isWaitingForWiFi = false
 
     public init() {}
 
-    public var needsAttentionCount: Int { attachFailed + unattachable }
+    public var needsAttentionCount: Int { attachFailed + unattachable + incomplete }
 
     public var localizedTitle: String {
         switch phase {
@@ -241,7 +244,9 @@ public struct AlbumSyncReport: Sendable, Equatable {
     public let attachFailed: Int
     public let unattachable: Int
     public let trashedSkipped: Int
-    /// One item for each photo that is not in the Proton album after this run, with its reason.
+    /// Photos that are in the Proton album, but whose backup is not complete after this run.
+    public let incomplete: Int
+    /// One item for each photo that needs attention after this run, with its reason.
     public let problems: [BackupFailedItem]
 
     public init(
@@ -252,6 +257,7 @@ public struct AlbumSyncReport: Sendable, Equatable {
         attachFailed: Int,
         unattachable: Int,
         trashedSkipped: Int,
+        incomplete: Int = 0,
         problems: [BackupFailedItem] = []
     ) {
         self.remoteAlbumID = remoteAlbumID
@@ -261,10 +267,11 @@ public struct AlbumSyncReport: Sendable, Equatable {
         self.attachFailed = attachFailed
         self.unattachable = unattachable
         self.trashedSkipped = trashedSkipped
+        self.incomplete = incomplete
         self.problems = problems
     }
 
-    public var isFullySynced: Bool { attachFailed == 0 && unattachable == 0 }
+    public var isFullySynced: Bool { attachFailed == 0 && unattachable == 0 && incomplete == 0 }
 }
 
 /// Errors the sync flow surfaces to the UI. All cases are explicit - there is no silent fallback.

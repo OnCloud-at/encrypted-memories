@@ -72,9 +72,26 @@ public final class AlbumSyncController {
         /// Row-level status with the correct priority. A previous failed photo means this album is
         /// not cleanly synced, even when `lastSyncedAt` is recent.
         public var localizedRowStatusDescription: String {
-            hasNeedsAttention
-                ? L10n.string("albumsync.detail_not_in_album \(needsAttentionCount)")
-                : localizedStateDescription
+            guard hasNeedsAttention else { return localizedStateDescription }
+            // A photo that is in the album while its backup is incomplete is no photo "not in the album".
+            return hasIncompletePhotos
+                ? L10n.string("albumsync.detail_needs_attention \(needsAttentionCount)")
+                : L10n.string("albumsync.detail_not_in_album \(needsAttentionCount)")
+        }
+
+        /// The last run listed a photo that is in the album while a part of it is not backed up, for example the
+        /// video of a Live Photo.
+        public var hasIncompletePhotos: Bool { Self.containsIncompletePhotos(problems) }
+
+        /// Title of the shared problem list for an album's last-run photos.
+        public static func localizedProblemSheetTitle(for problems: [BackupFailedItem]) -> String {
+            containsIncompletePhotos(problems)
+                ? L10n.string("albumsync.problem_sheet_title_attention")
+                : L10n.string("albumsync.problem_sheet_title")
+        }
+
+        private static func containsIncompletePhotos(_ problems: [BackupFailedItem]) -> Bool {
+            problems.contains { $0.id.hasPrefix(AlbumSyncProblemList.incompleteIDPrefix) }
         }
     }
 
