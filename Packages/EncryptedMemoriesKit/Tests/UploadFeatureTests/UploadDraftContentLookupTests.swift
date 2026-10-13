@@ -91,6 +91,81 @@ final class UploadDraftContentLookupTests: XCTestCase {
         XCTAssertEqual(server.uploadRequestCount, 0)
     }
 
+    func testAdoptedLivePrimaryUploadsOnlyItsMissingVideoAndKeepsTheForeignDraft() async throws {
+        let harness = try EditScenarioHarness(live: true)
+        defer { try? harness.cleanup() }
+        let asset = try XCTUnwrap(harness.library.snapshot.first)
+        let active = harness.server.seedLink(digest: Data(Insecure.SHA1.hash(data: asset.current)))
+        let draft = harness.server.seedDraft(
+            name: "IMG_1.HEIC", digest: Data(Insecure.SHA1.hash(data: Data("different-photo".utf8))),
+            clientUID: "other-uploader")
+        let before = try await harness.server.findDuplicates(nameHashes: ["nh(IMG_1.HEIC)"])
+        XCTAssertEqual(before.map(\.linkID), [draft.nodeID])
+        XCTAssertTrue(harness.server.links.filter { $0.mainLinkID == active.nodeID }.isEmpty)
+        let entry = try await harness.enqueue()
+
+        await harness.pass()
+
+        XCTAssertEqual(harness.state(of: entry), .alreadyBackedUp)
+        XCTAssertEqual(harness.identities.record(for: entry.source)?.remoteLinkID, active.nodeID)
+        let after = try await harness.server.findDuplicates(nameHashes: ["nh(IMG_1.HEIC)"])
+        XCTAssertEqual(after, before, "The foreign draft must survive unchanged")
+        XCTAssertEqual(harness.server.uploadRequestCount, 1)
+        let uploaded = harness.server.links.filter { $0.uid != active && $0.uid != draft }
+        XCTAssertEqual(uploaded.count, 1)
+        let video = try XCTUnwrap(uploaded.first)
+        XCTAssertEqual(video.mainLinkID, active.nodeID)
+        XCTAssertEqual(video.nameHash, "nh(IMG_1.MOV)")
+        XCTAssertEqual(video.state, .active)
+        XCTAssertEqual(
+            video.contentHash,
+            EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: try XCTUnwrap(asset.pairedVideo)))))
+        let secondarySource = UploadSourceIdentity(
+            kind: .photoLibraryAsset, identifier: asset.identifier, resource: .livePairedVideo)
+        XCTAssertEqual(harness.identities.record(for: secondarySource)?.remoteLinkID, video.linkID)
+        XCTAssertEqual(harness.identities.record(for: secondarySource)?.outcome, "uploaded")
+
+        try harness.relaunch()
+        XCTAssertEqual(harness.state(of: entry), .alreadyBackedUp)
+        XCTAssertEqual(harness.identities.record(for: entry.source)?.remoteLinkID, active.nodeID)
+        XCTAssertEqual(harness.identities.record(for: secondarySource)?.remoteLinkID, video.linkID)
+        XCTAssertEqual(harness.server.uploadRequestCount, 1)
+    }
+
+    func testBlockedResolveKeepsExistingRestoredVersionJournalUpdates() async throws {
+        let harness = try EditScenarioHarness()
+        defer { try? harness.cleanup() }
+        let source = try XCTUnwrap(harness.library.snapshot.first).source
+        let descriptor = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/fixture/current.heic"), filename: "current.heic",
+            fileSize: 20, modificationDate: harness.clock.now, precomputedSHA1Digest: Data(repeating: 1, count: 20))
+        let restored = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
+        try harness.journal.addSuperseded(restored, for: source)
+        try harness.journal.settle([restored.nodeID], related: [], trashed: true, for: source)
+        try harness.journal.keepDeleted(for: source)
+        XCTAssertEqual(harness.journal.entry(for: source).retired, [restored.nodeID])
+        XCTAssertEqual(harness.journal.entry(for: source).keptDeleted, true)
+        let draft = harness.server.seedDraft(
+            name: descriptor.filename, digest: Data(repeating: 3, count: 20), clientUID: "other-uploader")
+        let before = try await harness.server.findDuplicates(nameHashes: ["nh(current.heic)"])
+        let pipeline = UploadDedupePipeline(
+            store: FakeIdentityStore(), checker: harness.server, currentClientUID: "this-uploader",
+            replacementJournal: harness.journal)
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID))
+        let journal = harness.journal.entry(for: source)
+        XCTAssertNil(journal.keptDeleted)
+        XCTAssertTrue(journal.retired.isEmpty)
+        XCTAssertEqual(journal.superseded, [PhotoUID(volumeID: "", nodeID: restored.nodeID)])
+        let after = try await harness.server.findDuplicates(nameHashes: ["nh(current.heic)"])
+        XCTAssertEqual(after, before)
+        XCTAssertEqual(harness.server.uploadRequestCount, 0)
+        try harness.relaunch()
+        XCTAssertEqual(harness.journal.entry(for: source), journal)
+    }
+
     private func fixture(
         server: EditScenarioServer, owner: String? = "other-uploader"
     ) -> (UploadDedupePipeline, UploadResourceDescriptor, PhotoUID) {
