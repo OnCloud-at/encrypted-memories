@@ -341,8 +341,11 @@ unset IOS_TEST_DESTINATION
 ```
 
 The override is optional. Without it, the scripts keep selecting an installed iPhone simulator.
-A named override resolves its requested runtime, or the newest runtime for `OS=latest`.
-An `id=` override selects an existing simulator directly. Both test modes wait for that simulator
+A named override selects the newest matching runtime. `OS=27` matches 27.x; `OS=27.1` matches
+27.1 and 27.1.x. A three-component value such as `OS=27.1.0` matches exactly, with missing runtime
+components treated as zero. An omitted OS or `OS=latest` selects the newest runtime.
+Empty `id=` or `OS=` fields and fields without `=` fail with exit 64. Simulator names containing a
+comma are not supported; use `id=` for those devices. An `id=` override selects an existing simulator directly. Both test modes wait for that simulator
 to boot and pass the same device ID to Xcode. `build-for-testing` does not boot a simulator.
 Command tests cover these choices in `.github/scripts/test_ios_test_commands.py`.
 

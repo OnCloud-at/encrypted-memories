@@ -33,13 +33,17 @@ import json, os, sys
 with open(os.environ['TEST_ROOT'] + '/commands.jsonl', 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\\n')
 if sys.argv[1:4] == ['simctl', 'list', 'devices']:
-    print(json.dumps({'devices': {
+    devices = {'devices': {
         'com.apple.CoreSimulator.SimRuntime.iOS-26-0': [
             {'name': 'iPhone 17', 'udid': 'older-simulator-test', 'isAvailable': True}],
         'com.apple.CoreSimulator.SimRuntime.iOS-27-0': [
             {'name': 'iPhone 17', 'udid': 'simulator-test', 'isAvailable': True}],
         'com.apple.CoreSimulator.SimRuntime.iOS-27-1': [
-            {'name': 'iPhone Duo', 'udid': 'duo-test', 'isAvailable': True}]}}))
+            {'name': 'iPhone Duo', 'udid': 'duo-test', 'isAvailable': True}]}}
+    if os.environ.get('TEST_PATCH_RUNTIME') == '1':
+        devices['devices']['com.apple.CoreSimulator.SimRuntime.iOS-27-1-1'] = [
+            {'name': 'iPhone Duo', 'udid': 'patched-duo-test', 'isAvailable': True}]
+    print(json.dumps(devices))
 if sys.argv[1:3] == ['simctl', 'bootstatus']:
     raise SystemExit(int(os.environ.get('TEST_BOOT_EXIT', '0')))
 '''
@@ -57,7 +61,7 @@ if sys.argv[1:3] == ['simctl', 'bootstatus']:
             if key.startswith('IOS_TEST_'):
                 del environment[key]
         environment.update(TEST_ROOT=str(self.root), PATH=str(self.root / 'bin') + ':' + os.environ['PATH'])
-        environment.update(TEST_BOOT_EXIT="0")
+        environment.update(TEST_BOOT_EXIT="0", TEST_PATCH_RUNTIME="0")
         environment.update(options)
         (self.root / "commands.jsonl").write_text("")
         result = subprocess.run(['bash', str(self.root / 'scripts/verify-ios-app-tests.sh'), mode],
@@ -115,6 +119,65 @@ if sys.argv[1:3] == ['simctl', 'bootstatus']:
             with self.subTest(runtime=runtime):
                 result = self.run_script(IOS_TEST_DESTINATION='platform=iOS Simulator,name=iPhone Duo,OS=' + runtime)
                 self.assertEqual(result.returncode, expected)
+                self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
+
+    def test_partial_or_missing_runtime_selects_the_highest_matching_version(self):
+        for runtime in ['27.1', '27', None]:
+            with self.subTest(runtime=runtime):
+                destination = 'platform=iOS Simulator,name=iPhone Duo'
+                if runtime is not None:
+                    destination += ',OS=' + runtime
+                result = self.run_script(IOS_TEST_DESTINATION=destination, TEST_PATCH_RUNTIME='1')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(['simctl', 'bootstatus', 'patched-duo-test', '-b'], self.commands)
+                invocation = self.commands[-1]
+                self.assertEqual(invocation[invocation.index('-destination') + 1],
+                                 'platform=iOS Simulator,id=patched-duo-test')
+
+    def test_three_component_runtime_matches_exactly(self):
+        for runtime, simulator in [('27.1.0', 'duo-test'), ('27.1.1', 'patched-duo-test')]:
+            with self.subTest(runtime=runtime):
+                result = self.run_script(IOS_TEST_DESTINATION='platform=iOS Simulator,name=iPhone Duo,OS=' + runtime,
+                                         TEST_PATCH_RUNTIME='1')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(['simctl', 'bootstatus', simulator, '-b'], self.commands)
+                invocation = self.commands[-1]
+                self.assertEqual(invocation[invocation.index('-destination') + 1],
+                                 'platform=iOS Simulator,id=' + simulator)
+
+    def test_unmatched_partial_runtime_stops_before_xcodebuild(self):
+        result = self.run_script(IOS_TEST_DESTINATION='platform=iOS Simulator,name=iPhone Duo,OS=28',
+                                 TEST_PATCH_RUNTIME='1')
+        self.assertEqual(result.returncode, 69, result.stderr)
+        self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
+
+    def test_empty_destination_id_stops_before_xcodebuild(self):
+        for destination in ['platform=iOS Simulator,id=',
+                            'platform=iOS Simulator,id=,name=iPhone Duo',
+                            'platform=iOS Simulator,name=iPhone Duo,id=']:
+            with self.subTest(destination=destination):
+                result = self.run_script(IOS_TEST_DESTINATION=destination)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn('destination id cannot be empty', result.stderr)
+                self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
+
+    def test_empty_destination_os_stops_before_xcodebuild(self):
+        for destination in ['platform=iOS Simulator,name=iPhone Duo,OS=',
+                            'platform=iOS Simulator,id=duo-test,OS=']:
+            with self.subTest(destination=destination):
+                result = self.run_script(IOS_TEST_DESTINATION=destination)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn('destination OS cannot be empty', result.stderr)
+                self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
+
+    def test_destination_fields_without_equals_stop_before_xcodebuild(self):
+        for destination in ['platform=iOS Simulator,name=iPhone Duo, Book',
+                            'platform=iOS Simulator,name=iPhone Duo,',
+                            'platform=iOS Simulator,,name=iPhone Duo']:
+            with self.subTest(destination=destination):
+                result = self.run_script(IOS_TEST_DESTINATION=destination)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn('destination fields must use key=value', result.stderr)
                 self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
 
     def test_failed_explicit_boot_stops_before_test_launch(self):

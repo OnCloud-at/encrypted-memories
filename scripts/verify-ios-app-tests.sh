@@ -76,13 +76,17 @@ for runtime, devices in devices_by_runtime.items():
     if not match:
         continue
     version = tuple(int(part) for part in match.group(1).split("-"))
-    if requested_version is not None and (version + (0, 0, 0))[:3] != (requested_version + (0, 0, 0))[:3]:
-        continue
+    if requested_version is not None:
+        matching_version = version + (0,) * max(0, 3 - len(version))
+        if len(requested_version) < 3:
+            matching_version = matching_version[:len(requested_version)]
+        if matching_version != requested_version:
+            continue
     for device in devices:
         if device.get("isAvailable") and device["name"] == name and (best is None or version > best[0]):
             best = (version, device["udid"])
 print(best[1] if best else "")
-' "$1" "${2:-latest}"
+' "$1" "${2-latest}"
 }
 
 if [[ -n "${IOS_TEST_DESTINATION:-}" ]]; then
@@ -92,12 +96,30 @@ if [[ -n "${IOS_TEST_DESTINATION:-}" ]]; then
   SIMULATOR_OS="latest"
   DESTINATION_PLATFORM=""
   IFS=',' read -r -a DESTINATION_FIELDS <<< "$DESTINATION"
+  # Bash read drops a trailing empty field; retain it for validation.
+  if [[ "$DESTINATION" == *, ]]; then DESTINATION_FIELDS+=(""); fi
   for field in "${DESTINATION_FIELDS[@]}"; do
+    if [[ "$field" != *=* ]]; then
+      echo "[ios-tests] destination fields must use key=value; names containing commas require id=." >&2
+      exit 64
+    fi
     case "$field" in
       platform=*) DESTINATION_PLATFORM="${field#platform=}" ;;
-      id=*) SIMULATOR_UDID="${field#id=}" ;;
+      id=*)
+        SIMULATOR_UDID="${field#id=}"
+        if [[ -z "$SIMULATOR_UDID" ]]; then
+          echo "[ios-tests] destination id cannot be empty." >&2
+          exit 64
+        fi
+        ;;
       name=*) SIMULATOR_NAME="${field#name=}" ;;
-      OS=*) SIMULATOR_OS="${field#OS=}" ;;
+      OS=*)
+        SIMULATOR_OS="${field#OS=}"
+        if [[ -z "$SIMULATOR_OS" ]]; then
+          echo "[ios-tests] destination OS cannot be empty." >&2
+          exit 64
+        fi
+        ;;
     esac
   done
   if [[ "$DESTINATION_PLATFORM" == "iOS Simulator" ]]; then
