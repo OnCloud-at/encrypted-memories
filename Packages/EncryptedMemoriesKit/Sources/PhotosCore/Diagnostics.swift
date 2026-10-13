@@ -282,6 +282,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
     /// useful for live diagnostics, but a future caller cannot accidentally export an asset-derived
     /// suffix merely by choosing a familiar prefix.
     private static let supportCounterKeys: Set<String> = [
+        "backup.metadata.equalCoordinates",
         "duplicates.thumbnail.blankOver3Seconds",
         "metrickit.diagnosticPayloads",
         "metrickit.metricPayloads",

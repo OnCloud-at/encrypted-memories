@@ -29,6 +29,68 @@ final class PrivacyExportPolicyTests: XCTestCase {
         try await assertLocationCopy(drag: true, storedPreference: nil)
     }
 
+    func testArchiveWithUnsetPreferenceRemovesGPSAndKeepsLensAndOriginals() async throws {
+        let defaults = UserDefaults.standard
+        let key = AppSettingsKey.removeLocationWhenSharing
+        let previous = defaults.object(forKey: key)
+        defer {
+            if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) }
+        }
+        defaults.removeObject(forKey: key)
+        XCTAssertNil(defaults.object(forKey: key))
+        let directory = try makeDirectory()
+        let archive = directory.appendingPathComponent("Export.zip")
+        var originals: [URL] = []
+        var bytes: [Data] = []
+        var photos: [PhotoItem] = []
+        for type in [UTType.jpeg, UTType.heic] {
+            let ext = try XCTUnwrap(type.preferredFilenameExtension)
+            let original = directory.appendingPathComponent("original.\(ext)")
+            try makeGPSImage(at: original, type: type)
+            originals.append(original)
+            bytes.append(try Data(contentsOf: original))
+            photos.append(
+                PhotoItem(
+                    uid: PhotoUID(volumeID: "test", nodeID: ext), captureTime: .now, mediaType: type.preferredMIMEType!)
+            )
+        }
+        let provider = ArchiveGPSFileProvider(
+            originals: Dictionary(uniqueKeysWithValues: zip(photos.map(\.uid), originals)))
+        try await OriginalExportWriter.writeArchive(items: photos, to: archive, provider: provider) { _ in }
+        let extracted = directory.appendingPathComponent("extracted", isDirectory: true)
+        let unzip = Process()
+        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        unzip.arguments = ["-q", archive.path, "-d", extracted.path]
+        try unzip.run()
+        unzip.waitUntilExit()
+        XCTAssertEqual(unzip.terminationStatus, 0)
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(atPath: extracted.path)),
+            Set(originals.map(\.lastPathComponent)))
+        for (index, original) in originals.enumerated() {
+            let output = extracted.appendingPathComponent(original.lastPathComponent)
+            XCTAssertNil(gpsProperties(at: output))
+            XCTAssertNil(iptcCity(at: output))
+            XCTAssertEqual(lensModel(at: output), Self.lensModel)
+            XCTAssertNotNil(gpsProperties(at: original))
+            XCTAssertEqual(try Data(contentsOf: original), bytes[index])
+        }
+    }
+
+    private struct ArchiveGPSFileProvider: OriginalFileProvider, PhotoMetadataProvider {
+        let originals: [PhotoUID: URL]
+        func writeOriginal(
+            for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
+        ) async throws {
+            let original = try XCTUnwrap(originals[uid])
+            try Data(contentsOf: original).write(to: destination)
+            onProgress(1)
+        }
+        func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+            PhotoMetadata(filename: try XCTUnwrap(originals[uid]).lastPathComponent)
+        }
+    }
+
     func testSingleExportWithExplicitOptOutKeepsGPSAndOriginalBytes() async throws {
         try await assertLocationCopy(drag: false, storedPreference: false)
     }

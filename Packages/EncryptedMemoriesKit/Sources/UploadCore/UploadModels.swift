@@ -449,11 +449,15 @@ public enum PhotoUploadMetadataEncoder {
         location: Location?,
         camera: Camera,
         media: Media,
-        iOSPhotos: IOSPhotos?
+        iOSPhotos: IOSPhotos?,
+        diagnostics: PhotoDiagnostics = .shared
     ) throws -> [PhotoUploadAdditionalMetadata] {
         let encoder = JSONEncoder()
         var output: [PhotoUploadAdditionalMetadata] = []
         if let location {
+            if location.latitude == location.longitude {
+                diagnostics.increment("backup.metadata.equalCoordinates")
+            }
             output.append(try encode(location, name: "Location", encoder: encoder))
         }
         output.append(try encode(camera, name: "Camera", encoder: encoder))

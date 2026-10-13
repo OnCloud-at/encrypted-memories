@@ -108,8 +108,8 @@ struct MobileShareExportTests {
     @Test(arguments: [nil, false] as [Bool?])
     func shareOfARealPhotoFollowsTheLocationPreference(storedValue: Bool?) async throws {
         try await SharingLocationPreferenceLease.with(storedValue: storedValue) {
-            let original = try makeLocatedJPEG()
-            #expect(locationProperties(of: original) != nil)
+            let original = try LocatedShareTestImage.makeLocatedJPEG()
+            #expect(LocatedShareTestImage.locationProperties(of: original) != nil)
             let result = await MobileMediaExporter.exportOriginals(
                 [item("located")], backend: ImageShareTestBackend(bytes: original))
             defer { MobileMediaExporter.cleanup(result.urls) }
@@ -119,47 +119,10 @@ struct MobileShareExportTests {
                 #expect(shared == original)
             } else {
                 // An unset preference removes the location and keeps the other metadata.
-                #expect(locationProperties(of: shared) == nil)
-                #expect(lensModel(of: shared) == Self.lensModel)
+                #expect(LocatedShareTestImage.locationProperties(of: shared) == nil)
+                #expect(LocatedShareTestImage.lensModel(of: shared) == LocatedShareTestImage.lensModel)
             }
         }
-    }
-
-    private static let lensModel = "Share test lens"
-
-    private func makeLocatedJPEG() throws -> Data {
-        let context = try #require(
-            CGContext(
-                data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 0,
-                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-        let image = try #require(context.makeImage())
-        let data = NSMutableData()
-        let destination = try #require(
-            CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil))
-        let properties: [CFString: Any] = [
-            kCGImagePropertyGPSDictionary: [
-                kCGImagePropertyGPSLatitude: 12.25, kCGImagePropertyGPSLatitudeRef: "N",
-                kCGImagePropertyGPSLongitude: 45.5, kCGImagePropertyGPSLongitudeRef: "E",
-            ] as [CFString: Any],
-            kCGImagePropertyExifDictionary: [kCGImagePropertyExifLensModel: Self.lensModel],
-        ]
-        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
-        try #require(CGImageDestinationFinalize(destination))
-        return data as Data
-    }
-
-    private func imageProperties(of data: Data) -> [CFString: Any]? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        return CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
-    }
-
-    private func locationProperties(of data: Data) -> [CFString: Any]? {
-        imageProperties(of: data)?[kCGImagePropertyGPSDictionary] as? [CFString: Any]
-    }
-
-    private func lensModel(of data: Data) -> String? {
-        (imageProperties(of: data)?[kCGImagePropertyExifDictionary] as? [CFString: Any])?[kCGImagePropertyExifLensModel]
-            as? String
     }
 
     @Test func diskFullDuringADownloadStopsTheShare() async throws {

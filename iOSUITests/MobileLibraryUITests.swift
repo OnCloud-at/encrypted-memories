@@ -165,7 +165,7 @@ final class MobileLibraryUITests: XCTestCase {
         let previewSwitch = app.switches["Blur App Preview"]
         XCTAssertTrue(previewSwitch.waitForExistence(timeout: 5))
         let initialValue = try XCTUnwrap(previewSwitch.value as? String)
-        XCTAssertTrue(initialValue == "0" || initialValue == "1")
+        XCTAssertEqual(initialValue, "1", "Blur App Preview defaults on")
         let changedValue = initialValue == "0" ? "1" : "0"
         previewSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         XCTAssertTrue(wait(for: previewSwitch, "value == '\(changedValue)'"))
@@ -206,6 +206,7 @@ final class MobileLibraryUITests: XCTestCase {
         let removeLocationSwitch = app.switches["Remove location when sharing"]
         XCTAssertTrue(removeLocationSwitch.waitForExistence(timeout: 5))
         let originalValue = try XCTUnwrap(removeLocationSwitch.value as? String)
+        XCTAssertEqual(originalValue, "1", "Remove location when sharing defaults on")
         removeLocationSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         let changedValue = originalValue == "0" ? "1" : "0"
         XCTAssertTrue(wait(for: removeLocationSwitch, "value == '\(changedValue)'"))
