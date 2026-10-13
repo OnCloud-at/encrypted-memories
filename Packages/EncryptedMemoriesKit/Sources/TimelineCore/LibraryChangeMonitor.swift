@@ -68,7 +68,8 @@ struct LibraryChangeRetryCount: Equatable {
 /// Result of the authoritative refresh requested after a change-token transition. A terminal result retires
 /// the monitor before it invokes the host callback, including when scope loss appears during the full load.
 public enum LibraryChangeRefreshOutcome: Sendable, Equatable {
-    case refreshed
+    /// Only this revision belongs to the published projection. Nil leaves monitoring unacknowledged.
+    case refreshed(token: String?)
     case retry
     case terminal
 }
@@ -79,6 +80,7 @@ public actor LibraryChangeMonitor {
     private struct StartRequest: Sendable {
         let provider: any LibraryChangeTokenProvider
         let policy: LibraryChangePollingPolicy
+        let isActive: Bool
         let resetBaseline: Bool
         let initialToken: String?
         let onChange: @Sendable () async -> LibraryChangeRefreshOutcome
@@ -100,9 +102,14 @@ public actor LibraryChangeMonitor {
 
     public init() {}
 
+    #if DEBUG
+        func testingBaseline() -> String? { lastToken }
+    #endif
+
     public func start(
         provider: any LibraryChangeTokenProvider,
         policy: LibraryChangePollingPolicy = .foreground,
+        isActive: Bool = true,
         initialToken: String? = nil,
         onTerminal: @Sendable @escaping (any LibraryChangeTerminalError) async -> Void = { _ in },
         onChange: @Sendable @escaping () async -> LibraryChangeRefreshOutcome
@@ -114,6 +121,7 @@ public actor LibraryChangeMonitor {
             StartRequest(
                 provider: provider,
                 policy: policy,
+                isActive: isActive,
                 resetBaseline: false,
                 initialToken: initialToken,
                 onChange: onChange,
@@ -127,6 +135,11 @@ public actor LibraryChangeMonitor {
         // A startup seed fills only an unknown baseline. Reappearing views must not overwrite a newer token the
         // same monitor already observed while the app was running.
         if lastToken == nil, let initialToken = request.initialToken { lastToken = initialToken }
+        // Inactive startup still installs the published snapshot's seed. Foreground reuses it.
+        guard request.isActive else {
+            desiredLifecycle = .stopped(resetBaseline: false)
+            return
+        }
         let delayFirstProbe = lastToken != nil
         nextTaskID &+= 1
         let taskID = nextTaskID
@@ -150,8 +163,16 @@ public actor LibraryChangeMonitor {
                     try Task.checkCancellation()
                     if let lastToken, token != lastToken {
                         switch await request.onChange() {
-                        case .refreshed:
+                        case .refreshed(let publishedToken):
+                            try Task.checkCancellation()
+                            if let publishedToken { self.lastToken = publishedToken }
+                            guard publishedToken == token else {
+                                try? await Task.sleep(for: retryCount.nextDelay(for: token, policy: request.policy))
+                                continue
+                            }
                             retryCount.reset()
+                            try await Task.sleep(for: request.policy.interval)
+                            continue
                         case .retry:
                             // A successful token probe with an inventory that has not converged is not a
                             // transport failure. Keep the old token and wait longer after each such load.
@@ -194,6 +215,7 @@ public actor LibraryChangeMonitor {
     public func restart(
         provider: any LibraryChangeTokenProvider,
         policy: LibraryChangePollingPolicy = .foreground,
+        isActive: Bool = true,
         resetBaseline: Bool = false,
         initialToken: String? = nil,
         onTerminal: @Sendable @escaping (any LibraryChangeTerminalError) async -> Void = { _ in },
@@ -203,6 +225,7 @@ public actor LibraryChangeMonitor {
             StartRequest(
                 provider: provider,
                 policy: policy,
+                isActive: isActive,
                 resetBaseline: resetBaseline,
                 initialToken: initialToken,
                 onChange: onChange,

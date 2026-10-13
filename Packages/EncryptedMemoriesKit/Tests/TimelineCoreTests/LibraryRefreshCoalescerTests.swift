@@ -16,9 +16,9 @@ import Testing
 
             await probe.releaseFirstRefresh()
 
-            #expect(await first.value == .refreshed)
-            #expect(await second.value == .refreshed)
-            #expect(await third.value == .refreshed)
+            #expect(await first.value == .refreshed(token: "published"))
+            #expect(await second.value == .refreshed(token: "published"))
+            #expect(await third.value == .refreshed(token: "published"))
             #expect(await probe.callCount == 2)
         }
     #endif
@@ -27,8 +27,8 @@ import Testing
         let coalescer = LibraryRefreshCoalescer()
         let counter = RefreshCounter()
 
-        #expect(await coalescer.request { await counter.refresh() } == .refreshed)
-        #expect(await coalescer.request { await counter.refresh() } == .refreshed)
+        #expect(await coalescer.request { await counter.refresh() } == .refreshed(token: "published"))
+        #expect(await coalescer.request { await counter.refresh() } == .refreshed(token: "published"))
         #expect(await counter.value == 2)
     }
 
@@ -71,7 +71,7 @@ import Testing
             await blocked.releaseFirstRefresh()
             await cancelTask.value
 
-            #expect(await new.value == .refreshed)
+            #expect(await new.value == .refreshed(token: "published"))
             #expect(await replacement.value == 1)
             _ = await old.value
         }
@@ -83,7 +83,7 @@ private actor RefreshCounter {
 
     func refresh() -> LibraryChangeRefreshOutcome {
         value += 1
-        return .refreshed
+        return .refreshed(token: "published")
     }
 }
 
@@ -93,13 +93,13 @@ private actor BlockingRefreshProbe {
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var firstRefreshContinuation: CheckedContinuation<Void, Never>?
 
-    init(firstOutcome: LibraryChangeRefreshOutcome = .refreshed) {
+    init(firstOutcome: LibraryChangeRefreshOutcome = .refreshed(token: "published")) {
         self.firstOutcome = firstOutcome
     }
 
     func refresh() async -> LibraryChangeRefreshOutcome {
         callCount += 1
-        guard callCount == 1 else { return .refreshed }
+        guard callCount == 1 else { return .refreshed(token: "published") }
 
         let waiters = startWaiters
         startWaiters.removeAll(keepingCapacity: false)

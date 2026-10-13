@@ -557,10 +557,12 @@ private actor ValidatedStartupRepository: PhotosRepository, LibraryChangeTokenPr
 
     func cachedTimelineValidationToken() async -> String? { persistedToken }
 
-    func loadTimeline() async throws -> [TimelineSection] {
+    func loadTimeline() async throws -> [TimelineSection] { try await loadTimelineSnapshot().sections }
+
+    func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
         remoteRequestCount += 1
         persistedToken = currentToken
-        return remote
+        return TimelineLoadSnapshot(sections: remote, validationToken: currentToken)
     }
 
     func libraryChangeToken() async throws -> String { currentToken }

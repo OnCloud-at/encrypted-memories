@@ -14,6 +14,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
     public let errorMessage: String?
     public let failureReason: TimelineRefreshFailureReason?
     public let addedUIDs: [PhotoUID]
+    /// Revision paired with the whole-library projection this refresh published. Nil for filtered routes.
+    public let publishedLibraryChangeToken: String?
 
     public var found: Bool { foundItem != nil }
 
@@ -26,7 +28,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         elapsedMs: Double,
         errorMessage: String? = nil,
         failureReason: TimelineRefreshFailureReason? = nil,
-        addedUIDs: [PhotoUID] = []
+        addedUIDs: [PhotoUID] = [],
+        publishedLibraryChangeToken: String? = nil
     ) {
         self.uploadedUID = uploadedUID
         self.foundItem = foundItem
@@ -37,6 +40,7 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         self.errorMessage = errorMessage
         self.failureReason = failureReason
         self.addedUIDs = addedUIDs
+        self.publishedLibraryChangeToken = publishedLibraryChangeToken
     }
 }
 
@@ -378,6 +382,10 @@ public final class TimelineViewModel {
         }
     }
 
+    #if DEBUG
+        func cancelInitialLoadForTesting() { initialLoadTask?.cancel() }
+    #endif
+
     public func load() async {
         guard filter.hasTimeline else { return }
         if let initialLoadTask {
@@ -592,23 +600,34 @@ public final class TimelineViewModel {
                 applyInitialLoad(.inventoryResolved(count: projection.snapshot.count, cached: true))
                 await applyAllContent(projection)
                 if !force {
-                    cacheValidation = await TimelineCacheValidationPolicy.validate(
+                    let shownRevisions = shownTimelineRevisions
+                    let validation = await TimelineCacheValidationPolicy.validateForPublication(
                         snapshot: cached,
                         repository: repository
                     )
-                    guard filter == .all else { return }
+                    var currentProjection: TimelineContentProjection?
+                    if let current = validation.snapshot {
+                        currentProjection = await normalizeOffMain(current.sections, for: .all)
+                    }
+                    cacheValidation = validation.validation
+                    guard !Task.isCancelled, filter == .all, shownRevisions == shownTimelineRevisions else {
+                        initialLibraryChangeToken = ""
+                        return
+                    }
                     if case .terminalFailure = cacheValidation {
                         initialLoadFailureReason = .scopeAccessLost
                         initialLibraryChangeToken = ""
                         return
                     }
-                    if case .validated(let token) = cacheValidation {
+                    if case .validated(let token) = cacheValidation, let currentProjection {
+                        let requiresNewFrame = currentProjection.uids != wholeLibraryUIDs
                         updateWholeLibraryAuthority(.authoritative)
                         applyInitialLoad(
                             .authoritativeInventoryResolved(
-                                count: projection.snapshot.count,
-                                requiresNewFrame: false
+                                count: currentProjection.snapshot.count,
+                                requiresNewFrame: requiresNewFrame
                             ))
+                        await applyAllContent(currentProjection)
                         initialLibraryChangeToken = token
                         return
                     }
@@ -637,7 +656,7 @@ public final class TimelineViewModel {
             // Only swap the grid if the library actually changed - otherwise keep the shown view (and the
             // user's scroll position) untouched.
             await applyAllContent(projection)
-            initialLibraryChangeToken = refreshed.validationToken ?? cacheValidation.monitorBaseline
+            initialLibraryChangeToken = refreshed.monitorBaseline(afterPublishing: true)
             authoritativeLoadSucceeded = true
         } catch {
             // A cancelled owner cannot publish. A backend cancellation of an active read is a load failure.
@@ -708,9 +727,11 @@ public final class TimelineViewModel {
         let shownWholeLibrary = f == .all ? wholeLibrarySnapshot : nil
         let shownRevisions = shownTimelineRevisions
         do {
+            let loaded = try await freshSnapshot(for: f)
             let refresh = await prepareRefreshOffMain(
-                try await freshSectionsForCurrentFilter(), for: f, shownItems: shownItems,
+                loaded.sections, for: f, shownItems: shownItems,
                 shownWholeLibrary: shownWholeLibrary)
+            try Task.checkCancellation()
             let projection = refresh.projection
             let sections = projection.sections
             guard filter == f else {  // a sidebar switch landed mid-refresh - don't clobber the new route
@@ -740,7 +761,8 @@ public final class TimelineViewModel {
                     timelineCountBefore: before,
                     timelineCountAfter: allItems.count,
                     filterDescription: Self.describe(filter),
-                    elapsedMs: elapsedMilliseconds(since: start)
+                    elapsedMs: elapsedMilliseconds(since: start),
+                    publishedLibraryChangeToken: loaded.validationToken
                 )
             }
             let items = sections.flatMap(\.items)
@@ -772,7 +794,8 @@ public final class TimelineViewModel {
                 timelineCountAfter: items.count,
                 filterDescription: Self.describe(filter),
                 elapsedMs: elapsedMilliseconds(since: start),
-                addedUIDs: addedUIDs
+                addedUIDs: addedUIDs,
+                publishedLibraryChangeToken: loaded.validationToken
             )
         } catch is CancellationError {
             return TimelineRefreshResult(
@@ -808,13 +831,14 @@ public final class TimelineViewModel {
         }
     }
 
-    private func freshSectionsForCurrentFilter() async throws -> [TimelineSection] {
-        switch filter {
+    private func freshSnapshot(for route: PhotoFilter) async throws -> TimelineLoadSnapshot {
+        switch route {
         case .all:
-            return try await repository.loadTimeline()
+            return try await repository.loadTimelineSnapshot()
         default:
-            guard let library else { return [] }
-            return try await library.timeline(filter: filter)
+            let sections = try await library?.timeline(filter: route) ?? []
+            // A filtered projection cannot certify a whole-library revision.
+            return TimelineLoadSnapshot(sections: sections, validationToken: nil)
         }
     }
 

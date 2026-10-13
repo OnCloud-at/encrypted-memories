@@ -14,7 +14,7 @@ import Testing
             policy: .init(interval: .milliseconds(5), failureInterval: .milliseconds(5))
         ) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
 
         try await Task.sleep(for: .milliseconds(18))
@@ -37,7 +37,7 @@ import Testing
             interval: .milliseconds(5), failureInterval: .milliseconds(5))
         await monitor.start(provider: provider, policy: policy) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         try await Task.sleep(for: .milliseconds(12))
         await monitor.stop()
@@ -45,7 +45,7 @@ import Testing
         await provider.set("b")
         await monitor.restart(provider: provider, policy: policy) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         let deadline = ContinuousClock.now + .seconds(2)
         while await counter.value == 0, ContinuousClock.now < deadline {
@@ -64,7 +64,7 @@ import Testing
             policy: .init(interval: .milliseconds(5), failureInterval: .milliseconds(5))
         ) {
             await attempts.increment()
-            return await attempts.value > 1 ? .refreshed : .retry
+            return await attempts.value > 1 ? .refreshed(token: "b") : .retry
         }
 
         try await Task.sleep(for: .milliseconds(12))
@@ -120,7 +120,7 @@ import Testing
             initialToken: "cached"
         ) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "new")
         }
 
         // The second probe proves that the first changed token was accepted and committed.
@@ -138,7 +138,7 @@ import Testing
             interval: .zero, failureInterval: .zero)
         await monitor.start(provider: provider, policy: policy, initialToken: "a") {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         await provider.set("b")
         let countAfterMutation = await provider.probeCount
@@ -150,7 +150,7 @@ import Testing
         let countBeforeRestart = await provider.probeCount
         await monitor.start(provider: provider, policy: policy, initialToken: "a") {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         await provider.waitUntilProbeCount(countBeforeRestart + 1)
         #expect(await counter.value == 1)
@@ -167,7 +167,7 @@ import Testing
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
             Issue.record("A cancelled probe must not publish a library change")
-            return .refreshed
+            return .refreshed(token: "b")
         }
 
         await provider.waitUntilEntered()
@@ -193,7 +193,7 @@ import Testing
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
             Issue.record("A cancelled probe must not publish a library change")
-            return .refreshed
+            return .refreshed(token: "b")
         }
 
         await retiringProvider.waitUntilEntered()
@@ -206,7 +206,7 @@ import Testing
             provider: replacementProvider,
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
-            .refreshed
+            .refreshed(token: "b")
         }
         await retiringProvider.release()
         await stopTask.value
@@ -230,12 +230,12 @@ import Testing
                     provider: replacement,
                     policy: .init(interval: .zero, failureInterval: .zero)
                 ) {
-                    .refreshed
+                    .refreshed(token: "b")
                 }
             },
             onChange: {
                 Issue.record("A terminal scope failure must not publish a library change")
-                return .refreshed
+                return .refreshed(token: "b")
             }
         )
 
