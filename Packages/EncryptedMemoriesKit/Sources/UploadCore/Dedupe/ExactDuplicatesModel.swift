@@ -1,6 +1,44 @@
 import Foundation
 import Observation
 import PhotosCore
+import Synchronization
+
+/// Publication ownership shared with synchronous task cancellation handlers.
+final class ExactDuplicateRankingPublication: Sendable {
+    private struct Owners {
+        var worker: UUID?
+        var merge: UUID?
+    }
+
+    private let owners = Mutex(Owners())
+
+    var worker: UUID? {
+        get { owners.withLock { $0.worker } }
+        set { owners.withLock { $0.worker = newValue } }
+    }
+
+    var merge: UUID? {
+        get { owners.withLock { $0.merge } }
+        set { owners.withLock { $0.merge = newValue } }
+    }
+
+    func owns(_ token: UUID) -> Bool {
+        owners.withLock { $0.worker == token || $0.merge == token }
+    }
+
+    func revoke(_ token: UUID?) {
+        guard let token else { return }
+        owners.withLock {
+            if $0.worker == token { $0.worker = nil }
+            if $0.merge == token { $0.merge = nil }
+        }
+    }
+
+    func cancel(_ task: Task<Void, Never>?, token: UUID?) {
+        revoke(token)
+        task?.cancel()
+    }
+}
 
 /// The reads and the merge that the Duplicates screens need. `ExactDuplicateFinder` serves the signed-in account;
 /// tests and the offline UI-test account supply their own.
@@ -406,7 +444,10 @@ public final class ExactDuplicatesModel {
     /// The ranking that Merge All waits for. Stop and a pause cancel it.
     @ObservationIgnored private var mergeRanking: Task<Void, Never>?
     /// Identifies the merge ranking that still owns page publication.
-    @ObservationIgnored private var mergeRankingToken: UUID?
+    private var mergeRankingToken: UUID? {
+        get { rankingPublication.merge }
+        set { rankingPublication.merge = newValue }
+    }
     /// A pause cancelled the ranking of Merge All; it ranks the remaining groups after the pause.
     @ObservationIgnored private var mergeRankingInterrupted = false
     /// The groups whose photo to keep a running merge already read. A ranking that lands meanwhile never moves their
@@ -448,7 +489,13 @@ public final class ExactDuplicatesModel {
     /// Waits for the pause after the last group shown. One at a time.
     @ObservationIgnored private var appearanceFollower: Task<Void, Never>?
     /// Identifies the running scroll ranking. A merge shows its own progress, so it never owns this ranking.
-    @ObservationIgnored private var rankingWorkerToken: UUID?
+    private var rankingWorkerToken: UUID? {
+        get { rankingPublication.worker }
+        set { rankingPublication.worker = newValue }
+    }
+    @ObservationIgnored private let rankingPublication = ExactDuplicateRankingPublication()
+    /// Cleanup ownership lasts until the cancelled worker is joined or replaced.
+    @ObservationIgnored private var rankingTaskToken: UUID?
     /// Identifies the ranking whose progress the screen shows.
     @ObservationIgnored private var rankingToken = UUID()
     @ObservationIgnored private let finder: any ExactDuplicateMerging
@@ -587,6 +634,7 @@ public final class ExactDuplicatesModel {
 
     /// A scan, metadata read, or index build failed while groups are retained. A retry can finish the check.
     public var checkFailedNote: String? {
+        guard !isMerging else { return nil }
         if phase == .failed, !groups.isEmpty { return L10n.string("duplicates.load_failed") }
         guard phase == .loaded, !isBuilding else { return nil }
         if rankingFailed { return L10n.string("duplicates.check_failed") }
@@ -799,7 +847,7 @@ public final class ExactDuplicatesModel {
         checksAllGroups = false
         isCheckingGroups = false
         stopFollowingAppearances()
-        ranking?.cancel()
+        rankingPublication.cancel(ranking, token: rankingWorkerToken)
     }
 
     private func stopFollowingAppearances() {
@@ -914,10 +962,12 @@ public final class ExactDuplicatesModel {
     /// Ranks the page of the group at `index` and the page after it, and waits for that ranking.
     private func rank(around index: Int) async {
         guard let task = requestRanking(around: [index]) else { return }
+        let publication = rankingPublication
+        let token = rankingWorkerToken
         await withTaskCancellationHandler {
             await task.value
         } onCancel: {
-            task.cancel()
+            publication.cancel(task, token: token)
         }
     }
 
@@ -958,6 +1008,7 @@ public final class ExactDuplicatesModel {
         }
         let token = UUID()
         rankingWorkerToken = token
+        rankingTaskToken = token
         // During a merge its own progress row stays; the scroll ranking runs without one.
         if !isMerging {
             rankingToken = token
@@ -991,7 +1042,7 @@ public final class ExactDuplicatesModel {
             }
             await finder.rankMembers(of: page, ranked: apply)
         }
-        guard rankingWorkerToken == token else { return }
+        guard rankingTaskToken == token else { return }
         if Task.isCancelled {
             // A closed screen stops the ranking. Groups that it did not rank can be requested again.
             let ranked = Set(groups.filter(\.isRanked).map(\.id))
@@ -1003,6 +1054,7 @@ public final class ExactDuplicatesModel {
         ranking = nil
         rankingQueue = []
         rankingWorkerToken = nil
+        rankingTaskToken = nil
         isCheckingGroups = false
         if rankingToken == token { rankingProgress = nil }
     }
@@ -1011,11 +1063,12 @@ public final class ExactDuplicatesModel {
     private func stopRanking() {
         isCheckingGroups = false
         stopFollowingAppearances()
-        ranking?.cancel()
+        rankingPublication.cancel(ranking, token: rankingWorkerToken)
         ranking = nil
         rankingQueue = []
         rankingRequested = []
         rankingWorkerToken = nil
+        rankingTaskToken = nil
         rankingToken = UUID()
         rankingProgress = nil
     }
@@ -1024,8 +1077,8 @@ public final class ExactDuplicatesModel {
     /// stay one group: a group splits in place, and leaves when no two copies match. The part with the photo shown
     /// as kept keeps the group's ID and the person's choice. Only active rankings can publish a page.
     private func apply(_ page: ExactDuplicateRankingPage, token: UUID) {
-        guard token == rankingWorkerToken || token == mergeRankingToken else { return }
-        if token == rankingToken, let progress = rankingProgress {
+        guard rankingPublication.owns(token) else { return }
+        if token == rankingToken || token == mergeRankingToken, let progress = rankingProgress {
             rankingProgress = ExactDuplicateScanProgress(
                 completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
             if !isRankingForMerge, progress.total > 0 {
@@ -1186,8 +1239,7 @@ public final class ExactDuplicatesModel {
         loadGeneration += 1
         rescanAfterMerge = false
         stopRanking()
-        mergeRankingToken = nil
-        mergeRanking?.cancel()
+        rankingPublication.cancel(mergeRanking, token: mergeRankingToken)
         stopMergeAll()
     }
 
@@ -1196,7 +1248,7 @@ public final class ExactDuplicatesModel {
     public func stopMergeAll() {
         guard canStopMergeAll else { return }
         isStoppingMergeAll = true
-        mergeRanking?.cancel()
+        rankingPublication.cancel(mergeRanking, token: mergeRankingToken)
         // A paused run wakes up to stop.
         wakeMergeResumers()
     }
@@ -1208,7 +1260,7 @@ public final class ExactDuplicatesModel {
         isMergePaused = true
         if let mergeRanking {
             mergeRankingInterrupted = true
-            mergeRanking.cancel()
+            rankingPublication.cancel(mergeRanking, token: mergeRankingToken)
         }
     }
 
@@ -1275,7 +1327,7 @@ public final class ExactDuplicatesModel {
             rankingToken = token
             rankingProgress = ExactDuplicateScanProgress(completed: 0, total: unranked.count)
             isRankingForMerge = true
-            await rankForMerge(unranked, token: token)
+            await rankForMerge(unranked)
             isRankingForMerge = false
             if rankingToken == token { rankingProgress = nil }
         }
@@ -1403,27 +1455,29 @@ public final class ExactDuplicatesModel {
 
     /// Ranks `unranked` for a merge. A pause cancels the ranking; after the pause, the groups that it did not rank
     /// rank again. A stop ends it.
-    private func rankForMerge(_ unranked: [ExactDuplicateGroup], token: UUID) async {
+    private func rankForMerge(_ unranked: [ExactDuplicateGroup]) async {
         let finder = finder
-        let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
-            await self?.apply(page, token: token)
-        }
+        let publication = rankingPublication
         var pending = unranked
         while !pending.isEmpty {
             await waitWhileMergePaused()
             if isStoppingMergeAll || Task.isCancelled { return }
             mergeRankingInterrupted = false
             let page = pending
+            let token = UUID()
+            let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
+                await self?.apply(page, token: token)
+            }
             let task = Task { await finder.rankMembers(of: page, ranked: apply) }
             mergeRankingToken = token
             mergeRanking = task
             await withTaskCancellationHandler {
                 await task.value
             } onCancel: {
-                task.cancel()
+                publication.cancel(task, token: token)
             }
             mergeRanking = nil
-            mergeRankingToken = nil
+            publication.revoke(token)
             // Only a pause ranks again; a group whose facts cannot be read stays unranked.
             guard mergeRankingInterrupted, !isStoppingMergeAll, !Task.isCancelled else { return }
             let unrankedIDs = Set(groups.filter { !$0.isRanked }.map(\.id))
