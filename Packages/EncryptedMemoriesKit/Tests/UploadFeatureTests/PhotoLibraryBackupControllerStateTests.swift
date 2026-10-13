@@ -1340,6 +1340,365 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        func testManualRetryResumesAfterCellularWiFiWaitWithoutTheIndexBackoff() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(networkDetermined: true, returnsDuringScan: false)
+        }
+
+        func testManualRetryResumesAfterTheFirstPathWaitExpiresWithoutTheIndexBackoff() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(networkDetermined: false, returnsDuringScan: false)
+        }
+
+        func testManualRetryResumesWhenWiFiReturnsDuringItsScanWithoutTheIndexBackoff() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(networkDetermined: true, returnsDuringScan: true)
+        }
+
+        func testManualRetryResumesInItsOwnRunWhenABackgroundWindowSeesWiFiFirst() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(
+                networkDetermined: true, returnsDuringScan: false, returnsInBackgroundWindow: true)
+        }
+
+        func testManualRetryResumesWhenMobileDataAllowsTheExpensivePathWithoutTheIndexBackoff() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(
+                networkDetermined: true, returnsDuringScan: false, enablesMobileData: true)
+        }
+
+        private func assertManualRetryResumesAfterWiFiWait(
+            networkDetermined: Bool, returnsDuringScan: Bool, returnsInBackgroundWindow: Bool = false,
+            enablesMobileData: Bool = false
+        ) async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: networkDetermined)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-manual-wifi-retry", source: signals.source,
+                firstNetworkPathWait: .milliseconds(100))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            let releaseScan = LockedFlag(!returnsDuringScan)
+            controller.replaceScanForTesting {
+                let pass = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                if pass == 1 {
+                    while !releaseScan.value, !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(10))
+                    }
+                }
+            }
+
+            await controller.retryUserResolvableWork()
+            signals.resetReads()
+
+            let waiting = await waitUntil {
+                if returnsDuringScan { return scans.count == 1 && owners.values == [.manual] && signals.hasBeenRead }
+                return controller.status.phase == .waitingForWiFi && !controller.isSyncing
+            }
+            XCTAssertTrue(waiting, "The manual pass must reach the policy wait before the network returns")
+            XCTAssertEqual(scans.count, 1)
+            XCTAssertEqual(owners.values, [.manual])
+            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue, "The wait preserves the issue")
+            XCTAssertEqual(queue.summary().resolved, 0, "An expensive path uploads nothing with mobile data off")
+
+            if !returnsDuringScan {
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                XCTAssertFalse(controller.isSyncing, "An expensive path cannot start the pending manual retry")
+                XCTAssertEqual(scans.count, 1, "An expensive path must not consume the pending manual retry")
+            }
+            signals.setNetworkDetermined(true)
+            if enablesMobileData {
+                signals.setUsesMobileData(true)
+            } else {
+                signals.setWaitsForWiFi(false)
+            }
+            if returnsInBackgroundWindow {
+                let windowRuns = PassCounter()
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
+                XCTAssertEqual(windowRuns.count, 0, "A window cannot expire the resumed manual retry")
+            } else if enablesMobileData {
+                controller.mobileDataSettingDidChange()
+            } else {
+                signals.announceChange()
+            }
+            releaseScan.value = true
+
+            let resumed = await waitUntil { scans.count >= 2 && !controller.isSyncing }
+            XCTAssertTrue(resumed, "The manual retry must resume before the one-hour index retry date")
+            XCTAssertEqual(owners.values, [.manual, .manual])
+            XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation), "The resumed pass prepares the index")
+            XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+            controller.syncNow()
+            XCTAssertFalse(controller.isSyncing, "The admitted manual retry cannot bypass a later automatic backoff")
+            await controller.shutdown()
+        }
+
+        func testBackgroundStartAfterTheFirstPathSnapshotCannotTakeADeferredManualPass() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-manual-path-observer-gap", source: signals.source,
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            await controller.retryUserResolvableWork()
+            XCTAssertFalse(controller.isSyncing)
+
+            // Publish the snapshot without notifying the observer, as the real main-actor hop can lag the path.
+            signals.setNetworkDetermined(true)
+            signals.setWaitsForWiFi(false)
+            let windowRuns = PassCounter()
+            await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
+            signals.announceChange()
+
+            let finished = await waitUntil { scans.count >= 1 && !controller.isSyncing }
+            XCTAssertTrue(finished)
+            XCTAssertEqual(windowRuns.count, 0, "The window never owns or expires the deferred manual pass")
+            XCTAssertEqual(owners.values, [.manual])
+            await controller.shutdown()
+        }
+
+        func testDeferredManualRetryKeepsItsOwnerWhenTheFirstKnownPathFindsABusyLock() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-manual-path-busy-lock", source: signals.source, firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            await controller.retryUserResolvableWork()
+            signals.setNetworkDetermined(true)
+            signals.setWaitsForWiFi(false)
+            // This foreground entry consumes the known snapshot before the observer, but cannot acquire the lock.
+            controller.syncNow()
+            XCTAssertEqual(scans.count, 0)
+            XCTAssertFalse(controller.isSyncing)
+            XCTAssertTrue(lock.release(runID: "other-live-run"))
+
+            controller.syncNow()
+
+            let finished = await waitUntil { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(finished, "A declined admission must not consume the person's retry intent")
+            XCTAssertEqual(owners.values, [.manual])
+            await controller.shutdown()
+        }
+
+        func testDeferredManualRetrySurvivesItsFirstOfflinePassBeforeTheObserver() async throws {
+            try await assertFirstManualOfflinePassResumes(deferred: true, holdsResumeLock: false)
+        }
+
+        func testManualRetrySurvivesLosingConnectivityAfterAdmission() async throws {
+            try await assertFirstManualOfflinePassResumes(deferred: false, holdsResumeLock: false)
+        }
+
+        func testFirstOfflineManualRetryKeepsItsIntentWhenWiFiFindsABusyLock() async throws {
+            try await assertFirstManualOfflinePassResumes(deferred: true, holdsResumeLock: true)
+        }
+
+        private func assertFirstManualOfflinePassResumes(deferred: Bool, holdsResumeLock: Bool) async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: false, networkDetermined: !deferred)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-manual-offline", source: signals.source, firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+
+            await controller.retryUserResolvableWork()
+            // No main-actor yield: the admitted task has not evaluated the runner's policy yet.
+            signals.setNetworkAvailable(false)
+            if deferred {
+                XCTAssertFalse(controller.isSyncing)
+                signals.setNetworkDetermined(true)
+                let windowRuns = PassCounter()
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
+                XCTAssertEqual(windowRuns.count, 0, "The window cannot own the first offline manual pass")
+            }
+            let offlineFinished = await waitUntil { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(offlineFinished)
+            XCTAssertEqual(owners.values, [.manual])
+            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
+            XCTAssertEqual(queue.summary().resolved, 0, "The offline pass performs no upload")
+
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            if holdsResumeLock {
+                XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
+            }
+            signals.setNetworkAvailable(true)
+            signals.resetReads()
+            signals.announceChange()
+            let observed = await waitUntil { signals.hasBeenRead }
+            XCTAssertTrue(observed)
+            if holdsResumeLock {
+                controller.syncNow()
+                XCTAssertFalse(controller.isSyncing, "The existing lock rejects the resumed retry")
+                XCTAssertEqual(scans.count, 1)
+                XCTAssertTrue(lock.release(runID: "other-live-run"))
+                controller.syncNow()
+            }
+            let resumed = await waitUntil { scans.count == 2 && !controller.isSyncing }
+            XCTAssertTrue(resumed, "The first offline manual pass must retain its retry past the saved index backoff")
+            XCTAssertEqual(owners.values, [.manual, .manual])
+            XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation))
+            XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+            controller.syncNow()
+            XCTAssertFalse(controller.isSyncing, "A completed retry consumes its backoff bypass")
+            await controller.shutdown()
+        }
+
+        func testManualRetrySurvivesAnOfflinePathBetweenCellularAndWiFi() async throws {
+            try await assertManualRetrySurvivesOffline(retryWhileOffline: false)
+        }
+
+        func testManualRetrySurvivesAnotherRetryWhileThePathIsOffline() async throws {
+            try await assertManualRetrySurvivesOffline(retryWhileOffline: true)
+        }
+
+        func testManualRetrySurvivesWiFiReturningDuringTheRepeatedOfflineScan() async throws {
+            try await assertManualRetrySurvivesOffline(retryWhileOffline: true, wiFiReturnsDuringScan: true)
+        }
+
+        private func assertManualRetrySurvivesOffline(
+            retryWhileOffline: Bool, wiFiReturnsDuringScan: Bool = false
+        ) async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-manual-offline-wifi", source: signals.source)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            let releaseOfflineScan = LockedFlag(!wiFiReturnsDuringScan)
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                if scans.increment() == 2 {
+                    while !releaseOfflineScan.value, !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(10))
+                    }
+                }
+            }
+            await controller.retryUserResolvableWork()
+            let waiting = await waitUntil { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(waiting)
+            XCTAssertEqual(controller.status.phase, .waitingForWiFi)
+
+            try await assertNoAutomaticResume(controller, "The initial Wi-Fi pass has settled")
+            signals.setNetworkAvailable(false)
+            signals.resetReads()
+            signals.announceChange()
+            let offlineObserved = await waitUntil { signals.hasBeenRead }
+            XCTAssertTrue(offlineObserved, "The observer consumes the offline snapshot before another retry")
+            if retryWhileOffline {
+                await controller.retryUserResolvableWork()
+            } else {
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+            }
+            signals.resetReads()
+            let offlinePassReady = await waitUntil {
+                if wiFiReturnsDuringScan { return scans.count == 2 && signals.hasBeenRead }
+                return !controller.isSyncing
+            }
+            XCTAssertTrue(offlinePassReady, "The repeated pass must read the offline policy before Wi-Fi returns")
+            let offlinePassCount = retryWhileOffline ? 2 : 1
+            XCTAssertEqual(
+                scans.count, offlinePassCount, "An offline snapshot must not consume the pending manual retry")
+
+            signals.setNetworkAvailable(true)
+            signals.setWaitsForWiFi(false)
+            signals.resetReads()
+            signals.announceChange()
+            if wiFiReturnsDuringScan {
+                let wakeObserved = await waitUntil { signals.hasBeenRead }
+                XCTAssertTrue(wakeObserved, "The Wi-Fi wake arrives while the offline scan still owns the pass")
+                XCTAssertTrue(controller.isSyncing)
+            }
+            releaseOfflineScan.value = true
+
+            let resumed = await waitUntil { scans.count > offlinePassCount && !controller.isSyncing }
+            XCTAssertTrue(resumed, "The retry survives the offline path and resumes without the index backoff")
+            XCTAssertEqual(owners.values, Array(repeating: .manual, count: offlinePassCount + 1))
+            await controller.shutdown()
+        }
+
+        func testAWiFiWaitNeverInheritsManualIntentFromAnotherRunsLock() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-foreign-manual-lock", source: signals.source)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let scans = PassCounter()
+            let releaseScan = LockedFlag(false)
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                while !releaseScan.value, !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+            }
+            controller.syncNow()
+            signals.resetReads()
+            let paused = await waitUntil { scans.count == 1 && signals.hasBeenRead }
+            XCTAssertTrue(paused)
+            // Let the policy result settle while the scan still owns the foreground pass.
+            try await Task.sleep(for: .milliseconds(300))
+            try holdAutomaticPasses(in: fixture)
+            let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
+            let runID = try XCTUnwrap(controller.activeExecutionRunID)
+            XCTAssertTrue(lock.release(runID: runID))
+            XCTAssertTrue(lock.acquire(owner: .manual, runID: "another-manual-run").didAcquire)
+            releaseScan.value = true
+            let ended = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(ended)
+            try await assertNoAutomaticResume(controller, "The foreground pass has settled on the expensive path")
+            XCTAssertTrue(lock.release(runID: "another-manual-run"))
+
+            signals.setWaitsForWiFi(false)
+            signals.announceChange()
+
+            let scheduled = await waitUntil { controller.isAutoResumeScheduledForTesting }
+            XCTAssertTrue(scheduled, "An automatic pass still honors its own remote-index backoff")
+            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
+            XCTAssertEqual(scans.count, 1, "Another run's manual lock cannot grant this controller a manual retry")
+            await controller.shutdown()
+        }
+
         func testAManualStartBeforeTheFirstNetworkPathStaysManual() async throws {
             let runtime = LibraryRuntimeState.makeProcessState()
             let fixture = try makeWiFiWaitFixture(
@@ -1889,10 +2248,16 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 private final class FakeBackupRuntimeSignals: @unchecked Sendable {
     private let lock = NSLock()
     private var waitsForWiFi: Bool
+    private var networkDetermined: Bool
+    private var networkAvailable = true
+    private var usesMobileData = false
     private var reads = 0
     private var continuations: [AsyncStream<LibraryRuntimeSnapshot>.Continuation] = []
 
-    init(waitsForWiFi: Bool) { self.waitsForWiFi = waitsForWiFi }
+    init(waitsForWiFi: Bool, networkDetermined: Bool = true) {
+        self.waitsForWiFi = waitsForWiFi
+        self.networkDetermined = networkDetermined
+    }
 
     var source: BackupRuntimeSignalSource {
         BackupRuntimeSignalSource(
@@ -1902,6 +2267,16 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
     }
 
     func setWaitsForWiFi(_ value: Bool) { lock.withLock { waitsForWiFi = value } }
+
+    func setNetworkAvailable(_ value: Bool) { lock.withLock { networkAvailable = value } }
+
+    func setUsesMobileData(_ value: Bool) { lock.withLock { usesMobileData = value } }
+
+    var hasBeenRead: Bool { lock.withLock { reads > 0 } }
+
+    func resetReads() { lock.withLock { reads = 0 } }
+
+    func setNetworkDetermined(_ value: Bool) { lock.withLock { networkDetermined = value } }
 
     func announceChange() {
         let continuations = lock.withLock { self.continuations }
@@ -1918,7 +2293,9 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
     private func read() -> BackupThrottleInputs {
         lock.withLock {
             reads += 1
-            return BackupThrottleInputs(isNetworkExpensive: waitsForWiFi, usesMobileData: !waitsForWiFi)
+            return BackupThrottleInputs(
+                isNetworkAvailable: networkAvailable, isNetworkExpensive: waitsForWiFi, usesMobileData: usesMobileData,
+                isNetworkDetermined: networkDetermined)
         }
     }
 }

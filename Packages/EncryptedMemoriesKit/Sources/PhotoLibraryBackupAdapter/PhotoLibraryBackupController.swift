@@ -193,6 +193,9 @@ public final class PhotoLibraryBackupController {
     @ObservationIgnored var onLibraryChange: (@MainActor () -> Void)?
     /// The runner ended the current pass waiting for Wi-Fi. Reset when a pass starts.
     private var passWaitedForWiFi = false
+    private var passPausedByPolicy = false
+    /// A manual Wi-Fi retry stays pending until the resumed pass gets past its policy pause.
+    private var manualWiFiRetryPending = false
     /// The owner of a foreground or explicit pass that did not start because no network path had arrived yet. The
     /// first path, the setting, or the end of `firstNetworkPathWait` starts it. An explicit action outranks an
     /// automatic foreground start.
@@ -737,6 +740,17 @@ public final class PhotoLibraryBackupController {
             startFirstNetworkPathWait()
             return nil
         }
+        if deferredStartOwner != nil {
+            // The snapshot can arrive before its observer. A window must still yield to the deferred session pass.
+            if owner == .manual { deferredStartOwner = .manual }
+            let run = startAfterFirstNetworkPath()
+            return owner == .foreground || owner == .manual ? run : nil
+        }
+        if manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait, owner != .manual {
+            let run = startSync(owner: .manual)
+            // A window cannot own or expire the person's resumed retry.
+            return owner == .foreground ? run : nil
+        }
         if owner != .manual,
             let retryAt = queueStore.runtimeIssue(for: .remoteIndexPreparation)?.nextAttemptAt,
             retryAt > Date()
@@ -786,6 +800,7 @@ public final class PhotoLibraryBackupController {
         instantEnqueueTask = nil
         isSyncing = true
         passWaitedForWiFi = false
+        passPausedByPolicy = false
         backedUpAtRunStart = lastProjectedProgress.backedUp
         updateIdleTimerIfNeeded()
         isScanning = false
@@ -825,7 +840,7 @@ public final class PhotoLibraryBackupController {
             self?.beginScanPhase()
             let scanDone = BackupScanSignal()
             let workIntent: LibraryWorkIntent = owner == .manual ? .userInitiated : .automatic
-            async let reconcile: Bool = Self.reconcileWhileScanning(
+            async let reconcile: BackupSyncProgress = Self.reconcileWhileScanning(
                 runner: runner,
                 scanDone: scanDone,
                 workIntent: workIntent
@@ -856,7 +871,7 @@ public final class PhotoLibraryBackupController {
             self?.finishScanPhase()
 
             await scanDone.markDone()
-            let waitedForWiFi = await reconcile  // drains the tail enqueued during the scan, then returns
+            let finalProgress = await reconcile  // drains the tail enqueued during the scan, then returns
             do {
                 // Requeue drops after the runner stops. The next pass retries them without looping in this pass.
                 try await Self.reconcileMissingSources(
@@ -866,7 +881,8 @@ public final class PhotoLibraryBackupController {
                 self?.reportSyncMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }
             tempStore.sweep()  // every export is re-derivable; nothing to keep between passes
-            self?.passWaitedForWiFi = waitedForWiFi
+            self?.passWaitedForWiFi = finalProgress.isPausedByPolicy && finalProgress.isWaitingForWiFi
+            self?.passPausedByPolicy = finalProgress.isPausedByPolicy
             await self?.finishSync(runID: runID)
         }
         syncTask = task
@@ -958,33 +974,32 @@ public final class PhotoLibraryBackupController {
     /// has signalled completion AND nothing runnable remains. Runs concurrently with the scan, so a
     /// slow or resuming scan never delays uploads. Static + the heavy work is on the runner actor, so
     /// it never touches the main thread and does not depend on the controller's lifetime.
-    /// Returns true when the last drain ended waiting for Wi-Fi. This is the runner's own result: the projected
-    /// status can still miss the runner's last callback when the pass completes.
+    /// Returns the last drain's policy state; the projector can still miss the runner's last callback at completion.
     private static func reconcileWhileScanning(
         runner: BackupSyncRunner,
         scanDone: BackupScanSignal,
         workIntent: LibraryWorkIntent
-    ) async -> Bool {
+    ) async -> BackupSyncProgress {
         while !Task.isCancelled {
             let progress = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
-            guard await runner.isQueueOperational() else { return false }
+            guard await runner.isQueueOperational() else { return progress }
             // A failed remote index cannot safely dedupe anything, and a closed runtime policy has
             // no eligible transport. End this pass and let the controller's typed retry scheduler
             // choose the next attempt instead of hammering either condition four times per second.
             if progress.remoteIndexPreparationFailed || progress.isPausedByPolicy {
-                return progress.isPausedByPolicy && progress.isWaitingForWiFi
+                return progress
             }
             if await scanDone.isDone() {
                 // The scan may have enqueued rows between our last claim and its done-signal; one more
                 // drain guarantees they upload before we return.
                 let tail = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
-                return tail.isPausedByPolicy && tail.isWaitingForWiFi
+                return tail
             }
             // Yield the CPU and let the scan enqueue more before the next drain (no hot empty spin).
             // A cancelled sleep drops straight out via the loop condition; no busy loop on stop.
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        return false
+        return BackupSyncProgress()
     }
 
     /// Runs the scan phase through the persistent catalog driver. `nonisolated` keeps SQLite and
@@ -1247,6 +1262,7 @@ public final class PhotoLibraryBackupController {
     /// Sign-out must await this before removing `accountDataDirectory`.
     public func shutdown() async {
         isShuttingDown = true
+        manualWiFiRetryPending = false
         pendingSyncAfterStop = false
         monitor.stopObserving()
         changeDebounceTask?.cancel()
@@ -1371,9 +1387,10 @@ public final class PhotoLibraryBackupController {
         }
     }
 
-    private func startAfterFirstNetworkPath() {
+    @discardableResult
+    private func startAfterFirstNetworkPath() -> StartedBackupRun? {
         guard !isShuttingDown, deferredStartOwner != nil || deferredBackgroundOwner != nil, !waitsForFirstNetworkPath
-        else { return }
+        else { return nil }
         let sessionOwner = deferredStartOwner
         let backgroundOwner = deferredBackgroundOwner
         deferredStartOwner = nil
@@ -1382,11 +1399,14 @@ public final class PhotoLibraryBackupController {
         firstNetworkPathWaitTask = nil
         if let sessionOwner {
             // The foreground or explicit pass runs on its own; a waiting window ends without owning it.
-            _ = startSync(owner: sessionOwner)
+            let run = startSync(owner: sessionOwner)
+            if run == nil { deferredStartOwner = sessionOwner }
             resumeDeferredStartWaiters(with: nil)
+            return run
         } else if let backgroundOwner {
             resumeDeferredStartWaiters(with: startSync(owner: backgroundOwner))
         }
+        return nil
     }
 
     /// Waits for the deferred pass of a background window. Cancellation, for example at the OS expiration, ends the
@@ -1429,8 +1449,8 @@ public final class PhotoLibraryBackupController {
     }
 
     private func resumeIfWiFiWaitEnded() {
-        guard !isShuttingDown, status.phase == .waitingForWiFi,
-            status.endsWiFiWait(for: runtimeSignals.current())
+        guard !isShuttingDown, status.phase == .waitingForWiFi || manualWiFiRetryPending,
+            runtimeSignals.current().canEndWiFiWait
         else { return }
         syncNow()
     }
@@ -1669,6 +1689,11 @@ public final class PhotoLibraryBackupController {
         let stopTask = runnerStopRunID == runID ? runnerStopTask : nil
         await stopTask?.value
         guard activeRunID == runID else { return }
+        if !isShuttingDown,
+            let lock = lockStore?.currentLock(), lock.runID == runID, lock.owner == .manual
+        {
+            manualWiFiRetryPending = passPausedByPolicy
+        }
         heartbeatTask?.cancel()
         heartbeatTask = nil
         lockStore?.release(runID: runID)
@@ -1711,7 +1736,7 @@ public final class PhotoLibraryBackupController {
         }
         // Wi-Fi or Ethernet returned, or the setting was turned on, while this pass still ran (for example during
         // its scan). Start the next pass now instead of keeping "Waiting for Wi-Fi" until the fallback.
-        let wiFiWaitEnded = waitedForWiFi && !runtimeSignals.current().waitsForWiFi
+        let wiFiWaitEnded = (waitedForWiFi || manualWiFiRetryPending) && runtimeSignals.current().canEndWiFiWait
         if shouldRestart {
             syncNow()
         } else if wiFiWaitEnded, startSync(owner: .foreground) != nil {

@@ -78,6 +78,11 @@ public struct BackupThrottleInputs: Sendable, Equatable {
         isNetworkAvailable && isNetworkExpensive && !usesMobileData
     }
 
+    /// A reachable path that permits backup traffic can end a Wi-Fi wait. An offline transition keeps the wait.
+    public var canEndWiFiWait: Bool {
+        isNetworkAvailable && !waitsForWiFi
+    }
+
     /// No network path has arrived yet, and mobile data is off. Uploads stay held, but a backup pass waits for the
     /// first path instead of reporting "Waiting for Wi-Fi": the network is often Wi-Fi.
     public var waitsForFirstNetworkPath: Bool {
