@@ -106,6 +106,7 @@ final class CoreArchitectureGateTests: XCTestCase {
             // These dependencies remain platform-neutral so dedupe stays in shared Core.
             allowedImports: [
                 "AVFoundation", "CryptoKit", "Foundation", "ImageIO", "Observation", "PhotosCore", "SQLite3",
+                "Synchronization",
             ],
             expectedDependencies: ["PhotosCore"],
             extraForbiddenTokens: []

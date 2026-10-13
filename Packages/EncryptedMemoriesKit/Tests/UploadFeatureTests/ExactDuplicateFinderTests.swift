@@ -287,6 +287,40 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(identities.reads, CountingIdentityStore.Reads(single: 0, batch: 2))
     }
 
+    func testACancelledRankingCanFinishDeliveringAnAlreadyReadPage() async throws {
+        let first = server.seedLink(digest: digest("late"))
+        let second = server.seedLink(digest: digest("late"))
+        let earlier = ExactDuplicateFingerprint(pixelWidth: 24)
+        for member in [first, second] { server.setFingerprint(earlier, of: member) }
+        indexServer()
+        let group = try await onlyGroup()
+        let finder = finder
+        let delivery = FinderGate()
+        let entered = expectation(description: "the real finder calls its page receiver")
+        let pages = PageCollector()
+        let ranking = Task {
+            await finder.rankMembers(of: [group]) { page in
+                entered.fulfill()
+                await delivery.pass()
+                XCTAssertTrue(Task.isCancelled, "delivery resumes after cancellation")
+                await pages.add(page)
+            }
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        ranking.cancel()
+        let changed = ExactDuplicateFingerprint(captureTime: date(99))
+        server.setFingerprint(changed, of: second)
+        delivery.open()
+        await ranking.value
+
+        let collected = await pages.pages
+        let page = try XCTUnwrap(collected.first)
+        XCTAssertEqual(collected.count, 1)
+        XCTAssertEqual(Set(page.members[group.id] ?? []), Set([first, second]))
+        XCTAssertEqual(page.fingerprints[group.id]?[second], earlier, "the receiver carries the earlier read")
+        XCTAssertNotEqual(page.fingerprints[group.id]?[second], changed, "the delivered facts predate the change")
+    }
+
     func testTheRankingPageCarriesTheFactsAndTheSizeOfEachMemberFromTheSameReads() async throws {
         let album = server.seedLink(digest: digest("a"), captureTime: date(5))
         let manifest = server.seedLink(digest: digest("a"), captureTime: date(0))
