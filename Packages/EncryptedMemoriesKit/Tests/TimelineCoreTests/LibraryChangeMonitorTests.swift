@@ -14,7 +14,7 @@ import Testing
             policy: .init(interval: .milliseconds(5), failureInterval: .milliseconds(5))
         ) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
 
         try await Task.sleep(for: .milliseconds(18))
@@ -37,7 +37,7 @@ import Testing
             interval: .milliseconds(5), failureInterval: .milliseconds(5))
         await monitor.start(provider: provider, policy: policy) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         try await Task.sleep(for: .milliseconds(12))
         await monitor.stop()
@@ -45,7 +45,7 @@ import Testing
         await provider.set("b")
         await monitor.restart(provider: provider, policy: policy) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         let deadline = ContinuousClock.now + .seconds(2)
         while await counter.value == 0, ContinuousClock.now < deadline {
@@ -64,7 +64,7 @@ import Testing
             policy: .init(interval: .milliseconds(5), failureInterval: .milliseconds(5))
         ) {
             await attempts.increment()
-            return await attempts.value > 1 ? .refreshed : .retry
+            return await attempts.value > 1 ? .refreshed(token: "b") : .retry
         }
 
         try await Task.sleep(for: .milliseconds(12))
@@ -120,7 +120,7 @@ import Testing
             initialToken: "cached"
         ) {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "new")
         }
 
         // The second probe proves that the first changed token was accepted and committed.
@@ -138,7 +138,7 @@ import Testing
             interval: .zero, failureInterval: .zero)
         await monitor.start(provider: provider, policy: policy, initialToken: "a") {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         await provider.set("b")
         let countAfterMutation = await provider.probeCount
@@ -150,7 +150,7 @@ import Testing
         let countBeforeRestart = await provider.probeCount
         await monitor.start(provider: provider, policy: policy, initialToken: "a") {
             await counter.increment()
-            return .refreshed
+            return .refreshed(token: "b")
         }
         await provider.waitUntilProbeCount(countBeforeRestart + 1)
         #expect(await counter.value == 1)
@@ -167,7 +167,7 @@ import Testing
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
             Issue.record("A cancelled probe must not publish a library change")
-            return .refreshed
+            return .refreshed(token: "b")
         }
 
         await provider.waitUntilEntered()
@@ -193,7 +193,7 @@ import Testing
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
             Issue.record("A cancelled probe must not publish a library change")
-            return .refreshed
+            return .refreshed(token: "b")
         }
 
         await retiringProvider.waitUntilEntered()
@@ -206,7 +206,7 @@ import Testing
             provider: replacementProvider,
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
-            .refreshed
+            .refreshed(token: "b")
         }
         await retiringProvider.release()
         await stopTask.value
@@ -230,12 +230,12 @@ import Testing
                     provider: replacement,
                     policy: .init(interval: .zero, failureInterval: .zero)
                 ) {
-                    .refreshed
+                    .refreshed(token: "b")
                 }
             },
             onChange: {
                 Issue.record("A terminal scope failure must not publish a library change")
-                return .refreshed
+                return .refreshed(token: "b")
             }
         )
 
@@ -265,6 +265,84 @@ import Testing
 
         #expect(await provider.probeCount == 1)
         #expect(await terminalCallbacks.value == 1)
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func unconfirmableRefreshIsNotRepeatedForTheSameTokenAndKeepsTheBaseline() async throws {
+        let provider = TokenProvider("a")
+        let refreshes = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+            initialToken: "a"
+        ) {
+            await refreshes.increment()
+            return .refreshedWithoutRevision
+        }
+
+        await provider.set("b")
+        await refreshes.waitUntil { $0 >= 1 }
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 1)
+        #expect(await monitor.testingBaseline() == "a")
+
+        await provider.set("c")
+        await refreshes.waitUntil { $0 >= 2 }
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 2)
+        #expect(await monitor.testingBaseline() == "a")
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func resumeRefreshesTheDeferredTokenAgainAndConfirmsIt() async throws {
+        let provider = TokenProvider("a")
+        let refreshes = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+            initialToken: "a"
+        ) {
+            await refreshes.increment()
+            return await refreshes.value == 1 ? .refreshedWithoutRevision : .refreshed(token: "b")
+        }
+
+        await provider.set("b")
+        await refreshes.waitUntil { $0 >= 1 }
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 1)
+
+        await monitor.resumeDeferredRefresh()
+        await monitor.waitUntilBaseline("b")
+        await provider.waitUntilProbeCount(await provider.probeCount + 20)
+        #expect(await refreshes.value == 2)
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func resumeDuringARefreshKeepsTheTokenPendingForAnotherRefresh() async throws {
+        let provider = TokenProvider("a")
+        let refreshes = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+            initialToken: "a"
+        ) {
+            await refreshes.increment()
+            if await refreshes.value == 1 {
+                await monitor.resumeDeferredRefresh()
+                return .refreshedWithoutRevision
+            }
+            return .refreshed(token: "b")
+        }
+
+        await provider.set("b")
+        await monitor.waitUntilBaseline("b")
+        #expect(await refreshes.value == 2)
         await monitor.stop()
     }
 }
@@ -307,6 +385,19 @@ private actor TokenProvider: LibraryChangeTokenProvider {
 private actor Counter {
     private(set) var value = 0
     func increment() { value += 1 }
+
+    /// Bounded, so a regression fails an expectation instead of hanging the run.
+    func waitUntil(_ condition: (Int) -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(value), ContinuousClock.now < deadline { await Task.yield() }
+    }
+}
+
+extension LibraryChangeMonitor {
+    fileprivate func waitUntilBaseline(_ token: String) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while testingBaseline() != token, ContinuousClock.now < deadline { await Task.yield() }
+    }
 }
 
 private actor BlockingTokenProvider: LibraryChangeTokenProvider {

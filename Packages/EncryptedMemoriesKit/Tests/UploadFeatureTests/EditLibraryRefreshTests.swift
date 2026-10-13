@@ -105,7 +105,7 @@ final class EditLibraryRefreshTests: XCTestCase {
 }
 
 /// Every route reads the same uploaded links as replacement and dedupe. Related files never become library tiles.
-private struct EditLibraryRepository: PhotosRepository, PhotoLibraryProvider {
+struct EditLibraryRepository: PhotosRepository, PhotoLibraryProvider {
     let server: EditScenarioServer
 
     var serverItems: [PhotoItem] { listing(includingTrashed: []) }

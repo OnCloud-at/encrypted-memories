@@ -1730,16 +1730,18 @@ final class MobileLibraryModel {
                 loadGeneration == self.loadToken,
                 self.session == session
             else { return }
-            try await applyItems(cached.sections, cached: true)
+            _ = try await applyItems(cached.sections, cached: true)
             guard !Task.isCancelled,
                 loadGeneration == self.loadToken,
                 self.session == session
             else { return }
             scheduleThumbnailPrefetch(using: feed)
-            cacheValidation = await TimelineCacheValidationPolicy.validate(
+            let mutationGeneration = timelineMutationGeneration
+            let validation = await TimelineCacheValidationPolicy.validateForPublication(
                 snapshot: cached,
                 repository: backend
             )
+            cacheValidation = validation.validation
             guard !Task.isCancelled,
                 loadGeneration == self.loadToken,
                 self.session == session
@@ -1747,17 +1749,18 @@ final class MobileLibraryModel {
             if case .terminalFailure = cacheValidation {
                 throw TimelineCacheValidationTerminalError()
             }
-            if case .validated(let token) = cacheValidation {
-                publishSmartSearchInventory(
-                    snapshot.items,
-                    authority: .authoritative
-                )
-                apply(.authoritativeInventoryResolved(count: items.count, requiresNewFrame: false))
+            let change = try await applyValidatedCacheForCurrentMutation(
+                validation, generation: mutationGeneration)
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            guard mutationGeneration == timelineMutationGeneration else {
                 initialLibraryLoadSettled = true
-                startLibraryChangeMonitorIfPossible(
-                    resetBaseline: true,
-                    initialToken: token
-                )
+                startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
+                return
+            }
+            if settleValidatedCachedTimeline(change: change, validation: cacheValidation) {
                 return
             }
         }
@@ -1777,11 +1780,7 @@ final class MobileLibraryModel {
         if hadCachedInventory {
             reconcileNewAssetThumbnails(since: shownBefore, change: change, using: feed)
         }
-        initialLibraryLoadSettled = true
-        self.startLibraryChangeMonitorIfPossible(
-            resetBaseline: true,
-            initialToken: refreshed.validationToken ?? cacheValidation.monitorBaseline
-        )
+        settleInitialTimelineLoad(refreshed, change: change)
     }
 
     /// Builds an immutable `TimelineSnapshot` off the main actor and publishes it only for the current load.
@@ -1894,12 +1893,36 @@ final class MobileLibraryModel {
         )
     }
 
+    private func applyValidatedCacheForCurrentMutation(
+        _ validation: TimelineCacheValidationResult, generation: Int
+    ) async throws -> TimelineProjectionChange? {
+        guard generation == timelineMutationGeneration, let current = validation.snapshot else { return nil }
+        return try await applyItems(current.sections, cached: false, authoritative: true)
+    }
+
+    private func settleValidatedCachedTimeline(
+        change: TimelineProjectionChange?, validation: TimelineCacheValidation
+    ) -> Bool {
+        guard change != nil, case .validated(let token) = validation else { return false }
+        publishSmartSearchInventory(snapshot.items, authority: .authoritative)
+        initialLibraryLoadSettled = true
+        startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: token)
+        return true
+    }
+
+    private func settleInitialTimelineLoad(
+        _ refreshed: TimelineLoadSnapshot, change: TimelineProjectionChange?
+    ) {
+        initialLibraryLoadSettled = true
+        startLibraryChangeMonitorIfPossible(
+            resetBaseline: true, initialToken: refreshed.monitorBaseline(afterPublishing: change != nil))
+    }
+
     private func startLibraryChangeMonitorIfPossible(
         resetBaseline: Bool = false,
         initialToken: String? = nil
     ) {
-        guard applicationIsActive,
-            initialLibraryLoadSettled,
+        guard initialLibraryLoadSettled,
             let provider = backend as? any LibraryChangeTokenProvider,
             let recoverySession = session,
             let refreshLease = currentMutationLease()
@@ -1914,6 +1937,7 @@ final class MobileLibraryModel {
             else { return }
             await self.libraryChangeMonitor.restart(
                 provider: provider,
+                isActive: self.applicationIsActive,
                 resetBaseline: resetBaseline,
                 initialToken: initialToken,
                 onTerminal: { [weak self] _ in
@@ -1958,11 +1982,13 @@ final class MobileLibraryModel {
         isRefreshingLibrary = true
         defer { isRefreshingLibrary = false }
         do {
-            let refreshed = try await backend.loadTimeline()
+            let refreshed = try await backend.loadTimelineSnapshot()
             try Task.checkCancellation()
             try requireCurrentMutation(refreshLease)
             let shownBefore = snapshot
-            let change = try await applyItems(refreshed, cached: false, authoritative: true)
+            guard let change = try await applyItems(refreshed.sections, cached: false, authoritative: true) else {
+                return .init(outcome: .retry, failureReason: .superseded)
+            }
             try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
                 scheduleThumbnailPrefetch(using: thumbnailFeed)
@@ -1972,7 +1998,7 @@ final class MobileLibraryModel {
             // refresh instead of adding a second poller; Collections reloads through its existing revision key.
             albumCatalogRevision &+= 1
             refreshLibrarySources()
-            return .init(outcome: .refreshed, failureReason: nil)
+            return .init(outcome: .refreshed(token: refreshed.validationToken), failureReason: nil)
         } catch is CancellationError {
             return .init(outcome: .retry, failureReason: .cancelled)
         } catch is any LibraryChangeTerminalError {
@@ -2035,9 +2061,36 @@ final class MobileLibraryModel {
 
         /// Settles the installed library like a completed initial load and reads its favorites, so search
         /// suggestions compute as they do for a signed-in account.
-        func settleIsolatedLibraryForTesting() {
+        func settleIsolatedLibraryForTesting(initialToken: String? = nil) {
             initialLibraryLoadSettled = true
             loadFavoritesIfNeeded()
+            if let initialToken {
+                startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: initialToken)
+            }
+        }
+
+        func publishIsolatedValidatedCacheForTesting(_ cached: CachedTimelineSnapshot) async throws -> Bool {
+            let change = try await applyItems(cached.sections, cached: false, authoritative: true)
+            return settleValidatedCachedTimeline(change: change, validation: .validated(token: "b"))
+        }
+
+        func validateIsolatedCacheForTesting(_ cached: CachedTimelineSnapshot) async throws -> Bool {
+            guard let backend else { return false }
+            let generation = timelineMutationGeneration
+            let validation = await TimelineCacheValidationPolicy.validateForPublication(
+                snapshot: cached, repository: backend)
+            let change = try await applyValidatedCacheForCurrentMutation(validation, generation: generation)
+            return settleValidatedCachedTimeline(change: change, validation: validation.validation)
+        }
+
+        func publishIsolatedInitialSnapshotForTesting(_ refreshed: TimelineLoadSnapshot) async throws {
+            let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
+            settleInitialTimelineLoad(refreshed, change: change)
+        }
+
+        func refreshIsolatedLibraryForTesting() async -> LibraryChangeRefreshOutcome {
+            guard let lease = currentMutationLease() else { return .retry }
+            return await performLibraryRefresh(lease: lease).outcome
         }
 
         func installIsolatedDuplicatesForTesting(_ finder: any ExactDuplicateMerging) {

@@ -143,6 +143,12 @@ public struct TimelineLoadSnapshot: Sendable {
         self.sections = sections
         self.validationToken = validationToken
     }
+
+    /// An unaccepted or unpaired projection leaves the next successful monitor probe pending.
+    public func monitorBaseline(afterPublishing accepted: Bool) -> String {
+        guard accepted else { return "" }
+        return validationToken ?? ""
+    }
 }
 
 /// Marker for an authoritative timeline load that is valid but has not yet converged with a completed local
@@ -206,6 +212,8 @@ public protocol LibraryChangeTokenProvider: Sendable {
     /// Allows a backend to use scope already present in the cached inventory (for example its volume ID),
     /// avoiding an unrelated root-discovery request on the user-visible launch path.
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String
+    /// Adapts a validated persisted revision without another listing. The validated remote cursor remains the baseline.
+    func monitorBaseline(for validationToken: String) async throws -> String
 }
 
 /// Marker for a change-token failure that cannot recover by polling the same remote scope again.
@@ -213,6 +221,15 @@ public protocol LibraryChangeTokenProvider: Sendable {
 public protocol LibraryChangeTerminalError: Error, Sendable {}
 
 public extension LibraryChangeTokenProvider {
+    func monitorBaseline(for validationToken: String) async throws -> String {
+        guard let remoteRevision = LibraryChangeMonitorSeedPolicy.remoteRevision(from: validationToken) else {
+            return validationToken
+        }
+        let observed = try await libraryChangeToken()
+        return LibraryChangeMonitorSeedPolicy.baseline(
+            validatedRemoteRevision: remoteRevision, observedMonitorToken: observed)
+    }
+
     func launchValidationToken() async throws -> String {
         try await libraryChangeToken()
     }

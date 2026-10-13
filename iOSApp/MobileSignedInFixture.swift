@@ -559,16 +559,28 @@ import UploadCore
 
     /// Every provider of the account backend, answered from memory. Media beyond thumbnails is unavailable, which
     /// the production viewer handles like an offline account.
-    struct MobileFixtureBackend: PhotosBackend {
+    struct MobileFixtureBackend: PhotosBackend, LibraryChangeTokenProvider {
         let sections: [TimelineSection]
         let thumbnails: [PhotoUID: Data]
+        var timelineLoader: (@Sendable () async throws -> TimelineLoadSnapshot)? = nil
+        var changeTokenLoader: (@Sendable () async throws -> String)? = nil
+        var cachedTimelineLoader: (@Sendable () async -> CachedTimelineSnapshot?)? = nil
         var favoriteLoader: (@Sendable () async throws -> Set<PhotoUID>)? = nil
         var favoriteWriter: (@Sendable ([PhotoUID], Bool) async throws -> Void)? = nil
         var trashEmptier: (@Sendable () async throws -> Void)? = nil
         /// Recently Deleted lists every fixture photo until it is emptied.
         let trashState = MobileFixtureTrashState()
 
-        func loadTimeline() async throws -> [TimelineSection] { sections }
+        func loadTimeline() async throws -> [TimelineSection] { try await loadTimelineSnapshot().sections }
+        func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
+            if let timelineLoader { return try await timelineLoader() }
+            return TimelineLoadSnapshot(sections: sections, validationToken: "fixture")
+        }
+        func libraryChangeToken() async throws -> String { try await changeTokenLoader?() ?? "fixture" }
+        func cachedTimelineSnapshot() async -> CachedTimelineSnapshot? {
+            guard let cachedTimelineLoader else { return nil }
+            return await cachedTimelineLoader()
+        }
         func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
             filter == .trash && trashState.isEmptied ? [] : sections
         }

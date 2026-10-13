@@ -295,7 +295,7 @@ struct MainView: View {
                 // placement when geometry is valid.
                 routeInitialScrollAnchor = routeScrollPositions[newValue]
                 routeScrollGeneration += 1
-                Task { await timelineModel.select(newValue) }
+                Task { await timelineModel.select(newValue, resuming: libraryChangeMonitor) }
             }
             .onChange(of: model.pendingTrash.localUIDs) { _, _ in
                 timelineModel.setPendingTrash(model.pendingTrash)
