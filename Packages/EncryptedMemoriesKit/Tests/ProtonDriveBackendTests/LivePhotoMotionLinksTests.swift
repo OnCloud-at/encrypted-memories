@@ -210,7 +210,7 @@ struct LivePhotoMotionLinksTests {
             """ : "ALTER TABLE media_type_evidence RENAME TO fixture_evidence;"
         #expect(sqlite3_exec(handle, fault, nil, nil, nil) == SQLITE_OK)
         // Refresh this connection's schema before testing preparation, not a deferred step error.
-        #expect(store.load().map(\.uid) == saved.sorted(by: TimelineOrder.areInIncreasingOrder).map(\.uid))
+        #expect(try store.load().map(\.uid) == saved.sorted(by: TimelineOrder.areInIncreasingOrder).map(\.uid))
         #expect(store.mediaTypeEvidence(volumeID: "v") == nil)
         let evidence = store.mediaTypeEvidenceForDisplay(volumeID: "v")
         #expect(!evidence.canRefine)
@@ -253,7 +253,7 @@ struct LivePhotoMotionLinksTests {
             #expect(displayed[1].isVideo, "the stored video must remain playable as a video")
             #expect(displayed[2].isLivePhoto, "unknown refinement must not hide the new photo or its Live control")
         }
-        #expect(store.load().map(\.uid) == saved.sorted(by: TimelineOrder.areInIncreasingOrder).map(\.uid))
+        #expect(try store.load().map(\.uid) == saved.sorted(by: TimelineOrder.areInIncreasingOrder).map(\.uid))
         #expect(store.validationToken() == "token")
     }
 

@@ -1580,7 +1580,6 @@ final class MobileLibraryModel {
 
         loadTask = Task { [weak self] in
             guard let self else { return }
-            var hadCachedInventory = false
             do {
                 // Suggestions validate locations as part of their content identity. Restore the existing
                 // encrypted store before publishing settled inventory, even if Map is never opened.
@@ -1684,67 +1683,8 @@ final class MobileLibraryModel {
                 UIKitMemoryPressureCoordinator.shared.attachFeed(feed)
                 self.configureSourceAnalysis(client: client, feed: feed)
                 self.configureSmartSearch(session: session, client: client, feed: feed)
-                // Show the persisted snapshot while Core validates its event token. A match avoids row
-                // enumeration; a mismatch falls back to the authoritative load.
-                var cacheValidation = TimelineCacheValidation.refreshRequired(monitorBaseline: nil)
-                if let cached = await backend.cachedTimelineSnapshot() {
-                    hadCachedInventory = true
-                    guard !Task.isCancelled,
-                        loadGeneration == self.loadToken,
-                        self.session == session
-                    else { return }
-                    try await applyItems(cached.sections, cached: true)
-                    guard !Task.isCancelled,
-                        loadGeneration == self.loadToken,
-                        self.session == session
-                    else { return }
-                    scheduleThumbnailPrefetch(using: feed)
-                    cacheValidation = await TimelineCacheValidationPolicy.validate(
-                        snapshot: cached,
-                        repository: backend
-                    )
-                    guard !Task.isCancelled,
-                        loadGeneration == self.loadToken,
-                        self.session == session
-                    else { return }
-                    if case .terminalFailure = cacheValidation {
-                        throw TimelineCacheValidationTerminalError()
-                    }
-                    if case .validated(let token) = cacheValidation {
-                        publishSmartSearchInventory(
-                            snapshot.items,
-                            authority: .authoritative
-                        )
-                        apply(.authoritativeInventoryResolved(count: items.count, requiresNewFrame: false))
-                        initialLibraryLoadSettled = true
-                        startLibraryChangeMonitorIfPossible(
-                            resetBaseline: true,
-                            initialToken: token
-                        )
-                        return
-                    }
-                }
-
-                let refreshed = try await backend.loadTimelineSnapshot()
-                guard !Task.isCancelled,
-                    loadGeneration == self.loadToken,
-                    self.session == session
-                else { return }
-                let shownBefore = snapshot
-                let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
-                guard !Task.isCancelled,
-                    loadGeneration == self.loadToken,
-                    self.session == session
-                else { return }
-                scheduleThumbnailPrefetch(using: feed)
-                if hadCachedInventory {
-                    reconcileNewAssetThumbnails(since: shownBefore, change: change, using: feed)
-                }
-                initialLibraryLoadSettled = true
-                self.startLibraryChangeMonitorIfPossible(
-                    resetBaseline: true,
-                    initialToken: refreshed.validationToken ?? cacheValidation.monitorBaseline
-                )
+                try await loadInitialTimeline(
+                    backend: backend, feed: feed, session: session, loadGeneration: loadGeneration)
             } catch let error as any LibraryChangeTerminalError {
                 guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 DebugLog.log("timeline: terminal scope failure during initial load - \(error)")
@@ -1772,6 +1712,76 @@ final class MobileLibraryModel {
                 startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
             }
         }
+    }
+
+    private func loadInitialTimeline(
+        backend: any PhotosRepository,
+        feed: UIKitThumbnailFeed,
+        session: ProtonSession,
+        loadGeneration: Int
+    ) async throws {
+        var hadCachedInventory = false
+        // Show the persisted snapshot while Core validates its event token. A match avoids row
+        // enumeration; a mismatch falls back to the authoritative load.
+        var cacheValidation = TimelineCacheValidation.refreshRequired(monitorBaseline: nil)
+        if let cached = await backend.cachedTimelineSnapshot() {
+            hadCachedInventory = true
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            try await applyItems(cached.sections, cached: true)
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            scheduleThumbnailPrefetch(using: feed)
+            cacheValidation = await TimelineCacheValidationPolicy.validate(
+                snapshot: cached,
+                repository: backend
+            )
+            guard !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            if case .terminalFailure = cacheValidation {
+                throw TimelineCacheValidationTerminalError()
+            }
+            if case .validated(let token) = cacheValidation {
+                publishSmartSearchInventory(
+                    snapshot.items,
+                    authority: .authoritative
+                )
+                apply(.authoritativeInventoryResolved(count: items.count, requiresNewFrame: false))
+                initialLibraryLoadSettled = true
+                startLibraryChangeMonitorIfPossible(
+                    resetBaseline: true,
+                    initialToken: token
+                )
+                return
+            }
+        }
+
+        let refreshed = try await backend.loadTimelineSnapshot()
+        guard !Task.isCancelled,
+            loadGeneration == self.loadToken,
+            self.session == session
+        else { return }
+        let shownBefore = snapshot
+        let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
+        guard !Task.isCancelled,
+            loadGeneration == self.loadToken,
+            self.session == session
+        else { return }
+        scheduleThumbnailPrefetch(using: feed)
+        if hadCachedInventory {
+            reconcileNewAssetThumbnails(since: shownBefore, change: change, using: feed)
+        }
+        initialLibraryLoadSettled = true
+        self.startLibraryChangeMonitorIfPossible(
+            resetBaseline: true,
+            initialToken: refreshed.validationToken ?? cacheValidation.monitorBaseline
+        )
     }
 
     /// Builds an immutable `TimelineSnapshot` off the main actor and publishes it only for the current load.
@@ -2032,6 +2042,18 @@ final class MobileLibraryModel {
 
         func installIsolatedDuplicatesForTesting(_ finder: any ExactDuplicateMerging) {
             replaceDuplicates(using: finder)
+        }
+
+        var isolatedInventoryAuthorityForTesting: SourceInventoryAuthority { primaryInventoryAuthority }
+
+        /// Drives the shipping startup read sequence with an already installed isolated account.
+        func loadIsolatedInitialTimelineForTesting(repository: any PhotosRepository) async throws {
+            guard let thumbnailFeed, let session else { throw CancellationError() }
+            primaryInventoryAuthority = .hydrating
+            loadState = .preparingInventory
+            initialLibraryLoadSettled = false
+            try await loadInitialTimeline(
+                backend: repository, feed: thumbnailFeed, session: session, loadGeneration: loadToken)
         }
 
         /// Replays first-load outcomes through the shipping reducer without a real account request.
