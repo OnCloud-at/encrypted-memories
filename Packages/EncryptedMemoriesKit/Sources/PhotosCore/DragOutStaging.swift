@@ -230,7 +230,8 @@ public actor DragOutStager {
                 try? FileManager.default.removeItem(at: finalURL)
                 let deliveredURL: URL
                 if removesLocation {
-                    deliveredURL = try await LocationSanitizedCopy.write(from: destination, to: finalURL)
+                    deliveredURL = try await OriginalExportWriter.completeDownloadedOriginal(
+                        from: destination, to: finalURL, removeLocation: true)
                     try FileManager.default.removeItem(at: destination)
                 } else {
                     try FileManager.default.moveItem(at: destination, to: finalURL)

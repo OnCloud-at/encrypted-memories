@@ -63,7 +63,7 @@ public enum OriginalExportWriter {
         try await provider.writeOriginal(for: item.uid, to: stagedFile, onProgress: onProgress)
         if PrivacyExportPolicy.isEnabled() {
             let cleanFile = stagingDirectory.appendingPathComponent("clean-" + destination.lastPathComponent)
-            let written = try await LocationSanitizedCopy.write(from: stagedFile, to: cleanFile)
+            let written = try await completeDownloadedOriginal(from: stagedFile, to: cleanFile, removeLocation: true)
             try installCompletedFile(written, at: destination)
         } else {
             try installCompletedFile(stagedFile, at: destination)
@@ -121,7 +121,7 @@ public enum OriginalExportWriter {
             if PrivacyExportPolicy.isEnabled() {
                 let output = stagingDirectory.appendingPathComponent(
                     UUID().uuidString + "." + URL(fileURLWithPath: name).pathExtension)
-                let written = try await LocationSanitizedCopy.write(from: sidecar, to: output)
+                let written = try await completeDownloadedOriginal(from: sidecar, to: output, removeLocation: true)
                 cleanFile = written
                 archiveSource = written
                 // A RAW photo leaves as a JPEG; the entry name follows the written format.
@@ -147,6 +147,19 @@ public enum OriginalExportWriter {
         let stagedFile = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
         try data.write(to: stagedFile, options: .atomic)
         try installCompletedFile(stagedFile, at: destination)
+    }
+
+    /// Completes one downloaded original at a name reserved by its caller. Privacy sampling, name reservation,
+    /// disk admission, and staging cleanup remain with each export policy. A sanitized copy retains its source;
+    /// an unchanged original moves to the reserved name.
+    static func completeDownloadedOriginal(
+        from source: URL, to destination: URL, removeLocation: Bool
+    ) async throws -> URL {
+        if removeLocation {
+            return try await LocationSanitizedCopy.write(from: source, to: destination)
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
+        return destination
     }
 
     /// A sandbox-safe staging directory on the destination volume.
