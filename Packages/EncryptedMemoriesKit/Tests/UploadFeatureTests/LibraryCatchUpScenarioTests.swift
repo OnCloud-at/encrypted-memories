@@ -143,8 +143,7 @@ final class LibraryCatchUpScenarioTests: XCTestCase {
             XCTAssertEqual(observed8, 1)
             let observed9 = await repository.filteredListings
             XCTAssertEqual(observed9, 2, "One filter selection and one changed-token refresh")
-            await model.select(.all)
-            await monitor.resumeDeferredRefresh()
+            await model.select(.all, resuming: monitor)
             await repository.releaseProbe()
             await repository.waitForProbes(5)
             await monitor.stop()
@@ -192,8 +191,7 @@ final class LibraryCatchUpScenarioTests: XCTestCase {
             let quietFull = await repository.fullListings
             XCTAssertEqual(quietFull, 1, "A filtered route never lists the whole library")
 
-            await model.select(.all)
-            await monitor.resumeDeferredRefresh()
+            await model.select(.all, resuming: monitor)
             await repository.waitForBaseline(of: monitor)
             let confirmed = await monitor.testingBaseline()
             let cursor = await repository.currentCursor

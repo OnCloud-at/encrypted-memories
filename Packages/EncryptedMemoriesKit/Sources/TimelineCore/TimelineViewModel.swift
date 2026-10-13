@@ -350,6 +350,14 @@ public final class TimelineViewModel {
         }
     }
 
+    /// Switches the route like `select(_:)`. When All Photos is shown afterwards, the whole library has loaded, so
+    /// the monitor can confirm a revision that a filtered route deferred. A newer selection can replace this one
+    /// while it loads: only the route that ends up shown counts.
+    public func select(_ newFilter: PhotoFilter, resuming monitor: LibraryChangeMonitor) async {
+        await select(newFilter)
+        if filter == .all { await monitor.resumeDeferredRefresh() }
+    }
+
     /// Re-runs the selected filter for the error-state Retry action. It does not fall back to `.all`.
     public func retry() async {
         if filter == .all { await loadAll(force: true) } else { await loadFiltered(filter) }
