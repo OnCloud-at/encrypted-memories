@@ -180,6 +180,24 @@ if sys.argv[1:3] == ['simctl', 'bootstatus']:
                 self.assertIn('destination fields must use key=value', result.stderr)
                 self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
 
+    def test_invalid_runtime_with_id_stops_before_any_command(self):
+        for runtime in ['not-a-version', '27.1.1.1', '27.', '.27', '-1']:
+            with self.subTest(runtime=runtime):
+                result = self.run_script(IOS_TEST_DESTINATION='platform=iOS Simulator,id=abc,OS=' + runtime)
+                self.assertEqual(result.returncode, 64, result.stderr)
+                self.assertIn('simulator OS must be latest or a numeric version', result.stderr)
+                self.assertEqual(self.commands, [])
+
+    def test_valid_runtime_with_id_is_forwarded_unchanged(self):
+        for runtime in ['27', '27.1', '27.1.1', 'latest']:
+            with self.subTest(runtime=runtime):
+                destination = 'platform=iOS Simulator,id=abc,OS=' + runtime
+                result = self.run_script(IOS_TEST_DESTINATION=destination)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(['simctl', 'bootstatus', 'abc', '-b'], self.commands)
+                invocation = self.commands[-1]
+                self.assertEqual(invocation[invocation.index('-destination') + 1], destination)
+
     def test_failed_explicit_boot_stops_before_test_launch(self):
         result = self.run_script(IOS_TEST_DESTINATION='platform=iOS Simulator,id=duo-test',
                                  IOS_TEST_PREPARED='1', TEST_BOOT_EXIT='1')

@@ -119,6 +119,10 @@ if [[ -n "${IOS_TEST_DESTINATION:-}" ]]; then
           echo "[ios-tests] destination OS cannot be empty." >&2
           exit 64
         fi
+        if [[ "$SIMULATOR_OS" != "latest" && ! "$SIMULATOR_OS" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+          echo "[ios-tests] simulator OS must be latest or a numeric version." >&2
+          exit 64
+        fi
         ;;
     esac
   done

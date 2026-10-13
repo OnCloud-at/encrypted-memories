@@ -344,8 +344,10 @@ The override is optional. Without it, the scripts keep selecting an installed iP
 A named override selects the newest matching runtime. `OS=27` matches 27.x; `OS=27.1` matches
 27.1 and 27.1.x. A three-component value such as `OS=27.1.0` matches exactly, with missing runtime
 components treated as zero. An omitted OS or `OS=latest` selects the newest runtime.
-Empty `id=` or `OS=` fields and fields without `=` fail with exit 64. Simulator names containing a
-comma are not supported; use `id=` for those devices. An `id=` override selects an existing simulator directly. Both test modes wait for that simulator
+OS values must use `latest` or one to three numeric components. Invalid OS values, empty `id=` or
+`OS=` fields, and fields without `=` fail with exit 64. Simulator names containing a comma are not
+supported; use `id=` for those devices. An `id=` override selects an existing simulator directly.
+Both test modes wait for that simulator
 to boot and pass the same device ID to Xcode. `build-for-testing` does not boot a simulator.
 Command tests cover these choices in `.github/scripts/test_ios_test_commands.py`.
 
@@ -366,5 +368,3 @@ update the expected Xcode version together. Keep the merge queue and required ch
 References: [Preparing your app for iPhone Duo](https://developer.apple.com/documentation/technologyoverviews/preparing-your-app-for-iphone-duo),
 [Device Hub interaction](https://developer.apple.com/documentation/xcode/interacting-with-your-app-in-device-hub),
 and [XCUIDevice.orientation](https://developer.apple.com/documentation/xcuiautomation/xcuidevice/orientation).
-
-Run every local build and test through the configured shared build queue.
