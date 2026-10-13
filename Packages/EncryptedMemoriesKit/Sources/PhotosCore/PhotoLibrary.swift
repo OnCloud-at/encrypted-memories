@@ -117,8 +117,8 @@ public extension PhotoFilter {
             )
         case .map:
             PhotoFilterEmptyStateCopy(
-                title: L10n.string("empty.no_photos_title"),
-                description: L10n.string("empty.no_photos_description"),
+                title: L10n.string("empty.filter_title \(L10n.string("map.cluster_title"))"),
+                description: L10n.string("empty.filter_description"),
                 systemImage: "map"
             )
         case .duplicates:

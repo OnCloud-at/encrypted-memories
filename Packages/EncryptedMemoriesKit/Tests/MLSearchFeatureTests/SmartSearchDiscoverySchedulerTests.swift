@@ -723,7 +723,7 @@ import TimelineCore
         #expect(store.save([item]).succeeded)
         #expect(store.updateDurations([item.uid: 42.75]).succeeded)
         #expect(store.save([item]).succeeded)
-        let restored = store.load()
+        let restored = try store.load()
         #expect(restored.first?.durationSeconds == 42.75)
         func fingerprint(_ items: [PhotoItem]) throws -> Data {
             try SmartSearchDiscoveryPersistence.fingerprint(

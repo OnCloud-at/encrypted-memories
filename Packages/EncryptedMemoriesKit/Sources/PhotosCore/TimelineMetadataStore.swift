@@ -193,6 +193,10 @@ public struct TimelineSaveResult: Sendable, Equatable {
 
 // MARK: - Store
 
+public enum TimelineMetadataReadError: Error {
+    case readFailed
+}
+
 /// App-owned SQLite timeline metadata store (schema v1). UI-free, SDK-free, platform-universal:
 /// raw SQLite C API over `Foundation` + Core value types only, with platform tuning injected via
 /// `LibraryDatabasePolicy`.
@@ -369,24 +373,43 @@ public final class TimelineMetadataStore {
     /// Ordered timeline load. The hot path is one indexed scan of `photos`; tags and burst
     /// membership are reconstructed from their feature tables with one full pass each (dictionary
     /// join in memory - no per-row queries, no blob decoding).
-    public func load() -> [PhotoItem] {
-        PhotoPerformanceSignposts.database.interval("db.load") {
-            loadInstrumented()
+    /// Throws when photos, tags, or series cannot prepare, finish, or decode every selected identity.
+    public func load() throws -> [PhotoItem] {
+        try PhotoPerformanceSignposts.database.interval("db.load") {
+            try loadInstrumented()
         }
     }
 
-    private func loadInstrumented() -> [PhotoItem] {
+    /// Pairs only a successfully read complete timeline inventory with its existing validation token.
+    /// A complete empty inventory without a token remains an absent cache.
+    public func cachedTimelineSnapshot() throws -> CachedTimelineSnapshot? {
+        let items = try load()
+        let token = validationToken()
+        guard !items.isEmpty || token != nil else { return nil }
+        let sections =
+            items.isEmpty
+            ? []
+            : [TimelineSection(id: "all", date: items.first?.captureTime ?? .distantPast, title: "", items: items)]
+        return CachedTimelineSnapshot(sections: sections, validationToken: token)
+    }
+
+    private func loadInstrumented() throws -> [PhotoItem] {
         let start = Date()
-        let tags = loadTags()
-        let bursts = loadBurstMembers()
+        let tags = try loadTags()
+        let bursts = try loadBurstMembers()
 
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, Self.timelineLoadSQL, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(db, Self.timelineLoadSQL, -1, &stmt, nil) == SQLITE_OK else {
+            throw TimelineMetadataReadError.readFailed
+        }
         defer { sqlite3_finalize(stmt) }
 
         var items: [PhotoItem] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1) else { continue }
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1) else {
+                throw TimelineMetadataReadError.readFailed
+            }
             let uid = PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC))
             let mime = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "image/jpeg"
             let relvid = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
@@ -402,7 +425,9 @@ public final class TimelineMetadataStore {
                     tags: tags[uid] ?? [],
                     burstMemberIDs: bursts[uid] ?? []
                 ))
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { throw TimelineMetadataReadError.readFailed }
         PhotoDiagnostics.shared.recordDBQuery(
             queryName: "timeline.load.orderedByTimelineIndex",
             durationMs: Date().timeIntervalSince(start) * 1000,
@@ -411,36 +436,47 @@ public final class TimelineMetadataStore {
         return items
     }
 
-    private func loadTags() -> [PhotoUID: Set<PhotoTag>] {
+    private func loadTags() throws -> [PhotoUID: Set<PhotoTag>] {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, "SELECT vol, node, tag FROM photo_tags;", -1, &stmt, nil) == SQLITE_OK else {
-            return [:]
+            throw TimelineMetadataReadError.readFailed
         }
         defer { sqlite3_finalize(stmt) }
         var result: [PhotoUID: Set<PhotoTag>] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1),
-                let tag = PhotoTag(rawValue: Int(sqlite3_column_int(stmt, 2)))
-            else { continue }
-            result[PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC)), default: []].insert(tag)
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1) else {
+                throw TimelineMetadataReadError.readFailed
+            }
+            if let tag = PhotoTag(rawValue: Int(sqlite3_column_int(stmt, 2))) {
+                result[PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC)), default: []].insert(
+                    tag)
+            }
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { throw TimelineMetadataReadError.readFailed }
         return result
     }
 
-    private func loadBurstMembers() -> [PhotoUID: [String]] {
+    private func loadBurstMembers() throws -> [PhotoUID: [String]] {
         var stmt: OpaquePointer?
         let sql =
             "SELECT anchor_vol, anchor_node, member_node FROM burst_members ORDER BY anchor_vol, anchor_node, seq;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [:] }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw TimelineMetadataReadError.readFailed
+        }
         defer { sqlite3_finalize(stmt) }
         var result: [PhotoUID: [String]] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
             guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1),
                 let memberC = sqlite3_column_text(stmt, 2)
-            else { continue }
+            else { throw TimelineMetadataReadError.readFailed }
             result[PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC)), default: []]
                 .append(String(cString: memberC))
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { throw TimelineMetadataReadError.readFailed }
         return result
     }
 
@@ -772,8 +808,14 @@ public final class TimelineMetadataStore {
     /// Keeps cached photo types usable for display after a failed read, without authorizing new MIME requests.
     public func mediaTypeEvidenceForDisplay(volumeID: String) -> (types: [String: String], canRefine: Bool) {
         if let evidence = mediaTypeEvidence(volumeID: volumeID) { return (evidence, true) }
-        let cached = load().lazy.filter { $0.uid.volumeID == volumeID }
-        return (Dictionary(uniqueKeysWithValues: cached.map { ($0.uid.nodeID, $0.mediaType) }), false)
+        do {
+            let cached = try load().lazy.filter { $0.uid.volumeID == volumeID }
+            return (Dictionary(uniqueKeysWithValues: cached.map { ($0.uid.nodeID, $0.mediaType) }), false)
+        } catch {
+            PhotoDiagnostics.shared.emitDebug(
+                "timeline.cacheReadFailed", ["fallback": "display", "canRefine": "false"])
+            return ([:], false)
+        }
     }
 
     /// Upload completion records MIME evidence before the new node can appear in a timeline row.

@@ -252,7 +252,7 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
         defer { timeline.close() }
         let items = [photo("a"), photo("b")]
         XCTAssertTrue(timeline.save(items).succeeded)
-        XCTAssertEqual(timeline.load(), items)
+        XCTAssertEqual(try timeline.load(), items)
     }
 
     func testV105AndBeta1DDLKeepEveryTimelineFieldWithTheNewCache() throws {
@@ -275,7 +275,7 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
             sqlite3_close(db)
             let cache = try XCTUnwrap(TimelineOrderMetadataStore(url: dir.appendingPathComponent("order.sqlite")))
             let timeline = try XCTUnwrap(TimelineMetadataStore(url: url))
-            let saved = timeline.load()
+            let saved = try timeline.load()
             XCTAssertEqual(saved.count, 1, release)
             XCTAssertEqual(saved[0].mediaType, "image/heic")
             XCTAssertEqual(saved[0].relatedVideoID, "motion")
@@ -289,7 +289,7 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
             timeline.close()
             cache.close()
             let reopened = try XCTUnwrap(TimelineMetadataStore(url: url))
-            XCTAssertEqual(reopened.load(), saved)
+            XCTAssertEqual(try reopened.load(), saved)
             XCTAssertEqual(reopened.validationToken(), "cursor")
             reopened.close()
         }

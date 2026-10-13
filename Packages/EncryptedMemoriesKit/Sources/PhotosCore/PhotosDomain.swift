@@ -175,8 +175,9 @@ public protocol PhotosRepository: Sendable {
     /// Last-known timeline persisted to disk, for instant startup (nil if none). `loadTimeline()`
     /// then refreshes in the background - stale-while-revalidate, so there's no spinner on relaunch.
     func cachedTimeline() async -> [TimelineSection]?
-    /// Reads the cached timeline and its paired validation revision as one snapshot. Implementations that
-    /// cannot provide an atomic pair should return a nil token so validation fails closed.
+    /// Reads the cached timeline and its paired validation revision as one snapshot. A failed or incomplete
+    /// photos, tags, or series read returns nil, so the caller uses the server load. Implementations that cannot provide an
+    /// atomic pair should return a nil token so validation fails closed.
     func cachedTimelineSnapshot() async -> CachedTimelineSnapshot?
     /// Opaque server revision captured atomically with the cached timeline. A caller may present the
     /// cached frame as authoritative only after this equals the provider's current change token.

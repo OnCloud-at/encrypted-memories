@@ -110,7 +110,7 @@ final class TimelineMIMEEvidenceReadTests: XCTestCase {
         try installReadFailure(failure, at: fixture.url)
         // Step an unaffected query on this connection so SQLite refreshes its cached schema.
         // Otherwise prepare can succeed with the old schema and fail only on the first step.
-        XCTAssertTrue(fixture.timeline.load().isEmpty)
+        XCTAssertTrue(try fixture.timeline.load().isEmpty)
         XCTAssertNil(fixture.timeline.mediaTypeEvidence(volumeID: "volume"), "an incomplete read must report failure")
         let reader = reader(fixture, useOrderCache: useOrderCache)
         try await reader.prepare(isCurrent: { true })

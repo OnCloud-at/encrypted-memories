@@ -8,6 +8,7 @@ import PhotoLibraryBackupAdapter
 import PhotosCore
 import ProtonAuth
 import ProtonDriveBackend
+import TimelineCore
 import UIKit
 import UploadCore
 
@@ -93,11 +94,15 @@ import UploadCore
         func install() {
             let albums = MobileFixtureAlbums()
             runtime.libraryModel.installIsolatedLibrary(
-                session: session, store: runtime.sessionModel.sessionStore, backend: backend, sections: sections,
+                session: session, store: runtime.sessionModel.sessionStore, backend: backend,
+                sections: MobileUITestLaunch.libraryLoadScenario == nil ? sections : [],
                 thumbnailFeed: feed,
                 albums: AlbumsRepository(
                     catalogBackend: albums, writeBackend: albums, capabilities: MobileFixtureAlbums.capabilities))
             runtime.libraryModel.settleIsolatedLibraryForTesting()
+            if let scenario = MobileUITestLaunch.libraryLoadScenario {
+                installLibraryLoadScenario(scenario)
+            }
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDeletedBackupFixture") {
                 installDeletedBackupFixture()
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesFailedBackupFixture") {
@@ -147,6 +152,68 @@ import UploadCore
                             "-EncryptedMemoriesDuplicatesInterruptedCheck") ? 2 : 0))
             }
             runtime.sessionModel.installIsolatedSession(session)
+        }
+
+        private func installLibraryLoadScenario(_ scenario: String) {
+            let model = runtime.libraryModel
+            switch scenario {
+            case "pending", "later", "offline":
+                model.applyIsolatedLibraryLoadEventsForTesting([])
+                if scenario == "offline" {
+                    LibraryRuntimeState.shared.update { $0.network = LibraryNetworkState(isReachable: false) }
+                } else if scenario == "later" {
+                    model.installIsolatedInitialLoadForTesting { [self] in
+                        do { try await Task.sleep(for: .seconds(20)) } catch { return }
+                        model.installIsolatedLibrary(
+                            session: session, store: runtime.sessionModel.sessionStore,
+                            backend: backend, sections: sections, thumbnailFeed: feed
+                        )
+                        model.settleIsolatedLibraryForTesting()
+                    }
+                }
+            case "failed", "cached-empty-failed":
+                let events: [LibraryLoadEvent] =
+                    scenario == "cached-empty-failed"
+                    ? [
+                        .inventoryResolved(count: 0, cached: true),
+                        .failed(message: "Fixture first load failed", retryable: true),
+                    ]
+                    : [.failed(message: "Fixture first load failed", retryable: true)]
+                model.applyIsolatedLibraryLoadEventsForTesting(events)
+            case "empty", "backup-on":
+                installEmptyBackupFixture(enabled: scenario == "backup-on")
+            case "unavailable":
+                break
+            default:
+                assertionFailure("Unknown library load fixture")
+            }
+        }
+
+        private func installEmptyBackupFixture(enabled: Bool) {
+            let directory = cacheDirectory.appendingPathComponent("empty-backup", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let suite = "empty-backup-fixture"
+                guard let defaults = UserDefaults(suiteName: suite),
+                    let journal = EditReplacementJournalFileStore.shared(accountDataDirectory: directory)
+                else { throw MobileFixtureError.bitmap }
+                defaults.removePersistentDomain(forName: suite)
+                let controller = PhotoLibraryBackupController(
+                    configuration: .init(
+                        accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                    identityResolver: MobileFixtureBackupBackend(), uploader: MobileFixtureBackupBackend(),
+                    replacementJournal: journal
+                )
+                if enabled {
+                    guard controller.installFailedItemsFixtureForTesting(kinds: []) else {
+                        throw MobileFixtureError.bitmap
+                    }
+                }
+                backupFixture = controller
+                runtime.libraryModel.installIsolatedBackupForTesting(controller)
+            } catch {
+                assertionFailure("The empty backup fixture could not be installed")
+            }
         }
 
         static let albumSyncFixtureAlbumID = "fixture-album-sync"

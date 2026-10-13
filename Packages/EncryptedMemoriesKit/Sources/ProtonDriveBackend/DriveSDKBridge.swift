@@ -673,7 +673,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func cachedTimelineSnapshot() -> CachedTimelineSnapshot? {
         guard !isShutDown else { return nil }
         guard let store = timelineStore else { return nil }
-        let rawItems = store.load()
+        let cached: CachedTimelineSnapshot
+        do {
+            guard let snapshot = try store.cachedTimelineSnapshot() else { return nil }
+            cached = snapshot
+        } catch {
+            DebugLog.log("timeline: cached timeline inventory read failed; loading from server")
+            return nil
+        }
+        let rawItems = cached.sections.flatMap(\.items)
         if let evidence = store.mediaTypeEvidence(volumeID: rawItems.first?.uid.volumeID ?? "") {
             scheduleMediaTypeReconciliation(items: rawItems, alreadyClassifiedNodeIDs: Set(evidence.keys))
         } else {
@@ -681,8 +689,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 "timeline: MIME evidence unavailable; cached photos remain visible without a new metadata pass")
         }
         let items = timelineOrderStore?.enrich(rawItems) ?? rawItems
-        let validationToken = store.validationToken()
-        guard !items.isEmpty || validationToken != nil else { return nil }
+        let validationToken = cached.validationToken
         librarySupport.lastSuccessfulLoad = .init(timestamp: Date(), sourcePath: .cache)
         recordSupportEvent(.libraryLoadSucceeded, sourcePath: .cache, count: items.count)
         DebugLog.log("timeline: served \(items.count) items from SQLite cache ✓")

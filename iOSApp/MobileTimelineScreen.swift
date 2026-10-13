@@ -74,6 +74,7 @@ struct MobileTimelineScreen: View {
     @State private var refinementTopPlacementPending = false
     @State private var searchSessionActive = false
     @State private var contextMenu = MobileGridContextMenuController()
+    @State private var showEmptyLibraryBackupSettings = false
     @State private var showAlbumPicker = false
     /// The native toolbar keeps its slots mounted from frame one, but its content appears only after the
     /// launch cover has finished dissolving. This prevents both chrome-over-cover and title relocation.
@@ -516,8 +517,8 @@ struct MobileTimelineScreen: View {
                     && (model.loadState.isLoading || model.loadState.failure != nil)
                 {
                     OfflineContentUnavailableView()
-                } else if model.loadState.isEmpty && !model.showsPendingPhotos {
-                    MobileEmptyLibraryView()
+                } else if model.isCompletelyEmpty && !model.showsPendingPhotos {
+                    LibraryEmptyView(backupAction: emptyLibraryBackupAction)
                 } else if let failure = model.loadState.failure {
                     MobileLibraryErrorView(message: failure.message, retryable: failure.retryable) {
                         Task { await model.retry() }
@@ -542,6 +543,30 @@ struct MobileTimelineScreen: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+            }
+            .sheet(isPresented: $showEmptyLibraryBackupSettings) {
+                if let backup = model.photoBackup {
+                    NavigationStack {
+                        MobileBackupScreen(
+                            controller: backup, uploadCoordinator: model.facade?.uploadCoordinator
+                        )
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button(L10n.string("action.done")) {
+                                    showEmptyLibraryBackupSettings = false
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var emptyLibraryBackupAction: LibraryEmptyBackupAction? {
+        model.photoBackup.map { backup in
+            LibraryEmptyBackupAction(isAvailable: backup.isAvailable, isEnabled: backup.isEnabled) {
+                showEmptyLibraryBackupSettings = true
             }
         }
     }

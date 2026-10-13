@@ -26,6 +26,7 @@ struct MainView: View {
     @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
         AppSettingsDefault.mapAndPlacesEnabled
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.openSettings) private var openSettings
     @Environment(\.undoManager) private var undoManager
 
     let model: AppModel
@@ -679,6 +680,7 @@ struct MainView: View {
                     isOffline: !networkMonitor.isOnline,
                     dragOutProvider: media,
                     onDragOutFailed: { dragOutFailureMessage = $0.localizedMessage },
+                    emptyLibraryBackupAction: emptyLibraryBackupAction,
                     onSelectionChange: { selectedUIDs = $0 },
                     onOpen: { item, items in
                         openPhoto(item, items, proxy: nil, followsReplacements: showsUnfilteredLibrary)
@@ -1116,6 +1118,15 @@ struct MainView: View {
     private var displayedFavorites: Set<PhotoUID> {
         _ = model.pendingFavoriteRevision
         return model.pendingGrid?.displayedFavorites(favorites) ?? favorites
+    }
+
+    private var emptyLibraryBackupAction: LibraryEmptyBackupAction? {
+        model.backupController.map { backup in
+            LibraryEmptyBackupAction(isAvailable: backup.isAvailable, isEnabled: !backup.folders.isEmpty) {
+                model.selectedSettingsTab = .backup
+                openSettings()
+            }
+        }
     }
 
     /// Pending files of the watched backup folders.

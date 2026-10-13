@@ -42,6 +42,9 @@ final class AppModel {
         case failed(String)
     }
 
+    /// Native Settings navigation; no persisted preference or account behavior.
+    var selectedSettingsTab: MacSettingsTabs.Tab.ID = .account
+
     private(set) var auth: AuthState = .checking
     private(set) var backend: BackendState = .idle
     /// High-level client composition (uploads + albums), built alongside the backend.
