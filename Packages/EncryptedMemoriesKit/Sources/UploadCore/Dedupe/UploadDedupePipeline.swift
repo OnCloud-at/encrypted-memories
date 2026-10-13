@@ -314,8 +314,16 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // and an active copy under another name can prove the photo live.
         var decision = nameDecision
         var provesLive = nameCandidates.provesLive
+        let blockedByDraft: Bool
+        if case .skip(.draftExists, _) = nameDecision {
+            blockedByDraft = true
+        } else {
+            blockedByDraft = false
+        }
         do {
-            if nameDecision.uploadsBytes {
+            // A name draft can hide an active copy under another name. Only active content may
+            // settle that block; a miss or an inactive copy leaves the draft protected.
+            if nameDecision.uploadsBytes || blockedByDraft {
                 let limit = isRoot && replacement.isEmpty ? Self.rootMatchBound : 1
                 let found = try await checker.findDuplicates(contentHash: contentHash, limit: limit)
                 for start in stride(from: 0, to: found.count, by: Self.rootMatchBatchSize) {
@@ -323,7 +331,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     let contentCandidates = try await candidates(
                         batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
                     provesLive = provesLive || contentCandidates.provesLive
-                    if let remoteContent = contentCandidates.items.first {
+                    if let remoteContent = contentCandidates.items.first(where: {
+                        !blockedByDraft || $0.linkState == .active
+                    }) {
                         decision = decisionForRemoteContent(
                             remoteContent,
                             replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)

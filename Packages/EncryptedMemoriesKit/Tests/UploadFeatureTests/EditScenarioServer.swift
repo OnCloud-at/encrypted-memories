@@ -9,6 +9,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 {
     enum State: String, Sendable {
         case active
+        case draft
         case trashed
         case deleted
     }
@@ -38,13 +39,14 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         var tags: Set<Int> = []
         /// The server time of the move to the trash, in seconds, where a person or a merge trashed the link.
         var trashTime: Int64?
+        var clientUID: String?
 
         var uid: PhotoUID { PhotoUID(volumeID: "vol", nodeID: linkID) }
         var duplicate: RemotePhotoDuplicate {
             RemotePhotoDuplicate(
                 nameHash: nameHash, contentHash: contentHash,
-                linkState: state == .active ? .active : state == .trashed ? .trashed : nil,
-                linkID: linkID)
+                linkState: state == .active ? .active : state == .draft ? .draft : state == .trashed ? .trashed : nil,
+                linkID: linkID, clientUID: clientUID)
         }
     }
 
@@ -62,6 +64,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var deletedAssets: [String: Set<String>] = [:]
     private var history: [Step] = []
     private var nextID = 1
+    private var uploadRequests = 0
+    private var contentLookupError: Error?
+    private var includeInactiveContent = false
     private var failTrash = false
     enum LineageRead: Sendable, Equatable { case identity, successors, ancestry, external }
     private var incompleteLineageRead: LineageRead?
@@ -87,6 +92,10 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private let ownAlbumIDs: Set<String> = ["own-album"]
 
     var links: [Link] { lock.withLock { orderedLinks() } }
+    var uploadRequestCount: Int { lock.withLock { uploadRequests } }
+
+    func setContentLookupError(_ error: Error?) { lock.withLock { contentLookupError = error } }
+    func returnInactiveContentFromStaleIndex() { lock.withLock { includeInactiveContent = true } }
     var personDeletedAssets: [String: Set<String>] { lock.withLock { deletedAssets } }
     var steps: [Step] { lock.withLock { history } }
     var remoteProofLookups: [[UploadBackupExternalIdentity]] { lock.withLock { proofLookups } }
@@ -366,6 +375,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         _ request: PhotoUploadRequest,
         onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
+        lock.withLock { uploadRequests += 1 }
         let digest = try UploadContentSHA1.digest(ofFileAt: request.fileURL)
         guard request.expectedSHA1 == digest else {
             throw UploadError.backend("The scenario upload bytes do not match the pipeline identity")
@@ -454,9 +464,12 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
-        lock.withLock {
-            // The content index proves only active content. Name lookup still includes trash.
-            orderedLinks().first { $0.state == .active && $0.contentHash == contentHash }?.duplicate
+        try lock.withLock {
+            if let contentLookupError { throw contentLookupError }
+            // Normal content lookup proves active content; fault tests can return stale rows.
+            return orderedLinks().first {
+                ($0.state == .active || includeInactiveContent) && $0.contentHash == contentHash
+            }?.duplicate
         }
     }
 
@@ -706,6 +719,18 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         lock.withLock {
             let uid = insertLink(digest: digest, main: main, captureTime: captureTime)
             record("other device upload \(uid.nodeID)")
+            return uid
+        }
+    }
+
+    func seedDraft(name: String, digest: Data, clientUID: String?) -> PhotoUID {
+        lock.withLock {
+            let uid = insertLink(digest: digest, main: nil, captureTime: .distantPast)
+            table[uid.nodeID] = Link(
+                linkID: uid.nodeID, nameHash: "nh(\(name))", contentHash: Self.contentHash(digest), state: .draft,
+                mainLinkID: nil, captureTime: .distantPast, assetID: "draft", generation: 0, isOriginal: false,
+                clientUID: clientUID)
+            record("foreign draft \(uid.nodeID)")
             return uid
         }
     }
