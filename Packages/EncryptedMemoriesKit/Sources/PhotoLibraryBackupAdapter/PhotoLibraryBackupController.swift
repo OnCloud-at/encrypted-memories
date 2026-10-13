@@ -1736,7 +1736,7 @@ public final class PhotoLibraryBackupController {
         }
         // Wi-Fi or Ethernet returned, or the setting was turned on, while this pass still ran (for example during
         // its scan). Start the next pass now instead of keeping "Waiting for Wi-Fi" until the fallback.
-        let wiFiWaitEnded = waitedForWiFi && runtimeSignals.current().canEndWiFiWait
+        let wiFiWaitEnded = (waitedForWiFi || manualWiFiRetryPending) && runtimeSignals.current().canEndWiFiWait
         if shouldRestart {
             syncNow()
         } else if wiFiWaitEnded, startSync(owner: .foreground) != nil {

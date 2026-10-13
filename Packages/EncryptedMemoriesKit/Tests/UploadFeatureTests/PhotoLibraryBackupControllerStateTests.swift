@@ -1497,7 +1497,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             try await assertManualRetrySurvivesOffline(retryWhileOffline: true)
         }
 
-        private func assertManualRetrySurvivesOffline(retryWhileOffline: Bool) async throws {
+        func testManualRetrySurvivesWiFiReturningDuringTheRepeatedOfflineScan() async throws {
+            try await assertManualRetrySurvivesOffline(retryWhileOffline: true, wiFiReturnsDuringScan: true)
+        }
+
+        private func assertManualRetrySurvivesOffline(
+            retryWhileOffline: Bool, wiFiReturnsDuringScan: Bool = false
+        ) async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
             let fixture = try makeWiFiWaitFixture(prefix: "backup-manual-offline-wifi", source: signals.source)
             defer { fixture.cleanup() }
@@ -1505,35 +1511,103 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             try holdAutomaticPasses(in: fixture)
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            let releaseOfflineScan = LockedFlag(!wiFiReturnsDuringScan)
             controller.replaceScanForTesting {
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
-                _ = scans.increment()
+                if scans.increment() == 2 {
+                    while !releaseOfflineScan.value, !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(10))
+                    }
+                }
             }
             await controller.retryUserResolvableWork()
             let waiting = await waitUntil { scans.count == 1 && !controller.isSyncing }
             XCTAssertTrue(waiting)
             XCTAssertEqual(controller.status.phase, .waitingForWiFi)
 
+            try await assertNoAutomaticResume(controller, "The initial Wi-Fi pass has settled")
             signals.setNetworkAvailable(false)
+            signals.resetReads()
             signals.announceChange()
+            let offlineObserved = await waitUntil { signals.hasBeenRead }
+            XCTAssertTrue(offlineObserved, "The observer consumes the offline snapshot before another retry")
             if retryWhileOffline {
                 await controller.retryUserResolvableWork()
             } else {
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
             }
-            let offlinePassEnded = await waitUntil { !controller.isSyncing }
-            XCTAssertTrue(offlinePassEnded)
+            signals.resetReads()
+            let offlinePassReady = await waitUntil {
+                if wiFiReturnsDuringScan { return scans.count == 2 && signals.hasBeenRead }
+                return !controller.isSyncing
+            }
+            XCTAssertTrue(offlinePassReady, "The repeated pass must read the offline policy before Wi-Fi returns")
             let offlinePassCount = retryWhileOffline ? 2 : 1
             XCTAssertEqual(
                 scans.count, offlinePassCount, "An offline snapshot must not consume the pending manual retry")
 
             signals.setNetworkAvailable(true)
             signals.setWaitsForWiFi(false)
+            signals.resetReads()
             signals.announceChange()
+            if wiFiReturnsDuringScan {
+                let wakeObserved = await waitUntil { signals.hasBeenRead }
+                XCTAssertTrue(wakeObserved, "The Wi-Fi wake arrives while the offline scan still owns the pass")
+                XCTAssertTrue(controller.isSyncing)
+            }
+            releaseOfflineScan.value = true
 
             let resumed = await waitUntil { scans.count > offlinePassCount && !controller.isSyncing }
             XCTAssertTrue(resumed, "The retry survives the offline path and resumes without the index backoff")
             XCTAssertEqual(owners.values, Array(repeating: .manual, count: offlinePassCount + 1))
+            await controller.shutdown()
+        }
+
+        func testAWiFiWaitNeverInheritsManualIntentFromAnotherRunsLock() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-foreign-manual-lock", source: signals.source)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let scans = PassCounter()
+            let releaseScan = LockedFlag(false)
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                while !releaseScan.value, !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+            }
+            controller.syncNow()
+            signals.resetReads()
+            let paused = await waitUntil { scans.count == 1 && signals.hasBeenRead }
+            XCTAssertTrue(paused)
+            // Let the policy result settle while the scan still owns the foreground pass.
+            try await Task.sleep(for: .milliseconds(300))
+            try holdAutomaticPasses(in: fixture)
+            let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
+            let runID = try XCTUnwrap(controller.activeExecutionRunID)
+            XCTAssertTrue(lock.release(runID: runID))
+            XCTAssertTrue(lock.acquire(owner: .manual, runID: "another-manual-run").didAcquire)
+            releaseScan.value = true
+            let ended = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(ended)
+            try await assertNoAutomaticResume(controller, "The foreground pass has settled on the expensive path")
+            XCTAssertTrue(lock.release(runID: "another-manual-run"))
+
+            signals.setWaitsForWiFi(false)
+            signals.announceChange()
+
+            let scheduled = await waitUntil { controller.isAutoResumeScheduledForTesting }
+            XCTAssertTrue(scheduled, "An automatic pass still honors its own remote-index backoff")
+            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
+            XCTAssertEqual(scans.count, 1, "Another run's manual lock cannot grant this controller a manual retry")
             await controller.shutdown()
         }
 
