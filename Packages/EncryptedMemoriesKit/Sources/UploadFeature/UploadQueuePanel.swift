@@ -112,6 +112,8 @@ public struct UploadQueuePanel: View {
                     .lineLimit(1).truncationMode(.middle)
                 statusLine(item)
             }
+            // The name column takes the free width before the spacer, so the upload bar spans the row.
+            .layoutPriority(1)
             Spacer()
             actions(for: item)
         }

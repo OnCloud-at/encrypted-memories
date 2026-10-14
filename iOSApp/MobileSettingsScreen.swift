@@ -110,7 +110,9 @@ struct MobileSettingsScreen: View {
                                 .monospacedDigit()
                                 .foregroundStyle(ProtonColor.textWeak)
                         }
-                        ActivityProgressBar(fraction: Double(min(used, max)) / Double(max))
+                        ActivityProgressBar(
+                            fraction: Double(min(used, max)) / Double(max),
+                            accessibilityLabel: String(localized: "settings.storage"))
                     }
                 }
             }

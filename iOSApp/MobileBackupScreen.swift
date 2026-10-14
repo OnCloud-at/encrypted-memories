@@ -92,7 +92,7 @@ private struct MobileManualUploadCheckSection: View {
                         }
                         if total > 0 {
                             if let fraction = status.fractionCompleted {
-                                ActivityProgressBar(fraction: fraction)
+                                ActivityProgressBar(fraction: fraction, accessibilityLabel: status.localizedTitle)
                             } else {
                                 ProgressView()
                                     .tint(ProtonColor.primary)

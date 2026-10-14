@@ -43,6 +43,8 @@ public struct ActivityProgressRow: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                    // Without a title the bar reads this line as its label; VoiceOver reads it once, on the bar.
+                    .accessibilityHidden(Self.barReadsDetail(title: title, fraction: fraction))
             }
             if let fraction {
                 ActivityProgressBar(fraction: fraction, accessibilityLabel: Self.accessibilityLabel(title, detail))
@@ -54,6 +56,11 @@ public struct ActivityProgressRow: View {
     /// itself reports the fraction as its value.
     nonisolated static func accessibilityLabel(_ title: String?, _ detail: String?) -> String? {
         title ?? detail
+    }
+
+    /// The bar takes the count line as its label when the row has no title, so the line itself stays silent.
+    nonisolated static func barReadsDetail(title: String?, fraction: Double?) -> Bool {
+        title == nil && fraction != nil
     }
 }
 

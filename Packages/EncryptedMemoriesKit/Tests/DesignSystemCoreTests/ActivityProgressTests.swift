@@ -17,6 +17,12 @@ import Testing
         #expect(ActivityProgressRow.accessibilityLabel(nil, nil) == nil)
     }
 
+    @Test func voiceOverReadsTheCountLineOnceOnTheBarOfAnUntitledRow() {
+        #expect(ActivityProgressRow.barReadsDetail(title: nil, fraction: 0.5))
+        #expect(!ActivityProgressRow.barReadsDetail(title: "Checking", fraction: 0.5))
+        #expect(!ActivityProgressRow.barReadsDetail(title: nil, fraction: nil))
+    }
+
     @Test func stateLineUsesSeventyPercentOfTheReadableWidth() {
         // A wide window offers more than the readable width; the line stays at 70 % of it.
         #expect(ActivityProgressStateLayout.availableWidth(for: 1_200) == 320)

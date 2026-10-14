@@ -4682,13 +4682,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Location data couldn't be loaded."
+            "value": "Location data couldn't be loaded. Please try again later."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die Standortdaten konnten nicht geladen werden."
+            "value": "Die Standortdaten konnten nicht geladen werden. Bitte später erneut versuchen."
           }
         }
       }
