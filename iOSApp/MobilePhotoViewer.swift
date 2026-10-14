@@ -666,20 +666,24 @@ struct MobilePhotoViewer: View {
         let uid = item.uid
         titleMetadataState = titleMetadataCoordinator.state(for: uid)
         metadataLoadState = .loading
-        isLoadingAlbumMemberships = libraryModel.facade?.albums != nil
-        async let memberships = resolvedAlbumTitles(for: uid)
-        async let titleResolution = titleMetadataCoordinator.resolve(item)
-        let membershipResult = await memberships
-        let resolution = await titleResolution
-        guard !Task.isCancelled, currentBaseItem?.uid == uid else { return }
-        applyAlbumMembershipResult(membershipResult)
-        titleMetadataState = .resolved(resolution)
-        metadataLoadState = resolution.metadataLoadState
-        guard let metadata = resolution.metadata else { return }
-        let resolvedKind = VideoContentSniffer.kind(mimeType: metadata.mimeType)
-        if resolvedKind != .unknown {
-            resolvedMediaKinds[uid] = resolvedKind
-        }
+        let albums = libraryModel.facade?.albums
+        isLoadingAlbumMemberships = albums != nil
+        let coordinator = titleMetadataCoordinator
+        await ViewerInfoPublication.run(
+            metadata: { await coordinator.resolve(item) },
+            memberships: { await Self.albumTitles(of: uid, in: albums) },
+            isCurrent: { currentBaseItem?.uid == uid },
+            publishMetadata: { resolution in
+                titleMetadataState = .resolved(resolution)
+                metadataLoadState = resolution.metadataLoadState
+                guard let metadata = resolution.metadata else { return }
+                let resolvedKind = VideoContentSniffer.kind(mimeType: metadata.mimeType)
+                if resolvedKind != .unknown {
+                    resolvedMediaKinds[uid] = resolvedKind
+                }
+            },
+            publishMemberships: { applyAlbumMembershipResult($0) }
+        )
     }
 
     private func retryCurrentMetadata() {
@@ -688,8 +692,10 @@ struct MobilePhotoViewer: View {
         metadataRequestGeneration &+= 1
     }
 
-    private func resolvedAlbumTitles(for uid: PhotoUID) async -> Result<[String], Error>? {
-        guard let repository = libraryModel.facade?.albums else { return nil }
+    private static func albumTitles(
+        of uid: PhotoUID, in repository: AlbumsRepository?
+    ) async -> Result<[String], Error>? {
+        guard let repository else { return nil }
         do {
             return .success(try await repository.albumMembershipTitles(for: uid))
         } catch {
