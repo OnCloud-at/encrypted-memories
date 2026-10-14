@@ -119,7 +119,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesReloadFailure"])
         XCTAssertTrue(group(1).waitForExistence(timeout: 10))
         app.buttons["duplicates.merge.0"].tap()
-        let retry = app.buttons["Retry"].firstMatch
+        let retry = app.buttons["Try again"].firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
         XCTAssertFalse(group(0).exists, "invalidated rows stay hidden")
@@ -137,7 +137,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesCheckingFixture",
             extra: ["-EncryptedMemoriesDuplicatesInterruptedCheck"])
-        let retry = app.buttons["Retry"].firstMatch
+        let retry = app.buttons["Try again"].firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 10), "two interruptions must end waiting")
         XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
         XCTAssertFalse(app.staticTexts["Duplicates appear here when it is done."].exists)
@@ -439,7 +439,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(0).waitForExistence(timeout: 15), "the cancellation-sensitive scan finishes")
         XCTAssertFalse(group(1).exists, "the successful refresh publishes its new result")
         XCTAssertFalse(app.staticTexts["The duplicates could not be loaded."].exists)
-        XCTAssertFalse(app.buttons["Retry"].exists)
+        XCTAssertFalse(app.buttons["Try again"].exists)
         XCTAssertFalse(progress.exists)
         keepScreenshot("duplicates-ios-slow-refresh-complete")
     }

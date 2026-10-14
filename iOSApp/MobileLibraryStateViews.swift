@@ -63,9 +63,7 @@ struct MobileSignOutFailureView: View {
             } description: {
                 Text(L10n.string("sign_out.cleanup_failed_message"))
             } actions: {
-                Button(L10n.string("sign_out.try_again"), action: onRetry)
-                    .buttonStyle(.borderedProminent)
-                    .tint(ProtonColor.primary)
+                RetryButton(.prominent, action: onRetry)
             }
             .padding()
         }
@@ -134,9 +132,7 @@ struct MobileLibraryErrorView: View {
             Text(message)
         } actions: {
             if retryable {
-                Button(String(localized: "action.try_again"), action: onRetry)
-                    .buttonStyle(.borderedProminent)
-                    .tint(ProtonColor.primary)
+                RetryButton(.prominent, action: onRetry)
             }
         }
     }

@@ -150,8 +150,7 @@ struct MobileCollectionsScreen: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("albums.load_failed").foregroundStyle(ProtonColor.textNorm)
                     Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    Button(String(localized: "action.try_again")) { Task { await loadAlbums() } }
-                        .font(.caption)
+                    RetryButton(.compact) { Task { await loadAlbums() } }
                 }
             } else if coordinator.albums.isEmpty {
                 Text("collections.empty_albums").foregroundStyle(ProtonColor.textWeak)
@@ -179,10 +178,7 @@ struct MobileCollectionsScreen: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(L10n.string("albums.shared_load_failed"))
                     Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    Button(L10n.string("action.retry")) {
-                        Task { await coordinator.refreshSharedAlbums() }
-                    }
-                    .font(.caption)
+                    RetryButton(.compact) { Task { await coordinator.refreshSharedAlbums() } }
                 }
             } else if coordinator.sharedAlbums.isEmpty {
                 Text(L10n.string("collections.empty_shared_albums"))
@@ -420,10 +416,7 @@ private struct MobileFilterGridScreen: View {
             } description: {
                 Text(message)
             } actions: {
-                Button(L10n.string("action.retry")) {
-                    Task { await load() }
-                }
-                .buttonStyle(.glassProminent)
+                RetryButton(.prominent) { Task { await load() } }
             }
         case .loaded:
             if isRouteEmpty {

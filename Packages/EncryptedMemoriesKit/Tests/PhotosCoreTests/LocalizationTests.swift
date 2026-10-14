@@ -98,6 +98,18 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), "Vorschaubild nicht verfügbar")
     }
 
+    func testEveryRetryActionHasOneTryAgainTitle() throws {
+        XCTAssertEqual(try localizedValue("action.retry", language: "en", in: packageCatalog), "Try again")
+        XCTAssertEqual(try localizedValue("action.retry", language: "de", in: packageCatalog), "Erneut versuchen")
+        let retiredKeys = ["action.try_again", "sign_out.try_again", "albums.try_again", "backup.failed_sheet_retry"]
+        for catalog in [packageCatalog, appCatalog, mobileCatalog] {
+            let keys = try loadCatalog(catalog).coverage.keys
+            for key in retiredKeys {
+                XCTAssertFalse(keys.contains(key), "\(key) duplicates action.retry in \(catalog.lastPathComponent)")
+            }
+        }
+    }
+
     func testWiFiWaitExplainsThatCellularBackupIsOffInEnglishAndGerman() throws {
         let texts = [
             ("backup.phase_waiting_wifi", "Waiting for Wi-Fi", "Wartet auf WLAN"),

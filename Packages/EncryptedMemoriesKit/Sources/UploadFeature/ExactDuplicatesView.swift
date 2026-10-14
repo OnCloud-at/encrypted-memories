@@ -80,7 +80,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
             ContentUnavailableView {
                 Label(message, systemImage: "exclamationmark.icloud")
             } actions: {
-                retryButton
+                RetryButton(.prominent) { Task { await model.load() } }
             }
             .frame(maxWidth: Self.readableWidth)
         case .noDuplicates:
@@ -128,15 +128,6 @@ public struct ExactDuplicatesView<Cover: View>: View {
         ExactDuplicatesWaitingProgressLayout {
             ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent, alignment: .center)
         }
-    }
-
-    @ViewBuilder private var retryButton: some View {
-        let retry = Button(L10n.string("action.retry")) { Task { await model.load() } }
-        #if os(iOS)
-            retry.buttonStyle(.glassProminent)
-        #else
-            retry
-        #endif
     }
 }
 
@@ -448,7 +439,7 @@ private struct ExactDuplicatesStatusRows: View {
             Label(note, systemImage: "exclamationmark.icloud")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Button(L10n.string("action.retry")) { Task { await model.load() } }
+            RetryButton(.compact) { Task { await model.load() } }
         }
     }
 }

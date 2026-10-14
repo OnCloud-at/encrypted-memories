@@ -118,7 +118,7 @@ struct InfoPanelView: View {
                 } description: {
                     Text(L10n.string("infopanel.load_failed_message"))
                 } actions: {
-                    Button(L10n.string("action.retry"), action: onRetry)
+                    RetryButton(.prominent, action: onRetry)
                 }
             }
         }

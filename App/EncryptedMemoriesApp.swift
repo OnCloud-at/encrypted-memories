@@ -537,9 +537,7 @@ private struct SignOutFailureView: View {
             } description: {
                 Text(L10n.string("sign_out.cleanup_failed_message"))
             } actions: {
-                Button(L10n.string("sign_out.try_again"), action: retry)
-                    .buttonStyle(.borderedProminent)
-                    .tint(ProtonColor.primary)
+                RetryButton(.prominent, action: retry)
             }
             .padding()
         }
@@ -567,7 +565,7 @@ private struct BackendErrorView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
             HStack(spacing: 10) {
-                Button(L10n.string("action.retry"), action: retry).buttonStyle(.glassProminent).frame(width: 120)
+                RetryButton(.prominent, action: retry).frame(width: 120)
                 Button(L10n.string("action.sign_out")) { confirmSignOut = true }
                     .buttonStyle(.plain)
                     .foregroundStyle(ProtonColor.textHint)

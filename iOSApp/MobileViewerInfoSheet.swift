@@ -1,3 +1,4 @@
+import DesignSystemCore
 import Foundation
 import MapKit
 import PhotoViewerCore
@@ -111,8 +112,7 @@ struct MobileViewerInfoSheet: View {
             } description: {
                 Text(L10n.string("infopanel.load_failed_message"))
             } actions: {
-                Button(L10n.string("action.retry"), action: onRetry)
-                    .buttonStyle(.borderedProminent)
+                RetryButton(.prominent, action: onRetry)
             }
             .frame(maxWidth: .infinity)
         }

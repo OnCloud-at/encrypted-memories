@@ -833,7 +833,7 @@ private struct MacFailedBackupSheet: View {
                 .font(.headline)
                 Spacer()
                 if let controller, items.offersUserRetry {
-                    Button(L10n.string("backup.failed_sheet_retry")) {
+                    RetryButton(.system) {
                         Task {
                             await controller.retryUserResolvableWork()
                             dismiss()

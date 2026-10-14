@@ -199,23 +199,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Für %lld Objekt(e) ist nicht genug freier Speicher da; sie werden ausgelassen." } }
       }
     },
-    "action.try_again": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Erneut versuchen"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Try again"
-          }
-        }
-      }
-    },
     "albums.detail_empty": {
       "extractionState": "manual",
       "localizations": {

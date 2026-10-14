@@ -567,7 +567,7 @@ struct MobileFailedBackupSheet: View {
                 .mobileVisibilityPriority(.high)
                 if let controller, items.offersUserRetry {
                     ToolbarItem(placement: .confirmationAction) {
-                        Button(L10n.string("backup.failed_sheet_retry")) {
+                        RetryButton(.system) {
                             Task {
                                 await controller.retryUserResolvableWork()
                                 dismiss()
