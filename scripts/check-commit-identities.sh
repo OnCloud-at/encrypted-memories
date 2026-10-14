@@ -8,6 +8,7 @@ set -euo pipefail
 #   <id>+<login>@users.noreply.github.com and <login>@users.noreply.github.com
 # of COMMIT_IDENTITY_LOGIN and COMMIT_IDENTITY_ID, plus noreply@github.com for
 # the committer (GitHub's web-flow account). Everything else fails.
+# The author name and the committer name must not name a tool either.
 # Every attribution trailer (any key ending in -by, for example Co-authored-by,
 # Signed-off-by, Reviewed-by, Tested-by, Generated-by) must carry only the
 # author's address and no tool name. A folded trailer counts with its
@@ -122,6 +123,14 @@ while IFS= read -r commit; do
   fi
   if ! is_committer_address "$committer"; then
     fail "$commit" "committer email is not the pull request author's GitHub noreply address"
+  fi
+  author_name="$(lower "$(git log -1 --format=%an "$commit")")"
+  committer_name="$(lower "$(git log -1 --format=%cn "$commit")")"
+  if [[ "$author_name" =~ $tool_name ]]; then
+    fail "$commit" "author name credits a tool"
+  fi
+  if [[ "$committer_name" =~ $tool_name ]]; then
+    fail "$commit" "committer name credits a tool"
   fi
   pending=""
   while IFS= read -r line; do

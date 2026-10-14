@@ -159,6 +159,42 @@ fresh_branch longer-word-name
 commit "$alice" "$alice" $'Longer word\n\nSigned-off-by: Devinder Singh <42+alice@users.noreply.github.com>'
 expect pass "a name with a tool name inside a longer word passes" alice "$alice_id"
 
+fresh_branch two-trailers-foreign-first
+commit "$alice" "$alice" $'Two trailers\n\nCo-authored-by: Mallory <7+mallory@users.noreply.github.com>\nSigned-off-by: Alice <42+alice@users.noreply.github.com>'
+expect fail "a foreign trailer followed by the author's own trailer fails" alice "$alice_id"
+
+fresh_branch two-trailers-foreign-second
+commit "$alice" "$alice" $'Two trailers\n\nCo-authored-by: Alice <42+alice@users.noreply.github.com>\nSigned-off-by: Mallory <7+mallory@users.noreply.github.com>'
+expect fail "the author's own trailer followed by a foreign trailer fails" alice "$alice_id"
+
+fresh_branch two-trailers-own
+commit "$alice" "$alice" $'Two trailers\n\nCo-authored-by: Alice <42+alice@users.noreply.github.com>\nSigned-off-by: Alice <42+alice@users.noreply.github.com>'
+expect pass "two trailers of the author pass" alice "$alice_id"
+
+fresh_branch tool-author-name
+GIT_AUTHOR_NAME=Claude commit "$alice" "$alice" "Author name is a tool"
+expect fail "a tool as author name with the author's address fails" alice "$alice_id"
+case "$last_output" in
+  *"author name"*) ;;
+  *) echo "FAIL: output does not name the author name field" >&2; failures=$((failures + 1)) ;;
+esac
+
+fresh_branch tool-committer-name
+GIT_COMMITTER_NAME="Codex CLI" commit "$alice" "$alice" "Committer name is a tool"
+expect fail "a tool as committer name with the author's address fails" alice "$alice_id"
+case "$last_output" in
+  *"committer name"*) ;;
+  *) echo "FAIL: output does not name the committer name field" >&2; failures=$((failures + 1)) ;;
+esac
+
+fresh_branch longer-word-author-name
+GIT_AUTHOR_NAME="Devinder Singh" commit "$alice" "$alice" "Name with a tool name inside a longer word"
+expect pass "an author name with a tool name inside a longer word passes" alice "$alice_id"
+
+fresh_branch github-committer-name
+GIT_COMMITTER_NAME=GitHub commit "$alice" "noreply@github.com" "Web-flow committer name"
+expect pass "the committer name GitHub passes" alice "$alice_id"
+
 fresh_branch assisted-by
 commit "$alice" "$alice" $'Assisted\n\nAssisted-by: Claude <noreply@anthropic.com>'
 expect fail "Assisted-by naming a tool fails" alice "$alice_id"
