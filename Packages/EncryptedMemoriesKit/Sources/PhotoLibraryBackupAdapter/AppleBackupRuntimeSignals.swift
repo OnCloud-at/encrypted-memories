@@ -2,19 +2,10 @@ import Foundation
 import PhotosCore
 import UploadCore
 
-/// Shared Apple runtime signals for every backup upload flow, including the Mac folder backup. The policy stays in
-/// Core; this adapter only translates public OS state and the mobile-data setting into its platform-neutral input.
-public enum AppleBackupRuntimeSignals {
-    public static func current() -> BackupThrottleInputs {
-        BackupThrottleInputs(
-            runtime: LibraryRuntimeState.shared.snapshot(),
-            usesMobileData: BackupMobileDataPolicy.isEnabled()
-        )
-    }
-}
-
 /// Where a backup controller reads its runtime signals: the current throttle inputs and a stream that fires when
-/// they may have changed. Production uses the one shared Apple runtime state; tests inject both.
+/// they may have changed. Production uses the one shared Apple runtime state for every backup upload flow, including
+/// the Mac folder backup; tests inject both. The policy stays in Core; this adapter only translates public OS state
+/// and the mobile-data setting into its platform-neutral input.
 public struct BackupRuntimeSignalSource: Sendable {
     public var current: @Sendable () -> BackupThrottleInputs
     public var updates: @Sendable () -> AsyncStream<LibraryRuntimeSnapshot>
@@ -77,6 +68,7 @@ private final class BackupMobileDataSettingObserver: @unchecked Sendable {
     private let onChange: @Sendable () -> Void
     private let lock = NSLock()
     private var lastValue: Bool
+    private var isActive = true
     private var token: (any NSObjectProtocol)?
 
     init(defaults: UserDefaults, onChange: @escaping @Sendable () -> Void) {
@@ -90,12 +82,15 @@ private final class BackupMobileDataSettingObserver: @unchecked Sendable {
             self?.settingsDidChange()
         }
         lock.withLock { self.token = token }
+        // A write between the first read and the registration is not lost.
+        settingsDidChange()
     }
 
     private func settingsDidChange() {
-        let value = BackupMobileDataPolicy.isEnabled(defaults: defaults)
+        // Reading under the lock keeps concurrent writers from leaving an older value behind.
         let changed = lock.withLock {
-            guard token != nil, value != lastValue else { return false }
+            let value = BackupMobileDataPolicy.isEnabled(defaults: defaults)
+            guard isActive, value != lastValue else { return false }
             lastValue = value
             return true
         }
@@ -104,6 +99,7 @@ private final class BackupMobileDataSettingObserver: @unchecked Sendable {
 
     func cancel() {
         let removed = lock.withLock {
+            isActive = false
             let current = token
             token = nil
             return current

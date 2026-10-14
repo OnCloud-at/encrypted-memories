@@ -4682,7 +4682,9 @@ extension BackupSyncRunnerTests {
 
     func testTurningOnMobileDataWakesThePausedDrain() async throws {
         let due = seedEntry("mobile-data-on.jpg")
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "BackupMobileDataWake-\(UUID().uuidString)"))
+        let suite = "BackupMobileDataWake-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(false, forKey: AppSettingsKey.backupUsesMobileData)
         let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: Self.cellular))
         let (runner, heldClock, pass) = await pausedDrain(signals: .observing(runtime: runtime, defaults: defaults))
@@ -4702,7 +4704,9 @@ extension BackupSyncRunnerTests {
     /// queue without an attempt and waits for Wi-Fi.
     func testTurningOffMobileDataStopsTheRunningCellularUpload() async throws {
         let due = seedEntry("mobile-data-off.jpg")
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "BackupMobileDataStop-\(UUID().uuidString)"))
+        let suite = "BackupMobileDataStop-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
         let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: Self.cellular))
         let signals = BackupRuntimeSignalSource.observing(runtime: runtime, defaults: defaults)
