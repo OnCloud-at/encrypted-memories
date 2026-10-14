@@ -2345,6 +2345,131 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
+    func testRemovingSourcesKeepsTheIncompleteDuplicateIndexWarning() async throws {
+        let source = UploadSourceIdentity(
+            kind: .photoLibraryAsset,
+            identifier: "removed-while-index-incomplete",
+            resource: .primary
+        )
+        XCTAssertTrue(
+            queueStore.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source,
+                    revision: UploadBackupRevision(date: resolver.defaultModified),
+                    originalFilename: "removed.heic",
+                    byteCount: 4,
+                    updatedAt: clock.now
+                )))
+        let degraded = UploadRemoteContentIndexHealth.degraded(indexedCount: 989, unresolvedCount: 11)
+        checker.contentIndexHealth = degraded
+        let stalledUploader = NonCooperativeBackupUploader()
+        let runner = makeRunner(uploader: stalledUploader, schedulerClock: BackupContinuousClock())
+
+        let drain = Task { await runner.runUntilDrained() }
+        let uploadStarted = await waitUntil { stalledUploader.uploadAttempts == 1 }
+        let beforeRemoval = await runner.currentProgress()
+
+        // The removal refreshes the progress from the queue before it waits for native cancellation.
+        let removal = Task { await runner.removePhotoLibraryAssets([source.identifier]) }
+        let cancelStarted = await waitUntil { stalledUploader.cancellations == 1 }
+        let afterRemoval = await runner.currentProgress()
+
+        await stalledUploader.cancelRelease.signal()
+        await stalledUploader.uploadRelease.signal()
+        _ = await removal.value
+        _ = await drain.value
+
+        XCTAssertTrue(uploadStarted)
+        XCTAssertTrue(cancelStarted)
+        XCTAssertEqual(beforeRemoval.remoteContentIndexHealth, degraded)
+        XCTAssertEqual(afterRemoval.total, 0, "the snapshot must come from the refreshed queue")
+        XCTAssertEqual(afterRemoval.remoteContentIndexHealth, degraded)
+        XCTAssertTrue(afterRemoval.remoteContentIndexHealth.shouldWarn)
+    }
+
+    func testFinishedPassKeepsTheIncompleteDuplicateIndexWarning() async throws {
+        _ = seedEntry("indexed.heic")
+        let degraded = UploadRemoteContentIndexHealth.degraded(indexedCount: 989, unresolvedCount: 11)
+        checker.contentIndexHealth = degraded
+        let runner = makeRunner()
+
+        let finished = await runner.runUntilDrained()
+
+        XCTAssertFalse(finished.isRunning)
+        XCTAssertEqual(finished.remoteContentIndexHealth, degraded)
+        XCTAssertTrue(finished.remoteContentIndexHealth.shouldWarn)
+        let current = await runner.currentProgress()
+        XCTAssertEqual(current.remoteContentIndexHealth, degraded)
+    }
+
+    /// A runner whose first pass read a degraded duplicate index. Later passes start from a new snapshot.
+    private func runnerThatReportedAnIncompleteIndex(
+        throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained }
+    ) async -> BackupSyncRunner {
+        _ = seedEntry("indexed.heic")
+        checker.contentIndexHealth = Self.incompleteIndex
+        let runner = makeRunner(throttleInputs: throttleInputs)
+        let first = await runner.runUntilDrained()
+        XCTAssertEqual(first.remoteContentIndexHealth, Self.incompleteIndex)
+        return runner
+    }
+
+    private static let incompleteIndex = UploadRemoteContentIndexHealth.degraded(
+        indexedCount: 989, unresolvedCount: 11)
+
+    func testIdlePassKeepsTheIncompleteDuplicateIndexWarning() async throws {
+        let runner = await runnerThatReportedAnIncompleteIndex()
+
+        let idle = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertFalse(idle.isRunning)
+        XCTAssertEqual(idle.remoteContentIndexHealth, Self.incompleteIndex)
+    }
+
+    func testPassPausedByPolicyKeepsTheIncompleteDuplicateIndexWarning() async throws {
+        let network = BackupNetworkBox(.unconstrained)
+        let runner = await runnerThatReportedAnIncompleteIndex(throttleInputs: { network.current })
+        _ = seedEntry("waiting.heic")
+        network.set(BackupThrottleInputs(isNetworkAvailable: false))
+
+        let paused = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertTrue(paused.isPausedByPolicy)
+        XCTAssertEqual(paused.remoteContentIndexHealth, Self.incompleteIndex)
+    }
+
+    func testCancelledIndexPreparationKeepsTheIncompleteDuplicateIndexWarning() async throws {
+        let runner = await runnerThatReportedAnIncompleteIndex()
+        checker.prepareRemoteIndexError = CancellationError()
+
+        let cancelled = await runner.runUntilDrained()
+
+        XCTAssertEqual(cancelled.remoteContentIndexHealth, Self.incompleteIndex)
+    }
+
+    func testFailedIndexPreparationKeepsTheIncompleteDuplicateIndexWarning() async throws {
+        let runner = await runnerThatReportedAnIncompleteIndex()
+        checker.prepareRemoteIndexError = URLError(.notConnectedToInternet)
+
+        let failed = await runner.runUntilDrained()
+
+        XCTAssertTrue(failed.remoteIndexPreparationFailed)
+        XCTAssertEqual(failed.remoteContentIndexHealth, Self.incompleteIndex)
+    }
+
+    func testSuccessfulIndexReadWithoutProblemsClearsTheIncompleteDuplicateIndexWarning() async throws {
+        let runner = await runnerThatReportedAnIncompleteIndex()
+        let complete = UploadRemoteContentIndexHealth.complete(indexedCount: 1000)
+        checker.contentIndexHealth = complete
+
+        let next = await runner.runUntilDrained()
+
+        XCTAssertEqual(next.remoteContentIndexHealth, complete)
+        XCTAssertFalse(next.remoteContentIndexHealth.shouldWarn)
+        let current = await runner.currentProgress()
+        XCTAssertEqual(current.remoteContentIndexHealth, complete)
+    }
+
     func testDraftBlocksWithBackoffAndNeverCountsAsBackedUp() async throws {
         let entry = seedEntry("draft.jpg")
         let hashes = expectedHashes(id: "draft.jpg")

@@ -767,6 +767,53 @@ final class MissingSourceReconciliationTests: XCTestCase {
             queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
     }
 
+    func testDismissedSourceRecheckKeepsTheIncompleteDuplicateIndexWarningWhileThePassRuns() async throws {
+        let offered = try candidate("permission-with-incomplete-index")
+        let clock = BackupTestClock()
+        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: "acknowledged missing"))
+        try await engine(clock: clock).enqueueChangedMissingSources([offered])
+        let network = BackupNetworkBox(.unconstrained)
+        let queue = try XCTUnwrap(self.queue)
+        queue.setChangeObserver { _ in
+            if queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state == .checking {
+                network.set(.init(isNetworkExpensive: true, usesMobileData: false))
+            }
+        }
+        let degraded = UploadRemoteContentIndexHealth.degraded(indexedCount: 989, unresolvedCount: 11)
+        let checker = FakeChecker()
+        checker.contentIndexHealth = degraded
+        let availability = AvailabilityResolver(candidate: offered)
+        let runner = availabilityRunner(
+            clock: clock, resolver: availability, network: network,
+            identityResolver: UploadDedupePipeline(store: FakeIdentityStore(), hasher: FakeHasher(), checker: checker))
+        let snapshots = ProgressSnapshots()
+        await runner.setOnProgress { snapshots.append($0) }
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        queue.setChangeObserver(nil)
+
+        // The claimed recheck must take the deferral path that refreshes the progress from the queue.
+        XCTAssertEqual(availability.calls, 0)
+        let pending = try XCTUnwrap(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+        XCTAssertEqual(pending.state, .discovered)
+        XCTAssertEqual(BackupIssueRecord.decode(pending.lastError)?.kind, .sourceMissing)
+        // Every snapshot that the running pass publishes after it reported the index health, including the one
+        // that follows the recheck deferral. The final snapshot (not running) is covered by the finished-pass test.
+        let all = snapshots.values
+        let reported = try XCTUnwrap(all.firstIndex { $0.remoteContentIndexHealth == degraded })
+        let afterReport = all[reported...].filter(\.isRunning)
+        for snapshot in afterReport {
+            XCTAssertEqual(snapshot.remoteContentIndexHealth, degraded)
+        }
+    }
+
+    private final class ProgressSnapshots: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [BackupSyncProgress] = []
+        var values: [BackupSyncProgress] { lock.withLock { stored } }
+        func append(_ progress: BackupSyncProgress) { lock.withLock { stored.append(progress) } }
+    }
+
     func testDismissedSourceRecheckRetainsTheRequestWhenPermissionChangesDuringAMissingRead() async throws {
         let offered = try candidate("permission-during-read")
         let clock = BackupTestClock()

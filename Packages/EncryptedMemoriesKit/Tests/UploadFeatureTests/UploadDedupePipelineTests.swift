@@ -117,6 +117,10 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     var remoteItemsByContentHash: [String: RemotePhotoDuplicate] = [:]
     var exactActiveDuplicates: [PhotoUID] = []
     var findError: Error?
+    /// What the account-wide content index reports to the backup screen.
+    var contentIndexHealth: UploadRemoteContentIndexHealth = .complete(indexedCount: 0)
+    /// Makes the next index preparations fail, for example with a cancellation.
+    var prepareRemoteIndexError: Error?
     private(set) var findBatches: [[String]] = []
     private(set) var nameHashCalls = 0
     private var invalidationCount = 0
@@ -199,6 +203,17 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     var linkActivityProvider: (@Sendable (String) -> Bool)?
     var linkVisibilityError: Error?
     private var visibilityReadCount = 0
+
+    func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
+        lock.withLock { contentIndexHealth }
+    }
+
+    func prepareRemoteIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws {
+        if let failure = lock.withLock({ prepareRemoteIndexError }) { throw failure }
+        await progress(.init(phase: .ready))
+    }
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         let failure = lock.withLock {
