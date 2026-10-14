@@ -87,8 +87,9 @@ public protocol AlbumSyncRemoteAlbumOps: Sendable {
     /// Attaches existing remote photos (no media re-upload). Per-item failures are aggregated,
     /// never masked; "already a member" is reported as convergence.
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult
-    /// Active main photos of the account with the same bytes, by lowercase SHA-1 hex. Read-only; another device's
-    /// copy of a shared photo has its own link with the same bytes.
+    /// Active photos of the account whose main file has the same bytes, by lowercase SHA-1 hex. Read-only; another
+    /// device's copy of a shared photo has its own link with the same bytes. The answer can name related files and
+    /// photos outside the album; the caller keeps only current album members.
     func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>]
 }
 

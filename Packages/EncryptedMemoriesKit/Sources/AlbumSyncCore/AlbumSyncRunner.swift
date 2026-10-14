@@ -33,8 +33,8 @@ public actor AlbumSyncRunner {
     private let mappingStore: AlbumSyncMappingStore?
     private let now: @Sendable () -> Date
 
-    /// Photos per `attach` call - a progress-granularity choice (the backend further batches to
-    /// the API's own limit internally).
+    /// Photos per `attach` call and per same-content lookup - a progress and Stop granularity choice (the backend
+    /// further batches to the API's own limit internally).
     private let attachChunkSize: Int
 
     private var onProgress: (@Sendable (AlbumSyncProgress) -> Void)?
@@ -235,9 +235,13 @@ public actor AlbumSyncRunner {
             of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links)
         // A photo with a usable link goes into the album even when the backup keeps a part of it open, for
         // example the video of a Live Photo behind a draft. It is no complete backup, so the album reports it.
+        let failedLinkIDs = Set(attachResult.failedLinkIDs)
+        // A photo that attaches through another photo's link with the same bytes is not in the album when that
+        // attach failed.
+        let failedContent = Set(plan.toAttach.filter { failedLinkIDs.contains($0.uid.nodeID) }.compactMap(\.sha1Hex))
         let incompleteIdentifiers = Self.incompleteIdentifiers(
-            orderedLocalIdentifiers: identifiers, links: links, attachFailedLinkIDs: Set(attachResult.failedLinkIDs),
-            backup: backupReport)
+            orderedLocalIdentifiers: identifiers, links: links, attachFailedLinkIDs: failedLinkIDs,
+            attachFailedContent: failedContent, albumMembers: children, backup: backupReport)
         progress.incomplete = incompleteIdentifiers.count
         let report = AlbumSyncReport(
             remoteAlbumID: remoteAlbumID,
@@ -273,25 +277,33 @@ public actor AlbumSyncRunner {
     }
 
     /// For each SHA-1 of a link that is not in the album, an album member with the same bytes, for example another
-    /// device's copy of a shared photo. A failed lookup finds none, so the photo attaches as before; Stop and
-    /// cancellation still end the run.
+    /// device's copy of a shared photo. The lookup runs in chunks, so Stop takes effect between them. A failed chunk
+    /// ends the lookup with the members found so far, and the other photos attach as before.
     private func membersWithSameContent(
         links: [String: AlbumSyncRemoteLink], children: Set<String>
     ) async throws -> [String: String] {
         let candidates = Set(
             links.values.compactMap { link in
                 link.isTrashed || children.contains(link.uid.nodeID) ? nil : link.sha1Hex
-            })
+            }
+        ).sorted()
         guard !candidates.isEmpty, !children.isEmpty else { return [:] }
-        let copies: [String: Set<String>]
-        do {
-            copies = try await remoteOps.activeMainLinkIDs(withSameContentAs: candidates)
-        } catch {
+        var copies: [String: Set<String>] = [:]
+        var start = 0
+        while start < candidates.count {
             try checkStop()
-            if error is CancellationError { throw error }
-            return [:]
+            let chunk = Set(candidates[start..<min(start + attachChunkSize, candidates.count)])
+            start += chunk.count
+            do {
+                copies.merge(try await remoteOps.activeMainLinkIDs(withSameContentAs: chunk)) { $0.union($1) }
+            } catch {
+                // Stop and task cancellation end the run; any other failure, also a cancelled index refresh, keeps
+                // today's attach for the rest.
+                try checkStop()
+                break
+            }
         }
-        // The smallest member id keeps the choice stable between runs.
+        // Only a current album member counts. The smallest member id keeps the choice stable between runs.
         return copies.compactMapValues { $0.intersection(children).min() }
     }
 
@@ -301,11 +313,18 @@ public actor AlbumSyncRunner {
         orderedLocalIdentifiers: [String],
         links: [String: AlbumSyncRemoteLink],
         attachFailedLinkIDs: Set<String>,
+        attachFailedContent: Set<String> = [],
+        albumMembers: Set<String> = [],
         backup: AlbumSyncBackupReport
     ) -> [String] {
         orderedLocalIdentifiers.filter { identifier in
             guard let link = links[identifier], !link.isTrashed, !attachFailedLinkIDs.contains(link.uid.nodeID)
             else {
+                return false
+            }
+            if let sha1Hex = link.sha1Hex, attachFailedContent.contains(sha1Hex),
+                !albumMembers.contains(link.uid.nodeID)
+            {
                 return false
             }
             return backup.problems[identifier] != nil

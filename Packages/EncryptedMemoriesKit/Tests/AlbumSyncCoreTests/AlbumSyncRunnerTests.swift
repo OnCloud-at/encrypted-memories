@@ -101,6 +101,8 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
     var nextAlbumID = "remote-album-1"
     var sameContent: [String: Set<String>] = [:]
     var sameContentError: (any Error)?
+    /// The first lookup call (1-based) that throws `sameContentError`; earlier calls answer normally.
+    var sameContentFailsFromCall = 1
     private var _sameContentRequests: [Set<String>] = []
     var sameContentRequests: [Set<String>] { lock.withLock { _sameContentRequests } }
 
@@ -120,8 +122,11 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
     }
 
     func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>] {
-        lock.withLock { _sameContentRequests.append(sha1Hexes) }
-        if let sameContentError { throw sameContentError }
+        let call = lock.withLock {
+            _sameContentRequests.append(sha1Hexes)
+            return _sameContentRequests.count
+        }
+        if let sameContentError, call >= sameContentFailsFromCall { throw sameContentError }
         return sameContent.filter { sha1Hexes.contains($0.key) }
     }
 
@@ -240,6 +245,77 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(remote.attachedBatches.flatMap { $0 } == ["copy-b"])
         #expect(report.attached == 1)
         #expect(report.isFullySynced)
+    }
+
+    @Test func aCancelledIndexRefreshAddsThePhotoAsBefore() async throws {
+        // The content index throws CancellationError when it is reset; the sync itself was not cancelled.
+        let remote = FakeRemoteOps()
+        remote.children = ["copy-a"]
+        remote.sameContentError = CancellationError()
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["shared"]], links: ["shared": link("copy-b")], remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(remote.attachedBatches.flatMap { $0 } == ["copy-b"])
+        #expect(report.attached == 1)
+    }
+
+    @Test func aFailedLaterChunkKeepsTheMembersAlreadyFound() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["copy-a"]
+        remote.sameContent = ["sha-copy-b": ["copy-a"]]
+        remote.sameContentError = AlbumSyncError.mappingStoreUnavailable
+        remote.sameContentFailsFromCall = 2
+        // Chunks of two, in SHA-1 order: [sha-copy-b, sha-own-1], then [sha-own-2].
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["shared", "own-1", "own-2"]],
+            links: ["shared": link("copy-b"), "own-1": link("own-1"), "own-2": link("own-2")], remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+        #expect(remote.sameContentRequests.count == 2)
+        #expect(remote.attachedBatches.flatMap { $0 } == ["own-1", "own-2"])
+        #expect(report.alreadyMember == 1)
+    }
+
+    @Test func stopBetweenLookupChunksAddsNothingAndAsksNoFurther() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let remote = FakeRemoteOps()
+        remote.children = ["member"]
+        let lookup = FakeLinkLookup()
+        lookup.links = ["a": link("la"), "b": link("lb"), "c": link("lc")]
+        let runner = AlbumSyncRunner(
+            localSource: FakeLocalSource(albums: [], contents: ["album": .present(["a", "b", "c"])]),
+            backup: FakeBackupExecutor(),
+            remoteOps: GatedSameContentRemoteOps(base: remote, entered: entered, release: release),
+            linkLookup: lookup, mappingStore: makeStore(), attachChunkSize: 2)
+        let sync = Task { try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3)) }
+        await entered.wait()
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(remote.sameContentRequests.count == 1, "the second chunk is never asked")
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func aPhotoBehindAFailedAttachOfTheSameBytesIsNotInTheAlbum() async throws {
+        // Two photos with equal bytes but their own links: only the first attaches, and that attach fails.
+        let remote = FakeRemoteOps()
+        remote.failAttachOf = ["la"]
+        let backup = FakeBackupExecutor()
+        backup.problems = [
+            "b": BackupFailedItem(
+                id: "queue-b", filename: "b.heic", reason: "still finishing", isPermanent: false,
+                issue: .remoteDraft, category: .automatic)
+        ]
+        let same = { (id: String) in
+            AlbumSyncRemoteLink(uid: PhotoUID(volumeID: "vol1", nodeID: id), sha1Hex: "same", isTrashed: false)
+        }
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["a", "b"]], links: ["a": same("la"), "b": same("lb")], remote: remote,
+            backup: backup)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 2))
+        #expect(remote.attachedBatches.flatMap { $0 } == ["la"])
+        #expect(report.attachFailed == 1)
+        #expect(report.incomplete == 0, "photo b is not in the album, so it is not an incomplete album member")
     }
 
     @Test func noSameContentLookupWhenNothingCanMatch() async throws {
