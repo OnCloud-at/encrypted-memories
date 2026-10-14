@@ -25,7 +25,7 @@ struct ProtonRequestTallyTests {
         #expect(ProtonRequestLabel.api(method: "PROPFIND", path: "/core/v4/users").method == "OTHER")
         #expect(ProtonRequestLabel.storage(method: "put") == ProtonRequestLabel(method: "PUT", endpoint: "<storage>"))
         // Mixed case, digits, padding and long words are identifiers; only short lowercase words and versions stay.
-        for segment in ["AbCd", "a1", "abc=", "v", "v4x", String(repeating: "a", count: 33)] {
+        for segment in ["AbCd", "a1", "abc=", "v", "x", "ab", "v4x", "v12345", String(repeating: "a", count: 33)] {
             #expect(!ProtonRequestLabel.isFixedWord(Substring(segment)), "\(segment)")
         }
         for segment in ["v4", "fetch_metadata", "add-multiple", "latest"] {

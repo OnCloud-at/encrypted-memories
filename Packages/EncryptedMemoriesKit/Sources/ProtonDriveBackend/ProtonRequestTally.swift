@@ -49,13 +49,15 @@ struct ProtonRequestLabel: Sendable, Equatable {
         ProtonRequestLabel(method: normalizedMethod(method), endpoint: storageEndpoint)
     }
 
-    /// A fixed word is lowercase letters with `_` or `-`, or a version such as `v4`. Proton identifiers are long
-    /// mixed-case base64 strings, so they never match.
+    /// A fixed word is 3 to 32 lowercase letters with `_` or `-`, or a version such as `v4`. Proton identifiers are
+    /// long mixed-case base64 strings, so they never match; a short segment counts as an identifier.
     static func isFixedWord(_ segment: Substring) -> Bool {
-        guard (1...32).contains(segment.count) else { return false }
-        if segment.first == "v", segment.count > 1, segment.dropFirst().allSatisfy({ ("0"..."9").contains($0) }) {
+        if segment.count > 1, segment.count <= 4, segment.first == "v",
+            segment.dropFirst().allSatisfy({ ("0"..."9").contains($0) })
+        {
             return true
         }
+        guard (3...32).contains(segment.count) else { return false }
         return segment.allSatisfy { ("a"..."z").contains($0) || $0 == "_" || $0 == "-" }
     }
 
