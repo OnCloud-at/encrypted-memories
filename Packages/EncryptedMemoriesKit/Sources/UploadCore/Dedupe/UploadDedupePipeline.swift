@@ -126,6 +126,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // `sources(withRemoteLinkID:)` scans the manifest without an index; once per hit that is quadratic in the
         // library size. Close the gap when the manifest has an indexed reverse lookup by remote link.
         // A frame of a replacing series edit skips it too: its row can name its copy under the replaced main photo.
+        // A secondary whose earlier row adopted a copy outside its main photo keeps that row on purpose: earlier marks
+        // are not checked again.
         if let cached, hmacReusable, !descriptor.requiresRelatedMatch,
             let outcome = cached.outcome.flatMap(UploadIdentityManifestStore.Outcome.init(rawValue:)),
             outcome == .uploaded || (outcome == .duplicateActive && !isBurstMember),
@@ -297,10 +299,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw detailedLookupError
         }
 
+        // The related photos of the main photo, read at most once in this resolve.
+        var relatedReads: [String: Set<String>] = [:]
         let nameCandidates: (items: [RemotePhotoDuplicate], provesLive: Bool)
         do {
             nameCandidates = try await candidates(
-                remoteItems, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
+                remoteItems, contentHash: contentHash, descriptor: descriptor, replacement: replacement,
+                relatedReads: &relatedReads)
         } catch {
             releasePendingUploadClaims(ownedBy: descriptor)
             throw error
@@ -332,7 +337,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                         let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
                         let contentCandidates = try await candidates(
                             batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement,
-                            requiresActiveMain: blockedByDraft)
+                            requiresActiveMain: blockedByDraft, relatedReads: &relatedReads)
                         provesLive = provesLive || contentCandidates.provesLive
                         let excluded =
                             blockedByDraft
@@ -607,7 +612,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         contentHash: String,
         descriptor: UploadResourceDescriptor,
         replacement: UploadReplacementScope,
-        requiresActiveMain: Bool = false
+        requiresActiveMain: Bool = false,
+        relatedReads: inout [String: Set<String>]
     ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
         if descriptor.source.resource.isBurstMember {
             return (
@@ -616,21 +622,25 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         if descriptor.needsRelatedProof {
             // A secondary of a replacing edit counts only a copy under its main photo. A plain secondary drops only
-            // active copies elsewhere: a trashed or deleted copy keeps its meaning as a deletion by the person.
-            let dropsEveryUnrelatedRow = descriptor.requiresRelatedMatch
-            var relatedLinkIDs: Set<String> = []
-            // A plain secondary asks only for an active copy of its own bytes: any other active row cannot settle it.
-            let needsLookup = remoteItems.contains {
-                dropsEveryUnrelatedRow
-                    ? $0.linkState != .draft : ($0.linkState == .active && $0.contentHash == contentHash)
+            // active copies elsewhere: a trashed or deleted copy keeps its meaning as a deletion by the person. A draft
+            // keeps its meaning. Only a row with these bytes can settle the secondary, so only such a row needs the list.
+            let countsOnlyUnderTheMainPhoto: (RemotePhotoDuplicate) -> Bool = {
+                descriptor.requiresRelatedMatch ? $0.linkState != .draft : $0.linkState == .active
             }
-            if needsLookup, let mainLinkID = descriptor.mainRemoteLinkID {
-                relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+            var relatedLinkIDs: Set<String> = []
+            if remoteItems.contains(where: { countsOnlyUnderTheMainPhoto($0) && $0.contentHash == contentHash }),
+                let mainLinkID = descriptor.mainRemoteLinkID
+            {
+                if let read = relatedReads[mainLinkID] {
+                    relatedLinkIDs = read
+                } else {
+                    relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+                    relatedReads[mainLinkID] = relatedLinkIDs
+                }
             }
             return (
                 remoteItems.filter { item in
-                    item.linkState == .draft || (item.linkID.map(relatedLinkIDs.contains) ?? false)
-                        || (!dropsEveryUnrelatedRow && item.linkState != .active)
+                    !countsOnlyUnderTheMainPhoto(item) || (item.linkID.map(relatedLinkIDs.contains) ?? false)
                 }, false
             )
         }

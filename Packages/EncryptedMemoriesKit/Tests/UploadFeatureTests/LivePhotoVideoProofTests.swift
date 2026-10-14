@@ -45,17 +45,15 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
             nameHash: "nh(\(name))", contentHash: videoContentHash, linkState: .active, linkID: linkID)
     }
 
+    private func trashedRow(_ linkID: String) -> RemotePhotoDuplicate {
+        RemotePhotoDuplicate(
+            nameHash: "nh(IMG_1.MOV)", contentHash: videoContentHash, linkState: .trashed, linkID: linkID)
+    }
+
     private func foreignDraft() -> RemotePhotoDuplicate {
         RemotePhotoDuplicate(
             nameHash: "nh(IMG_1.MOV)", contentHash: nil, linkState: .draft, linkID: "foreign-draft",
             clientUID: "another-installation")
-    }
-
-    private func settles(_ decision: UploadDuplicateDecision) -> Bool {
-        switch decision {
-        case .skip(.activeDuplicate, _), .skip(.knownFromManifest, _): true
-        default: false
-        }
     }
 
     // MARK: - Reproduction of issue 562: an unrelated main file settles the video
@@ -66,7 +64,7 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
 
         let result = try await pipeline.resolve(video())
 
-        XCTAssertFalse(settles(result.decision), "an unrelated main file settled the video: \(result.decision)")
+        XCTAssertEqual(result.decision, .upload, "the video uploads under the Live Photo")
     }
 
     func testAnUnrelatedMainFileNextToAForeignDraftKeepsTheVideoBlocked() async throws {
@@ -84,7 +82,7 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
 
         let result = try await pipeline.resolve(video())
 
-        XCTAssertFalse(settles(result.decision), "an unrelated main file settled the video: \(result.decision)")
+        XCTAssertEqual(result.decision, .upload, "the video uploads under the Live Photo")
     }
 
     func testTheManifestRowOfAnUnrelatedMainFileDoesNotSettleTheVideo() async throws {
@@ -102,7 +100,7 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
 
         let result = try await pipeline.resolve(video())
 
-        XCTAssertFalse(settles(result.decision), "an unrelated manifest row settled the video: \(result.decision)")
+        XCTAssertEqual(result.decision, .upload, "an unrelated manifest row proves nothing")
     }
 
     func testTheExactLookupFallbackNeverSettlesTheVideoWithAnUnrelatedMainFile() async throws {
@@ -161,15 +159,71 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
     }
 
     func testATrashedCopyKeepsItsMeaningAsADeletionByThePerson() async throws {
-        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
-            RemotePhotoDuplicate(
-                nameHash: "nh(IMG_1.MOV)", contentHash: videoContentHash, linkState: .trashed, linkID: "trashed-video")
-        ]
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video")]
         checker.relatedLinkIDsByMainLinkID["live-main"] = []
 
         let result = try await pipeline.resolve(video())
 
         XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
+        XCTAssertTrue(checker.relatedLookups.isEmpty, "a trashed copy keeps its meaning without the related list")
+    }
+
+    func testAnUnrelatedActiveCopyNoLongerHidesATrashedCopyNextToIt() async throws {
+        // The active file elsewhere proves nothing, so the trashed copy decides as it does on its own.
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video"), trashedRow("trashed-video")]
+        checker.relatedLinkIDsByMainLinkID["live-main"] = []
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
+    }
+
+    func testTheNameAndTheContentLookupReadTheRelatedPhotosOnce() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video")]
+        checker.remoteItemsByContentHash[videoContentHash] = activeRow("elsewhere", name: "OTHER.MOV")
+        checker.relatedLinkIDsByMainLinkID["live-main"] = []
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertEqual(checker.relatedLookups, ["live-main"], "the related photos are read once")
+    }
+
+    func testAnOwnInterruptedDraftNextToAnUnrelatedCopyIsReplaced() async throws {
+        let pipeline = UploadDedupePipeline(
+            store: store, hasher: hasher, checker: checker, currentClientUID: "this-installation")
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
+            activeRow("standalone-video"),
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.MOV)", contentHash: nil, linkState: .draft, linkID: "own-draft",
+                clientUID: "this-installation"),
+        ]
+        checker.relatedLinkIDsByMainLinkID["live-main"] = []
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .uploadReplacingDraft)
+    }
+
+    func testEverySecondaryOfAMainPhotoNeedsACopyUnderThatMainPhoto() async throws {
+        let resources: [UploadSourceIdentity.Resource] = [
+            .livePairedVideo, .photoKit(role: "pairedVideo", ordinal: 0), .photoKit(role: "originalPhoto", ordinal: 0),
+        ]
+        for resource in resources {
+            let store = FakeIdentityStore()
+            let pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+            checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video")]
+            checker.relatedLinkIDsByMainLinkID["live-main"] = []
+            let secondary = UploadResourceDescriptor(
+                source: .file(URL(fileURLWithPath: "/photos/IMG_1.HEIC"), resource: resource),
+                fileURL: URL(fileURLWithPath: videoPath), filename: "IMG_1.MOV", fileSize: 1000,
+                modificationDate: Date(timeIntervalSince1970: 1_700_000_000), mainRemoteLinkID: "live-main")
+
+            let result = try await pipeline.resolve(secondary)
+
+            XCTAssertEqual(result.decision, .upload, "\(resource)")
+            await pipeline.uploadDidFail(secondary)
+        }
     }
 
     func testAVideoOfAReplacingEditIgnoresItsTrashedCopyUnderTheEarlierPhoto() async throws {
