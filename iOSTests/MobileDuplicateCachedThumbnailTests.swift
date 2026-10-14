@@ -53,6 +53,35 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
         XCTAssertFalse(accepted)
     }
 
+    /// A full-screen cover over the viewer, such as the series selection, ends the viewer's thumbnail access; the
+    /// filmstrip cell keeps its own. When the cover closes, the shown copy needs the viewer's access again.
+    func testDuplicatesViewerReopensItsThumbnailAccessWhenACoverCloses() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.close() }
+        let duplicates = try XCTUnwrap(fixture.library.duplicates)
+        let uid = fixture.item.uid
+        let openAccesses = { fixture.feed.feedCore.openVisibleThumbnailAccessUIDs }
+        fixture.show(
+            MobilePhotoViewer(
+                items: [fixture.item], startIndex: 0, context: .library,
+                libraryModel: fixture.library, viewerRouter: MobileViewerRouter(),
+                duplicateGroup: MobileDuplicateViewerGroup(model: duplicates)))
+        try await waitUntil { openAccesses() == [uid, uid] }
+        XCTAssertEqual(openAccesses(), [uid, uid], "the viewer and its filmstrip cell read the shown copy")
+
+        let cover = UIViewController()
+        cover.modalPresentationStyle = .fullScreen
+        fixture.root.present(cover, animated: false)
+        try await waitUntil { openAccesses() == [uid] }
+        XCTAssertEqual(openAccesses(), [uid], "the cover ends the viewer's access")
+        fixture.root.dismiss(animated: false)
+
+        try await waitUntil { openAccesses() == [uid, uid] }
+        XCTAssertEqual(openAccesses(), [uid, uid], "the viewer opens the access of the shown copy again")
+        fixture.show(Color.black)
+        try await waitUntilRevoked(fixture.feed)
+    }
+
     func testDuplicatesViewerFilmstripShowsItsCachedCopyAndRevokesOnClose() async throws {
         let fixture = try await Fixture()
         defer { fixture.close() }

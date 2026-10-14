@@ -19,6 +19,13 @@ public final class VisibleThumbnailSession {
 
     public func end() { select(nil) }
 
+    /// Opens the access for `uid` when it is not open, for example when a viewer appears again after a cover over it
+    /// closed. An open access for the same photo stays, so a load that holds it goes on.
+    public func reopen(_ uid: PhotoUID?) {
+        guard uid != self.uid else { return }
+        select(uid)
+    }
+
     public func memoryDecoded(for uid: PhotoUID) -> DecodedThumbnail? {
         guard self.uid == uid, let access else { return nil }
         return feed.memoryDecoded(for: uid, access: access)

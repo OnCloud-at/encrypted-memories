@@ -731,6 +731,30 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
+    /// A viewer that appears again opens the access of its photo only when it is not open: a load that holds the open
+    /// access finishes, and an access that a cover ended opens again.
+    @MainActor @Test func visibleThumbnailSessionReopensOnlyAClosedAccess() async throws {
+        let uid = Self.uid("duplicates-session-reopen")
+        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 24, height: 24)], delayMilliseconds: 300)
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("duplicates-session-reopen"), loader: loader, configuration: Self.configuration())
+        let session = VisibleThumbnailSession(feed: feed)
+        session.select(uid)
+        let load = Task { await session.visibleDecoded(for: uid) }
+        for _ in 0..<200 where await loader.requestCount() == 0 { try await Task.sleep(for: .milliseconds(5)) }
+
+        session.reopen(uid)
+
+        #expect(await load.value != nil, "the open access stays, so its load finishes")
+        #expect(feed.openVisibleThumbnailAccessUIDs == [uid])
+        session.end()
+        #expect(feed.openVisibleThumbnailAccessUIDs.isEmpty)
+        session.reopen(uid)
+        #expect(feed.openVisibleThumbnailAccessUIDs == [uid], "an ended access opens again")
+        session.end()
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func cachedDuplicateSurvivesLibraryViewportReplacement() async throws {
         let duplicate = Self.uid("duplicates-viewport")
         let cache = Self.cache("duplicates-viewport")
