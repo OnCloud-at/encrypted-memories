@@ -1818,8 +1818,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let scans = PassCounter()
             let owners = OwnerRecorder()
             controller.replaceScanForTesting {
-                _ = scans.increment()
+                // The owner is recorded before the count rises, so a wait for the count also sees the owner.
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                _ = scans.increment()
             }
             controller.syncNow()
             let windowEnds = PassCounter()
@@ -1850,8 +1851,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let scans = PassCounter()
             let owners = OwnerRecorder()
             controller.replaceScanForTesting {
-                _ = scans.increment()
+                // The owner is recorded before the count rises, so a wait for the count also sees the owner.
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                _ = scans.increment()
             }
             await controller.retryUserResolvableWork()
             let runs = PassCounter()
