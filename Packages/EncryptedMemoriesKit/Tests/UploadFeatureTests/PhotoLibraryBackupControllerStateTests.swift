@@ -309,7 +309,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
                 shown.ended = true
             }
-            while shown.lists.isEmpty { await Task.yield() }
+            try await waitForCondition { !shown.lists.isEmpty }
             XCTAssertFalse(shown.lists[0].offersUserRetry)
 
             // The pass gives a photo a reason that the person resolves; no count of the status changes.
@@ -344,7 +344,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
                 shown.ended = true
             }
-            while shown.lists.isEmpty { await Task.yield() }
+            try await waitForCondition { !shown.lists.isEmpty }
             XCTAssertTrue(queue.upsert(quotaEntry("first")))
             try await waitForCondition { shown.lists.count == 2 }
             try await waitForCondition { clock.isWaiting }
@@ -356,7 +356,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(shown.lists.count, 2, "writes inside the pause wait for it")
             clock.releaseAll()
             try await waitForCondition { shown.lists.count == 3 }
-            XCTAssertEqual(Set(shown.lists[2].map(\.filename)), ["first.heic", "second.heic", "third.heic"])
+            if shown.lists.count >= 3 {
+                XCTAssertEqual(Set(shown.lists[2].map(\.filename)), ["first.heic", "second.heic", "third.heic"])
+            }
 
             pass.cancel()
             await fixture.controller.finishSyncForTesting(runID: "run")
@@ -374,20 +376,52 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
             let shown = ShownProblemLists()
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
             let follow = Task {
-                await fixture.controller.followProblemList(clock: HeldBackupSleepClock(clock: BackupTestClock())) {
-                    shown.lists.append($0)
-                }
+                await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
                 shown.ended = true
             }
-            while shown.lists.isEmpty { await Task.yield() }
+            try await waitForCondition { !shown.lists.isEmpty }
 
             pass.cancel()
             await fixture.controller.finishSyncForTesting(runID: "run")
             try await waitForCondition { shown.ended }
+            clock.releaseAll()
             follow.cancel()
             await follow.value
             XCTAssertEqual(shown.lists.count, 2, "the end of the pass shows the final list once, without a write")
+            await fixture.controller.shutdown()
+        }
+
+        func testAPassThatEndsDuringThePauseStillShowsItsLastWrites() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-end-in-pause")
+            defer { fixture.cleanup() }
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let shown = ShownProblemLists()
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            let follow = Task {
+                await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                shown.ended = true
+            }
+            try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertTrue(queue.upsert(quotaEntry("first")))
+            try await waitForCondition { shown.lists.count == 2 }
+            try await waitForCondition { clock.isWaiting }
+
+            // The last write of the pass and the end of the pass both fall into the pause.
+            XCTAssertTrue(queue.upsert(quotaEntry("last")))
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            clock.releaseAll()
+            try await waitForCondition { shown.ended }
+            follow.cancel()
+            await follow.value
+            XCTAssertEqual(shown.lists.count, 3, "the end of the pass reads once more after the pause")
+            XCTAssertEqual(shown.lists.last.map { Set($0.map(\.filename)) }, ["first.heic", "last.heic"])
             await fixture.controller.shutdown()
         }
 

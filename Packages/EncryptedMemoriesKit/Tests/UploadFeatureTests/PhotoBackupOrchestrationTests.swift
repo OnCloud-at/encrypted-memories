@@ -816,30 +816,20 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         _ = lockStore.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(-Self.lease))
         XCTAssertTrue(lockStore.acquire(owner: .foreground, runID: runID).didAcquire)
 
-        actor ScanSignal {
-            var done = false
-            func markDone() { done = true }
-            func isDone() -> Bool { done }
-        }
-        let scanDone = ScanSignal()
+        let scanDone = BackupScanSignal()
         let instantEnqueueRan = IntBox()
 
         // Break `self` capture for Swift 6 isolation (runner is a stored property to self.runner).
         // Local lets make the closure capture only the actor value, not self.
         let runner = self.runner!
 
-        // Concurrent reconcile loop (mirrors reconcileWhileScanning): drain, and if the scan isn't done
-        // yet, yield and drain again. This is the loop that must pick up the mid-pass-enqueued asset.
-        async let reconcile: Void = {
-            while !Task.isCancelled {
-                await runner.runUntilDrained(mode: .eligibleOnly)
-                if await scanDone.isDone() {
-                    await runner.runUntilDrained(mode: .eligibleOnly)
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000)
-            }
-        }()
+        // The controller's own reconcile loop drains concurrently with the scan and must pick up the
+        // mid-pass-enqueued asset. The test clock ends its coalescing pauses at once.
+        let queue = self.queue!
+        let testClock = clock!
+        async let reconcile: BackupSyncProgress = PhotoLibraryBackupController.reconcileWhileScanning(
+            runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: testClock,
+            now: { testClock.now })
 
         // Scan phase. The full scan enumerates A and B (C is not in `infos` yet; it is the
         // change-observer asset). Partway through the scan we run the targeted instant-enqueue for C:
@@ -860,7 +850,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         _ = try await sync.run(engine: engine, identifiers: nil)
         await scanDone.markDone()
 
-        await reconcile
+        _ = await reconcile
         lockStore.release(runID: runID)
 
         // All three are backed up in this pass. C was enqueued mid-pass and drained by the same reconcile loop.
@@ -898,6 +888,10 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             store: catalog, enumerator: enumerator, chunkSize: 50, now: { [clock] in clock!.now })
         _ = try await targeted.run(engine: engine, identifiers: ["C"])
 
+        // The write woke the loop; it waits out the coalescing pause, so writes of the same chunk drain together.
+        try await waitForCondition { held.isWaiting }
+        XCTAssertTrue(uploader.requests.isEmpty, "the drain waits for the coalescing pause")
+        held.releaseAll()
         try await waitForCondition { [uploader] in uploader!.requests.map(\.name) == ["IMG_C.HEIC"] }
         let scanStillRuns = await !scanDone.isDone()
         XCTAssertTrue(scanStillRuns, "C uploads while the scan still runs")
@@ -965,14 +959,14 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
     func testNothingWaitsForADateWhenNoRowIsDueLater() throws {
         XCTAssertNil(PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now))
-        let draft = BackupIssueRecord(
-            kind: .unknown, detail: "draft", nextAttemptAt: clock.now.addingTimeInterval(90)
-        ).persistedValue
+        // The runner parks a draft with its re-check date as `updatedAt`.
+        let recheck = clock.now.addingTimeInterval(90)
+        let draft = BackupIssueRecord(kind: .remoteDraft, detail: "draft", nextAttemptAt: recheck).persistedValue
         XCTAssertTrue(
             queue.upsert(
                 UploadBackupSyncQueueEntry(
                     source: .init(kind: .photoLibraryAsset, identifier: "draft"), revision: .init(rawValue: 1),
-                    originalFilename: "draft.heic", state: .blockedByDraft, lastError: draft, updatedAt: clock.now)))
+                    originalFilename: "draft.heic", state: .blockedByDraft, lastError: draft, updatedAt: recheck)))
         XCTAssertEqual(
             PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now), 90,
             "a draft re-check wakes the drain at its date")

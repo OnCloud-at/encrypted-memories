@@ -551,18 +551,36 @@ public final class PhotoLibraryBackupController {
         let wake = BackupWorkWake()
         let follower = queueStore.map { wake.follow($0.changes()) }
         defer { follower?.cancel() }
+        let passEnd = PassEndWatch()
         await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
-        while isSyncing {
-            withObservationTracking {
-                _ = isSyncing
-            } onChange: {
-                Task { await wake.signal() }
-            }
+        guard isSyncing else { return }
+        while !Task.isCancelled {
+            watchPassEnd(passEnd, wake: wake)
             await wake.wait(clock: clock)
             guard !Task.isCancelled else { return }
+            // A pass that ended before this read, also during the pause, gets this one last read.
+            let passEnded = !isSyncing
             await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
-            guard isSyncing else { return }
+            if passEnded { return }
             try? await clock.sleep(for: coalescing)
+        }
+    }
+
+    /// One observation of `isSyncing` at a time: it wakes the problem list once when the pass ends.
+    @MainActor private final class PassEndWatch {
+        var isArmed = false
+    }
+
+    private func watchPassEnd(_ watch: PassEndWatch, wake: BackupWorkWake) {
+        guard !watch.isArmed else { return }
+        watch.isArmed = true
+        withObservationTracking {
+            _ = isSyncing
+        } onChange: {
+            Task { @MainActor in
+                watch.isArmed = false
+                await wake.signal()
+            }
         }
     }
 
@@ -990,13 +1008,15 @@ public final class PhotoLibraryBackupController {
     /// slow or resuming scan never delays uploads. Static + the heavy work is on the runner actor, so
     /// it never touches the main thread and does not depend on the controller's lifetime.
     /// Returns the last drain's policy state; the projector can still miss the runner's last callback at completion.
-    /// Between drains it waits for a committed queue write, the end of the scan, or the next persisted due date.
-    /// `nonisolated`: the due-date read is SQLite work and must stay off the main actor.
+    /// Between drains it waits for a committed queue write, the end of the scan, or the next persisted due date;
+    /// writes within `coalescing` seconds start one drain. `nonisolated`: the due-date read is SQLite work and must
+    /// stay off the main actor.
     nonisolated static func reconcileWhileScanning(
         runner: BackupSyncRunner,
         scanDone: BackupScanSignal,
         workIntent: LibraryWorkIntent,
         queue: UploadBackupSyncQueueManifestStore,
+        coalescing: TimeInterval = 1,
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) async -> BackupSyncProgress {
@@ -1008,7 +1028,7 @@ public final class PhotoLibraryBackupController {
             guard await runner.isQueueOperational() else { return progress }
             // A failed remote index cannot safely dedupe anything, and a closed runtime policy has
             // no eligible transport. End this pass and let the controller's typed retry scheduler
-            // choose the next attempt instead of hammering either condition four times per second.
+            // choose the next attempt instead of draining again at every queue write.
             if progress.remoteIndexPreparationFailed || progress.isPausedByPolicy {
                 return progress
             }
@@ -1021,17 +1041,18 @@ public final class PhotoLibraryBackupController {
             // Rows that are due now but were not taken (a full disk, a dismissed recheck) wait for the next write
             // or the end of the scan instead of a hot loop. Cancellation wakes the wait.
             await scanDone.wake.wait(atMost: nextDueDelay(in: queue, now: now()), clock: clock)
+            // More rows of the same scan chunk arrive together; the end of the scan drains at once.
+            if await !scanDone.isDone() { try? await clock.sleep(for: coalescing) }
         }
         return BackupSyncProgress()
     }
 
     /// Seconds until the next persisted retry date or draft re-check, or nil when nothing waits for a date.
     nonisolated static func nextDueDelay(in queue: UploadBackupSyncQueueManifestStore, now: Date) -> TimeInterval? {
-        var dates = [queue.nextRunnableDate(excludingSourcesOf: [])]
-        // The runner re-checks blocked drafts one batch at a time, oldest first; the same batch gives their dates.
-        dates += queue.entries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 32).map {
-            BackupIssueRecord.decode($0.lastError)?.nextAttemptAt
-        }
+        // A blocked draft stores its re-check date as `updatedAt`, as the runner's own wait reads it.
+        let dates = [
+            queue.nextRunnableDate(excludingSourcesOf: []), queue.earliestEntry(in: .blockedByDraft)?.updatedAt,
+        ]
         guard let next = dates.compactMap({ $0 }).filter({ $0 > now }).min() else { return nil }
         return next.timeIntervalSince(now)
     }
@@ -1938,6 +1959,7 @@ actor BackupWorkWake {
             pending = false
             return
         }
+        assert(waiter == nil, "one loop waits on a wake at a time")
         let timer = delay.map { delay in
             Task { [weak self] in
                 guard (try? await clock.sleep(for: max(0, delay))) != nil else { return }
