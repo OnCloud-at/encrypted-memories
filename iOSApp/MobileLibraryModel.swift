@@ -246,18 +246,14 @@ final class MobileLibraryModel {
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
     private(set) var photoBackup: PhotoLibraryBackupController?
-    /// Local photos on their way to Proton, merged into the whole-library grid (shared with macOS).
-    private(set) var pendingGrid: PendingGridSession?
-    @ObservationIgnored private var pendingStore: PendingBackupManifestStore?
-    @ObservationIgnored private var lastFavoriteIntents: [PhotoUID: Bool] = [:]
+    /// The pending grid of this account and its lists, shared with macOS. `PendingGridConnection` describes each one.
+    @ObservationIgnored private let pendingGridConnection = PendingGridConnection()
+    var pendingGrid: PendingGridSession? { pendingGridConnection.session }
     /// The grid's view of the library: Proton photos plus pending local photos.
     private(set) var pendingPresentation = PendingTimelinePresentation.empty
-    /// Local photos in "Zuletzt gelöscht", shown with the Proton trash.
-    private(set) var pendingTrash = PendingTrashPresentation.empty
-    /// Photos deleted before upload, for the Backup settings list.
-    private(set) var excludedPendingTiles: [PendingTile] = []
-    /// Changes when pending favorite intents change, so favorite displays refresh.
-    private(set) var pendingFavoriteRevision: UInt64 = 0
+    var pendingTrash: PendingTrashPresentation { pendingGridConnection.trash }
+    var excludedPendingTiles: [PendingTile] { pendingGridConnection.excludedTiles }
+    var pendingFavoriteRevision: UInt64 { pendingGridConnection.favoriteRevision }
     /// Offers to undo the last delete of pending photos.
     var undoNotice: UndoNoticeContent?
     /// Favorites as the app shows them, including the intents of pending photos.
@@ -377,16 +373,10 @@ final class MobileLibraryModel {
         client: ProtonClientFacade,
         feed: UIKitThumbnailFeed
     ) {
-        guard
-            let session = startPendingGrid(
-                store: store, photoBackup: photoBackup, remote: ProtonPendingRemoteEffects(facade: client), feed: feed)
-        else { return }
         let albums = client.albums
-        Task { [weak session] in
-            await albums.setPendingAlbumAdds { [weak session] uids, albumID in
-                await session?.addToAlbum(uids, albumID: albumID) ?? false
-            }
-        }
+        startPendingGrid(
+            store: store, photoBackup: photoBackup, remote: ProtonPendingRemoteEffects(facade: client), feed: feed,
+            albumAdds: { await albums.setPendingAlbumAdds($0) })
     }
 
     /// Shows the pending photos of `photoBackup` in the grid. Without `feed`, their thumbnails do not load.
@@ -395,43 +385,29 @@ final class MobileLibraryModel {
         store: PendingBackupManifestStore?,
         photoBackup: PhotoLibraryBackupController,
         remote: any PendingRemoteEffects,
-        feed: UIKitThumbnailFeed?
+        feed: UIKitThumbnailFeed?,
+        albumAdds: (@Sendable (@escaping @Sendable ([PhotoUID], String) async -> Bool) async -> Void)? = nil
     ) -> PendingGridSession? {
-        pendingStore = store
-        guard let store, let session = PendingGridSession(store: store, photoBackup: photoBackup, remote: remote)
-        else { return nil }
-        session.presenter.onChange = { [weak self] presentation in
-            self?.pendingPresentation = presentation
-        }
-        session.onListsChange = { [weak self, weak session] in
-            guard let self, let session else { return }
-            pendingTrash = session.trash
-            excludedPendingTiles = session.excludedTiles
-        }
-        session.onPendingChange = { [weak self] snapshot in
-            guard let self, snapshot.favoriteIntents != lastFavoriteIntents else { return }
-            lastFavoriteIntents = snapshot.favoriteIntents
-            pendingFavoriteRevision &+= 1
-        }
-        if let feed { session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request) }
-        pendingGrid = session
-        session.setRemote(snapshot)
-        session.start()
-        return session
+        pendingGridConnection.start(
+            store: store,
+            makeSession: { PendingGridSession(store: $0, photoBackup: photoBackup, remote: remote) },
+            albumAdds: albumAdds,
+            prepare: { session in
+                session.presenter.onChange = { [weak self] presentation in
+                    self?.pendingPresentation = presentation
+                }
+                if let feed { session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request) }
+                session.setRemote(snapshot)
+            }
+        )
     }
 
-    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
-    /// shuts down, and the store after it.
+    /// Retires the pending grid (`PendingGridConnection.retire()`) and clears the iOS grid presentation and the
+    /// undo notice.
     private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
-        let retired = (pendingGrid, pendingStore)
-        pendingGrid = nil
-        pendingStore = nil
+        let retired = pendingGridConnection.retire()
         pendingPresentation = .empty
-        pendingTrash = .empty
-        excludedPendingTiles = []
         undoNotice = nil
-        lastFavoriteIntents = [:]
-        pendingFavoriteRevision &+= 1
         return retired
     }
 
