@@ -111,7 +111,8 @@ public enum UnusedNetworkStorePurge {
     }
 
     /// iOS apps always run in their own container. A macOS app outside its own sandbox container
-    /// (`Containers/<bundle id>/Data/Library`) shares `Library/Cookies` with other apps, so the purge must not run there.
+    /// (`Containers/<bundle id>/Data/Library`) shares `Library/Cookies` with other apps,
+    /// so the purge must not run there.
     static func isSandboxContainerLibrary(_ library: URL, bundleIdentifier: String) -> Bool {
         let library = library.standardizedFileURL
         let data = library.deletingLastPathComponent()

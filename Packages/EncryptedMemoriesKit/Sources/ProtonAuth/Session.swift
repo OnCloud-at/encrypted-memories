@@ -197,8 +197,9 @@ public enum ProtonAuthLocalDataPurge {
         }.value
     }
 
-    /// The unused network store purge never fails or aborts sign-in, and it removes files only once.
-    /// That cold launch awaits its removal before an account opens; a failed removal retries at the next one.
+    /// The unused network store purge runs once per arming and never fails or aborts sign-in. Sign-out clears
+    /// its completion flag with the preferences, so the next cold launch runs it again; a failed removal also
+    /// retries at the next cold launch. Each run is awaited before an account opens.
     static func performStartupOffMain(
         claim: BackupLocalDataPurge.Claim?,
         defaults: SendableUserDefaults,

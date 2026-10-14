@@ -188,7 +188,8 @@ struct SessionHardeningTests {
         #expect(!BackupLocalDataPurge.isPurgePending(defaults: defaults))
     }
 
-    /// Drives the startup entry that both apps call, so an unhooked purge fails here.
+    /// Drives the internal startup overload that builds the purge closure, with an injected store location,
+    /// so an unhooked purge fails here. The public wrapper (`Location.current`, `.standard`) is not exercised.
     @Test func productionStartupCleanupRemovesTheUnusedNetworkStores() async throws {
         let suite = "auth-startup-network-wiring-test-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
