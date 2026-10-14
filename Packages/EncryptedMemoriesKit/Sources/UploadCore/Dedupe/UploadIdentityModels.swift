@@ -140,6 +140,11 @@ public struct UploadResourceDescriptor: Sendable {
         self.backupRevision = backupRevision
     }
 
+    /// A secondary of a main photo, for example the video of a Live Photo, counts as saved only through a remote
+    /// copy that is a related photo of `mainRemoteLinkID`. A main photo with the same name or the same bytes is
+    /// another file and proves nothing. The pipeline checks a burst member against its own rule first.
+    var needsRelatedProof: Bool { requiresRelatedMatch || mainRemoteLinkID != nil }
+
     public func withBackupRevision(_ revision: UploadBackupRevision) -> UploadResourceDescriptor {
         copy(backupRevision: revision)
     }

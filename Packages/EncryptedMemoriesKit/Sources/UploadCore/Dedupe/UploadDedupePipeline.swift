@@ -112,9 +112,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // Burst-member rule, see `UploadDuplicateDecisionPolicy.burstMemberCandidates`: the same bytes as an active
         // photo prove nothing. Only this member's own upload, or the server's related list, proves the relation.
         let isBurstMember = descriptor.source.resource.isBurstMember
-        // A secondary of an edited photo that replaces an earlier upload: its earlier copy is a related photo of
-        // the replaced photo and moves to the trash with it. Only a copy under the new main photo counts.
-        let requiresRelatedMatch = descriptor.requiresRelatedMatch && !isBurstMember
+        // A secondary of a main photo counts only a copy under that main photo. Another main file with the same name
+        // or bytes proves nothing. For a secondary of an edit that replaces an earlier upload this also holds: its
+        // earlier copy is a related photo of the replaced photo and moves to the trash with it.
+        let requiresRelatedMatch = descriptor.needsRelatedProof
         // A main photo of its own. It never adopts a related file of another photo, see `rootEligible`.
         let isRoot = descriptor.source.resource == .primary && descriptor.mainRemoteLinkID == nil
 
@@ -125,6 +126,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // `sources(withRemoteLinkID:)` scans the manifest without an index; once per hit that is quadratic in the
         // library size. Close the gap when the manifest has an indexed reverse lookup by remote link.
         // A frame of a replacing series edit skips it too: its row can name its copy under the replaced main photo.
+        // A secondary whose earlier row adopted a copy outside its main photo keeps that row on purpose: earlier marks
+        // are not checked again.
         if let cached, hmacReusable, !descriptor.requiresRelatedMatch,
             let outcome = cached.outcome.flatMap(UploadIdentityManifestStore.Outcome.init(rawValue:)),
             outcome == .uploaded || (outcome == .duplicateActive && !isBurstMember),
@@ -296,10 +299,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw detailedLookupError
         }
 
+        // What the server said about the copies under the main photo, read at most once in this resolve.
+        var relatedReads = RelatedProofReads()
         let nameCandidates: (items: [RemotePhotoDuplicate], provesLive: Bool)
         do {
             nameCandidates = try await candidates(
-                remoteItems, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
+                remoteItems, contentHash: contentHash, descriptor: descriptor, replacement: replacement,
+                relatedReads: &relatedReads)
         } catch {
             releasePendingUploadClaims(ownedBy: descriptor)
             throw error
@@ -331,7 +337,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                         let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
                         let contentCandidates = try await candidates(
                             batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement,
-                            requiresActiveMain: blockedByDraft)
+                            requiresActiveMain: blockedByDraft, relatedReads: &relatedReads)
                         provesLive = provesLive || contentCandidates.provesLive
                         let excluded =
                             blockedByDraft
@@ -597,8 +603,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             history: entry.replacementHistory(excluding: scope.knownForeignLinks))
     }
 
-    /// The remote rows that can prove this resource. A burst member and a secondary of a replacing edit count
-    /// only a copy under their main photo. A primary ignores the photos that an edit replaces or replaced and
+    /// The remote rows that can prove this resource. A burst member and a secondary of a main photo count
+    /// only a copy under their main photo as saved. A primary ignores the photos that an edit replaces or replaced and
     /// their related photos: the backup moves those to the trash itself, so they are neither this photo nor a
     /// deletion by the person.
     private func candidates(
@@ -606,21 +612,59 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         contentHash: String,
         descriptor: UploadResourceDescriptor,
         replacement: UploadReplacementScope,
-        requiresActiveMain: Bool = false
+        requiresActiveMain: Bool = false,
+        relatedReads: inout RelatedProofReads
     ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
         if descriptor.source.resource.isBurstMember {
             return (
                 try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor), false
             )
         }
-        if descriptor.requiresRelatedMatch {
+        if descriptor.needsRelatedProof {
+            // A secondary of a replacing edit counts only a copy under its main photo. A plain secondary drops only
+            // active copies elsewhere: a trashed or deleted copy keeps its meaning as a deletion by the person, and
+            // so does a draft. Only a row with these bytes can settle the secondary, so only such a row is checked.
+            let countsOnlyUnderTheMainPhoto: (RemotePhotoDuplicate) -> Bool = {
+                descriptor.requiresRelatedMatch ? $0.linkState != .draft : $0.linkState == .active
+            }
+            let toProve = Set(
+                remoteItems.filter { countsOnlyUnderTheMainPhoto($0) && $0.contentHash == contentHash }
+                    .compactMap(\.linkID))
             var relatedLinkIDs: Set<String> = []
-            if remoteItems.contains(where: { $0.linkState != .draft }), let mainLinkID = descriptor.mainRemoteLinkID {
-                relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+            if !toProve.isEmpty, let mainLinkID = descriptor.mainRemoteLinkID {
+                if descriptor.requiresRelatedMatch {
+                    // The main photo of a replacing edit is the upload that just finished, so its list can be read.
+                    if let read = relatedReads.relatedByMain[mainLinkID] {
+                        relatedLinkIDs = read
+                    } else {
+                        relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+                        relatedReads.relatedByMain[mainLinkID] = relatedLinkIDs
+                    }
+                } else {
+                    // The main photo can be in the trash, and the server refuses its list then. The role of each copy
+                    // answers in that case too. Every copy with these bytes needs an answer that states its role: a
+                    // failed read, a copy the answer leaves out, or an answer without the photo state fails the check,
+                    // so an unproven own copy never uploads a second time.
+                    let unasked = toProve.subtracting(relatedReads.askedLinks)
+                    if !unasked.isEmpty {
+                        let read = try await checker.linkVisibility(of: unasked.sorted())
+                        relatedReads.askedLinks.formUnion(unasked)
+                        relatedReads.visibility.merge(read) { _, new in new }
+                    }
+                    guard toProve.allSatisfy({ relatedReads.visibility[$0]?.hasExplicitPhotoState == true }) else {
+                        throw UploadError.backend("The role of a copy with these bytes is unavailable")
+                    }
+                    relatedLinkIDs = toProve.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
+                }
             }
             return (
                 remoteItems.filter { item in
-                    item.linkState == .draft || (item.linkID.map(relatedLinkIDs.contains) ?? false)
+                    guard let linkID = item.linkID else {
+                        // An active copy without a link is an inconsistent answer. It stays, so a plain secondary
+                        // fails closed as before.
+                        return !descriptor.requiresRelatedMatch || !countsOnlyUnderTheMainPhoto(item)
+                    }
+                    return !countsOnlyUnderTheMainPhoto(item) || relatedLinkIDs.contains(linkID)
                 }, false
             )
         }
@@ -809,6 +853,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             return
         }
         try replacementJournal?.unretire([linkID], for: source)
+    }
+
+    /// What one resolve learned about the copies that could prove a secondary.
+    private struct RelatedProofReads {
+        var relatedByMain: [String: Set<String>] = [:]
+        var visibility: [String: RemoteLinkVisibility] = [:]
+        var askedLinks: Set<String> = []
     }
 
     /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
