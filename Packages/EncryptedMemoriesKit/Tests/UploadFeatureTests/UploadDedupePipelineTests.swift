@@ -1168,7 +1168,7 @@ final class UploadDedupePipelineTests: XCTestCase {
             "an unproven role keeps the decision of the listing")
     }
 
-    func testASecondaryStillAdoptsItsCopyUnderItsMainPhotoWithoutAVisibilityRead() async throws {
+    func testASecondaryAdoptsItsCopyUnderItsMainPhotoWithOneRoleRead() async throws {
         let video = UploadResourceDescriptor(
             source: .file(URL(fileURLWithPath: "/photos/IMG_1.HEIC"), resource: .livePairedVideo),
             fileURL: URL(fileURLWithPath: "/photos/IMG_1.MOV"), filename: "IMG_1.MOV", fileSize: 1000,
@@ -1182,7 +1182,9 @@ final class UploadDedupePipelineTests: XCTestCase {
         let result = try await pipeline.resolve(video)
 
         XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "video-link"))
-        XCTAssertEqual(checker.linkVisibilityCallCount, 0)
+        // The copy proves the video only through its role. One read answers it, also for a main photo in the trash.
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+        XCTAssertTrue(checker.relatedLookups.isEmpty)
     }
 
     func testTheSDKFallbackNeverAdoptsARelatedFileForAPrimary() async throws {
