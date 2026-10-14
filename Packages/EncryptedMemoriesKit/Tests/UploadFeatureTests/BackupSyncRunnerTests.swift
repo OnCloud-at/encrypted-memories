@@ -4597,3 +4597,104 @@ private final class ActiveRowSamples: @unchecked Sendable {
     var values: [Int] { lock.withLock { samples } }
     func append(_ value: Int) { lock.withLock { samples.append(value) } }
 }
+
+/// A drain that waits for Wi-Fi resumes as soon as a runtime change or the "Use Cellular Data" setting allows it, not
+/// only after its poll interval (#458). The held clock never ends the poll while an assertion runs.
+extension BackupSyncRunnerTests {
+    private static let cellular = LibraryNetworkState(
+        path: LibraryNetworkPath(
+            isSatisfied: true, isExpensive: true, usedInterfaces: [.cellular], availableInterfaces: [.cellular]))
+    private static let offline = LibraryNetworkState(path: LibraryNetworkPath(isSatisfied: false))
+
+    private func pausedDrain(
+        signals: BackupRuntimeSignalSource
+    ) async -> (BackupSyncRunner, HeldBackupSleepClock, Task<BackupSyncProgress, Never>) {
+        let heldClock = HeldBackupSleepClock(clock: clock)
+        let runner = makeRunner(
+            throttleInputs: signals.current, runtimeChanges: signals.updates, schedulerClock: heldClock)
+        let pass = Task { await runner.runUntilDrained() }
+        let waiting = await waitUntil { heldClock.isWaiting }
+        XCTAssertTrue(waiting, "the drain waits for Wi-Fi")
+        return (runner, heldClock, pass)
+    }
+
+    func testWiFiWakesThePausedDrainBeforeItsPoll() async throws {
+        let due = seedEntry("wifi-returns.jpg")
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: Self.cellular))
+        let (runner, heldClock, pass) = await pausedDrain(signals: .mobileDataOff(runtime))
+        XCTAssertTrue(uploader.requests.isEmpty)
+
+        runtime.update { $0.network = Self.wiFi }
+        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        await runner.stop()
+        heldClock.releaseAll()
+        _ = await pass.value
+
+        XCTAssertTrue(uploaded, "Wi-Fi ends the wait without the poll interval")
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    func testProhibitedNetworkChangesKeepThePausedDrainWaiting() async throws {
+        let due = seedEntry("still-waiting.jpg")
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: Self.cellular))
+        let (runner, heldClock, pass) = await pausedDrain(signals: .mobileDataOff(runtime))
+
+        runtime.update { $0.network = Self.offline }
+        runtime.update { $0.network = Self.cellular }
+        let uploadedEarly = await waitUntil(timeout: .milliseconds(300)) { !self.uploader.requests.isEmpty }
+        let row = try XCTUnwrap(queueStore.entry(for: due.source, revision: due.revision))
+        runtime.update { $0.network = Self.wiFi }
+        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        await runner.stop()
+        heldClock.releaseAll()
+        _ = await pass.value
+
+        XCTAssertFalse(uploadedEarly, "offline and cellular data keep the backup waiting")
+        XCTAssertEqual(row.state, .discovered)
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertTrue(uploaded)
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    func testCancellationEndsThePausedWait() async throws {
+        _ = seedEntry("cancelled-wait.jpg")
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: Self.cellular))
+        let finished = BackupEventLog()
+        let heldClock = HeldBackupSleepClock(clock: clock)
+        let runner = makeRunner(
+            throttleInputs: BackupRuntimeSignalSource.mobileDataOff(runtime).current, schedulerClock: heldClock)
+        let pass = Task {
+            let result = await runner.runUntilDrained()
+            finished.append("finished")
+            return result
+        }
+        let waiting = await waitUntil { heldClock.isWaiting }
+        XCTAssertTrue(waiting)
+
+        pass.cancel()
+        let ended = await waitUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
+        heldClock.releaseAll()
+        _ = await pass.value
+
+        XCTAssertTrue(ended, "cancellation does not wait for the poll interval")
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testTurningOnMobileDataWakesThePausedDrain() async throws {
+        let due = seedEntry("mobile-data-on.jpg")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "BackupMobileDataWake-\(UUID().uuidString)"))
+        defaults.set(false, forKey: AppSettingsKey.backupUsesMobileData)
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: Self.cellular))
+        let (runner, heldClock, pass) = await pausedDrain(signals: .observing(runtime: runtime, defaults: defaults))
+
+        // The settings toggle writes this preference; no runtime change accompanies it.
+        defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
+        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        await runner.stop()
+        heldClock.releaseAll()
+        _ = await pass.value
+
+        XCTAssertTrue(uploaded, "the setting ends the wait without the poll interval")
+        XCTAssertEqual(uploader.requests.map(\.allowsExpensiveNetwork), [true])
+    }
+}
