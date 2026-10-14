@@ -565,7 +565,8 @@ public final class PhotoLibraryBackupController {
         }
         var passEnded = !isSyncing
         await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
-        while !passEnded {
+        // A pass that started during the read is followed as well; its start already woke this list.
+        while !passEnded || isSyncing {
             await wake.wait(clock: clock)
             guard !Task.isCancelled else { return }
             // A pass that ended before this read, also during the pause or the previous read, gets this last read.
