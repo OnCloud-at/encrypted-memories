@@ -2,6 +2,7 @@ import Foundation
 import PhotosCore
 import ProtonAuth
 import Testing
+import UploadCore
 
 @testable import ProtonDriveBackend
 
@@ -99,8 +100,10 @@ struct ProtonRequestTallyTests {
 
     @Test func anEnclosingCauseWinsUnlessTheWorkReplacesIt() async throws {
         let scopes = ProtonRequestCauseScopes()
-        let nested = await scopes.run(.duplicates) { await scopes.run(.trashWrite) { ProtonRequestContext.cause } }
-        #expect(nested == .duplicates)
+        let nested = await scopes.run(.duplicatesMerge) {
+            await scopes.run(.trashWrite) { ProtonRequestContext.cause }
+        }
+        #expect(nested == .duplicatesMerge)
         let replaced = await scopes.run(.timelineFull) {
             await scopes.run(.trashList, replacing: true) { ProtonRequestContext.cause }
         }
@@ -133,6 +136,32 @@ struct ProtonRequestTallyTests {
         #expect(download.totalCooldownSeconds == 0)
     }
 
+    @Test func aNonFiniteRetryAfterNeverReachesTheReport() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let permit = try await governor.acquire(scope: .api)
+        await governor.finish(permit, statusCode: 429, retryAfter: .infinity)
+        let snapshot = await governor.requestSupportSnapshot()
+        let api = try #require(snapshot.scopes.first { $0.scope == "api" })
+        #expect(api.maximumRetryAfterSeconds == nil)
+        #expect(api.totalCooldownSeconds.isFinite)
+        // The support report encodes with the default strategy, which throws on a non-finite number.
+        _ = try JSONEncoder().encode(snapshot)
+    }
+
+    @Test func servicesOutsideTheBridgeNameTheirCauseThroughTheirShutdownGate() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let resolver = ShutdownGatedUploadIdentityResolver(
+            base: RequestingResolver(governor: governor),
+            admission: JoinedShutdownGate(),
+            requestCause: ProtonRequestCauseBinding(scopes: governor.causes, cause: .backup)
+        )
+        await resolver.prime([])
+        // An enclosing cause still wins, so a duplicate merge that checks uploads stays a merge.
+        await governor.causes.run(.duplicatesMerge) { await resolver.prime([]) }
+        let causes = await governor.requestSupportSnapshot().counts.map(\.cause)
+        #expect(causes == ["backup", "duplicates.merge"])
+    }
+
     @Test func oneSummaryLinePerMinuteCoversThePreviousMinute() async throws {
         let clock = TallyTestClock()
         let lines = SummaryRecorder()
@@ -153,13 +182,18 @@ struct ProtonRequestTallyTests {
         try await request(.viewer, status: 200)
         #expect(
             lines.values == [
-                ["requests": "3", "causes": "thumbnails:2,timeline.full:1", "statuses": "2xx:2,5xx:1"]
+                [
+                    "requests": "3", "windowSeconds": "61", "causes": "thumbnails:2,timeline.full:1",
+                    "statuses": "2xx:2,5xx:1",
+                ]
             ])
 
         clock.now = clock.now.addingTimeInterval(120)
         try await request(.viewer, status: nil)
         #expect(lines.values.count == 2)
-        #expect(lines.values.last == ["requests": "1", "causes": "viewer:1", "statuses": "2xx:1"])
+        // The window after an idle period is longer than a minute and says so.
+        #expect(
+            lines.values.last == ["requests": "1", "windowSeconds": "120", "causes": "viewer:1", "statuses": "2xx:1"])
     }
 
     @Test func theKeyTableStaysBoundedAndCountsTheRestAsOverflow() {
@@ -227,6 +261,27 @@ struct ProtonRequestTallyTests {
 }
 
 private struct EmptyResponse: Decodable {}
+
+/// Sends one counted request from `prime`, the way the real pipeline reaches the network.
+private struct RequestingResolver: UploadIdentityResolving {
+    let governor: ProtonRequestGovernor
+
+    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+        throw CancellationError()
+    }
+
+    func recordUploaded(
+        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String, remoteLinkID: String
+    ) async throws {}
+
+    func prime(_ descriptors: [UploadResourceDescriptor]) async {
+        guard
+            let permit = try? await governor.acquire(
+                scope: .api, label: .api(method: "POST", path: "/drive/volumes/x/photos/duplicates"))
+        else { return }
+        await governor.finish(permit, statusCode: 200)
+    }
+}
 
 private final class AlwaysOKURLProtocol: URLProtocol {
     override static func canInit(with request: URLRequest) -> Bool { true }

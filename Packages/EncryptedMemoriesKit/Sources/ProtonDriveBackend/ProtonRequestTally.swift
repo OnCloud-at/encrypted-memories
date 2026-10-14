@@ -17,7 +17,10 @@ enum ProtonRequestCause: String, CaseIterable, Sendable {
     case trashWrite = "trash.write"
     case account
     case backup
-    case duplicates
+    /// Node reads of the duplicate ranking and of the merge plan.
+    case duplicatesRead = "duplicates.read"
+    /// Trash and restore of a duplicate merge.
+    case duplicatesMerge = "duplicates.merge"
     case series
     case albums
     case librarySave = "library.save"
@@ -128,6 +131,20 @@ final class ProtonRequestCauseScopes: @unchecked Sendable {
     }
 }
 
+/// The cause that a service names for its own requests. Services outside `DriveSDKBridge` actor isolation run their
+/// requests through their own shutdown admission, so they open the scope there. An enclosing cause still wins.
+struct ProtonRequestCauseBinding: Sendable {
+    let scopes: ProtonRequestCauseScopes
+    let cause: ProtonRequestCause
+
+    func run<T>(
+        isolation: isolated (any Actor)? = #isolation,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await scopes.run(cause, operation: operation)
+    }
+}
+
 /// Per-session request counts kept by the governor. Counts only: the keys hold code-owned names and endpoint templates.
 struct ProtonRequestTally: Sendable {
     struct Key: Hashable, Sendable {
@@ -175,16 +192,21 @@ struct ProtonRequestTally: Sendable {
         scope: ProtonRequestScope, retryAfter: TimeInterval?, cooldownFrom start: Date, until end: Date
     ) {
         var totals = scopes[scope] ?? ScopeTotals()
-        if let retryAfter { totals.maximumRetryAfter = max(totals.maximumRetryAfter ?? 0, retryAfter) }
+        // A malformed header can parse as infinity, which a JSON report cannot hold.
+        if let retryAfter, retryAfter.isFinite {
+            totals.maximumRetryAfter = max(totals.maximumRetryAfter ?? 0, retryAfter)
+        }
         totals.cooldownSeconds += max(0, end.timeIntervalSince(start))
         scopes[scope] = totals
     }
 
-    /// One line per minute with requests: the requests of the previous minute by cause and status class.
+    /// At most one line per minute, written by the first request after the window: the requests of the window by cause
+    /// and status class. An idle app writes no line, so no timer wakes it.
     private mutating func dueSummary(at timestamp: Date) -> [String: String]? {
         guard let start = summaryStart, timestamp.timeIntervalSince(start) >= Self.summaryInterval else { return nil }
         let total = summaryCauses.values.reduce(0, +)
-        var fields = ["requests": "\(total)"]
+        // The line is written by the first request after the minute, so it states the real window length.
+        var fields = ["requests": "\(total)", "windowSeconds": "\(Int(timestamp.timeIntervalSince(start)))"]
         fields["causes"] = summaryCauses.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
             .joined(separator: ",")
         fields["statuses"] = summaryStatuses.sorted { $0.key.rawValue < $1.key.rawValue }

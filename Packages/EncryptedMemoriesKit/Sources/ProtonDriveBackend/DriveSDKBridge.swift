@@ -218,6 +218,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
+    private nonisolated func requestCause(_ cause: ProtonRequestCause) -> ProtonRequestCauseBinding {
+        ProtonRequestCauseBinding(scopes: requestGovernor.causes, cause: cause)
+    }
+
     /// Every entry point names the work it does, so the request counts of the support report can tell the
     /// features apart. The cause does not change what or when the bridge requests.
     private nonisolated func withOpenSession<T: Sendable>(
@@ -1428,7 +1432,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         SDKAlbumCatalogBackend(
             client: photosClient,
             admission: shutdownGate,
-            sharedAlbumSnapshotCache: sharedAlbumSnapshotCache
+            sharedAlbumSnapshotCache: sharedAlbumSnapshotCache,
+            requestCause: requestCause(.albums)
         )
     }
 
@@ -1475,7 +1480,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
-        try await withOpenSession(cause: .timelineFilter) { bridge in
+        // The all-photos filter starts or joins the shared full load, so it counts as that load.
+        let cause: ProtonRequestCause = filter == .all ? .timelineFull : .timelineFilter
+        return try await withOpenSession(cause: cause) { bridge in
             try await bridge.timelineImpl(filter: filter)
         }
     }
@@ -1946,7 +1953,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             prepared: prepared,
             source: source,
             crypto: crypto,
-            admission: shutdownGate
+            admission: shutdownGate,
+            requestCause: requestCause(.viewer)
         )
         // Unique per-item URL so AVFoundation never reuses a cached asset/loader across videos.
         let host = uid.nodeID.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "stream"
@@ -2196,7 +2204,8 @@ extension DriveSDKBridge: PhotoUploading {
             return UploadIdentityResolverComposition(
                 resolver: ShutdownGatedUploadIdentityResolver(
                     base: DedupeUnavailableIdentityResolver(),
-                    admission: shutdownGate
+                    admission: shutdownGate,
+                    requestCause: requestCause(.backup)
                 ),
                 duplicateChecker: nil,
                 identityStore: nil,
@@ -2232,7 +2241,8 @@ extension DriveSDKBridge: PhotoUploading {
             replacementJournal: replacementJournal
         )
         return UploadIdentityResolverComposition(
-            resolver: ShutdownGatedUploadIdentityResolver(base: pipeline, admission: shutdownGate),
+            resolver: ShutdownGatedUploadIdentityResolver(
+                base: pipeline, admission: shutdownGate, requestCause: requestCause(.backup)),
             duplicateChecker: service,
             identityStore: store,
             contentIndex: store,
@@ -2250,7 +2260,8 @@ extension DriveSDKBridge: PhotoUploading {
         ProtonAlbumWriteService(
             session: driveSession,
             crypto: crypto,
-            admission: shutdownGate
+            admission: shutdownGate,
+            requestCause: requestCause(.albums)
         ) { [self] in
             try await photosShareContext()
         }
@@ -2479,17 +2490,17 @@ extension DriveSDKBridge: EditReplacementRemote {}
 extension DriveSDKBridge: ExactDuplicateRemote {
     /// The person merges duplicates, so the duplicates take the person's trash path.
     func trashDuplicates(_ uids: [PhotoUID]) async throws {
-        try await requestGovernor.causes.run(.duplicates) { try await trash(uids) }
+        try await requestGovernor.causes.run(.duplicatesMerge) { try await trash(uids) }
     }
 
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {
-        try await requestGovernor.causes.run(.duplicates) { try await restore(uids) }
+        try await requestGovernor.causes.run(.duplicatesMerge) { try await restore(uids) }
     }
 
     /// Reads the stored timeline, so ranking the photo to keep costs no request.
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
         let items =
-            (try? await withOpenSession(cause: .duplicates) { bridge in
+            (try? await withOpenSession(cause: .duplicatesRead) { bridge in
                 bridge.timelineStore?.items(for: uids) ?? []
             }) ?? []
         return Dictionary(items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })
@@ -2498,7 +2509,7 @@ extension DriveSDKBridge: ExactDuplicateRemote {
     /// Reads the node of each photo, so only the members of the groups that the screen ranks or merges cost a read.
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         guard !uids.isEmpty else { return [:] }
-        return try await requestGovernor.causes.run(.duplicates) {
+        return try await requestGovernor.causes.run(.duplicatesRead) {
             try await makeAlbumCatalogBackend().nodeFacts(of: uids)
         }
     }
