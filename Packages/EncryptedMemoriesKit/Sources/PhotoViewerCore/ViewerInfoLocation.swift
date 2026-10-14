@@ -6,6 +6,8 @@ public struct ViewerInfoLocation {
     public let markerTitle: String
     public let coordinateText: String?
     public let showsMap: Bool
+    /// Whether the location section has anything to show: a usable place name or the stored coordinates.
+    public var hasContent: Bool { placeName != nil || coordinateText != nil }
 
     public init(metadata: PhotoMetadata?, placeName: String?, mapAndPlacesEnabled: Bool) {
         let trimmed = placeName?.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -145,7 +145,7 @@ struct MobileViewerInfoSheet: View {
     private var locationSection: some View {
         let location = ViewerInfoLocation(
             metadata: metadata, placeName: placeName, mapAndPlacesEnabled: mapAndPlacesEnabled)
-        if placeName != nil || metadata?.hasLocation == true {
+        if location.hasContent {
             VStack(alignment: .leading, spacing: 10) {
                 if let placeName = location.placeName {
                     Label(placeName, systemImage: "mappin.and.ellipse")
