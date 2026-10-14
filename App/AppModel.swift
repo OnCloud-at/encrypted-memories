@@ -334,11 +334,12 @@ final class AppModel {
         guard scopeRecoveryTask == nil, facade == nil, case .failed = backend,
             case .signedIn(let session) = auth
         else { return }
+        let failed = backendTask
         Task {
             await backendRetry.run(
                 retire: { [weak self] in
-                    let failed = self?.backendTask
-                    self?.backendTask = nil
+                    // A sign-out must still find a preparation that replaced the failed one meanwhile.
+                    if self?.backendTask == failed { self?.backendTask = nil }
                     await failed?.value
                 },
                 start: { [weak self] in

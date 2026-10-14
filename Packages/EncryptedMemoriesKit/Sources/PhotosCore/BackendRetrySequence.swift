@@ -31,7 +31,8 @@ public final class BackendRetrySequence {
     }
 
     /// Ends the running retry, for example at sign-out: it starts no backend afterwards. Returns it, so a teardown
-    /// can wait for its retirement.
+    /// can wait for its retirement. A retry that starts after this call does not wait for the ended one, so the caller
+    /// awaits the returned task before it lets the next backend start.
     @discardableResult
     public func cancel() -> Task<Void, Never>? {
         let task = running

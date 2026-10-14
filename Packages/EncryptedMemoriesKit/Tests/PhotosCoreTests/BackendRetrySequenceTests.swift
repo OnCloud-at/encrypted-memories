@@ -18,6 +18,12 @@ final class BackendRetrySequenceTests: XCTestCase {
             events.append("retire ends")
         }
 
+        /// Releases the shutdown that began first.
+        func releaseFirstRetire() {
+            guard !retireGates.isEmpty else { return }
+            retireGates.removeFirst().resume()
+        }
+
         /// Releases every held shutdown, so a test never waits for a retry that a defect left blocked.
         func releaseRetire() {
             retireGates.forEach { $0.resume() }
@@ -92,6 +98,41 @@ final class BackendRetrySequenceTests: XCTestCase {
 
         XCTAssertEqual(
             recorder.events, ["retire begins", "retire ends", "returns"], "a sign-out during the retry starts nothing")
+    }
+
+    /// The caller of a cancelled retry returns after the next retry started; it must not end that retry's place, or a
+    /// later tap would start a third backend next to the second.
+    func testTheCallerOfACancelledRetryLeavesTheNextRetryInPlace() async {
+        let sequence = BackendRetrySequence()
+        let recorder = Recorder()
+        Task {
+            await sequence.run(retire: { await recorder.retire() }, start: { recorder.events.append("first start") })
+            recorder.events.append("first returns")
+        }
+        await waitUntil { recorder.isRetiring }
+        sequence.cancel()
+        Task {
+            await sequence.run(retire: { await recorder.retire() }, start: { recorder.events.append("second start") })
+            recorder.events.append("second returns")
+        }
+        await waitUntil { recorder.events.filter { $0 == "retire begins" }.count == 2 }
+        let second = sequence.current
+
+        // The first shutdown ends, and its caller returns, while the second retry still shuts down.
+        recorder.releaseFirstRetire()
+        await waitUntil { recorder.events.contains("first returns") }
+        XCTAssertNotNil(second)
+        XCTAssertEqual(sequence.current, second, "the second retry keeps its place")
+        Task {
+            await sequence.run(retire: { await recorder.retire() }, start: { recorder.events.append("third start") })
+            recorder.events.append("third returns")
+        }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(recorder.events.filter { $0 == "retire begins" }.count, 2, "a third tap joins the second retry")
+
+        recorder.releaseRetire()
+        await waitUntil { recorder.events.contains("second returns") && recorder.events.contains("third returns") }
+        XCTAssertEqual(recorder.events.filter { $0.hasSuffix("start") }, ["second start"])
     }
 
     func testAFinishedRetryLetsTheNextRetryRun() async {
