@@ -378,4 +378,4 @@ The software is provided without warranty or a support obligation. Dependencies 
 
 Apple and the Apple logo are trademarks of Apple Inc., registered in the U.S. and other countries and regions. App Store is a service mark of Apple Inc.
 
-Made with ❤️ in Austria 🇦🇹
+<p align="center">Made with ❤️ in Austria 🇦🇹</p>

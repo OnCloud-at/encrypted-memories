@@ -736,8 +736,9 @@ p { text-wrap: pretty; }
 
 .footer-origin {
   flex-basis: 100%;
-  margin: 0;
+  margin: 8px 0 0;
   font-size: 0.8rem;
+  text-align: center;
 }
 
 .site-footer div {
