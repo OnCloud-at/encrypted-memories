@@ -539,16 +539,30 @@ public final class PhotoLibraryBackupController {
         return Array(order.flatMap { items[$0] ?? [] }.prefix(limit))
     }
 
-    /// Gives `apply` the problem list now and, while a pass runs, again after each `interval`: a photo can get
-    /// another reason during a pass without changing a count, and the list then follows within `interval`.
+    /// Gives `apply` the problem list now and, while a pass runs, again after each committed queue write: a photo
+    /// can get another reason during a pass without changing a count. The first write after a quiet moment shows at
+    /// once; further writes within `coalescing` seconds are read together after it. The end of the pass reads once
+    /// more and stops.
     public func followProblemList(
-        limit: Int = 200, interval: Duration = .seconds(5), _ apply: ([BackupFailedItem]) -> Void
+        limit: Int = 200, coalescing: TimeInterval = 1, clock: any BackupSchedulerClock = BackupContinuousClock(),
+        _ apply: ([BackupFailedItem]) -> Void
     ) async {
+        // Subscribe before the first read, so a write between that read and the first wait is not lost.
+        let wake = BackupWorkWake()
+        let follower = queueStore.map { wake.follow($0.changes()) }
+        defer { follower?.cancel() }
         await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
         while isSyncing {
-            try? await Task.sleep(for: interval)
+            withObservationTracking {
+                _ = isSyncing
+            } onChange: {
+                Task { await wake.signal() }
+            }
+            await wake.wait(clock: clock)
             guard !Task.isCancelled else { return }
             await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
+            guard isSyncing else { return }
+            try? await clock.sleep(for: coalescing)
         }
     }
 
@@ -843,7 +857,8 @@ public final class PhotoLibraryBackupController {
             async let reconcile: BackupSyncProgress = Self.reconcileWhileScanning(
                 runner: runner,
                 scanDone: scanDone,
-                workIntent: workIntent
+                workIntent: workIntent,
+                queue: queueStore
             )
             do {
                 if let scanBody {
@@ -975,11 +990,18 @@ public final class PhotoLibraryBackupController {
     /// slow or resuming scan never delays uploads. Static + the heavy work is on the runner actor, so
     /// it never touches the main thread and does not depend on the controller's lifetime.
     /// Returns the last drain's policy state; the projector can still miss the runner's last callback at completion.
-    private static func reconcileWhileScanning(
+    /// Between drains it waits for a committed queue write, the end of the scan, or the next persisted due date.
+    static func reconcileWhileScanning(
         runner: BackupSyncRunner,
         scanDone: BackupScanSignal,
-        workIntent: LibraryWorkIntent
+        workIntent: LibraryWorkIntent,
+        queue: UploadBackupSyncQueueManifestStore,
+        clock: any BackupSchedulerClock = BackupContinuousClock(),
+        now: @escaping @Sendable () -> Date = { Date() }
     ) async -> BackupSyncProgress {
+        // Subscribe before the first drain, so a row enqueued after a drain wakes the next one.
+        let follower = scanDone.wake.follow(queue.changes())
+        defer { follower.cancel() }
         while !Task.isCancelled {
             let progress = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
             guard await runner.isQueueOperational() else { return progress }
@@ -995,11 +1017,22 @@ public final class PhotoLibraryBackupController {
                 let tail = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
                 return tail
             }
-            // Yield the CPU and let the scan enqueue more before the next drain (no hot empty spin).
-            // A cancelled sleep drops straight out via the loop condition; no busy loop on stop.
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            // Rows that are due now but were not taken (a full disk, a dismissed recheck) wait for the next write
+            // or the end of the scan instead of a hot loop. Cancellation wakes the wait.
+            await scanDone.wake.wait(atMost: nextDueDelay(in: queue, now: now()), clock: clock)
         }
         return BackupSyncProgress()
+    }
+
+    /// Seconds until the next persisted retry date or draft re-check, or nil when nothing waits for a date.
+    nonisolated static func nextDueDelay(in queue: UploadBackupSyncQueueManifestStore, now: Date) -> TimeInterval? {
+        var dates = [queue.nextRunnableDate(excludingSourcesOf: [])]
+        // The runner re-checks blocked drafts one batch at a time, oldest first; the same batch gives their dates.
+        dates += queue.entries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 32).map {
+            BackupIssueRecord.decode($0.lastError)?.nextAttemptAt
+        }
+        guard let next = dates.compactMap({ $0 }).filter({ $0 > now }).min() else { return nil }
+        return next.timeIntervalSince(now)
     }
 
     /// Runs the scan phase through the persistent catalog driver. `nonisolated` keeps SQLite and
@@ -1156,6 +1189,9 @@ public final class PhotoLibraryBackupController {
             refreshFromQueue()
             return true
         }
+
+        /// The queue store that this controller owns. Only it reports committed writes to the problem list.
+        internal var queueStoreForTesting: UploadBackupSyncQueueManifestStore? { queueStore }
 
         /// Turns the backup on without the launch resume, which reads the real photo library authorization again.
         internal func setEnabledForTesting() {
@@ -1867,6 +1903,61 @@ public final class PhotoLibraryBackupController {
 /// stop, instead of polling forever.
 actor BackupScanSignal {
     private var done = false
-    func markDone() { done = true }
+    /// Wakes the reconcile loop between drains.
+    nonisolated let wake = BackupWorkWake()
+    func markDone() async {
+        done = true
+        await wake.signal()
+    }
     func isDone() -> Bool { done }
+}
+
+/// Wakes one waiting loop when its work may have changed: a committed queue write, the end of a scan or pass, a
+/// persisted due date, or cancellation. Wakes that arrive while nobody waits count as one, so a burst of writes
+/// costs one more read instead of one per write.
+actor BackupWorkWake {
+    private var pending = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    /// True while a loop waits for its next wake.
+    var isWaiting: Bool { waiter != nil }
+
+    func signal() {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume()
+        } else {
+            pending = true
+        }
+    }
+
+    /// Returns after the next signal, at once when one is pending, or after `delay` seconds on `clock`.
+    func wait(atMost delay: TimeInterval? = nil, clock: any BackupSchedulerClock) async {
+        guard !pending, !Task.isCancelled else {
+            pending = false
+            return
+        }
+        let timer = delay.map { delay in
+            Task { [weak self] in
+                guard (try? await clock.sleep(for: max(0, delay))) != nil else { return }
+                await self?.signal()
+            }
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { waiter = $0 }
+        } onCancel: {
+            Task { await self.signal() }
+        }
+        timer?.cancel()
+        pending = false
+    }
+
+    /// Feeds every committed queue write into this wake until the caller cancels the returned task.
+    nonisolated func follow(_ changes: AsyncStream<UploadBackupSyncQueueChange>) -> Task<Void, Never> {
+        Task { [weak self] in
+            for await _ in changes {
+                await self?.signal()
+            }
+        }
+    }
 }
