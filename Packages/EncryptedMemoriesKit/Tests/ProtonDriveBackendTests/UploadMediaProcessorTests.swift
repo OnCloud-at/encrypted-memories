@@ -1,4 +1,6 @@
+import AVFoundation
 import CoreGraphics
+import CoreVideo
 import Foundation
 import ImageIO
 import Testing
@@ -6,99 +8,282 @@ import UniformTypeIdentifiers
 
 @testable import ProtonDriveBackend
 
-/// Uploaded thumbnails and previews are plain 8-bit SDR JPEGs that every Proton client shows correctly,
-/// also one that ignores embedded colour profiles (#269).
-@Suite("Upload thumbnail colour")
+/// Uploaded thumbnails and previews are opaque 8-bit JPEGs in sRGB or Display P3 (#269). HDR content is anchored at
+/// its reference white (ITU-R BT.2408), and every other source that is not sRGB or Display P3 is converted to sRGB, so
+/// a viewer that ignores an embedded profile still shows sRGB thumbnails correctly. Expected colours are fixed values,
+/// never a render of the source by the same conversion.
+@Suite("Upload thumbnail colour", .serialized)
 struct UploadMediaProcessorTests {
-    private struct Source {
-        let name: String
-        let space: CGColorSpace
-        let bitsPerComponent: Int
-        let bitmapInfo: UInt32
-    }
-
+    private static let tolerance = 6
+    /// The sRGB colour of every SDR source.
+    private static let fill = [199, 46, 46]
+    private static let opaque8 = CGImageAlphaInfo.noneSkipLast.rawValue
     private static let halfFloat =
         CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.floatComponents.rawValue
         | CGBitmapInfo.byteOrder16Little.rawValue
-    private static let opaque8 = CGImageAlphaInfo.noneSkipLast.rawValue
 
-    /// Sources whose colour space a viewer must understand to show the right colour: HDR photos (HLG, PQ),
-    /// the BT.2020 frames that AVAssetImageGenerator returns for HDR videos, and linear light.
-    private static let convertedSources: [Source] = [
-        source("HLG", CGColorSpace.itur_2100_HLG, halfFloat: true),
-        source("PQ", CGColorSpace.itur_2100_PQ, halfFloat: true),
-        source("BT.2020", CGColorSpace.itur_2020, halfFloat: true),
-        source("8-bit BT.2020", CGColorSpace.itur_2020, halfFloat: false),
-        source("linear sRGB", CGColorSpace.extendedLinearSRGB, halfFloat: true),
-    ]
+    // MARK: HDR
 
-    private static func source(_ name: String, _ spaceName: CFString, halfFloat: Bool) -> Source {
-        Source(
-            name: name,
-            space: CGColorSpace(name: spaceName)!,
-            bitsPerComponent: halfFloat ? 16 : 8,
-            bitmapInfo: halfFloat ? Self.halfFloat : opaque8
-        )
-    }
-
-    @Test(arguments: convertedSources.map(\.name))
-    func hdrAndWideGamutSourcesUploadSRGBJPEGs(_ name: String) async throws {
-        let source = try #require(Self.convertedSources.first { $0.name == name })
-        let image = try Self.image(in: source)
-        let thumbnails = try await Self.thumbnails(of: image)
-        let expected = try Self.managedSRGBColor(of: image)
+    /// BT.2408: reference white (HLG 0.75, PQ 0.58) shows as SDR white, 18 % grey (signal 0.38) as linear 0.128.
+    @Test(arguments: [
+        ("HLG reference white", 0.75, 255), ("HLG 18% grey", 0.38, 101),
+        ("PQ reference white", 0.58, 255), ("PQ 18% grey", 0.38, 100),
+    ])
+    func hdrStillsShowReferenceWhiteAsSDRWhite(name: String, signal: Double, expected: Int) async throws {
+        let spaceName = name.hasPrefix("HLG") ? CGColorSpace.itur_2100_HLG : CGColorSpace.itur_2100_PQ
+        let space = try #require(CGColorSpace(name: spaceName))
+        let image = try Self.signalImage(space, signal: signal)
+        let thumbnails = try await Self.thumbnails(ofStill: image)
         #expect(thumbnails.count == 2)
-        for thumbnail in thumbnails {
-            let decoded = try Self.decode(thumbnail.data)
-            #expect(decoded.bitsPerComponent == 8, "\(name) \(thumbnail.type)")
-            #expect(decoded.colorSpace?.name == CGColorSpace.sRGB, "\(name) \(thumbnail.type)")
-            // A viewer that ignores the embedded profile shows the raw bytes as sRGB.
-            let shown = try Self.rawColor(of: decoded)
-            #expect(Self.isClose(shown, expected), "\(name) \(thumbnail.type): shown \(shown), expected \(expected)")
+        for (type, data) in thumbnails {
+            let shown = try Self.shownSRGB(data, expectingName: CGColorSpace.sRGB)
+            #expect(Self.isClose(shown, [expected, expected, expected]), "\(name) \(type): \(shown)")
         }
     }
 
-    @Test func sRGBAndDisplayP3SourcesKeepTheirColourSpace() async throws {
-        for (spaceName, sourceName) in [(CGColorSpace.sRGB, "sRGB"), (CGColorSpace.displayP3, "Display P3")] {
-            let image = try Self.image(in: Self.source(sourceName, spaceName, halfFloat: false))
-            let thumbnails = try await Self.thumbnails(of: image)
-            let expected = try Self.managedSRGBColor(of: image)
-            #expect(thumbnails.count == 2)
-            for thumbnail in thumbnails {
-                let decoded = try Self.decode(thumbnail.data)
-                #expect(decoded.bitsPerComponent == 8, "\(sourceName) \(thumbnail.type)")
-                #expect(decoded.colorSpace?.name == spaceName, "\(sourceName) \(thumbnail.type)")
-                let shown = try Self.managedSRGBColor(of: decoded)
-                #expect(Self.isClose(shown, expected), "\(sourceName) \(thumbnail.type): \(shown) vs \(expected)")
+    /// An HLG video (iPhone records HDR video as HLG) takes the same conversion through its video frame.
+    @Test(arguments: [(0.75, 255), (0.38, 101)])
+    func hlgVideoFrameShowsReferenceWhiteAsSDRWhite(signal: Double, expected: Int) async throws {
+        let hlg = try #require(CGColorSpace(name: CGColorSpace.itur_2100_HLG))
+        let url = try Self.clip(
+            transfer: AVVideoTransferFunction_ITU_R_2100_HLG, primaries: AVVideoColorPrimaries_ITU_R_2020,
+            matrix: AVVideoYCbCrMatrix_ITU_R_2020, space: hlg, value: signal)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let thumbnails = await UploadMediaProcessor.thumbnails(for: url, isVideo: true)
+        #expect(thumbnails.count == 1)
+        let shown = try Self.shownSRGB(try #require(thumbnails.first).data, expectingName: CGColorSpace.sRGB)
+        #expect(Self.isClose(shown, [expected, expected, expected]), "\(shown)")
+    }
+
+    /// An ordinary SDR video frame is BT.709. Its code value 0.5 shows as sRGB 139 (Apple's video gamma 1.961).
+    @Test func sdrVideoFrameIsConvertedToSRGB() async throws {
+        let bt709 = try #require(CGColorSpace(name: CGColorSpace.itur_709))
+        let url = try Self.clip(
+            transfer: AVVideoTransferFunction_ITU_R_709_2, primaries: AVVideoColorPrimaries_ITU_R_709_2,
+            matrix: AVVideoYCbCrMatrix_ITU_R_709_2, space: bt709, value: 0.5)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let thumbnails = await UploadMediaProcessor.thumbnails(for: url, isVideo: true)
+        let shown = try Self.shownSRGB(try #require(thumbnails.first).data, expectingName: CGColorSpace.sRGB)
+        #expect(Self.isClose(shown, [139, 139, 139]), "\(shown)")
+    }
+
+    // MARK: SDR
+
+    /// Sources whose colour space is not sRGB or Display P3 are converted to sRGB and keep their colour.
+    @Test(arguments: ["BT.2020 16-bit", "BT.2020 8-bit", "linear sRGB", "unnamed Display P3 profile", "Adobe RGB"])
+    func otherSDRSourcesAreConvertedToSRGB(name: String) async throws {
+        let (space, bits): (CGColorSpace, Int) =
+            switch name {
+            case "BT.2020 16-bit": (try #require(CGColorSpace(name: CGColorSpace.itur_2020)), 16)
+            case "BT.2020 8-bit": (try #require(CGColorSpace(name: CGColorSpace.itur_2020)), 8)
+            case "linear sRGB": (try #require(CGColorSpace(name: CGColorSpace.extendedLinearSRGB)), 16)
+            case "Adobe RGB": (try #require(CGColorSpace(name: CGColorSpace.adobeRGB1998)), 8)
+            default: (try Self.unnamedDisplayP3(), 8)
             }
+        let image = try Self.filledImage(space, bits: bits, color: Self.fill)
+        for (type, data) in try await Self.thumbnails(ofStill: image) {
+            let shown = try Self.shownSRGB(data, expectingName: CGColorSpace.sRGB)
+            #expect(Self.isClose(shown, Self.fill), "\(name) \(type): \(shown)")
         }
     }
 
-    // MARK: - Helpers
+    /// A grey photo becomes an sRGB JPEG; its grey stays.
+    @Test func greySourceIsConvertedToSRGB() async throws {
+        let grey = [128, 128, 128]
+        let alpha = CGImageAlphaInfo.none.rawValue
+        let image = try Self.filledImage(CGColorSpaceCreateDeviceGray(), bits: 8, color: grey, bitmapInfo: alpha)
+        for (type, data) in try await Self.thumbnails(ofStill: image) {
+            let shown = try Self.shownSRGB(data, expectingName: CGColorSpace.sRGB)
+            #expect(Self.isClose(shown, grey), "\(type): \(shown)")
+        }
+    }
 
-    /// A 2,400 x 1,600 source of one colour, so the thumbnail is downscaled and the preview is not.
-    private static func image(in source: Source) throws -> CGImage {
+    /// sRGB and Display P3 sources keep their colour space, also at 16 bits per component; the JPEG has 8.
+    @Test(arguments: [("sRGB", 8), ("Display P3", 8), ("sRGB", 16), ("Display P3", 16)])
+    func sRGBAndDisplayP3SourcesKeepTheirColourSpace(spaceLabel: String, bits: Int) async throws {
+        let spaceName = spaceLabel == "sRGB" ? CGColorSpace.sRGB : CGColorSpace.displayP3
+        // 16-bit integer components: ImageIO decodes float components into the extended variant of a space.
+        let info = bits == 16 ? Self.opaque8 | CGBitmapInfo.byteOrder16Little.rawValue : Self.opaque8
+        let image = try Self.filledImage(
+            try #require(CGColorSpace(name: spaceName)), bits: bits, color: Self.fill, bitmapInfo: info)
+        for (type, data) in try await Self.thumbnails(ofStill: image) {
+            let shown = try Self.shownSRGB(data, expectingName: spaceName)
+            #expect(Self.isClose(shown, Self.fill), "\(spaceLabel) \(bits) \(type): \(shown)")
+        }
+    }
+
+    /// A source with an alpha channel is flattened to an opaque JPEG.
+    @Test func alphaSourceBecomesOpaque() async throws {
+        let space = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+        let alpha = CGImageAlphaInfo.premultipliedLast.rawValue
+        let image = try Self.filledImage(space, bits: 8, color: Self.fill, bitmapInfo: alpha)
+        for (type, data) in try await Self.thumbnails(ofStill: image) {
+            let decoded = try Self.decode(data)
+            #expect([CGImageAlphaInfo.none, .noneSkipFirst, .noneSkipLast].contains(decoded.alphaInfo), "\(type)")
+            #expect(Self.isClose(try Self.shownSRGB(data, expectingName: CGColorSpace.sRGB), Self.fill), "\(type)")
+        }
+    }
+
+    // MARK: Limits
+
+    /// When a source that needs a conversion cannot be converted, the thumbnail is omitted instead of uploaded with
+    /// the wrong colours. A source that needs no conversion still falls back to the unconverted image.
+    @Test func failedConversionOmitsTheThumbnail() throws {
+        let failing: (CGImage, Int, Int, CGColorSpace, Bool) -> CGImage? = { _, _, _, _, _ in nil }
+        let hlg = try Self.signalImage(try #require(CGColorSpace(name: CGColorSpace.itur_2100_HLG)), signal: 0.75)
+        let bt2020Space = try #require(CGColorSpace(name: CGColorSpace.itur_2020))
+        let bt2020 = try Self.filledImage(bt2020Space, bits: 8, color: Self.fill)
+        let sRGB = try Self.filledImage(try #require(CGColorSpace(name: CGColorSpace.sRGB)), bits: 8, color: Self.fill)
+        #expect(UploadMediaProcessor.sdrImage(of: hlg, maxPixel: 512, draw: failing) == nil)
+        #expect(UploadMediaProcessor.sdrImage(of: bt2020, maxPixel: 512, draw: failing) == nil)
+        #expect(UploadMediaProcessor.sdrImage(of: sRGB, maxPixel: 512, draw: failing) === sRGB)
+    }
+
+    /// One HDR conversion at a time: a second one waits. An SDR source never waits for the HDR gate.
+    @Test func hdrConversionsRunOneAtATime() async throws {
+        let gate = UploadMediaProcessor.hdrConversions
+        let hlg = try Self.signalImage(try #require(CGColorSpace(name: CGColorSpace.itur_2100_HLG)), signal: 0.75)
+        let hdrURL = try Self.tiff(hlg)
+        let sRGB = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+        let sdrURL = try Self.tiff(try Self.filledImage(sRGB, bits: 8, color: Self.fill))
+        defer {
+            try? FileManager.default.removeItem(at: hdrURL)
+            try? FileManager.default.removeItem(at: sdrURL)
+        }
+        await gate.acquire()
+        let held = Task { await UploadMediaProcessor.thumbnails(for: hdrURL, isVideo: false) }
+        var waited = false
+        for _ in 0..<1_000 where !waited {
+            waited = await gate.waitingCount == 1
+            if !waited { try await Task.sleep(for: .milliseconds(10)) }
+        }
+        #expect(waited, "a second HDR conversion must wait for the first")
+        let sdr = await UploadMediaProcessor.thumbnails(for: sdrURL, isVideo: false)
+        #expect(sdr.count == 2, "an SDR source does not take the HDR gate")
+        await gate.release()
+        #expect(await held.value.count == 2)
+        #expect(await gate.waitingCount == 0)
+    }
+
+    // MARK: Helpers
+
+    /// A 2,400 x 1,600 HDR image of one grey signal value, written exactly as half floats.
+    private static func signalImage(_ space: CGColorSpace, signal: Double) throws -> CGImage {
+        let width = 2_400
+        let height = 1_600
+        let value = Float16(signal)
+        var pixels = [Float16](repeating: value, count: width * height * 4)
+        for index in stride(from: 3, to: pixels.count, by: 4) { pixels[index] = 1 }
+        let data = pixels.withUnsafeBufferPointer { Data(buffer: $0) }
+        let provider = try #require(CGDataProvider(data: data as CFData))
+        return try #require(
+            CGImage(
+                width: width, height: height, bitsPerComponent: 16, bitsPerPixel: 64, bytesPerRow: width * 8,
+                space: space, bitmapInfo: CGBitmapInfo(rawValue: halfFloat), provider: provider, decode: nil,
+                shouldInterpolate: false, intent: .defaultIntent))
+    }
+
+    /// A 2,400 x 1,600 image in `space` filled with the sRGB colour `color`.
+    private static func filledImage(
+        _ space: CGColorSpace, bits: Int, color: [Int], bitmapInfo: UInt32? = nil
+    ) throws -> CGImage {
+        let info = bitmapInfo ?? (bits == 16 ? halfFloat : opaque8)
         let context = try #require(
             CGContext(
-                data: nil, width: 2_400, height: 1_600, bitsPerComponent: source.bitsPerComponent, bytesPerRow: 0,
-                space: source.space, bitmapInfo: source.bitmapInfo))
+                data: nil, width: 2_400, height: 1_600, bitsPerComponent: bits, bytesPerRow: 0, space: space,
+                bitmapInfo: info))
         let sRGB = try #require(CGColorSpace(name: CGColorSpace.sRGB))
-        let red = try #require(CGColor(colorSpace: sRGB, components: [0.78, 0.18, 0.18, 1]))
-        context.setFillColor(red)
+        let components = color.map { CGFloat($0) / 255 } + [1]
+        context.setFillColor(try #require(CGColor(colorSpace: sRGB, components: components)))
         context.fill(CGRect(x: 0, y: 0, width: 2_400, height: 1_600))
         return try #require(context.makeImage())
     }
 
-    /// Writes `image` as a TIFF with its colour profile and runs the production upload thumbnail path on it.
-    private static func thumbnails(of image: CGImage) async throws -> [(type: String, data: Data)] {
+    /// Display P3 whose profile header differs, so CoreGraphics does not recognize it as the named space.
+    private static func unnamedDisplayP3() throws -> CGColorSpace {
+        var icc = try #require(CGColorSpace(name: CGColorSpace.displayP3)?.copyICCData()) as Data
+        icc.replaceSubrange(80..<84, with: Array("XTST".utf8))
+        for index in 84..<100 { icc[index] = 0 }
+        let space = try #require(CGColorSpace(iccData: icc as CFData))
+        #expect(space.name == nil)
+        return space
+    }
+
+    private static func tiff(_ image: CGImage) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("upload-thumbnail-colour-\(UUID().uuidString).tiff")
-        defer { try? FileManager.default.removeItem(at: url) }
         let destination = try #require(
             CGImageDestinationCreateWithURL(url as CFURL, UTType.tiff.identifier as CFString, 1, nil))
         CGImageDestinationAddImage(destination, image, nil)
         #expect(CGImageDestinationFinalize(destination))
+        return url
+    }
+
+    /// Writes `image` as a TIFF with its colour profile and runs the production upload thumbnail path on it.
+    private static func thumbnails(ofStill image: CGImage) async throws -> [(type: String, data: Data)] {
+        let url = try tiff(image)
+        defer { try? FileManager.default.removeItem(at: url) }
         return await UploadMediaProcessor.thumbnails(for: url, isVideo: false).map { ("\($0.type)", $0.data) }
+    }
+
+    /// A three-frame ProRes clip of one grey `value` in the given transfer, written in the test.
+    private static func clip(
+        transfer: String, primaries: String, matrix: String, space: CGColorSpace, value: Double
+    ) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("upload-thumbnail-clip-\(UUID().uuidString).mov")
+        let width = 320
+        let height = 180
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.proRes422HQ, AVVideoWidthKey: width, AVVideoHeightKey: height,
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: primaries, AVVideoTransferFunctionKey: transfer,
+                    AVVideoYCbCrMatrixKey: matrix,
+                ],
+            ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
+                kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+            ])
+        writer.add(input)
+        #expect(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+        for frame in 0..<3 {
+            while !input.isReadyForMoreMediaData { usleep(1_000) }
+            let pool = try #require(adaptor.pixelBufferPool)
+            var created: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &created)
+            let buffer = try #require(created)
+            CVPixelBufferLockBaseAddress(buffer, [])
+            let base = try #require(CVPixelBufferGetBaseAddress(buffer)).assumingMemoryBound(to: Float16.self)
+            let rowLength = CVPixelBufferGetBytesPerRow(buffer) / 2
+            for row in 0..<height {
+                for column in 0..<width {
+                    let offset = row * rowLength + column * 4
+                    base[offset] = Float16(value)
+                    base[offset + 1] = Float16(value)
+                    base[offset + 2] = Float16(value)
+                    base[offset + 3] = 1
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, .shouldPropagate)
+            CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, primaries as CFString, .shouldPropagate)
+            CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, transfer as CFString, .shouldPropagate)
+            CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, matrix as CFString, .shouldPropagate)
+            #expect(adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 30)))
+        }
+        input.markAsFinished()
+        let finished = DispatchSemaphore(value: 0)
+        writer.finishWriting { finished.signal() }
+        finished.wait()
+        #expect(writer.status == .completed, "\(String(describing: writer.error))")
+        return url
     }
 
     private static func decode(_ data: Data) throws -> CGImage {
@@ -106,26 +291,25 @@ struct UploadMediaProcessorTests {
         return try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
     }
 
-    /// The colour CoreGraphics shows for `image` on an sRGB display, as 8-bit components.
-    private static func managedSRGBColor(of image: CGImage) throws -> [Int] {
+    /// Checks the 8-bit JPEG and its colour space name, then draws its centre into a known 8-bit RGBA sRGB context.
+    private static func shownSRGB(_ data: Data, expectingName name: CFString) throws -> [Int] {
+        let image = try decode(data)
+        #expect(image.bitsPerComponent == 8)
+        #expect(image.colorSpace?.name == name)
+        let sRGB = try #require(CGColorSpace(name: CGColorSpace.sRGB))
         let context = try #require(
             CGContext(
-                data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
-                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: opaque8))
+                data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: sRGB,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
         context.interpolationQuality = .none
-        context.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        let centre = try #require(
+            image.cropping(to: CGRect(x: image.width / 2, y: image.height / 2, width: 1, height: 1)))
+        context.draw(centre, in: CGRect(x: 0, y: 0, width: 1, height: 1))
         let pixel = try #require(context.data).assumingMemoryBound(to: UInt8.self)
         return (0..<3).map { Int(pixel[$0]) }
     }
 
-    /// The stored 8-bit components of the centre pixel, without any colour conversion.
-    private static func rawColor(of image: CGImage) throws -> [Int] {
-        let bytes = try #require(image.dataProvider?.data) as Data
-        let offset = (image.height / 2) * image.bytesPerRow + (image.width / 2) * (image.bitsPerPixel / 8)
-        return (0..<3).map { Int(bytes[offset + $0]) }
-    }
-
     private static func isClose(_ lhs: [Int], _ rhs: [Int]) -> Bool {
-        zip(lhs, rhs).allSatisfy { abs($0 - $1) <= 6 }
+        zip(lhs, rhs).allSatisfy { abs($0 - $1) <= tolerance }
     }
 }
