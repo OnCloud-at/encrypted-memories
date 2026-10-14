@@ -11,18 +11,6 @@ import Testing
         #expect(ActivityProgressBar.clamped(.infinity) == 0)
     }
 
-    @Test func barIsNamedAfterTheTitleOrElseTheCountLine() {
-        #expect(ActivityProgressRow.accessibilityLabel("Checking", "3 of 9") == "Checking")
-        #expect(ActivityProgressRow.accessibilityLabel(nil, "3 of 9") == "3 of 9")
-        #expect(ActivityProgressRow.accessibilityLabel(nil, nil) == nil)
-    }
-
-    @Test func voiceOverReadsTheCountLineOnceOnTheBarOfAnUntitledRow() {
-        #expect(ActivityProgressRow.barReadsDetail(title: nil, fraction: 0.5))
-        #expect(!ActivityProgressRow.barReadsDetail(title: "Checking", fraction: 0.5))
-        #expect(!ActivityProgressRow.barReadsDetail(title: nil, fraction: nil))
-    }
-
     @Test func stateLineUsesSeventyPercentOfTheReadableWidth() {
         // A wide window offers more than the readable width; the line stays at 70 % of it.
         #expect(ActivityProgressStateLayout.availableWidth(for: 1_200) == 320)

@@ -1,4 +1,3 @@
-import PhotosCore
 import SwiftUI
 
 /// One titled progress row for lists and empty states on macOS, iOS, and iPadOS: a short title, a count line, and the
@@ -43,24 +42,13 @@ public struct ActivityProgressRow: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
-                    // Without a title the bar reads this line as its label; VoiceOver reads it once, on the bar.
-                    .accessibilityHidden(Self.barReadsDetail(title: title, fraction: fraction))
             }
             if let fraction {
-                ActivityProgressBar(fraction: fraction, accessibilityLabel: Self.accessibilityLabel(title, detail))
+                // VoiceOver names the bar after the title. Without a title the visible count line says what the
+                // bar counts, so the bar keeps the system's reading of its percentage and nothing is read twice.
+                ActivityProgressBar(fraction: fraction, accessibilityLabel: title)
             }
         }
-    }
-
-    /// VoiceOver names the bar after the row's title, or after its count line when the row has no title. The bar
-    /// itself reports the fraction as its value.
-    nonisolated static func accessibilityLabel(_ title: String?, _ detail: String?) -> String? {
-        title ?? detail
-    }
-
-    /// The bar takes the count line as its label when the row has no title, so the line itself stays silent.
-    nonisolated static func barReadsDetail(title: String?, fraction: Double?) -> Bool {
-        title == nil && fraction != nil
     }
 }
 
