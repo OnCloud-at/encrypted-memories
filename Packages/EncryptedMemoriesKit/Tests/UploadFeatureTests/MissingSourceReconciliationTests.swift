@@ -187,8 +187,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(totals, [0, 0, 0], "the photo must not be queued again after each pass")
         XCTAssertEqual(resolver.resolveCount(for: "gone"), 1, "Photos is asked once")
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 1)
-        XCTAssertEqual(tracked.pages - pagesBefore, 2, "one catalog walk for the one drop, not one per pass")
-        XCTAssertNil(catalog.entry(for: "gone"), "the catalog no longer lists the photo")
+        XCTAssertEqual(tracked.pages - pagesBefore, 1, "one catalog walk for the one drop, not one per pass")
+        XCTAssertTrue(catalog.presentEntries(for: ["gone"]).isEmpty, "the catalog no longer lists the photo")
         XCTAssertEqual(queue.summary().sourceMissing, 0, "nothing is shown as a problem")
 
         // When Photos lists the photo again, it backs up as usual.
@@ -197,7 +197,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             engine: engine(clock: clock),
             changes: .init(changedIdentifiers: ["gone"], deletedIdentifiers: [], requiresFullRescan: false),
             commitChanges: {})
-        XCTAssertNotNil(catalog.entry(for: "gone"))
+        XCTAssertFalse(catalog.presentEntries(for: ["gone"]).isEmpty)
         resolver.set(.standard, for: "gone")
         let progress = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(progress.uploaded, 1)
@@ -238,7 +238,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             XCTAssertEqual(resolver.resolveCount(for: id), 4, "\(code): one attempt and three checks")
             XCTAssertEqual(queue.missingSourceDiscardGeneration(), generationBefore, "\(code)")
             XCTAssertEqual(tracked.pages, pagesBefore, "\(code): no catalog walk")
-            XCTAssertNotNil(catalog.entry(for: id), "\(code): the photo is still in the library")
+            XCTAssertFalse(catalog.presentEntries(for: [id]).isEmpty, "\(code): the photo is still in the library")
         }
     }
 

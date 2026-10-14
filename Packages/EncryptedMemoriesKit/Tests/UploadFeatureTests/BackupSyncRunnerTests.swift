@@ -1243,14 +1243,18 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(row.updatedAt, planned, "the planned check keeps its time")
     }
 
-    func testAPhotoThatPhotosNoLongerKnowsLeavesTheBackupAtOnce() async throws {
+    func testAFileThatPhotosCannotFindForAListedPhotoIsCheckedAgainLater() async throws {
+        // The photo is still listed; only its file cannot be found. It waits for the checks of a missing file
+        // instead of leaving the backup, so catalog recovery does not add it back on every pass.
         let entry = seedEntry("unknown.heic")
         resolver.set(
             .failure(photoKitFailure(.identifierNotFound, for: "unknown.heic"), times: 1), for: entry.source.identifier)
 
         _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
 
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.detail, BackupFailedItem.sourceReportedMissingDetail)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
     }
 
