@@ -349,10 +349,13 @@ jobs:
     outputs:
       architecture: ${{ steps.architecture.outcome }}
       shell: ${{ steps.shell.outcome }}
+      upgrade_probes: ${{ steps.upgrade-probes.outcome }}
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          # The Metal admission test reads the pinned historical releases by tag.
+          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/prepare-apple-build
         id: prepare
@@ -369,6 +372,20 @@ jobs:
         env:
           SKIP_XCODEGEN: "1"
         run: DERIVED_DATA_PATH="$HOME/Developer/xcode/EncryptedMemories/core-gate-dd.noindex/macOS" bash ./scripts/verify-macos-app-shell.sh
+      - name: Set up Python
+        id: python
+        if: ${{ !cancelled() }}
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
+      # The hygiene job runs these files on Ubuntu, but their darwin-only tests skip themselves there; only a macOS job runs them.
+      - name: Test the macOS upgrade probes
+        id: upgrade-probes
+        if: ${{ !cancelled() && steps.python.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_upgrade_metal.py
+          python3 .github/scripts/test_upgrade_journey.py UpgradeJourneyTests.test_native_macos_settings_pane_retries_only_unacknowledged_clicks
       - if: always()
         run: bash ./scripts/report-build-storage.sh
 
@@ -448,6 +465,11 @@ jobs:
       - name: Require macOS app shell
         env:
           RESULT: ${{ needs.macos-verification.outputs.shell }}
+        run: test "$RESULT" = success
+      - name: Require the macOS upgrade probe tests
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ needs.macos-verification.outputs.upgrade_probes }}
         run: test "$RESULT" = success
 
   ios-app-shell:
