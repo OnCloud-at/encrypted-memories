@@ -306,7 +306,8 @@ actor ProtonRequestGovernor {
     func finish(
         _ permit: Permit,
         statusCode: Int?,
-        retryAfter: TimeInterval? = nil
+        retryAfter: TimeInterval? = nil,
+        cancelled: Bool = false
     ) {
         guard var state = states[permit.scope], state.activePermitIDs.remove(permit.id) != nil else { return }
         state.inFlight = max(0, state.inFlight - 1)
@@ -317,7 +318,7 @@ actor ProtonRequestGovernor {
                 method: permit.label?.method ?? "OTHER",
                 endpoint: permit.label?.endpoint ?? "<unlabeled>",
                 cause: permit.cause,
-                status: ProtonRequestStatusClass(statusCode: statusCode)
+                status: ProtonRequestStatusClass(statusCode: statusCode, cancelled: cancelled)
             ),
             at: timestamp
         )

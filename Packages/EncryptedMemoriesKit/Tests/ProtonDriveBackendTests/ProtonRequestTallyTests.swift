@@ -43,6 +43,36 @@ struct ProtonRequestTallyTests {
         for (code, expected) in cases {
             #expect(ProtonRequestStatusClass(statusCode: code) == expected, "\(String(describing: code))")
         }
+        // A cancelled request is no network failure; a response that arrived keeps its own class.
+        #expect(ProtonRequestStatusClass(statusCode: nil, cancelled: true) == .cancelled)
+        #expect(ProtonRequestStatusClass(statusCode: 200, cancelled: true) == .success)
+        #expect(ProtonRequestStatusClass.isCancellation(CancellationError()))
+        #expect(ProtonRequestStatusClass.isCancellation(URLError(.cancelled)))
+        #expect(!ProtonRequestStatusClass.isCancellation(URLError(.timedOut)))
+        #expect(!ProtonRequestStatusClass.isCancellation(URLError(.notConnectedToInternet)))
+    }
+
+    @Test func aCancelledDriveSessionRequestCountsAsCancelledNotAsTransport() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let session = DriveSession(
+            session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
+            store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
+            accountCacheDirectory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("request-tally-tests-\(UUID().uuidString)"),
+            requestGovernor: governor,
+            urlProtocolClasses: [NeverAnsweringURLProtocol.self]
+        )
+        let request = Task {
+            let _: EmptyResponse = try await session.getJSON("/core/v4/users", as: EmptyResponse.self)
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while await governor.snapshot().api.inFlight == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        request.cancel()
+        _ = await request.result
+        let statuses = await governor.requestSupportSnapshot().counts.map(\.status)
+        #expect(statuses == ["cancelled"])
     }
 
     @Test func governorCountsEachFinishedRequestByEndpointCauseAndStatus() async throws {
@@ -89,6 +119,8 @@ struct ProtonRequestTallyTests {
         }
         try await callback()
         try await scopes.run(.thumbnails) { try await callback() }
+        // Local work sends no request, so it never appears in an inferred cause.
+        try await scopes.run(.local) { try await callback() }
         try await scopes.run(.thumbnails) {
             try await Task.detached {
                 try await scopes.run(.timelineFull) { try await callback() }
@@ -96,6 +128,8 @@ struct ProtonRequestTallyTests {
         }
         let causes = await governor.requestSupportSnapshot().counts.map(\.cause)
         #expect(causes == ["unattributed", "~thumbnails", "~thumbnails+timeline.full"])
+        let unattributed = await governor.requestSupportSnapshot().counts.first { $0.cause == "unattributed" }
+        #expect(unattributed?.count == 2)
     }
 
     @Test func anEnclosingCauseWinsUnlessTheWorkReplacesIt() async throws {
@@ -294,6 +328,14 @@ private final class AlwaysOKURLProtocol: URLProtocol {
         client?.urlProtocol(self, didLoad: Data("{}".utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
+    override func stopLoading() {}
+}
+
+/// Holds every request until its task is cancelled, the way a scrolled-away thumbnail fetch ends.
+private final class NeverAnsweringURLProtocol: URLProtocol {
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {}
     override func stopLoading() {}
 }
 

@@ -104,7 +104,8 @@ final class DriveSession: @unchecked Sendable {
         do {
             (data, response) = try await urlSession.data(for: req)
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {
@@ -332,7 +333,8 @@ extension DriveSession {
         do {
             (data, response) = try await storageSession.data(for: req)
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {

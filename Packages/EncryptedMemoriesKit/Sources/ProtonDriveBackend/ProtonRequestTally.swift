@@ -25,6 +25,9 @@ enum ProtonRequestCause: String, CaseIterable, Sendable {
     case albums
     case librarySave = "library.save"
     case tags
+    /// Shared reads and favorite writes that keep a photo's albums and favorite state when another copy replaces
+    /// it: series dissolution, duplicate merge and edit replacement all use them.
+    case carryOver = "carryover"
     case photosRoot = "photos.root"
     /// Session-gated work that normally reads only local stores.
     case local
@@ -71,6 +74,11 @@ struct ProtonRequestLabel: Sendable, Equatable {
 }
 
 enum ProtonRequestStatusClass: String, Sendable {
+    /// A thrown cancellation, either Swift's or the one URLSession reports for a cancelled task.
+    static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
+
     case success = "2xx"
     case redirect = "3xx"
     case unauthorized = "401"
@@ -80,10 +88,12 @@ enum ProtonRequestStatusClass: String, Sendable {
     case clientError = "4xx"
     case serverError = "5xx"
     case transport
+    /// The caller cancelled the request, for example a thumbnail that scrolled away. Not a network failure.
+    case cancelled
 
-    init(statusCode: Int?) {
+    init(statusCode: Int?, cancelled: Bool = false) {
         switch statusCode {
-        case nil: self = .transport
+        case nil: self = cancelled ? .cancelled : .transport
         case 401: self = .unauthorized
         case 404: self = .notFound
         case 408: self = .timeout
@@ -114,7 +124,8 @@ final class ProtonRequestCauseScopes: @unchecked Sendable {
     ) async rethrows -> T {
         let effective = replacing ? cause : (ProtonRequestContext.cause ?? cause)
         let id = UUID()
-        lock.withLock { active[id] = effective }
+        // Local work sends no request, so it must not take part in inferring the cause of a callback request.
+        if effective != .local { lock.withLock { active[id] = effective } }
         defer { _ = lock.withLock { active.removeValue(forKey: id) } }
         return try await ProtonRequestContext.$cause.withValue(effective) {
             try await operation()

@@ -1576,8 +1576,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     /// The backup moves the photos that an edit replaced to the trash. This is no deletion by the person.
+    /// Only an edit replacement of the backup trashes a replaced photo.
     func trashReplaced(_ uids: [PhotoUID]) async throws {
-        try await moveToTrash(uids)
+        try await requestGovernor.causes.run(.backup) { try await moveToTrash(uids) }
     }
 
     private func moveToTrash(_ uids: [PhotoUID]) async throws {
@@ -2517,7 +2518,7 @@ extension DriveSDKBridge: ExactDuplicateRemote {
 
 extension DriveSDKBridge: SeriesDissolutionRemote {
     func ownPhotosVolumeID() async throws -> String {
-        try await withOpenSession(cause: .series) { bridge in
+        try await withOpenSession(cause: .carryOver) { bridge in
             try await bridge.resolvePhotosRoot().volumeID
         }
     }
@@ -2529,7 +2530,7 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
     }
 
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
-        try await withOpenSession(cause: .series) { bridge in
+        try await withOpenSession(cause: .carryOver) { bridge in
             let active = try await bridge.activeNodeIDs(Set(uids.map(\.nodeID)))
             return Set(uids.filter { active.contains($0.nodeID) })
         }
@@ -2538,13 +2539,13 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
         // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
-        let favorites = try await requestGovernor.causes.run(.series) { try await favoriteUIDs() }
+        let favorites = try await requestGovernor.causes.run(.carryOver) { try await favoriteUIDs() }
         return Set(uids.filter(favorites.contains))
     }
 
     func markFavorite(_ uids: [PhotoUID]) async throws {
         // `setFavorites` throws unless every node confirms the tag, so a partial write never counts as success.
-        try await requestGovernor.causes.run(.series) { try await setFavorites(uids, true) }
+        try await requestGovernor.causes.run(.carryOver) { try await setFavorites(uids, true) }
     }
 
     /// The series dissolution moves the photos of a dissolved series to the trash. This is no deletion by the person.
