@@ -29,7 +29,7 @@ final class AlbumSyncRetryScenarioTests: XCTestCase {
         var reports: [AlbumSyncReport] = []
         var memberCounts: [Int] = []
         for _ in 0..<3 {
-            reports.append(try await syncAlbum(on: device, identifiers: assets.keys.sorted()))
+            reports.append(try await device.syncAlbum(assets.keys.sorted(), backup: RetryAlbumBackup(device: device)))
             memberCounts.append(try await device.server.childMainLinkIDs(albumID: "own-album").count)
         }
 
@@ -47,41 +47,11 @@ final class AlbumSyncRetryScenarioTests: XCTestCase {
         XCTAssertEqual(device.server.links.first { $0.uid == blockingDraft }?.state, .draft)
         XCTAssertEqual(device.server.uploadRequestCount, 2, "Only asset-1 and asset-2 upload, each once")
     }
-
-    /// One Album Sync of the scenario album with the real runner, manifest lookup and mapping store.
-    private func syncAlbum(on device: EditScenarioHarness, identifiers: [String]) async throws -> AlbumSyncReport {
-        let album = LocalAlbumSummary(id: "local-album", title: "Scenario album", assetCount: identifiers.count)
-        let lookup = try XCTUnwrap(
-            UploadManifestRemoteLinkLookup(
-                manifestURL: device.directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
-                policy: .conservative))
-        let mapping = try XCTUnwrap(
-            AlbumSyncMappingStore(
-                url: device.directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)))
-        defer { mapping.close() }
-        let runner = AlbumSyncRunner(
-            localSource: RetryAlbumSource(identifiers: identifiers),
-            backup: RetryAlbumBackup(device: device),
-            remoteOps: device.server, linkLookup: lookup, mappingStore: mapping)
-        do {
-            let report = try await runner.sync(album: album, resolution: .attachToExisting(remoteAlbumID: "own-album"))
-            await lookup.shutdown()
-            return report
-        } catch {
-            await lookup.shutdown()
-            throw error
-        }
-    }
-}
-
-private struct RetryAlbumSource: AlbumSyncLocalAlbumSource {
-    let identifiers: [String]
-    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
-    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(identifiers) }
 }
 
 /// Like the album executor, each run starts with an empty queue and backup state, so every photo of the album goes
-/// through the duplicate check again. Then it reports the unresolved album rows.
+/// through scan, preflight and the identity resolver again; a photo that is already known settles from the upload
+/// manifest. Then it reports the unresolved album rows.
 private final class RetryAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
     let device: EditScenarioHarness
     init(device: EditScenarioHarness) { self.device = device }
@@ -89,7 +59,7 @@ private final class RetryAlbumBackup: AlbumSyncBackupExecuting, @unchecked Senda
     func ensureBackedUp(
         localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport {
-        try device.resetAlbumSyncScratch(localIdentifiers)
+        try device.resetAlbumSyncScratch()
         try await device.enqueue()
         await device.pass()
         let album = Set(localIdentifiers)
