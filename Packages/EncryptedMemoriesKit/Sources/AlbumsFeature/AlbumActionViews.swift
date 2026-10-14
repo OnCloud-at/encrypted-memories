@@ -1,4 +1,5 @@
 import AlbumCore
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 
@@ -165,9 +166,7 @@ public struct AlbumDestinationPicker: View {
         } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text(message).font(.caption).foregroundStyle(.secondary)
-                Button(L10n.string("albums.try_again")) {
-                    Task { await coordinator.refresh() }
-                }
+                RetryButton(.compact) { Task { await coordinator.refresh() } }
             }
         } else if coordinator.albums.isEmpty {
             VStack(spacing: 8) {

@@ -512,8 +512,7 @@ public struct PhotoViewerView: View {
             Text(error.userMessage)
         } actions: {
             if error.isRetryable {
-                Button(L10n.string("action.retry")) { model.retry() }
-                    .buttonStyle(.glassProminent)
+                RetryButton(.prominent) { model.retry() }
             }
         }
         .fixedSize()

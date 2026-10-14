@@ -588,13 +588,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Noch keine Alben" } }
       }
     },
-    "albums.try_again": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Try Again" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Erneut versuchen" } }
-      }
-    },
     "error.album_created_add_failed %@": {
       "extractionState": "manual",
       "localizations": {
@@ -1221,14 +1214,6 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Hiding a notice does not back up the photo." } },
         "de": { "stringUnit": { "state": "translated", "value": "Ein ausgeblendeter Hinweis sichert das Foto nicht." } }
-      }
-    },
-    "backup.failed_sheet_retry": {
-      "extractionState": "manual",
-      "comment": "Button in the failed-items sheet that retries all retryable items now.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Try again" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Erneut versuchen" } }
       }
     },
     "backup.failed_sheet_done": {
@@ -2097,7 +2082,7 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Retry"
+            "value": "Try again"
           }
         },
         "de": {
@@ -4546,23 +4531,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Sign-out not completed"
-          }
-        }
-      }
-    },
-    "sign_out.try_again": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Erneut versuchen"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Try again"
           }
         }
       }

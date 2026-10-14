@@ -213,8 +213,7 @@ public struct TimelineView: View {
             Text(message)
                 .textSelection(.enabled)
         } actions: {
-            Button(L10n.string("action.retry")) { Task { await model.retry() } }
-                .buttonStyle(.borderedProminent)
+            RetryButton(.prominent) { Task { await model.retry() } }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
