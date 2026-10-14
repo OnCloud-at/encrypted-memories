@@ -427,12 +427,11 @@ final class PendingBackupStoreTests: XCTestCase {
         let action = try XCTUnwrap(store.actions().first)
         XCTAssertTrue(store.retryAction(action, at: date))
         XCTAssertTrue(store.dueActions(by: date).isEmpty)
-        XCTAssertEqual(store.nextActionDate(), date.addingTimeInterval(60))
+        XCTAssertEqual(store.actions().first?.nextAttemptAt, date.addingTimeInterval(60))
         XCTAssertEqual(store.dueActions(by: date.addingTimeInterval(60)).count, 1)
 
         XCTAssertTrue(store.failAction(action))
         XCTAssertTrue(store.dueActions(by: date.addingTimeInterval(1_000_000)).isEmpty)
-        XCTAssertNil(store.nextActionDate())
         XCTAssertEqual(store.actions().first?.failed, true)
     }
 

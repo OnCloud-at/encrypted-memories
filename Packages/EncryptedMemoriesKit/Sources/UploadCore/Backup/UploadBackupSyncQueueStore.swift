@@ -218,7 +218,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     throw UploadRemoteCommitRecoveryError.storeUnavailable
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
-                guard let reconciliation = strictReconciliation(stmt, column: 10) else {
+                guard let reconciliation = reconciliation(stmt, column: 10) else {
                     operationFailed = true
                     throw UploadRemoteCommitRecoveryError.malformedReceipt(source, revision)
                 }
@@ -1708,19 +1708,6 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     private func reconciliation(
-        _ stmt: OpaquePointer?,
-        column: Int32
-    ) -> UploadRemoteCommitReconciliation? {
-        guard sqlite3_column_type(stmt, column) != SQLITE_NULL,
-            let bytes = sqlite3_column_blob(stmt, column)
-        else {
-            return nil
-        }
-        let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, column)))
-        return try? JSONDecoder().decode(UploadRemoteCommitReconciliation.self, from: data)
-    }
-
-    private func strictReconciliation(
         _ stmt: OpaquePointer?,
         column: Int32
     ) -> UploadRemoteCommitReconciliation? {
