@@ -1307,6 +1307,92 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(mergeJournal.pendingMerges(), [first], "the refused merge waits for the next scan")
     }
 
+    /// The check at the account start and the check at the start of a scan can begin together. The second waits for the
+    /// first, so only one of them restores the duplicate of an open merge.
+    func testTwoPendingMergeChecksRunOneAfterTheOther() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        // The merge trashed its duplicate, and another device trashed the kept photo at the same moment.
+        for link in [duplicate, kept] { server.personTrash(link) }
+        XCTAssertTrue(
+            mergeJournal.record([
+                pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+            ]))
+        let remote = RestoreGatedRemote(base: server)
+        let finder = finder(remote: remote)
+        let first = Task { await finder.resolvePendingMerges() }
+        try await waitUntil { remote.arrivals == 1 }
+        let readsBefore = server.readCounts.visibility
+
+        let second = Task { await finder.resolvePendingMerges() }
+        // A second check that does not wait reads the open merge and restores the duplicate again.
+        try await waitUntil { finder.pendingChecks.waiting == 1 }
+        XCTAssertEqual(server.readCounts.visibility, readsBefore, "the second check waits for the first")
+        remote.gate.open()
+        await first.value
+        await second.value
+
+        XCTAssertEqual(remote.arrivals, 1, "one check restores the duplicate")
+        XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
+        XCTAssertEqual(state(of: duplicate), .active)
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    /// A check that waits for another check ends without a read when its task is cancelled, for example at sign-out.
+    func testACancelledPendingMergeCheckStopsWaitingForTheRunningOne() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        for link in [duplicate, kept] { server.personTrash(link) }
+        XCTAssertTrue(
+            mergeJournal.record([
+                pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+            ]))
+        let remote = RestoreGatedRemote(base: server)
+        let finder = finder(remote: remote)
+        let first = Task { await finder.resolvePendingMerges() }
+        try await waitUntil { remote.arrivals == 1 }
+        let readsBefore = server.readCounts.visibility
+        let second = Task { await finder.resolvePendingMerges() }
+        let ended = EndFlag()
+        Task {
+            await second.value
+            ended.set()
+        }
+        try await waitUntil { finder.pendingChecks.waiting == 1 }
+
+        second.cancel()
+        try await waitUntil { ended.isSet }
+        // A check whose task was cancelled before it reached the queue does not wait either.
+        let cancelledEarly = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await finder.resolvePendingMerges()
+        }
+        let endedEarly = EndFlag()
+        Task {
+            await cancelledEarly.value
+            endedEarly.set()
+        }
+        try await waitUntil { endedEarly.isSet }
+
+        XCTAssertEqual(finder.pendingChecks.waiting, 0)
+        XCTAssertEqual(server.readCounts.visibility, readsBefore, "the cancelled checks read nothing")
+        remote.gate.open()
+        await first.value
+        XCTAssertEqual(remote.arrivals, 1)
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    /// Waits up to five seconds for `condition`, so a missing event fails the test instead of hanging it.
+    private func waitUntil(
+        _ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(condition(), "the condition did not become true", file: file, line: line)
+    }
+
     func testLateJournalWritesCannotRecreateAPurgedAccountDirectory() throws {
         let kept = server.seedLink(digest: digest("a"))
         let duplicate = server.seedLink(digest: digest("a"))
@@ -2866,6 +2952,42 @@ private final class TrashStoppingRemote: ExactDuplicateRemote, @unchecked Sendab
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
     func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
+}
+
+/// Holds every restore before it reaches the server while its gate is closed, and counts the restores that arrived.
+private final class RestoreGatedRemote: ExactDuplicateRemote, @unchecked Sendable {
+    let base: EditScenarioServer
+    let gate = FinderGate()
+    private let lock = NSLock()
+    private var _arrivals = 0
+
+    init(base: EditScenarioServer) { self.base = base }
+
+    var arrivals: Int { lock.withLock { _arrivals } }
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws {
+        lock.withLock { _arrivals += 1 }
+        await gate.pass()
+        try await base.restoreDuplicates(uids)
+    }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
+}
+
+/// Turns true once.
+private final class EndFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
 }
 
 /// The server as one device reads it: its timeline does not know the capture dates of `unknown`.
