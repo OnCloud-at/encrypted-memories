@@ -213,6 +213,17 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         XCTAssertTrue(checker.relatedLookups.isEmpty)
     }
 
+    func testAVideoOfAReplacingEditReadsTheListOfItsMainPhotoOnce() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video")]
+        checker.remoteItemsByContentHash[videoContentHash] = activeRow("elsewhere", name: "OTHER.MOV")
+        checker.relatedLinkIDsByMainLinkID["live-main"] = []
+
+        let result = try await pipeline.resolve(video(replacesEarlierUpload: true))
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertEqual(checker.relatedLookups, ["live-main"], "the list of the new main photo is read once")
+    }
+
     func testAnOwnInterruptedDraftNextToAnUnrelatedCopyIsReplaced() async throws {
         let pipeline = UploadDedupePipeline(
             store: store, hasher: hasher, checker: checker, currentClientUID: "this-installation")

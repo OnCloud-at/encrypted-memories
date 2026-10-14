@@ -845,8 +845,6 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         try replacementJournal?.unretire([linkID], for: source)
     }
 
-    /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
-    /// an active row with the member's content exists, so a new series costs no extra request.
     /// What one resolve learned about the copies that could prove a secondary.
     private struct RelatedProofReads {
         var relatedByMain: [String: Set<String>] = [:]
@@ -854,6 +852,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         var askedLinks: Set<String> = []
     }
 
+    /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
+    /// an active row with the member's content exists, so a new series costs no extra request.
     private func burstMemberCandidates(
         _ remoteItems: [RemotePhotoDuplicate],
         contentHash: String,
