@@ -117,16 +117,11 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(try localizedValue("library.title", language: "de", in: packageCatalog), "Mediathek")
     }
 
-    func testMadeInAustriaLineIsSharedAndLocalized() throws {
-        XCTAssertEqual(
-            try localizedValue("brand.made_in_austria", language: "en", in: packageCatalog),
-            "Made with ❤️ in Austria 🇦🇹"
-        )
-        XCTAssertEqual(
-            try localizedValue("brand.made_in_austria", language: "de", in: packageCatalog),
-            "Mit ❤️ in Österreich 🇦🇹 gemacht"
-        )
-        XCTAssertFalse(ProductBrand.madeInAustria.isEmpty)
+    func testMadeInAustriaLineIsSharedEnglishOnly() throws {
+        let line = "Made with ❤️ in Austria 🇦🇹"
+        XCTAssertEqual(try localizedValue("brand.made_in_austria", language: "en", in: packageCatalog), line)
+        XCTAssertEqual(try localizedValue("brand.made_in_austria", language: "de", in: packageCatalog), line)
+        XCTAssertEqual(ProductBrand.madeInAustria, line)
         XCTAssertNotEqual(ProductBrand.madeInAustria, "brand.made_in_austria")
     }
 
