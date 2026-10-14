@@ -448,10 +448,12 @@ public final class TimelineMetadataStore {
             guard let volC = sqlite3_column_text(stmt, 0), let nodeC = sqlite3_column_text(stmt, 1) else {
                 throw TimelineMetadataReadError.readFailed
             }
-            if let tag = PhotoTag(rawValue: Int(sqlite3_column_int(stmt, 2))) {
-                result[PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC)), default: []].insert(
-                    tag)
+            guard sqlite3_column_type(stmt, 2) == SQLITE_INTEGER,
+                let tag = PhotoTag(rawValue: Int(sqlite3_column_int64(stmt, 2)))
+            else {
+                throw TimelineMetadataReadError.readFailed
             }
+            result[PhotoUID(volumeID: String(cString: volC), nodeID: String(cString: nodeC)), default: []].insert(tag)
             step = sqlite3_step(stmt)
         }
         guard step == SQLITE_DONE else { throw TimelineMetadataReadError.readFailed }

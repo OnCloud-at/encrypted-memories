@@ -14,6 +14,30 @@ final class TimelineMetadataAuxiliaryReadFailureTests: TimelineMetadataReadFixtu
             projection: "vol, node, CASE WHEN node='second' THEN abs(-9223372036854775808) ELSE tag END AS tag")
     }
 
+    func testUnknownTagNumberDiscardsCacheWithAReadableToken() throws {
+        try assertUnmappableTagRow("99")
+    }
+
+    func testTagNumberBeyondThirtyTwoBitsDiscardsCacheWithAReadableToken() throws {
+        // The low 32 bits of this number are 0, the Favorites tag.
+        try assertUnmappableTagRow("4294967296")
+    }
+
+    func testTextTagDiscardsCacheWithAReadableToken() throws {
+        try assertUnmappableTagRow("'x'")
+    }
+
+    private func assertUnmappableTagRow(_ tagLiteral: String) throws {
+        let fixture = try makeFixture()
+        defer { fixture.store.close() }
+        try execute(
+            "INSERT INTO photo_tags(vol, node, tag) VALUES('volume', 'second', \(tagLiteral));", at: fixture.url)
+        XCTAssertEqual(fixture.store.validationToken(), "matching-token")
+        XCTAssertThrowsError(try fixture.store.load(), "A tag row that cannot be mapped is an incomplete read")
+        XCTAssertThrowsError(try fixture.store.cachedTimelineSnapshot(), "No token may authorize a dropped tag")
+        XCTAssertEqual(fixture.store.validationToken(), "matching-token")
+    }
+
     func testFailedSeriesPreparationDiscardsCacheWithAReadableToken() throws {
         try assertRejectedRead(table: "burst_members", projection: nil)
     }
