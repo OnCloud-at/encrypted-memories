@@ -294,6 +294,8 @@ struct MobilePhotoViewer: View {
             liveTextHighlighted = false
             visibleThumbnail?.select(uid)
         }
+        // A full-screen cover over the viewer, such as the series selection, ends the access of the shown copy.
+        .onAppear { visibleThumbnail?.reopen(currentBaseItem?.uid) }
         .onDisappear {
             cancelViewerMutationPresentation()
             titleMetadataCoordinator.cancelAll()
