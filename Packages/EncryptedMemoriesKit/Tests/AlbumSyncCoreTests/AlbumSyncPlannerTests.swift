@@ -130,6 +130,9 @@ import Testing
         )
         #expect(plan.toAttach.map(\.uid.nodeID) == ["lb", "lc"], "the first photo in album order attaches")
         #expect(plan.duplicatesCollapsed == 1)
+        #expect(
+            plan.sameBytesAlternates.mapValues { $0.map(\.uid.nodeID) } == ["lb": ["la"]],
+            "the other link stays ready in case the first one fails")
     }
 
     @Test func linksWithoutBytesKeepTheirOwnAttach() {

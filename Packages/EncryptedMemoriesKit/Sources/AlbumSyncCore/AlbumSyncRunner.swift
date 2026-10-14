@@ -209,25 +209,13 @@ public actor AlbumSyncRunner {
         publish()
         try checkStop()
 
-        // Attach in chunks for progress and stop granularity. The backend batches to the API limit.
         progress.phase = .attaching
         publish()
-        var attachResult = AlbumSyncAttachResult()
-        var index = 0
-        while index < plan.toAttach.count {
-            try checkStop()
-            try await ensureAlbumPresent(albumID: album.id)
-            try checkStop()
-            let chunk = Array(plan.toAttach[index..<min(index + attachChunkSize, plan.toAttach.count)])
-            let result = try await remoteOps.attach(chunk, albumID: remoteAlbumID)
-            attachResult += result
-            index += chunk.count
-            progress.attachDone = attachResult.attached
-            progress.alreadyMember = plan.alreadyMember + attachResult.alreadyMember
-            progress.attachFailed = attachResult.failed
-            progress.message = attachResult.firstFailureMessage
-            publish()
-        }
+        var attachResult = try await attach(
+            plan.toAttach, localAlbumID: album.id, remoteAlbumID: remoteAlbumID, after: AlbumSyncAttachResult(),
+            alreadyMember: plan.alreadyMember)
+        attachResult = try await attachAlternates(
+            of: plan, after: attachResult, localAlbumID: album.id, remoteAlbumID: remoteAlbumID)
 
         // Persist the run outcome on the mapping and settle the status.
         try await ensureAlbumPresent(albumID: album.id)
@@ -235,13 +223,9 @@ public actor AlbumSyncRunner {
             of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links)
         // A photo with a usable link goes into the album even when the backup keeps a part of it open, for
         // example the video of a Live Photo behind a draft. It is no complete backup, so the album reports it.
-        let failedLinkIDs = Set(attachResult.failedLinkIDs)
-        // A photo that attaches through another photo's link with the same bytes is not in the album when that
-        // attach failed.
-        let failedContent = Set(plan.toAttach.filter { failedLinkIDs.contains($0.uid.nodeID) }.compactMap(\.sha1Hex))
         let incompleteIdentifiers = Self.incompleteIdentifiers(
-            orderedLocalIdentifiers: identifiers, links: links, attachFailedLinkIDs: failedLinkIDs,
-            attachFailedContent: failedContent, albumMembers: children, backup: backupReport)
+            orderedLocalIdentifiers: identifiers, links: links, attachFailedLinkIDs: Set(attachResult.failedLinkIDs),
+            backup: backupReport)
         progress.incomplete = incompleteIdentifiers.count
         let report = AlbumSyncReport(
             remoteAlbumID: remoteAlbumID,
@@ -276,18 +260,102 @@ public actor AlbumSyncRunner {
         return report
     }
 
+    /// Attaches `candidates` in chunks for progress and Stop granularity, adding to `earlier`. The backend batches to
+    /// the API limit.
+    private func attach(
+        _ candidates: [AlbumSyncAttachCandidate], localAlbumID: String, remoteAlbumID: String,
+        after earlier: AlbumSyncAttachResult, alreadyMember: Int
+    ) async throws -> AlbumSyncAttachResult {
+        var total = earlier
+        var index = 0
+        while index < candidates.count {
+            try checkStop()
+            try await ensureAlbumPresent(albumID: localAlbumID)
+            try checkStop()
+            let chunk = Array(candidates[index..<min(index + attachChunkSize, candidates.count)])
+            total += try await remoteOps.attach(chunk, albumID: remoteAlbumID)
+            index += chunk.count
+            progress.attachDone = total.attached
+            progress.alreadyMember = alreadyMember + total.alreadyMember
+            progress.attachFailed = total.failed
+            progress.message = total.firstFailureMessage
+            publish()
+        }
+        return total
+    }
+
+    /// When a planned link fails to attach, the photos with the same bytes try their own links, one after the other,
+    /// until one attaches. Then the bytes are in the album, and the earlier failures of those photos no longer count.
+    /// Without a successful alternate every tried link stays a failure, so each of those photos is named.
+    private func attachAlternates(
+        of plan: AlbumSyncAttachPlan, after first: AlbumSyncAttachResult, localAlbumID: String, remoteAlbumID: String
+    ) async throws -> AlbumSyncAttachResult {
+        var result = first
+        var remaining = plan.sameBytesAlternates
+        var failures: [String: [String]] = [:]
+        var waiting: [String] = []
+        for linkID in first.failedLinkIDs where remaining[linkID] != nil {
+            failures[linkID] = [linkID]
+            waiting.append(linkID)
+        }
+        var resolved: [String] = []
+        while !waiting.isEmpty {
+            var round: [(planned: String, candidate: AlbumSyncAttachCandidate)] = []
+            for planned in waiting {
+                guard var alternates = remaining[planned], !alternates.isEmpty else { continue }
+                round.append((planned, alternates.removeFirst()))
+                remaining[planned] = alternates
+            }
+            guard !round.isEmpty else { break }
+            let before = result.failedLinkIDs.count
+            result = try await attach(
+                round.map(\.candidate), localAlbumID: localAlbumID, remoteAlbumID: remoteAlbumID, after: result,
+                alreadyMember: plan.alreadyMember)
+            let failedNow = Set(result.failedLinkIDs.dropFirst(before))
+            waiting = []
+            for (planned, candidate) in round {
+                if failedNow.contains(candidate.uid.nodeID) {
+                    failures[planned, default: []].append(candidate.uid.nodeID)
+                    waiting.append(planned)
+                } else {
+                    resolved.append(planned)
+                }
+            }
+        }
+        for planned in resolved {
+            for linkID in failures[planned] ?? [] {
+                guard let index = result.failedLinkIDs.firstIndex(of: linkID) else { continue }
+                result.failedLinkIDs.remove(at: index)
+                result.failed -= 1
+            }
+        }
+        if result.failed == 0 { result.firstFailureMessage = nil }
+        if !resolved.isEmpty {
+            progress.attachFailed = result.failed
+            progress.message = result.firstFailureMessage
+            publish()
+        }
+        return result
+    }
+
     /// For each SHA-1 of a link that is not in the album, an album member with the same bytes, for example another
-    /// device's copy of a shared photo. The lookup runs in chunks, so Stop takes effect between them. A failed chunk
-    /// ends the lookup with the members found so far, and the other photos attach as before.
+    /// device's copy of a shared photo. Members whose bytes this run already knows count first, also when the lookup
+    /// fails. The lookup runs in chunks, so Stop takes effect between them. A failed chunk ends the lookup with the
+    /// members found so far, and the other photos attach as before.
     private func membersWithSameContent(
         links: [String: AlbumSyncRemoteLink], children: Set<String>
     ) async throws -> [String: String] {
+        var members: [String: String] = [:]
+        for link in links.values where !link.isTrashed && children.contains(link.uid.nodeID) {
+            guard let sha1Hex = link.sha1Hex else { continue }
+            members[sha1Hex] = min(members[sha1Hex] ?? link.uid.nodeID, link.uid.nodeID)
+        }
         let candidates = Set(
             links.values.compactMap { link in
                 link.isTrashed || children.contains(link.uid.nodeID) ? nil : link.sha1Hex
             }
-        ).sorted()
-        guard !candidates.isEmpty, !children.isEmpty else { return [:] }
+        ).filter { members[$0] == nil }.sorted()
+        guard !candidates.isEmpty, !children.isEmpty else { return members }
         var copies: [String: Set<String>] = [:]
         var start = 0
         while start < candidates.count {
@@ -304,7 +372,10 @@ public actor AlbumSyncRunner {
             }
         }
         // Only a current album member counts. The smallest member id keeps the choice stable between runs.
-        return copies.compactMapValues { $0.intersection(children).min() }
+        for (sha1Hex, member) in copies.compactMapValues({ $0.intersection(children).min() }) {
+            members[sha1Hex] = member
+        }
+        return members
     }
 
     /// The photos with a usable, not trashed link whose backup row is unresolved, in album order. A photo whose
@@ -313,18 +384,11 @@ public actor AlbumSyncRunner {
         orderedLocalIdentifiers: [String],
         links: [String: AlbumSyncRemoteLink],
         attachFailedLinkIDs: Set<String>,
-        attachFailedContent: Set<String> = [],
-        albumMembers: Set<String> = [],
         backup: AlbumSyncBackupReport
     ) -> [String] {
         orderedLocalIdentifiers.filter { identifier in
             guard let link = links[identifier], !link.isTrashed, !attachFailedLinkIDs.contains(link.uid.nodeID)
             else {
-                return false
-            }
-            if let sha1Hex = link.sha1Hex, attachFailedContent.contains(sha1Hex),
-                !albumMembers.contains(link.uid.nodeID)
-            {
                 return false
             }
             return backup.problems[identifier] != nil

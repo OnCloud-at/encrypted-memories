@@ -17,6 +17,9 @@ public struct AlbumSyncAttachPlan: Sendable, Equatable {
     /// Distinct local assets that resolved to an already-planned remote link or to a link with the same bytes
     /// (duplicate content across the album collapses to one attach).
     public var duplicatesCollapsed = 0
+    /// For a planned link, the other links with the same bytes in local album order. They do not attach; one of them
+    /// attaches only when the planned link fails, so the photo still reaches the album.
+    public var sameBytesAlternates: [String: [AlbumSyncAttachCandidate]] = [:]
 
     public init() {}
 }
@@ -35,7 +38,8 @@ public enum AlbumSyncPlanner {
         var plan = AlbumSyncAttachPlan()
         var planned = Set<String>()
         planned.reserveCapacity(orderedLocalIdentifiers.count)
-        var plannedContent = Set<String>()
+        /// The planned link of each SHA-1.
+        var plannedContent: [String: String] = [:]
         var seenMembers = Set<String>()
 
         for identifier in orderedLocalIdentifiers {
@@ -61,13 +65,19 @@ public enum AlbumSyncPlanner {
                 }
                 continue
             }
-            // A link with bytes that another planned link already carries would add the same photo twice.
-            let newContent = link.sha1Hex.map { plannedContent.insert($0).inserted } ?? true
-            if planned.insert(linkID).inserted, newContent {
-                plan.toAttach.append(AlbumSyncAttachCandidate(uid: link.uid, sha1Hex: link.sha1Hex))
-            } else {
+            guard planned.insert(linkID).inserted else {
                 plan.duplicatesCollapsed += 1
+                continue
             }
+            let candidate = AlbumSyncAttachCandidate(uid: link.uid, sha1Hex: link.sha1Hex)
+            // A link with bytes that another planned link already carries would add the same photo twice.
+            if let sha1Hex = link.sha1Hex, let representative = plannedContent[sha1Hex] {
+                plan.sameBytesAlternates[representative, default: []].append(candidate)
+                plan.duplicatesCollapsed += 1
+                continue
+            }
+            if let sha1Hex = link.sha1Hex { plannedContent[sha1Hex] = linkID }
+            plan.toAttach.append(candidate)
         }
         return plan
     }
