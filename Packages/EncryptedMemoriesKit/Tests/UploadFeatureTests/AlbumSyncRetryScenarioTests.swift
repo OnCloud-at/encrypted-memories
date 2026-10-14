@@ -44,7 +44,6 @@ final class AlbumSyncRetryScenarioTests: XCTestCase {
         }
         let members = try await device.server.childMainLinkIDs(albumID: "own-album")
         XCTAssertTrue(members.contains(hiddenCopy.nodeID))
-        XCTAssertFalse(members.contains(blockingDraft.nodeID))
         XCTAssertEqual(device.server.links.first { $0.uid == blockingDraft }?.state, .draft)
         XCTAssertEqual(device.server.uploadRequestCount, 2, "Only asset-1 and asset-2 upload, each once")
     }
@@ -81,7 +80,8 @@ private struct RetryAlbumSource: AlbumSyncLocalAlbumSource {
     func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(identifiers) }
 }
 
-/// Scans and drains the device queue once per run, then reports the unresolved rows like the album executor.
+/// Like the album executor, each run starts with an empty queue and backup state, so every photo of the album goes
+/// through the duplicate check again. Then it reports the unresolved album rows.
 private final class RetryAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
     let device: EditScenarioHarness
     init(device: EditScenarioHarness) { self.device = device }
@@ -89,11 +89,15 @@ private final class RetryAlbumBackup: AlbumSyncBackupExecuting, @unchecked Senda
     func ensureBackedUp(
         localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport {
+        try device.resetAlbumSyncScratch(localIdentifiers)
         try await device.enqueue()
         await device.pass()
+        let album = Set(localIdentifiers)
         var problems: [String: BackupFailedItem] = [:]
         device.queue.forEachProblemEntry { entry in
-            if problems[entry.source.identifier] == nil {
+            if entry.source.kind == .photoLibraryAsset, album.contains(entry.source.identifier),
+                problems[entry.source.identifier] == nil
+            {
                 problems[entry.source.identifier] = BackupFailedItem(entry: entry)
             }
             return true

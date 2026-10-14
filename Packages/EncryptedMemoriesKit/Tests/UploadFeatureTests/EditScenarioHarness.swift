@@ -424,6 +424,18 @@ final class EditScenarioHarness {
         try relaunch()
     }
 
+    /// Album Sync starts every run with an empty queue and backup state (`PhotoAlbumBackupExecutor`). The upload
+    /// manifest and the running pipeline stay, as in the app.
+    func resetAlbumSyncScratch(_ identifiers: [String]) throws {
+        for identifier in identifiers {
+            let candidate = try library.candidate(identifier)
+            _ = queue.remove(source: candidate.snapshot.source, revision: candidate.snapshot.revision)
+            XCTAssertTrue(backupState.removeRecords(for: candidate.snapshot.source, keeping: []))
+            XCTAssertNil(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        }
+        XCTAssertEqual(backupState.count(), 0)
+    }
+
     private func seedV105(_ asset: EditScenarioLibrary.Asset, remoteIdentity: Bool = false) throws {
         // v1.0.5 did not read the Live effect, so it planned every Live Photo with its tagged paired video.
         var info = asset.info
