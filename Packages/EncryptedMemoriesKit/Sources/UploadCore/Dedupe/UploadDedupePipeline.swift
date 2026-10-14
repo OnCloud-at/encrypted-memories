@@ -112,9 +112,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // Burst-member rule, see `UploadDuplicateDecisionPolicy.burstMemberCandidates`: the same bytes as an active
         // photo prove nothing. Only this member's own upload, or the server's related list, proves the relation.
         let isBurstMember = descriptor.source.resource.isBurstMember
-        // A secondary of an edited photo that replaces an earlier upload: its earlier copy is a related photo of
-        // the replaced photo and moves to the trash with it. Only a copy under the new main photo counts.
-        let requiresRelatedMatch = descriptor.requiresRelatedMatch && !isBurstMember
+        // A secondary of a main photo counts only a copy under that main photo. Another main file with the same name
+        // or bytes proves nothing. For a secondary of an edit that replaces an earlier upload this also holds: its
+        // earlier copy is a related photo of the replaced photo and moves to the trash with it.
+        let requiresRelatedMatch = descriptor.needsRelatedProof
         // A main photo of its own. It never adopts a related file of another photo, see `rootEligible`.
         let isRoot = descriptor.source.resource == .primary && descriptor.mainRemoteLinkID == nil
 
@@ -597,8 +598,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             history: entry.replacementHistory(excluding: scope.knownForeignLinks))
     }
 
-    /// The remote rows that can prove this resource. A burst member and a secondary of a replacing edit count
-    /// only a copy under their main photo. A primary ignores the photos that an edit replaces or replaced and
+    /// The remote rows that can prove this resource. A burst member and a secondary of a main photo count
+    /// only a copy under their main photo as saved. A primary ignores the photos that an edit replaces or replaced and
     /// their related photos: the backup moves those to the trash itself, so they are neither this photo nor a
     /// deletion by the person.
     private func candidates(
@@ -613,14 +614,23 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor), false
             )
         }
-        if descriptor.requiresRelatedMatch {
+        if descriptor.needsRelatedProof {
+            // A secondary of a replacing edit counts only a copy under its main photo. A plain secondary drops only
+            // active copies elsewhere: a trashed or deleted copy keeps its meaning as a deletion by the person.
+            let dropsEveryUnrelatedRow = descriptor.requiresRelatedMatch
             var relatedLinkIDs: Set<String> = []
-            if remoteItems.contains(where: { $0.linkState != .draft }), let mainLinkID = descriptor.mainRemoteLinkID {
+            // A plain secondary asks only for an active copy of its own bytes: any other active row cannot settle it.
+            let needsLookup = remoteItems.contains {
+                dropsEveryUnrelatedRow
+                    ? $0.linkState != .draft : ($0.linkState == .active && $0.contentHash == contentHash)
+            }
+            if needsLookup, let mainLinkID = descriptor.mainRemoteLinkID {
                 relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
             }
             return (
                 remoteItems.filter { item in
                     item.linkState == .draft || (item.linkID.map(relatedLinkIDs.contains) ?? false)
+                        || (!dropsEveryUnrelatedRow && item.linkState != .active)
                 }, false
             )
         }

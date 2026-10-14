@@ -143,9 +143,26 @@ final class EditUpgradeScenarioTests: XCTestCase {
         _ = try await harness.fullRescan()
         await harness.pass()
         XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
-        XCTAssertEqual(uploads, 0)
         XCTAssertTrue(trashed.isEmpty)
-        XCTAssertEqual(serverState(), before, "a metadata change keeps the Live Photo in Proton")
+        if fixture == .edited {
+            // v1.0.5 counted the video of the edited version as saved, because the same file already sat under the
+            // first version of the photo. It was never related to the edited version. With the Live effect off, the
+            // video is a secondary of its own kind now, so no v1.0.5 row covers it, and a copy under another main
+            // photo proves nothing. A later queue pass uploads the video once under the edited version. This costs
+            // the size of the video in storage once. Nothing is deleted or changed in Proton.
+            XCTAssertEqual(uploads, 1, "the video uploads once under the edited version")
+            let after = serverState()
+            XCTAssertEqual(Array(after.prefix(before.count)), before, "no existing link changes")
+            XCTAssertEqual(after.count, before.count + 1)
+            let added = try XCTUnwrap(harness.server.links.last)
+            XCTAssertEqual(added.mainLinkID, legacyMain, "the video is related to the edited version")
+            XCTAssertEqual(added.contentHash, videoHash)
+            XCTAssertEqual(added.state, .active)
+            XCTAssertEqual(added.tags, [], "the edit backs the video up like the still photo")
+        } else {
+            XCTAssertEqual(uploads, 0)
+            XCTAssertEqual(serverState(), before, "a metadata change keeps the Live Photo in Proton")
+        }
 
         harness.library.edit("edit-after-upgrade", at: harness.clock.now)
         let entry = try await harness.enqueue()
