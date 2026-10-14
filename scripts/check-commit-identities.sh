@@ -102,9 +102,17 @@ check_trailer() {
   fi
 }
 
+# Read each git output into a variable first: a failure inside a process substitution would end the loop silently.
+commits="$(git rev-list "${log_range[@]}")" || {
+  echo "The commit range cannot be read, so it cannot be checked." >&2
+  exit 2
+}
+
 while IFS= read -r commit; do
+  [[ -n "$commit" ]] || continue
   author="$(git log -1 --format=%ae "$commit")"
   committer="$(git log -1 --format=%ce "$commit")"
+  message="$(git log -1 --format=%B "$commit")"
   if ! is_author_address "$author"; then
     fail "$commit" "author email is not the pull request author's GitHub noreply address"
   fi
@@ -113,8 +121,8 @@ while IFS= read -r commit; do
   fi
   while IFS= read -r line; do
     check_trailer "$commit" "$(lower "$line")"
-  done < <(git log -1 --format=%B "$commit")
-done < <(git rev-list "${log_range[@]}")
+  done <<<"$message"
+done <<<"$commits"
 
 if ((violations)); then
   cat >&2 <<'EOF'

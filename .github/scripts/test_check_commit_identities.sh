@@ -201,6 +201,17 @@ COMMIT_IDENTITY_LOGIN=alice COMMIT_IDENTITY_ID=$alice_id \
 if [[ "$status" -eq 2 ]]; then echo "ok: a base commit missing from the checkout fails closed"
 else echo "FAIL: a base commit missing from the checkout fails closed (exit $status)" >&2; failures=$((failures + 1)); fi
 
+status=0
+output="$(COMMIT_IDENTITY_LOGIN=alice COMMIT_IDENTITY_ID=$alice_id \
+  bash "$script" base 0123456789abcdef0123456789abcdef01234567 2>&1)" || status=$?
+if [[ "$status" -eq 2 && "$output" == *"cannot be checked"* ]]; then echo "ok: a head commit missing from the checkout fails closed"
+else echo "FAIL: a head commit missing from the checkout fails closed (exit $status)" >&2; failures=$((failures + 1)); fi
+
+status=0
+COMMIT_IDENTITY_LOGIN=alice COMMIT_IDENTITY_ID=$alice_id bash "$script" HEAD HEAD >/dev/null 2>&1 || status=$?
+if [[ "$status" -eq 0 ]]; then echo "ok: an empty range passes"
+else echo "FAIL: an empty range passes (exit $status)" >&2; failures=$((failures + 1)); fi
+
 # Fallback: no environment, as in the local pre-push guard.
 fresh_branch fallback-pass
 git config user.email "$alice"
