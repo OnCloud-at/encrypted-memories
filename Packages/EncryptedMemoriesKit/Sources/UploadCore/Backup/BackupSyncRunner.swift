@@ -35,7 +35,7 @@ public actor BackupSyncRunner {
         /// Rows active before (start − grace) are treated as crash leftovers. 0 = every active
         /// row at start is stale, which is correct while a single runner owns the queue.
         public var staleActiveGrace: TimeInterval
-        /// Poll interval while the throttle reports "pause" (thermal critical etc.).
+        /// Longest wait while the throttle reports "pause" (thermal critical etc.); a runtime change ends it earlier.
         public var pausedPollInterval: TimeInterval
         /// Maximum time an upload may emit no backend progress before it is cancelled and retried.
         /// Total upload duration is unlimited while progress continues.
@@ -439,11 +439,8 @@ public actor BackupSyncRunner {
                         emitProgress()
                     }
                     if mode == .eligibleOnly { break }
-                    do {
-                        try await clock.sleep(for: configuration.pausedPollInterval)
-                    } catch {
-                        break
-                    }
+                    // A runtime change, for example Wi-Fi, ends the wait at once; the poll stays as fallback.
+                    await waitForSchedulerWake(orAfter: configuration.pausedPollInterval)
                     continue
                 }
                 if progress.isPausedByPolicy {
