@@ -328,7 +328,10 @@ public actor BackupSyncRunner {
         await requeueDueBlockedRows()
         guard queue.isOperational() else { return progress }
 
+        // The last known index health stays visible until this pass reads it again.
+        let previousIndexHealth = progress.remoteContentIndexHealth
         progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
+        progress.remoteContentIndexHealth = previousIndexHealth
         progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
         guard queue.isOperational() else { return progress }
@@ -514,9 +517,11 @@ public actor BackupSyncRunner {
         if queue.isOperational() {
             let wasPausedByPolicy = progress.isPausedByPolicy
             let wasWaitingForWiFi = progress.isWaitingForWiFi
+            let indexHealth = progress.remoteContentIndexHealth
             progress = BackupSyncProgress(summary: queue.summary(), isRunning: false)
             progress.isPausedByPolicy = wasPausedByPolicy
             progress.isWaitingForWiFi = wasWaitingForWiFi
+            progress.remoteContentIndexHealth = indexHealth
         } else {
             // Preserve the last trustworthy counters. The controller exposes the unavailable store;
             // replacing this with an empty summary would falsely look like a completed backup.
@@ -2430,6 +2435,7 @@ public actor BackupSyncRunner {
         progress.remoteIndexPreparation = previous.remoteIndexPreparation
         progress.remoteIndexPreparationFailed = previous.remoteIndexPreparationFailed
         progress.remoteIndexPreparationIssue = previous.remoteIndexPreparationIssue
+        progress.remoteContentIndexHealth = previous.remoteContentIndexHealth
         progress.activeTransfer = previous.activeTransfer
         progress.activeExecutionItemEquivalents = previous.activeExecutionItemEquivalents
         progress.outstanding = previous.outstanding
