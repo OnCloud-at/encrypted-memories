@@ -153,6 +153,12 @@ class UpgradeMetadataTests(unittest.TestCase):
                     def launch(self, server, seed=False):
                         steps.append('launch-' + self.phase)
 
+                    def require_running(self):
+                        pass
+
+                    def explain(self, message):
+                        return message
+
                     def kill_app(self):
                         steps.append('kill-old')
 
