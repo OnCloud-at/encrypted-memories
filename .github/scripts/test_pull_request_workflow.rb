@@ -149,6 +149,32 @@ class PullRequestWorkflowTests < Minitest::Test
       steps.find { |step| step["name"] == "Retain UI latency diagnostics" }]
   end
 
+  def test_darwin_only_script_tests_run_in_the_macos_job_and_the_queue_requires_them
+    jobs = @workflow.fetch("jobs")
+    macos = jobs.fetch("macos-verification")
+    steps = macos.fetch("steps")
+    probes = steps.find { |step| step["id"] == "upgrade-probes" }
+    refute_nil probes, "The macOS job must run the tests that skip themselves on other systems"
+    # A new darwin-only test file must join this step, or the hygiene job would skip it silently.
+    darwin_only = Dir[File.expand_path("test_*.py", __dir__)]
+      .select { |path| File.read(path).include?("sys.platform == 'darwin'") }.map { |path| File.basename(path) }
+    refute_empty darwin_only
+    darwin_only.each { |name| assert_includes probes.fetch("run"), name }
+    refute_includes probes.fetch("if"), "steps.shell", "The probes must not depend on the app shell build"
+    checkout = steps.find { |step| step["uses"].to_s.start_with?("actions/checkout@") }
+    assert_equal 0, checkout.fetch("with").fetch("fetch-depth"), "The Metal test reads pinned releases by tag"
+    python = steps.find { |step| step["id"] == "python" }
+    assert_equal "3.14", python.fetch("with").fetch("python-version")
+    assert_operator steps.index(python), :<, steps.index(probes)
+    assert_equal "${{ steps.upgrade-probes.outcome }}", macos.fetch("outputs").fetch("upgrade_probes")
+    gate = jobs.fetch("macos-app-shell").fetch("steps").find { |step| step.fetch("env", {}).key?("RESULT") &&
+      step.fetch("env").fetch("RESULT").include?("upgrade_probes") }
+    refute_nil gate, "The macOS gate must require the probe result"
+    assert_equal "${{ needs.macos-verification.outputs.upgrade_probes }}", gate.fetch("env").fetch("RESULT")
+    assert_equal 'test "$RESULT" = success', gate.fetch("run")
+    assert_includes jobs.fetch("macos-app-shell").fetch("needs"), "macos-verification"
+  end
+
   def test_ui_diagnostics_default_to_disabled
     inputs = (@workflow["on"] || @workflow.fetch(true)).fetch("workflow_dispatch").fetch("inputs")
     diagnostics = inputs.fetch("collect_ui_diagnostics", {})
