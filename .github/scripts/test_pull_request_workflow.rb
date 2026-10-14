@@ -155,11 +155,29 @@ class PullRequestWorkflowTests < Minitest::Test
     steps = macos.fetch("steps")
     probes = steps.find { |step| step["id"] == "upgrade-probes" }
     refute_nil probes, "The macOS job must run the tests that skip themselves on other systems"
-    # A new darwin-only test file must join this step, or the hygiene job would skip it silently.
-    darwin_only = Dir[File.expand_path("test_*.py", __dir__)]
-      .select { |path| File.read(path).include?("sys.platform == 'darwin'") }.map { |path| File.basename(path) }
-    refute_empty darwin_only
-    darwin_only.each { |name| assert_includes probes.fetch("run"), name }
+    # A darwin-only test class or method that this step does not run would be skipped silently by the hygiene job.
+    root = File.expand_path("../..", __dir__)
+    commands = probes.fetch("run").lines.map(&:strip)
+    assert_includes commands, "set -euo pipefail"
+    assert_empty commands.grep(/\|\||;|&&/), "A probe command must not mask its exit status"
+    guards = 0
+    Dir[File.join(root, ".github/scripts/test_*.py"), File.join(root, "scripts/tests/test_*.py")].each do |path|
+      lines = File.readlines(path)
+      lines.each_with_index do |line, index|
+        next unless line =~ /skip/i && line =~ /darwin/i
+        guards += 1
+        kind, symbol = lines[(index + 1)..].find { |candidate| candidate =~ /\A\s*(def|class) \w+/ }
+          .match(/\A\s*(def|class) (\w+)/).captures
+        script = path.delete_prefix("#{root}/")
+        pattern = if kind == "class"
+          /\Apython3 #{Regexp.escape(script)}\z/ # A guarded class runs as part of its whole file.
+        else
+          /\Apython3 #{Regexp.escape(script)} .*\b#{Regexp.escape(symbol)}\b/
+        end
+        assert commands.any? { |command| command.match?(pattern) }, "#{script}: #{kind} #{symbol} is darwin-only but the macOS job does not run it"
+      end
+    end
+    assert_operator guards, :>=, 2
     refute_includes probes.fetch("if"), "steps.shell", "The probes must not depend on the app shell build"
     checkout = steps.find { |step| step["uses"].to_s.start_with?("actions/checkout@") }
     assert_equal 0, checkout.fetch("with").fetch("fetch-depth"), "The Metal test reads pinned releases by tag"

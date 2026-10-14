@@ -467,6 +467,7 @@ jobs:
           RESULT: ${{ needs.macos-verification.outputs.shell }}
         run: test "$RESULT" = success
       - name: Require the macOS upgrade probe tests
+        if: ${{ always() }}
         env:
           RESULT: ${{ needs.macos-verification.outputs.upgrade_probes }}
         run: test "$RESULT" = success
