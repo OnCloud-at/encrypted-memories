@@ -307,6 +307,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let clock = HeldBackupSleepClock(clock: BackupTestClock())
             let follow = Task {
                 await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                shown.ended = true
             }
             while shown.lists.isEmpty { await Task.yield() }
             XCTAssertFalse(shown.lists[0].offersUserRetry)
@@ -322,6 +323,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             pass.cancel()
             await fixture.controller.finishSyncForTesting(runID: "run")
             clock.releaseAll()
+            try await waitForCondition { shown.ended }
+            follow.cancel()
             await follow.value
             XCTAssertFalse(fixture.controller.isSyncing, "following ends with the pass")
             await fixture.controller.shutdown()
@@ -339,11 +342,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let clock = HeldBackupSleepClock(clock: BackupTestClock())
             let follow = Task {
                 await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                shown.ended = true
             }
             while shown.lists.isEmpty { await Task.yield() }
             XCTAssertTrue(queue.upsert(quotaEntry("first")))
-            try await waitUntil { shown.lists.count == 2 }
-            try await waitUntil { clock.isWaiting }
+            try await waitForCondition { shown.lists.count == 2 }
+            try await waitForCondition { clock.isWaiting }
 
             // Two writes inside the pause: neither shows until the pause ends, then both show in one read.
             XCTAssertTrue(queue.upsert(quotaEntry("second")))
@@ -351,11 +355,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(100))
             XCTAssertEqual(shown.lists.count, 2, "writes inside the pause wait for it")
             clock.releaseAll()
-            try await waitUntil { shown.lists.count == 3 }
+            try await waitForCondition { shown.lists.count == 3 }
             XCTAssertEqual(Set(shown.lists[2].map(\.filename)), ["first.heic", "second.heic", "third.heic"])
 
             pass.cancel()
             await fixture.controller.finishSyncForTesting(runID: "run")
+            try await waitForCondition { shown.ended }
+            follow.cancel()
             await follow.value
             await fixture.controller.shutdown()
         }
@@ -372,11 +378,14 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 await fixture.controller.followProblemList(clock: HeldBackupSleepClock(clock: BackupTestClock())) {
                     shown.lists.append($0)
                 }
+                shown.ended = true
             }
             while shown.lists.isEmpty { await Task.yield() }
 
             pass.cancel()
             await fixture.controller.finishSyncForTesting(runID: "run")
+            try await waitForCondition { shown.ended }
+            follow.cancel()
             await follow.value
             XCTAssertEqual(shown.lists.count, 2, "the end of the pass shows the final list once, without a write")
             await fixture.controller.shutdown()
@@ -390,7 +399,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 updatedAt: Date().addingTimeInterval(3_600))
         }
 
-        private func waitUntil(_ condition: () -> Bool) async throws {
+        private func waitForCondition(_ condition: () -> Bool) async throws {
             let deadline = ContinuousClock.now + .seconds(10)
             while !condition(), ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(5))
@@ -401,6 +410,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
     @MainActor private final class ShownProblemLists {
         var lists: [[BackupFailedItem]] = []
+        var ended = false
     }
 
     func testAUserRetryLeavesARowThatTheRunnerClaimedMeanwhile() throws {

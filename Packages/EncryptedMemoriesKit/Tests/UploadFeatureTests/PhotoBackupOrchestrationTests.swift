@@ -885,22 +885,24 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let scanDone = BackupScanSignal()
         // No timer may end the wait: the held clock never lets a sleep finish.
         let held = HeldBackupSleepClock(clock: clock)
+        let testClock = clock!
         let reconcile = Task {
             await PhotoLibraryBackupController.reconcileWhileScanning(
                 runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: held,
-                now: { [clock] in clock!.now })
+                now: { testClock.now })
         }
-        try await waitUntil { await scanDone.wake.isWaiting }
+        try await waitForCondition { await scanDone.wake.isWaiting }
 
         enumerator.infos = [photoInfo("C")]
         let targeted = PhotoLibraryCatalogSync(
             store: catalog, enumerator: enumerator, chunkSize: 50, now: { [clock] in clock!.now })
         _ = try await targeted.run(engine: engine, identifiers: ["C"])
 
-        try await waitUntil { [uploader] in uploader!.requests.map(\.name) == ["IMG_C.HEIC"] }
+        try await waitForCondition { [uploader] in uploader!.requests.map(\.name) == ["IMG_C.HEIC"] }
         let scanStillRuns = await !scanDone.isDone()
         XCTAssertTrue(scanStillRuns, "C uploads while the scan still runs")
         await scanDone.markDone()
+        reconcile.cancel()
         _ = await reconcile.value
         XCTAssertEqual(queue.summary().uploaded, 1)
     }
@@ -922,20 +924,43 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         let scanDone = BackupScanSignal()
         let held = HeldBackupSleepClock(clock: clock)
+        let testClock = clock!
         let reconcile = Task {
             await PhotoLibraryBackupController.reconcileWhileScanning(
                 runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: held,
-                now: { [clock] in clock!.now })
+                now: { testClock.now })
         }
-        try await waitUntil { held.isWaiting }
+        try await waitForCondition { held.isWaiting }
         XCTAssertTrue(uploader.requests.isEmpty, "D is not due yet")
 
         held.releaseAll()  // The 30-second wait ends and the test clock moves to the retry date.
-        try await waitUntil { [uploader] in uploader!.requests.map(\.name) == ["IMG_D.HEIC"] }
+        try await waitForCondition { [uploader] in uploader!.requests.map(\.name) == ["IMG_D.HEIC"] }
         let scanStillRuns = await !scanDone.isDone()
         XCTAssertTrue(scanStillRuns, "D uploads at its retry date, before the scan ends")
         await scanDone.markDone()
+        reconcile.cancel()
         _ = await reconcile.value
+    }
+
+    func testTheEndOfTheScanEndsAWaitingDrainWithoutAWrite() async throws {
+        let runner = self.runner!
+        let queue = self.queue!
+        let scanDone = BackupScanSignal()
+        let held = HeldBackupSleepClock(clock: clock)
+        let testClock = clock!
+        let ended = IntBox()
+        let reconcile = Task {
+            _ = await PhotoLibraryBackupController.reconcileWhileScanning(
+                runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: held,
+                now: { testClock.now })
+            ended.value = 1
+        }
+        try await waitForCondition { await scanDone.wake.isWaiting }
+
+        await scanDone.markDone()
+        try await waitForCondition { ended.value == 1 }
+        reconcile.cancel()
+        await reconcile.value
     }
 
     func testNothingWaitsForADateWhenNoRowIsDueLater() throws {
@@ -953,7 +978,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             "a draft re-check wakes the drain at its date")
     }
 
-    private func waitUntil(_ condition: () async -> Bool) async throws {
+    private func waitForCondition(_ condition: () async -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(10)
         while ContinuousClock.now < deadline {
             if await condition() { return }
