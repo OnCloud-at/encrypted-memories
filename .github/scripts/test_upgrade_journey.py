@@ -510,6 +510,30 @@ with SigningIdentity(root) as signer:
         self.assertEqual(events, ['ui-prepare', 'kill-old', 'ui-verify'])
         self.assertLess(now, 30)  # The preparation takes 21 s; the verification wait ends at its first check.
 
+    def test_a_verification_timeout_keeps_its_message_and_names_the_app_that_ended_after_activation(self):
+        ended = 'The app process 7 (EncryptedMemories) is no longer running'
+        error, _, _, _ = self.run_case_on_a_virtual_clock(
+            prepare_startup=1, verify_startup=1, app_ended=ended, ended_after_start=True, verify_act=241)
+        self.assertEqual(str(error), 'v1.0.5 / index.embed: UI verification timed out; ' + ended)
+        error, _, _, _ = self.run_case_on_a_virtual_clock(prepare_startup=1, verify_startup=1, verify_act=241)
+        self.assertEqual(str(error), 'v1.0.5 / index.embed: UI verification timed out')
+
+    def test_the_process_name_follows_the_installed_version_of_the_app(self):
+        with tempfile.TemporaryDirectory() as directory:
+            versions = []
+            for name in ['OldExecutable', 'NewExecutable']:
+                bundle = Path(directory) / (name + '.app')
+                bundle.mkdir()
+                (bundle / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': name}))
+                versions.append(bundle)
+            app = run_journey.InstalledApp.__new__(run_journey.InstalledApp)
+            app.simulator, app.directory, app.app_log = 'OWN-DEVICE', Path(directory), None
+            with patch.object(run_journey, 'command'), patch.object(run_journey.InstalledApp, 'stream_app_log'):
+                app.install(versions[0])
+                self.assertEqual(app.executable, 'OldExecutable')
+                app.install(versions[1])
+                self.assertEqual(app.executable, 'NewExecutable')
+
     def test_a_missing_checkpoint_keeps_its_message_and_names_the_app_that_ended_after_activation(self):
         ended = 'The app process 7 (EncryptedMemories) is no longer running'
         error, _, _, _ = self.run_case_on_a_virtual_clock(
@@ -1097,13 +1121,13 @@ else:
 
     def run_case_on_a_virtual_clock(
             self, prepare_startup, verify_startup, act=20, reach_at=None, app_ended=None, ended_after_start=False, verify_code=0,
-            ended_from_verify=False):
+            ended_from_verify=False, verify_act=None):
         """Run index.embed through run_journey.main() with UI runs whose first test case starts after the given seconds.
 
         Each UI run acts `act` seconds after its first test case started; None never starts a test case. With
         `reach_at`, the old app reaches its checkpoint on its own that many seconds after the preparation launch.
         With `app_ended`, the launched app is gone: its running check fails with that message at once, or only
-        names it next to a later failure when `ended_after_start`; with `ended_from_verify` it is alive until the new app launches. `verify_code` is the exit code of the verification run."""
+        names it next to a later failure when `ended_after_start`; with `ended_from_verify` it is alive until the new app launches. `verify_code` is the exit code of the verification run and `verify_act` the seconds that it acts (default `act`)."""
         clock = {'now': 0.0}
         runs, events, servers = [], [], []
         self.summary_lines = []
@@ -1126,14 +1150,15 @@ else:
             sleep = staticmethod(advance)
 
         class Run:
-            def __init__(self, log, startup, reach=None, code=0):
+            def __init__(self, log, startup, reach=None, code=0, acts=None):
                 self.log, self.announced, self.stopped, self.code = log, False, False, code
+                self.acts = act if acts is None else acts
                 self.start_at = None if startup is None else clock['now'] + startup
                 self.reach_at = None if reach is None else clock['now'] + reach
                 log.write_text('Running tests...\n')
 
             def remaining(self):
-                return float('inf') if self.start_at is None else max(0, self.start_at + act - clock['now'])
+                return float('inf') if self.start_at is None else max(0, self.start_at + self.acts - clock['now'])
 
             def poll(self):
                 return 0 if self.stopped else None
@@ -1202,7 +1227,8 @@ else:
 
         def ui(runner, destination, point, phase, case, *_):
             runs.append(Run(case / (phase + '-ui.log'), prepare_startup if phase == 'prepare' else verify_startup,
-                            reach_at if phase == 'prepare' else None, verify_code if phase == 'verify' else 0))
+                            reach_at if phase == 'prepare' else None, verify_code if phase == 'verify' else 0,
+                            verify_act if phase == 'verify' else None))
             events.append('ui-' + phase)
             return runs[-1], io.StringIO()
 

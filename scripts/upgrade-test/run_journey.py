@@ -266,9 +266,8 @@ class InstalledApp:
         if self.app_log:
             return
         if self.simulator:
-            executable = self.executable = plistlib.loads((app / 'Info.plist').read_bytes())['CFBundleExecutable']
             stream = ['xcrun', 'simctl', 'spawn', self.simulator, 'log', 'stream', '--style', 'compact',
-                      '--predicate', f'process == "{executable}"']
+                      '--predicate', f'process == "{self.executable}"']
         else:
             stream = ['/usr/bin/log', 'stream', '--style', 'compact', '--predicate', f'processImagePath BEGINSWITH "{self.installed}/"']
         self.app_log_file = open(self.directory / 'app.log', 'w')
@@ -278,6 +277,8 @@ class InstalledApp:
         if self.simulator:
             # This always installs over the existing app. The upgrade phase never uninstalls or erases it.
             command(['xcrun', 'simctl', 'install', self.simulator, str(app)])
+            # The name of the installed version, for the log filter of the first install and for messages about its process.
+            self.executable = plistlib.loads((app / 'Info.plist').read_bytes())['CFBundleExecutable']
         else:
             self.installed = self.directory / 'installed.app'
             if self.installed.exists():
@@ -570,7 +571,7 @@ def main():
                         if code:
                             raise JourneyError(app.explain(f'{tag} / {point}: UI verification failed ({code})'))
                     except subprocess.TimeoutExpired as error:
-                        raise JourneyError(f'{tag} / {point}: UI verification timed out') from error
+                        raise JourneyError(app.explain(f'{tag} / {point}: UI verification timed out')) from error
                     finally:
                         stop_group(verifying)
                         verify_log.close()
