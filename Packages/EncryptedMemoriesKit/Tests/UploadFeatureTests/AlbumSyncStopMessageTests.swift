@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import UploadCore
 import XCTest
 
 @testable import AlbumSyncCore
@@ -9,6 +10,15 @@ import XCTest
 /// sent completed it. Both are information, not errors.
 @MainActor
 final class AlbumSyncStopMessageTests: XCTestCase {
+    private struct NoRemoteAlbums: AlbumSyncRemoteAlbumOps {
+        func listAlbums() async throws -> [AlbumSyncRemoteAlbum] { [] }
+        func createAlbum(name: String) async throws -> String { "remote-1" }
+        func childMainLinkIDs(albumID: String) async throws -> Set<String> { [] }
+        func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
+            AlbumSyncAttachResult()
+        }
+    }
+
     private func report(unattachable: Int = 0, incomplete: Int = 0) -> AlbumSyncReport {
         AlbumSyncReport(
             remoteAlbumID: "remote-1", totalAssets: 3, attached: 3 - unattachable, alreadyMember: 0, attachFailed: 0,
@@ -28,6 +38,25 @@ final class AlbumSyncStopMessageTests: XCTestCase {
     func testAStoppedRunThatEndedWithPhotosThatNeedAttentionAddsNoMessage() {
         XCTAssertNil(AlbumSyncController.messageAfterStop(finished: report(unattachable: 1)))
         XCTAssertNil(AlbumSyncController.messageAfterStop(finished: report(incomplete: 1)))
+    }
+
+    func testAnErrorAfterAStopMessageShowsAsAnErrorAgain() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-stop-message-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let controller = AlbumSyncController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative),
+            identityResolver: nil, uploader: MockUploader(), remoteOps: NoRemoteAlbums())
+        addTeardownBlock { await controller.shutdown() }
+        XCTAssertEqual(controller.lastMessageStyle, .error)
+
+        controller.setMessage(L10n.string("albumsync.error_stopped"), style: .information)
+        XCTAssertEqual(controller.lastMessageStyle, .information)
+        controller.setMessage(AlbumSyncError.alreadyRunning.errorDescription)
+
+        XCTAssertEqual(controller.lastMessage, AlbumSyncError.alreadyRunning.errorDescription)
+        XCTAssertEqual(controller.lastMessageStyle, .error, "a real error stays red")
     }
 
     func testTheStopTextsAreTheExistingEnglishAndGermanStrings() throws {

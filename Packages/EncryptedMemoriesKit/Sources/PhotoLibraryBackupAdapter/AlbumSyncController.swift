@@ -431,7 +431,7 @@ public final class AlbumSyncController {
         return report.isFullySynced ? L10n.string("albumsync.phase_completed") : nil
     }
 
-    private func setMessage(_ message: String?, style: MessageStyle = .error) {
+    func setMessage(_ message: String?, style: MessageStyle = .error) {
         lastMessage = message
         lastMessageStyle = style
     }
