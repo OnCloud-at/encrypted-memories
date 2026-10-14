@@ -1,0 +1,107 @@
+import Foundation
+
+/// One-time cold-launch removal of the system URL cache and cookie file that the SDK network client
+/// wrote before it switched to an ephemeral session (#605). Nothing ever read them.
+///
+/// The purge never lists either container. It removes only the literal names below, directly inside
+/// `Library/Caches/<bundle id>` and `Library/Cookies`, and never follows a symbolic link. Every other
+/// entry stays, including the Core ML compile cache next to the URL cache and all app caches.
+/// On macOS it runs only inside the app's sandbox container, where `Library/Cookies` is the app's own.
+public enum UnusedNetworkStorePurge {
+    static let completedKey = "network.unusedStorePurged.v1"
+    static let urlCacheEntryNames = ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData"]
+    static let cookieFileName = "Cookies.binarycookies"
+
+    public struct Result: Sendable, Equatable {
+        public let removed: [URL]
+        public let failed: [URL]
+
+        public var succeeded: Bool { failed.isEmpty }
+    }
+
+    /// Runs the purge unless an earlier launch completed it. Returns nil when it did not run.
+    /// Any failure leaves the completion flag unset, so the next cold launch tries again.
+    @discardableResult
+    public static func purgeOnce(defaults: UserDefaults = .standard) -> Result? {
+        let fm = FileManager.default
+        guard let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first,
+            let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first,
+            let bundleIdentifier = Bundle.main.bundleIdentifier
+        else { return nil }
+        return purgeOnce(
+            defaults: defaults,
+            libraryDirectory: library,
+            cachesDirectory: caches,
+            bundleIdentifier: bundleIdentifier,
+            removeItem: { try TransientPlaintextPurge.removeWithoutFollowingLinks(at: $0, boundary: $0) }
+        )
+    }
+
+    static func purgeOnce(
+        defaults: UserDefaults,
+        libraryDirectory: URL,
+        cachesDirectory: URL,
+        bundleIdentifier: String,
+        removeItem: (URL) throws -> Void
+    ) -> Result? {
+        guard !defaults.bool(forKey: completedKey) else { return nil }
+        guard isAppContainerLibrary(libraryDirectory) else { return nil }
+
+        var removed: [URL] = []
+        var failed: [URL] = []
+        let containers: [(parent: URL, name: String, entries: [String])] = [
+            (cachesDirectory, bundleIdentifier, urlCacheEntryNames),
+            (libraryDirectory, "Cookies", [cookieFileName]),
+        ]
+        for (parent, name, entries) in containers {
+            let parent = parent.standardizedFileURL
+            let container = parent.appendingPathComponent(name, isDirectory: true).standardizedFileURL
+            // A name with `/` or `..` would leave the search-path directory.
+            guard container.deletingLastPathComponent().path == parent.path, container.lastPathComponent == name else {
+                failed.append(container)
+                continue
+            }
+            // A link in place of the container points outside the app's own files.
+            guard itemType(at: container) == .typeDirectory else { continue }
+            for entry in entries {
+                let target = container.appendingPathComponent(entry).standardizedFileURL
+                guard itemType(at: target) != nil else { continue }
+                do {
+                    try removeItem(target)
+                } catch {
+                    failed.append(target)
+                    continue
+                }
+                if itemType(at: target) == nil {
+                    removed.append(target)
+                } else {
+                    failed.append(target)
+                }
+            }
+        }
+        if failed.isEmpty {
+            defaults.set(true, forKey: completedKey)
+        }
+        return Result(removed: removed, failed: failed)
+    }
+
+    /// iOS apps always run in their own container. A macOS app outside its sandbox container
+    /// (`Containers/<id>/Data/Library`) shares `Library/Cookies` with other apps, so the purge must not run there.
+    static func isAppContainerLibrary(_ library: URL) -> Bool {
+        #if os(macOS)
+            let library = library.standardizedFileURL
+            let data = library.deletingLastPathComponent()
+            return library.lastPathComponent == "Library"
+                && data.lastPathComponent == "Data"
+                && data.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "Containers"
+        #else
+            return true
+        #endif
+    }
+
+    /// The type of the item itself, without following a final symbolic link; nil when nothing exists.
+    private static func itemType(at url: URL) -> FileAttributeType? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
+        return attributes[.type] as? FileAttributeType
+    }
+}

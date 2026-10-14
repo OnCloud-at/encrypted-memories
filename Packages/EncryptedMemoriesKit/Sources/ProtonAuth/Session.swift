@@ -154,9 +154,13 @@ public enum ProtonAuthLocalDataPurge {
                 }
             }
         #endif
+        let sendableDefaults = SendableUserDefaults(defaults)
         return await performStartupOffMain(
             claim: claim,
-            defaults: SendableUserDefaults(defaults),
+            defaults: sendableDefaults,
+            unusedNetworkStorePurge: {
+                UnusedNetworkStorePurge.purgeOnce(defaults: sendableDefaults.value)
+            },
             plaintextPurge: {
                 if let plaintextPurgeSucceeded {
                     return plaintextPurgeSucceeded
@@ -179,13 +183,16 @@ public enum ProtonAuthLocalDataPurge {
         }.value
     }
 
+    /// A failed unused network store purge never blocks sign-in; it retries at the next cold launch.
     static func performStartupOffMain(
         claim: BackupLocalDataPurge.Claim?,
         defaults: SendableUserDefaults,
+        unusedNetworkStorePurge: @escaping @Sendable () -> Void = {},
         plaintextPurge: @escaping @Sendable () -> Bool,
         purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
         await Task.detached(priority: .utility) {
+            unusedNetworkStorePurge()
             let plaintextPurgeSucceeded = plaintextPurge()
             let signOutPurgeSucceeded =
                 claim.map {

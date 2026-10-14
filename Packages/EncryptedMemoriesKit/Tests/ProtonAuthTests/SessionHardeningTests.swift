@@ -185,6 +185,32 @@ struct SessionHardeningTests {
         #expect(!FileManager.default.fileExists(atPath: root.path))
         #expect(!BackupLocalDataPurge.isPurgePending(defaults: defaults))
     }
+
+    @Test @MainActor func startupCleanupRemovesUnusedNetworkStoresFirstAndOffMain() async throws {
+        let suite = "auth-startup-network-store-test-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let probe = StartupPurgeProbe()
+
+        let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
+            claim: nil,
+            defaults: SendableUserDefaults(defaults),
+            unusedNetworkStorePurge: {
+                probe.record("network")
+            },
+            plaintextPurge: {
+                probe.record("plaintext")
+                return true
+            },
+            purgeKeychain: {
+                probe.record("keychain")
+            }
+        )
+
+        #expect(succeeded)
+        #expect(probe.events == ["network", "plaintext"])
+        #expect(probe.usedMainThread == false)
+    }
 }
 
 private struct NonPersistingAppleKeychainStore: AppleKeychainStoring {
