@@ -234,6 +234,8 @@ public struct ExactDuplicateFinder: Sendable {
     let rankingContext = ExactDuplicateRankingContext()
     /// The merges of this finder between their record and the check of their kept photo.
     let mergesInFlight = ExactDuplicateMergesInFlight()
+    /// The checks of the pending merges, one at a time.
+    let pendingChecks = ExactDuplicatePendingCheckTurns()
 
     public init(
         checker: any UploadDuplicateChecking,
@@ -920,8 +922,13 @@ public struct ExactDuplicateFinder: Sendable {
     /// read of all their links. A failed read or a connection failure ends the check, so an offline scan waits for one
     /// read and its retries; the merges then stay for the next scan or merge. Any other failure of one merge leaves the
     /// checks of the next merges running. Without a pending merge, nothing is read from the server, so the apps call it
-    /// at launch: a group whose copies both left the library comes back before the person opens Duplicates.
+    /// at launch: a group whose copies both left the library comes back before the person opens Duplicates. A check
+    /// that starts while another one runs waits for it and then reads the journal again.
     public func resolvePendingMerges() async {
+        await pendingChecks.run { await resolvePendingMergesInTurn() }
+    }
+
+    private func resolvePendingMergesInTurn() async {
         guard let pending = mergeJournal.pendingMerges() else {
             log("[Duplicates] the merge journal cannot be read")
             return
@@ -1177,6 +1184,59 @@ final class ExactDuplicateMergesInFlight: @unchecked Sendable {
 
     func contains(_ intent: ExactDuplicateMergeIntent) -> Bool {
         lock.withLock { keys.contains(intent.key) }
+    }
+}
+
+/// Runs the checks of the pending merges of one finder one at a time, in the order of their start. Two checks that
+/// ran together could both find a kept photo in the trash and both restore its duplicates and move their rows back.
+final class ExactDuplicatePendingCheckTurns: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isRunning = false
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+
+    /// The checks that wait for their turn.
+    var waiting: Int { lock.withLock { waiters.count } }
+
+    /// Runs `check` once no earlier check runs. A task that is cancelled while it waits runs no check.
+    func run(_ check: () async -> Void) async {
+        guard await enter() else { return }
+        await check()
+        leave()
+    }
+
+    private func enter() async -> Bool {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                let admitted = lock.withLock { () -> Bool? in
+                    guard !Task.isCancelled else { return false }
+                    guard isRunning else {
+                        isRunning = true
+                        return true
+                    }
+                    waiters.append((id, continuation))
+                    return nil
+                }
+                if let admitted { continuation.resume(returning: admitted) }
+            }
+        } onCancel: {
+            lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+                guard let index = waiters.firstIndex(where: { $0.id == id }) else { return nil }
+                return waiters.remove(at: index).continuation
+            }?.resume(returning: false)
+        }
+    }
+
+    /// Hands the turn to the next waiting check.
+    private func leave() {
+        let next = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+            guard !waiters.isEmpty else {
+                isRunning = false
+                return nil
+            }
+            return waiters.removeFirst().continuation
+        }
+        next?.resume(returning: true)
     }
 }
 
