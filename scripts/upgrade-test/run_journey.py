@@ -329,13 +329,18 @@ class InstalledApp:
             lines = (self.directory / 'app.log').read_text(errors='replace').splitlines()[-5:]
         except OSError:
             lines = []
-        return (f'The app process {self.app_pid} ({self.executable}) ended before the UI test activated it; XCTest would start it '
-                'again without the fixture arguments. Last app log lines: ' + (' | '.join(lines) or 'none'))
+        return (f'The app process {self.app_pid} ({self.executable}) is no longer running; if it ended before activate(), XCTest '
+                'starts it again without the fixture arguments. Last app log lines: ' + (' | '.join(lines) or 'none'))
 
     def require_running(self):
         reason = self.ended_reason()
         if reason:
             raise JourneyError(reason)
+
+    def explain(self, message):
+        """Append the ended app to a failure message, so the cause is named next to the original failure."""
+        reason = self.ended_reason()
+        return f'{message}; {reason}' if reason else message
 
     def macos_app_pid(self):
         if not hasattr(self, 'installed'):
@@ -425,7 +430,10 @@ def wait_ui_test_start(process, log, label, reached=None, timeout=UI_STARTUP_SEC
     event = 'exited'
     while process.poll() is None:
         if app_check is not None:
-            app_check()
+            try:
+                app_check()
+            except JourneyError as error:
+                raise JourneyError(f'{label}: {error}') from error
         if reached is not None and reached.is_set():
             event = 'reached its checkpoint'
             break
@@ -536,9 +544,8 @@ def main():
                     preparation_deadline = time.monotonic() + PREPARATION_SECONDS
                     try:
                         server.wait_checkpoint(timeout=max(0, preparation_deadline - time.monotonic()), preparing=preparing)
-                    except JourneyError:
-                        app.require_running()  # A dead app is the cause; name it instead of the missing checkpoint.
-                        raise
+                    except JourneyError as error:
+                        raise JourneyError(app.explain(str(error))) from error
                     saved_consent = None
                     consent_evidence = {}
                     if point.startswith('backup.'):
@@ -561,8 +568,7 @@ def main():
                             verifying, case / 'verify-ui.log', f'{tag} / {point} verification', app_check=app.require_running)
                         code = verifying.wait(timeout=VERIFICATION_SECONDS)
                         if code:
-                            app.require_running()
-                            raise JourneyError(f'{tag} / {point}: UI verification failed ({code})')
+                            raise JourneyError(app.explain(f'{tag} / {point}: UI verification failed ({code})'))
                     except subprocess.TimeoutExpired as error:
                         raise JourneyError(f'{tag} / {point}: UI verification timed out') from error
                     finally:
