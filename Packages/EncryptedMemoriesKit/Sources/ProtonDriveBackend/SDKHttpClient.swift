@@ -5,7 +5,7 @@ import ProtonDriveSDK
 /// storage requests; we add the session auth headers and perform the I/O, refreshing on 401.
 final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     private let driveSession: DriveSession
-    private let urlSession: URLSession
+    let urlSession: URLSession
     private let requestGovernor: ProtonRequestGovernor
     private let expensiveUploadAccess: ExpensiveUploadAccess?
 
@@ -18,7 +18,9 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         self.driveSession = driveSession
         self.requestGovernor = requestGovernor
         self.expensiveUploadAccess = expensiveUploadAccess
-        let cfg = URLSessionConfiguration.default
+        // Responses are never read from a cache, so keep none and keep cookies only in memory.
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.urlCache = nil
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         // Test seam: lets unit tests intercept requests with a URLProtocol stub (never set in production).
         if let urlProtocolClasses { cfg.protocolClasses = urlProtocolClasses }

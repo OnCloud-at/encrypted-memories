@@ -145,6 +145,20 @@ public enum ProtonAuthLocalDataPurge {
         defaults: UserDefaults = .standard,
         plaintextPurgeSucceeded: Bool? = nil
     ) async -> Bool {
+        await performStartupOffMain(
+            claim: claim,
+            defaults: defaults,
+            plaintextPurgeSucceeded: plaintextPurgeSucceeded,
+            networkStores: UnusedNetworkStorePurge.Location.current
+        )
+    }
+
+    static func performStartupOffMain(
+        claim: BackupLocalDataPurge.Claim?,
+        defaults: UserDefaults,
+        plaintextPurgeSucceeded: Bool?,
+        networkStores: UnusedNetworkStorePurge.Location?
+    ) async -> Bool {
         #if os(iOS)
             if claim != nil {
                 // Foundation's default network stores are app-sandbox local on iOS, but live
@@ -154,9 +168,13 @@ public enum ProtonAuthLocalDataPurge {
                 }
             }
         #endif
+        let sendableDefaults = SendableUserDefaults(defaults)
         return await performStartupOffMain(
             claim: claim,
-            defaults: SendableUserDefaults(defaults),
+            defaults: sendableDefaults,
+            unusedNetworkStorePurge: {
+                UnusedNetworkStorePurge.purgeOnce(defaults: sendableDefaults.value, location: networkStores)
+            },
             plaintextPurge: {
                 if let plaintextPurgeSucceeded {
                     return plaintextPurgeSucceeded
@@ -179,13 +197,18 @@ public enum ProtonAuthLocalDataPurge {
         }.value
     }
 
+    /// The unused network store purge runs once per arming and never fails or aborts sign-in. Sign-out clears
+    /// its completion flag with the preferences, so the next cold launch runs it again; a failed removal also
+    /// retries at the next cold launch. Each run is awaited before an account opens.
     static func performStartupOffMain(
         claim: BackupLocalDataPurge.Claim?,
         defaults: SendableUserDefaults,
+        unusedNetworkStorePurge: @escaping @Sendable () -> Void,
         plaintextPurge: @escaping @Sendable () -> Bool,
         purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
         await Task.detached(priority: .utility) {
+            unusedNetworkStorePurge()
             let plaintextPurgeSucceeded = plaintextPurge()
             let signOutPurgeSucceeded =
                 claim.map {
