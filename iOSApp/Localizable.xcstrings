@@ -332,7 +332,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ihre Sitzung wird überprüft …"
+            "value": "Deine Sitzung wird überprüft …"
           }
         },
         "en": {
@@ -349,7 +349,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Melden Sie sich mit Ihrem Proton-Konto an, um Ihre Fotos in Proton Drive zu sehen."
+            "value": "Melde dich mit deinem Proton-Konto an, um deine Fotos in Proton Drive zu sehen."
           }
         },
         "en": {
@@ -485,7 +485,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ihre Mediathek wird geladen …"
+            "value": "Deine Mediathek wird geladen …"
           }
         },
         "en": {
