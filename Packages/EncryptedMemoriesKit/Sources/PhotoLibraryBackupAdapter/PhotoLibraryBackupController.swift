@@ -104,7 +104,14 @@ public final class PhotoLibraryBackupController {
     /// The backup waits because mobile data is off for backups. Changes only with that state, so observers of the
     /// grid badges do not follow every progress tick.
     public private(set) var isWaitingForWiFi = false
-    public private(set) var isSyncing = false
+    public private(set) var isSyncing = false {
+        didSet {
+            guard isSyncing != oldValue else { return }
+            for wake in passStateWakes.values { Task { await wake.signal() } }
+        }
+    }
+    /// Open problem lists, woken when a pass starts or ends.
+    @ObservationIgnored private var passStateWakes: [UUID: BackupWorkWake] = [:]
     public private(set) var lastMessage: String?
     /// Exact Core-derived eligibility time for the next automatic attempt. Platform schedulers may
     /// request an OS window around this date but never invent their own retry cadence.
@@ -547,40 +554,24 @@ public final class PhotoLibraryBackupController {
         limit: Int = 200, coalescing: TimeInterval = 1, clock: any BackupSchedulerClock = BackupContinuousClock(),
         _ apply: ([BackupFailedItem]) -> Void
     ) async {
-        // Subscribe before the first read, so a write between that read and the first wait is not lost.
+        // Subscribe before the first read, so a write or the end of the pass during that read is not lost.
         let wake = BackupWorkWake()
         let follower = queueStore.map { wake.follow($0.changes()) }
-        defer { follower?.cancel() }
-        let passEnd = PassEndWatch()
+        let id = UUID()
+        passStateWakes[id] = wake
+        defer {
+            follower?.cancel()
+            passStateWakes[id] = nil
+        }
+        var passEnded = !isSyncing
         await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
-        guard isSyncing else { return }
-        while !Task.isCancelled {
-            watchPassEnd(passEnd, wake: wake)
+        while !passEnded {
             await wake.wait(clock: clock)
             guard !Task.isCancelled else { return }
-            // A pass that ended before this read, also during the pause, gets this one last read.
-            let passEnded = !isSyncing
+            // A pass that ended before this read, also during the pause or the previous read, gets this last read.
+            passEnded = !isSyncing
             await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
-            if passEnded { return }
-            try? await clock.sleep(for: coalescing)
-        }
-    }
-
-    /// One observation of `isSyncing` at a time: it wakes the problem list once when the pass ends.
-    @MainActor private final class PassEndWatch {
-        var isArmed = false
-    }
-
-    private func watchPassEnd(_ watch: PassEndWatch, wake: BackupWorkWake) {
-        guard !watch.isArmed else { return }
-        watch.isArmed = true
-        withObservationTracking {
-            _ = isSyncing
-        } onChange: {
-            Task { @MainActor in
-                watch.isArmed = false
-                await wake.signal()
-            }
+            if !passEnded { try? await clock.sleep(for: coalescing) }
         }
     }
 
@@ -1041,7 +1032,8 @@ public final class PhotoLibraryBackupController {
             // Rows that are due now but were not taken (a full disk, a dismissed recheck) wait for the next write
             // or the end of the scan instead of a hot loop. Cancellation wakes the wait.
             await scanDone.wake.wait(atMost: nextDueDelay(in: queue, now: now()), clock: clock)
-            // More rows of the same scan chunk arrive together; the end of the scan drains at once.
+            // Writes of the same scan chunk drain together. A scan that ended before the pause drains at once; one that
+            // ends during it, and a stored date, drain at most `coalescing` seconds later.
             if await !scanDone.isDone() { try? await clock.sleep(for: coalescing) }
         }
         return BackupSyncProgress()
@@ -1211,6 +1203,9 @@ public final class PhotoLibraryBackupController {
             refreshFromQueue()
             return true
         }
+
+        /// Open problem lists that wait for the start or end of a pass.
+        internal var passStateWakeCountForTesting: Int { passStateWakes.count }
 
         /// The queue store that this controller owns. Only it reports committed writes to the problem list.
         internal var queueStoreForTesting: UploadBackupSyncQueueManifestStore? { queueStore }

@@ -382,6 +382,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 shown.ended = true
             }
             try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 1)
 
             pass.cancel()
             await fixture.controller.finishSyncForTesting(runID: "run")
@@ -390,6 +391,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             follow.cancel()
             await follow.value
             XCTAssertEqual(shown.lists.count, 2, "the end of the pass shows the final list once, without a write")
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 0, "a closed list leaves nothing behind")
             await fixture.controller.shutdown()
         }
 
