@@ -30,6 +30,9 @@ jobs:
     name: Repository hygiene
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -85,7 +88,48 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
-        run: bash scripts/check-commit-identities.sh "$BASE_SHA" "$HEAD_SHA"
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          SENDER_ID: ${{ github.event.sender.id }}
+        run: |
+          set -euo pipefail
+          # Commits may carry only the noreply addresses of the pull request author.
+          # Account values reach the script only through environment variables.
+          # The two commit SHAs are passed as quoted arguments; the script validates them as git commits.
+          case "$EVENT_NAME" in
+            pull_request)
+              login="$PR_AUTHOR_LOGIN"
+              account_id="$PR_AUTHOR_ID"
+              ;;
+            merge_group)
+              # The queue ref is gh-readonly-queue/<base>/pr-<number>-<sha>; its commit has that pull request's author.
+              pr_ref='/pr-([0-9]+)-[0-9a-f]{40}$'
+              if [[ ! "$MERGE_GROUP_HEAD_REF" =~ $pr_ref ]]; then
+                echo "The merge group ref names no pull request." >&2
+                exit 1
+              fi
+              read -r login account_id < <(gh api "repos/$GITHUB_REPOSITORY/pulls/${BASH_REMATCH[1]}" \
+                --jq '"\(.user.login) \(.user.id)"')
+              ;;
+            *)
+              # A manual run checks the tip commit of the dispatched ref for the account that started it.
+              login="$SENDER_LOGIN"
+              account_id="$SENDER_ID"
+              ;;
+          esac
+          if [[ -z "$login" || -z "$account_id" ]]; then
+            echo "The event names no account to check commit identities against." >&2
+            exit 1
+          fi
+          COMMIT_IDENTITY_LOGIN="$login" COMMIT_IDENTITY_ID="$account_id" \
+            bash scripts/check-commit-identities.sh "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Test commit identity check
+        run: bash .github/scripts/test_check_commit_identities.sh
 
       - name: Test Apple release automation
         run: |
