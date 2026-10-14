@@ -355,7 +355,7 @@ final class MobileLibraryModel {
     @ObservationIgnored private let sourceAnalysis = LibrarySourceAnalysisSession()
     private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime? { sourceAnalysis.runtime }
     /// Coalesces repeated retry taps into one ordered transient retirement and one replacement load.
-    @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private let retrySequence = BackendRetrySequence()
     /// Coalesces terminal Drive scope recovery. This path keeps authentication but purges all lost-scope data.
     @ObservationIgnored private let scopeRecoveryCoordinator = MobileScopeRecoveryCoordinator()
     @ObservationIgnored private var nextScopeRecoveryID: UInt64 = 0
@@ -769,20 +769,13 @@ final class MobileLibraryModel {
     func retry() async {
         guard let session, let store else { return }
         if await scopeRecoveryCoordinator.joinIfActive() { return }
-        if let retryTask {
-            await retryTask.value
-            return
-        }
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.retryTask = nil }
-            await self.retireForRetry()
-            guard !Task.isCancelled, self.session == session else { return }
-            self.configuredUID = nil
-            self.start(session: session, store: store, preserveVisibleSnapshot: true)
-        }
-        retryTask = task
-        await task.value
+        await retrySequence.run(
+            retire: { [weak self] in await self?.retireForRetry() },
+            start: { [weak self] in
+                guard let self, self.session == session else { return }
+                self.configuredUID = nil
+                self.start(session: session, store: store, preserveVisibleSnapshot: true)
+            })
     }
 
     /// Schedules a Drive-scope recovery for the exact session and load that observed the terminal result. The
@@ -803,7 +796,7 @@ final class MobileLibraryModel {
             failedLoadGeneration: failedLoadGeneration,
             requestID: nextScopeRecoveryID
         )
-        let activeRetry = retryTask
+        let activeRetry = retrySequence.current
         let activeThumbnailCache = thumbnailCache
         let activeOriginalsCache = originalsCache
         let locationStore = locationStore
@@ -1237,12 +1230,10 @@ final class MobileLibraryModel {
         let activeLocationCrawl = locationCrawl.crawl
         let activeLocationCrawlStarter = locationCrawl.startingTask
         let activeLocationIndex = locationIndex
-        let activeRetry = retryTask
+        let activeRetry = retrySequence.cancel()
         let activeScopeRecovery = scopeRecoveryCoordinator.cancel()
 
         loadToken &+= 1  // supersede any in-flight snapshot sort
-        activeRetry?.cancel()
-        retryTask = nil
         isRecoveringScope = false
         activeLoadTask?.cancel()
         loadTask = nil
