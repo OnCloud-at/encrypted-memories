@@ -1197,7 +1197,9 @@ final class ExactDuplicatePendingCheckTurns: @unchecked Sendable {
     /// The checks that wait for their turn.
     var waiting: Int { lock.withLock { waiters.count } }
 
-    /// Runs `check` once no earlier check runs. A task that is cancelled while it waits runs no check.
+    /// Runs `check` once no earlier check runs. A task that is cancelled while it waits leaves the queue and runs no
+    /// check. A cancellation that arrives as the turn passes to it can still start the check, which then stops before
+    /// its first merge.
     func run(_ check: () async -> Void) async {
         guard await enter() else { return }
         await check()

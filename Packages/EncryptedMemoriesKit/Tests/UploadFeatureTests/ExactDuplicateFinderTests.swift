@@ -1327,10 +1327,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
         let second = Task { await finder.resolvePendingMerges() }
         // A second check that does not wait reads the open merge and restores the duplicate again.
-        let deadline = ContinuousClock.now + .milliseconds(500)
-        while remote.arrivals < 2, server.readCounts.visibility == readsBefore, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        try await waitUntil { finder.pendingChecks.waiting == 1 }
         XCTAssertEqual(server.readCounts.visibility, readsBefore, "the second check waits for the first")
         remote.gate.open()
         await first.value
