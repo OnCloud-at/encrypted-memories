@@ -444,7 +444,7 @@ final class FixtureBackend: PhotoUploading, UploadDuplicateChecking, @unchecked 
     func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
         lock.withLock { links.filter { $0.hash == contentHash }.prefix(limit).map(duplicate) }
     }
-    #if !UPGRADE_RECORDING
+    #if !UPGRADE_RECORDING || UPGRADE_HISTORICAL_LINK_VISIBILITY
         func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
             lock.withLock {
                 Dictionary(

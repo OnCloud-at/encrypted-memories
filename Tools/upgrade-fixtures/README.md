@@ -24,6 +24,11 @@ The historical SwiftPM scratch lives under `$ENCRYPTED_MEMORIES_BUILD_ROOT/Upgra
 Its separate dependency cache lives beside it. Later recordings reuse these caches for the same release.
 The script removes its historical worktree after recording and verifies its registration is gone. Build output and raw snapshots may remain in that scratch.
 Each regeneration creates a fresh run directory. Never share the current package's scratch with the release build.
+The recorded data tree lives under `/Users/Shared/EncryptedMemoriesUpgradeFixtures/<release>/<run>/` (set `UPGRADE_FIXTURE_DATA_BASE` to move it), so no stored path names a person.
+The packer scans every archive member, the manifest, and the WAL policy proof for a home directory, volume, temporary location, or private host, in its plain and its JSON-escaped form.
+A hit fails the recording, and the packer writes no corpus file; its message names the place and never the value.
+The script removes the run's data tree when it ends, also after a failure.
+A failed run can leave a release folder that holds only the WAL policy proof. Delete that folder before the next run.
 
 To test the next release, pass its stable tag. Check the overlay against its public Core interfaces.
 The script writes `Fixtures/<release>/` and updates `Fixtures/releases.json` with the tag, commit, and SDK.

@@ -205,7 +205,9 @@ import XCTest
             guard ProcessInfo.processInfo.environment["UPGRADE_CHECK_SCENARIO"] == nil else { return }
             let releases = try releases(at: fixtureRoot())
             let started = ContinuousClock.now
-            let deadline = DispatchTime.now() + 120
+            // The budget grows with the recorded releases: 60 s of setup plus 60 s for each (120 s for one release).
+            let budget = 60 * (releases.count + 1)
+            let deadline = DispatchTime.now() + .seconds(budget)
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(
                 "upgrade-check-\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -241,7 +243,7 @@ import XCTest
                         do {
                             try fixtureRequire(
                                 DispatchTime.now().uptimeNanoseconds < deadline.uptimeNanoseconds,
-                                "Upgrade verification exceeded its total 120 second deadline")
+                                "Upgrade verification exceeded its total deadline")
                             let pool = root.appendingPathComponent(release.tag)
                             let label = "\(release.tag)/\(scenario)"
                             let log = pool.appendingPathComponent("\(scenario).log")
@@ -301,7 +303,7 @@ import XCTest
             for failure in results.failures { XCTFail(failure) }
             let elapsed = started.duration(to: .now)
             print("Upgrade corpus verification duration: \(elapsed)")
-            XCTAssertLessThan(elapsed, .seconds(120), "Upgrade verification exceeds the CI runtime budget")
+            XCTAssertLessThan(elapsed, .seconds(budget), "Upgrade verification exceeds the CI runtime budget")
         }
 
         private static func finish(_ process: Process, done: DispatchSemaphore, deadline: DispatchTime) throws {
@@ -311,7 +313,7 @@ import XCTest
                 kill(process.processIdentifier, SIGKILL)
                 process.waitUntilExit()
             }
-            throw FixtureFailure(description: "Upgrade verification exceeded its total 120 second deadline")
+            throw FixtureFailure(description: "Upgrade verification exceeded its total deadline")
         }
 
         func testScenarioWorker() async throws {

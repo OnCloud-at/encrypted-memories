@@ -352,6 +352,9 @@ INTERPOSE(observed_write_nocancel, write_nocancel);
 INTERPOSE(observed_pwrite_nocancel, pwrite_nocancel);
 INTERPOSE(observed_writev, writev);
 
+static void capture_open(const char *path, int flags, bool existed, int result) {
+    if (result >= 0 && ((flags & O_TRUNC) || ((flags & O_CREAT) && !existed))) capture("create-or-truncate", path, 0, 0, 0);
+}
 static int observed_open_file(const char *path, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list arguments; va_start(arguments, flags); mode = va_arg(arguments, int); va_end(arguments); }
@@ -359,7 +362,19 @@ static int observed_open_file(const char *path, int flags, ...) {
     pthread_mutex_lock(&mutex);
     bool existed = access(path, F_OK) == 0;
     int result = open(path, flags, mode), saved = errno;
-    if (result >= 0 && ((flags & O_TRUNC) || ((flags & O_CREAT) && !existed))) capture("create-or-truncate", path, 0, 0, 0);
+    capture_open(path, flags, existed, result);
+    pthread_mutex_unlock(&mutex); errno = saved; return result;
+}
+// Foundation opens some helper files with a data protection class; their creation is a boundary as well.
+extern int open_dprotected_np(const char *, int, int, int, ...);
+static int observed_open_protected(const char *path, int flags, int protection_class, int protection_flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list arguments; va_start(arguments, protection_flags); mode = va_arg(arguments, int); va_end(arguments); }
+    pthread_once(&once, initialize);
+    pthread_mutex_lock(&mutex);
+    bool existed = access(path, F_OK) == 0;
+    int result = open_dprotected_np(path, flags, protection_class, protection_flags, mode), saved = errno;
+    capture_open(path, flags, existed, result);
     pthread_mutex_unlock(&mutex); errno = saved; return result;
 }
 static int observed_renamex(const char *from, const char *to, unsigned int flags) {
@@ -374,6 +389,7 @@ static int observed_renamex(const char *from, const char *to, unsigned int flags
     pthread_mutex_unlock(&mutex); errno = saved; return result;
 }
 INTERPOSE(observed_open_file, open);
+INTERPOSE(observed_open_protected, open_dprotected_np);
 INTERPOSE(observed_renamex, renamex_np);
 // Preparation, reset, close and explicit checkpoints can also change the mapped WAL index.
 static int observed_prepare(sqlite3 *db, const char *sql, int count, sqlite3_stmt **statement, const char **tail) {
