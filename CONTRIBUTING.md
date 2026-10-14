@@ -29,6 +29,7 @@ The repository is public, and a pull request keeps every commit you push, even w
 - Never commit credentials, keys, tokens, certificates, provisioning profiles, or `.env` files.
 - Never commit personal data: real names, host names, local paths, device identifiers, or private network addresses. This includes commit metadata.
 - Use your GitHub noreply address as commit email, and run `git config --global user.useConfigOnly true`, so Git never derives an address from your machine name.
+- CI accepts only the noreply addresses of the account that opens the pull request (`<id>+<login>@users.noreply.github.com` or `<login>@users.noreply.github.com`) and `noreply@github.com` for the committer. A noreply address of another login credits that person's account. `Co-authored-by`, `Signed-off-by`, `Reviewed-by`, and `Generated-by` trailers must carry the author's own address and must not name a tool.
 - Check each commit before you push, not only the final result. CI scans every commit of a pull request, and GitHub push protection blocks known secret formats.
 
 ## Architecture rules
