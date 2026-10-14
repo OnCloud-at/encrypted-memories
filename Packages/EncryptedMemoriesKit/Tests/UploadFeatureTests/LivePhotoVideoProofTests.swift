@@ -128,8 +128,63 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
             let result = try await pipeline.resolve(video())
             XCTFail("a failed read must not decide the video: \(result.decision)")
         } catch {
-            XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+            XCTAssertEqual(
+                (error as? UploadError)?.localizedDescription,
+                UploadError.backend("link roles unavailable").localizedDescription, "the read error reaches the caller")
         }
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+        try await assertTheClaimsOfTheVideoAreReleased()
+    }
+
+    func testACopyThatTheRoleAnswerLeavesOutFailsTheCheck() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("own-video")]
+        checker.linkVisibilityByID["own-video"] = .some(nil)
+
+        do {
+            let result = try await pipeline.resolve(video())
+            XCTFail("an unanswered copy must not decide the video: \(result.decision)")
+        } catch {}
+        try await assertTheClaimsOfTheVideoAreReleased()
+    }
+
+    func testARoleAnswerWithoutThePhotoStateFailsTheCheck() async throws {
+        // The answer names no main photo because the server left out the photo state, not because the copy is a
+        // main photo of its own. The own copy must not count as unrelated.
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("own-video")]
+        checker.linkVisibilityByID["own-video"] = RemoteLinkVisibility(
+            isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+
+        do {
+            let result = try await pipeline.resolve(video())
+            XCTFail("an answer without the photo state must not decide the video: \(result.decision)")
+        } catch {}
+        try await assertTheClaimsOfTheVideoAreReleased()
+    }
+
+    func testAnActiveCopyWithoutALinkStaysAnInconsistentAnswer() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.MOV)", contentHash: videoContentHash, linkState: .active, linkID: nil)
+        ]
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.inconsistentRemoteState, remoteLinkID: nil))
+    }
+
+    /// A second check of the same bytes finishes: the failed check released its content and name claims.
+    private func assertTheClaimsOfTheVideoAreReleased() async throws {
+        checker.linkVisibilityError = nil
+        checker.linkVisibilityByID = [:]
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = []
+        await pipeline.invalidateCachedRemoteState()
+        let finished = expectation(description: "a second check of the same bytes finishes")
+        let pipeline = self.pipeline!
+        let descriptor = video()
+        Task {
+            if (try? await pipeline.resolve(descriptor))?.decision == .upload { finished.fulfill() }
+        }
+        await fulfillment(of: [finished], timeout: 10)
     }
 
     func testTheVideoOfAnotherLivePhotoWithTheSameBytesDoesNotSettleTheVideo() async throws {

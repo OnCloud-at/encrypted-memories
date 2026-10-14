@@ -622,8 +622,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         if descriptor.needsRelatedProof {
             // A secondary of a replacing edit counts only a copy under its main photo. A plain secondary drops only
-            // active copies elsewhere: a trashed or deleted copy keeps its meaning as a deletion by the person. A draft
-            // keeps its meaning. Only a row with these bytes can settle the secondary, so only such a row needs the list.
+            // active copies elsewhere: a trashed or deleted copy keeps its meaning as a deletion by the person, and
+            // so does a draft. Only a row with these bytes can settle the secondary, so only such a row is checked.
             let countsOnlyUnderTheMainPhoto: (RemotePhotoDuplicate) -> Bool = {
                 descriptor.requiresRelatedMatch ? $0.linkState != .draft : $0.linkState == .active
             }
@@ -642,19 +642,29 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     }
                 } else {
                     // The main photo can be in the trash, and the server refuses its list then. The role of each copy
-                    // answers in that case too. A failed read fails the check, like a failed list.
+                    // answers in that case too. Every copy with these bytes needs an answer that states its role: a
+                    // failed read, a copy the answer leaves out, or an answer without the photo state fails the check,
+                    // so an unproven own copy never uploads a second time.
                     let unasked = toProve.subtracting(relatedReads.askedLinks)
                     if !unasked.isEmpty {
                         let read = try await checker.linkVisibility(of: unasked.sorted())
                         relatedReads.askedLinks.formUnion(unasked)
                         relatedReads.visibility.merge(read) { _, new in new }
                     }
+                    guard toProve.allSatisfy({ relatedReads.visibility[$0]?.hasExplicitPhotoState == true }) else {
+                        throw UploadError.backend("The role of a copy with these bytes is unavailable")
+                    }
                     relatedLinkIDs = toProve.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
                 }
             }
             return (
                 remoteItems.filter { item in
-                    !countsOnlyUnderTheMainPhoto(item) || (item.linkID.map(relatedLinkIDs.contains) ?? false)
+                    guard let linkID = item.linkID else {
+                        // An active copy without a link is an inconsistent answer. It stays, so a plain secondary
+                        // fails closed as before.
+                        return !descriptor.requiresRelatedMatch || !countsOnlyUnderTheMainPhoto(item)
+                    }
+                    return !countsOnlyUnderTheMainPhoto(item) || relatedLinkIDs.contains(linkID)
                 }, false
             )
         }
