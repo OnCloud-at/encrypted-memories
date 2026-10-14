@@ -930,7 +930,8 @@ public actor BackupSyncRunner {
             checkingEntry = released
         }
         guard let resolved else {
-            discardMissingSource(checkingEntry, from: persistedState)
+            // Photos lists no asset for the source any more.
+            discardMissingSource(checkingEntry, from: persistedState, sourceIsUnavailable: true)
             return
         }
         resourcePressureStreak = 0  // A successful export indicates available volume space.
@@ -2407,12 +2408,14 @@ public actor BackupSyncRunner {
 
     private func discardMissingSource(
         _ entry: UploadBackupSyncQueueEntry,
-        from oldState: UploadBackupSyncQueueState
+        from oldState: UploadBackupSyncQueueState,
+        sourceIsUnavailable: Bool = false
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
-        // The catalog forgets the source first, so missing-source recovery does not queue it again on every pass.
-        // A failed write keeps the earlier behavior.
-        _ = markSourceUnavailable?(entry.source)
+        // Only a source that the library no longer lists leaves the catalog, before its row goes, so missing-source
+        // recovery does not queue it again on every pass. A file that is gone keeps the earlier recovery. A failed
+        // write keeps the earlier behavior too.
+        if sourceIsUnavailable { _ = markSourceUnavailable?(entry.source) }
         guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
             if queue.entry(for: entry.source, revision: entry.revision) != nil {
                 stopRequested = true

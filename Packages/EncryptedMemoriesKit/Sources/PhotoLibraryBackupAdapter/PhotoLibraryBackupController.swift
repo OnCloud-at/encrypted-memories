@@ -326,7 +326,12 @@ public final class PhotoLibraryBackupController {
                 configuration: .init(retry: retryPolicy),
                 throttleInputs: runtimeSignals.current,
                 runtimeChanges: runtimeSignals.updates,
-                markSourceUnavailable: { catalogStore.recordUnavailableSource($0, at: Date()) },
+                markSourceUnavailable: { source in
+                    // An empty answer only counts while the library answers at all: a library without access, on an
+                    // offline volume or not loaded yet must not empty the catalog.
+                    guard PhotoLibraryResourceResolver.libraryAnswersAssetQueries() else { return false }
+                    return catalogStore.recordUnavailableSource(source, at: Date())
+                },
                 events: pendingRecorder
             )
         } else {

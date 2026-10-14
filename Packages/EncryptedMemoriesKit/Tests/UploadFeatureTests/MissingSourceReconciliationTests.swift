@@ -203,6 +203,26 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(progress.uploaded, 1)
     }
 
+    func testAFileThatIsGoneDuringTheBackupKeepsThePhotoInTheCatalog() async throws {
+        // The temporary file of a listed photo can vanish during the backup. Only a photo that the library no
+        // longer lists leaves the catalog; the earlier recovery still brings this one back.
+        let candidate = try candidate("vanished-file")
+        XCTAssertTrue(queue.upsert(row(candidate)))
+        let clock = BackupTestClock()
+        let resolver = ScriptedBackupResolver(defaultModified: Date(timeIntervalSince1970: 200))
+        resolver.set(.failure(UploadError.fileMissing("vanished-file.jpg"), times: 1), for: "vanished-file")
+        let runner = runner(
+            clock: clock, resolver: resolver, markSourceUnavailable: catalogRecordsUnavailableSources())
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertFalse(catalog.presentEntries(for: ["vanished-file"]).isEmpty, "the photo stays in the catalog")
+        try await PhotoLibraryCatalogSync(store: catalog).reconcileMissingSources(engine: engine(clock: clock))
+        XCTAssertNotNil(
+            queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision),
+            "recovery queues the photo again")
+    }
+
     func testAPhotoWhoseFileCannotBeReadUsesTheMissingChecksInsteadOfReturningOnEveryPass() async throws {
         for code in [PHPhotosError.Code.invalidResource, .identifierNotFound] {
             let id = "unreadable-\(code.rawValue)"

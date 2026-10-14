@@ -297,6 +297,15 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         )
     }
 
+    /// True while Photos grants access and lists at least one asset. An empty asset query proves a source gone only then.
+    static func libraryAnswersAssetQueries() -> Bool {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited else { return false }
+        let options = PHFetchOptions()
+        options.fetchLimit = 1
+        return PHAsset.fetchAssets(with: options).firstObject != nil
+    }
+
     /// The backup plan of the asset as Photos lists it now. Nil when the asset has no backup work of its own: a series
     /// photo that belongs to another main photo. An asset that lists no main file takes the checks of a file that
     /// Photos reports as missing, so it never leaves the queue and comes back through catalog recovery on every pass.
