@@ -4697,4 +4697,40 @@ extension BackupSyncRunnerTests {
         XCTAssertTrue(uploaded, "the setting ends the wait without the poll interval")
         XCTAssertEqual(uploader.requests.map(\.allowsExpensiveNetwork), [true])
     }
+
+    /// Turning "Use Cellular Data" off during an upload on cellular data stops that upload at once. It returns to the
+    /// queue without an attempt and waits for Wi-Fi.
+    func testTurningOffMobileDataStopsTheRunningCellularUpload() async throws {
+        let due = seedEntry("mobile-data-off.jpg")
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "BackupMobileDataStop-\(UUID().uuidString)"))
+        defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: Self.cellular))
+        let signals = BackupRuntimeSignalSource.observing(runtime: runtime, defaults: defaults)
+        let running = RunningUntilCancelledUploader()
+        let runner = makeRunner(uploader: running, throttleInputs: signals.current, runtimeChanges: signals.updates)
+        let finished = expectation(description: "the pass ends")
+        let progressBox = BackupProgressBox()
+        let pass = Task {
+            progressBox.set(await runner.runUntilDrained(mode: .eligibleOnly))
+            finished.fulfill()
+        }
+        await running.started.wait()
+
+        // The settings toggle writes this preference; no runtime change accompanies it.
+        defaults.set(false, forKey: AppSettingsKey.backupUsesMobileData)
+        await fulfillment(of: [finished], timeout: 5)
+        // Without the reaction the transfer would run on; end it so the failure reports instead of hanging.
+        if progressBox.value == nil { await runner.stop() }
+        await pass.value
+
+        XCTAssertEqual(running.cancellations, 1, "turning the setting off cancels the cellular transfer")
+        XCTAssertEqual(running.requests.map(\.allowsExpensiveNetwork), [true])
+        let row = try XCTUnwrap(queueStore.entry(for: due.source, revision: due.revision))
+        XCTAssertEqual(row.state, .queuedForUpload)
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertNil(BackupIssueRecord.decode(row.lastError))
+        let progress = try XCTUnwrap(progressBox.value)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertEqual(progress.failed, 0)
+    }
 }
