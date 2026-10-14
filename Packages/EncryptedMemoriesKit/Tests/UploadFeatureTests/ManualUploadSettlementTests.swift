@@ -219,10 +219,6 @@ private final class FailingSettlementStore: UploadManualSettlementStoreProtocol,
         lock.withLock { failed ? [] : Array(records.values) }
     }
 
-    func pendingRecords() -> [UploadManualSettlementRecord] {
-        lock.withLock { failed ? [] : records.values.filter(\.isPending) }
-    }
-
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool {
         lock.withLock {

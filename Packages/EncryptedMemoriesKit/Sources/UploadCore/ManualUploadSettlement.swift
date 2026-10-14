@@ -215,7 +215,6 @@ public protocol UploadManualSettlementStoreProtocol: Sendable {
     func upsert(_ record: UploadManualSettlementRecord) -> Bool
     func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord?
     func allRecords() -> [UploadManualSettlementRecord]
-    func pendingRecords() -> [UploadManualSettlementRecord]
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool
     func close()
@@ -334,10 +333,6 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
 
     public func allRecords() -> [UploadManualSettlementRecord] {
         readRecords(whereClause: nil)
-    }
-
-    public func pendingRecords() -> [UploadManualSettlementRecord] {
-        readRecords(whereClause: "stage <> 'terminal'")
     }
 
     @discardableResult

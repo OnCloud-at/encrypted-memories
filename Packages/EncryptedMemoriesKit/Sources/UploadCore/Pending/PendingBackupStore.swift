@@ -629,18 +629,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         lock.withLock { upsertActionLocked(key, kind: .addToAlbum, albumID: albumID, desired: true, at: date) }
     }
 
-    @discardableResult
-    public func removeAction(_ key: PendingSourceKey, kind: PendingActionKind, albumID: String) -> Bool {
-        lock.withLock {
-            execute("DELETE FROM pending_action WHERE source_kind=? AND source_id=? AND kind=? AND album_id=?;") {
-                stmt in
-                bindKey(stmt, key)
-                bindText(stmt, 3, kind.rawValue)
-                bindText(stmt, 4, albumID)
-            }
-        }
-    }
-
     public func actions() -> [PendingAction] {
         lock.withLock { actionsLocked(where: nil) }
     }
@@ -650,18 +638,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             actionsLocked(where: "failed=0 AND next_attempt_at <= ?") {
                 sqlite3_bind_double($0, 1, date.timeIntervalSince1970)
             }
-        }
-    }
-
-    /// The earliest time an unfinished action becomes due, for the coordinator's timer.
-    public func nextActionDate() -> Date? {
-        lock.withLock {
-            var result: Date?
-            _ = query("SELECT MIN(next_attempt_at) FROM pending_action WHERE failed=0;") { stmt in
-                guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return }
-                result = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0))
-            }
-            return result
         }
     }
 
