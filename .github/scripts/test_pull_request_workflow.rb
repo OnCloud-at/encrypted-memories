@@ -155,7 +155,8 @@ class PullRequestWorkflowTests < Minitest::Test
     steps = macos.fetch("steps")
     probes = steps.find { |step| step["id"] == "upgrade-probes" }
     refute_nil probes, "The macOS job must run the tests that skip themselves on other systems"
-    # A darwin-only test class or method that this step does not run would be skipped silently by the hygiene job.
+    # A darwin-only test class or method skips itself on Ubuntu, so only this macOS step can run it. Detection is a
+    # one-line heuristic: a line with "skip" and "darwin" is followed by the guarded class or method.
     root = File.expand_path("../..", __dir__)
     commands = probes.fetch("run").lines.map(&:strip)
     assert_includes commands, "set -euo pipefail"
@@ -183,6 +184,8 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal 0, checkout.fetch("with").fetch("fetch-depth"), "The Metal test reads pinned releases by tag"
     python = steps.find { |step| step["id"] == "python" }
     assert_equal "3.14", python.fetch("with").fetch("python-version")
+    # A cancelled run must not report a probe result, and a failed earlier step must not hide it.
+    [python, probes].each { |step| assert_includes step.fetch("if"), "!cancelled()" }
     assert_operator steps.index(python), :<, steps.index(probes)
     assert_equal "${{ steps.upgrade-probes.outcome }}", macos.fetch("outputs").fetch("upgrade_probes")
     gate = jobs.fetch("macos-app-shell").fetch("steps").find { |step| step.fetch("env", {}).key?("RESULT") &&
@@ -190,6 +193,7 @@ class PullRequestWorkflowTests < Minitest::Test
     refute_nil gate, "The macOS gate must require the probe result"
     assert_equal "${{ needs.macos-verification.outputs.upgrade_probes }}", gate.fetch("env").fetch("RESULT")
     assert_equal 'test "$RESULT" = success', gate.fetch("run")
+    assert_equal "${{ always() }}", gate.fetch("if"), "The probe result must report even when the app shell check fails"
     assert_includes jobs.fetch("macos-app-shell").fetch("needs"), "macos-verification"
   end
 

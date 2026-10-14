@@ -378,7 +378,7 @@ jobs:
         uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
         with:
           python-version: '3.14'
-      # These tests skip themselves on other systems, so the hygiene job cannot run them.
+      # The hygiene job runs these files on Ubuntu, but their darwin-only tests skip themselves there; only a macOS job runs them.
       - name: Test the macOS upgrade probes
         id: upgrade-probes
         if: ${{ !cancelled() && steps.python.outcome == 'success' }}
