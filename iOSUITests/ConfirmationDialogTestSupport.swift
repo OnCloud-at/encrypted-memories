@@ -22,18 +22,33 @@ extension XCUIApplication {
         return button
     }
 
+    /// One accessibility snapshot can lose presented sheets while the dialog stays visible (merge-queue run 38441899952).
+    /// Only consecutive misses prove that the button is gone; the first sighting ends the check at once.
+    /// The loop runs `checks` times at most, so it cannot wait without a limit.
+    static func isConfirmedGone(
+        exists: () -> Bool, checks: Int = 5, interval: TimeInterval = 1
+    ) -> Bool {
+        precondition(checks > 0, "At least one check must decide")
+        for check in 0..<checks {
+            if check > 0 { Thread.sleep(forTimeInterval: interval) }
+            if exists() { return false }
+        }
+        return true
+    }
+
     /// Closing the dialog acknowledges the decision. Repeat only a tap that the dialog did not acknowledge.
     func tapDialogButton(
         _ identifier: String, tap: (XCUIElement) -> Void = { $0.tap() }
     ) throws {
+        let isGone = { Self.isConfirmedGone(exists: { self.buttons[identifier].firstMatch.exists }) }
         for attempt in 0..<2 {
-            if attempt > 0, !buttons[identifier].firstMatch.exists { return }
+            if attempt > 0, isGone() { return }
             tap(try hittableDialogButton(identifier))
             let acknowledged = XCTNSPredicateExpectation(
                 predicate: NSPredicate(format: "exists == false"), object: buttons[identifier].firstMatch
             )
-            // Allow several snapshot cycles before retrying input.
-            if XCTWaiter.wait(for: [acknowledged], timeout: Self.dialogWaitTimeout) == .completed { return }
+            // Allow several snapshot cycles before retrying input. One stale miss must not end the wait.
+            if XCTWaiter.wait(for: [acknowledged], timeout: Self.dialogWaitTimeout) == .completed, isGone() { return }
         }
         throw ConfirmationDialogTestError.notAcknowledged(identifier)
     }
