@@ -930,7 +930,8 @@ public actor BackupSyncRunner {
             checkingEntry = released
         }
         guard let resolved else {
-            // Photos lists no asset for the source any more.
+            // The source has no backup work of its own now: the library no longer lists it, or it belongs to another
+            // photo. The catalog hook decides which.
             discardMissingSource(checkingEntry, from: persistedState, sourceIsUnavailable: true)
             return
         }

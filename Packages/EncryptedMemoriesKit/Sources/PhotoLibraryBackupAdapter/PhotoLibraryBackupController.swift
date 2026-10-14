@@ -328,8 +328,11 @@ public final class PhotoLibraryBackupController {
                 runtimeChanges: runtimeSignals.updates,
                 markSourceUnavailable: { source in
                     // An empty answer only counts while the library answers at all: a library without access, on an
-                    // offline volume or not loaded yet must not empty the catalog.
-                    guard PhotoLibraryResourceResolver.libraryAnswersAssetQueries() else { return false }
+                    // offline volume or not loaded yet must not empty the catalog. A photo that Photos still lists, for
+                    // example a series photo of another main photo, stays in the catalog.
+                    guard PhotoLibraryResourceResolver.libraryAnswersAssetQueries(),
+                        PhotoKitAssetMapper.asset(withLocalIdentifier: source.identifier) == nil
+                    else { return false }
                     return catalogStore.recordUnavailableSource(source, at: Date())
                 },
                 events: pendingRecorder
