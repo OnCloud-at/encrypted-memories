@@ -80,10 +80,10 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             )
             throw UploadError.sourceNotReady(entry.originalFilename, until: until)
         }
-        guard let plan = PhotoBackupAssetPlanner.exportPlan(for: info),
-            let candidate = PhotoBackupAssetPlanner.candidate(for: info),
-            let primaryResource = PhotoKitAssetMapper.resource(for: plan.primary.role, of: asset)
-        else {
+        guard let (plan, candidate) = try Self.livePlan(for: info, filename: entry.originalFilename) else {
+            return nil
+        }
+        guard let primaryResource = PhotoKitAssetMapper.resource(for: plan.primary.role, of: asset) else {
             return nil
         }
 
@@ -289,6 +289,16 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             materializeWithProgress: primaryMaterializer,
             cleanup: { for url in exportedURLs.urls { tempStore.discard(url) } }
         )
+    }
+
+    /// The backup plan of the asset as Photos lists it now. Nil when the asset has no backup work of its own.
+    static func livePlan(
+        for info: PhotoBackupAssetInfo, filename: String
+    ) throws -> (PhotoBackupExportPlan, UploadBackupAssetCandidate)? {
+        guard let plan = PhotoBackupAssetPlanner.exportPlan(for: info),
+            let candidate = PhotoBackupAssetPlanner.candidate(for: info)
+        else { return nil }
+        return (plan, candidate)
     }
 
     private static func isUniqueCloudIdentifier(_ identifier: String?, localIdentifier: String) -> Bool {

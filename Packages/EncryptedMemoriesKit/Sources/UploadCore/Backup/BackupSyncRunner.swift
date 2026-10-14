@@ -87,6 +87,9 @@ public actor BackupSyncRunner {
     /// Pushed runtime changes, such as a new network path. A change that makes the backup wait for Wi-Fi stops the
     /// transfers that already run, so their bytes do not continue on cellular data.
     private let runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)?
+    /// Records that the source no longer exists, before its row goes, so missing-source recovery does not queue it
+    /// again on every pass. Nil for sources without a catalog (folder backup, album scratch queues).
+    private let markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)?
     private let clock: any BackupSchedulerClock
     private let now: @Sendable () -> Date
 
@@ -175,6 +178,7 @@ public actor BackupSyncRunner {
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
         runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
+        markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)? = nil,
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         events: (any BackupItemEventSink)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
@@ -191,6 +195,7 @@ public actor BackupSyncRunner {
         self.configuration = configuration
         self.throttleInputs = throttleInputs
         self.runtimeChanges = runtimeChanges
+        self.markSourceUnavailable = markSourceUnavailable
         self.clock = clock
         self.now = now
     }

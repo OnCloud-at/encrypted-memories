@@ -6,13 +6,37 @@ import XCTest
 @testable import UploadCore
 
 final class PhotoLibraryResourceErrorTests: XCTestCase {
-    func testPhotoKitErrorsThatProveTheResourceGoneBecomeTerminalSourceErrors() {
+    func testAnUnreadableResourceOfAListedPhotoIsCheckedAgainBeforeItCountsAsMissing() {
+        // The asset still exists; only its file cannot be read. It takes the checks of a missing resource, so it
+        // never leaves the queue and returns through catalog recovery on every pass.
         for code in [PHPhotosError.Code.identifierNotFound, .invalidResource] {
             let native = NSError(domain: PHPhotosErrorDomain, code: code.rawValue)
 
             let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0001.jpeg")
 
-            XCTAssertEqual(normalized as? UploadError, .fileMissing("IMG_0001.jpeg"), "\(code)")
+            XCTAssertEqual(normalized as? UploadError, .sourceReportedMissing("IMG_0001.jpeg"), "\(code)")
+        }
+    }
+
+    func testALiveAssetWithoutItsMainFileIsCheckedAgainButASeriesPhotoOfAnotherMainHasNoWork() throws {
+        func info(_ roles: [PhotoBackupAssetInfo.Resource.Role]) -> PhotoBackupAssetInfo {
+            PhotoBackupAssetInfo(
+                localIdentifier: "asset", creationDate: Date(timeIntervalSince1970: 100),
+                modificationDate: Date(timeIntervalSince1970: 200), pixelWidth: 10, pixelHeight: 10,
+                durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: roles.map { .init(role: $0, originalFilename: "IMG_0003.HEIC", mimeType: "image/heic") })
+        }
+
+        XCTAssertNotNil(
+            try PhotoLibraryResourceResolver.livePlan(for: info([.originalPhoto]), filename: "IMG_0003.HEIC"))
+        XCTAssertNil(
+            try PhotoLibraryResourceResolver.livePlan(
+                for: info([.originalPhoto, .burstMainReference]), filename: "IMG_0003.HEIC"),
+            "a series photo of another main photo has no backup work of its own")
+        XCTAssertThrowsError(
+            try PhotoLibraryResourceResolver.livePlan(for: info([.adjustmentData]), filename: "IMG_0003.HEIC")
+        ) { error in
+            XCTAssertEqual(error as? UploadError, .sourceReportedMissing("IMG_0003.HEIC"))
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 import SQLite3
 import XCTest
 
@@ -157,6 +158,88 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(queue.count(), 2)
         XCTAssertEqual(queue.entry(for: terminal.source, revision: terminal.revision), terminal)
         XCTAssertNotNil(queue.entry(for: dropped.snapshot.source, revision: dropped.snapshot.revision))
+    }
+
+    // MARK: - Issue 445: a photo that cannot be read must not return on every pass
+
+    func testAPhotoThatPhotosNoLongerListsLeavesTheCatalogInsteadOfReturningOnEveryPass() async throws {
+        let gone = try candidate("gone")
+        let info = PhotoLibraryCatalogMapper.info(for: try XCTUnwrap(catalog.entry(for: "gone")))
+        XCTAssertTrue(queue.upsert(row(gone)))
+        let tracked = PageCatalog(inner: catalog)
+        let sync = PhotoLibraryCatalogSync(store: tracked)
+        let clock = BackupTestClock()
+        try await sync.reconcileMissingSources(engine: engine(clock: clock))
+        let pagesBefore = tracked.pages
+        let resolver = ScriptedBackupResolver(defaultModified: Date(timeIntervalSince1970: 200))
+        resolver.set(.missing, for: "gone")
+        let runner = runner(
+            clock: clock, resolver: resolver, markSourceUnavailable: catalogRecordsUnavailableSources())
+
+        var totals: [Int] = []
+        for _ in 1...3 {
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            try await sync.reconcileMissingSources(engine: engine(clock: clock))
+            totals.append(queue.summary().total)
+            clock.advance(by: 3600)
+        }
+
+        XCTAssertEqual(totals, [0, 0, 0], "the photo must not be queued again after each pass")
+        XCTAssertEqual(resolver.resolveCount(for: "gone"), 1, "Photos is asked once")
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 1)
+        XCTAssertEqual(tracked.pages - pagesBefore, 2, "one catalog walk for the one drop, not one per pass")
+        XCTAssertNil(catalog.entry(for: "gone"), "the catalog no longer lists the photo")
+        XCTAssertEqual(queue.summary().sourceMissing, 0, "nothing is shown as a problem")
+
+        // When Photos lists the photo again, it backs up as usual.
+        let listed = PhotoLibraryCatalogSync(store: catalog, enumerator: ChangedEnumerator(info: info))
+        try await listed.runPass(
+            engine: engine(clock: clock),
+            changes: .init(changedIdentifiers: ["gone"], deletedIdentifiers: [], requiresFullRescan: false),
+            commitChanges: {})
+        XCTAssertNotNil(catalog.entry(for: "gone"))
+        resolver.set(.standard, for: "gone")
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(progress.uploaded, 1)
+    }
+
+    func testAPhotoWhoseFileCannotBeReadUsesTheMissingChecksInsteadOfReturningOnEveryPass() async throws {
+        for code in [PHPhotosError.Code.invalidResource, .identifierNotFound] {
+            let id = "unreadable-\(code.rawValue)"
+            let candidate = try candidate(id)
+            XCTAssertTrue(queue.upsert(row(candidate)))
+            let tracked = PageCatalog(inner: catalog)
+            let sync = PhotoLibraryCatalogSync(store: tracked)
+            let clock = BackupTestClock()
+            try await sync.reconcileMissingSources(engine: engine(clock: clock))
+            let pagesBefore = tracked.pages
+            let generationBefore = queue.missingSourceDiscardGeneration()
+            let resolver = ScriptedBackupResolver(defaultModified: Date(timeIntervalSince1970: 200))
+            let failure = PhotoLibraryResourceResolver.normalizedPhotoKitError(
+                NSError(domain: PHPhotosErrorDomain, code: code.rawValue), filename: "\(id).jpg")
+            resolver.set(.failure(failure, times: 100), for: id)
+            let runner = runner(
+                clock: clock, resolver: resolver, markSourceUnavailable: catalogRecordsUnavailableSources())
+
+            var totals: [Int] = []
+            for wait in [3600.0, 7200, 14_400] {
+                _ = await runner.runUntilDrained(mode: .eligibleOnly)
+                try await sync.reconcileMissingSources(engine: engine(clock: clock))
+                totals.append(queue.summary().total)
+                clock.advance(by: wait)
+            }
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            try await sync.reconcileMissingSources(engine: engine(clock: clock))
+
+            XCTAssertEqual(totals, [1, 1, 1], "\(code): the row stays while Photos is asked again")
+            let terminal = try XCTUnwrap(
+                queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision), "\(code)")
+            XCTAssertEqual(terminal.state, .sourceMissing, "\(code): shown once as missing after the last check")
+            XCTAssertEqual(resolver.resolveCount(for: id), 4, "\(code): one attempt and three checks")
+            XCTAssertEqual(queue.missingSourceDiscardGeneration(), generationBefore, "\(code)")
+            XCTAssertEqual(tracked.pages, pagesBefore, "\(code): no catalog walk")
+            XCTAssertNotNil(catalog.entry(for: id), "\(code): the photo is still in the library")
+        }
     }
 
     func testAChangedPhotoReopensATerminalMissingRowAtTheSameOrANewRevision() async throws {
@@ -1496,13 +1579,23 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 1)
     }
 
-    private func runner(clock: BackupTestClock, resolver: ScriptedBackupResolver) -> BackupSyncRunner {
+    private func runner(
+        clock: BackupTestClock, resolver: ScriptedBackupResolver,
+        markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)? = nil
+    ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queue, preflight: UploadBackupPreflightIndex(store: state), resolver: resolver,
             identityResolver: UploadDedupePipeline(
                 store: FakeIdentityStore(), hasher: FakeHasher(), checker: FakeChecker()),
             uploader: MockUploader(workDuration: .milliseconds(1), deliverProgress: false),
+            markSourceUnavailable: markSourceUnavailable,
             clock: clock, now: { clock.now })
+    }
+
+    /// The catalog hook as the photo library backup wires it.
+    private func catalogRecordsUnavailableSources() -> @Sendable (UploadSourceIdentity) -> Bool {
+        let catalog = self.catalog!
+        return { catalog.recordUnavailableSource($0, at: Date()) }
     }
 
     private struct ChangedEnumerator: PhotoLibraryAssetEnumerator {

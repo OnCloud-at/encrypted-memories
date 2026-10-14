@@ -295,6 +295,14 @@ public extension PhotoLibraryCatalogStore {
     func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] {
         entries.map(classify)
     }
+
+    /// Photos lists no asset for this source any more: the person deleted it, or it lies outside a narrowed
+    /// limited-access selection. The entry leaves the present inventory, so missing-source recovery does not queue it
+    /// again; the next scan or Photos change that lists the asset brings it back.
+    @discardableResult
+    func recordUnavailableSource(_ source: UploadSourceIdentity, at date: Date) -> Bool {
+        markRemoved([source.identifier], removedAt: date).succeeded
+    }
 }
 
 /// Persisted progress of a resumable full-library scan (see `PhotoLibraryCatalogSync`).
