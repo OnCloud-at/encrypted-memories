@@ -11,6 +11,11 @@ mkdir -p "$(dirname "$historical")"
 commit="$(git -C "$current" rev-parse "refs/tags/$release^{commit}")"
 git -C "$current" worktree add --detach "$historical" "$commit"
 cleanup() {
+  # The recorded data tree is no corpus, and every local user can read the shared folder: remove only this run's tree.
+  if [[ -n "${UPGRADE_FIXTURE_DATA_BASE:-}" && -n "${UPGRADE_FIXTURE_RUN_ID:-}" ]]; then
+    rm -rf -- "$UPGRADE_FIXTURE_DATA_BASE/$release/$UPGRADE_FIXTURE_RUN_ID"
+    rmdir "$UPGRADE_FIXTURE_DATA_BASE/$release" "$UPGRADE_FIXTURE_DATA_BASE" 2>/dev/null || true
+  fi
   # Only this script's disposable checkout contains the overlay and vendored SDK.
   git -C "$current" worktree remove --force "$historical"
   if git -C "$current" worktree list --porcelain | /usr/bin/grep -Fxq "worktree $historical"; then
@@ -21,6 +26,8 @@ cleanup() {
 trap cleanup EXIT
 python3 "$current/Tools/upgrade-fixtures/apply-overlay.py" "$current" "$historical" "$commit"
 export UPGRADE_FIXTURE_RELEASE="$release"
+# The recorded data tree lives in the shared folder, so no stored path names a person; the packer rejects any hit.
+export UPGRADE_FIXTURE_DATA_BASE="${UPGRADE_FIXTURE_DATA_BASE:-/Users/Shared/EncryptedMemoriesUpgradeFixtures}"
 mkdir -p "$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/$release"
 run_directory="$(mktemp -d "$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/$release/run.XXXXXX")"
 export UPGRADE_FIXTURE_RUN_ID="${run_directory##*/}"

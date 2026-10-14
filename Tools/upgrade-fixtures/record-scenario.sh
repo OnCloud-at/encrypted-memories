@@ -53,7 +53,9 @@ fi
 binary="$historical_build/SPM.noindex/debug/UpgradeFixtureRecorder"
 [[ -x "$binary" && -f "$fixture_build/observe.dylib" ]] || { echo 'Build the recorder first.' >&2; exit 66; }
 recorded="$fixture_build/recorded/$scenario"
-data="$fixture_build/data/$scenario"
+# Some records store the path of the data tree. Keep it in the shared folder, which names no person.
+data_base="${UPGRADE_FIXTURE_DATA_BASE:?Use regenerate.sh to select the data root}"
+data="$data_base/$release/${UPGRADE_FIXTURE_RUN_ID:-run}/$scenario"
 [[ ! -e "$recorded" && ! -e "$data" ]] || { echo 'Use a fresh recording destination.' >&2; exit 73; }
 mkdir -p "$recorded" "$data/Temporary"
 /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny network*)' /usr/bin/env -i \

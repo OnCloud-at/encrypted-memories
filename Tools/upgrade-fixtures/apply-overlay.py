@@ -19,11 +19,17 @@ text = manifest.read_text()
 marker = '    targets: ['
 if 'name: "UpgradeFixtureRecorder"' in text:
     raise SystemExit('Overlay already applied')
-text = text.replace(marker, marker + '''
+# A release whose duplicate-check protocol already requires linkVisibility(of:) needs the fixture backend to provide it.
+identity_models = package / 'Sources/UploadCore/Dedupe/UploadIdentityModels.swift'
+defines = ['UPGRADE_RECORDING']
+if 'func linkVisibility(of' in identity_models.read_text():
+    defines.append('UPGRADE_HISTORICAL_LINK_VISIBILITY')
+settings = ', '.join(f'.define("{name}")' for name in defines)
+text = text.replace(marker, marker + f'''
         .executableTarget(
             name: "UpgradeFixtureRecorder",
             dependencies: ["PhotosCore", "UploadCore", "PhotoLibraryBackupAdapter", "MLSearchCore", "MediaByteCache", "MediaLocationCore"],
-            swiftSettings: [.define("UPGRADE_RECORDING")]
+            swiftSettings: [{settings}]
         ),''', 1)
 text = text.replace('    products: [', '    products: [\n        .executable(name: "UpgradeFixtureRecorder", targets: ["UpgradeFixtureRecorder"]),', 1)
 manifest.write_text(text)

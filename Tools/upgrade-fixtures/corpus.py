@@ -16,7 +16,11 @@ from pathlib import Path
 BUDGET = 15_000_000
 MINIMUM_PUBLIC_RELEASE = 'v1.0.5'
 SCENARIOS = ('backup', 'model', 'index', 'cache', 'location')
-PRIVATE = re.compile(rb'/Users/|/home/[a-z]|/Volumes/|/private/|/var/folders/|file://|[.]ts[.]net|[.]lan\b|[A-Za-z0-9_-]+\.local\b|(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d+\.\d+')
+# A home directory of any person, a volume or temporary location of the recording machine, or a private host or
+# address, in any letter case. The shared folder and the hosted runner's account are allowed. A name may start with
+# a JSON unicode escape.
+NAME = rb'(?:[^/\s"\\]|\\u[0-9a-f]{4})+'
+PRIVATE = re.compile(rb'/Users/(?!(?:Shared|runner)(?:[/\s"\\]|$))' + NAME + rb'|/home/(?!runner(?:[/\s"\\]|$))' + NAME + rb'|/Volumes/|/private/|/var/folders/|[.]ts[.]net|[.]lan\b|[A-Za-z0-9_-]+\.local\b|(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d+\.\d+', re.IGNORECASE)
 
 def release_version(tag):
     if not re.fullmatch(r'v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)', tag):
@@ -63,8 +67,16 @@ def release_catalog(destination, metadata):
     catalog['releases'] = sorted(entries.values(), key=lambda record: release_version(record['tag']))
     return catalog
 
+def unescaped(data):
+    # JSON writes a slash as "\/" or "\u002f", and a record inside a record repeats the escape.
+    data = re.sub(rb'\\u002f', b'/', data, flags=re.IGNORECASE)
+    while b'\\/' in data:
+        data = data.replace(b'\\/', b'/')
+    return data
+
 def check_bytes(data, label, strict_issues=False):
-    if PRIVATE.search(data):
+    # The message names the place only, never the value.
+    if PRIVATE.search(data) or PRIVATE.search(unescaped(data)):
         raise ValueError('Private path or hostname in ' + label)
     for encoded in re.findall(rb'encryptedmemories-backup-issue-v1:([A-Za-z0-9+/]+={0,2})', data):
         if not strict_issues:
@@ -74,6 +86,15 @@ def check_bytes(data, label, strict_issues=False):
                 encoded = encoded[:-1]
             encoded += b'=' * (-len(encoded) % 4)
         check_bytes(base64.b64decode(encoded, validate=True), label + ' decoded backup issue')
+
+def check_published(folder, proof=None):
+    """Scan what a release folder publishes: every archive member, the manifest and the WAL policy proof."""
+    with tarfile.open(folder / 'corpus.tar.gz', 'r:gz') as archive:
+        for member in archive:
+            if member.isfile():
+                check_bytes(archive.extractfile(member).read(), 'archive member ' + member.name)
+    check_bytes((folder / 'manifest.json').read_bytes(), 'manifest.json')
+    check_bytes((proof or folder / 'wal-policy-proof.json').read_bytes(), 'wal-policy-proof.json')
 
 def network_retry(value):
     prefix = 'encryptedmemories-backup-issue-v1:'
@@ -115,6 +136,9 @@ def safe_rows(tree, name, unreadable, sql):
     return [] if name in unreadable else rows(tree, name, sql)
 
 def pack(recorded, destination):
+    # A staging folder that an interrupted run left behind would count as an unlisted release.
+    for stale in destination.parent.glob('.pack-*'):
+        shutil.rmtree(stale, ignore_errors=True)
     blobs = {}
     manifest = dict(format=1, **json.loads((recorded.parent / 'recording.json').read_text()), scenarios={})
     catalog = release_catalog(destination, manifest)
@@ -176,34 +200,48 @@ def pack(recorded, destination):
             raise ValueError('No write boundaries for ' + scenario)
         manifest['scenarios'][scenario] = snapshots
     destination.mkdir(parents=True, exist_ok=True)
+    proof = destination / 'wal-policy-proof.json'
+    if not proof.is_file():
+        raise ValueError('The WAL policy proof is missing')
     encoded = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
     check_bytes(encoded, 'manifest')
-    archive = destination / 'corpus.tar.gz'
-    with archive.open('wb') as raw, gzip.GzipFile(fileobj=raw, mode='wb', mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as tar:
-        for digest, data in sorted(blobs.items()):
-            info = tarfile.TarInfo('blobs/' + digest)
-            info.size = len(data)
-            info.mode = 0o644
-            tar.addfile(info, io.BytesIO(data))
-    (destination / 'manifest.json').write_bytes(encoded)
-    size = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
-    if size > BUDGET:
-        raise ValueError(f'Corpus exceeds hard 15 MB budget: {size}')
+    # Write and scan in a staging folder, so a hit or the budget leaves the release folder as it was.
+    with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.pack-') as staging_name:
+        staging = Path(staging_name)
+        archive = staging / 'corpus.tar.gz'
+        with archive.open('wb') as raw, gzip.GzipFile(fileobj=raw, mode='wb', mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as tar:
+            for digest, data in sorted(blobs.items()):
+                info = tarfile.TarInfo('blobs/' + digest)
+                info.size = len(data)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+        (staging / 'manifest.json').write_bytes(encoded)
+        check_published(staging, proof)
+        archive_bytes = archive.stat().st_size
+        size = sum(path.stat().st_size for path in staging.iterdir()) + proof.stat().st_size
+        if size > BUDGET:
+            raise ValueError(f'Corpus exceeds hard 15 MB budget: {size}')
+        for name in ('corpus.tar.gz', 'manifest.json'):
+            (staging / name).replace(destination / name)
     catalog_path = destination.parent / 'releases.json'
     encoded_catalog = json.dumps(catalog, indent=2) + '\n'
     check_bytes(encoded_catalog.encode(), 'release list')
     temporary_catalog = catalog_path.with_suffix('.json.tmp')
     temporary_catalog.write_text(encoded_catalog)
     temporary_catalog.replace(catalog_path)
-    print(json.dumps({'snapshots': {key: len(value) for key, value in manifest['scenarios'].items()}, 'blobs': len(blobs), 'archiveBytes': archive.stat().st_size, 'manifestBytes': len(encoded), 'totalBytes': size}, indent=2))
+    print(json.dumps({'snapshots': {key: len(value) for key, value in manifest['scenarios'].items()}, 'blobs': len(blobs), 'archiveBytes': archive_bytes, 'manifestBytes': len(encoded), 'totalBytes': size}, indent=2))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('recorded', type=Path, nargs='?')
     parser.add_argument('destination', type=Path, nargs='?')
     parser.add_argument('--check-release')
+    parser.add_argument('--check-published', type=Path, help='Scan the published files of one release folder')
     args = parser.parse_args()
-    if args.check_release is not None:
+    if args.check_published is not None:
+        check_published(args.check_published)
+        print('No private path or hostname in ' + args.check_published.name)
+    elif args.check_release is not None:
         release_version(args.check_release)
     elif args.recorded is None or args.destination is None:
         parser.error('recorded and destination are required')
