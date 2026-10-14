@@ -2410,6 +2410,9 @@ public actor BackupSyncRunner {
         from oldState: UploadBackupSyncQueueState
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
+        // The catalog forgets the source first, so missing-source recovery does not queue it again on every pass.
+        // A failed write keeps the earlier behavior.
+        _ = markSourceUnavailable?(entry.source)
         guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
             if queue.entry(for: entry.source, revision: entry.revision) != nil {
                 stopRequested = true

@@ -221,17 +221,17 @@ final class MissingSourceReconciliationTests: XCTestCase {
             let runner = runner(
                 clock: clock, resolver: resolver, markSourceUnavailable: catalogRecordsUnavailableSources())
 
-            var totals: [Int] = []
+            var queued: [Bool] = []
             for wait in [3600.0, 7200, 14_400] {
                 _ = await runner.runUntilDrained(mode: .eligibleOnly)
                 try await sync.reconcileMissingSources(engine: engine(clock: clock))
-                totals.append(queue.summary().total)
+                queued.append(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision) != nil)
                 clock.advance(by: wait)
             }
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
             try await sync.reconcileMissingSources(engine: engine(clock: clock))
 
-            XCTAssertEqual(totals, [1, 1, 1], "\(code): the row stays while Photos is asked again")
+            XCTAssertEqual(queued, [true, true, true], "\(code): the row stays while Photos is asked again")
             let terminal = try XCTUnwrap(
                 queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision), "\(code)")
             XCTAssertEqual(terminal.state, .sourceMissing, "\(code): shown once as missing after the last check")
