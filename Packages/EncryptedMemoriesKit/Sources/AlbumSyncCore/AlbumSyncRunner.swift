@@ -227,6 +227,14 @@ public actor AlbumSyncRunner {
 
         // Persist the run outcome on the mapping and settle the status.
         try await ensureAlbumPresent(albumID: album.id)
+        let attachFailedIdentifiers = Self.localIdentifiers(
+            of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links)
+        // A photo with a usable link goes into the album even when the backup keeps a part of it open, for
+        // example the video of a Live Photo behind a draft. It is no complete backup, so the album reports it.
+        let incompleteIdentifiers = Self.incompleteIdentifiers(
+            orderedLocalIdentifiers: identifiers, links: links, attachFailedLinkIDs: Set(attachResult.failedLinkIDs),
+            backup: backupReport)
+        progress.incomplete = incompleteIdentifiers.count
         let report = AlbumSyncReport(
             remoteAlbumID: remoteAlbumID,
             totalAssets: identifiers.count,
@@ -235,10 +243,11 @@ public actor AlbumSyncRunner {
             attachFailed: attachResult.failed,
             unattachable: plan.missingRemote,
             trashedSkipped: plan.trashedRemote,
+            incomplete: incompleteIdentifiers.count,
             problems: AlbumSyncProblemList.items(
                 missingIdentifiers: plan.missingRemoteIdentifiers,
-                attachFailedIdentifiers: Self.localIdentifiers(
-                    of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links),
+                attachFailedIdentifiers: attachFailedIdentifiers,
+                incompleteIdentifiers: incompleteIdentifiers,
                 backup: backupReport)
         )
         var mapping =
@@ -248,7 +257,7 @@ public actor AlbumSyncRunner {
         mapping.title = album.title
         mapping.lastSyncedAt = now()
         mapping.lastAttachedCount = report.attached
-        mapping.lastFailedCount = report.attachFailed + report.unattachable
+        mapping.lastFailedCount = report.attachFailed + report.unattachable + report.incomplete
         guard mappingStore.upsert(mapping) else { throw AlbumSyncError.mappingStoreUnavailable }
 
         progress.phase = report.isFullySynced ? .completed : .needsAttention
@@ -257,6 +266,23 @@ public actor AlbumSyncRunner {
         }
         publish()
         return report
+    }
+
+    /// The photos with a usable, not trashed link whose backup row is unresolved, in album order. A photo whose
+    /// link failed to attach is not in the album and counts as failed, also when another photo shares the link.
+    static func incompleteIdentifiers(
+        orderedLocalIdentifiers: [String],
+        links: [String: AlbumSyncRemoteLink],
+        attachFailedLinkIDs: Set<String>,
+        backup: AlbumSyncBackupReport
+    ) -> [String] {
+        orderedLocalIdentifiers.filter { identifier in
+            guard let link = links[identifier], !link.isTrashed, !attachFailedLinkIDs.contains(link.uid.nodeID)
+            else {
+                return false
+            }
+            return backup.problems[identifier] != nil
+        }
     }
 
     /// Maps failed link ids back, in album order, to the local photo that planned each attach:

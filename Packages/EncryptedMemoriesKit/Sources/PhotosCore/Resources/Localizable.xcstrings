@@ -1878,6 +1878,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Fotos nicht im Album" } }
       }
     },
+    "albumsync.problem_sheet_title_attention": {
+      "extractionState": "manual",
+      "comment": "Title of the list of photos that the last album sync listed because a part of them is not backed up yet, such as the video of a Live Photo. The photos are in the Proton album.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos that need attention" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos, die Aufmerksamkeit benötigen" } }
+      }
+    },
     "albumsync.issue_attach_failed": {
       "extractionState": "manual",
       "comment": "Reason for one photo: it is backed up, but adding it to the Proton album failed. Sync now tries again.",
