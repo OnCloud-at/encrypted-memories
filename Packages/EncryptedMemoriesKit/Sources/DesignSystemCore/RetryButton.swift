@@ -33,11 +33,20 @@ public struct RetryButton: View {
                 .buttonStyle(.glassProminent)
                 .tint(ProtonColor.primary)
         case .compact:
-            button
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .font(.footnote)
-                .tint(ProtonColor.primary)
+            // iPhone and iPad keep the automatic style: inside a list it leaves the whole row tappable, elsewhere it
+            // draws as tinted text. The Mac's automatic style is a push button, so the Mac draws borderless text.
+            #if os(macOS)
+                button
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .font(.footnote)
+                    .tint(ProtonColor.primary)
+            #else
+                button
+                    .controlSize(.small)
+                    .font(.footnote)
+                    .tint(ProtonColor.primary)
+            #endif
         case .system:
             button
         }

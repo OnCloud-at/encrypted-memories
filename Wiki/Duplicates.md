@@ -17,7 +17,7 @@ The app does not store the result of the check. After each launch, the first tim
 
 If the app still builds its index of your library, the screen shows **Still checking your library. More duplicates can appear.** above the groups. If no group exists yet, the screen shows **Checking Your Library**.
 
-If the app cannot read some photos, the screen says how many photos could not be checked. If the check does not finish, the screen says **The library check did not finish.** and offers **Retry**. If the app cannot read the library, the screen says **The duplicates could not be loaded.** and offers **Retry**.
+If the app cannot read some photos, the screen says how many photos could not be checked. If the check does not finish, the screen says **The library check did not finish.** and offers **Try again**. If the app cannot read the library, the screen says **The duplicates could not be loaded.** and offers **Try again**.
 
 ## Read a group
 
