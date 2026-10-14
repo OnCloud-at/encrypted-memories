@@ -3001,6 +3001,47 @@ struct ThumbnailFeedCoreTests {
 
             #expect(store.snapshot.isEmpty, "an old feed must not checkpoint a post-switch disk probe")
         }
+
+        @Test func workerThatLosesItsLeaseWhileWaitingForADownloadSlotLeavesNoDownloadCounters() async throws {
+            let uids = ["lease-lost-a", "lease-lost-b"].map { Self.uid($0) }
+            let cache = Self.cache("lease-lost-while-waiting-for-a-slot")
+            let loader = ControlledLateLoader(payloads: [:])
+            let feed = ThumbnailFeedCore(
+                cache: cache,
+                loader: loader,
+                configuration: Self.configuration(
+                    downloadConcurrencyLimit: 2,
+                    batchSize: 1,
+                    downloadTimeoutSeconds: 30
+                )
+            )
+
+            await feed.startPrefetch(uids)
+            // The configuration allows one download at a time. The first worker holds that slot inside the
+            // loader; the second one has taken its batch and polls for a free slot.
+            try await Self.waitUntil {
+                let queueLength = await feed.prefetchStatus().currentQueueLength
+                return await loader.requestCount() == 1 && queueLength == 0
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            let waiting = await feed.downloadCountersForTesting()
+            #expect(waiting.activeDownloaders == 1)
+            #expect(waiting.downloadInFlight == 1)
+
+            // The account changes while the second worker waits. The first download then frees the slot.
+            cache.configure(accountUID: "acct-B", key: feedCacheTestKey)
+            await loader.release()
+            try await Self.waitUntil { await !feed.downloadCountersForTesting().workersRunning }
+
+            let stopped = await feed.downloadCountersForTesting()
+            #expect(!stopped.workersRunning)
+            #expect(stopped.activeDownloaders == 0, "a worker that stops on a lost lease must not keep a download slot")
+            #expect(stopped.downloadInFlight == 0, "a worker that stops on a lost lease must not keep in-flight items")
+            let status = await feed.prefetchStatus()
+            #expect(status.downloadsInFlight == 0)
+            #expect(status.activeJobs == 0)
+            await feed.stopPrefetch()
+        }
     #endif
 
     @Test func prefetchStatusReportsIncrementalDiskCoverage() async throws {

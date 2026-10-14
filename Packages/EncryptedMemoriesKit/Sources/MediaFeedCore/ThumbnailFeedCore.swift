@@ -2225,11 +2225,13 @@ public actor ThumbnailFeedCore {
                 try? await Task.sleep(for: .milliseconds(60))
             }
             if Task.isCancelled { return }
+            // Nothing is counted before the lease check: a worker that stops here has no other way to give the
+            // download slot and the in-flight items back.
+            guard ownerLeaseIsCurrent() else { return }
             activeDownloaders += 1
             downloadInFlight += chunk.count
             prefetchDownloadStarted += reportedCount(in: chunk)
             diagnostics.recordNetworkRequestDuringPinch()
-            guard ownerLeaseIsCurrent() else { return }
             let writerGeneration = cache.captureWriterGeneration()
             let snapshot = await Self.loadBatch(
                 chunk,
@@ -3464,6 +3466,11 @@ public actor ThumbnailFeedCore {
 
         /// Debug-only seam that reports refreshes which ran a chunked `cache.has` sweep.
         func coverageFullScanCountForTesting() -> Int { coverageFullScans }
+
+        /// Debug-only seam that reports the download counters and whether any worker task still runs.
+        func downloadCountersForTesting() -> (activeDownloaders: Int, downloadInFlight: Int, workersRunning: Bool) {
+            (activeDownloaders, downloadInFlight, workersRunning)
+        }
     }
 #endif
 
