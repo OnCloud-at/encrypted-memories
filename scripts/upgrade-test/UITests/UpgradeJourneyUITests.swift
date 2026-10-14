@@ -400,6 +400,11 @@ final class UpgradeJourneyUITests: XCTestCase {
             XCTAssertTrue(larger.waitForExistence(timeout: 60))
             try clickUncovered(larger, name: "Larger thumbnails")
         #else
+            // The host started the app with simctl. If it ended since, activate() makes XCTest start it again
+            // without the fixture arguments, and only the signed-out screen would show it 60 s later.
+            XCTAssertNotEqual(
+                app.state, .notRunning,
+                "The app that simctl launched is not running; the host names its process and exit reason")
             app.activate()
         #endif
         let photo = app.descendants(matching: .any)

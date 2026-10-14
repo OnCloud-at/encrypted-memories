@@ -266,7 +266,7 @@ class InstalledApp:
         if self.app_log:
             return
         if self.simulator:
-            executable = plistlib.loads((app / 'Info.plist').read_bytes())['CFBundleExecutable']
+            executable = self.executable = plistlib.loads((app / 'Info.plist').read_bytes())['CFBundleExecutable']
             stream = ['xcrun', 'simctl', 'spawn', self.simulator, 'log', 'stream', '--style', 'compact',
                       '--predicate', f'process == "{executable}"']
         else:
@@ -318,6 +318,24 @@ class InstalledApp:
         else:
             # XCTest owns the LaunchServices start and passes these arguments to that exact app.
             self.launch_arguments = args
+
+    def ended_reason(self):
+        """Describe the app that simctl launched when its process is gone; None while it runs or when XCTest owns the launch."""
+        if not self.simulator or not hasattr(self, 'app_pid'):
+            return None
+        if subprocess.run(['/bin/ps', '-p', str(self.app_pid)], stdout=subprocess.DEVNULL).returncode == 0:
+            return None
+        try:
+            lines = (self.directory / 'app.log').read_text(errors='replace').splitlines()[-5:]
+        except OSError:
+            lines = []
+        return (f'The app process {self.app_pid} ({self.executable}) ended before the UI test activated it; XCTest would start it '
+                'again without the fixture arguments. Last app log lines: ' + (' | '.join(lines) or 'none'))
+
+    def require_running(self):
+        reason = self.ended_reason()
+        if reason:
+            raise JourneyError(reason)
 
     def macos_app_pid(self):
         if not hasattr(self, 'installed'):
@@ -399,11 +417,15 @@ def ui_run(runner, destination, point, phase, evidence, app_path=None, launch_ar
     return process, log
 
 
-def wait_ui_test_start(process, log, label, reached=None, timeout=UI_STARTUP_SECONDS):
-    """Return the seconds until XCTest started a test case, the run exited, or the app reached its checkpoint."""
+def wait_ui_test_start(process, log, label, reached=None, timeout=UI_STARTUP_SECONDS, app_check=None):
+    """Return the seconds until XCTest started a test case, the run exited, or the app reached its checkpoint.
+
+    `app_check` raises as soon as the app that the host launched has ended."""
     started = time.monotonic()
     event = 'exited'
     while process.poll() is None:
+        if app_check is not None:
+            app_check()
         if reached is not None and reached.is_set():
             event = 'reached its checkpoint'
             break
@@ -433,6 +455,7 @@ def main():
     args = parser.parse_args()
     toolchain = output(['xcodebuild', '-version'])
     summary('Xcode toolchain: ' + toolchain.replace('\n', '; '))
+    summary('Listen backlog limit kern.ipc.somaxconn: ' + output(['sysctl', '-n', 'kern.ipc.somaxconn']))
     if args.platform == 'macOS':
         command(['xcrun', 'swift', str(args.automation / 'scripts/upgrade-test/metal_devices.swift')])
     summary(CONSENT_LIMITATION)
@@ -507,10 +530,15 @@ def main():
                     app.launch(server, seed=True)
                     preparing, prepare_log = ui_run(runner, app.destination, point, 'prepare', case, getattr(app, 'installed', None), app.launch_arguments)
                     timing['prepare_ui_startup_s'] = wait_ui_test_start(
-                        preparing, case / 'prepare-ui.log', f'{tag} / {point} preparation', server.reached)
+                        preparing, case / 'prepare-ui.log', f'{tag} / {point} preparation', server.reached,
+                        app_check=app.require_running)
                     # The consent wait below also ends within this budget, before the server releases its held checkpoint.
                     preparation_deadline = time.monotonic() + PREPARATION_SECONDS
-                    server.wait_checkpoint(timeout=max(0, preparation_deadline - time.monotonic()), preparing=preparing)
+                    try:
+                        server.wait_checkpoint(timeout=max(0, preparation_deadline - time.monotonic()), preparing=preparing)
+                    except JourneyError:
+                        app.require_running()  # A dead app is the cause; name it instead of the missing checkpoint.
+                        raise
                     saved_consent = None
                     consent_evidence = {}
                     if point.startswith('backup.'):
@@ -529,9 +557,11 @@ def main():
                     app.launch(server)
                     verifying, verify_log = ui_run(runner, app.destination, point, 'verify', case, getattr(app, 'installed', None), app.launch_arguments)
                     try:
-                        timing['verify_ui_startup_s'] = wait_ui_test_start(verifying, case / 'verify-ui.log', f'{tag} / {point} verification')
+                        timing['verify_ui_startup_s'] = wait_ui_test_start(
+                            verifying, case / 'verify-ui.log', f'{tag} / {point} verification', app_check=app.require_running)
                         code = verifying.wait(timeout=VERIFICATION_SECONDS)
                         if code:
+                            app.require_running()
                             raise JourneyError(f'{tag} / {point}: UI verification failed ({code})')
                     except subprocess.TimeoutExpired as error:
                         raise JourneyError(f'{tag} / {point}: UI verification timed out') from error
