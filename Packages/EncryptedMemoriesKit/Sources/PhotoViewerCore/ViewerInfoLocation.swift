@@ -8,7 +8,8 @@ public struct ViewerInfoLocation {
     public let showsMap: Bool
 
     public init(metadata: PhotoMetadata?, placeName: String?, mapAndPlacesEnabled: Bool) {
-        self.placeName = mapAndPlacesEnabled ? placeName.flatMap { $0.isEmpty ? nil : $0 } : nil
+        let trimmed = placeName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.placeName = mapAndPlacesEnabled ? (trimmed?.isEmpty == false ? placeName : nil) : nil
         markerTitle = self.placeName ?? L10n.string("map.cluster_title")
         if let latitude = metadata?.latitude, let longitude = metadata?.longitude {
             coordinateText = PhotoCoordinateText.format(latitude: latitude, longitude: longitude)

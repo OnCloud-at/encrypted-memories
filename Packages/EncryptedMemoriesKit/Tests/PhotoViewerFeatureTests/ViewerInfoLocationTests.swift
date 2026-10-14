@@ -23,6 +23,22 @@ final class ViewerInfoLocationTests: XCTestCase {
         }
     }
 
+    func testWhitespaceOnlyPlaceNameUsesTheFallbackMarkerTitle() {
+        for name: String? in [" ", "\n", " \t\n ", "\u{00A0}"] {
+            let location = ViewerInfoLocation(metadata: metadata, placeName: name, mapAndPlacesEnabled: true)
+            XCTAssertNil(location.placeName)
+            XCTAssertEqual(location.markerTitle, L10n.string("map.cluster_title"))
+            XCTAssertTrue(location.showsMap)
+            XCTAssertNotNil(location.coordinateText)
+        }
+    }
+
+    func testPlaceNameWithTextIsKeptExactlyAsGiven() {
+        let location = ViewerInfoLocation(metadata: metadata, placeName: " Known place ", mapAndPlacesEnabled: true)
+        XCTAssertEqual(location.placeName, " Known place ")
+        XCTAssertEqual(location.markerTitle, " Known place ")
+    }
+
     func testNoLocationShowsNeitherMapNorCoordinates() {
         let location = ViewerInfoLocation(metadata: PhotoMetadata(), placeName: nil, mapAndPlacesEnabled: true)
         XCTAssertNil(location.placeName)
