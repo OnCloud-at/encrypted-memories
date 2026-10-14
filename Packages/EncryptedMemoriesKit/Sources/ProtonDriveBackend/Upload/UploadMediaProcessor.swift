@@ -18,14 +18,18 @@ enum UploadMediaProcessor {
     static let thumbnailMaxBytes = 60 * 1_024
     static let previewMaxBytes = 1_024 * 1_024
     private static let compressionQualities: [Double] = [0.7, 0.4, 0.2, 0.1, 0]
-    /// HDR sources take a half-float buffer of up to about 22 MB at preview size. One conversion at a time keeps
-    /// parallel uploads within the memory of small iPhones.
+    /// An HDR conversion takes a half-float buffer of up to about 22 MB at preview size. Running one at a time keeps
+    /// a single such buffer alive; the decoded source of each upload exists before the gate. Measured on macOS with
+    /// three parallel 1920 x 1440 HLG uploads: 157 MB peak above baseline with the gate, 187 MB without.
     static let hdrConversions = UploadHDRConversionGate()
 
     static func thumbnails(for url: URL, isVideo: Bool) async -> [ThumbnailData] {
         guard let source = await baseImage(for: url, isVideo: isVideo) else { return [] }
         let isHDR = usesHDRTransfer(source)
         if isHDR { await hdrConversions.acquire() }
+        defer { if isHDR { hdrConversions.release() } }
+        // A cancelled upload (pause, sign-out) frees the gate at once instead of converting first.
+        if isHDR, Task.isCancelled { return [] }
         var result: [ThumbnailData] = []
         if let thumb = jpeg(
             downscaling: source,
@@ -44,7 +48,6 @@ enum UploadMediaProcessor {
         {
             result.append(ThumbnailData(type: .preview, data: preview))
         }
-        if isHDR { await hdrConversions.release() }
         return result
     }
 
@@ -74,7 +77,8 @@ enum UploadMediaProcessor {
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: previewMaxPixel, height: previewMaxPixel)
         // An HDR frame keeps its HDR transfer here, so it takes the same reference-white conversion as an HDR photo.
-        // The default (forceSDR) maps the HDR peak to SDR white and shows reference white at about 60 %.
+        // With the SDK default policy, forceSDR (AVAssetImageGenerator.h), AVFoundation converts the frame itself; a
+        // probe of an HLG frame showed reference white at 154 of 255 (60 %) that way.
         generator.dynamicRangePolicy = .matchSource
         let time = CMTime(seconds: 0, preferredTimescale: 600)
         return try? await generator.image(at: time).image
@@ -93,8 +97,8 @@ enum UploadMediaProcessor {
         return nil
     }
 
-    /// An opaque image of at most `maxPixel` in the output colour space; JPEG encoding stores it with 8 bits. Nil when a
-    /// source that needs a colour conversion cannot be converted: no thumbnail is better than one with wrong colours.
+    /// An opaque image of at most `maxPixel` in the output colour space; JPEG encoding stores it with 8 bits. Nil when
+    /// a source that needs a colour conversion cannot be converted: no thumbnail is better than one with wrong colours.
     static func sdrImage(
         of image: CGImage, maxPixel: Int,
         draw: (CGImage, _ width: Int, _ height: Int, CGColorSpace, _ halfFloat: Bool) -> CGImage? = draw
@@ -103,7 +107,8 @@ enum UploadMediaProcessor {
         let colorSpace = outputColorSpace(for: image)
         if usesHDRTransfer(image) {
             // ITU-R BT.2408: HDR reference white becomes SDR white, and brighter highlights clip. Extended linear sRGB
-            // holds reference white at 1.0. A direct draw into SDR maps the HDR peak to white instead.
+            // holds reference white at 1.0. A direct draw into SDR maps the HDR peak to white instead; a probe of an
+            // HLG still showed reference white at 188 of 255 (74 %) that way.
             guard let linear = CGColorSpace(name: CGColorSpace.extendedLinearSRGB),
                 let anchored = draw(image, width, height, linear, true)
             else { return nil }
@@ -173,27 +178,37 @@ enum UploadMediaProcessor {
     }
 }
 
-/// Admits one holder at a time, in arrival order.
-actor UploadHDRConversionGate {
+/// Admits one holder at a time, in arrival order. `release()` is synchronous, so a `defer` releases exactly once.
+final class UploadHDRConversionGate: @unchecked Sendable {
+    private let lock = NSLock()
     private var isHeld = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     /// Callers that wait for the holder.
-    var waitingCount: Int { waiters.count }
+    var waitingCount: Int { lock.withLock { waiters.count } }
 
     func acquire() async {
-        guard isHeld else {
-            isHeld = true
-            return
+        await withCheckedContinuation { continuation in
+            let admitted = lock.withLock {
+                guard isHeld else {
+                    isHeld = true
+                    return true
+                }
+                waiters.append(continuation)
+                return false
+            }
+            if admitted { continuation.resume() }
         }
-        await withCheckedContinuation { waiters.append($0) }
     }
 
     func release() {
-        if waiters.isEmpty {
-            isHeld = false
-        } else {
-            waiters.removeFirst().resume()
+        let next: CheckedContinuation<Void, Never>? = lock.withLock {
+            guard !waiters.isEmpty else {
+                isHeld = false
+                return nil
+            }
+            return waiters.removeFirst()
         }
+        next?.resume()
     }
 }

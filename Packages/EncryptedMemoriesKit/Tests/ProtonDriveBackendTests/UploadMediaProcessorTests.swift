@@ -112,15 +112,17 @@ struct UploadMediaProcessorTests {
         }
     }
 
-    /// A source with an alpha channel is flattened to an opaque JPEG.
-    @Test func alphaSourceBecomesOpaque() async throws {
+    /// A source with an alpha channel is flattened onto black, as before: (199, 46, 46) at alpha 0.5 shows as
+    /// about (100, 23, 23).
+    @Test func alphaSourceIsFlattenedOntoBlack() async throws {
         let space = try #require(CGColorSpace(name: CGColorSpace.sRGB))
         let alpha = CGImageAlphaInfo.premultipliedLast.rawValue
-        let image = try Self.filledImage(space, bits: 8, color: Self.fill, bitmapInfo: alpha)
+        let image = try Self.filledImage(space, bits: 8, color: Self.fill, alpha: 0.5, bitmapInfo: alpha)
         for (type, data) in try await Self.thumbnails(ofStill: image) {
             let decoded = try Self.decode(data)
             #expect([CGImageAlphaInfo.none, .noneSkipFirst, .noneSkipLast].contains(decoded.alphaInfo), "\(type)")
-            #expect(Self.isClose(try Self.shownSRGB(data, expectingName: CGColorSpace.sRGB), Self.fill), "\(type)")
+            let shown = try Self.shownSRGB(data, expectingName: CGColorSpace.sRGB)
+            #expect(Self.isClose(shown, [100, 23, 23], tolerance: 4), "\(type): \(shown)")
         }
     }
 
@@ -151,21 +153,105 @@ struct UploadMediaProcessorTests {
             try? FileManager.default.removeItem(at: sdrURL)
         }
         await gate.acquire()
+        var holdsGate = true
+        defer { if holdsGate { gate.release() } }
         let held = Task { await UploadMediaProcessor.thumbnails(for: hdrURL, isVideo: false) }
-        var waited = false
-        for _ in 0..<1_000 where !waited {
-            waited = await gate.waitingCount == 1
-            if !waited { try await Task.sleep(for: .milliseconds(10)) }
-        }
-        #expect(waited, "a second HDR conversion must wait for the first")
+        #expect(try await Self.waitUntil { gate.waitingCount == 1 }, "a second HDR conversion must wait for the first")
         let sdr = await UploadMediaProcessor.thumbnails(for: sdrURL, isVideo: false)
         #expect(sdr.count == 2, "an SDR source does not take the HDR gate")
-        await gate.release()
+        holdsGate = false
+        gate.release()
         #expect(await held.value.count == 2)
-        #expect(await gate.waitingCount == 0)
+        #expect(gate.waitingCount == 0)
+    }
+
+    /// A cancelled HDR upload (pause, sign-out) converts nothing once it gets the gate, and frees it at once.
+    @Test func aCancelledHDRUploadSkipsItsConversionAndFreesTheGate() async throws {
+        let gate = UploadMediaProcessor.hdrConversions
+        let hlg = try Self.signalImage(try #require(CGColorSpace(name: CGColorSpace.itur_2100_HLG)), signal: 0.75)
+        let hdrURL = try Self.tiff(hlg)
+        defer { try? FileManager.default.removeItem(at: hdrURL) }
+        await gate.acquire()
+        var holdsGate = true
+        defer { if holdsGate { gate.release() } }
+        let cancelled = Task { await UploadMediaProcessor.thumbnails(for: hdrURL, isVideo: false) }
+        #expect(try await Self.waitUntil { gate.waitingCount == 1 })
+        cancelled.cancel()
+        holdsGate = false
+        gate.release()
+        #expect(await cancelled.value.isEmpty, "a cancelled upload must not convert")
+        let admitted = AdmissionFlag()
+        let next = Task {
+            await gate.acquire()
+            admitted.set()
+            gate.release()
+        }
+        let free = try await Self.waitUntil { admitted.isSet }
+        #expect(free, "the gate is free after the cancelled upload")
+        if !free { gate.release() }
+        await next.value
+    }
+
+    /// The gate admits waiters in arrival order: three waiters queued one after another get in in that order.
+    @Test func gateAdmitsWaitersInArrivalOrder() async throws {
+        let gate = UploadHDRConversionGate()
+        await gate.acquire()
+        var holdsGate = true
+        defer { if holdsGate { gate.release() } }
+        let order = AdmissionOrder()
+        var waiters: [Task<Void, Never>] = []
+        for index in 0..<3 {
+            waiters.append(
+                Task {
+                    await gate.acquire()
+                    order.append(index)
+                    gate.release()
+                })
+            #expect(try await Self.waitUntil { gate.waitingCount == index + 1 })
+        }
+        holdsGate = false
+        gate.release()
+        for waiter in waiters { await waiter.value }
+        #expect(order.values == [0, 1, 2])
+        #expect(gate.waitingCount == 0)
+    }
+
+    /// A holder that is cancelled still releases the gate in its `defer`, so the next waiter gets in.
+    @Test func gateIsReleasedAfterACancelledHolder() async throws {
+        let gate = UploadHDRConversionGate()
+        let holding = AdmissionFlag()
+        let holder = Task {
+            await gate.acquire()
+            defer { gate.release() }
+            holding.set()
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
+        }
+        #expect(try await Self.waitUntil { holding.isSet })
+        let admitted = AdmissionFlag()
+        let next = Task {
+            await gate.acquire()
+            admitted.set()
+            gate.release()
+        }
+        #expect(try await Self.waitUntil { gate.waitingCount == 1 })
+        holder.cancel()
+        await holder.value
+        let free = try await Self.waitUntil { admitted.isSet }
+        #expect(free, "the next waiter gets in after the cancelled holder")
+        if !free { gate.release() }
+        await next.value
     }
 
     // MARK: Helpers
+
+    /// Polls `condition` for up to ten seconds, a bound that only stops a hung test.
+    private static func waitUntil(_ condition: () -> Bool) async throws -> Bool {
+        for _ in 0..<1_000 {
+            if condition() { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
 
     /// A 2,400 x 1,600 HDR image of one grey signal value, written exactly as half floats.
     private static func signalImage(_ space: CGColorSpace, signal: Double) throws -> CGImage {
@@ -185,7 +271,7 @@ struct UploadMediaProcessorTests {
 
     /// A 2,400 x 1,600 image in `space` filled with the sRGB colour `color`.
     private static func filledImage(
-        _ space: CGColorSpace, bits: Int, color: [Int], bitmapInfo: UInt32? = nil
+        _ space: CGColorSpace, bits: Int, color: [Int], alpha: CGFloat = 1, bitmapInfo: UInt32? = nil
     ) throws -> CGImage {
         let info = bitmapInfo ?? (bits == 16 ? halfFloat : opaque8)
         let context = try #require(
@@ -193,7 +279,7 @@ struct UploadMediaProcessorTests {
                 data: nil, width: 2_400, height: 1_600, bitsPerComponent: bits, bytesPerRow: 0, space: space,
                 bitmapInfo: info))
         let sRGB = try #require(CGColorSpace(name: CGColorSpace.sRGB))
-        let components = color.map { CGFloat($0) / 255 } + [1]
+        let components = color.map { CGFloat($0) / 255 } + [alpha]
         context.setFillColor(try #require(CGColor(colorSpace: sRGB, components: components)))
         context.fill(CGRect(x: 0, y: 0, width: 2_400, height: 1_600))
         return try #require(context.makeImage())
@@ -309,7 +395,27 @@ struct UploadMediaProcessorTests {
         return (0..<3).map { Int(pixel[$0]) }
     }
 
-    private static func isClose(_ lhs: [Int], _ rhs: [Int]) -> Bool {
+    private static func isClose(_ lhs: [Int], _ rhs: [Int], tolerance: Int = tolerance) -> Bool {
         zip(lhs, rhs).allSatisfy { abs($0 - $1) <= tolerance }
     }
+}
+
+/// Records that a task got past the gate.
+private final class AdmissionFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool { lock.withLock { value } }
+
+    func set() { lock.withLock { value = true } }
+}
+
+/// Records the order in which tasks got past the gate.
+private final class AdmissionOrder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [Int] = []
+
+    var values: [Int] { lock.withLock { recorded } }
+
+    func append(_ value: Int) { lock.withLock { recorded.append(value) } }
 }
