@@ -56,16 +56,20 @@ public final class AlbumActionCoordinator {
     public func presentation(for album: SharedAlbumSummary) -> SharedAlbumPresentation {
         SharedAlbumPresentation(album: album, permissions: permissions(for: album))
     }
-    /// The album list shows its loading row while it has no albums and a load runs or none has finished yet, so a
-    /// retry after a failure shows loading instead of an empty list.
+    /// The album list shows its loading row while it has no albums and the first load runs, or a retry runs after a
+    /// failed load. A reload of an empty list that loaded fine keeps showing the empty list instead of flickering.
     public var showsAlbumLoadingPlaceholder: Bool {
-        albums.isEmpty && (isLoading || !hasCompletedInitialAlbumLoad)
+        albums.isEmpty && (!hasCompletedInitialAlbumLoad || (isLoading && lastAlbumLoadFailed))
     }
     public var showsSharedAlbumLoadingPlaceholder: Bool {
-        canListSharedWithMe && sharedAlbums.isEmpty && (isLoadingShared || !hasCompletedInitialSharedAlbumLoad)
+        canListSharedWithMe && sharedAlbums.isEmpty
+            && (!hasCompletedInitialSharedAlbumLoad || (isLoadingShared && lastSharedAlbumLoadFailed))
     }
 
     private let repository: AlbumsRepository
+    /// Whether the last finished load failed. The error message clears when a retry starts; this does not.
+    private var lastAlbumLoadFailed = false
+    private var lastSharedAlbumLoadFailed = false
     private var membershipSelection: [PhotoUID] = []
     private var membershipsByPhoto: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
     private var membershipSelectionIsCovered = false
@@ -84,8 +88,10 @@ public final class AlbumActionCoordinator {
         }
         do {
             albums = try await repository.listAlbums()
+            lastAlbumLoadFailed = false
         } catch {
             loadErrorMessage = Self.message(for: error)
+            lastAlbumLoadFailed = true
         }
     }
 
@@ -99,8 +105,10 @@ public final class AlbumActionCoordinator {
         }
         do {
             sharedAlbums = try await repository.listSharedWithMeAlbums()
+            lastSharedAlbumLoadFailed = false
         } catch {
             sharedLoadErrorMessage = Self.message(for: error)
+            lastSharedAlbumLoadFailed = true
         }
     }
 
@@ -222,10 +230,12 @@ public final class AlbumActionCoordinator {
         do {
             albums = try await repository.listAlbums()
             loadErrorMessage = nil
+            lastAlbumLoadFailed = false
         } catch {
             // The write already succeeded. Keep the old list and let the owning screen's revision
             // refresh retry later instead of turning a successful mutation into a false failure.
             loadErrorMessage = Self.message(for: error)
+            lastAlbumLoadFailed = true
         }
     }
 

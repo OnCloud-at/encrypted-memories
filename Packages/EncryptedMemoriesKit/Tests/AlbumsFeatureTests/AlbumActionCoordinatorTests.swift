@@ -108,6 +108,34 @@ final class AlbumActionCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder)
     }
 
+    /// A reload of an empty list that loaded fine keeps the empty list on screen; only a retry after a failure shows
+    /// the loading row.
+    @MainActor
+    func testReloadOfAnEmptyListThatLoadedFineKeepsTheEmptyList() async {
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let coordinator = AlbumActionCoordinator(repository: repository(backend))
+        await coordinator.refresh()
+        await coordinator.refreshSharedAlbums()
+        XCTAssertTrue(coordinator.albums.isEmpty)
+        XCTAssertTrue(coordinator.sharedAlbums.isEmpty)
+
+        let gate = ListGate()
+        backend.listHold = { await gate.pass() }
+        let reload = Task { await coordinator.refresh() }
+        let sharedReload = Task { await coordinator.refreshSharedAlbums() }
+        await gate.waitUntilHeld(2)
+        XCTAssertTrue(coordinator.isLoading)
+        XCTAssertTrue(coordinator.isLoadingShared)
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder, "an ordinary reload keeps the empty list")
+        XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder, "an ordinary reload keeps the empty list")
+
+        await gate.open()
+        await reload.value
+        await sharedReload.value
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder)
+        XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder)
+    }
+
     @MainActor
     func testCreateAndAddRefreshesSharedAlbumState() async {
         let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
