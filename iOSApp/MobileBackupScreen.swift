@@ -77,7 +77,7 @@ private struct MobileManualUploadCheckSection: View {
                     Image(systemName: status.isActive ? "arrow.trianglehead.2.clockwise" : "checkmark.shield")
                         .foregroundStyle(status.isActive ? ProtonColor.primary : ProtonColor.textWeak)
                         .frame(width: 18)
-                        .spinsWhileActive(status.isActive, period: 1.7)
+                        .spinsWhileActive(status.isActive)
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text(status.localizedTitle)
@@ -92,8 +92,7 @@ private struct MobileManualUploadCheckSection: View {
                         }
                         if total > 0 {
                             if let fraction = status.fractionCompleted {
-                                ProgressView(value: fraction)
-                                    .tint(ProtonColor.primary)
+                                ActivityProgressBar(fraction: fraction)
                             } else {
                                 ProgressView()
                                     .tint(ProtonColor.primary)
@@ -433,7 +432,7 @@ private struct MobilePhotoBackupSections: View {
         case .activity:
             Image(systemName: "arrow.trianglehead.2.clockwise")
                 .foregroundStyle(ProtonColor.primary)
-                .spinsWhileActive(true, period: 1.7)
+                .spinsWhileActive(true)
         case .attention:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -462,10 +461,8 @@ private struct MobilePhotoBackupSections: View {
     /// queue-wide completion. An empty reserved slot keeps the row stable. Scanning stays barless.
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
         if let fraction = display.progressBarFraction, display.isActive || display.accessory == .paused {
-            ProgressView(value: fraction)
-                .tint(ProtonColor.primary)
+            ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel ?? "")
                 .frame(height: 4)
-                .accessibilityLabel(display.localizedProgressBarLabel ?? "")
         } else {
             Color.clear.frame(height: 4)
         }

@@ -1,3 +1,4 @@
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 import UploadCore
@@ -48,10 +49,7 @@ public struct UploadQueuePanel: View {
                     .disabled(!UploadQueuePresentation.canClearFinished(s))
             }
             if s.total > 0 {
-                ProgressView(value: s.totalProgress)
-                Text(s.summaryText)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                ActivityProgressRow(title: nil, detail: s.summaryText, fraction: s.totalProgress)
             }
             if let error = coordinator.latestFolderEnumerationError {
                 HStack(alignment: .top, spacing: 8) {
@@ -122,13 +120,7 @@ public struct UploadQueuePanel: View {
 
     @ViewBuilder private func statusLine(_ item: UploadItem) -> some View {
         if case .uploading(let p) = item.state {
-            VStack(alignment: .leading, spacing: 2) {
-                ProgressView(value: p)
-                    .frame(maxWidth: 170)
-                Text(L10n.string("upload.state_uploading \(Int(p * 100))"))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            ActivityProgressRow(title: nil, detail: L10n.string("upload.state_uploading \(Int(p * 100))"), fraction: p)
         } else {
             Text(item.state.label)
                 .font(.caption)

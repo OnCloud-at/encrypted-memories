@@ -270,7 +270,7 @@ private struct BackupSettingsTab: View {
         }
         if status.isActive || status.phase == .paused {
             if let fraction = status.fractionCompleted {
-                ProgressView(value: fraction)
+                ActivityProgressBar(fraction: fraction)
             } else {
                 ProgressView()  // Totals are unknown during scanning.
             }
@@ -365,7 +365,7 @@ private struct AccountSettingsTab: View {
                                 .font(.system(size: 11).monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
-                        ProgressView(value: Double(min(used, max)), total: Double(max))
+                        ActivityProgressBar(fraction: Double(min(used, max)) / Double(max))
                     }
                 } else {
                     Text("settings.storage_unavailable")
@@ -744,10 +744,7 @@ private struct PhotoLibraryBackupSection: View {
             if let fraction = display.progressBarFraction,
                 display.isActive || display.accessory == .paused
             {
-                ProgressView(value: fraction)
-                    .tint(ProtonColor.primary)
-                    .controlSize(.small)
-                    .accessibilityLabel(display.localizedProgressBarLabel ?? "")
+                ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel ?? "")
             } else {
                 Color.clear
             }
@@ -763,7 +760,7 @@ private struct PhotoLibraryBackupSection: View {
         case .activity:
             Image(systemName: "arrow.trianglehead.2.clockwise")
                 .foregroundStyle(ProtonColor.primary)
-                .spinsWhileActive(true, period: 1.7)
+                .spinsWhileActive(true)
         case .attention:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -1211,7 +1208,7 @@ private struct BackupStatusSummaryRow: View {
 
             if let total = status.totalConsidered, total > 0 {
                 if let fraction = status.fractionCompleted {
-                    ProgressView(value: fraction)
+                    ActivityProgressBar(fraction: fraction)
                 } else {
                     ProgressView()
                 }

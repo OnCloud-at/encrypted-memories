@@ -110,8 +110,7 @@ struct MobileSettingsScreen: View {
                                 .monospacedDigit()
                                 .foregroundStyle(ProtonColor.textWeak)
                         }
-                        ProgressView(value: Double(min(used, max)), total: Double(max))
-                            .tint(ProtonColor.primary)
+                        ActivityProgressBar(fraction: Double(min(used, max)) / Double(max))
                     }
                 }
             }
