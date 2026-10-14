@@ -442,6 +442,114 @@ with SigningIdentity(root) as signer:
                 app.kill_app()
             kill.assert_not_called()
 
+    def simulator_app(self, directory, pid, log_lines):
+        app = run_journey.InstalledApp.__new__(run_journey.InstalledApp)
+        app.simulator, app.app_pid, app.executable, app.directory = 'OWN-DEVICE', pid, 'EncryptedMemories', Path(directory)
+        if log_lines is not None:
+            (app.directory / 'app.log').write_text('\n'.join(log_lines) + '\n')
+        return app
+
+    def test_an_ended_simulator_app_is_named_with_its_process_and_last_log_lines(self):
+        ended = subprocess.Popen([sys.executable, '-c', 'pass'])
+        ended.wait()
+        lines = [f'line {number}' for number in range(6)] + ['Fatal error: synthetic thumbnail request failed']
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.simulator_app(directory, ended.pid, lines)
+            with self.assertRaises(JourneyError) as caught:
+                app.require_running()
+        message = str(caught.exception)
+        self.assertIn(f'The app process {ended.pid} (EncryptedMemories) is no longer running', message)
+        self.assertIn('Fatal error: synthetic thumbnail request failed', message)
+        self.assertNotIn('line 1 ', message + ' ')  # Only the last five lines.
+
+    def test_an_ended_simulator_app_without_a_log_still_fails_with_its_process(self):
+        ended = subprocess.Popen([sys.executable, '-c', 'pass'])
+        ended.wait()
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.simulator_app(directory, ended.pid, None)
+            with self.assertRaisesRegex(JourneyError, rf'process {ended.pid} \(EncryptedMemories\) is no longer running.*none'):
+                app.require_running()
+
+    def test_a_running_simulator_app_and_a_macos_app_pass_the_running_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.simulator_app(directory, os.getpid(), None).require_running()
+            macos = run_journey.InstalledApp.__new__(run_journey.InstalledApp)
+            macos.simulator = None
+            macos.require_running()
+
+    def test_the_ui_start_wait_fails_at_once_when_the_launched_app_ended(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+            self.addCleanup(process.kill)
+
+            def app_check():
+                raise JourneyError('The app process 1 (EncryptedMemories) is no longer running')
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(JourneyError, r'^label: The app process 1 \(EncryptedMemories\) is no longer running$'):
+                run_journey.wait_ui_test_start(process, Path(directory) / 'ui.log', 'label', app_check=app_check)
+            self.assertLess(time.monotonic() - started, 5)
+
+    def test_the_listen_backlog_limit_enters_the_journey_summary(self):
+        error, _, _, _ = self.run_case_on_a_virtual_clock(prepare_startup=1, verify_startup=1)
+        self.assertIsNone(error)
+        self.assertIn('Listen backlog limit kern.ipc.somaxconn: 128', self.summary_lines)
+
+    def test_a_dead_app_ends_the_wait_for_the_ui_test_at_once(self):
+        error, events, now, _ = self.run_case_on_a_virtual_clock(
+            prepare_startup=None, verify_startup=1, app_ended='The app process 7 (EncryptedMemories) is no longer running')
+        self.assertEqual(str(error), 'v1.0.5 / index.embed preparation: The app process 7 (EncryptedMemories) is no longer running')
+        self.assertEqual(events, ['ui-prepare'])
+        self.assertLess(now, 5)
+
+    def test_a_dead_new_app_ends_the_wait_for_the_verification_ui_test_at_once(self):
+        ended = 'The app process 8 (EncryptedMemories) is no longer running'
+        error, events, now, _ = self.run_case_on_a_virtual_clock(
+            prepare_startup=1, verify_startup=None, app_ended=ended, ended_from_verify=True)
+        self.assertEqual(str(error), 'v1.0.5 / index.embed verification: ' + ended)
+        self.assertEqual(events, ['ui-prepare', 'kill-old', 'ui-verify'])
+        self.assertLess(now, 30)  # The preparation takes 21 s; the verification wait ends at its first check.
+
+    def test_a_verification_timeout_keeps_its_message_and_names_the_app_that_ended_after_activation(self):
+        ended = 'The app process 7 (EncryptedMemories) is no longer running'
+        error, _, _, _ = self.run_case_on_a_virtual_clock(
+            prepare_startup=1, verify_startup=1, app_ended=ended, ended_after_start=True, verify_act=241)
+        self.assertEqual(str(error), 'v1.0.5 / index.embed: UI verification timed out; ' + ended)
+        error, _, _, _ = self.run_case_on_a_virtual_clock(prepare_startup=1, verify_startup=1, verify_act=241)
+        self.assertEqual(str(error), 'v1.0.5 / index.embed: UI verification timed out')
+
+    def test_the_process_name_follows_the_installed_version_of_the_app(self):
+        with tempfile.TemporaryDirectory() as directory:
+            versions = []
+            for name in ['OldExecutable', 'NewExecutable']:
+                bundle = Path(directory) / (name + '.app')
+                bundle.mkdir()
+                (bundle / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': name}))
+                versions.append(bundle)
+            app = run_journey.InstalledApp.__new__(run_journey.InstalledApp)
+            app.simulator, app.directory, app.app_log = 'OWN-DEVICE', Path(directory), None
+            with patch.object(run_journey, 'command'), patch.object(run_journey.InstalledApp, 'stream_app_log'):
+                app.install(versions[0])
+                self.assertEqual(app.executable, 'OldExecutable')
+                app.install(versions[1])
+                self.assertEqual(app.executable, 'NewExecutable')
+
+    def test_a_missing_checkpoint_keeps_its_message_and_names_the_app_that_ended_after_activation(self):
+        ended = 'The app process 7 (EncryptedMemories) is no longer running'
+        error, _, _, _ = self.run_case_on_a_virtual_clock(
+            prepare_startup=10, verify_startup=1, act=181, app_ended=ended, ended_after_start=True)
+        self.assertEqual(str(error), 'The historical app did not reach index.embed; ' + ended)
+        error, _, _, _ = self.run_case_on_a_virtual_clock(prepare_startup=10, verify_startup=1, act=181)
+        self.assertEqual(str(error), 'The historical app did not reach index.embed')
+
+    def test_a_failed_verification_keeps_its_exit_code_and_names_the_app_that_ended_after_activation(self):
+        ended = 'The app process 7 (EncryptedMemories) is no longer running'
+        error, _, _, _ = self.run_case_on_a_virtual_clock(
+            prepare_startup=1, verify_startup=1, app_ended=ended, ended_after_start=True, verify_code=1)
+        self.assertEqual(str(error), 'v1.0.5 / index.embed: UI verification failed (1); ' + ended)
+        error, _, _, _ = self.run_case_on_a_virtual_clock(prepare_startup=1, verify_startup=1, verify_code=1)
+        self.assertEqual(str(error), 'v1.0.5 / index.embed: UI verification failed (1)')
+
     def test_owned_simulator_journey_preserves_a_foreign_booted_device(self):
         devices = {'FOREIGN-DEVICE': 'Booted'}
         operations = []
@@ -1011,13 +1119,18 @@ else:
             with self.assertRaisesRegex(JourneyError, 'index.beforeCommit'):
                 server.wait_checkpoint(timeout=0.01)
 
-    def run_case_on_a_virtual_clock(self, prepare_startup, verify_startup, act=20, reach_at=None):
+    def run_case_on_a_virtual_clock(
+            self, prepare_startup, verify_startup, act=20, reach_at=None, app_ended=None, ended_after_start=False, verify_code=0,
+            ended_from_verify=False, verify_act=None):
         """Run index.embed through run_journey.main() with UI runs whose first test case starts after the given seconds.
 
         Each UI run acts `act` seconds after its first test case started; None never starts a test case. With
-        `reach_at`, the old app reaches its checkpoint on its own that many seconds after the preparation launch."""
+        `reach_at`, the old app reaches its checkpoint on its own that many seconds after the preparation launch.
+        With `app_ended`, the launched app is gone: its running check fails with that message at once, or only
+        names it next to a later failure when `ended_after_start`; with `ended_from_verify` it is alive until the new app launches. `verify_code` is the exit code of the verification run and `verify_act` the seconds that it acts (default `act`)."""
         clock = {'now': 0.0}
         runs, events, servers = [], [], []
+        self.summary_lines = []
 
         def advance(seconds):
             clock['now'] += seconds
@@ -1037,14 +1150,15 @@ else:
             sleep = staticmethod(advance)
 
         class Run:
-            def __init__(self, log, startup, reach=None):
-                self.log, self.announced, self.stopped = log, False, False
+            def __init__(self, log, startup, reach=None, code=0, acts=None):
+                self.log, self.announced, self.stopped, self.code = log, False, False, code
+                self.acts = act if acts is None else acts
                 self.start_at = None if startup is None else clock['now'] + startup
                 self.reach_at = None if reach is None else clock['now'] + reach
                 log.write_text('Running tests...\n')
 
             def remaining(self):
-                return float('inf') if self.start_at is None else max(0, self.start_at + act - clock['now'])
+                return float('inf') if self.start_at is None else max(0, self.start_at + self.acts - clock['now'])
 
             def poll(self):
                 return 0 if self.stopped else None
@@ -1055,7 +1169,7 @@ else:
                     raise subprocess.TimeoutExpired('xcodebuild', timeout)
                 advance(self.remaining())
                 self.stopped = True
-                return 0
+                return self.code
 
         class Server:
             def __init__(self, case, point):
@@ -1097,6 +1211,13 @@ else:
             def launch(self, server, seed=False):
                 pass
 
+            def require_running(self):
+                if app_ended and not ended_after_start and (not ended_from_verify or 'ui-verify' in events):
+                    raise JourneyError(app_ended)
+
+            def explain(self, message):
+                return f'{message}; {app_ended}' if app_ended else message
+
             def kill_app(self):
                 events.append('kill-old')
                 clock['killed'] = clock['now']
@@ -1106,7 +1227,8 @@ else:
 
         def ui(runner, destination, point, phase, case, *_):
             runs.append(Run(case / (phase + '-ui.log'), prepare_startup if phase == 'prepare' else verify_startup,
-                            reach_at if phase == 'prepare' else None))
+                            reach_at if phase == 'prepare' else None, verify_code if phase == 'verify' else 0,
+                            verify_act if phase == 'verify' else None))
             events.append('ui-' + phase)
             return runs[-1], io.StringIO()
 
@@ -1123,7 +1245,9 @@ else:
                          '--platform', 'iOS', '--points', 'index.embed']
             with patch.object(sys, 'argv', arguments), patch.object(run_journey, 'release_metadata', return_value={'tag': 'v1.1.0'}), \
                     patch.object(run_journey, 'build_app', side_effect=builds), patch.object(run_journey, 'command'), \
-                    patch.object(run_journey, 'output', return_value='arm64'), patch.object(run_journey, 'verify_bundle_metadata', return_value={}), \
+                    patch.object(run_journey, 'output', side_effect=lambda args, *_, **__: '128' if args == ['sysctl', '-n', 'kern.ipc.somaxconn'] else 'arm64'), \
+                    patch.object(run_journey, 'summary', side_effect=self.summary_lines.append), \
+                    patch.object(run_journey, 'verify_bundle_metadata', return_value={}), \
                     patch.object(run_journey, 'InstalledApp', App), patch.object(run_journey, 'FixtureServer', Server), \
                     patch.object(run_journey, 'ui_run', side_effect=ui), patch.object(run_journey, 'stop_group', lambda run: setattr(run, 'stopped', True)), \
                     patch.object(run_journey, 'sample_runner'), patch.object(run_journey, 'time', Clock), \
