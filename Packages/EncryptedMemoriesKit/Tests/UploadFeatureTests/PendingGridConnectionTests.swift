@@ -191,6 +191,43 @@ import UploadCore
         fixture.store.close()
     }
 
+    @Test func theTrashAndExcludedListsFollowTheSessionUntilRetired() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let fileQueue = try #require(
+            UploadBackupSyncQueueManifestStore(url: fixture.directory.appendingPathComponent("file-queue.sqlite")))
+        let path = fixture.directory.appendingPathComponent("watched/photo.heic").path
+        let source = UploadSourceIdentity(kind: .fileURL, identifier: path)
+        #expect(
+            fileQueue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: UploadBackupRevision(rawValue: 1), originalFilename: "photo.heic",
+                    state: .queuedForUpload, updatedAt: Date(timeIntervalSince1970: 1_700_000_000))))
+        let files = PendingFileSource(
+            queue: fileQueue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true },
+            returnToBackup: { _ in true })
+        let connection = PendingGridConnection()
+        let started = connection.start(store: fixture.store) {
+            PendingGridSession(store: $0, photoBackup: fixture.controller, remote: NoRemoteEffects(), files: files)
+        }
+        let session = try #require(started)
+        let uid = PendingSourceKey(kind: .fileURL, identifier: path).localUID
+        #expect(await eventually { session.pendingSnapshot.tiles.contains { $0.item.uid == uid } })
+
+        #expect(await session.delete([uid]))
+        #expect(await eventually { !connection.trash.localUIDs.isEmpty }, "a deleted file shows in Recently Deleted")
+        #expect(connection.trash.localUIDs == session.trash.localUIDs)
+        #expect(connection.excludedTiles.map(\.item.uid) == [uid], "the Backup settings list shows the deleted file")
+
+        _ = connection.retire()
+        #expect(connection.trash.isEmpty)
+        #expect(connection.excludedTiles.isEmpty)
+        await session.close()
+        await fixture.controller.shutdown()
+        fixture.store.close()
+        fileQueue.close()
+    }
+
     private func eventually(_ condition: () async -> Bool) async -> Bool {
         for _ in 0..<200 {
             if await condition() { return true }
@@ -234,6 +271,20 @@ private struct Fixture {
     func remove() {
         defaults.removePersistentDomain(forName: suite)
         try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private struct AllFilesMetadata: PendingSourceMetadataProviding {
+    func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
+        Dictionary(
+            uniqueKeysWithValues: keys.map {
+                (
+                    $0,
+                    PendingPresentationMetadata(
+                        captureTime: Date(timeIntervalSince1970: 1_700_000_000), mediaType: "image/heic",
+                        displayName: "photo.heic")
+                )
+            })
     }
 }
 
