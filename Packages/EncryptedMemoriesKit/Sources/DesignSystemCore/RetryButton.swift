@@ -15,7 +15,7 @@ public struct RetryButton: View {
     }
 
     /// The single title of every Retry action.
-    static var title: String { L10n.string("action.retry") }
+    nonisolated static var title: String { L10n.string("action.retry") }
 
     private let style: Style
     private let action: () -> Void
