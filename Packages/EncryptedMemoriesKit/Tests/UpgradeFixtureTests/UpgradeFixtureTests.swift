@@ -243,7 +243,7 @@ import XCTest
                         do {
                             try fixtureRequire(
                                 DispatchTime.now().uptimeNanoseconds < deadline.uptimeNanoseconds,
-                                "Upgrade verification exceeded its total 120 second deadline")
+                                "Upgrade verification exceeded its total deadline")
                             let pool = root.appendingPathComponent(release.tag)
                             let label = "\(release.tag)/\(scenario)"
                             let log = pool.appendingPathComponent("\(scenario).log")
@@ -313,7 +313,7 @@ import XCTest
                 kill(process.processIdentifier, SIGKILL)
                 process.waitUntilExit()
             }
-            throw FixtureFailure(description: "Upgrade verification exceeded its total 120 second deadline")
+            throw FixtureFailure(description: "Upgrade verification exceeded its total deadline")
         }
 
         func testScenarioWorker() async throws {

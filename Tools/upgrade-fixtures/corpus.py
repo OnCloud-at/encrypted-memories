@@ -9,18 +9,49 @@ import json
 import re
 import shutil
 import sqlite3
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
 
 BUDGET = 15_000_000
 MINIMUM_PUBLIC_RELEASE = 'v1.0.5'
 SCENARIOS = ('backup', 'model', 'index', 'cache', 'location')
-# A home directory of any person, a volume or temporary location of the recording machine, or a private host or
-# address, in any letter case. The shared folder and the hosted runner's account are allowed. A name may start with
-# a JSON unicode escape.
+# What a recorded corpus must not hold. Every rule has a category, so a hit names the rule and never the value.
+# Every /Users/<name> and /home/<name> is a hit, wherever it stands: stored text follows other cells and type bytes
+# with no delimiter. The one exemption is an API route: the exact lowercase folder name directly after a version
+# segment, such as /core/v4/users/me. A real home folder is spelled Users, so this spelling is never exempt.
+ROUTE = rb'(?<!/v\d)(?<!/v\d\d)'
+# What ends a complete folder name: a separator, whitespace, a double quote, an escaped slash or whitespace letter,
+# or the end of the data. Every other character, and every other backslash escape, continues the name.
+END = rb'(?:[/\s"]|\\(?:/|u002f|[nrt])|$)'
+# A name may start with a JSON unicode escape.
 NAME = rb'(?:[^/\s"\\]|\\u[0-9a-f]{4})+'
-PRIVATE = re.compile(rb'/Users/(?!(?:Shared|runner)(?:[/\s"\\]|$))' + NAME + rb'|/home/(?!runner(?:[/\s"\\]|$))' + NAME + rb'|/Volumes/|/private/|/var/folders/|[.]ts[.]net|[.]lan\b|[A-Za-z0-9_-]+\.local\b|(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d+\.\d+', re.IGNORECASE)
+# The shared folder and the hosted runner's account are the only home folders the recorder may name.
+ALLOWED = rb'(?:Users/(?:Shared|runner)|home/runner)'
+
+def ci(pattern):
+    """The pattern without regard to letter case; the flag is scoped, so a rule can still test the exact case."""
+    return rb'(?i:' + pattern + rb')'
+
+def root(names):
+    """A home folder; `names` are lowercase alternatives. Only that exact spelling after /v<digits> is exempt."""
+    return (rb'(?:' + ROUTE + rb'/' + ci(names) + rb'/|/(?!(?:' + names + rb')/)' + ci(names) + rb'/)')
+
+RULES = (
+    ('home path', re.compile(root(rb'users') + ci(rb'(?!(?:Shared|runner)' + END + rb')' + NAME))),
+    ('home path', re.compile(root(rb'home') + ci(rb'(?!runner' + END + rb')' + NAME))),
+    ('home path', re.compile(root(rb'users|home') + rb'(?=[/\s"\\]|$)')),
+    ('path traversal', re.compile(ci(rb'/' + ALLOWED + rb'(?:/[^/\s"\\]*)*/\.\.' + END))),
+    ('volume', re.compile(rb'/Volumes/', re.IGNORECASE)),
+    ('temporary location', re.compile(rb'/private/|/var/folders/', re.IGNORECASE)),
+    ('file URL with a host', re.compile(rb'file://(?!/)', re.IGNORECASE)),
+    ('file URL outside the shared folders', re.compile(rb'file:///(?!' + ALLOWED + END + rb')', re.IGNORECASE)),
+    ('host', re.compile(rb'[.]ts[.]net|[.]lan\b|[A-Za-z0-9_-]+\.local\b', re.IGNORECASE)),
+    ('address', re.compile(
+        rb'(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d+\.\d+')),
+)
 
 def release_version(tag):
     if not re.fullmatch(r'v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)', tag):
@@ -68,16 +99,36 @@ def release_catalog(destination, metadata):
     return catalog
 
 def unescaped(data):
-    # JSON writes a slash as "\/" or "\u002f", and a record inside a record repeats the escape.
+    # JSON writes a slash as "\\/" or "\\u002f", and a record inside a record repeats the escape.
     data = re.sub(rb'\\u002f', b'/', data, flags=re.IGNORECASE)
     while b'\\/' in data:
         data = data.replace(b'\\/', b'/')
     return data
 
+def views(data):
+    """The data as stored, JSON-unescaped, percent-decoded once and twice, each also without NUL bytes (UTF-16)."""
+    for base in (data, data.replace(b'\x00', b'')) if b'\x00' in data else (data,):
+        flat = unescaped(base)
+        yield base
+        yield flat
+        if b'%' in flat:
+            decoded = unquote_to_bytes(flat)
+            yield decoded
+            if b'%' in decoded:
+                yield unquote_to_bytes(decoded)
+
+def private_category(data):
+    for view in views(data):
+        for category, rule in RULES:
+            if rule.search(view):
+                return category
+    return None
+
 def check_bytes(data, label, strict_issues=False):
-    # The message names the place only, never the value.
-    if PRIVATE.search(data) or PRIVATE.search(unescaped(data)):
-        raise ValueError('Private path or hostname in ' + label)
+    # The message names the category and the place, never the value.
+    category = private_category(data)
+    if category:
+        raise ValueError(f'Private {category} in {label}')
     for encoded in re.findall(rb'encryptedmemories-backup-issue-v1:([A-Za-z0-9+/]+={0,2})', data):
         if not strict_issues:
             # A raw SQLite page can end inside a value. Decode every complete prefix.
@@ -209,7 +260,8 @@ def pack(recorded, destination):
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.pack-') as staging_name:
         staging = Path(staging_name)
         archive = staging / 'corpus.tar.gz'
-        with archive.open('wb') as raw, gzip.GzipFile(fileobj=raw, mode='wb', mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as tar:
+        with archive.open('wb') as raw, gzip.GzipFile(fileobj=raw, mode='wb', mtime=0) as compressed, \
+                tarfile.open(fileobj=compressed, mode='w') as tar:
             for digest, data in sorted(blobs.items()):
                 info = tarfile.TarInfo('blobs/' + digest)
                 info.size = len(data)
@@ -229,7 +281,9 @@ def pack(recorded, destination):
     temporary_catalog = catalog_path.with_suffix('.json.tmp')
     temporary_catalog.write_text(encoded_catalog)
     temporary_catalog.replace(catalog_path)
-    print(json.dumps({'snapshots': {key: len(value) for key, value in manifest['scenarios'].items()}, 'blobs': len(blobs), 'archiveBytes': archive_bytes, 'manifestBytes': len(encoded), 'totalBytes': size}, indent=2))
+    summary = {'snapshots': {key: len(value) for key, value in manifest['scenarios'].items()}, 'blobs': len(blobs),
+               'archiveBytes': archive_bytes, 'manifestBytes': len(encoded), 'totalBytes': size}
+    print(json.dumps(summary, indent=2))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
@@ -239,7 +293,10 @@ if __name__ == '__main__':
     parser.add_argument('--check-published', type=Path, help='Scan the published files of one release folder')
     args = parser.parse_args()
     if args.check_published is not None:
-        check_published(args.check_published)
+        try:
+            check_published(args.check_published)
+        except ValueError as error:
+            sys.exit(str(error))
         print('No private path or hostname in ' + args.check_published.name)
     elif args.check_release is not None:
         release_version(args.check_release)
