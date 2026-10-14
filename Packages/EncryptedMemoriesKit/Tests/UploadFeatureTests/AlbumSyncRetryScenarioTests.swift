@@ -29,7 +29,8 @@ final class AlbumSyncRetryScenarioTests: XCTestCase {
         var reports: [AlbumSyncReport] = []
         var memberCounts: [Int] = []
         for _ in 0..<3 {
-            reports.append(try await device.syncAlbum(assets.keys.sorted(), backup: RetryAlbumBackup(device: device)))
+            let backup = EditScenarioAlbumBackup(device: device)
+            reports.append(try await device.syncAlbum(assets.keys.sorted(), backup: backup))
             memberCounts.append(try await device.server.childMainLinkIDs(albumID: "own-album").count)
         }
 
@@ -47,40 +48,4 @@ final class AlbumSyncRetryScenarioTests: XCTestCase {
         XCTAssertEqual(device.server.links.first { $0.uid == blockingDraft }?.state, .draft)
         XCTAssertEqual(device.server.uploadRequestCount, 2, "Only asset-1 and asset-2 upload, each once")
     }
-}
-
-/// Like the album executor, each run starts with an empty queue and backup state, so every photo of the album goes
-/// through scan, preflight and the identity resolver again; a photo that is already known settles from the upload
-/// manifest. Then it reports the unresolved album rows.
-private final class RetryAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
-    let device: EditScenarioHarness
-    init(device: EditScenarioHarness) { self.device = device }
-
-    func ensureBackedUp(
-        localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
-    ) async throws -> AlbumSyncBackupReport {
-        try device.resetAlbumSyncScratch()
-        try await device.enqueue()
-        await device.pass()
-        let album = Set(localIdentifiers)
-        var problems: [String: BackupFailedItem] = [:]
-        device.queue.forEachProblemEntry { entry in
-            if entry.source.kind == .photoLibraryAsset, album.contains(entry.source.identifier),
-                problems[entry.source.identifier] == nil
-            {
-                problems[entry.source.identifier] = BackupFailedItem(entry: entry)
-            }
-            return true
-        }
-        return AlbumSyncBackupReport(
-            total: localIdentifiers.count, backedUp: localIdentifiers.count - problems.count,
-            failed: problems.count, sourceMissing: 0, skippedRemoteDeletion: 0, problems: problems)
-    }
-
-    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
-        try await AlbumSyncRemoteProofLookup.remoteLinks(
-            for: localIdentifiers, catalog: device.library, queue: device.queue, resolver: device.identityResolver)
-    }
-
-    func stop() async {}
 }

@@ -884,6 +884,42 @@ struct EditScenarioAlbumSource: AlbumSyncLocalAlbumSource {
     func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(identifiers) }
 }
 
+/// Like the album executor, each run starts with an empty queue and backup state, so every photo of the album goes
+/// through scan, preflight and the identity resolver again; a photo that is already known settles from the upload
+/// manifest. Then it reports the unresolved album rows.
+final class EditScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
+    let device: EditScenarioHarness
+    init(device: EditScenarioHarness) { self.device = device }
+
+    func ensureBackedUp(
+        localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
+    ) async throws -> AlbumSyncBackupReport {
+        try device.resetAlbumSyncScratch()
+        try await device.enqueue()
+        await device.pass()
+        let album = Set(localIdentifiers)
+        var problems: [String: BackupFailedItem] = [:]
+        device.queue.forEachProblemEntry { entry in
+            if entry.source.kind == .photoLibraryAsset, album.contains(entry.source.identifier),
+                problems[entry.source.identifier] == nil
+            {
+                problems[entry.source.identifier] = BackupFailedItem(entry: entry)
+            }
+            return true
+        }
+        return AlbumSyncBackupReport(
+            total: localIdentifiers.count, backedUp: localIdentifiers.count - problems.count,
+            failed: problems.count, sourceMissing: 0, skippedRemoteDeletion: 0, problems: problems)
+    }
+
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        try await AlbumSyncRemoteProofLookup.remoteLinks(
+            for: localIdentifiers, catalog: device.library, queue: device.queue, resolver: device.identityResolver)
+    }
+
+    func stop() async {}
+}
+
 extension EditScenarioHarness {
     /// One Album Sync of the scenario album into the server's own album, with the real runner, upload manifest lookup
     /// and mapping store of this device.

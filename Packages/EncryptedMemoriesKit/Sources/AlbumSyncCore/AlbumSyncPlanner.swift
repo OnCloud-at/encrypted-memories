@@ -14,8 +14,8 @@ public struct AlbumSyncAttachPlan: Sendable, Equatable {
     public var missingRemoteIdentifiers: [String] = []
     /// The local identifiers behind `trashedRemote`, in local album order.
     public var trashedRemoteIdentifiers: [String] = []
-    /// Distinct local assets that resolved to an already-planned remote link (duplicate content
-    /// across the album collapses to one attach).
+    /// Distinct local assets that resolved to an already-planned remote link or to a link with the same bytes
+    /// (duplicate content across the album collapses to one attach).
     public var duplicatesCollapsed = 0
 
     public init() {}
@@ -24,14 +24,18 @@ public struct AlbumSyncAttachPlan: Sendable, Equatable {
 /// Pure set-difference planning for local assets, manifest links, and current album members.
 /// The result is deterministic, performs no I/O, and runs in linear time.
 public enum AlbumSyncPlanner {
+    /// - Parameter memberWithSameContent: For a SHA-1, a current album member with the same bytes under another
+    ///   link, for example another device's copy of a shared photo. Such a photo counts as already in the album.
     public static func plan(
         orderedLocalIdentifiers: [String],
         remoteLinks: [String: AlbumSyncRemoteLink],
-        existingChildLinkIDs: Set<String>
+        existingChildLinkIDs: Set<String>,
+        memberWithSameContent: [String: String] = [:]
     ) -> AlbumSyncAttachPlan {
         var plan = AlbumSyncAttachPlan()
         var planned = Set<String>()
         planned.reserveCapacity(orderedLocalIdentifiers.count)
+        var plannedContent = Set<String>()
         var seenMembers = Set<String>()
 
         for identifier in orderedLocalIdentifiers {
@@ -46,16 +50,20 @@ public enum AlbumSyncPlanner {
                 continue
             }
             let linkID = link.uid.nodeID
-            if existingChildLinkIDs.contains(linkID) {
+            let member =
+                existingChildLinkIDs.contains(linkID) ? linkID : link.sha1Hex.flatMap { memberWithSameContent[$0] }
+            if let member {
                 // Count each distinct member once even if several local assets map to it.
-                if seenMembers.insert(linkID).inserted {
+                if seenMembers.insert(member).inserted {
                     plan.alreadyMember += 1
                 } else {
                     plan.duplicatesCollapsed += 1
                 }
                 continue
             }
-            if planned.insert(linkID).inserted {
+            // A link with bytes that another planned link already carries would add the same photo twice.
+            let newContent = link.sha1Hex.map { plannedContent.insert($0).inserted } ?? true
+            if planned.insert(linkID).inserted, newContent {
                 plan.toAttach.append(AlbumSyncAttachCandidate(uid: link.uid, sha1Hex: link.sha1Hex))
             } else {
                 plan.duplicatesCollapsed += 1

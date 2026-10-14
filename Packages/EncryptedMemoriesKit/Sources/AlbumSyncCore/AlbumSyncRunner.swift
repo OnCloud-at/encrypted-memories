@@ -193,10 +193,14 @@ public actor AlbumSyncRunner {
         try await ensureAlbumPresent(albumID: album.id)
         try checkStop()
         let children = try await remoteOps.childMainLinkIDs(albumID: remoteAlbumID)
+        try checkStop()
+        let sameContent = try await membersWithSameContent(links: links, children: children)
+        try checkStop()
         let plan = AlbumSyncPlanner.plan(
             orderedLocalIdentifiers: identifiers,
             remoteLinks: links,
-            existingChildLinkIDs: children
+            existingChildLinkIDs: children,
+            memberWithSameContent: sameContent
         )
         progress.alreadyMember = plan.alreadyMember
         progress.unattachable = plan.missingRemote
@@ -266,6 +270,29 @@ public actor AlbumSyncRunner {
         }
         publish()
         return report
+    }
+
+    /// For each SHA-1 of a link that is not in the album, an album member with the same bytes, for example another
+    /// device's copy of a shared photo. A failed lookup finds none, so the photo attaches as before; Stop and
+    /// cancellation still end the run.
+    private func membersWithSameContent(
+        links: [String: AlbumSyncRemoteLink], children: Set<String>
+    ) async throws -> [String: String] {
+        let candidates = Set(
+            links.values.compactMap { link in
+                link.isTrashed || children.contains(link.uid.nodeID) ? nil : link.sha1Hex
+            })
+        guard !candidates.isEmpty, !children.isEmpty else { return [:] }
+        let copies: [String: Set<String>]
+        do {
+            copies = try await remoteOps.activeMainLinkIDs(withSameContentAs: candidates)
+        } catch {
+            try checkStop()
+            if error is CancellationError { throw error }
+            return [:]
+        }
+        // The smallest member id keeps the choice stable between runs.
+        return copies.compactMapValues { $0.intersection(children).min() }
     }
 
     /// The photos with a usable, not trashed link whose backup row is unresolved, in album order. A photo whose

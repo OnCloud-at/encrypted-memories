@@ -1207,6 +1207,16 @@ extension EditScenarioServer: AlbumSyncRemoteAlbumOps {
             }.map(\.linkID))
     }
 
+    func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>] {
+        var result: [String: Set<String>] = [:]
+        for link in links where link.state == .active && link.mainLinkID == nil {
+            for sha1Hex in sha1Hexes where link.contentHash == "ch(\(sha1Hex))" {
+                result[sha1Hex, default: []].insert(link.linkID)
+            }
+        }
+        return result
+    }
+
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
         let existing = try await childMainLinkIDs(albumID: albumID)
         let new = photos.filter { !existing.contains($0.uid.nodeID) }
