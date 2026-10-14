@@ -22,11 +22,14 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
 
     private let videoPath = "/photos/IMG_1.MOV"
 
-    private func video(mainLinkID: String = "live-main") -> UploadResourceDescriptor {
+    private func video(
+        mainLinkID: String = "live-main", replacesEarlierUpload: Bool = false
+    ) -> UploadResourceDescriptor {
         UploadResourceDescriptor(
             source: .file(URL(fileURLWithPath: "/photos/IMG_1.HEIC"), resource: .livePairedVideo),
             fileURL: URL(fileURLWithPath: videoPath), filename: "IMG_1.MOV", fileSize: 1000,
-            modificationDate: Date(timeIntervalSince1970: 1_700_000_000), mainRemoteLinkID: mainLinkID)
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000), mainRemoteLinkID: mainLinkID,
+            requiresRelatedMatch: replacesEarlierUpload)
     }
 
     private func sha1Hex(seed: String) -> String {
@@ -167,6 +170,20 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         let result = try await pipeline.resolve(video())
 
         XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
+    }
+
+    func testAVideoOfAReplacingEditIgnoresItsTrashedCopyUnderTheEarlierPhoto() async throws {
+        // The earlier copy moved to the trash with the earlier photo that the edit replaces. That is no deletion
+        // by the person, so the video uploads under the edited photo.
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.MOV)", contentHash: videoContentHash, linkState: .trashed, linkID: "earlier-video")
+        ]
+        checker.relatedLinkIDsByMainLinkID["live-main"] = []
+
+        let result = try await pipeline.resolve(video(replacesEarlierUpload: true))
+
+        XCTAssertEqual(result.decision, .upload)
     }
 
     func testAForeignDraftAloneKeepsTheVideoBlocked() async throws {
