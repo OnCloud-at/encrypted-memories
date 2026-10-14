@@ -154,7 +154,7 @@ class PullRequestWorkflowTests < Minitest::Test
   # decorator is split over lines; parentheses inside its strings would confuse the line counting.
   def darwin_guards(root)
     Dir[File.join(root, ".github/scripts/test_*.py"), File.join(root, "scripts/tests/test_*.py")].flat_map do |path|
-      lines = File.readlines(path)
+      lines = File.readlines(path, encoding: "UTF-8")
       script = path.delete_prefix("#{root}/")
       guards = []
       index = 0
@@ -191,7 +191,9 @@ class PullRequestWorkflowTests < Minitest::Test
     root = File.expand_path("../..", __dir__)
     commands = probes.fetch("run").lines.map(&:strip)
     assert_includes commands, "set -euo pipefail"
-    assert_empty commands.grep(/\|\||;|&&/), "A probe command must not mask its exit status"
+    assert_empty commands.grep(/\|\||;|&&|&\s*\z|#/), "A probe command must not mask its exit status or run in the background"
+    assert commands.drop(1).all? { |command| command.start_with?("python3 .github/scripts/") },
+      "The probe step may contain only the shell option line and the Python test commands"
     guards = darwin_guards(root)
     assert_operator guards.length, :>=, 2
     guards.each do |script, line, kind, symbol|
@@ -218,6 +220,7 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_operator steps.index(python), :<, steps.index(probes)
     assert_equal "${{ steps.upgrade-probes.outcome }}", macos.fetch("outputs").fetch("upgrade_probes")
     gate_job = jobs.fetch("macos-app-shell")
+    assert_equal "macOS app shell", gate_job.fetch("name"), "The gate must stay the required check of that name"
     gate = gate_job.fetch("steps").find { |step| step.fetch("env", {}).key?("RESULT") &&
       step.fetch("env").fetch("RESULT").include?("upgrade_probes") }
     refute_nil gate, "The macOS gate must require the probe result"
