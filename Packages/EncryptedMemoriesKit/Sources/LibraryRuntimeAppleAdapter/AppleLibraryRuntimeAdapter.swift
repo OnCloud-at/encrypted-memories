@@ -245,11 +245,10 @@ public final class AppleLibraryRuntimeAdapter {
 /// Merges observed pressure independently from proactive background cache reduction.
 /// A UIKit warning retains purge-now semantics in every execution opportunity.
 public enum AppleRuntimeMemoryPolicy {
-    /// Background activity affects cache budgets, not observed pressure. Keep the argument for source compatibility.
+    /// Background activity affects cache budgets, not observed pressure.
     public static func pressure(
         dispatchPressure: MemoryConditions.Pressure,
-        memoryWarningLatched: Bool,
-        isBackgrounded _: Bool
+        memoryWarningLatched: Bool
     ) -> MemoryConditions.Pressure {
         memoryWarningLatched ? .critical : dispatchPressure
     }
@@ -265,8 +264,7 @@ public enum AppleRuntimeMemoryPolicy {
         return MemoryConditions(
             pressure: pressure(
                 dispatchPressure: dispatchPressure,
-                memoryWarningLatched: memoryWarningLatched,
-                isBackgrounded: isBackgrounded
+                memoryWarningLatched: memoryWarningLatched
             ),
             thermal: thermal,
             lowPowerMode: lowPowerMode,
