@@ -30,9 +30,7 @@ public struct ActivityProgressRow: View {
             if title != nil || (fraction == nil && showsIndeterminateProgress) {
                 HStack(spacing: 8) {
                     if fraction == nil, showsIndeterminateProgress {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(ProtonColor.primary)
+                        ProgressSpinner()
                     }
                     if let title {
                         Text(title)

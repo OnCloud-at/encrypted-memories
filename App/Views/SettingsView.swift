@@ -272,7 +272,7 @@ private struct BackupSettingsTab: View {
             if let fraction = status.fractionCompleted {
                 ActivityProgressBar(fraction: fraction, accessibilityLabel: status.localizedTitle)
             } else {
-                ProgressView()  // Totals are unknown during scanning.
+                ProgressSpinner()  // Totals are unknown during scanning.
             }
             if let name = status.currentItemName {
                 Text(name)
@@ -479,7 +479,7 @@ private struct LibrarySettingsTab: View {
                         confirmDelete = true
                     } label: {
                         if deleting {
-                            ProgressView().controlSize(.small)
+                            ProgressSpinner()
                         } else {
                             Text("settings.delete_offline_cache_button")
                         }
@@ -1030,8 +1030,7 @@ private struct AlbumSyncSection: View {
             }
             Spacer()
             if isActive {
-                ProgressView()
-                    .controlSize(.small)
+                ProgressSpinner()
             } else if album.state == .needsDecision {
                 Button(L10n.string("settings.albumsync_decide")) { controller.presentConflict(albumID: album.id) }
                     .controlSize(.small)
@@ -1065,8 +1064,7 @@ private struct AlbumSyncSection: View {
                     .font(.system(size: 11).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            ProgressView()
-                .controlSize(.small)
+            ProgressSpinner()
         }
     }
 
@@ -1213,7 +1211,7 @@ private struct BackupStatusSummaryRow: View {
                 if let fraction = status.fractionCompleted {
                     ActivityProgressBar(fraction: fraction, accessibilityLabel: status.localizedTitle)
                 } else {
-                    ProgressView()
+                    ProgressSpinner()
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     if status.alreadyBackedUp > 0 {
@@ -1299,7 +1297,7 @@ private struct CacheStatusTab: View {
                 Button {
                     Task { await refresh() }
                 } label: {
-                    if refreshing { ProgressView().controlSize(.small) } else { Text("action.refresh") }
+                    if refreshing { ProgressSpinner() } else { Text("action.refresh") }
                 }
                 .disabled(refreshing)
             }
@@ -1372,7 +1370,7 @@ private struct MacBugReportSheet: View {
                     Task { await exportSupportReport() }
                 } label: {
                     if isPreparingReport {
-                        ProgressView().controlSize(.small)
+                        ProgressSpinner()
                     } else {
                         Text(L10n.string("settings.bug_report_download"))
                     }

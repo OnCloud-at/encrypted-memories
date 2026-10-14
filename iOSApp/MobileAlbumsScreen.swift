@@ -143,7 +143,7 @@ struct MobileCollectionsScreen: View {
         if let coordinator = model.albumActions {
             if coordinator.showsAlbumLoadingPlaceholder {
                 HStack {
-                    ProgressView().controlSize(.small).tint(ProtonColor.primary)
+                    ProgressSpinner()
                     Text("collections.loading_albums").foregroundStyle(ProtonColor.textWeak)
                 }
             } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {
@@ -170,7 +170,7 @@ struct MobileCollectionsScreen: View {
         if let coordinator = model.albumActions {
             if coordinator.showsSharedAlbumLoadingPlaceholder {
                 HStack {
-                    ProgressView().controlSize(.small).tint(ProtonColor.primary)
+                    ProgressSpinner()
                     Text(L10n.string("collections.loading_shared_albums"))
                         .foregroundStyle(ProtonColor.textWeak)
                 }
@@ -526,7 +526,7 @@ private struct MobileFilterGridScreen: View {
                     restoreSelected()
                 } label: {
                     if isRestoring {
-                        ProgressView()
+                        ProgressSpinner()
                     } else {
                         Label(String(localized: "trash.restore_button"), systemImage: "arrow.uturn.backward")
                     }
@@ -574,7 +574,7 @@ private struct MobileFilterGridScreen: View {
         } else if case .album = filter {
             albumActionsMenu
         } else if filter == .trash, isEmptyingTrash {
-            ProgressView()
+            ProgressSpinner()
         } else if filter == .trash {
             Menu {
                 Button {

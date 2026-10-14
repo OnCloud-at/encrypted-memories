@@ -160,7 +160,7 @@ public struct AlbumDestinationPicker: View {
     @ViewBuilder private var destinationRows: some View {
         if coordinator.isLoading, coordinator.albums.isEmpty {
             HStack(spacing: 10) {
-                ProgressView().controlSize(.small)
+                ProgressSpinner()
                 Text(L10n.string("albums.loading"))
             }
         } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {

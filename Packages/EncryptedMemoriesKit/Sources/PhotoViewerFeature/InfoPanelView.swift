@@ -109,7 +109,7 @@ struct InfoPanelView: View {
                 row(L10n.string("infopanel.type"), mime)
             }
             if metadataLoadState == .loading || metadataLoadState == .idle {
-                ProgressView()
+                ProgressSpinner()
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.top, 8)
             } else if metadataLoadState == .failed {
@@ -131,7 +131,7 @@ struct InfoPanelView: View {
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
             if isLoadingAlbumMemberships {
-                ProgressView().controlSize(.small)
+                ProgressSpinner(accessibilityLabel: L10n.string("infopanel.albums"))
             } else if albumMembershipsLoadFailed {
                 Label(L10n.string("infopanel.albums_load_failed"), systemImage: "exclamationmark.triangle")
                     .font(.caption)

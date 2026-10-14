@@ -2576,7 +2576,7 @@ struct MainView: View {
             saveToLibrary(Array(uids))
         } label: {
             if isSavingToLibrary {
-                ProgressView().controlSize(.small)
+                ProgressSpinner()
             } else {
                 Label(
                     L10n.string("library.save_to_library"),

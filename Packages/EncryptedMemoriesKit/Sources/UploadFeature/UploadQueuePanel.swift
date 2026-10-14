@@ -152,7 +152,7 @@ public struct UploadQueuePanel: View {
         case .queued:
             Image(systemName: "clock").foregroundStyle(.secondary)
         default:
-            ProgressView().controlSize(.small)
+            ProgressSpinner()
         }
     }
 
