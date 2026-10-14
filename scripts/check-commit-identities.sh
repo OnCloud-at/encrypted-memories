@@ -8,8 +8,10 @@ set -euo pipefail
 #   <id>+<login>@users.noreply.github.com and <login>@users.noreply.github.com
 # of COMMIT_IDENTITY_LOGIN and COMMIT_IDENTITY_ID, plus noreply@github.com for
 # the committer (GitHub's web-flow account). Everything else fails.
-# Trailers that credit a person or a tool (Co-authored-by, Signed-off-by,
-# Reviewed-by, Generated-by) must carry an allowed address and no tool name.
+# Every attribution trailer (any key ending in -by, for example Co-authored-by,
+# Signed-off-by, Reviewed-by, Tested-by, Generated-by) must carry only the
+# author's address and no tool name. A folded trailer counts with its
+# continuation lines.
 # Without COMMIT_IDENTITY_LOGIN the script uses the noreply address of the
 # checkout's own user.email, so the local pre-push guard needs no environment.
 # Violations name only the commit and field so the log never repeats an address.
@@ -63,10 +65,13 @@ else
   exit 2
 fi
 
-trailer_key='^[[:space:]]*(co-authored-by|co-developed-by|signed-off-by|reviewed-by|generated-by|assisted-by)[[:space:]]*:'
-# A tool name counts as a whole word in the name part of a trailer, so "Ali Haider" is not "aider".
+# Every attribution trailer: any key of letters and hyphens that ends in -by (Co-authored-by, Tested-by, ...).
+trailer_key='^[[:space:]]*([a-z][a-z-]*-by)[[:space:]]*:'
+# A line that starts with white space and continues a folded trailer.
+trailer_continuation='^[[:space:]]+[^[:space:]]'
+# A tool name counts as a whole word in the name parts of a trailer, so "Ali Haider" is not "aider".
 tool_name='(^|[^a-z0-9])(anthropic|claude|codex|openai|chatgpt|gpt|t3 ?code|coding[ -]?agent|copilot|gemini|grok|cursor|aider|windsurf|deepseek|lumo|apertus|opencode|assistant)([^a-z0-9]|$)'
-trailer_address='<([^<>]*)>(.*)$'
+trailer_address='^([^<]*)<([^<>]*)>(.*)$'
 violations=0
 
 fail() {
@@ -74,29 +79,28 @@ fail() {
   violations=1
 }
 
+# Checks one trailer, joined with its continuation lines. Empty text and non-trailers pass.
 check_trailer() {
-  local commit="$1" line="$2" key rest found=0 name
+  local commit="$1" line="$2" key rest names="" found=0 address
   [[ "$line" =~ $trailer_key ]] || return 0
   key="${BASH_REMATCH[1]}"
-  name="${line%%<*}"
-  name="${name#*:}"
-  if [[ "$name" =~ $tool_name ]]; then
-    fail "$commit" "$key trailer credits a tool"
-    return 0
-  fi
-  if [[ "$name" == *@* ]]; then
-    fail "$commit" "$key trailer carries an address outside brackets"
-    return 0
-  fi
-  rest="$line"
+  rest="${line#*:}"
   while [[ "$rest" =~ $trailer_address ]]; do
     found=1
-    local address="${BASH_REMATCH[1]}"
-    rest="${BASH_REMATCH[2]}"
+    names="$names ${BASH_REMATCH[1]}"
+    address="${BASH_REMATCH[2]}"
+    rest="${BASH_REMATCH[3]}"
     if ! is_author_address "$address"; then
       fail "$commit" "$key trailer address is not the pull request author's"
     fi
   done
+  names="$names $rest"
+  if [[ "$names" =~ $tool_name ]]; then
+    fail "$commit" "$key trailer credits a tool"
+  fi
+  if [[ "$names" == *@* ]]; then
+    fail "$commit" "$key trailer carries an address outside brackets"
+  fi
   if ((!found)); then
     fail "$commit" "$key trailer has no email address"
   fi
@@ -119,9 +123,20 @@ while IFS= read -r commit; do
   if ! is_committer_address "$committer"; then
     fail "$commit" "committer email is not the pull request author's GitHub noreply address"
   fi
+  pending=""
   while IFS= read -r line; do
-    check_trailer "$commit" "$(lower "$line")"
+    line="$(lower "$line")"
+    if [[ "$line" =~ $trailer_key ]]; then
+      check_trailer "$commit" "$pending"
+      pending="$line"
+    elif [[ -n "$pending" && "$line" =~ $trailer_continuation ]]; then
+      pending="$pending $line"
+    else
+      check_trailer "$commit" "$pending"
+      pending=""
+    fi
   done <<<"$message"
+  check_trailer "$commit" "$pending"
 done <<<"$commits"
 
 if ((violations)); then

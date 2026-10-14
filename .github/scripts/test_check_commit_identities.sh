@@ -163,6 +163,42 @@ fresh_branch bare-address
 commit "$alice" "$alice" $'Bare address\n\nCo-authored-by: Mallory mallory@users.noreply.github.com <42+alice@users.noreply.github.com>'
 expect fail "an address outside brackets in the name fails" alice "$alice_id"
 
+fresh_branch tested-by-other
+commit "$alice" "$alice" $'Tested\n\nTested-by: Mallory <7+mallory@users.noreply.github.com>'
+expect fail "Tested-by of another login fails" alice "$alice_id"
+
+fresh_branch suggested-by-other
+commit "$alice" "$alice" $'Suggested\n\nSuggested-By: Mallory <7+mallory@users.noreply.github.com>'
+expect fail "any other -by key of another login fails" alice "$alice_id"
+
+fresh_branch tested-by-own
+commit "$alice" "$alice" $'Tested\n\nTested-by: Alice <42+alice@users.noreply.github.com>'
+expect pass "Tested-by of the author passes" alice "$alice_id"
+
+fresh_branch tested-by-no-address
+commit "$alice" "$alice" $'Tested\n\nTested-by: Bob'
+expect fail "any -by key without an address fails" alice "$alice_id"
+
+fresh_branch folded-own
+commit "$alice" "$alice" $'Folded\n\nCo-authored-by: Alice\n <42+alice@users.noreply.github.com>'
+expect pass "a folded trailer with only the author's address passes" alice "$alice_id"
+
+fresh_branch folded-other
+commit "$alice" "$alice" $'Folded\n\nCo-authored-by: Alice <42+alice@users.noreply.github.com>\n <7+mallory@users.noreply.github.com>'
+expect fail "another login's address on a continuation line fails" alice "$alice_id"
+
+fresh_branch folded-other-tab
+commit "$alice" "$alice" $'Folded\n\nReviewed-by: Alice <42+alice@users.noreply.github.com>\n\t<7+mallory@users.noreply.github.com>'
+expect fail "another login's address after a tab continuation fails" alice "$alice_id"
+
+fresh_branch folded-tool
+commit "$alice" "$alice" $'Folded\n\nCo-authored-by: Alice <42+alice@users.noreply.github.com>\n  Claude <42+alice@users.noreply.github.com>'
+expect fail "a tool name on a continuation line fails" alice "$alice_id"
+
+fresh_branch indented-text-after-prose
+commit "$alice" "$alice" $'Prose\n\nSome text\n   indented line with <7+mallory@users.noreply.github.com>'
+expect pass "an indented line that continues no trailer passes" alice "$alice_id"
+
 fresh_branch external
 carol="99+carol@users.noreply.github.com"
 commit "$carol" "$carol" "External contributor"
