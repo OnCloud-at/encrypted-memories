@@ -991,7 +991,8 @@ public final class PhotoLibraryBackupController {
     /// it never touches the main thread and does not depend on the controller's lifetime.
     /// Returns the last drain's policy state; the projector can still miss the runner's last callback at completion.
     /// Between drains it waits for a committed queue write, the end of the scan, or the next persisted due date.
-    static func reconcileWhileScanning(
+    /// `nonisolated`: the due-date read is SQLite work and must stay off the main actor.
+    nonisolated static func reconcileWhileScanning(
         runner: BackupSyncRunner,
         scanDone: BackupScanSignal,
         workIntent: LibraryWorkIntent,
