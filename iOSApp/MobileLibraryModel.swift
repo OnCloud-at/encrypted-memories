@@ -402,7 +402,8 @@ final class MobileLibraryModel {
         )
     }
 
-    /// Retires the pending grid (`PendingGridConnection.retire()`) and clears the iOS grid presentation and undo notice.
+    /// Retires the pending grid (`PendingGridConnection.retire()`) and clears the iOS grid presentation and the
+    /// undo notice.
     private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
         let retired = pendingGridConnection.retire()
         pendingPresentation = .empty
