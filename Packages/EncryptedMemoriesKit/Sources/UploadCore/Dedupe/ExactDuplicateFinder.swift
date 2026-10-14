@@ -235,7 +235,9 @@ public struct ExactDuplicateFinder: Sendable {
     /// The merges of this finder between their record and the check of their kept photo.
     let mergesInFlight = ExactDuplicateMergesInFlight()
     /// The checks of the pending merges, one at a time.
-    let pendingChecks = ExactDuplicatePendingCheckTurns()
+    let pendingChecks = ExactDuplicateTurns()
+    /// The merges and the emptyings of Recently Deleted, one at a time.
+    let mergeTurns = ExactDuplicateTurns()
 
     public init(
         checker: any UploadDuplicateChecking,
@@ -544,7 +546,27 @@ public struct ExactDuplicateFinder: Sendable {
     /// A preselected photo to keep is ranked again with the favorites of the run: the ranking of the screen can predate
     /// a favorite set since. A failed listing fails every group. The carry-over also takes the favorite tags that the
     /// compound reads of the group show, so a favorite set elsewhere during the run moves to the kept photo.
+    ///
+    /// A merge waits while Recently Deleted is emptied (`excludingMerges(_:)`), and the emptying waits for a running
+    /// merge.
     public func merge(
+        _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        do {
+            return try await mergeTurns.runOrThrow { await mergeInTurn(requests, in: run) }
+        } catch {
+            return requests.map { _ in .failure(error) }
+        }
+    }
+
+    /// Runs `body`, which empties Recently Deleted, while no merge of this finder runs, and holds new merges until it
+    /// ends. A merge that trashed its copies between the check of the open merges and the emptying would lose them for
+    /// good. Throws `CancellationError` without running `body` when the task is cancelled while it waits.
+    public func excludingMerges(_ body: () async throws -> Void) async throws {
+        try await mergeTurns.runOrThrow(body)
+    }
+
+    private func mergeInTurn(
         _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
         await resolvePendingMerges()
@@ -1187,14 +1209,15 @@ final class ExactDuplicateMergesInFlight: @unchecked Sendable {
     }
 }
 
-/// Runs the checks of the pending merges of one finder one at a time, in the order of their start. Two checks that
-/// ran together could both find a kept photo in the trash and both restore its duplicates and move their rows back.
-final class ExactDuplicatePendingCheckTurns: @unchecked Sendable {
+/// Runs the work of one finder one at a time, in the order of its start. Two checks of the pending merges that ran
+/// together could both find a kept photo in the trash and both restore its duplicates and move their rows back. An
+/// emptying of Recently Deleted next to a merge could delete the copies that the merge trashed before their check.
+final class ExactDuplicateTurns: @unchecked Sendable {
     private let lock = NSLock()
     private var isRunning = false
     private var waiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
 
-    /// The checks that wait for their turn.
+    /// The callers that wait for their turn.
     var waiting: Int { lock.withLock { waiters.count } }
 
     /// Runs `check` once no earlier check runs. A task that is cancelled while it waits leaves the queue and runs no
@@ -1204,6 +1227,14 @@ final class ExactDuplicatePendingCheckTurns: @unchecked Sendable {
         guard await enter() else { return }
         await check()
         leave()
+    }
+
+    /// Runs `body` like `run(_:)`. Throws `CancellationError` without running it when the task is cancelled while it
+    /// waits.
+    func runOrThrow<T>(_ body: () async throws -> T) async throws -> T {
+        guard await enter() else { throw CancellationError() }
+        defer { leave() }
+        return try await body()
     }
 
     private func enter() async -> Bool {
