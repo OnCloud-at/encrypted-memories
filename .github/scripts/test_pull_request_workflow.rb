@@ -149,52 +149,87 @@ class PullRequestWorkflowTests < Minitest::Test
       steps.find { |step| step["name"] == "Retain UI latency diagnostics" }]
   end
 
+  # A deliberate, narrow exception to "do not search source files in tests": this CI contract finds the darwin-only
+  # Python tests, so a new one cannot skip silently on Ubuntu. It reads decorator statements only, also when a
+  # decorator is split over lines; parentheses inside its strings would confuse the line counting.
+  def darwin_guards(root)
+    Dir[File.join(root, ".github/scripts/test_*.py"), File.join(root, "scripts/tests/test_*.py")].flat_map do |path|
+      lines = File.readlines(path)
+      script = path.delete_prefix("#{root}/")
+      guards = []
+      index = 0
+      while index < lines.length
+        if lines[index] =~ /\A\s*@.*skip/i
+          start = index
+          statement = lines[index].dup
+          depth = statement.count("(") - statement.count(")")
+          while depth > 0 && index + 1 < lines.length
+            index += 1
+            statement << lines[index]
+            depth += lines[index].count("(") - lines[index].count(")")
+          end
+          if statement =~ /darwin/i
+            target = lines[(index + 1)..].find { |candidate| candidate =~ /\A\s*(def|class) \w+/ }
+            flunk "#{script}:#{start + 1}: a darwin skip guard is followed by no class or method" if target.nil?
+            kind, symbol = target.match(/\A\s*(def|class) (\w+)/).captures
+            guards << [script, start + 1, kind, symbol]
+          end
+        end
+        index += 1
+      end
+      guards
+    end
+  end
+
   def test_darwin_only_script_tests_run_in_the_macos_job_and_the_queue_requires_them
     jobs = @workflow.fetch("jobs")
     macos = jobs.fetch("macos-verification")
     steps = macos.fetch("steps")
     probes = steps.find { |step| step["id"] == "upgrade-probes" }
     refute_nil probes, "The macOS job must run the tests that skip themselves on other systems"
-    # A darwin-only test class or method skips itself on Ubuntu, so only this macOS step can run it. Detection is a
-    # one-line heuristic: a line with "skip" and "darwin" is followed by the guarded class or method.
+    # A darwin-only test class or method skips itself on Ubuntu, so only this macOS step can run it.
     root = File.expand_path("../..", __dir__)
     commands = probes.fetch("run").lines.map(&:strip)
     assert_includes commands, "set -euo pipefail"
     assert_empty commands.grep(/\|\||;|&&/), "A probe command must not mask its exit status"
-    guards = 0
-    Dir[File.join(root, ".github/scripts/test_*.py"), File.join(root, "scripts/tests/test_*.py")].each do |path|
-      lines = File.readlines(path)
-      lines.each_with_index do |line, index|
-        next unless line =~ /skip/i && line =~ /darwin/i
-        guards += 1
-        kind, symbol = lines[(index + 1)..].find { |candidate| candidate =~ /\A\s*(def|class) \w+/ }
-          .match(/\A\s*(def|class) (\w+)/).captures
-        script = path.delete_prefix("#{root}/")
-        pattern = if kind == "class"
-          /\Apython3 #{Regexp.escape(script)}\z/ # A guarded class runs as part of its whole file.
-        else
-          /\Apython3 #{Regexp.escape(script)} .*\b#{Regexp.escape(symbol)}\b/
-        end
-        assert commands.any? { |command| command.match?(pattern) }, "#{script}: #{kind} #{symbol} is darwin-only but the macOS job does not run it"
+    guards = darwin_guards(root)
+    assert_operator guards.length, :>=, 2
+    guards.each do |script, line, kind, symbol|
+      pattern = if kind == "class"
+        /\Apython3 #{Regexp.escape(script)}\z/ # A guarded class runs as part of its whole file.
+      else
+        /\Apython3 #{Regexp.escape(script)} .*\b#{Regexp.escape(symbol)}\b/
       end
+      assert commands.any? { |command| command.match?(pattern) },
+        "#{script}:#{line}: #{kind} #{symbol} is darwin-only but the macOS job does not run it"
     end
-    assert_operator guards, :>=, 2
-    refute_includes probes.fetch("if"), "steps.shell", "The probes must not depend on the app shell build"
     checkout = steps.find { |step| step["uses"].to_s.start_with?("actions/checkout@") }
     assert_equal 0, checkout.fetch("with").fetch("fetch-depth"), "The Metal test reads pinned releases by tag"
     python = steps.find { |step| step["id"] == "python" }
-    assert_equal "3.14", python.fetch("with").fetch("python-version")
-    # A cancelled run must not report a probe result, and a failed earlier step must not hide it.
-    [python, probes].each { |step| assert_includes step.fetch("if"), "!cancelled()" }
+    # The exact conditions: a cancelled run reports nothing, and no earlier failure may hide the probe result.
+    assert_equal "${{ !cancelled() }}", python.fetch("if")
+    assert_equal "${{ !cancelled() && steps.python.outcome == 'success' }}", probes.fetch("if")
+    # The same pinned action and version as the upgrade gate that runs on the same image.
+    upgrade_python = YAML.load_file(File.join(WORKFLOWS, "testflight-internal.yml")).fetch("jobs").fetch("upgrade")
+      .fetch("steps").find { |step| step["id"] == "python" }
+    assert_match(/\Aactions\/setup-python@[0-9a-f]{40}\z/, python.fetch("uses"))
+    assert_equal upgrade_python.fetch("uses"), python.fetch("uses")
+    assert_equal upgrade_python.fetch("with").fetch("python-version"), python.fetch("with").fetch("python-version")
     assert_operator steps.index(python), :<, steps.index(probes)
     assert_equal "${{ steps.upgrade-probes.outcome }}", macos.fetch("outputs").fetch("upgrade_probes")
-    gate = jobs.fetch("macos-app-shell").fetch("steps").find { |step| step.fetch("env", {}).key?("RESULT") &&
+    gate_job = jobs.fetch("macos-app-shell")
+    gate = gate_job.fetch("steps").find { |step| step.fetch("env", {}).key?("RESULT") &&
       step.fetch("env").fetch("RESULT").include?("upgrade_probes") }
     refute_nil gate, "The macOS gate must require the probe result"
     assert_equal "${{ needs.macos-verification.outputs.upgrade_probes }}", gate.fetch("env").fetch("RESULT")
     assert_equal 'test "$RESULT" = success', gate.fetch("run")
     assert_equal "${{ always() }}", gate.fetch("if"), "The probe result must report even when the app shell check fails"
-    assert_includes jobs.fetch("macos-app-shell").fetch("needs"), "macos-verification"
+    assert_includes gate_job.fetch("needs"), "macos-verification"
+    # continue-on-error would turn a failed step into an "outcome" of success for the gate.
+    { "macOS job" => macos, "Python step" => python, "probe step" => probes, "macOS gate job" => gate_job,
+      "macOS gate step" => gate }.each do |name, item|
+      refute item.key?("continue-on-error"), "The #{name} must not set continue-on-error"
+    end
   end
 
   def test_ui_diagnostics_default_to_disabled
