@@ -236,24 +236,44 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "video-link"))
     }
 
-    func testATrashedCopyKeepsItsMeaningAsADeletionByThePerson() async throws {
+    func testATrashedFileOfAnotherPhotoIsNoDeletionOfTheVideo() async throws {
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video")]
         checker.relatedLinkIDsByMainLinkID["live-main"] = []
 
         let result = try await pipeline.resolve(video())
 
-        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
-        XCTAssertTrue(checker.relatedLookups.isEmpty, "a trashed copy keeps its meaning without the related list")
+        XCTAssertEqual(result.decision, .upload, "the person did not delete this Live Photo")
     }
 
-    func testAnUnrelatedActiveCopyNoLongerHidesATrashedCopyNextToIt() async throws {
-        // The active file elsewhere proves nothing, so the trashed copy decides as it does on its own.
+    func testATrashedCopyOfTheSameLivePhotoStaysTheDeletionByThePerson() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("own-trashed-video")]
+        checker.relatedLinkIDsByMainLinkID["live-main"] = ["own-trashed-video"]
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "own-trashed-video"))
+    }
+
+    func testUnrelatedActiveAndTrashedFilesLeaveTheVideoToUpload() async throws {
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video"), trashedRow("trashed-video")]
         checker.relatedLinkIDsByMainLinkID["live-main"] = []
 
         let result = try await pipeline.resolve(video())
 
-        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
+        XCTAssertEqual(result.decision, .upload)
+    }
+
+    func testADeletedCopyKeepsItsMeaningBecauseItsRoleCannotBeRead() async throws {
+        // A copy deleted for good has no role that the server can still name, so it keeps its earlier meaning.
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.MOV)", contentHash: videoContentHash, linkState: nil, linkID: "deleted-video")
+        ]
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.deletedRemotely, remoteLinkID: "deleted-video"))
+        XCTAssertEqual(checker.linkVisibilityCallCount, 0)
     }
 
     func testTheNameAndTheContentLookupReadTheRoleOfACopyOnce() async throws {

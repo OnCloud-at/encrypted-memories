@@ -621,11 +621,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             )
         }
         if descriptor.needsRelatedProof {
-            // A secondary of a replacing edit counts only a copy under its main photo. A plain secondary drops only
-            // active copies elsewhere: a trashed or deleted copy keeps its meaning as a deletion by the person, and
-            // so does a draft. Only a row with these bytes can settle the secondary, so only such a row is checked.
+            // A secondary of a replacing edit counts only a copy under its main photo. A plain secondary drops active
+            // and trashed copies elsewhere: a trashed copy is a deletion by the person only when it belongs to this
+            // photo. A copy deleted for good has no role left to read and keeps its meaning, and so does a draft.
+            // Only a row with these bytes can decide the secondary, so only such a row is checked.
             let countsOnlyUnderTheMainPhoto: (RemotePhotoDuplicate) -> Bool = {
-                descriptor.requiresRelatedMatch ? $0.linkState != .draft : $0.linkState == .active
+                descriptor.requiresRelatedMatch
+                    ? $0.linkState != .draft : $0.linkState == .active || $0.linkState == .trashed
             }
             let toProve = Set(
                 remoteItems.filter { countsOnlyUnderTheMainPhoto($0) && $0.contentHash == contentHash }
