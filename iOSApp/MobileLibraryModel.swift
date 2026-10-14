@@ -246,17 +246,13 @@ final class MobileLibraryModel {
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
     private(set) var photoBackup: PhotoLibraryBackupController?
-    /// The pending grid of this account and its lists (shared with macOS).
+    /// The pending grid of this account and its lists, shared with macOS. `PendingGridConnection` describes each one.
     @ObservationIgnored private let pendingGridConnection = PendingGridConnection()
-    /// Local photos on their way to Proton, merged into the whole-library grid.
     var pendingGrid: PendingGridSession? { pendingGridConnection.session }
     /// The grid's view of the library: Proton photos plus pending local photos.
     private(set) var pendingPresentation = PendingTimelinePresentation.empty
-    /// Local photos in "Zuletzt gelöscht", shown with the Proton trash.
     var pendingTrash: PendingTrashPresentation { pendingGridConnection.trash }
-    /// Photos deleted before upload, for the Backup settings list.
     var excludedPendingTiles: [PendingTile] { pendingGridConnection.excludedTiles }
-    /// Changes when pending favorite intents change, so favorite displays refresh.
     var pendingFavoriteRevision: UInt64 { pendingGridConnection.favoriteRevision }
     /// Offers to undo the last delete of pending photos.
     var undoNotice: UndoNoticeContent?
@@ -406,8 +402,7 @@ final class MobileLibraryModel {
         )
     }
 
-    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
-    /// shuts down, and the store after it.
+    /// Retires the pending grid (`PendingGridConnection.retire()`) and clears the iOS grid presentation.
     private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
         let retired = pendingGridConnection.retire()
         pendingPresentation = .empty

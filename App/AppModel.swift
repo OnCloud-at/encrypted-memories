@@ -61,15 +61,11 @@ final class AppModel {
     /// macOS folder-backup composition. This type owns folder access and lifecycle; sync semantics stay in core.
     private(set) var backupController: FolderBackupController?
     private(set) var photoBackupController: PhotoLibraryBackupController?
-    /// The pending grid of this account and its lists (shared with iOS).
+    /// The pending grid of this account and its lists, shared with iOS. `PendingGridConnection` describes each one.
     @ObservationIgnored private let pendingGridConnection = PendingGridConnection()
-    /// Local photos on their way to Proton, merged into the whole-library grid.
     var pendingGrid: PendingGridSession? { pendingGridConnection.session }
-    /// Local photos in "Zuletzt gelöscht", shown with the Proton trash.
     var pendingTrash: PendingTrashPresentation { pendingGridConnection.trash }
-    /// Photos deleted before upload, for the Backup settings list.
     var excludedPendingTiles: [PendingTile] { pendingGridConnection.excludedTiles }
-    /// Changes when pending favorite intents change, so favorite displays refresh.
     var pendingFavoriteRevision: UInt64 { pendingGridConnection.favoriteRevision }
     private(set) var albumSyncController: AlbumSyncController?
     /// Bumped after album sync creates or mutates Proton albums. Views use it only to refresh
@@ -244,7 +240,7 @@ final class AppModel {
         let activeFacade = facade
         let folderBackup = backupController
         let photoBackup = photoBackupController
-        let activePendingGrid = retirePendingGrid()
+        let activePendingGrid = pendingGridConnection.retire()
         let albumSync = albumSyncController
         auth = .signingOut
         let backendShutdown = backendTask
@@ -353,7 +349,7 @@ final class AppModel {
         let activeFacade = facade
         let folderBackup = backupController
         let photoBackup = photoBackupController
-        let activePendingGrid = retirePendingGrid()
+        let activePendingGrid = pendingGridConnection.retire()
         let albumSync = albumSyncController
         searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
@@ -617,12 +613,6 @@ final class AppModel {
             },
             albumAdds: { await albums.setPendingAlbumAdds($0) }
         )
-    }
-
-    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
-    /// shuts down, and the store after it.
-    private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
-        pendingGridConnection.retire()
     }
 
     private func apply(_ state: ProtonAuthState, prepareBackendOnSignedIn: Bool) {

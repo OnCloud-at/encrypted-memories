@@ -1,8 +1,10 @@
 import Foundation
-import PhotoLibraryBackupAdapter
+import Observation
 import PhotosCore
 import Testing
 import UploadCore
+
+@testable import PhotoLibraryBackupAdapter
 
 @Suite @MainActor struct PendingGridConnectionTests {
     @Test func aStoreWithoutASessionStaysForTheTeardown() async throws {
@@ -133,6 +135,62 @@ import UploadCore
         fixture.store.close()
     }
 
+    @Test func theHostPreparesTheSessionBeforeItStarts() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let connection = PendingGridConnection()
+        var startedBeforePrepare: Bool?
+
+        let started = connection.start(
+            store: fixture.store,
+            makeSession: { PendingGridSession(store: $0, photoBackup: fixture.controller, remote: NoRemoteEffects()) },
+            prepare: { _ in startedBeforePrepare = fixture.controller.onLibraryChange != nil }
+        )
+
+        #expect(startedBeforePrepare == false, "the presentation is attached before the first snapshot")
+        #expect(fixture.controller.onLibraryChange != nil, "the session started after the host prepared it")
+        _ = connection.retire()
+        await started?.close()
+        await fixture.controller.shutdown()
+        fixture.store.close()
+    }
+
+    @Test func screensThatReadTheConnectionAreToldAboutEveryChange() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let connection = PendingGridConnection()
+        let changes = ChangeCounter()
+        func observe() {
+            withObservationTracking {
+                _ = connection.session
+                _ = connection.trash
+                _ = connection.excludedTiles
+                _ = connection.favoriteRevision
+            } onChange: {
+                changes.count += 1
+            }
+        }
+
+        observe()
+        let started = connection.start(store: fixture.store) {
+            PendingGridSession(store: $0, photoBackup: fixture.controller, remote: NoRemoteEffects())
+        }
+        let session = try #require(started)
+        #expect(changes.count == 1, "showing the pending grid reaches the screen")
+
+        observe()
+        let uid = PendingSourceKey(kind: .photoLibraryAsset, identifier: "local-favorite").localUID
+        #expect(await session.setFavorite([uid], favorite: true))
+        #expect(await eventually { changes.count == 2 }, "a new favorite intent reaches the screen")
+
+        observe()
+        _ = connection.retire()
+        #expect(changes.count == 3, "retiring the pending grid reaches the screen")
+        await session.close()
+        await fixture.controller.shutdown()
+        fixture.store.close()
+    }
+
     private func eventually(_ condition: () async -> Bool) async -> Bool {
         for _ in 0..<200 {
             if await condition() { return true }
@@ -140,6 +198,10 @@ import UploadCore
         }
         return await condition()
     }
+}
+
+private final class ChangeCounter: @unchecked Sendable {
+    var count = 0
 }
 
 private actor HandlerBox {
