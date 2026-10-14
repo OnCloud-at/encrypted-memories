@@ -1,9 +1,9 @@
 import AppleSecurityCore
 import Foundation
-import PhotosCore
 import Security
 import Testing
 
+@testable import PhotosCore
 @testable import ProtonAuth
 
 /// Session secrets must never have a plaintext developer bypass. Tokens and the key password are always
@@ -186,6 +186,43 @@ struct SessionHardeningTests {
         #expect(probe.usedMainThread == false)
         #expect(!FileManager.default.fileExists(atPath: root.path))
         #expect(!BackupLocalDataPurge.isPurgePending(defaults: defaults))
+    }
+
+    /// Drives the startup entry that both apps call, so an unhooked purge fails here.
+    @Test func productionStartupCleanupRemovesTheUnusedNetworkStores() async throws {
+        let suite = "auth-startup-network-wiring-test-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("auth-startup-network-wiring-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let bundleIdentifier = "at.oncloud.encryptedmemories"
+        let library = root.appendingPathComponent("Containers/\(bundleIdentifier)/Data/Library", isDirectory: true)
+        let caches = library.appendingPathComponent("Caches", isDirectory: true)
+        let urlCache = caches.appendingPathComponent(bundleIdentifier, isDirectory: true)
+        let compileCache = urlCache.appendingPathComponent("com.apple.e5rt.e5bundlecache/entry")
+        let cookieFile = library.appendingPathComponent("Cookies/Cookies.binarycookies")
+        for file in [urlCache.appendingPathComponent("Cache.db"), compileCache, cookieFile] {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data([1]).write(to: file)
+        }
+
+        let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
+            claim: nil,
+            defaults: defaults,
+            plaintextPurgeSucceeded: true,
+            networkStores: UnusedNetworkStorePurge.Location(
+                libraryDirectory: library, cachesDirectory: caches, bundleIdentifier: bundleIdentifier)
+        )
+
+        #expect(succeeded)
+        #expect(!FileManager.default.fileExists(atPath: urlCache.appendingPathComponent("Cache.db").path))
+        #expect(!FileManager.default.fileExists(atPath: cookieFile.path))
+        #expect(FileManager.default.fileExists(atPath: compileCache.path))
+        #expect(defaults.bool(forKey: UnusedNetworkStorePurge.completedKey))
     }
 
     @Test @MainActor func startupCleanupRemovesUnusedNetworkStoresFirstAndOffMain() async throws {

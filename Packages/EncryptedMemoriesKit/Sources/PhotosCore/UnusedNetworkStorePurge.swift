@@ -13,6 +13,28 @@ public enum UnusedNetworkStorePurge {
     static let urlCacheEntryNames = ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData"]
     static let cookieFileName = "Cookies.binarycookies"
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "NetworkStorePurge")
+    #if os(macOS)
+        static let requiresSandboxContainer = true
+    #else
+        static let requiresSandboxContainer = false
+    #endif
+
+    /// The app's own Library, Caches directory and bundle identifier.
+    public struct Location: Sendable, Equatable {
+        let libraryDirectory: URL
+        let cachesDirectory: URL
+        let bundleIdentifier: String
+
+        /// Resolved from the system search paths; nil when the system reports none.
+        public static var current: Location? {
+            let fm = FileManager.default
+            guard let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first,
+                let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first,
+                let bundleIdentifier = Bundle.main.bundleIdentifier
+            else { return nil }
+            return Location(libraryDirectory: library, cachesDirectory: caches, bundleIdentifier: bundleIdentifier)
+        }
+    }
 
     public struct Result: Sendable, Equatable {
         public let removed: [URL]
@@ -24,17 +46,13 @@ public enum UnusedNetworkStorePurge {
     /// Runs the purge unless an earlier launch completed it. Returns nil when it did not run.
     /// Any failure leaves the completion flag unset, so the next cold launch tries again.
     @discardableResult
-    public static func purgeOnce(defaults: UserDefaults = .standard) -> Result? {
-        let fm = FileManager.default
-        guard let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first,
-            let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first,
-            let bundleIdentifier = Bundle.main.bundleIdentifier
-        else { return nil }
+    public static func purgeOnce(defaults: UserDefaults = .standard, location: Location? = .current) -> Result? {
+        guard let location else { return nil }
         return purgeOnce(
             defaults: defaults,
-            libraryDirectory: library,
-            cachesDirectory: caches,
-            bundleIdentifier: bundleIdentifier,
+            libraryDirectory: location.libraryDirectory,
+            cachesDirectory: location.cachesDirectory,
+            bundleIdentifier: location.bundleIdentifier,
             removeItem: { try TransientPlaintextPurge.removeWithoutFollowingLinks(at: $0, boundary: $0) }
         )
     }
@@ -44,11 +62,14 @@ public enum UnusedNetworkStorePurge {
         libraryDirectory: URL,
         cachesDirectory: URL,
         bundleIdentifier: String,
+        requiresSandboxContainer: Bool = Self.requiresSandboxContainer,
         removeItem: (URL) throws -> Void
     ) -> Result? {
         guard !defaults.bool(forKey: completedKey) else { return nil }
         // Both containers must sit in the app's own Library.
-        guard isAppContainerLibrary(libraryDirectory),
+        guard
+            !requiresSandboxContainer
+                || isSandboxContainerLibrary(libraryDirectory, bundleIdentifier: bundleIdentifier),
             cachesDirectory.standardizedFileURL.deletingLastPathComponent().path
                 == libraryDirectory.standardizedFileURL.path
         else { return nil }
@@ -89,18 +110,16 @@ public enum UnusedNetworkStorePurge {
         return Result(removed: removed, failed: failed)
     }
 
-    /// iOS apps always run in their own container. A macOS app outside its sandbox container
-    /// (`Containers/<id>/Data/Library`) shares `Library/Cookies` with other apps, so the purge must not run there.
-    static func isAppContainerLibrary(_ library: URL) -> Bool {
-        #if os(macOS)
-            let library = library.standardizedFileURL
-            let data = library.deletingLastPathComponent()
-            return library.lastPathComponent == "Library"
-                && data.lastPathComponent == "Data"
-                && data.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "Containers"
-        #else
-            return true
-        #endif
+    /// iOS apps always run in their own container. A macOS app outside its own sandbox container
+    /// (`Containers/<bundle id>/Data/Library`) shares `Library/Cookies` with other apps, so the purge must not run there.
+    static func isSandboxContainerLibrary(_ library: URL, bundleIdentifier: String) -> Bool {
+        let library = library.standardizedFileURL
+        let data = library.deletingLastPathComponent()
+        let container = data.deletingLastPathComponent()
+        return library.lastPathComponent == "Library"
+            && data.lastPathComponent == "Data"
+            && container.lastPathComponent == bundleIdentifier
+            && container.deletingLastPathComponent().lastPathComponent == "Containers"
     }
 
     /// The type of the item itself, without following a final symbolic link; nil when nothing exists.

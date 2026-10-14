@@ -55,6 +55,7 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         bundleIdentifier: String? = nil,
         library: URL? = nil,
         caches: URL? = nil,
+        requiresSandboxContainer: Bool = UnusedNetworkStorePurge.requiresSandboxContainer,
         removeItem: (URL) throws -> Void = {
             try TransientPlaintextPurge.removeWithoutFollowingLinks(at: $0, boundary: $0)
         }
@@ -65,6 +66,7 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
             libraryDirectory: library,
             cachesDirectory: caches ?? library.appendingPathComponent("Caches", isDirectory: true),
             bundleIdentifier: bundleIdentifier ?? self.bundleIdentifier,
+            requiresSandboxContainer: requiresSandboxContainer,
             removeItem: removeItem
         )
     }
@@ -209,11 +211,12 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         XCTAssertTrue(exists(outsideFolderFile))
     }
 
+    /// Uses the iOS rule (no sandbox layout check), so only the containment check can refuse the identifier.
     func testBundleIdentifierCannotLeaveTheCachesDirectory() throws {
         let escaped = library.appendingPathComponent("escape/Cache.db")
         try write(escaped)
 
-        let result = try XCTUnwrap(purge(bundleIdentifier: "../escape"))
+        let result = try XCTUnwrap(purge(bundleIdentifier: "../escape", requiresSandboxContainer: false))
 
         XCTAssertTrue(exists(escaped))
         XCTAssertFalse(result.succeeded)
@@ -236,6 +239,20 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         XCTAssertEqual(result.removed, [])
         XCTAssertTrue(exists(outsideCache))
         XCTAssertTrue(exists(outsideCookies))
+    }
+
+    func testDoesNothingInsideAnotherAppsSandboxContainer() throws {
+        let otherLibrary = root.appendingPathComponent("Containers/other.id/Data/Library", isDirectory: true)
+        let otherCache = otherLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+        let otherCookies = otherLibrary.appendingPathComponent("Cookies/Cookies.binarycookies")
+        try write(otherCache)
+        try write(otherCookies)
+
+        XCTAssertNil(purge(library: otherLibrary, requiresSandboxContainer: true))
+
+        XCTAssertTrue(exists(otherCache))
+        XCTAssertTrue(exists(otherCookies))
+        XCTAssertFalse(isDone)
     }
 
     #if os(macOS)

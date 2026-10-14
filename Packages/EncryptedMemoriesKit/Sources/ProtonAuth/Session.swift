@@ -145,6 +145,20 @@ public enum ProtonAuthLocalDataPurge {
         defaults: UserDefaults = .standard,
         plaintextPurgeSucceeded: Bool? = nil
     ) async -> Bool {
+        await performStartupOffMain(
+            claim: claim,
+            defaults: defaults,
+            plaintextPurgeSucceeded: plaintextPurgeSucceeded,
+            networkStores: UnusedNetworkStorePurge.Location.current
+        )
+    }
+
+    static func performStartupOffMain(
+        claim: BackupLocalDataPurge.Claim?,
+        defaults: UserDefaults,
+        plaintextPurgeSucceeded: Bool?,
+        networkStores: UnusedNetworkStorePurge.Location?
+    ) async -> Bool {
         #if os(iOS)
             if claim != nil {
                 // Foundation's default network stores are app-sandbox local on iOS, but live
@@ -159,7 +173,7 @@ public enum ProtonAuthLocalDataPurge {
             claim: claim,
             defaults: sendableDefaults,
             unusedNetworkStorePurge: {
-                UnusedNetworkStorePurge.purgeOnce(defaults: sendableDefaults.value)
+                UnusedNetworkStorePurge.purgeOnce(defaults: sendableDefaults.value, location: networkStores)
             },
             plaintextPurge: {
                 if let plaintextPurgeSucceeded {
@@ -183,7 +197,8 @@ public enum ProtonAuthLocalDataPurge {
         }.value
     }
 
-    /// A failed unused network store purge never blocks sign-in; it retries at the next cold launch.
+    /// The unused network store purge never fails or aborts sign-in, and it removes files only once.
+    /// That cold launch awaits its removal before an account opens; a failed removal retries at the next one.
     static func performStartupOffMain(
         claim: BackupLocalDataPurge.Claim?,
         defaults: SendableUserDefaults,
