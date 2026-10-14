@@ -632,6 +632,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let toProve = Set(
                 remoteItems.filter { countsOnlyUnderTheMainPhoto($0) && $0.contentHash == contentHash }
                     .compactMap(\.linkID))
+            // A link that a row also lists as active needs a stated role like any active copy.
+            let activeToProve = Set(
+                remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }.compactMap(\.linkID))
+            let trashedToProve = toProve.subtracting(activeToProve)
             var relatedLinkIDs: Set<String> = []
             if !toProve.isEmpty, let mainLinkID = descriptor.mainRemoteLinkID {
                 if descriptor.requiresRelatedMatch {
@@ -644,26 +648,29 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     }
                 } else {
                     // The main photo can be in the trash, and the server refuses its list then. The role of each copy
-                    // answers in that case too. Every copy with these bytes needs an answer that states its role: a
-                    // failed read, a copy the answer leaves out, or an answer without the photo state fails the check,
-                    // so an unproven own copy never uploads a second time.
+                    // answers in that case too. Every active copy with these bytes needs an answer that states its
+                    // role: a failed read, a copy the answer leaves out, or an answer without the photo state fails
+                    // the check, so an unproven own copy never uploads a second time. A trashed copy without a stated
+                    // role keeps its earlier meaning as a deletion by the person.
                     let unasked = toProve.subtracting(relatedReads.askedLinks)
                     if !unasked.isEmpty {
                         let read = try await checker.linkVisibility(of: unasked.sorted())
                         relatedReads.askedLinks.formUnion(unasked)
                         relatedReads.visibility.merge(read) { _, new in new }
                     }
-                    guard toProve.allSatisfy({ relatedReads.visibility[$0]?.hasExplicitPhotoState == true }) else {
+                    let stated = toProve.filter { relatedReads.visibility[$0]?.hasExplicitPhotoState == true }
+                    guard toProve.subtracting(stated).isSubset(of: trashedToProve) else {
                         throw UploadError.backend("The role of a copy with these bytes is unavailable")
                     }
-                    relatedLinkIDs = toProve.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
+                    relatedLinkIDs = stated.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
+                        .union(trashedToProve.subtracting(stated))
                 }
             }
             return (
                 remoteItems.filter { item in
                     guard let linkID = item.linkID else {
-                        // An active copy without a link is an inconsistent answer. It stays, so a plain secondary
-                        // fails closed as before.
+                        // An active or trashed copy without a link cannot be proven either way. It stays, so a plain
+                        // secondary keeps the earlier answer: an inconsistent answer or a deletion by the person.
                         return !descriptor.requiresRelatedMatch || !countsOnlyUnderTheMainPhoto(item)
                     }
                     return !countsOnlyUnderTheMainPhoto(item) || relatedLinkIDs.contains(linkID)

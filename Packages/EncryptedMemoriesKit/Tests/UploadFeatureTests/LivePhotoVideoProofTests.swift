@@ -254,6 +254,26 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "own-trashed-video"))
     }
 
+    func testATrashedFileWithoutAStatedRoleKeepsItsEarlierMeaning() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video")]
+        checker.linkVisibilityByID["trashed-video"] = RemoteLinkVisibility(
+            isActive: false, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
+    }
+
+    func testATrashedFileWithoutAStatedRoleDoesNotHideTheOwnActiveCopy() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("own-video"), trashedRow("trashed-video")]
+        checker.relatedLinkIDsByMainLinkID["live-main"] = ["own-video"]
+        checker.linkVisibilityByID["trashed-video"] = .some(nil)
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "own-video"))
+    }
+
     func testUnrelatedActiveAndTrashedFilesLeaveTheVideoToUpload() async throws {
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video"), trashedRow("trashed-video")]
         checker.relatedLinkIDsByMainLinkID["live-main"] = []

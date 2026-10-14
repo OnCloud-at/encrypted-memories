@@ -3628,14 +3628,20 @@ final class BackupSyncRunnerTests: XCTestCase {
     }
 
     func testATrashedCopyOfTheSameLivePhotoStaysTheDeletionByThePerson() async throws {
+        // The Live Photo's main photo is already in Proton; the person trashed its video there on its own.
         let entry = seedEntry("live.heic")
         resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(live.heic)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(live.heic)", contentHash: expectedContentHash(path: "/backup/live.heic"),
+                linkState: .active, linkID: "existing-main")
+        ]
         checker.remoteItemsByNameHash["nh(live.mov)"] = [trashedPairedVideo()]
-        checker.relatedLinkIDsByMainLinkID[testUID("live.heic").nodeID] = ["trashed-paired"]
+        checker.relatedLinkIDsByMainLinkID["existing-main"] = ["trashed-paired"]
 
         let progress = await makeRunner().runUntilDrained()
 
-        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"])
+        XCTAssertTrue(uploader.requests.isEmpty, "nothing uploads")
         XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
         XCTAssertEqual(progress.backedUp, 0)
         XCTAssertNil(
