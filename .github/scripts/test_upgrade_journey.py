@@ -238,7 +238,7 @@ with SigningIdentity(root) as signer:
 
     def test_standalone_ui_runner_does_not_inherit_app_hardening(self):
         repo = Path(__file__).resolve().parents[2]
-        with tempfile.TemporaryDirectory() as root:
+        with _temporary_directory() as root:
             root = Path(root)
             source = root / 'scratch/source'
             (source / 'UpgradeUITests').mkdir(parents=True)
@@ -1110,7 +1110,7 @@ else:
             events.append('ui-' + phase)
             return runs[-1], io.StringIO()
 
-        with tempfile.TemporaryDirectory() as directory:
+        with _temporary_directory() as directory:
             root = Path(directory)
             source = root / 'source'
             (source / 'UpgradeUITests').mkdir(parents=True)
