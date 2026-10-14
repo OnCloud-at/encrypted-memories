@@ -10,6 +10,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 {
     enum State: String, Sendable {
         case active
+        case draft
         case trashed
         case deleted
     }
@@ -39,13 +40,14 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         var tags: Set<Int> = []
         /// The server time of the move to the trash, in seconds, where a person or a merge trashed the link.
         var trashTime: Int64?
+        var clientUID: String?
 
         var uid: PhotoUID { PhotoUID(volumeID: "vol", nodeID: linkID) }
         var duplicate: RemotePhotoDuplicate {
             RemotePhotoDuplicate(
                 nameHash: nameHash, contentHash: contentHash,
-                linkState: state == .active ? .active : state == .trashed ? .trashed : nil,
-                linkID: linkID)
+                linkState: state == .active ? .active : state == .draft ? .draft : state == .trashed ? .trashed : nil,
+                linkID: linkID, clientUID: clientUID)
         }
     }
 
@@ -63,11 +65,21 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var deletedAssets: [String: Set<String>] = [:]
     private var history: [Step] = []
     private var nextID = 1
+    private var uploadRequests = 0
+    private var contentLookupError: Error?
+    private var contentLookupRows: [RemotePhotoDuplicate]?
+    private var contentQueries = 0
+    private var visibilityErrors: [String: any Error] = [:]
+    private var visibilityOverrides: [String: RemoteLinkVisibility] = [:]
+    private var visibilityAfterContentLookup: [String: RemoteLinkVisibility] = [:]
+    private var cancelContentCaller = false
+    private var includeInactiveContent = false
     private var failTrash = false
     enum LineageRead: Sendable, Equatable { case identity, successors, ancestry, external }
     private var incompleteLineageRead: LineageRead?
     private var failLineageRead = false
     private var failVisibilityRead = false
+    private var omittedVisibilityLinks: Set<String> = []
     private var failCompoundRead = false
     private var cancelCompoundRead = false
     private var failRelatedLookupForTrashedMain = false
@@ -88,6 +100,23 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private let ownAlbumIDs: Set<String> = ["own-album"]
 
     var links: [Link] { lock.withLock { orderedLinks() } }
+    var uploadRequestCount: Int { lock.withLock { uploadRequests } }
+
+    func setContentLookupError(_ error: Error?) { lock.withLock { contentLookupError = error } }
+    func setContentLookupRows(_ rows: [RemotePhotoDuplicate]) { lock.withLock { contentLookupRows = rows } }
+    func setVisibility(_ visibility: RemoteLinkVisibility, for linkID: String) {
+        lock.withLock { visibilityOverrides[linkID] = visibility }
+    }
+    func setVisibilityAfterContentLookup(_ visibility: RemoteLinkVisibility, for linkID: String) {
+        lock.withLock { visibilityAfterContentLookup[linkID] = visibility }
+    }
+    func cancelCallerAtContentLookup(_ enabled: Bool) { lock.withLock { cancelContentCaller = enabled } }
+    var contentLookupCount: Int { lock.withLock { contentQueries } }
+    func setVisibilityError(_ error: (any Error)?, whenAskingFor linkID: String) {
+        lock.withLock { visibilityErrors[linkID] = error }
+    }
+    func omitVisibility(of linkIDs: Set<String>) { lock.withLock { omittedVisibilityLinks = linkIDs } }
+    func returnInactiveContentFromStaleIndex() { lock.withLock { includeInactiveContent = true } }
     var personDeletedAssets: [String: Set<String>] { lock.withLock { deletedAssets } }
     var steps: [Step] { lock.withLock { history } }
     var remoteProofLookups: [[UploadBackupExternalIdentity]] { lock.withLock { proofLookups } }
@@ -367,6 +396,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         _ request: PhotoUploadRequest,
         onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
+        lock.withLock { uploadRequests += 1 }
         let digest = try UploadContentSHA1.digest(ofFileAt: request.fileURL)
         guard request.expectedSHA1 == digest else {
             throw UploadError.backend("The scenario upload bytes do not match the pipeline identity")
@@ -454,10 +484,25 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
+        if lock.withLock({ cancelContentCaller }) { withUnsafeCurrentTask { $0?.cancel() } }
+        let rows = try lock.withLock { () throws -> [RemotePhotoDuplicate]? in
+            contentQueries += 1
+            if let contentLookupError { throw contentLookupError }
+            visibilityOverrides.merge(visibilityAfterContentLookup) { _, new in new }
+            return contentLookupRows.map { Array($0.prefix(limit)) }
+        }
+        if let rows { return rows }
+        return try await findDuplicate(contentHash: contentHash).map { [$0] } ?? []
+    }
+
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
-        lock.withLock {
-            // The content index proves only active content. Name lookup still includes trash.
-            orderedLinks().first { $0.state == .active && $0.contentHash == contentHash }?.duplicate
+        try lock.withLock {
+            if let contentLookupError { throw contentLookupError }
+            // Normal content lookup proves active content; fault tests can return stale rows.
+            return orderedLinks().first {
+                ($0.state == .active || includeInactiveContent) && $0.contentHash == contentHash
+            }?.duplicate
         }
     }
 
@@ -488,6 +533,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         guard !linkIDs.isEmpty else { return [:] }
         return try lock.withLock {
             counted.visibility += 1
+            for linkID in linkIDs {
+                if let error = visibilityErrors[linkID] { throw error }
+            }
             if failVisibilityRead { throw UploadError.backend("The scenario visibility read failed") }
             if armedVisibilityFailures > 0 {
                 armedVisibilityFailures -= 1
@@ -495,7 +543,13 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             }
             var result: [String: RemoteLinkVisibility] = [:]
             for linkID in linkIDs {
-                guard let link = table[linkID], link.state != .deleted else { continue }
+                if let override = visibilityOverrides[linkID] {
+                    result[linkID] = override
+                    continue
+                }
+                guard !omittedVisibilityLinks.contains(linkID), let link = table[linkID], link.state != .deleted else {
+                    continue
+                }
                 result[linkID] = RemoteLinkVisibility(
                     isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID,
                     trashTime: link.state == .trashed || staleTrashTime ? link.trashTime : nil)
@@ -707,6 +761,18 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         lock.withLock {
             let uid = insertLink(digest: digest, main: main, captureTime: captureTime)
             record("other device upload \(uid.nodeID)")
+            return uid
+        }
+    }
+
+    func seedDraft(name: String, digest: Data, clientUID: String?) -> PhotoUID {
+        lock.withLock {
+            let uid = insertLink(digest: digest, main: nil, captureTime: .distantPast)
+            table[uid.nodeID] = Link(
+                linkID: uid.nodeID, nameHash: "nh(\(name))", contentHash: Self.contentHash(digest), state: .draft,
+                mainLinkID: nil, captureTime: .distantPast, assetID: "draft", generation: 0, isOriginal: false,
+                clientUID: clientUID)
+            record("foreign draft \(uid.nodeID)")
             return uid
         }
     }

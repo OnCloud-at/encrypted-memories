@@ -314,23 +314,54 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // and an active copy under another name can prove the photo live.
         var decision = nameDecision
         var provesLive = nameCandidates.provesLive
+        let blockedByDraft: Bool
+        if case .skip(.draftExists, _) = nameDecision {
+            blockedByDraft = true
+        } else {
+            blockedByDraft = false
+        }
         do {
-            if nameDecision.uploadsBytes {
-                let limit = isRoot && replacement.isEmpty ? Self.rootMatchBound : 1
-                let found = try await checker.findDuplicates(contentHash: contentHash, limit: limit)
-                for start in stride(from: 0, to: found.count, by: Self.rootMatchBatchSize) {
-                    let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
-                    let contentCandidates = try await candidates(
-                        batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
-                    provesLive = provesLive || contentCandidates.provesLive
-                    if let remoteContent = contentCandidates.items.first {
-                        decision = decisionForRemoteContent(
-                            remoteContent,
-                            replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
-                        break
+            // A name draft can hide an active copy under another name. Only active content may
+            // settle that block; a miss or an inactive copy leaves the draft protected.
+            if nameDecision.uploadsBytes || (blockedByDraft && isRoot && !isBurstMember && !requiresRelatedMatch) {
+                do {
+                    let limit = isRoot && replacement.isEmpty ? Self.rootMatchBound : 1
+                    let found = try await checker.findDuplicates(contentHash: contentHash, limit: limit)
+                    for start in stride(from: 0, to: found.count, by: Self.rootMatchBatchSize) {
+                        let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
+                        let contentCandidates = try await candidates(
+                            batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement,
+                            requiresActiveMain: blockedByDraft)
+                        provesLive = provesLive || contentCandidates.provesLive
+                        let excluded =
+                            blockedByDraft
+                            ? try await relatedLinks(
+                                among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true)
+                            : []
+                        if let remoteContent = contentCandidates.items.first(where: {
+                            guard blockedByDraft else { return true }
+                            guard $0.linkState == .active, $0.contentHash == contentHash,
+                                let linkID = $0.linkID, !linkID.isEmpty
+                            else { return false }
+                            return !excluded.contains(linkID)
+                        }) {
+                            decision = decisionForRemoteContent(
+                                remoteContent,
+                                replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
+                            break
+                        }
                     }
+                    try Task.checkCancellation()
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard blockedByDraft else { throw error }
+                    if (error as? UploadError) == .cancelled || (error as? URLError)?.code == .cancelled {
+                        throw error
+                    }
+                    try Task.checkCancellation()
+                    decision = nameDecision
                 }
-                try Task.checkCancellation()
             }
             if decision.uploadsBytes, !replacement.isEmpty, !provesLive,
                 descriptor.source.kind == .photoLibraryAsset, descriptor.source.resource == .primary,
@@ -574,7 +605,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         _ remoteItems: [RemotePhotoDuplicate],
         contentHash: String,
         descriptor: UploadResourceDescriptor,
-        replacement: UploadReplacementScope
+        replacement: UploadReplacementScope,
+        requiresActiveMain: Bool = false
     ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
         if descriptor.source.resource.isBurstMember {
             return (
@@ -596,7 +628,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             guard descriptor.source.resource == .primary, descriptor.mainRemoteLinkID == nil else {
                 return (remoteItems, false)
             }
-            return (try await rootEligible(remoteItems, contentHash: contentHash), false)
+            return (
+                try await rootEligible(remoteItems, contentHash: contentHash, requiresActiveMain: requiresActiveMain),
+                false
+            )
         }
         // Only the state of a photo shows that it is still in the library: its current upload is active, the
         // person restored an earlier version, or an active main photo holds these bytes.
@@ -611,7 +646,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             visibility = try await checker.linkVisibility(of: asked.sorted())
         }
         func isLiveMain(_ linkID: String) -> Bool {
-            visibility[linkID]?.isActiveMain ?? false
+            guard !requiresActiveMain || visibility[linkID]?.hasExplicitPhotoState == true else { return false }
+            return visibility[linkID]?.isActiveMain ?? false
         }
         let ownMatches = Set(matches.filter(isLiveMain)).filter {
             !replacement.knownForeignLinks.contains($0)
@@ -682,12 +718,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// under an edited photo, or a paired video. Those bytes do not make a photo of their own, so the primary
     /// uploads as its own photo. With a replacement, `candidates` already counts only live main photos.
     private func rootEligible(
-        _ remoteItems: [RemotePhotoDuplicate], contentHash: String
+        _ remoteItems: [RemotePhotoDuplicate], contentHash: String, requiresActiveMain: Bool
     ) async throws -> [RemotePhotoDuplicate] {
         let matches = Set(
             remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }.compactMap(\.linkID))
         guard !matches.isEmpty else { return remoteItems }
-        let related = try await relatedLinks(among: matches)
+        let related = try await relatedLinks(among: matches, requiresActiveMain: requiresActiveMain)
         guard !related.isEmpty else { return remoteItems }
         return remoteItems.filter { item in item.linkID.map { !related.contains($0) } ?? true }
     }
@@ -732,8 +768,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// The links that the server names as a related file of a main photo. The name and duplicate rows carry no
     /// role, so the visibility read proves it. `prime` normally read it already; only a link that it did not
     /// cover costs one read here. A link that the server no longer names, or a failed read, proves nothing: the
-    /// rows stay as listed, as before this check.
-    private func relatedLinks(among linkIDs: Set<String>) async throws -> Set<String> {
+    /// rows stay as listed, as before this check. A blocked name instead requires positive active-main proof:
+    /// strict callers also exclude unknown and inactive links.
+    private func relatedLinks(
+        among linkIDs: Set<String>, requiresActiveMain: Bool = false
+    ) async throws -> Set<String> {
         var known = rootVisibility
         let unasked = linkIDs.subtracting(rootVisibilityAsked)
         if !unasked.isEmpty {
@@ -744,6 +783,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                guard !requiresActiveMain else { throw error }
                 try Task.checkCancellation()
             }
             // A view invalidated while this read ran stays invalidated; the answer still serves this resolve.
@@ -753,7 +793,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             known = rootVisibility.merging(read) { _, new in new }
         }
-        return linkIDs.filter { known[$0]?.mainPhotoLinkID != nil }
+        return linkIDs.filter {
+            if requiresActiveMain {
+                return known[$0].map { $0.hasExplicitPhotoState && $0.isActiveMain } != true
+            }
+            return known[$0]?.mainPhotoLinkID != nil
+        }
     }
 
     /// An earlier version that the person restored is the photo again: it leaves the retired list.

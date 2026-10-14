@@ -160,15 +160,20 @@ public protocol TimelineInventoryConvergenceError: Error, Sendable {}
 /// trash, so only the main photo's state tells whether the file still belongs to a photo in the library.
 public struct RemoteLinkVisibility: Equatable, Sendable {
     public var isActive: Bool
-    /// Nil for a main photo.
+    /// Nil for a main photo or unavailable role data.
     public var mainPhotoLinkID: String?
+    /// Whether the answer explicitly includes the state and revision Photo role data.
+    public var hasExplicitPhotoState: Bool
     /// The server time of the move to the trash, in seconds. Nil for a link that is not in the trash.
     public var trashTime: Int64?
 
-    public init(isActive: Bool, mainPhotoLinkID: String?, trashTime: Int64? = nil) {
+    public init(
+        isActive: Bool, mainPhotoLinkID: String?, trashTime: Int64? = nil, hasExplicitPhotoState: Bool = true
+    ) {
         self.isActive = isActive
         self.mainPhotoLinkID = mainPhotoLinkID
         self.trashTime = trashTime
+        self.hasExplicitPhotoState = hasExplicitPhotoState
     }
 }
 

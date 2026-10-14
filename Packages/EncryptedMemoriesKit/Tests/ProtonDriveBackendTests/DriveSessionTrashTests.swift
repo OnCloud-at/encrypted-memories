@@ -109,6 +109,31 @@ private func makeSession() -> DriveSession {
     )
 }
 
+private struct DecodedVisibilityChecker: UploadDuplicateChecking {
+    let session: DriveSession
+    let blocked: Bool
+
+    func hashKeyEpoch() async throws -> String { "epoch" }
+    func nameHash(forCorrectedName name: String) async throws -> String { "name" }
+    func contentHash(forSHA1Hex sha1Hex: String) async throws -> String { "content" }
+    func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
+        blocked
+            ? [
+                .init(
+                    nameHash: "name", contentHash: "other", linkState: .draft,
+                    linkID: "draft", clientUID: "other-uploader")
+            ]
+            : []
+    }
+    func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
+        .init(nameHash: "other", contentHash: contentHash, linkState: .active, linkID: "photo")
+    }
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> { [] }
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        try await session.fetchLinkVisibility(shareID: "share1", linkIDs: linkIDs)
+    }
+}
+
 private func linkIDs(inBodyOf request: StubURLProtocol.Recorded) throws -> [String] {
     let body = try #require(request.body)
     let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
@@ -377,6 +402,59 @@ extension DriveSessionStubSuite {
             #expect(links["trashed-edit"] == .init(isActive: false, mainPhotoLinkID: nil, trashTime: 1_790_000_000))
             #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit"))
             #expect(links["deleted"] == nil, "a link that the server no longer knows is absent")
+        }
+
+        @Test(arguments: [
+            #"{"LinkID":"photo","State":1}"#,
+            #"{"LinkID":"photo","State":1,"FileProperties":{}}"#,
+            #"{"LinkID":"photo","State":1,"FileProperties":{"ActiveRevision":{}}}"#,
+            #"{"LinkID":"photo","FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}}"#,
+        ])
+        func blockedContentRejectsIncompleteDecodedPhotoState(link: String) async throws {
+            try await assertDecodedContentDecision(link: link, acceptsBlocked: false)
+        }
+
+        @Test func blockedContentAcceptsCompleteDecodedMainPhoto() async throws {
+            try await assertDecodedContentDecision(
+                link:
+                    #"{"LinkID":"photo","State":1,"FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}}"#,
+                acceptsBlocked: true)
+        }
+
+        private func assertDecodedContentDecision(link: String, acceptsBlocked: Bool) async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata", json: "{\"Code\":1000,\"Links\":[\(link)]}")
+            let session = makeSession()
+            let visibility = try await session.fetchLinkVisibility(shareID: "share1", linkIDs: ["photo"])
+            #expect(visibility["photo"]?.isActive == true, "legacy missing-state default remains active")
+            #expect(visibility["photo"]?.mainPhotoLinkID == nil)
+            #expect(
+                TimelineRemoteVisibilityRequirement.awaited(["photo"], links: visibility, mainPhotos: [:]) == ["photo"])
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let file = directory.appendingPathComponent("current.heic")
+            let descriptor = UploadResourceDescriptor(
+                source: .file(file), fileURL: file, filename: "current.heic", fileSize: 20,
+                modificationDate: Date(timeIntervalSince1970: 1_720_000_000),
+                precomputedSHA1Digest: Data(repeating: 1, count: 20))
+            for blocked in [true, false] {
+                let store = try #require(
+                    UploadIdentityManifestStore(url: directory.appendingPathComponent("manifest-\(blocked).sqlite")))
+                let pipeline = UploadDedupePipeline(
+                    store: store, checker: DecodedVisibilityChecker(session: session, blocked: blocked),
+                    currentClientUID: "this-uploader")
+                let result = try await pipeline.resolve(descriptor)
+                let accepts = !blocked || acceptsBlocked
+                #expect(
+                    result.decision
+                        == (accepts
+                            ? .skip(.activeDuplicate, remoteLinkID: "photo")
+                            : .skip(.draftExists, remoteLinkID: "draft")))
+                #expect(store.record(for: descriptor.source)?.remoteLinkID == (accepts ? "photo" : nil))
+                #expect(store.record(for: descriptor.source)?.outcome == (accepts ? "duplicateActive" : nil))
+            }
         }
 
         @Test func linkVisibilityRejectsAResponseWithoutLinks() async throws {

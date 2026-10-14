@@ -461,7 +461,8 @@ extension DriveSession {
                 result[id] = .init(
                     isActive: link.state == nil || link.state == 1,
                     mainPhotoLinkID: link.fileProperties?.activeRevision?.photo?.mainPhotoLinkID,
-                    trashTime: link.trashed)
+                    trashTime: link.trashed,
+                    hasExplicitPhotoState: link.state != nil && link.fileProperties?.activeRevision?.photo != nil)
             }
         }
         return result
