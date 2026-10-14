@@ -73,7 +73,7 @@ enum UploadMediaProcessor {
 
     private static func jpeg(downscaling image: CGImage, maxPixel: Int, maxBytes: Int) -> Data? {
         let scaled = downscale(image, maxPixel: maxPixel) ?? image
-        let encodedImage = opaqueCopyIfNeeded(scaled) ?? scaled
+        let encodedImage = sdrCopyIfNeeded(scaled) ?? scaled
         for quality in compressionQualities {
             guard let data = JPEGEncoding.data(from: encodedImage, quality: quality) else { return nil }
             if data.count <= maxBytes {
@@ -91,14 +91,10 @@ enum UploadMediaProcessor {
         let scale = Double(maxPixel) / Double(longest)
         let nw = Int((Double(w) * scale).rounded())
         let nh = Int((Double(h) * scale).rounded())
-        let colorSpace =
-            image.colorSpace?.model == .rgb
-            ? image.colorSpace ?? CGColorSpaceCreateDeviceRGB()
-            : CGColorSpaceCreateDeviceRGB()
         guard
             let ctx = CGContext(
                 data: nil, width: nw, height: nh, bitsPerComponent: 8, bytesPerRow: 0,
-                space: colorSpace,
+                space: outputColorSpace(for: image),
                 bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
             )
         else { return nil }
@@ -107,19 +103,24 @@ enum UploadMediaProcessor {
         return ctx.makeImage()
     }
 
-    private static func opaqueCopyIfNeeded(_ image: CGImage) -> CGImage? {
-        switch image.alphaInfo {
-        case .premultipliedFirst, .premultipliedLast, .first, .last, .alphaOnly:
-            break
-        case .none, .noneSkipFirst, .noneSkipLast:
-            return image
-        @unknown default:
-            break
+    /// Proton clients expect plain 8-bit SDR JPEGs; one that ignores an HLG, PQ, BT.2020 or linear profile
+    /// shows such a thumbnail grey, washed out or dark. sRGB and Display P3 sources keep their colour space;
+    /// every other source, including HDR video frames, is drawn into sRGB, which tone-maps HDR content.
+    private static func outputColorSpace(for image: CGImage) -> CGColorSpace {
+        if let colorSpace = image.colorSpace,
+            colorSpace.name == CGColorSpace.sRGB || colorSpace.name == CGColorSpace.displayP3
+        {
+            return colorSpace
         }
-        let colorSpace =
-            image.colorSpace?.model == .rgb
-            ? image.colorSpace ?? CGColorSpaceCreateDeviceRGB()
-            : CGColorSpaceCreateDeviceRGB()
+        return CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    }
+
+    /// An opaque 8-bit copy in the output colour space, or the image itself when it already is one.
+    private static func sdrCopyIfNeeded(_ image: CGImage) -> CGImage? {
+        let colorSpace = outputColorSpace(for: image)
+        if image.bitsPerComponent == 8, image.colorSpace == colorSpace, isOpaque(image) {
+            return image
+        }
         guard
             let context = CGContext(
                 data: nil,
@@ -133,5 +134,16 @@ enum UploadMediaProcessor {
         else { return nil }
         context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         return context.makeImage()
+    }
+
+    private static func isOpaque(_ image: CGImage) -> Bool {
+        switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast:
+            true
+        case .premultipliedFirst, .premultipliedLast, .first, .last, .alphaOnly:
+            false
+        @unknown default:
+            false
+        }
     }
 }
