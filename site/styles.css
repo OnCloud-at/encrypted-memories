@@ -734,6 +734,12 @@ p { text-wrap: pretty; }
 
 .footer-brand img { border-radius: 7px; }
 
+.footer-origin {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 0.8rem;
+}
+
 .site-footer div {
   display: flex;
   flex-wrap: wrap;

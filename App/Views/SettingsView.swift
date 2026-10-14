@@ -35,9 +35,14 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             MacSettingsTabs(tabs: tabs, selectedTab: $appModel.selectedSettingsTab)
             Divider()
-            AppBuildInfoLabel()
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 7)
+            VStack(spacing: 2) {
+                AppBuildInfoLabel()
+                Text(ProductBrand.madeInAustria)
+                    .font(.caption2)
+                    .foregroundStyle(ProtonColor.textHint)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
         }
         .navigationTitle("sidebar.settings")
         .onChange(of: mapAndPlacesEnabled) { _, enabled in

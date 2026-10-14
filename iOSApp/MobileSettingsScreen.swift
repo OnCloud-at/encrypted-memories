@@ -274,6 +274,10 @@ struct MobileSettingsScreen: View {
                         .font(.footnote)
                         .foregroundStyle(ProtonColor.textHint)
                     AppBuildInfoLabel()
+                    Text(ProductBrand.madeInAustria)
+                        .font(.caption2)
+                        .foregroundStyle(ProtonColor.textHint)
+                        .multilineTextAlignment(.center)
                 }
                 Spacer()
             }

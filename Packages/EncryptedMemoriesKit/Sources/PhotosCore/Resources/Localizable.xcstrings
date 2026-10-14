@@ -2058,6 +2058,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Encrypted Memories ist eine unabhängige App und kein Produkt von Proton AG." } }
       }
     },
+    "brand.made_in_austria": {
+      "extractionState": "manual",
+      "comment": "Quiet footer line in the About area of Settings on every platform. The English text is on purpose also under \"de\" (owner decision, no translation). Keep the emoji.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Made with ❤️ in Austria 🇦🇹" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Made with ❤️ in Austria 🇦🇹" } }
+      }
+    },
     "login.account_requirement": {
       "extractionState": "manual",
       "comment": "States that sign-in requires an existing Proton account.",
