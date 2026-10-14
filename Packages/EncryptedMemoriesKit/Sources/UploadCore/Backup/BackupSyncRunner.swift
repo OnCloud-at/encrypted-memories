@@ -2926,7 +2926,7 @@ private final class BackupUploadActivity: @unchecked Sendable {
     }
 }
 
-private enum BackupUploadResolution: @unchecked Sendable {
+enum BackupUploadResolution: @unchecked Sendable {
     case success(PhotoUID)
     case failure(Error)
     case timedOut
@@ -2981,7 +2981,7 @@ private final class BackupUploadJoin: @unchecked Sendable {
     }
 }
 
-private final class BackupUploadRace: @unchecked Sendable {
+final class BackupUploadRace: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<BackupUploadResolution, Never>?
     private var resolution: BackupUploadResolution?
@@ -2997,16 +2997,22 @@ private final class BackupUploadRace: @unchecked Sendable {
         }
     }
 
+    /// True only when this call decided the race. A race keeps its first resolution (success, failure, timeout or
+    /// cancellation), and a later caller must not act on a decision it did not make.
     @discardableResult
     func resolve(_ value: BackupUploadResolution) -> Bool {
-        let continuation: CheckedContinuation<BackupUploadResolution, Never>? = lock.withLock {
-            guard resolution == nil else { return nil }
-            resolution = value
-            defer { self.continuation = nil }
-            return self.continuation
-        }
-        continuation?.resume(returning: value)
-        return true
+        let result:
+            (
+                continuation: CheckedContinuation<BackupUploadResolution, Never>?,
+                decided: Bool
+            ) = lock.withLock {
+                guard resolution == nil else { return (nil, false) }
+                resolution = value
+                defer { self.continuation = nil }
+                return (self.continuation, true)
+            }
+        result.continuation?.resume(returning: value)
+        return result.decided
     }
 
     @discardableResult

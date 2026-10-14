@@ -1949,6 +1949,34 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: entry), .completed)
     }
 
+    func testUploadRaceReportsOnlyTheCallThatDecidedIt() async throws {
+        let uid = testUID("decided.jpg")
+        let race = BackupUploadRace()
+
+        XCTAssertTrue(race.resolve(.success(uid)), "the first resolution decides the race")
+        XCTAssertFalse(race.resolve(.timedOut), "a timeout after a success must not claim the race")
+        XCTAssertFalse(race.resolve(.cancelled))
+        XCTAssertFalse(race.resolve(.failure(UploadError.backend("late"))))
+
+        guard case .success(let decided) = await race.wait() else {
+            return XCTFail("the first resolution must stay")
+        }
+        XCTAssertEqual(decided, uid)
+    }
+
+    func testUploadRaceKeepsATimeoutAgainstALateSuccessAndTheOwnerOfItCancels() async throws {
+        let race = BackupUploadRace()
+
+        XCTAssertTrue(race.resolve(.timedOut))
+        XCTAssertFalse(race.resolve(.success(testUID("late.jpg"))))
+        XCTAssertFalse(race.resolve(.timedOut), "a second timeout does not decide the race again")
+
+        guard case .timedOut = await race.wait() else {
+            return XCTFail("the first resolution must stay")
+        }
+        XCTAssertTrue(race.requestCancellation(), "a timed-out race still needs its native cancellation")
+    }
+
     func testTaskCancellationJoinsNativeCancellationAndUploadBeforeReversion() async throws {
         let entry = seedEntry("task-cancel-join.jpg")
         let stalledUploader = NonCooperativeBackupUploader()
