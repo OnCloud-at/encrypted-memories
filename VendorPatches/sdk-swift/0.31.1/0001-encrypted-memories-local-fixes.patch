@@ -1,5 +1,5 @@
 diff --git a/Package.swift b/Package.swift
-index b675ee3..d79652e 100644
+index 01cccf5..38a293e 100644
 --- a/Package.swift
 +++ b/Package.swift
 @@ -3,0 +4 @@
@@ -117,18 +117,18 @@ index f8ba40e..220a08a 100644
 +        await freeTask().value
 +    }
 diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-index 3407864..458a790 100644
+index a5cb60e..9371fb1 100644
 --- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 +++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-@@ -54,0 +55,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -57,0 +58,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +    private var shutdownTask: Task<Void, Never>?
 +    private var didShutDown = false
-@@ -133 +135,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -136 +138,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -        Self.freeEncryptedMemoriesClient(Int64(clientHandle), logger)
 +        let handle = Int64(clientHandle)
 +        let logger = logger
 +        Task { await Self.freeEncryptedMemoriesClient(handle, logger) }
-@@ -136,4 +140,18 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -139,4 +143,18 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -    private static func freeEncryptedMemoriesClient(_ clientHandle: Int64, _ logger: Logger?) {
 -        Task {
 -            let freeRequest = Proton_Drive_Sdk_DrivePhotosClientFreeRequest.with {
@@ -151,7 +151,7 @@ index 3407864..458a790 100644
 +        let task: Task<Void, Never> = Task {
 +            for source in tokenSources {
 +                try? await source.cancel()
-@@ -141,8 +159,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -144,8 +162,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -            do {
 -                try await SDKRequestHandler.send(freeRequest, logger: logger) as Void
 -            } catch {
@@ -162,7 +162,7 @@ index 3407864..458a790 100644
 -                )
 +            for source in tokenSources {
 +                await source.freeAndWait()
-@@ -149,0 +162,19 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -152,0 +165,19 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +            await Self.freeEncryptedMemoriesClient(handle, logger)
 +        }
 +        shutdownTask = task
@@ -182,23 +182,23 @@ index 3407864..458a790 100644
 +                "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
 +                category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
 +            )
-@@ -441,0 +473 @@ extension EncryptedMemoriesClient {
+@@ -444,0 +476 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -457,0 +490 @@ extension EncryptedMemoriesClient {
+@@ -460,0 +493 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
-@@ -472,0 +506 @@ extension EncryptedMemoriesClient {
+@@ -475,0 +509 @@ extension EncryptedMemoriesClient {
 +        try operation.claimStart()
-@@ -492,0 +527 @@ extension EncryptedMemoriesClient {
+@@ -495,0 +530 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -515,0 +551 @@ extension EncryptedMemoriesClient {
+@@ -518,0 +554 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
 diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index ff58245..ed17d5b 100644
+index bfbdda4..a744d57 100644
 --- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 +++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-@@ -349,0 +350 @@ extension ProtonDriveClient {
+@@ -351,0 +352 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
-@@ -381,0 +383 @@ extension ProtonDriveClient {
+@@ -383,0 +385 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
 diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
 index 367242f..f6b161f 100644
