@@ -102,8 +102,9 @@ final class MobileDeletedBackupUITests: XCTestCase {
     }
 
     private func assertBackUpAgainResolved() {
+        // The empty state replaces the list, so the row is gone as soon as the text shows; one check proves it.
         XCTAssertTrue(app.staticTexts["Nothing needs attention."].waitForExistence(timeout: 60))
-        XCTAssertEqual(waitForDecisionRowRemoval(), .completed)
+        XCTAssertFalse(decisionRow.exists)
         XCTAssertFalse(app.buttons["backup.keepDeleted.dialog"].firstMatch.exists)
         XCTAssertFalse(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)
         app.buttons["Done"].tap()
