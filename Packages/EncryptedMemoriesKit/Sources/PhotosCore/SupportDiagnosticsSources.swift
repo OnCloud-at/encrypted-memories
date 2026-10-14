@@ -15,6 +15,7 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
     private var queues: [WeakSource] = []
     private var journals: [WeakSource] = []
     private weak var places: (any PhotoPlaceSupportSource)?
+    private weak var requests: (any RemoteRequestSupportSource)?
     private var pendingGrid = PendingGridSupportSnapshot()
     private let trail: SupportEventTrail
 
@@ -42,6 +43,22 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
         }
         // The trail holds identifiers of this account in memory.
         if unregistered { trail.clear() }
+    }
+
+    public func registerRequests(_ source: any RemoteRequestSupportSource) {
+        lock.withLock { requests = source }
+    }
+
+    /// An old session cannot clear the newer session's request counts.
+    public func unregisterRequests(_ source: any RemoteRequestSupportSource) {
+        lock.withLock {
+            if requests === source { requests = nil }
+        }
+    }
+
+    public func requestSnapshot() async -> RemoteRequestSupportSnapshot? {
+        let source = lock.withLock { requests }
+        return await source?.remoteRequestSupportSnapshot()
     }
 
     public func registerPlaces(_ source: any PhotoPlaceSupportSource) {

@@ -1,0 +1,259 @@
+import Foundation
+import PhotosCore
+import ProtonAuth
+import Testing
+
+@testable import ProtonDriveBackend
+
+@Suite("Proton request counts")
+struct ProtonRequestTallyTests {
+    private static let volumeID =
+        "Xk3vR9aQ2mZ0pL7wB4nT8yHc6uJ1eFgS5dKqV0oWbN2iM9rA7tY3xC8zE4hU6jG1fP5lD0sQ9vB2nK7wR3mT8yX4c=="
+    private static let linkID =
+        "aB9cD8eF7gH6iJ5kL4mN3oP2qR1sT0uV9wX8yZ7AbC6dE5fG4hI3jK2lM1nO0pQ9rS8tU7vW6xY5zA4bC3dE2fG1hI=="
+
+    @Test func endpointTemplatesKeepOnlyFixedPathWords() {
+        let label = ProtonRequestLabel.api(
+            method: "get",
+            path: "/drive/v2/volumes/\(Self.volumeID)/links/\(Self.linkID)/trash_multiple?Page=2&PageSize=150"
+        )
+        #expect(
+            label == ProtonRequestLabel(method: "GET", endpoint: "/drive/v2/volumes/{id}/links/{id}/trash_multiple"))
+        #expect(
+            ProtonRequestLabel.api(method: "POST", path: "/drive/photos/volumes/abc123/albums/x/add-multiple").endpoint
+                == "/drive/photos/volumes/{id}/albums/{id}/add-multiple")
+        #expect(ProtonRequestLabel.api(method: "PROPFIND", path: "/core/v4/users").method == "OTHER")
+        #expect(ProtonRequestLabel.storage(method: "put") == ProtonRequestLabel(method: "PUT", endpoint: "<storage>"))
+        // Mixed case, digits, padding and long words are identifiers; only short lowercase words and versions stay.
+        for segment in ["AbCd", "a1", "abc=", "v", "v4x", String(repeating: "a", count: 33)] {
+            #expect(!ProtonRequestLabel.isFixedWord(Substring(segment)), "\(segment)")
+        }
+        for segment in ["v4", "fetch_metadata", "add-multiple", "latest"] {
+            #expect(ProtonRequestLabel.isFixedWord(Substring(segment)), "\(segment)")
+        }
+    }
+
+    @Test func statusCodesFallIntoTheReportedClasses() {
+        let cases: [(Int?, ProtonRequestStatusClass)] = [
+            (nil, .transport), (200, .success), (204, .success), (302, .redirect), (401, .unauthorized),
+            (404, .notFound), (408, .timeout), (429, .rateLimited), (422, .clientError), (503, .serverError),
+            (99, .transport),
+        ]
+        for (code, expected) in cases {
+            #expect(ProtonRequestStatusClass(statusCode: code) == expected, "\(String(describing: code))")
+        }
+    }
+
+    @Test func governorCountsEachFinishedRequestByEndpointCauseAndStatus() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let label = ProtonRequestLabel.api(method: "GET", path: "/drive/volumes/\(Self.volumeID)/events/latest")
+        try await governor.causes.run(.timelineProbe) {
+            let ok = try await governor.acquire(scope: .api, label: label)
+            await governor.finish(ok, statusCode: 200)
+            let failed = try await governor.acquire(scope: .api, label: label)
+            await governor.finish(failed, statusCode: nil)
+            let again = try await governor.acquire(scope: .api, label: label)
+            await governor.finish(again, statusCode: 200)
+            // A permit finishes once; a second finish is not a second request.
+            await governor.finish(again, statusCode: 200)
+        }
+        let download = try await governor.acquire(scope: .storageDownload, label: .storage(method: "GET"))
+        await governor.finish(download, statusCode: 503)
+
+        let snapshot = await governor.requestSupportSnapshot()
+        #expect(
+            snapshot.counts == [
+                .init(
+                    scope: "api", method: "GET", endpoint: "/drive/volumes/{id}/events/latest",
+                    cause: "timeline.probe", status: "2xx", count: 2),
+                .init(
+                    scope: "api", method: "GET", endpoint: "/drive/volumes/{id}/events/latest",
+                    cause: "timeline.probe", status: "transport", count: 1),
+                .init(
+                    scope: "storageDownload", method: "GET", endpoint: "<storage>",
+                    cause: "unattributed", status: "5xx", count: 1),
+            ])
+        #expect(snapshot.overflowRequests == 0)
+        #expect(snapshot.scopes.map(\.scope) == ["api", "storageDownload", "storageUpload"])
+    }
+
+    @Test func callbackRequestsWithoutATaskCauseAreMarkedAsInferred() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let scopes = governor.causes
+        let label = ProtonRequestLabel.api(method: "POST", path: "/drive/shares/x/links/fetch_metadata")
+        // A native SDK callback starts a new task, so it carries no task-local cause.
+        func callback() async throws {
+            let permit = try await Task.detached { try await governor.acquire(scope: .api, label: label) }.value
+            await governor.finish(permit, statusCode: 200)
+        }
+        try await callback()
+        try await scopes.run(.thumbnails) { try await callback() }
+        try await scopes.run(.thumbnails) {
+            try await Task.detached {
+                try await scopes.run(.timelineFull) { try await callback() }
+            }.value
+        }
+        let causes = await governor.requestSupportSnapshot().counts.map(\.cause)
+        #expect(causes == ["unattributed", "~thumbnails", "~thumbnails+timeline.full"])
+    }
+
+    @Test func anEnclosingCauseWinsUnlessTheWorkReplacesIt() async throws {
+        let scopes = ProtonRequestCauseScopes()
+        let nested = await scopes.run(.duplicates) { await scopes.run(.trashWrite) { ProtonRequestContext.cause } }
+        #expect(nested == .duplicates)
+        let replaced = await scopes.run(.timelineFull) {
+            await scopes.run(.trashList, replacing: true) { ProtonRequestContext.cause }
+        }
+        #expect(replaced == .trashList)
+        #expect(scopes.resolve(taskCause: nil) == "unattributed")
+    }
+
+    @Test func rateLimitsRecordTheLargestRetryAfterAndCooldownWithoutOverlap() async throws {
+        let clock = TallyTestClock()
+        let governor = ProtonRequestGovernor(
+            configuration: Self.configuration(initial: 4), now: { clock.now }, summaryLog: { _ in })
+        let first = try await governor.acquire(scope: .api)
+        let second = try await governor.acquire(scope: .api)
+        let third = try await governor.acquire(scope: .api)
+        await governor.finish(first, statusCode: 429, retryAfter: 10)
+        // A second 429 whose cooldown ends inside the first adds no cooldown time.
+        await governor.finish(second, statusCode: 429, retryAfter: 4)
+        // A third 429 extends the cooldown by 5 s beyond the first one.
+        clock.now = clock.now.addingTimeInterval(5)
+        await governor.finish(third, statusCode: 429, retryAfter: 10)
+
+        let api = try #require(await governor.requestSupportSnapshot().scopes.first { $0.scope == "api" })
+        #expect(api.maximumRetryAfterSeconds == 10)
+        #expect(api.totalCooldownSeconds == 15)
+        #expect(api.peakInFlight == 3)
+        #expect(api.rateLimitedLastMinute == 3)
+        let download = try #require(
+            await governor.requestSupportSnapshot().scopes.first { $0.scope == "storageDownload" })
+        #expect(download.maximumRetryAfterSeconds == nil)
+        #expect(download.totalCooldownSeconds == 0)
+    }
+
+    @Test func oneSummaryLinePerMinuteCoversThePreviousMinute() async throws {
+        let clock = TallyTestClock()
+        let lines = SummaryRecorder()
+        let governor = ProtonRequestGovernor(now: { clock.now }, summaryLog: { lines.append($0) })
+        func request(_ cause: ProtonRequestCause, status: Int?) async throws {
+            try await governor.causes.run(cause) {
+                let permit = try await governor.acquire(scope: .api)
+                await governor.finish(permit, statusCode: status)
+            }
+        }
+        try await request(.thumbnails, status: 200)
+        clock.now = clock.now.addingTimeInterval(30)
+        try await request(.timelineFull, status: 503)
+        try await request(.thumbnails, status: 200)
+        #expect(lines.values.isEmpty)
+
+        clock.now = clock.now.addingTimeInterval(31)
+        try await request(.viewer, status: 200)
+        #expect(
+            lines.values == [
+                ["requests": "3", "causes": "thumbnails:2,timeline.full:1", "statuses": "2xx:2,5xx:1"]
+            ])
+
+        clock.now = clock.now.addingTimeInterval(120)
+        try await request(.viewer, status: nil)
+        #expect(lines.values.count == 2)
+        #expect(lines.values.last == ["requests": "1", "causes": "viewer:1", "statuses": "2xx:1"])
+    }
+
+    @Test func theKeyTableStaysBoundedAndCountsTheRestAsOverflow() {
+        var tally = ProtonRequestTally()
+        let start = Date(timeIntervalSince1970: 0)
+        for index in 0..<(ProtonRequestTally.maximumKeys + 3) {
+            _ = tally.record(
+                .init(scope: .api, method: "GET", endpoint: "/e\(index)", cause: "c", status: .success), at: start)
+        }
+        // A known key still counts after the table is full.
+        _ = tally.record(.init(scope: .api, method: "GET", endpoint: "/e0", cause: "c", status: .success), at: start)
+        #expect(tally.counts.count == ProtonRequestTally.maximumKeys)
+        #expect(tally.overflowRequests == 3)
+        #expect(tally.counts[.init(scope: .api, method: "GET", endpoint: "/e0", cause: "c", status: .success)] == 2)
+    }
+
+    @Test func driveSessionRequestsAreCountedWithoutIdentifiersOrQuery() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let session = DriveSession(
+            session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
+            store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
+            accountCacheDirectory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("request-tally-tests-\(UUID().uuidString)"),
+            requestGovernor: governor,
+            urlProtocolClasses: [AlwaysOKURLProtocol.self]
+        )
+        let path = "/drive/shares/\(Self.volumeID)/links/\(Self.linkID)?Thumbnails=1"
+        let _: EmptyResponse = try await governor.causes.run(.viewerMetadata) {
+            try await session.getJSON(path, as: EmptyResponse.self)
+        }
+        let snapshot = await governor.requestSupportSnapshot()
+        #expect(
+            snapshot.counts == [
+                .init(
+                    scope: "api", method: "GET", endpoint: "/drive/shares/{id}/links/{id}",
+                    cause: "viewer.metadata", status: "2xx", count: 1)
+            ])
+        let encoded = String(decoding: try JSONEncoder().encode(snapshot), as: UTF8.self)
+        #expect(!encoded.contains(String(Self.volumeID.prefix(12))))
+        #expect(!encoded.contains(String(Self.linkID.prefix(12))))
+        #expect(!encoded.contains("Thumbnails"))
+    }
+
+    @Test func supportSourceRegistrationBelongsToOneSession() async throws {
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        let old = ProtonRequestGovernor(summaryLog: { _ in })
+        let current = ProtonRequestGovernor(summaryLog: { _ in })
+        let permit = try await current.acquire(scope: .api, label: .api(method: "GET", path: "/core/v4/users"))
+        await current.finish(permit, statusCode: 200)
+
+        sources.registerRequests(old)
+        sources.registerRequests(current)
+        sources.unregisterRequests(old)
+        #expect(await sources.requestSnapshot()?.counts.map(\.endpoint) == ["/core/v4/users"])
+        sources.unregisterRequests(current)
+        #expect(await sources.requestSnapshot() == nil)
+    }
+
+    private static func configuration(initial: Int) -> ProtonRequestGovernor.Configuration {
+        let scope = ProtonRequestGovernor.Configuration.Scope(initialConcurrency: initial, maximumConcurrency: initial)
+        return .init(
+            api: scope, storageDownload: scope, storageUpload: scope, successWindowForIncrease: 32,
+            starvationPromotionInterval: 10, priorityScopeLifetime: 60)
+    }
+}
+
+private struct EmptyResponse: Decodable {}
+
+private final class AlwaysOKURLProtocol: URLProtocol {
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data("{}".utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+private final class TallyTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = Date(timeIntervalSince1970: 1_000)
+    var now: Date {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+    }
+}
+
+private final class SummaryRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [[String: String]] = []
+    var values: [[String: String]] { lock.withLock { lines } }
+    func append(_ line: [String: String]) { lock.withLock { lines.append(line) } }
+}

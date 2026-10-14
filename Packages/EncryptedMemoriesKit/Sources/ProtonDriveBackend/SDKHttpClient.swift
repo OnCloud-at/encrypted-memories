@@ -83,7 +83,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         content.onStreamError = { streamError.set($0) }
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: .storageUpload)
+            permit = try await requestGovernor.acquire(
+                scope: .storageUpload, label: .storage(method: method))
         } catch {
             return .failure(error as NSError)
         }
@@ -185,7 +186,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: .storageDownload)
+            permit = try await requestGovernor.acquire(
+                scope: .storageDownload, label: .storage(method: method))
         } catch {
             return .failure(error as NSError)
         }
@@ -227,7 +229,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     ) async -> Result<HttpClientResponse, NSError> {
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: scope)
+            permit = try await requestGovernor.acquire(scope: scope, label: Self.label(for: request, scope: scope))
         } catch {
             return .failure(error as NSError)
         }
@@ -272,6 +274,12 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
             await requestGovernor.finish(permit, statusCode: nil)
             return .failure(error as NSError)
         }
+    }
+
+    static func label(for request: URLRequest, scope: ProtonRequestScope) -> ProtonRequestLabel {
+        let method = request.httpMethod ?? "GET"
+        guard scope == .api else { return .storage(method: method) }
+        return .api(method: method, path: request.url?.path ?? "")
     }
 
     private static func canRetryAfterRateLimit(method: String) -> Bool {

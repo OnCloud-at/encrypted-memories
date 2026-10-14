@@ -195,6 +195,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             recordMetricEventCallback: { _ in }
         )
         SupportDiagnosticsSources.shared.registerLibrary(self)
+        SupportDiagnosticsSources.shared.registerRequests(requestGovernor)
         DebugLog.log("bridge: EncryptedMemoriesClient created ✓")
     }
 
@@ -204,6 +205,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         if !isShutDown {
             isShutDown = true
             SupportDiagnosticsSources.shared.unregisterLibrary(self)
+            SupportDiagnosticsSources.shared.unregisterRequests(requestGovernor)
             timelineLoadGeneration &+= 1
             shutdownGate.closeAdmission()
             timelineLoadTask?.task.cancel()
@@ -216,11 +218,17 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
+    /// Every entry point names the work it does, so the request counts of the support report can tell the
+    /// features apart. The cause does not change what or when the bridge requests.
     private nonisolated func withOpenSession<T: Sendable>(
+        cause: ProtonRequestCause,
+        replacing: Bool = false,
         _ operation: @escaping @Sendable (isolated DriveSDKBridge) async throws -> T
     ) async throws -> T {
-        try await shutdownGate.withAdmission { [self] in
-            try await operation(self)
+        try await requestGovernor.causes.run(cause, replacing: replacing) {
+            try await shutdownGate.withAdmission { [self] in
+                try await operation(self)
+            }
         }
     }
 
@@ -249,13 +257,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - PhotosRepository
 
     func loadTimeline() async throws -> [TimelineSection] {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .timelineFull) { bridge in
             try await bridge.loadTimelineSnapshotImpl().sections
         }
     }
 
     func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .timelineFull) { bridge in
             try await bridge.loadTimelineSnapshotImpl()
         }
     }
@@ -708,7 +716,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// One bounded SDK event probe. A changed cursor tells the shared foreground monitor to perform
     /// an authoritative timeline refresh; unchanged polls never enumerate or decrypt the library.
     func libraryChangeToken() async throws -> String {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .timelineProbe) { bridge in
             let root = try await bridge.resolvePhotosRoot()
             let cursor = TimelineInventoryValidationTokenPolicy.remoteEventToken(
                 from: bridge.timelineStore?.validationToken()
@@ -738,13 +746,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func launchValidationToken() async throws -> String {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .timelineValidation) { bridge in
             try await bridge.launchValidationTokenImpl()
         }
     }
 
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .timelineValidation) { bridge in
             if let volumeID = snapshot.sections.lazy.flatMap(\.items).first?.uid.volumeID {
                 let cursor = TimelineInventoryValidationTokenPolicy.remoteEventToken(
                     from: snapshot.validationToken
@@ -855,7 +863,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             libraryID: items.first?.uid.volumeID ?? photosRoot?.volumeID)
         metadataReconciliation.schedule(inventory) { [weak self] pass in
             guard let self else { return }
-            _ = try? await self.withOpenSession { bridge in
+            _ = try? await self.withOpenSession(cause: .reconcile, replacing: true) { bridge in
                 await bridge.reconcileTimelineMetadata(pass: pass)
             }
         }
@@ -1100,7 +1108,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Rows persisted in the local SQLite timeline store - surfaced as "metadata rows" in Settings.
     func metadataRowCount() async -> Int {
-        (try? await withOpenSession { bridge in
+        (try? await withOpenSession(cause: .local) { bridge in
             bridge.timelineStore?.count() ?? 0
         }) ?? 0
     }
@@ -1108,7 +1116,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - ThumbnailProvider
 
     func thumbnail(for uid: PhotoUID) async throws -> Data {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .thumbnails) { bridge in
             try await bridge.singleThumbnail(uid, type: .thumbnail)
         }
     }
@@ -1120,7 +1128,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult {
         do {
-            return try await withOpenSession { bridge in
+            return try await withOpenSession(cause: .thumbnails) { bridge in
                 await bridge.loadThumbnailsImpl(
                     for: uids,
                     priority: .nearViewportScrollAhead,
@@ -1138,7 +1146,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult {
         do {
-            return try await withOpenSession { bridge in
+            return try await withOpenSession(cause: .thumbnails) { bridge in
                 await bridge.loadThumbnailsImpl(for: uids, priority: priority, onLoaded: onLoaded)
             }
         } catch {
@@ -1200,13 +1208,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - FullMediaProvider
 
     func preview(for uid: PhotoUID) async throws -> Data {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .viewer) { bridge in
             try await bridge.singleThumbnail(uid, type: .preview)
         }
     }
 
     func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .viewer) { bridge in
             try await bridge.originalDataImpl(for: uid, onProgress: onProgress)
         }
     }
@@ -1216,7 +1224,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         onChunk: @escaping @Sendable (Data) async throws -> Void,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .viewer) { bridge in
             try await bridge.streamOriginalBytesImpl(for: uid, onChunk: onChunk, onProgress: onProgress)
         }
     }
@@ -1270,7 +1278,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         to destination: URL,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .export) { bridge in
             try await bridge.writeOriginalImpl(for: uid, to: destination, onProgress: onProgress)
         }
     }
@@ -1393,7 +1401,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// The photos share context for the dedupe service - same discovery + cache as every other
     /// photos feature (`resolvePhotosRoot`).
     func photosShareContext() async throws -> PhotosShareContext {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .photosRoot) { bridge in
             try await bridge.photosShareContextImpl()
         }
     }
@@ -1427,7 +1435,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.31.1 has no album-write API).
     /// The photo's `nodeID` is its Drive link id.
     func setAlbumCover(albumID: String, photoUID: PhotoUID) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .albums) { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.setAlbumCover(
                 volumeID: root.volumeID,
@@ -1438,14 +1446,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func deleteAlbum(albumID: String) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .albums) { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.deleteAlbum(volumeID: root.volumeID, albumLinkID: albumID)
         }
     }
 
     func removePhotos(_ photoUIDs: [PhotoUID], fromAlbum albumID: String) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .albums) { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.removeFromAlbum(
                 volumeID: root.volumeID,
@@ -1459,7 +1467,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// account-data request also updates the encrypted offline cache; it does not rebuild the signed-in client.
     func refreshAccountInfo() async throws {
         let recordedBefore = uploadedBytes
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .account) { bridge in
             _ = try await bridge.driveSession.fetchAccountData()
         }
         // Uploads recorded during the request stay counted; the response may not contain them yet.
@@ -1467,7 +1475,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .timelineFilter) { bridge in
             try await bridge.timelineImpl(filter: filter)
         }
     }
@@ -1529,7 +1537,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - FavoritesProvider
 
     func favoriteUIDs() async throws -> Set<PhotoUID> {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .favorites) { bridge in
             let root = try await bridge.resolvePhotosRoot()
             let entries = try await bridge.driveSession.fetchPhotosList(
                 volumeID: root.volumeID,
@@ -1540,7 +1548,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func setFavorites(_ uids: [PhotoUID], _ favorite: Bool) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .favorites) { bridge in
             try await SDKFavoriteWriter(client: bridge.photosClient).setFavorites(uids, favorite: favorite)
         }
     }
@@ -1548,7 +1556,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - PhotoLibrarySaving
 
     func saveToLibrary(_ uids: [PhotoUID]) async throws -> PhotoLibrarySaveResult {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .librarySave) { bridge in
             try await SDKPhotoLibrarySaver(client: bridge.photosClient).save(uids)
         }
     }
@@ -1566,7 +1574,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func moveToTrash(_ uids: [PhotoUID]) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .trashWrite) { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
             // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted. They
@@ -1597,7 +1605,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func restore(_ uids: [PhotoUID]) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .trashWrite) { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
             // A listing can drop these photos before the library lists them again; their thumbnails stay.
@@ -1608,7 +1616,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func emptyTrash() async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .trashWrite) { bridge in
             _ = try await bridge.resolvePhotosRoot()
             try await SDKCancellableOperation.run { [photosClient = bridge.photosClient] cancellationToken in
                 try await photosClient.emptyTrash(cancellationToken: cancellationToken)
@@ -1693,8 +1701,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private func listTrashInBackground() async {
         defer { trashListingTask = nil }
         do {
-            _ = try await ProtonRequestContext.$priority.withValue(.maintenance) {
-                try await listTrash()
+            // The task inherited the cause of the load that scheduled it.
+            _ = try await requestGovernor.causes.run(.trashList, replacing: true) {
+                try await ProtonRequestContext.$priority.withValue(.maintenance) {
+                    try await listTrash()
+                }
             }
         } catch {
             DebugLog.log("trash: background listing failed - \(error)")
@@ -1789,7 +1800,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - PhotoMetadataProvider
 
     func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .viewerMetadata) { bridge in
             try await bridge.metadataImpl(for: uid)
         }
     }
@@ -1822,7 +1833,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - BurstGroupProvider
 
     func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .viewer) { bridge in
             try await bridge.burstGroupImpl(containing: uid)
         }
     }
@@ -1900,7 +1911,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - VideoStreamProvider
 
     func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .viewer) { bridge in
             try await bridge.makeStreamingAssetImpl(for: uid)
         }
     }
@@ -1950,7 +1961,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     func prefetchEncrypted(for uid: PhotoUID) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .viewer) { bridge in
             let priorityScope = await bridge.requestGovernor.beginPriorityScope(
                 .immediate,
                 promoting: [.api, .storageDownload],
@@ -2095,7 +2106,7 @@ extension DriveSDKBridge: PhotoDimensionRecording {
     /// Batched by `PhotoDimensionCoalescer`; the store fills only rows without dimensions
     /// (first-seen-wins), so repeated decodes and future true-dimension writers can coexist.
     func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {
-        _ = try? await withOpenSession { bridge in
+        _ = try? await withOpenSession(cause: .local) { bridge in
             bridge.timelineStore?.updateDimensions(batch)
         }
     }
@@ -2249,7 +2260,7 @@ extension DriveSDKBridge: PhotoUploading {
         _ request: PhotoUploadRequest,
         onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .backup) { bridge in
             try await bridge.uploadImpl(request, onProgress: onProgress)
         }
     }
@@ -2436,7 +2447,7 @@ extension DriveSDKBridge: PhotoUploading {
     }
 
     func cancel(token: UUID) async {
-        _ = try? await withOpenSession { bridge in
+        _ = try? await withOpenSession(cause: .backup) { bridge in
             do {
                 try await bridge.photosClient.cancelUpload(with: token)
             } catch {
@@ -2452,7 +2463,7 @@ extension DriveSDKBridge: PhotoUploading {
 
 extension DriveSDKBridge: PhotoTagAdding {
     func addTags(_ tags: [Int], to uid: PhotoUID) async throws {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .tags) { bridge in
             // Backup may know only the main photo's link id; see `PhotoUploadRequest.mainPhotoUID`.
             let volumeID = uid.volumeID.isEmpty ? try await bridge.resolvePhotosRoot().volumeID : uid.volumeID
             try await SDKPhotoTagAdder(client: bridge.photosClient).addTags(
@@ -2468,41 +2479,46 @@ extension DriveSDKBridge: EditReplacementRemote {}
 extension DriveSDKBridge: ExactDuplicateRemote {
     /// The person merges duplicates, so the duplicates take the person's trash path.
     func trashDuplicates(_ uids: [PhotoUID]) async throws {
-        try await trash(uids)
+        try await requestGovernor.causes.run(.duplicates) { try await trash(uids) }
     }
 
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {
-        try await restore(uids)
+        try await requestGovernor.causes.run(.duplicates) { try await restore(uids) }
     }
 
     /// Reads the stored timeline, so ranking the photo to keep costs no request.
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
-        let items = (try? await withOpenSession { bridge in bridge.timelineStore?.items(for: uids) ?? [] }) ?? []
+        let items =
+            (try? await withOpenSession(cause: .duplicates) { bridge in
+                bridge.timelineStore?.items(for: uids) ?? []
+            }) ?? []
         return Dictionary(items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Reads the node of each photo, so only the members of the groups that the screen ranks or merges cost a read.
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         guard !uids.isEmpty else { return [:] }
-        return try await makeAlbumCatalogBackend().nodeFacts(of: uids)
+        return try await requestGovernor.causes.run(.duplicates) {
+            try await makeAlbumCatalogBackend().nodeFacts(of: uids)
+        }
     }
 }
 
 extension DriveSDKBridge: SeriesDissolutionRemote {
     func ownPhotosVolumeID() async throws -> String {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .series) { bridge in
             try await bridge.resolvePhotosRoot().volumeID
         }
     }
 
     func source(for member: PhotoUID) async throws -> SeriesMemberSource {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .series) { bridge in
             try await SDKPhotoMetadataReader.seriesMemberSource(for: member, client: bridge.photosClient)
         }
     }
 
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
-        try await withOpenSession { bridge in
+        try await withOpenSession(cause: .series) { bridge in
             let active = try await bridge.activeNodeIDs(Set(uids.map(\.nodeID)))
             return Set(uids.filter { active.contains($0.nodeID) })
         }
@@ -2511,19 +2527,19 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
         // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
-        let favorites = try await favoriteUIDs()
+        let favorites = try await requestGovernor.causes.run(.series) { try await favoriteUIDs() }
         return Set(uids.filter(favorites.contains))
     }
 
     func markFavorite(_ uids: [PhotoUID]) async throws {
         // `setFavorites` throws unless every node confirms the tag, so a partial write never counts as success.
-        try await setFavorites(uids, true)
+        try await requestGovernor.causes.run(.series) { try await setFavorites(uids, true) }
     }
 
     /// The series dissolution moves the photos of a dissolved series to the trash. This is no deletion by the person.
     func trashSeries(_ uids: [PhotoUID]) async throws {
-        try await moveToTrash(uids)
-        try await withOpenSession { bridge in
+        try await requestGovernor.causes.run(.series) { try await moveToTrash(uids) }
+        try await withOpenSession(cause: .series) { bridge in
             // The cached bursts listing still names the trashed series; the next lookup must read it again.
             bridge.burstCatalogEntries = nil
             bridge.burstCatalogLookup = [:]
