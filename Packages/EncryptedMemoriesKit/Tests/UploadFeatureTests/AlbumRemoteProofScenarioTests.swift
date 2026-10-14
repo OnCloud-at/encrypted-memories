@@ -107,33 +107,9 @@ final class AlbumRemoteProofScenarioTests: XCTestCase {
     }
 
     private func syncAlbum(on device: EditScenarioHarness, recheckBackup: Bool = true) async throws -> AlbumSyncReport {
-        let album = LocalAlbumSummary(id: "local-album", title: "Scenario album", assetCount: 1)
-        let lookup = try XCTUnwrap(
-            UploadManifestRemoteLinkLookup(
-                manifestURL: device.directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
-                policy: .conservative))
-        let mapping = try XCTUnwrap(
-            AlbumSyncMappingStore(
-                url: device.directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)))
-        defer { mapping.close() }
-        let runner = AlbumSyncRunner(
-            localSource: ScenarioAlbumSource(),
-            backup: ScenarioAlbumBackup(device: device, recheckBackup: recheckBackup),
-            remoteOps: device.server, linkLookup: lookup, mappingStore: mapping)
-        do {
-            let report = try await runner.sync(album: album, resolution: .attachToExisting(remoteAlbumID: "own-album"))
-            await lookup.shutdown()
-            return report
-        } catch {
-            await lookup.shutdown()
-            throw error
-        }
+        try await device.syncAlbum(
+            ["asset-1"], backup: ScenarioAlbumBackup(device: device, recheckBackup: recheckBackup))
     }
-}
-
-private struct ScenarioAlbumSource: AlbumSyncLocalAlbumSource {
-    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
-    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(["asset-1"]) }
 }
 
 private final class ScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {

@@ -1,3 +1,4 @@
+import AlbumSyncCore
 import CryptoKit
 import Foundation
 import Photos
@@ -424,6 +425,25 @@ final class EditScenarioHarness {
         try relaunch()
     }
 
+    /// Album Sync deletes its queue and backup-state files before every run (`PhotoAlbumBackupExecutor`). The upload
+    /// manifest, the catalog and the running pipeline stay, as in the app.
+    func resetAlbumSyncScratch() throws {
+        queue.close()
+        backupState.close()
+        let scratch = [
+            UploadBackupSyncQueueManifestStore.databaseFileName, UploadBackupStateManifestStore.databaseFileName,
+        ]
+        for name in scratch {
+            for suffix in ["", "-wal", "-shm"] {
+                let file = directory.appendingPathComponent(name + suffix)
+                if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            }
+        }
+        try openBackupStores()
+        XCTAssertEqual(queue.summary().total, 0)
+        XCTAssertEqual(backupState.count(), 0)
+    }
+
     private func seedV105(_ asset: EditScenarioLibrary.Asset, remoteIdentity: Bool = false) throws {
         // v1.0.5 did not read the Live effect, so it planned every Live Photo with its tagged paired video.
         var info = asset.info
@@ -520,15 +540,9 @@ final class EditScenarioHarness {
     }
 
     private func open() throws {
-        queue = try XCTUnwrap(
-            UploadBackupSyncQueueManifestStore(
-                url: directory.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
         identities = try XCTUnwrap(
             UploadIdentityManifestStore(
                 url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
-        backupState = try XCTUnwrap(
-            UploadBackupStateManifestStore(
-                url: directory.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)))
         catalog = try XCTUnwrap(
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
@@ -536,6 +550,17 @@ final class EditScenarioHarness {
         pipeline = UploadDedupePipeline(
             store: identities, checker: index, resourceCoordinator: coordinator, replacementJournal: journal,
             now: { [clock] in clock.now })
+        try openBackupStores()
+    }
+
+    /// The queue and backup state with the engine and runner that use them, over the open manifest and pipeline.
+    private func openBackupStores() throws {
+        queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
+        backupState = try XCTUnwrap(
+            UploadBackupStateManifestStore(
+                url: directory.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)))
         let replacement = EditedPhotoReplacement(
             remote: deviceRemote, albums: server, relations: index, identities: identities, journal: journal)
         let preflight = UploadBackupPreflightIndex(store: backupState, now: { [clock] in clock.now })
@@ -849,5 +874,38 @@ final class EditScenarioHarness {
             check(ownAlbums.isSubset(of: main.albums), "S4 own albums must move", file: file, line: line)
         }
         assertRetired(file: file, line: line)
+    }
+}
+
+/// A local album of the scenario library with a fixed list of photos.
+struct EditScenarioAlbumSource: AlbumSyncLocalAlbumSource {
+    let identifiers: [String]
+    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(identifiers) }
+}
+
+extension EditScenarioHarness {
+    /// One Album Sync of the scenario album into the server's own album, with the real runner, upload manifest lookup
+    /// and mapping store of this device.
+    func syncAlbum(_ identifiers: [String], backup: any AlbumSyncBackupExecuting) async throws -> AlbumSyncReport {
+        let album = LocalAlbumSummary(id: "local-album", title: "Scenario album", assetCount: identifiers.count)
+        let lookup = try XCTUnwrap(
+            UploadManifestRemoteLinkLookup(
+                manifestURL: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
+                policy: .conservative))
+        let mapping = try XCTUnwrap(
+            AlbumSyncMappingStore(url: directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)))
+        defer { mapping.close() }
+        let runner = AlbumSyncRunner(
+            localSource: EditScenarioAlbumSource(identifiers: identifiers), backup: backup,
+            remoteOps: server, linkLookup: lookup, mappingStore: mapping)
+        do {
+            let report = try await runner.sync(album: album, resolution: .attachToExisting(remoteAlbumID: "own-album"))
+            await lookup.shutdown()
+            return report
+        } catch {
+            await lookup.shutdown()
+            throw error
+        }
     }
 }
