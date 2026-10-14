@@ -228,8 +228,10 @@ import UploadCore
         fileQueue.close()
     }
 
+    /// A deadline, not a number of tries: a loaded machine slows the session's snapshot stream, not the result.
     private func eventually(_ condition: () async -> Bool) async -> Bool {
-        for _ in 0..<200 {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < deadline {
             if await condition() { return true }
             try? await Task.sleep(for: .milliseconds(5))
         }
