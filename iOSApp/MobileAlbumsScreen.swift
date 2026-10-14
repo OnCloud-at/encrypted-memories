@@ -141,7 +141,7 @@ struct MobileCollectionsScreen: View {
 
     @ViewBuilder private var albumsSection: some View {
         if let coordinator = model.albumActions {
-            if coordinator.showsInitialAlbumLoadingPlaceholder {
+            if coordinator.showsAlbumLoadingPlaceholder {
                 HStack {
                     ProgressView().controlSize(.small).tint(ProtonColor.primary)
                     Text("collections.loading_albums").foregroundStyle(ProtonColor.textWeak)
@@ -168,7 +168,7 @@ struct MobileCollectionsScreen: View {
 
     @ViewBuilder private var sharedAlbumsSection: some View {
         if let coordinator = model.albumActions {
-            if coordinator.showsInitialSharedAlbumLoadingPlaceholder {
+            if coordinator.showsSharedAlbumLoadingPlaceholder {
                 HStack {
                     ProgressView().controlSize(.small).tint(ProtonColor.primary)
                     Text(L10n.string("collections.loading_shared_albums"))

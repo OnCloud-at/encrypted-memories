@@ -8,6 +8,34 @@ private func coordinatorUID(_ nodeID: String) -> PhotoUID {
     PhotoUID(volumeID: "volume", nodeID: nodeID)
 }
 
+/// Holds every catalog listing until the test opens it, and tells the test how many listings wait.
+private actor ListGate {
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    private var heldWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func pass() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiting.append(continuation)
+            let ready = heldWaiters.filter { $0.count <= waiting.count }
+            heldWaiters.removeAll { $0.count <= waiting.count }
+            ready.forEach { $0.continuation.resume() }
+        }
+    }
+
+    func waitUntilHeld(_ count: Int) async {
+        guard waiting.count < count else { return }
+        await withCheckedContinuation { heldWaiters.append((count, $0)) }
+    }
+
+    func open() {
+        isOpen = true
+        waiting.forEach { $0.resume() }
+        waiting.removeAll()
+    }
+}
+
 final class AlbumActionCoordinatorTests: XCTestCase {
     private func sharedAlbum(_ nodeID: String) -> SharedAlbumSummary {
         SharedAlbumSummary(
@@ -27,22 +55,57 @@ final class AlbumActionCoordinatorTests: XCTestCase {
         let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
-        XCTAssertTrue(coordinator.showsInitialAlbumLoadingPlaceholder)
-        XCTAssertTrue(coordinator.showsInitialSharedAlbumLoadingPlaceholder)
+        XCTAssertTrue(coordinator.showsAlbumLoadingPlaceholder)
+        XCTAssertTrue(coordinator.showsSharedAlbumLoadingPlaceholder)
 
         await coordinator.refresh()
         await coordinator.refreshSharedAlbums()
 
         XCTAssertTrue(coordinator.hasCompletedInitialAlbumLoad)
         XCTAssertTrue(coordinator.hasCompletedInitialSharedAlbumLoad)
-        XCTAssertFalse(coordinator.showsInitialAlbumLoadingPlaceholder)
-        XCTAssertFalse(coordinator.showsInitialSharedAlbumLoadingPlaceholder)
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder)
+        XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder)
 
         await coordinator.refresh()
         await coordinator.refreshSharedAlbums()
 
-        XCTAssertFalse(coordinator.showsInitialAlbumLoadingPlaceholder)
-        XCTAssertFalse(coordinator.showsInitialSharedAlbumLoadingPlaceholder)
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder)
+        XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder)
+    }
+
+    /// A retry after a failed load shows the loading row while it runs, not "No albums yet", and a second failure
+    /// shows the error again.
+    @MainActor
+    func testRetryAfterAFailedLoadShowsLoadingUntilTheResultArrives() async {
+        struct Offline: Error {}
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        backend.listError = Offline()
+        backend.sharedListError = Offline()
+        let coordinator = AlbumActionCoordinator(repository: repository(backend))
+        await coordinator.refresh()
+        await coordinator.refreshSharedAlbums()
+        XCTAssertNotNil(coordinator.loadErrorMessage)
+        XCTAssertNotNil(coordinator.sharedLoadErrorMessage)
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder)
+        XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder)
+
+        let gate = ListGate()
+        backend.listHold = { await gate.pass() }
+        let retry = Task { await coordinator.refresh() }
+        let sharedRetry = Task { await coordinator.refreshSharedAlbums() }
+        await gate.waitUntilHeld(2)
+        XCTAssertNil(coordinator.loadErrorMessage)
+        XCTAssertNil(coordinator.sharedLoadErrorMessage)
+        XCTAssertTrue(coordinator.showsAlbumLoadingPlaceholder, "a running retry shows the loading row")
+        XCTAssertTrue(coordinator.showsSharedAlbumLoadingPlaceholder, "a running retry shows the loading row")
+
+        await gate.open()
+        await retry.value
+        await sharedRetry.value
+        XCTAssertNotNil(coordinator.loadErrorMessage, "a second failure shows the error again")
+        XCTAssertNotNil(coordinator.sharedLoadErrorMessage, "a second failure shows the error again")
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder)
+        XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder)
     }
 
     @MainActor

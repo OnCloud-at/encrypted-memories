@@ -56,11 +56,13 @@ public final class AlbumActionCoordinator {
     public func presentation(for album: SharedAlbumSummary) -> SharedAlbumPresentation {
         SharedAlbumPresentation(album: album, permissions: permissions(for: album))
     }
-    public var showsInitialAlbumLoadingPlaceholder: Bool {
-        !hasCompletedInitialAlbumLoad && albums.isEmpty
+    /// The album list shows its loading row while it has no albums and a load runs or none has finished yet, so a
+    /// retry after a failure shows loading instead of an empty list.
+    public var showsAlbumLoadingPlaceholder: Bool {
+        albums.isEmpty && (isLoading || !hasCompletedInitialAlbumLoad)
     }
-    public var showsInitialSharedAlbumLoadingPlaceholder: Bool {
-        canListSharedWithMe && !hasCompletedInitialSharedAlbumLoad && sharedAlbums.isEmpty
+    public var showsSharedAlbumLoadingPlaceholder: Bool {
+        canListSharedWithMe && sharedAlbums.isEmpty && (isLoadingShared || !hasCompletedInitialSharedAlbumLoad)
     }
 
     private let repository: AlbumsRepository
