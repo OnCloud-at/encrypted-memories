@@ -183,7 +183,7 @@ struct MobileSeriesFavoritesScreen: View {
                 set: { if !$0 { model.dismissFailure() } }
             )
         ) {
-            RetryButton(.system) { Task { await model.keepOnlyMarkedFavorites() } }
+            Button(RetryButton.title) { Task { await model.keepOnlyMarkedFavorites() } }
             Button(L10n.string("action.cancel"), role: .cancel) {}
         } message: {
             Text(

@@ -2,20 +2,21 @@ import PhotosCore
 import SwiftUI
 
 /// The one Retry action of macOS, iOS and iPadOS, titled "Try again". `.prominent` is the main action of an empty or
-/// error state; `.compact` is a small text button inside a row, a note or a banner; `.system` leaves the drawing to an
-/// alert or a toolbar. Every style uses the same title.
+/// error state; `.compact` is a small text button inside a row, a note or a banner; `.system` leaves the drawing to a
+/// toolbar or a sheet header. Every style uses the same title. An alert builds its actions from `Button` values, so an
+/// alert uses a plain `Button(RetryButton.title)` instead of this view.
 public struct RetryButton: View {
     public enum Style: Sendable {
         /// The primary action below an empty or error state.
         case prominent
         /// A small text button inside a row, a note or a banner.
         case compact
-        /// A button that an alert or a toolbar draws in its own style.
+        /// A button that a toolbar or a sheet header draws in its own style.
         case system
     }
 
     /// The single title of every Retry action.
-    nonisolated static var title: String { L10n.string("action.retry") }
+    public nonisolated static var title: String { L10n.string("action.retry") }
 
     private let style: Style
     private let action: () -> Void
