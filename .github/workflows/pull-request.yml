@@ -98,7 +98,8 @@ jobs:
         run: |
           set -euo pipefail
           # Commits may carry only the noreply addresses of the pull request author.
-          # Event values reach the script through the environment, never the command line.
+          # Account values reach the script only through environment variables.
+          # The two commit SHAs are passed as quoted arguments; the script validates them as git commits.
           case "$EVENT_NAME" in
             pull_request)
               login="$PR_AUTHOR_LOGIN"

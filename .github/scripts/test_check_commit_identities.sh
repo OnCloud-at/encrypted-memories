@@ -151,6 +151,14 @@ fresh_branch name-contains-tool-word
 commit "$alice" "$alice" $'Habitual sign-off\n\nSigned-off-by: Ali Haider <42+alice@users.noreply.github.com>'
 expect pass "a name that contains a tool word inside another word passes" alice "$alice_id"
 
+fresh_branch listed-tool-name
+commit "$alice" "$alice" $'Listed tool\n\nCo-authored-by: Devin <42+alice@users.noreply.github.com>'
+expect fail "a newly listed tool name with the author's address fails" alice "$alice_id"
+
+fresh_branch longer-word-name
+commit "$alice" "$alice" $'Longer word\n\nSigned-off-by: Devinder Singh <42+alice@users.noreply.github.com>'
+expect pass "a name with a tool name inside a longer word passes" alice "$alice_id"
+
 fresh_branch assisted-by
 commit "$alice" "$alice" $'Assisted\n\nAssisted-by: Claude <noreply@anthropic.com>'
 expect fail "Assisted-by naming a tool fails" alice "$alice_id"

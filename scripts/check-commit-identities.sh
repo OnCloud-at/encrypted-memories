@@ -13,7 +13,7 @@ set -euo pipefail
 # author's address and no tool name. A folded trailer counts with its
 # continuation lines.
 # Without COMMIT_IDENTITY_LOGIN the script uses the noreply address of the
-# checkout's own user.email, so the local pre-push guard needs no environment.
+# checkout's own user.email, so a local pre-push check needs no environment.
 # Violations name only the commit and field so the log never repeats an address.
 #
 # Usage: check-commit-identities.sh [<base-sha> [<head-sha>]]
@@ -70,7 +70,7 @@ trailer_key='^[[:space:]]*([a-z][a-z-]*-by)[[:space:]]*:'
 # A line that starts with white space and continues a folded trailer.
 trailer_continuation='^[[:space:]]+[^[:space:]]'
 # A tool name counts as a whole word in the name parts of a trailer, so "Ali Haider" is not "aider".
-tool_name='(^|[^a-z0-9])(anthropic|claude|codex|openai|chatgpt|gpt|t3 ?code|coding[ -]?agent|copilot|gemini|grok|cursor|aider|windsurf|deepseek|lumo|apertus|opencode|assistant)([^a-z0-9]|$)'
+tool_name='(^|[^a-z0-9])(anthropic|claude|codex|openai|chatgpt|gpt|t3 ?code|coding[ -]?agent|copilot|gemini|grok|cursor|aider|windsurf|deepseek|lumo|apertus|opencode|assistant|devin|cline|qwen|tabnine|sourcery|replit|kiro)([^a-z0-9]|$)'
 trailer_address='^([^<]*)<([^<>]*)>(.*)$'
 violations=0
 
