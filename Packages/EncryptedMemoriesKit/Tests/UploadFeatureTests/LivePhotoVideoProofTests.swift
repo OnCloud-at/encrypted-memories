@@ -120,16 +120,37 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         }
     }
 
-    func testAFailedRelatedLookupFailsClosedForACopyWithTheSameBytes() async throws {
+    func testAFailedRoleReadFailsClosedForACopyWithTheSameBytes() async throws {
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video")]
-        checker.relatedLookupError = UploadError.backend("related photos unavailable")
+        checker.linkVisibilityError = UploadError.backend("link roles unavailable")
 
         do {
             let result = try await pipeline.resolve(video())
-            XCTFail("a failed related lookup must not decide the video: \(result.decision)")
+            XCTFail("a failed read must not decide the video: \(result.decision)")
         } catch {
-            XCTAssertEqual(checker.relatedLookups, ["live-main"])
+            XCTAssertEqual(checker.linkVisibilityCallCount, 1)
         }
+    }
+
+    func testTheVideoOfAnotherLivePhotoWithTheSameBytesDoesNotSettleTheVideo() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("other-live-video")]
+        checker.relatedLinkIDsByMainLinkID["other-main"] = ["other-live-video"]
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .upload, "a copy under another main photo proves nothing")
+    }
+
+    func testAVideoWhoseMainPhotoIsInTheTrashIsProvenByTheRoleOfItsCopy() async throws {
+        // The server refuses the related list of a main photo in the trash. The copy still names its main photo.
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("old-video")]
+        checker.relatedLinkIDsByMainLinkID["trashed-main"] = ["old-video"]
+        checker.relatedLookupError = UploadError.backend("Related photos of the main photo are unavailable")
+
+        let result = try await pipeline.resolve(video(mainLinkID: "trashed-main"))
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "old-video"))
+        XCTAssertTrue(checker.relatedLookups.isEmpty, "no list of a main photo that may be in the trash")
     }
 
     // MARK: - The related lookup runs only when it can change the decision
@@ -140,11 +161,13 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
                 nameHash: "nh(IMG_1.MOV)", contentHash: "ch(other-bytes)", linkState: .active, linkID: "other-video")
         ]
         checker.relatedLookupError = UploadError.backend("related photos unavailable")
+        checker.linkVisibilityError = UploadError.backend("link roles unavailable")
 
         let result = try await pipeline.resolve(video())
 
         XCTAssertEqual(result.decision, .upload, "a camera counter that repeats is another photo")
         XCTAssertTrue(checker.relatedLookups.isEmpty, "the answer could not change the decision")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 0, "the answer could not change the decision")
     }
 
     // MARK: - Controls that hold before and after the fix
@@ -178,15 +201,16 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-video"))
     }
 
-    func testTheNameAndTheContentLookupReadTheRelatedPhotosOnce() async throws {
+    func testTheNameAndTheContentLookupReadTheRoleOfACopyOnce() async throws {
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video")]
-        checker.remoteItemsByContentHash[videoContentHash] = activeRow("elsewhere", name: "OTHER.MOV")
+        checker.remoteItemsByContentHash[videoContentHash] = activeRow("standalone-video")
         checker.relatedLinkIDsByMainLinkID["live-main"] = []
 
         let result = try await pipeline.resolve(video())
 
         XCTAssertEqual(result.decision, .upload)
-        XCTAssertEqual(checker.relatedLookups, ["live-main"], "the related photos are read once")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1, "the role of the copy is read once")
+        XCTAssertTrue(checker.relatedLookups.isEmpty)
     }
 
     func testAnOwnInterruptedDraftNextToAnUnrelatedCopyIsReplaced() async throws {

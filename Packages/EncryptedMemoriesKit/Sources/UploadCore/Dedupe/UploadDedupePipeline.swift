@@ -299,8 +299,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw detailedLookupError
         }
 
-        // The related photos of the main photo, read at most once in this resolve.
-        var relatedReads: [String: Set<String>] = [:]
+        // What the server said about the copies under the main photo, read at most once in this resolve.
+        var relatedReads = RelatedProofReads()
         let nameCandidates: (items: [RemotePhotoDuplicate], provesLive: Bool)
         do {
             nameCandidates = try await candidates(
@@ -613,7 +613,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         descriptor: UploadResourceDescriptor,
         replacement: UploadReplacementScope,
         requiresActiveMain: Bool = false,
-        relatedReads: inout [String: Set<String>]
+        relatedReads: inout RelatedProofReads
     ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
         if descriptor.source.resource.isBurstMember {
             return (
@@ -627,15 +627,29 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let countsOnlyUnderTheMainPhoto: (RemotePhotoDuplicate) -> Bool = {
                 descriptor.requiresRelatedMatch ? $0.linkState != .draft : $0.linkState == .active
             }
+            let toProve = Set(
+                remoteItems.filter { countsOnlyUnderTheMainPhoto($0) && $0.contentHash == contentHash }
+                    .compactMap(\.linkID))
             var relatedLinkIDs: Set<String> = []
-            if remoteItems.contains(where: { countsOnlyUnderTheMainPhoto($0) && $0.contentHash == contentHash }),
-                let mainLinkID = descriptor.mainRemoteLinkID
-            {
-                if let read = relatedReads[mainLinkID] {
-                    relatedLinkIDs = read
+            if !toProve.isEmpty, let mainLinkID = descriptor.mainRemoteLinkID {
+                if descriptor.requiresRelatedMatch {
+                    // The main photo of a replacing edit is the upload that just finished, so its list can be read.
+                    if let read = relatedReads.relatedByMain[mainLinkID] {
+                        relatedLinkIDs = read
+                    } else {
+                        relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+                        relatedReads.relatedByMain[mainLinkID] = relatedLinkIDs
+                    }
                 } else {
-                    relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
-                    relatedReads[mainLinkID] = relatedLinkIDs
+                    // The main photo can be in the trash, and the server refuses its list then. The role of each copy
+                    // answers in that case too. A failed read fails the check, like a failed list.
+                    let unasked = toProve.subtracting(relatedReads.askedLinks)
+                    if !unasked.isEmpty {
+                        let read = try await checker.linkVisibility(of: unasked.sorted())
+                        relatedReads.askedLinks.formUnion(unasked)
+                        relatedReads.visibility.merge(read) { _, new in new }
+                    }
+                    relatedLinkIDs = toProve.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
                 }
             }
             return (
@@ -833,6 +847,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
     /// an active row with the member's content exists, so a new series costs no extra request.
+    /// What one resolve learned about the copies that could prove a secondary.
+    private struct RelatedProofReads {
+        var relatedByMain: [String: Set<String>] = [:]
+        var visibility: [String: RemoteLinkVisibility] = [:]
+        var askedLinks: Set<String> = []
+    }
+
     private func burstMemberCandidates(
         _ remoteItems: [RemotePhotoDuplicate],
         contentHash: String,
