@@ -54,6 +54,7 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
     private func purge(
         bundleIdentifier: String? = nil,
         library: URL? = nil,
+        caches: URL? = nil,
         removeItem: (URL) throws -> Void = {
             try TransientPlaintextPurge.removeWithoutFollowingLinks(at: $0, boundary: $0)
         }
@@ -62,7 +63,7 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         return UnusedNetworkStorePurge.purgeOnce(
             defaults: defaults,
             libraryDirectory: library,
-            cachesDirectory: library.appendingPathComponent("Caches", isDirectory: true),
+            cachesDirectory: caches ?? library.appendingPathComponent("Caches", isDirectory: true),
             bundleIdentifier: bundleIdentifier ?? self.bundleIdentifier,
             removeItem: removeItem
         )
@@ -158,6 +159,54 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         XCTAssertEqual(retry.removed, [wal])
         XCTAssertFalse(exists(wal))
         XCTAssertTrue(isDone)
+    }
+
+    func testAnEntryThatVanishesDuringRemovalCountsAsRemoved() throws {
+        try seedUnusedStores()
+
+        let result = try XCTUnwrap(
+            purge(removeItem: { url in
+                try TransientPlaintextPurge.removeWithoutFollowingLinks(at: url, boundary: url)
+                throw CocoaError(.fileNoSuchFile)
+            }))
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.removed.count, 5)
+        XCTAssertTrue(isDone)
+    }
+
+    func testCachesOutsideTheAppLibraryAreRefused() throws {
+        let foreignCaches = root.appendingPathComponent("elsewhere/Caches", isDirectory: true)
+        let foreignCache = foreignCaches.appendingPathComponent("\(bundleIdentifier)/Cache.db")
+        try write(foreignCache)
+        try write(cookies.appendingPathComponent("Cookies.binarycookies"))
+
+        XCTAssertNil(purge(caches: foreignCaches))
+
+        XCTAssertTrue(exists(foreignCache))
+        XCTAssertTrue(exists(cookies.appendingPathComponent("Cookies.binarycookies")))
+        XCTAssertFalse(isDone)
+    }
+
+    func testANamedEntryThatIsALinkIsRemovedAsALink() throws {
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let outsideDatabase = outside.appendingPathComponent("database")
+        let outsideFolder = outside.appendingPathComponent("folder", isDirectory: true)
+        let outsideFolderFile = outsideFolder.appendingPathComponent("entry")
+        try write(outsideDatabase)
+        try write(outsideFolderFile)
+        try FileManager.default.createSymbolicLink(
+            at: urlCache.appendingPathComponent("Cache.db"), withDestinationURL: outsideDatabase)
+        try FileManager.default.createSymbolicLink(
+            at: urlCache.appendingPathComponent("fsCachedData"), withDestinationURL: outsideFolder)
+
+        let result = try XCTUnwrap(purge())
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertFalse(exists(urlCache.appendingPathComponent("Cache.db")))
+        XCTAssertFalse(exists(urlCache.appendingPathComponent("fsCachedData")))
+        XCTAssertTrue(exists(outsideDatabase))
+        XCTAssertTrue(exists(outsideFolderFile))
     }
 
     func testBundleIdentifierCannotLeaveTheCachesDirectory() throws {

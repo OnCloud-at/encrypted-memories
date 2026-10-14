@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// One-time cold-launch removal of the system URL cache and cookie file that the SDK network client
 /// wrote before it switched to an ephemeral session (#605). Nothing ever read them.
@@ -11,6 +12,7 @@ public enum UnusedNetworkStorePurge {
     static let completedKey = "network.unusedStorePurged.v1"
     static let urlCacheEntryNames = ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData"]
     static let cookieFileName = "Cookies.binarycookies"
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "NetworkStorePurge")
 
     public struct Result: Sendable, Equatable {
         public let removed: [URL]
@@ -45,7 +47,11 @@ public enum UnusedNetworkStorePurge {
         removeItem: (URL) throws -> Void
     ) -> Result? {
         guard !defaults.bool(forKey: completedKey) else { return nil }
-        guard isAppContainerLibrary(libraryDirectory) else { return nil }
+        // Both containers must sit in the app's own Library.
+        guard isAppContainerLibrary(libraryDirectory),
+            cachesDirectory.standardizedFileURL.deletingLastPathComponent().path
+                == libraryDirectory.standardizedFileURL.path
+        else { return nil }
 
         var removed: [URL] = []
         var failed: [URL] = []
@@ -66,12 +72,8 @@ public enum UnusedNetworkStorePurge {
             for entry in entries {
                 let target = container.appendingPathComponent(entry).standardizedFileURL
                 guard itemType(at: target) != nil else { continue }
-                do {
-                    try removeItem(target)
-                } catch {
-                    failed.append(target)
-                    continue
-                }
+                // An entry that disappeared on its own during removal counts as removed.
+                try? removeItem(target)
                 if itemType(at: target) == nil {
                     removed.append(target)
                 } else {
@@ -81,6 +83,8 @@ public enum UnusedNetworkStorePurge {
         }
         if failed.isEmpty {
             defaults.set(true, forKey: completedKey)
+        } else {
+            logger.error("Could not remove \(failed.count) unused network store entries; retrying at next launch.")
         }
         return Result(removed: removed, failed: failed)
     }

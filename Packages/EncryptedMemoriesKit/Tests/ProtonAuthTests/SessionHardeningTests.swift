@@ -122,7 +122,8 @@ struct SessionHardeningTests {
         let claim = try #require(BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [root]))
         #expect(
             await ProtonAuthLocalDataPurge.performStartupOffMain(
-                claim: claim, defaults: SendableUserDefaults(defaults), plaintextPurge: { true },
+                claim: claim, defaults: SendableUserDefaults(defaults), unusedNetworkStorePurge: {},
+                plaintextPurge: { true },
                 purgeKeychain: { try ProtonAuthLocalDataPurge.purgeKeychain(using: keychain) }
             ))
         #expect(try store.load() == nil)
@@ -170,6 +171,7 @@ struct SessionHardeningTests {
         let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
             claim: claim,
             defaults: SendableUserDefaults(defaults),
+            unusedNetworkStorePurge: {},
             plaintextPurge: {
                 probe.record("plaintext")
                 return true

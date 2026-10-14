@@ -187,7 +187,7 @@ public enum ProtonAuthLocalDataPurge {
     static func performStartupOffMain(
         claim: BackupLocalDataPurge.Claim?,
         defaults: SendableUserDefaults,
-        unusedNetworkStorePurge: @escaping @Sendable () -> Void = {},
+        unusedNetworkStorePurge: @escaping @Sendable () -> Void,
         plaintextPurge: @escaping @Sendable () -> Bool,
         purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
