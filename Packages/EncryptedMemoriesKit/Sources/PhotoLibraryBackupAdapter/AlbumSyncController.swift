@@ -382,8 +382,7 @@ public final class AlbumSyncController {
             while let album = self?.dequeueNextAlbum() {
                 do {
                     let report = try await runner.sync(album: album, resolution: .automatic)
-                    // Only a finished run replaces the list; a stopped or failed run keeps the previous one.
-                    self?.lastRunStore.record(report.problems, albumID: album.id)
+                    self?.recordFinishedRun(report.problems, albumID: album.id)
                     self?.remoteAlbumsChangedDuringBatch = true
                 } catch let error as AlbumSyncError {
                     switch error {
@@ -391,11 +390,14 @@ public final class AlbumSyncController {
                         self?.recordConflict(album: album, existing: existing)
                     case .stopped:
                         self?.queuedAlbumIDs.removeAll()
+                        self?.reloadSelection()
                     default:
                         self?.lastMessage = error.errorDescription
+                        self?.reloadSelection()
                     }
                 } catch {
                     self?.lastMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self?.reloadSelection()
                 }
             }
             self?.finishSync()
@@ -518,7 +520,7 @@ public final class AlbumSyncController {
 
     // MARK: - Progress mirror (throttled, phase changes immediate)
 
-    private func applyProgress(_ snapshot: AlbumSyncProgress) {
+    func applyProgress(_ snapshot: AlbumSyncProgress) {
         guard snapshot != progress else { return }
         let now = Date()
         if snapshot.phase == progress.phase, now.timeIntervalSince(lastProgressUpdate) < 0.15 {
@@ -526,9 +528,14 @@ public final class AlbumSyncController {
         }
         lastProgressUpdate = now
         progress = snapshot
-        if snapshot.phase == .completed || snapshot.phase == .needsAttention {
-            reloadSelection()
-        }
+    }
+
+    /// Only a finished run replaces the list; a stopped or failed run keeps the previous one. The runner has stored
+    /// the new count before it reports the end of the run, so the row reloads only after the list is stored: it never
+    /// combines the new count with the previous run's list.
+    func recordFinishedRun(_ problems: [BackupFailedItem], albumID: String) {
+        lastRunStore.record(problems, albumID: albumID)
+        reloadSelection()
     }
 
     private func reportMappingStoreUnavailable() {
