@@ -108,6 +108,7 @@ public enum SQLiteStoreSchemaGate {
         } else {
             result = sqlite3_step(statement)
         }
+        // Without a shared cache this probe meets only busy codes; the mask also accepts extended busy codes.
         let primary = result & 0xFF
         return primary == SQLITE_BUSY || primary == SQLITE_LOCKED
     }

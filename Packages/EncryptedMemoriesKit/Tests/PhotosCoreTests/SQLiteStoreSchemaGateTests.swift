@@ -106,4 +106,33 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
         XCTAssertEqual(sqlite3_column_int(statement, 0), 2)
     }
+
+    func testOnlyADatabaseThatAnotherConnectionLocksCountsAsHeld() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let missing = directory.appendingPathComponent("missing.sqlite")
+        XCTAssertFalse(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: missing), "a missing file is not held")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path), "the check creates no file")
+
+        let text = directory.appendingPathComponent("text.sqlite")
+        try Data("not a database".utf8).write(to: text)
+        XCTAssertFalse(
+            SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: text), "a file that is no database is not held")
+
+        let database = directory.appendingPathComponent("held.sqlite")
+        var owner: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &owner), SQLITE_OK)
+        defer { sqlite3_close(owner) }
+        XCTAssertEqual(sqlite3_exec(owner, "CREATE TABLE marker (value INTEGER);", nil, nil, nil), SQLITE_OK)
+        XCTAssertFalse(
+            SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: database),
+            "a readable database without a lock is not held")
+
+        XCTAssertEqual(sqlite3_exec(owner, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(owner, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertTrue(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: database), "an exclusive lock holds the file")
+        XCTAssertEqual(sqlite3_exec(owner, "COMMIT;", nil, nil, nil), SQLITE_OK)
+    }
 }
