@@ -36,6 +36,9 @@ public final class SmartSearchDiscoveryScheduler {
 
     @ObservationIgnored private let runtimeState: LibraryRuntimeState
     @ObservationIgnored private let debounce: Duration
+    /// The wait before each retry of a failed refresh or suggestion save. Its count is the evidence retry budget; the
+    /// save budget stays four attempts.
+    @ObservationIgnored private let retryDelays: [Duration]
     @ObservationIgnored private let placeName: SmartSearchDiscoveryModel.PlaceNameResolver
     @ObservationIgnored private let libraryRows: SmartSearchLibraryRowsCache
     @ObservationIgnored private var input: Input?
@@ -73,10 +76,13 @@ public final class SmartSearchDiscoveryScheduler {
     public init(
         runtimeState: LibraryRuntimeState = .shared,
         debounce: Duration = .milliseconds(250),
+        retryDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(4)],
         placeName: @escaping SmartSearchDiscoveryModel.PlaceNameResolver
     ) {
+        precondition(!retryDelays.isEmpty, "a failed suggestion save needs at least one retry delay")
         self.runtimeState = runtimeState
         self.debounce = debounce
+        self.retryDelays = retryDelays
         self.placeName = placeName
         let libraryRows = SmartSearchLibraryRowsCache()
         self.libraryRows = libraryRows
@@ -621,7 +627,7 @@ public final class SmartSearchDiscoveryScheduler {
             } else if current.key != self.input?.key {
                 self.schedule(after: self.debounce)
             } else {
-                let delays: [Duration] = [.seconds(1), .seconds(2), .seconds(4)]
+                let delays = self.retryDelays
                 if self.pendingPersistenceKey == current.contentKey {
                     guard self.failedPersistenceKey != current.cacheKey else { return }
                     let retry = min(delays.count - 1, max(0, self.persistenceWriteFailures - 1))
