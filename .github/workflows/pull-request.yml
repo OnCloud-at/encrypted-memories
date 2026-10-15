@@ -416,6 +416,51 @@ jobs:
       - if: always()
         run: bash ./scripts/report-build-storage.sh
 
+  # Cancels the rest of a merge queue run as soon as one of its jobs fails, so the other jobs stop using the macOS
+  # runners. The job has no checkout and runs no script or action of the pull request: its code is this block, and it
+  # reads only the run id and the repository. The write scope for Actions exists only here, in no worker job.
+  # No result job needs it and it is not a required check.
+  cancel-on-failure:
+    name: Cancel a queue run after a failure
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run when a job fails
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          workers=("Repository hygiene" "Package verification and style" "iOS verification" "iOS UI verification" "macOS verification")
+          own="Cancel a queue run after a failure"
+          while true; do
+            if ! lines="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
+              --jq '.jobs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>&1)"; then
+              echo "The jobs of the run could not be read; trying again: $lines"
+              sleep 30
+              continue
+            fi
+            failed="$(printf '%s\n' "$lines" | awk -F'\t' -v own="$own" '$1 != own && $3 == "failure" { print $1 }')"
+            if [[ -n "$failed" ]]; then
+              echo "A job failed: $failed"
+              gh run cancel "$GITHUB_RUN_ID" || echo "The cancel request failed."
+              exit 0
+            fi
+            unfinished=0
+            for name in "${workers[@]}"; do
+              status="$(printf '%s\n' "$lines" | awk -F'\t' -v name="$name" '$1 == name { print $2 }')"
+              [[ "$status" == "completed" ]] || unfinished=1
+            done
+            if [[ $unfinished -eq 0 ]]; then
+              echo "All worker jobs finished without a failure."
+              exit 0
+            fi
+            sleep 30
+          done
+
   code-quality:
     name: Swift style
     needs: [package-verification]
