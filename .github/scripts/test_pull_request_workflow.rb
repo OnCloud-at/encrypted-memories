@@ -2,6 +2,9 @@ require "minitest/autorun"
 require "yaml"
 require "open3"
 require "tmpdir"
+require "fileutils"
+require "json"
+require "timeout"
 
 class PullRequestWorkflowTests < Minitest::Test
   WORKFLOWS = File.expand_path("../workflows", __dir__)
@@ -36,6 +39,176 @@ class PullRequestWorkflowTests < Minitest::Test
       job = jobs.find { |candidate| candidate["name"] == name }
       refute_nil job, name
       assert job["if"].nil? || evaluate(job["if"], {"github.event_name" => "merge_group"}), name
+    end
+  end
+
+  WORKER_JOBS = %w[
+    repository-hygiene package-verification ios-verification ios-ui-verification macos-verification
+  ].freeze
+  WATCHDOG = "cancel-on-failure"
+
+  def watchdog
+    @workflow.fetch("jobs").fetch(WATCHDOG)
+  end
+
+  def test_only_the_queue_watchdog_may_write_actions_and_it_runs_no_code_of_the_pull_request
+    assert_equal({"contents" => "read"}, @workflow.fetch("permissions"))
+    jobs = @workflow.fetch("jobs")
+    jobs.each do |name, job|
+      scopes = job.fetch("permissions", {})
+      if name == WATCHDOG
+        assert_equal({"actions" => "write"}, scopes, "the watchdog has no other scope, also no contents")
+      else
+        refute scopes.key?("actions"), "#{name} must not request an actions scope"
+        assert_empty scopes.values - %w[read], "#{name} stays read-only"
+      end
+    end
+    # Only inline shell: no checkout, no action, no script of the pull request.
+    steps = watchdog.fetch("steps")
+    assert_equal 1, steps.length
+    assert_empty steps.first.keys - %w[name env run]
+    refute_match(%r{\./|scripts/|\.github/|\bbash \S+\.sh|\bsource\b|\bcurl\b}, steps.first.fetch("run"))
+    environment = {"GH_TOKEN" => "${{ github.token }}", "GH_REPO" => "${{ github.repository }}"}
+    assert_equal environment, steps.first.fetch("env")
+    # No result job waits for it, and it is not a required check.
+    jobs.each { |name, job| refute_includes Array(job["needs"]), WATCHDOG, name }
+    refute_includes REQUIRED_CHECKS, watchdog.fetch("name")
+    assert_equal "ubuntu-24.04", watchdog.fetch("runs-on")
+    # The longest queue run took 123 minutes. The loop ends before the job limit, which stays below the 180 minute
+    # check timeout of the queue.
+    limit = watchdog.fetch("timeout-minutes")
+    assert_operator limit, :>=, 150
+    assert_operator limit, :<=, 180
+    assert_operator watchdog.fetch("steps").first.fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i, :<, limit * 60
+    {"merge_group" => true, "pull_request" => false, "workflow_dispatch" => false}.each do |event, expected|
+      assert_equal expected, evaluate(watchdog.fetch("if"), {"github.event_name" => event}), event
+    end
+  end
+
+  def test_the_watchdog_reads_the_jobs_of_its_run_and_cancels_that_run_only
+    script = watchdog.fetch("steps").first.fetch("run")
+    assert_includes script, %q(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs" --paginate)
+    assert_includes script, %q(gh run cancel "$GITHUB_RUN_ID")
+    assert_includes script, "while (( SECONDS < deadline )); do"
+    assert_equal 1, script.scan("gh run cancel").length
+    assert_equal 1, script.scan("gh api").length
+    # The jobs that end the watch are the worker jobs of this workflow.
+    names = WORKER_JOBS.map { |id| @workflow.fetch("jobs").fetch(id).fetch("name") }
+    listed = script[/^workers=\((.*)\)$/, 1].scan(/"([^"]+)"/).flatten
+    assert_equal names, listed
+    assert_includes script, %(own="#{watchdog.fetch('name')}")
+  end
+
+  # Runs the real script of the watchdog with a fake `gh` and no waiting. Each element of `responses` is the answer
+  # of one jobs query: an Array of [name, status, conclusion] rows, or :error.
+  def run_watchdog(responses, cancel_exit: 0, cancel_message: "")
+    script = watchdog.fetch("steps").first.fetch("run")
+    Dir.mktmpdir do |dir|
+      bin = File.join(dir, "bin")
+      Dir.mkdir(bin)
+      File.write(File.join(dir, "script.sh"), script)
+      responses.each_with_index do |response, index|
+        jobs = response == :error ? [] : response.map do |name, status, conclusion|
+          {"name" => name, "status" => status, "conclusion" => conclusion.empty? ? nil : conclusion}
+        end
+        File.write(File.join(dir, "response.#{index}"), JSON.generate({"jobs" => jobs}))
+        File.write(File.join(dir, "error.#{index}"), response == :error ? "1" : "0")
+      end
+      File.write(File.join(bin, "gh"), <<~SH)
+        #!/usr/bin/env bash
+        if [[ "$1 $2" == "run cancel" ]]; then
+          echo "$3" >> "#{dir}/cancelled"
+          [[ -z "${FAKE_CANCEL_MESSAGE:-}" ]] || echo "$FAKE_CANCEL_MESSAGE" >&2
+          exit "${FAKE_CANCEL_EXIT:-0}"
+        fi
+        n=$(cat "#{dir}/calls" 2>/dev/null || echo 0)
+        echo $((n + 1)) > "#{dir}/calls"
+        i=$((n < #{responses.length} ? n : #{responses.length} - 1))
+        if [[ "$(cat "#{dir}/error.$i")" == 1 ]]; then echo "HTTP 502" >&2; exit 1; fi
+        # The real filter of the script runs on the JSON of the API.
+        filter=""
+        while [[ $# -gt 0 ]]; do if [[ "$1" == "--jq" ]]; then filter="$2"; fi; shift; done
+        jq -r "$filter" "#{dir}/response.$i"
+      SH
+      # A script that never ends is stopped after 40 waits, so a broken loop fails the test instead of hanging it.
+      File.write(File.join(bin, "sleep"), <<~SH)
+        #!/usr/bin/env bash
+        echo "$1" >> "#{dir}/slept"
+        if [[ $(wc -l < "#{dir}/slept") -ge 40 ]]; then kill -9 "$PPID"; fi
+      SH
+      FileUtils.chmod(0o755, [File.join(bin, "gh"), File.join(bin, "sleep")])
+      env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "GH_REPO" => "owner/repo", "GITHUB_RUN_ID" => "4242",
+             "GH_TOKEN" => "unused", "FAKE_CANCEL_EXIT" => cancel_exit.to_s,
+             "FAKE_CANCEL_MESSAGE" => cancel_message}
+      _out, status = Timeout.timeout(20) { Open3.capture2e(env, "bash", File.join(dir, "script.sh")) }
+      cancelled = File.exist?(File.join(dir, "cancelled")) ? File.read(File.join(dir, "cancelled")).split : []
+      calls = File.exist?(File.join(dir, "calls")) ? File.read(File.join(dir, "calls")).to_i : 0
+      @waits = File.exist?(File.join(dir, "slept")) ? File.read(File.join(dir, "slept")).split : []
+      [status.exitstatus, cancelled, calls]
+    end
+  end
+
+  def workers(status:, conclusion: "success")
+    WORKER_JOBS.map do |id|
+      [@workflow.fetch("jobs").fetch(id).fetch("name"), status, status == "completed" ? conclusion : ""]
+    end
+  end
+
+  def test_the_watchdog_cancels_on_the_first_failed_job_and_ends_when_the_workers_finish
+    own = ["Cancel a queue run after a failure", "in_progress", ""]
+    running = workers(status: "in_progress")
+    failed_ui = workers(status: "in_progress").tap { |rows| rows[3] = [rows[3][0], "completed", "failure"] }
+    # A failure: one cancel of this run, then the job ends.
+    status, cancelled, calls = run_watchdog([running + [own], failed_ui + [own]])
+    assert_equal [0, ["4242"], 2], [status, cancelled, calls]
+    # A failed result job counts as well.
+    result = ["Swift package tests", "completed", "failure"]
+    assert_equal ["4242"], run_watchdog([running + [own, result]])[1]
+    # All workers done without a failure: no cancel.
+    status, cancelled, = run_watchdog([running + [own], workers(status: "completed") + [own]])
+    assert_equal [0, []], [status, cancelled]
+    # Cancelled or skipped jobs are not failures.
+    cancelled_rows = workers(status: "completed").tap do |rows|
+      rows[1..].each_index { |index| rows[index + 1] = [rows[index + 1][0], "completed", "cancelled"] }
+    end + [own]
+    assert_equal [0, []], run_watchdog([cancelled_rows]).first(2)
+    # The own job never counts, also when it shows a failure.
+    own_failed = ["Cancel a queue run after a failure", "completed", "failure"]
+    assert_equal [0, []], run_watchdog([workers(status: "completed") + [own_failed]]).first(2)
+    # A worker job that is not listed yet keeps the watch going until it appears.
+    partial = workers(status: "completed").first(3) + [own]
+    status, cancelled, calls = run_watchdog([partial, partial, workers(status: "completed") + [own]])
+    assert_equal [0, [], 3], [status, cancelled, calls]
+    assert_equal %w[30 30], @waits, "every wait is 30 seconds"
+  end
+
+  def test_the_watchdog_survives_api_errors_and_a_failing_cancel
+    own = ["Cancel a queue run after a failure", "in_progress", ""]
+    failed = workers(status: "completed", conclusion: "failure") + [own]
+    status, cancelled, calls = run_watchdog([:error, :error, failed])
+    assert_equal [0, ["4242"], 3], [status, cancelled, calls]
+    assert_equal ["30", "30"], @waits.first(2), "every wait is 30 seconds"
+    # A cancel request that fails ends the job red (the job is not required), also without a second attempt, unless
+    # the run is already cancelled or completed.
+    status, cancelled, = run_watchdog([failed], cancel_exit: 1, cancel_message: "HTTP 500")
+    assert_equal [1, ["4242"]], [status, cancelled]
+    status, cancelled, = run_watchdog([failed], cancel_exit: 1, cancel_message: "HTTP 409: Cannot cancel a workflow run that is completed")
+    assert_equal [0, ["4242"]], [status, cancelled]
+    # A read that keeps failing ends red after 20 attempts, so that nothing silently watches nothing.
+    status, cancelled, calls = run_watchdog([:error])
+    assert_equal [1, [], 20], [status, cancelled, calls]
+    # A hygiene job that ended without success (a timeout is a cancelled job) cancels the run too; a manual cancel
+    # of the whole run finds an already cancelled run and ends without an error.
+    hygiene_timeout = workers(status: "in_progress").tap { |rows| rows[0] = [rows[0][0], "completed", "cancelled"] }
+    assert_equal ["4242"], run_watchdog([hygiene_timeout + [own]])[1]
+  end
+
+  def test_every_result_job_runs_also_when_a_worker_job_is_cancelled
+    results = @workflow.fetch("jobs").reject { |id, _| WORKER_JOBS.include?(id) || id == WATCHDOG }
+    refute_empty results
+    results.each do |id, job|
+      assert_includes job.fetch("if").to_s, "always()", "#{id}: a cancelled run must still produce a failing check"
+      refute_empty job.fetch("needs"), id
     end
   end
 
