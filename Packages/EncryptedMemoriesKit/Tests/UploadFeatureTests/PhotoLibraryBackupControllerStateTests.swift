@@ -1312,8 +1312,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             _ controller: PhotoLibraryBackupController, _ message: String,
             file: StaticString = #filePath, line: UInt = #line
         ) async throws {
-            // The pass schedules its wake right after it ends; give a wrongly scheduled timer that time.
-            try await Task.sleep(for: .milliseconds(300))
+            // The pass decides its next wake at the end of its completion; check after that decision. A runner snapshot
+            // that reaches the status projector after the completion is not awaited; it can change only the shown
+            // date, never schedule a timer.
+            await controller.waitForSyncRunCompletionForTesting()
             XCTAssertFalse(controller.isAutoResumeScheduledForTesting, message, file: file, line: line)
             XCTAssertFalse(
                 (controller.nextAutomaticAttemptAt ?? .distantPast) > Date(), message, file: file, line: line)
@@ -1366,11 +1368,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 firstNetworkPathWait: .seconds(60))
             defer { fixture.cleanup() }
             let controller = fixture.controller
+            let firstPathWait = holdFirstNetworkPathWait(of: controller)
+            defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             controller.replaceScanForTesting { _ = scans.increment() }
 
             controller.syncNow()
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { firstPathWait.isWaiting }
             XCTAssertEqual(scans.count, 0, "no pass starts before the first network path")
             XCTAssertFalse(controller.isSyncing)
             XCTAssertNotEqual(controller.status.phase, .waitingForWiFi)
@@ -1390,11 +1394,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 firstNetworkPathWait: .seconds(60))
             defer { fixture.cleanup() }
             let controller = fixture.controller
+            let firstPathWait = holdFirstNetworkPathWait(of: controller)
+            defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             controller.replaceScanForTesting { _ = scans.increment() }
 
             controller.syncNow()
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { firstPathWait.isWaiting }
             XCTAssertEqual(scans.count, 0)
 
             runtime.update {
@@ -1443,11 +1449,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 firstNetworkPathWait: .seconds(60))
             defer { fixture.cleanup() }
             let controller = fixture.controller
+            let firstPathWait = holdFirstNetworkPathWait(of: controller)
+            defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             controller.replaceScanForTesting { _ = scans.increment() }
 
             controller.syncNow()
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { firstPathWait.isWaiting }
             XCTAssertEqual(scans.count, 0)
 
             usesMobileData.value = true
@@ -1466,12 +1474,15 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 firstNetworkPathWait: .milliseconds(500))
             defer { fixture.cleanup() }
             let controller = fixture.controller
+            let firstPathWait = holdFirstNetworkPathWait(of: controller)
+            defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             controller.replaceScanForTesting { _ = scans.increment() }
 
             controller.syncNow()
-            try await Task.sleep(for: .milliseconds(200))
+            _ = await waitUntil { firstPathWait.isWaiting }
             XCTAssertEqual(scans.count, 0, "the pass first waits for the path")
+            firstPathWait.releaseAll()
 
             let waiting = await waitUntil(timeout: .seconds(10)) {
                 scans.count == 1 && !controller.isSyncing && controller.status.phase == .waitingForWiFi
@@ -1880,6 +1891,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 firstNetworkPathWait: .seconds(60))
             defer { fixture.cleanup() }
             let controller = fixture.controller
+            let firstPathWait = holdFirstNetworkPathWait(of: controller)
+            defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             controller.replaceScanForTesting { _ = scans.increment() }
             // A system issue with a later retry date holds automatic passes; only an explicit action passes it.
@@ -1893,7 +1906,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             // This explicit action keeps the system issue, unlike "Back up now".
             await controller.retryUserResolvableWork()
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { firstPathWait.isWaiting }
             XCTAssertEqual(scans.count, 0, "the explicit pass waits for the first path")
 
             runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
@@ -1920,6 +1933,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 firstNetworkPathWait: deliverPath ? .seconds(60) : .milliseconds(800))
             defer { fixture.cleanup() }
             let controller = fixture.controller
+            let firstPathWait = holdFirstNetworkPathWait(of: controller)
+            defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             let owners = OwnerRecorder()
             controller.replaceScanForTesting {
@@ -1933,11 +1948,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 _ = windowEnds.increment()
             }
 
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 && firstPathWait.isWaiting }
             XCTAssertEqual(scans.count, 0, "the pass waits for the first path")
             XCTAssertEqual(windowEnds.count, 0, "the window stays open while its pass waits")
             if deliverPath {
                 runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            } else {
+                firstPathWait.releaseAll()
             }
 
             let ended = await waitUntil(timeout: .seconds(5)) { windowEnds.count == 1 }
@@ -1946,7 +1963,6 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(runs.count, 1, "the window received exactly one run")
             XCTAssertEqual(owners.values, [.iOSBackgroundTask], "the pass keeps the kind of the background window")
             await window.value
-            try await Task.sleep(for: .milliseconds(200))
             XCTAssertEqual(windowEnds.count, 1, "the window ends exactly once")
             await controller.shutdown()
         }
@@ -1966,7 +1982,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
                 _ = windowEnds.increment()
             }
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
             XCTAssertEqual(windowEnds.count, 0)
 
             // The iOS expiration handler cancels the work of the window.
@@ -2002,7 +2018,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
                 _ = windowEnds.increment()
             }
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
             window.cancel()
             let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
             XCTAssertTrue(ended)
@@ -2036,7 +2052,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
                 _ = windowEnds.increment()
             }
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
 
             runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
 
@@ -2110,6 +2126,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 firstNetworkPathWait: .seconds(2))
             defer { fixture.cleanup() }
             let controller = fixture.controller
+            let firstPathWait = holdFirstNetworkPathWait(of: controller)
+            defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             controller.replaceScanForTesting { _ = scans.increment() }
             controller.syncNow()
@@ -2118,11 +2136,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
                 _ = windowEnds.increment()
             }
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
             XCTAssertEqual(windowEnds.count, 0, "the window waits for its deferred pass")
             window.cancel()
             let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
             XCTAssertTrue(ended)
+            firstPathWait.releaseAll()
 
             let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 }
             XCTAssertTrue(started, "the foreground pass still starts when its bounded wait ends")
@@ -2143,7 +2162,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 _ = firstEnds.increment()
             }
             defer { first.cancel() }
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
             XCTAssertEqual(firstEnds.count, 0, "the first window waits for its deferred pass")
 
             // The person pauses the backup, so the next window has nothing to start and nothing to wait for.
@@ -2177,7 +2196,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 _ = windowEnds.increment()
             }
             defer { window.cancel() }
-            try await Task.sleep(for: .milliseconds(300))
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
             XCTAssertEqual(windowEnds.count, 0, "the window waits for its deferred pass")
 
             await controller.shutdown()
@@ -2186,6 +2205,16 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(ended, "a sign-out ends the waiting window")
             XCTAssertEqual(runs.count, 0)
             XCTAssertEqual(scans.count, 0)
+        }
+
+        /// Holds the wait for the first network path until the test releases it, so the bounded wait ends on cue.
+        private func holdFirstNetworkPathWait(of controller: PhotoLibraryBackupController) -> HeldBackupSleepClock {
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            controller.replaceFirstNetworkPathSleepForTesting { wait in
+                let (seconds, attoseconds) = wait.components
+                try? await clock.sleep(for: TimeInterval(seconds) + TimeInterval(attoseconds) / 1e18)
+            }
+            return clock
         }
 
         /// Records a remote index issue with a retry date in an hour, which holds every pass except an explicit one.

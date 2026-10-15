@@ -238,6 +238,11 @@ public final class PhotoLibraryBackupController {
         private var passBodyForTesting: (@Sendable () async -> Void)?
         /// Replaces only the PhotoKit scan of a started pass; the runner still drains the queue.
         private var scanBodyForTesting: (@Sendable () async -> Void)?
+        /// Replaces the real sleep of the wait for the first network path, so a test decides when the wait ends.
+        private var firstNetworkPathSleepForTesting: (@Sendable (Duration) async -> Void)?
+        /// Ended passes whose completion (status projection and the next wake) still runs.
+        private var completingSyncRuns = 0
+        private var syncRunCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     #endif
 
     /// Platform hook: invoked with `true` when a backup pass is actively running (so the host app may
@@ -1252,6 +1257,19 @@ public final class PhotoLibraryBackupController {
             passBodyForTesting = body
         }
 
+        internal func replaceFirstNetworkPathSleepForTesting(_ sleep: @escaping @Sendable (Duration) async -> Void) {
+            firstNetworkPathSleepForTesting = sleep
+        }
+
+        /// Returns when every ended pass has finished its completion, including the decision about its next wake.
+        internal func waitForSyncRunCompletionForTesting() async {
+            guard completingSyncRuns > 0 else { return }
+            await withCheckedContinuation { syncRunCompletionWaiters.append($0) }
+        }
+
+        /// Background windows that wait for their deferred pass.
+        internal var deferredStartWaiterCountForTesting: Int { deferredStartWaiters.count }
+
         @discardableResult
         internal func installSyncRunForTesting(
             runID: String,
@@ -1456,8 +1474,15 @@ public final class PhotoLibraryBackupController {
     private func startFirstNetworkPathWait() {
         guard firstNetworkPathWaitTask == nil else { return }
         let wait = firstNetworkPathWait
+        #if DEBUG
+            let testSleep = firstNetworkPathSleepForTesting
+        #endif
         firstNetworkPathWaitTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: wait)
+            #if DEBUG
+                if let testSleep { await testSleep(wait) } else { try? await Task.sleep(for: wait) }
+            #else
+                try? await Task.sleep(for: wait)
+            #endif
             guard let self, !Task.isCancelled else { return }
             self.firstNetworkPathWaitTask = nil
             self.firstNetworkPathWaitEnded = true
@@ -1777,6 +1802,17 @@ public final class PhotoLibraryBackupController {
         lockStore?.release(runID: runID)
         activeRunID = nil
         isSyncing = false
+        #if DEBUG
+            completingSyncRuns += 1
+            defer {
+                completingSyncRuns -= 1
+                if completingSyncRuns == 0 {
+                    let waiters = syncRunCompletionWaiters
+                    syncRunCompletionWaiters.removeAll()
+                    for waiter in waiters { waiter.resume() }
+                }
+            }
+        #endif
         updateIdleTimerIfNeeded()
         isScanning = false
         syncTask = nil
