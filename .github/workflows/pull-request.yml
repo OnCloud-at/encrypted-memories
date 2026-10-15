@@ -198,14 +198,16 @@ jobs:
         run: |
           set -euo pipefail
           name="swift-$SWIFT_VERSION-RELEASE-ubuntu24.04"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+          curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+            --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors --retry-max-time 600 \
             "https://download.swift.org/swift-$SWIFT_VERSION-release/ubuntu2404/swift-$SWIFT_VERSION-RELEASE/$name.tar.gz" \
             --output "$RUNNER_TEMP/swift.tar.gz"
           echo "$SWIFT_SHA256  $RUNNER_TEMP/swift.tar.gz" | sha256sum --check
           mkdir -p "$RUNNER_TEMP/swift"
           tar -xzf "$RUNNER_TEMP/swift.tar.gz" -C "$RUNNER_TEMP/swift" --strip-components=1 \
             "$name/usr/bin/swift-format" "$name/usr/lib"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+          curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+            --connect-timeout 20 --max-time 300 --retry 3 --retry-all-errors --retry-max-time 600 \
             "https://github.com/realm/SwiftLint/releases/download/$SWIFTLINT_VERSION/swiftlint_linux_amd64.zip" \
             --output "$RUNNER_TEMP/swiftlint.zip"
           echo "$SWIFTLINT_SHA256  $RUNNER_TEMP/swiftlint.zip" | sha256sum --check

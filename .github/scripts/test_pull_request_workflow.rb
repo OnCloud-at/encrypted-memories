@@ -260,7 +260,18 @@ class PullRequestWorkflowTests < Minitest::Test
     env = install.fetch("env")
     assert_match(/\A\h{64}\z/, env.fetch("SWIFT_SHA256"))
     assert_match(/\A\h{64}\z/, env.fetch("SWIFTLINT_SHA256"))
-    assert_equal 2, install.fetch("run").scan("sha256sum --check").length
+    script = install.fetch("run")
+    # Each download is checked by a hash that fails the step, before anything is unpacked, over https only.
+    checks = script.lines.select { |line| line.include?("sha256sum") }
+    assert_equal 2, checks.length
+    checks.each { |line| assert_match(/\A\s*echo "\$\{?\w+\}?  \$RUNNER_TEMP\/\S+" \| sha256sum --check\n?\z/, line) }
+    assert script.index("sha256sum").to_i < script.index("tar -xzf")
+    assert script.index("sha256sum", script.index("swiftlint.zip\" ")) < script.index("unzip")
+    assert_match(/\Aset -euo pipefail/, script)
+    assert_equal 2, script.scan("--proto '=https' --proto-redir '=https'").length
+    assert_equal 2, script.scan("--max-time").length
+    assert_equal 2, script.scan("--retry 3").length
+    refute_match(/latest/i, script)
     action = YAML.load_file(File.join(WORKFLOWS, "../actions/install-swiftlint/action.yml"))
     assert_equal action.fetch("runs").fetch("steps").first.fetch("env").fetch("SWIFTLINT_VERSION"), env.fetch("SWIFTLINT_VERSION")
     style = linux.fetch("steps").find { |step| step["id"] == "style" }

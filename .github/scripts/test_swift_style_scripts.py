@@ -31,21 +31,28 @@ class SwiftStyleScripts(unittest.TestCase):
         return subprocess.run(['bash', str(ROOT / 'scripts' / script), *arguments], capture_output=True, text=True,
                               env=env, cwd=ROOT)
 
-    def swiftlint(self, output, status=0):
+    def swiftlint(self, output, status=0, stream='1'):
+        # The real tool prints its warnings on stderr; `stream` 2 does the same.
         return tool(self.dir, 'swiftlint', f'''if [[ "$1" == "version" ]]; then echo 0.65.1; exit 0; fi
 echo "$@" > "{self.dir}/swiftlint-arguments"
-cat <<'TEXT'
+cat <<'TEXT' >&{stream}
 {output}
 TEXT
 exit {status}
 ''')
 
     def test_a_skipped_swiftlint_rule_fails_the_check(self):
-        tool_path = self.swiftlint("warning: Skipping enabled rule 'custom_rules' because it requires SourceKit.")
-        result = self.run_script('lint-swift.sh', self.sample, SWIFTLINT_EXECUTABLE=str(tool_path))
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn('Skipping enabled rule', result.stdout)
-        self.assertIn('style check is incomplete', result.stderr)
+        messages = [
+            "warning: Skipping enabled rule 'custom_rules' because it requires SourceKit and SourceKit access is prohibited.",
+            'warning: SourceKit-based rules will be skipped because sourcekitd has failed.',
+        ]
+        for message in messages:
+            for stream in ['1', '2']:
+                with self.subTest(message=message[:40], stream=stream):
+                    tool_path = self.swiftlint(message, stream=stream)
+                    result = self.run_script('lint-swift.sh', self.sample, SWIFTLINT_EXECUTABLE=str(tool_path))
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn('style check is incomplete', result.stderr)
 
     def test_a_clean_run_passes_and_gets_the_strict_arguments(self):
         tool_path = self.swiftlint('Done linting! Found 0 violations.')
@@ -80,9 +87,27 @@ exit {status}
         result = self.run_script('check-swift-format.sh', self.sample, SWIFT_FORMAT_EXECUTABLE=str(tool_path))
         self.assertEqual(result.returncode, 1)
 
+    def canary_swiftlint(self, fires=True):
+        # The canary file has a forbidden comment: a working SwiftLint reports it with exit 2.
+        body = f'''if [[ "$1" == "version" ]]; then echo 0.65.1; exit 0; fi
+for argument in "$@"; do
+  if [[ "$argument" == *StyleCanary.swift ]]; then {'echo "canary: no_em_dash_in_comments"; exit 2' if fires else 'exit 0'}; fi
+done
+echo "Done linting!"
+'''
+        return tool(self.dir, 'swiftlint', body)
+
+    def test_a_swiftlint_that_does_not_report_the_canary_fails_the_check(self):
+        swiftlint = self.canary_swiftlint(fires=False)
+        format_tool = tool(self.dir, 'swift-format', 'exit 0\n')
+        result = self.run_script('verify-swift-style.sh', SWIFTLINT_EXECUTABLE=str(swiftlint),
+                                 SWIFT_FORMAT_EXECUTABLE=str(format_tool))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('does not run completely', result.stderr)
+
     def test_the_style_script_checks_the_changed_files_with_a_base_commit_and_all_files_without_one(self):
         head = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True, cwd=ROOT).stdout.strip()
-        swiftlint = self.swiftlint('Done linting!')
+        swiftlint = self.canary_swiftlint()
         format_tool = tool(self.dir, 'swift-format', f'echo "$#" > "{self.dir}/format-count"\n')
         for base, expected in [(head, 'No changed Swift files require linting.'), ('', 'Done linting')]:
             with self.subTest(base=bool(base)):
