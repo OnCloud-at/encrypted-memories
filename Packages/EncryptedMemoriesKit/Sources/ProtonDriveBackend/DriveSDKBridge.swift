@@ -4,6 +4,7 @@ import Foundation
 import PhotosCore
 import ProtonAuth
 import ProtonDriveSDK
+import Synchronization
 import UploadCore
 
 private typealias LibraryPhotoTag = PhotosCore.PhotoTag
@@ -33,6 +34,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let timelineOrderStore: TimelineOrderMetadataStore?
     /// Holds the timeline metadata pass while the first full remote index build of this launch runs.
     private nonisolated let firstIndexBuildGate: TimelineMetadataStartGate
+    /// The duplicate service of this account. Shutdown ends its remote index build before the account's stores close.
+    private nonisolated let uploadDedupeService = Mutex<ProtonUploadDedupeService?>(nil)
     private let metadataReconciliation: TimelineMetadataReconciliation
     /// Drive key-derivation + block decryption for video streaming (built once at sign-in).
     private let crypto: DriveCrypto
@@ -253,6 +256,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         _ = await timelineTask?.result
         await metadataReconciliation.waitForCurrentPass()
         await trashTask?.value
+        // A cancelled waiter no longer waits for the remote index build; end the build before the identity stores
+        // close after this shutdown. Releasing the service also ends its reference back to this bridge.
+        let dedupeService = uploadDedupeService.withLock { service in
+            defer { service = nil }
+            return service
+        }
+        await dedupeService?.shutdown()
         timelineOrderStore?.close()
         timelineStore?.close()
         await photosClient.shutdown()
@@ -2235,6 +2245,7 @@ extension DriveSDKBridge: PhotoUploading {
         ) { [self] in
             try await photosShareContext()
         }
+        uploadDedupeService.withLock { $0 = service }
         let pipeline = UploadDedupePipeline(
             store: store,
             checker: service,

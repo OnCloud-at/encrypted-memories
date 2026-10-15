@@ -66,6 +66,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private var remoteContentIndexTask: Task<Void, any Error>?
     /// Names the build in `remoteContentIndexTask`, so a build that ends clears only itself.
     private var remoteContentIndexBuild = 0
+    /// A preparation stopped waiting while a build ran; the timeline metadata pass then waits for that build to end.
+    private var metadataPassWaitsForBuild = false
+    /// Set when the account's work ends. No build starts after it.
+    private var isShutDown = false
     private var remoteIndexProgressHandlers: [UUID: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void] =
         [:]
     private var remoteContentIndexGeneration = 0
@@ -376,7 +380,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         firstBuildGate?.buildStarted()
         // A finished or failed preparation releases the timeline metadata pass held for the first full build. A
         // cancelled preparation leaves a running build, which releases the pass when it ends.
-        defer { if remoteContentIndexTask == nil { firstBuildGate?.open() } }
+        defer {
+            if remoteContentIndexTask == nil {
+                metadataPassWaitsForBuild = false
+                firstBuildGate?.open()
+            } else {
+                metadataPassWaitsForBuild = true
+            }
+        }
         await progress(.init(phase: .loading))
         defer { remoteIndexProgressHandlers[token] = nil }
         let material = try await resolveMaterial()
@@ -410,6 +421,18 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     func remoteMainsChangedHere() async {
         remoteMainsChangedCount += 1
         lastRemoteContentRefreshAt = nil
+    }
+
+    /// Ends the running index build before the account's stores close, and lets no new build start. The build keeps its
+    /// resumable position for the next sign-in of the account.
+    func shutdown() async {
+        isShutDown = true
+        remoteContentIndexGeneration += 1
+        lastRemoteContentRefreshAt = nil
+        let running = remoteContentIndexTask
+        remoteContentIndexTask = nil
+        running?.cancel()
+        _ = await running?.result
     }
 
     func invalidateCachedRemoteState() async {
@@ -494,6 +517,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             if let newer = remoteContentIndexTask, newer != running { try await newer.valueUntilCancelled() }
         }
 
+        // A pass that is already cancelled, or an account that is shutting down, starts no build.
+        try Task.checkCancellation()
+        guard !isShutDown else { throw CancellationError() }
         let session = self.session
         let crypto = self.crypto
         let store = self.contentIndexStore
@@ -526,12 +552,15 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     }
 
     private func finishRemoteContentIndexBuild(_ build: Int, generation: Int, leftAtStart: Int, succeeded: Bool) {
-        // A preparation that stopped waiting left the metadata pass held for this build. A preparation that still
-        // waits releases the pass itself when it ends, after its last progress.
-        if remoteIndexProgressHandlers.isEmpty { firstBuildGate?.open() }
-        guard remoteContentIndexGeneration == generation else { return }
-        if remoteContentIndexBuild == build { remoteContentIndexTask = nil }
-        if succeeded, remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
+        if remoteContentIndexGeneration == generation {
+            if remoteContentIndexBuild == build { remoteContentIndexTask = nil }
+            if succeeded, remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
+        }
+        // A preparation that stopped waiting left the metadata pass held for the build; it starts when no build runs.
+        if metadataPassWaitsForBuild, remoteContentIndexTask == nil {
+            metadataPassWaitsForBuild = false
+            firstBuildGate?.open()
+        }
     }
 
     private func emitRemoteIndexProgress(_ value: UploadRemoteIndexPreparationProgress) async {
