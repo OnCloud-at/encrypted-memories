@@ -84,7 +84,13 @@ public final class TimelineOrderMetadataStore {
                 stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK })
         }
         db = open()
-        if db == nil, SQLiteStoreSchemaGate.removeDatabaseFiles(at: url) { db = open() }
+        // A cache that another connection holds for now stays on disk, so the next open of the store, at the next
+        // launch or sign-in, can read it. Every other failed open replaces the cache as before.
+        if db == nil, !SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: url),
+            SQLiteStoreSchemaGate.removeDatabaseFiles(at: url)
+        {
+            db = open()
+        }
         guard db != nil else { return nil }
         var check: OpaquePointer?
         let valid =
