@@ -86,11 +86,6 @@ public protocol PhotoUploading: Sendable {
 }
 
 public extension PhotoUploading {
-    /// A reservation that coordinates with nothing. The production uploader shares one admission per account.
-    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
-        try await UploadNetworkAdmission().reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
-    }
-
     func pause(token: UUID) async throws {}
     func resume(token: UUID) async throws {}
     func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {}
