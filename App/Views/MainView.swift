@@ -1546,6 +1546,13 @@ struct MainView: View {
                         Label(L10n.string("map.scan_failed_title"), systemImage: "exclamationmark.triangle")
                     } description: {
                         Text(L10n.string("map.scan_failed_message"))
+                    } actions: {
+                        // Scans the whole library again, like the automatic start and the iPhone map; the route
+                        // left under the map may hold only an album, a tag or Recently Deleted.
+                        RetryButton(.prominent) {
+                            OfflineLibraryManager.shared.restartLocationCrawl(
+                                items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
+                        }
                     }
                 case .completed:
                     ContentUnavailableView {
