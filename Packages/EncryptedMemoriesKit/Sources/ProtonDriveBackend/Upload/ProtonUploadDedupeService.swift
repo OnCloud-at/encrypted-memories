@@ -64,6 +64,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private var material: Material?
     private var materialTask: Task<Material, any Error>?
     private var remoteContentIndexTask: Task<Void, any Error>?
+    /// Names the build in `remoteContentIndexTask`, so a build that ends clears only itself.
+    private var remoteContentIndexBuild = 0
+    /// Every build that has not ended, also one that an invalidation cancelled. Shutdown waits for all of them.
+    private var unfinishedRemoteContentIndexBuilds: [Int: Task<Void, any Error>] = [:]
+    /// A preparation stopped waiting while a build ran; the timeline metadata pass then waits for that build to end.
+    private var metadataPassWaitsForBuild = false
+    /// Set when the account's work ends. No build starts after it.
+    private var isShutDown = false
     private var remoteIndexProgressHandlers: [UUID: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void] =
         [:]
     private var remoteContentIndexGeneration = 0
@@ -372,8 +380,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let token = UUID()
         remoteIndexProgressHandlers[token] = progress
         firstBuildGate?.buildStarted()
-        // A finished or failed preparation releases the timeline metadata pass held for the first full build.
-        defer { firstBuildGate?.open() }
+        // A finished or failed preparation releases the timeline metadata pass held for the first full build. A
+        // cancelled preparation leaves a running build, which releases the pass when it ends.
+        defer {
+            if remoteContentIndexTask == nil {
+                metadataPassWaitsForBuild = false
+                firstBuildGate?.open()
+            } else {
+                metadataPassWaitsForBuild = true
+            }
+        }
         await progress(.init(phase: .loading))
         defer { remoteIndexProgressHandlers[token] = nil }
         let material = try await resolveMaterial()
@@ -409,7 +425,27 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         lastRemoteContentRefreshAt = nil
     }
 
+    /// Ends the running index build before the account's stores close, and lets no new build start. The build keeps its
+    /// resumable position for the next sign-in of the account.
+    func shutdown() async {
+        isShutDown = true
+        remoteContentIndexGeneration += 1
+        lastRemoteContentRefreshAt = nil
+        remoteContentIndexTask = nil
+        let unfinished = Array(unfinishedRemoteContentIndexBuilds.values)
+        for build in unfinished { build.cancel() }
+        for build in unfinished { _ = await build.result }
+    }
+
+    /// True while a build has not ended.
+    var hasUnfinishedRemoteContentIndexBuild: Bool { !unfinishedRemoteContentIndexBuilds.isEmpty }
+
+    /// The builds that have not ended.
+    var unfinishedRemoteContentIndexBuildCount: Int { unfinishedRemoteContentIndexBuilds.count }
+
     func invalidateCachedRemoteState() async {
+        // Callers that hold the service directly can reach it after the shutdown. The stores may be closed by then.
+        guard !isShutDown else { return }
         remoteContentIndexGeneration += 1
         lastRemoteContentRefreshAt = nil
         remoteContentIndexTask?.cancel()
@@ -420,7 +456,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     }
 
     func recordUploaded(contentHash: String, remoteLinkID: String) async {
-        guard let material = try? await resolveMaterial() else { return }
+        // The check follows the `await`: a shutdown can begin while the material resolves.
+        guard let material = try? await resolveMaterial(), !isShutDown else { return }
         _ = contentIndexStore.upsertRemoteContentRecord(
             UploadRemoteContentIndexRecord(
                 contentHash: contentHash,
@@ -484,13 +521,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         if let running = remoteContentIndexTask {
             let leftBefore = remoteMainsChangedCount
-            try await running.value
+            try await running.valueUntilCancelled()
             guard rebuildsMissingLineage || remoteMainsChangedCount != leftBefore else { return }
             // A rebuild, and a refresh after a trash during the running one, run after the refreshes that started
             // before them, never beside them.
-            if let newer = remoteContentIndexTask, newer != running { try await newer.value }
+            if let newer = remoteContentIndexTask, newer != running { try await newer.valueUntilCancelled() }
         }
 
+        // A pass that is already cancelled, or an account that is shutting down, starts no build.
+        try Task.checkCancellation()
+        guard !isShutDown else { throw CancellationError() }
         let session = self.session
         let crypto = self.crypto
         let store = self.contentIndexStore
@@ -500,22 +540,45 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] value in
             await self?.emitRemoteIndexProgress(value)
         }
-        let task = Task {
-            try await Self.refreshRemoteContentIndex(
-                material: material, session: session, crypto: crypto, store: store,
-                lineageStore: lineageStore, rebuildsMissingLineage: rebuildsMissingLineage, progress: report)
+        remoteContentIndexBuild += 1
+        let build = remoteContentIndexBuild
+        // The build records its own end. A waiter whose task is cancelled, for example by an expiring background
+        // window, stops waiting at once; the build keeps running for later waiters and keeps its resumable cursor.
+        let task = Task { [weak self] in
+            do {
+                try await Self.refreshRemoteContentIndex(
+                    material: material, session: session, crypto: crypto, store: store,
+                    lineageStore: lineageStore, rebuildsMissingLineage: rebuildsMissingLineage, progress: report)
+                await self?.finishRemoteContentIndexBuild(
+                    build, material: material, rebuiltLineage: rebuildsMissingLineage, generation: generation,
+                    leftAtStart: leftAtStart, succeeded: true)
+            } catch {
+                await self?.finishRemoteContentIndexBuild(
+                    build, material: material, rebuiltLineage: rebuildsMissingLineage, generation: generation,
+                    leftAtStart: leftAtStart, succeeded: false)
+                throw error
+            }
         }
         remoteContentIndexTask = task
-        do {
-            try await task.value
-            guard remoteContentIndexGeneration == generation else { throw CancellationError() }
-            if remoteContentIndexTask == task { remoteContentIndexTask = nil }
-            if remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
-        } catch {
-            if remoteContentIndexGeneration == generation, remoteContentIndexTask == task {
-                remoteContentIndexTask = nil
-            }
-            throw error
+        unfinishedRemoteContentIndexBuilds[build] = task
+        try await task.valueUntilCancelled()
+        guard remoteContentIndexGeneration == generation else { throw CancellationError() }
+    }
+
+    private func finishRemoteContentIndexBuild(
+        _ build: Int, material: Material, rebuiltLineage: Bool, generation: Int, leftAtStart: Int, succeeded: Bool
+    ) {
+        unfinishedRemoteContentIndexBuilds[build] = nil
+        if remoteContentIndexGeneration == generation {
+            if remoteContentIndexBuild == build { remoteContentIndexTask = nil }
+            if succeeded, remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
+        }
+        // A preparation that stopped waiting left the metadata pass held for the first full build. The pass starts
+        // when no build runs and that build ended: this one rebuilt the lineage, or no lineage rebuild is still due.
+        let firstFullBuildEnded = rebuiltLineage || !rebuildsMissingLineage(material: material)
+        if metadataPassWaitsForBuild, remoteContentIndexTask == nil, firstFullBuildEnded {
+            metadataPassWaitsForBuild = false
+            firstBuildGate?.open()
         }
     }
 
@@ -1186,5 +1249,53 @@ extension DriveSession {
             retryOnRateLimit: true
         )
         return (try JSONDecoder().decode(PhotoDuplicatesResponse.self, from: data)).duplicateHashes ?? []
+    }
+}
+
+extension Task where Success: Sendable, Failure == any Error {
+    /// The task's result for one waiter. A cancelled waiter throws `CancellationError` at once; the task itself keeps
+    /// running for its other waiters.
+    fileprivate func valueUntilCancelled() async throws -> Success {
+        let waiter = CancellableTaskWaiter<Success>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard waiter.attach(continuation) else { return }
+                Task<Void, Never> { waiter.resume(with: await self.result) }
+            }
+        } onCancel: {
+            waiter.cancel()
+        }
+    }
+}
+
+/// Resumes one waiter once, with the first of the task's result and the waiter's cancellation.
+private final class CancellableTaskWaiter<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, any Error>?
+    private var outcome: Result<Value, any Error>?
+
+    /// False when the waiter was already cancelled; the continuation is then resumed.
+    func attach(_ continuation: CheckedContinuation<Value, any Error>) -> Bool {
+        let outcome = lock.withLock { () -> Result<Value, any Error>? in
+            if self.outcome == nil { self.continuation = continuation }
+            return self.outcome
+        }
+        guard let outcome else { return true }
+        continuation.resume(with: outcome)
+        return false
+    }
+
+    func cancel() {
+        resume(with: .failure(CancellationError()))
+    }
+
+    func resume(with result: Result<Value, any Error>) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Value, any Error>? in
+            guard outcome == nil else { return nil }
+            outcome = result
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(with: result)
     }
 }
