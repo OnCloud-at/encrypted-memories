@@ -669,10 +669,12 @@ struct MobilePhotoViewer: View {
         let albums = libraryModel.facade?.albums
         isLoadingAlbumMemberships = albums != nil
         let coordinator = titleMetadataCoordinator
+        // A retry, a privacy change or an album change keeps the photo but starts a new run.
+        let run = metadataTaskID
         await ViewerInfoPublication.run(
             metadata: { await coordinator.resolve(item) },
             memberships: { await Self.albumTitles(of: uid, in: albums) },
-            isCurrent: { currentBaseItem?.uid == uid },
+            isCurrent: { metadataTaskID == run },
             publishMetadata: { resolution in
                 titleMetadataState = .resolved(resolution)
                 metadataLoadState = resolution.metadataLoadState
