@@ -298,18 +298,13 @@ final class MobileLibraryModel {
     }
 
     /// Encrypted GPS index shared with the Map tab. The per-account key protects it at rest.
-    let locationIndex = PhotoLocationIndex()
+    var locationIndex: PhotoLocationIndex { locationCrawl.index }
     /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
     @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
-    private var locationPrivacyStopTask: Task<Void, Never>?
-    private let locationStore = PhotoLocationStore()
-    private let locationCrawl = LocationCrawl()
-    private var locationCrawlStarted = false
-    private var locationCrawlGeneration: UInt64 = 0
-    private var locationCrawlStartTask: Task<Void, Never>?
-    private var locationInventoryRevision: UInt64 = 0
-    private var locationCrawlInventoryRevision: UInt64 = 0
-    private var locationInventoryTask: Task<LocationCrawlInventory, Never>?
+    private var locationStore: PhotoLocationStore { locationCrawl.store }
+    /// The GPS crawl session shared with macOS. Startup restores the location cache before a crawl can start.
+    @ObservationIgnored private let locationCrawl = LocationCrawlSession(
+        platform: .init(headStart: .seconds(3), requiresStoreSession: true))
 
     /// Encrypted thumbnail cache retained for Settings diagnostics and clear actions. Decoded previews remain
     /// in RAM, while video bytes are managed by the backend.
@@ -640,7 +635,7 @@ final class MobileLibraryModel {
         }.value
         try requireCurrentMutation(mutationLease)
         guard generation == timelineMutationGeneration else { return }
-        let shouldRestartLocationCrawl = locationCrawlStarted
+        let shouldRestartLocationCrawl = locationCrawl.isStarted
         publish(result.0, locationInventoryChanged: true)
         apply(.inventoryResolved(count: result.0.snapshot.count, cached: false))
         await locationIndex.retainOnly(
@@ -650,7 +645,7 @@ final class MobileLibraryModel {
         )
         try requireCurrentMutation(mutationLease)
         if shouldRestartLocationCrawl {
-            locationCrawlStarted = false
+            locationCrawl.prepareRestart()
             startLocationCrawlIfNeeded()
         }
     }
@@ -1041,127 +1036,28 @@ final class MobileLibraryModel {
         guard
             MapAndPlacesPolicy.allowsLocationCrawl(
                 enabled: MapAndPlacesPolicy.isEnabled(), itemCount: items.count),
-            !locationCrawlStarted, let backend, let cacheContext
+            !locationCrawl.isStarted, let backend, let cacheContext
         else { return }
-        locationCrawlStarted = true
-        locationCrawlGeneration &+= 1
-        let crawlGeneration = locationCrawlGeneration
         let loadGeneration = loadToken
         let accountUID = cacheContext.accountUID
-        let previousStarter = locationCrawlStartTask
-        let previousPrivacyStop = locationPrivacyStopTask
-        previousStarter?.cancel()
-
-        // Reuse the latest off-actor projection when available. The fallback covers tests or an early Map open.
-        let initialItems = items
-        let inventoryTask =
-            locationInventoryTask
-            ?? Task.detached(priority: .utility) {
-                LocationCrawlInventory(items: initialItems)
-            }
-        locationInventoryTask = inventoryTask
-        locationCrawlInventoryRevision = locationInventoryRevision
-        let index = locationIndex
-        let store = locationStore
-        let crawl = locationCrawl
         let feed = thumbnailFeed
-        let governor = LibraryWorkloadGovernorPolicy()
-        locationCrawlStartTask = Task { @MainActor [weak self, previousStarter, previousPrivacyStop] in
-            await previousPrivacyStop?.value
-            await previousStarter?.value
-            guard let self,
-                !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            // Startup already restored the account's location cache. Map entry only resumes its crawl.
-            await crawl.cancel()
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            guard let sessionLease = store.captureSessionLease() else { return }
-            let initialInventory = await inventoryTask.value
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            // Give thumbnail crawling a head start, then yield to visible demand. Do not use
-            // `hasPendingThumbnailWork()` because it includes whole-library fill and can starve map indexing.
-            do {
-                try await Task.sleep(for: .seconds(3))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled,
-                store.isCurrentSessionLease(sessionLease),
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            await crawl.start(
-                uids: initialInventory.uids,
-                captureDates: initialInventory.captureDates,
+        locationCrawl.start(
+            items: items,
+            LocationCrawlSession.Start(
                 accountUID: accountUID,
                 location: LocationCrawl.metadataProbe(backend),
-                index: index,
-                store: store,
-                shouldYield: {
-                    let applicationIsActive = await MainActor.run { self.applicationIsActive }
-                    guard applicationIsActive else { return true }
-                    let visibleDemand = await feed?.hasVisibleThumbnailPressure() ?? false
-                    return governor.budget(
-                        for: .backgroundLocationCrawl,
-                        signals: LibraryWorkloadSignals(hasVisibleMediaDemand: visibleDemand)
-                    ).shouldYield
-                },
+                visibleDemand: { await feed?.hasVisibleThumbnailPressure() ?? false },
+                yieldsAlways: { [weak self] in await MainActor.run { !(self?.applicationIsActive ?? false) } },
                 log: { DebugLog.log($0) },
-                inventory: { @MainActor [weak self] in
-                    guard let self, let task = self.locationInventoryTask else {
-                        return LocationCrawlInventory()
-                    }
-                    let revision = self.locationInventoryRevision
-                    let inventory = await task.value
-                    self.locationCrawlInventoryRevision = max(
-                        self.locationCrawlInventoryRevision,
-                        revision
-                    )
-                    return inventory
-                }
+                isCurrent: { [weak self] in loadGeneration == self?.loadToken && self?.session?.uid == accountUID },
+                restartForNewerInventory: { [weak self] in self?.startLocationCrawlIfNeeded() }
             )
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID
-            else {
-                await crawl.cancel()
-                return
-            }
-            if self.locationCrawlInventoryRevision != self.locationInventoryRevision {
-                self.locationCrawlStarted = false
-                self.startLocationCrawlIfNeeded()
-            }
-        }
+        )
     }
 
     func pauseMapAndPlaces() {
         mapPrewarmer.cancel()
-        locationCrawlGeneration &+= 1
-        locationCrawlStarted = false
-        locationCrawlStartTask?.cancel()
-        let previousStop = locationPrivacyStopTask
-        let crawl = locationCrawl
-        locationPrivacyStopTask = Task {
-            await previousStop?.value
-            await crawl.cancel()
-        }
+        locationCrawl.pause()
     }
 
     func resumeMapAndPlaces() {
@@ -1172,7 +1068,7 @@ final class MobileLibraryModel {
 
     func restartLocationCrawlIfNeeded() {
         guard !items.isEmpty else { return }
-        locationCrawlStarted = false
+        locationCrawl.prepareRestart()
         startLocationCrawlIfNeeded()
     }
 
@@ -1244,8 +1140,8 @@ final class MobileLibraryModel {
         let activeRefreshCoalescer = libraryRefreshCoalescer
         let activeUploadRefreshCoordinator = uploadRefreshCoordinator
         let activeChangeMonitor = libraryChangeMonitor
-        let activeLocationCrawl = locationCrawl
-        let activeLocationCrawlStarter = locationCrawlStartTask
+        let activeLocationCrawl = locationCrawl.crawl
+        let activeLocationCrawlStarter = locationCrawl.startingTask
         searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
@@ -1264,12 +1160,7 @@ final class MobileLibraryModel {
         seriesDissolutionTask = nil
         favoriteState.reset(keepingFavorites: true)
         let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
-        locationCrawlGeneration &+= 1
-        activeLocationCrawlStarter?.cancel()
-        locationCrawlStartTask = nil
-        locationCrawlStarted = false
-        locationInventoryTask?.cancel()
-        locationInventoryTask = nil
+        locationCrawl.retire()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating
@@ -1343,8 +1234,8 @@ final class MobileLibraryModel {
         let activeRefreshCoalescer = libraryRefreshCoalescer
         let activeUploadRefreshCoordinator = uploadRefreshCoordinator
         let activeChangeMonitor = libraryChangeMonitor
-        let activeLocationCrawl = locationCrawl
-        let activeLocationCrawlStarter = locationCrawlStartTask
+        let activeLocationCrawl = locationCrawl.crawl
+        let activeLocationCrawlStarter = locationCrawl.startingTask
         let activeLocationIndex = locationIndex
         let activeRetry = retryTask
         let activeScopeRecovery = scopeRecoveryCoordinator.cancel()
@@ -1391,9 +1282,7 @@ final class MobileLibraryModel {
         thumbnailCache = nil
         originalsCache = nil
         loadState = .initial
-        locationCrawlStarted = false
-        locationInventoryTask?.cancel()
-        locationInventoryTask = nil
+        locationCrawl.resetForTeardown()
         locationIndex.replaceAll([])
         locationIndex.updateScanProgress(PhotoLocationScanProgress())
         var teardownOwners = [
@@ -1827,26 +1716,16 @@ final class MobileLibraryModel {
         publishPrimaryInventory: Bool = true
     ) {
         if locationInventoryChanged {
-            let locationItems = projection.snapshot.items
-            locationInventoryTask?.cancel()
-            locationInventoryTask = Task.detached(priority: .utility) {
-                LocationCrawlInventory(items: locationItems)
-            }
+            locationCrawl.updateInventory(projection.snapshot.items)
         }
         snapshot = projection.snapshot
         sections = projection.sections
         timelineRevision &+= 1
-        if locationInventoryChanged {
-            locationInventoryRevision &+= 1
-        }
         if publishPrimaryInventory {
             publishSmartSearchInventory(projection.snapshot.items)
         }
-        if locationCrawlStarted,
-            locationCrawlInventoryRevision != locationInventoryRevision,
-            locationIndex.scanProgress.phase == .completed || locationIndex.scanProgress.phase == .failed
-        {
-            locationCrawlStarted = false
+        if locationCrawl.finishedWithOutdatedInventory {
+            locationCrawl.prepareRestart()
             startLocationCrawlIfNeeded()
         }
     }

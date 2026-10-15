@@ -41,16 +41,14 @@ final class OfflineLibraryManager {
     /// (`PhotoLocationStore`, same per-account key as the media caches) and decrypted only into the in-memory
     /// `PhotoLocationIndex`. Filled by a low-priority background crawl behind the thumbnail crawl; purged on
     /// sign-out. The Map UI binds to `locationIndex`.
-    let locationStore = PhotoLocationStore()
-    let locationIndex = PhotoLocationIndex()
+    var locationStore: PhotoLocationStore { locationCrawl.store }
+    var locationIndex: PhotoLocationIndex { locationCrawl.index }
     /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
     @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
-    private let locationCrawl = LocationCrawl()
-    private var locationPrivacyStopTask: Task<Void, Never>?
-    private var locationCrawlStarted = false
-    private var locationCrawlGeneration: UInt64 = 0
+    /// The GPS crawl session shared with iOS. The account configuration and the prewarmer stay here.
+    @ObservationIgnored private let locationCrawl = LocationCrawlSession(
+        platform: .init(headStart: .seconds(8), requiresStoreSession: false))
     private var locationConfigurationGeneration: UInt64 = 0
-    private var locationCrawlStartTask: Task<Void, Never>?
     private var locationConfigurationTask: Task<Void, Never>?
     private var originalsCapEnforcementTask: Task<Void, Never>?
     /// Admission for account-bound cap passes. Teardown closes it before its first suspension, so a Settings
@@ -58,7 +56,6 @@ final class OfflineLibraryManager {
     /// next `configure(session:)`.
     private var originalsCapGate = JoinedShutdownGate()
     private var configuredAccountUID: String?
-    private var latestLocationInventoryTask: Task<LocationCrawlInventory, Never>?
 
     /// Persisted switch for retaining viewed originals in the encrypted cache up to the configured cap.
     /// Thumbnail crawling is independent of this setting.
@@ -170,17 +167,14 @@ final class OfflineLibraryManager {
         // publication; account teardown still joins readers before closing provider stores.
         statsSession = statsCoordinator.beginSession()
         context.configure(cache, previewCache, originalsCache)
-        let previousCrawlStarted = locationCrawlStarted
+        let previousCrawlStarted = locationCrawl.isStarted
         let accountChanged = previousAccountUID != nil && previousAccountUID != context.accountUID
-        locationCrawlGeneration &+= 1
         locationConfigurationGeneration &+= 1
         let configurationGeneration = locationConfigurationGeneration
-        locationCrawlStarted = false
         configuredAccountUID = context.accountUID
         let previousConfiguration = locationConfigurationTask
-        let previousStarter = locationCrawlStartTask
         previousConfiguration?.cancel()
-        previousStarter?.cancel()
+        let previousStarter = locationCrawl.invalidate()
         if accountChanged {
             locationIndex.replaceAll([])
             locationIndex.updateScanProgress(PhotoLocationScanProgress())
@@ -196,7 +190,7 @@ final class OfflineLibraryManager {
                 self.configuredAccountUID == accountUID
             else { return }
             if previousCrawlStarted {
-                await self.locationCrawl.cancel()
+                await self.locationCrawl.crawl.cancel()
             }
             guard !Task.isCancelled,
                 self.locationConfigurationGeneration == configurationGeneration,
@@ -243,25 +237,19 @@ final class OfflineLibraryManager {
     func stopForAccountTeardown() async {
         originalsCapGate.closeAdmission()
         let retiringStatsSession = statsTeardownSession
-        let activeLocationCrawlStarter = locationCrawlStartTask
         let activeLocationConfiguration = locationConfigurationTask
         let activeFeed = feed
-        locationCrawlGeneration &+= 1
         locationConfigurationGeneration &+= 1
-        activeLocationCrawlStarter?.cancel()
+        let activeLocationCrawlStarter = locationCrawl.retire()
         activeLocationConfiguration?.cancel()
-        locationCrawlStartTask = nil
         locationConfigurationTask = nil
         locationIndex.replaceAll([])
         locationIndex.updateScanProgress(PhotoLocationScanProgress())
-        locationCrawlStarted = false
         let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
         feed = nil
         statsProvider = nil
         liveAssetCount = 0
         configuredAccountUID = nil
-        latestLocationInventoryTask?.cancel()
-        latestLocationInventoryTask = nil
         await activeLocationConfiguration?.value
         await activeLocationCrawlStarter?.value
         await activeThumbnailUpdateTask?.value
@@ -273,7 +261,7 @@ final class OfflineLibraryManager {
             if statsTeardownSession == retiringStatsSession { statsTeardownSession = nil }
         }
         await activeFeed?.stopPrefetch()
-        await locationCrawl.cancel()
+        await locationCrawl.crawl.cancel()
         // A non-cooperative metadata probe can return after the eager UI clear above but before the
         // joined Core cancellation completes. Clear once more at the retirement barrier.
         locationIndex.replaceAll([])
@@ -303,105 +291,26 @@ final class OfflineLibraryManager {
             MapAndPlacesPolicy.allowsLocationCrawl(
                 enabled: MapAndPlacesPolicy.isEnabled(), itemCount: items.count)
         else { return }
-        let inventoryTask = Task.detached(priority: .utility) {
-            LocationCrawlInventory(items: items)
-        }
-        latestLocationInventoryTask?.cancel()
-        latestLocationInventoryTask = inventoryTask
-        if locationCrawlStarted,
-            locationIndex.scanProgress.phase == .completed || locationIndex.scanProgress.phase == .failed
-        {
-            locationCrawlStarted = false
-        }
-        guard !locationCrawlStarted else { return }
-        locationCrawlStarted = true
-        locationCrawlGeneration &+= 1
-        let crawlGeneration = locationCrawlGeneration
+        locationCrawl.updateInventory(items)
+        if locationCrawl.finishedWithOutdatedInventory { locationCrawl.prepareRestart() }
         let accountUID = configuredAccountUID ?? ""
-        let previousStarter = locationCrawlStartTask
-        let previousPrivacyStop = locationPrivacyStopTask
-        let previousConfiguration = locationConfigurationTask
-        previousStarter?.cancel()
-        let index = locationIndex
-        let store = locationStore
         let feed = self.feed
-        let governor = LibraryWorkloadGovernorPolicy()
-        locationCrawlStartTask = Task {
-            @MainActor [weak self, previousStarter, previousConfiguration, previousPrivacyStop] in
-            await previousPrivacyStop?.value
-            await previousConfiguration?.value
-            await previousStarter?.value
-            guard let self,
-                !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                self.configuredAccountUID == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            let initialInventory = await inventoryTask.value
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                self.configuredAccountUID == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            // Give the thumbnail crawl a head start, then crawl GPS whenever the grid isn't actively
-            // demanding on-screen thumbnails - so the Map crawl shares the rate-limit budget as P2 and
-            // never stalls scrolling (thumbnails are P1).
-            do {
-                try await Task.sleep(for: .seconds(8))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                self.configuredAccountUID == accountUID,
-                MapAndPlacesPolicy.isEnabled()
-            else { return }
-            await self.locationCrawl.start(
-                uids: initialInventory.uids,
-                captureDates: initialInventory.captureDates,
+        locationCrawl.start(
+            items: items,
+            LocationCrawlSession.Start(
                 accountUID: accountUID,
                 location: LocationCrawl.metadataProbe(metadata),
-                index: index,
-                store: store,
-                // P2: back off while the grid has visible demand (scrolling or queued visible-priority
-                // thumbnails). Do not use `hasPendingThumbnailWork()`: it includes whole-library fill and can
-                // starve the Map behind a large thumbnail crawl.
-                shouldYield: {
-                    let visibleDemand = await feed?.hasVisibleThumbnailPressure() ?? false
-                    return governor.budget(
-                        for: .backgroundLocationCrawl,
-                        signals: LibraryWorkloadSignals(hasVisibleMediaDemand: visibleDemand)
-                    ).shouldYield
-                },
+                visibleDemand: { await feed?.hasVisibleThumbnailPressure() ?? false },
                 log: { DebugLog.log($0) },
-                inventory: { @MainActor [weak self] in
-                    guard let task = self?.latestLocationInventoryTask else {
-                        return LocationCrawlInventory()
-                    }
-                    return await task.value
-                }
+                isCurrent: { [weak self] in self?.configuredAccountUID == accountUID },
+                awaiting: locationConfigurationTask
             )
-            guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                self.configuredAccountUID == accountUID
-            else {
-                await self.locationCrawl.cancel()
-                return
-            }
-        }
+        )
     }
 
     func pauseMapAndPlaces() {
         mapPrewarmer.cancel()
-        locationCrawlGeneration &+= 1
-        locationCrawlStarted = false
-        locationCrawlStartTask?.cancel()
-        let previousStop = locationPrivacyStopTask
-        let crawl = locationCrawl
-        locationPrivacyStopTask = Task {
-            await previousStop?.value
-            await crawl.cancel()
-        }
+        locationCrawl.pause()
     }
 
     func resumeMapAndPlaces(items: [PhotoItem], metadata: any PhotoMetadataProvider) {
@@ -412,7 +321,7 @@ final class OfflineLibraryManager {
 
     func restartLocationCrawl(items: [PhotoItem], metadata: any PhotoMetadataProvider) {
         guard !items.isEmpty else { return }
-        locationCrawlStarted = false
+        locationCrawl.prepareRestart()
         startLocationCrawl(items: items, metadata: metadata)
     }
 
@@ -428,8 +337,8 @@ final class OfflineLibraryManager {
         let uids = await Task.detached(priority: .userInitiated) { Set(items.map(\.uid)) }.value
         guard isCurrent() else { return }
         await locationIndex.retainOnly(uids, persistTo: locationStore, sessionLease: lease)
-        guard isCurrent(), recrawlRestoredItems, locationCrawlStarted else { return }
-        locationCrawlStarted = false
+        guard isCurrent(), recrawlRestoredItems, locationCrawl.isStarted else { return }
+        locationCrawl.prepareRestart()
         startLocationCrawl(items: items, metadata: metadata)
     }
 
