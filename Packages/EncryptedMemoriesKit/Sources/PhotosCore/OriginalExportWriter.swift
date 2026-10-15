@@ -167,13 +167,20 @@ public enum OriginalExportWriter {
     /// A save panel authorizes the selected file but not sibling files with generated names. Foundation's
     /// replacement directory is the location Apple provides for atomic-save staging on the destination volume.
     static func stagingDirectory(for destination: URL) throws -> URL {
-        try FileManager.default.url(
+        let directory = try FileManager.default.url(
             for: .itemReplacementDirectory,
             in: .userDomainMask,
             appropriateFor: destination,
             create: true
         )
+        stagingDirectoryObserver?(directory)
+        return directory
     }
+
+    /// Receives every staging directory created by the task that binds it and by the tasks that inherit the binding.
+    /// Tests check their own staging cleanup without listing the shared replacement-directory parent, which other
+    /// processes also use.
+    @TaskLocal static var stagingDirectoryObserver: (@Sendable (URL) -> Void)?
 
     static func installCompletedFile(_ stagedFile: URL, at destination: URL) throws {
         let fileManager = FileManager.default
