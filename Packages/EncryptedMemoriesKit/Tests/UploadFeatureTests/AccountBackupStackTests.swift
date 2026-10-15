@@ -73,7 +73,7 @@ final class AccountBackupStackTests: XCTestCase {
 
     private func makeStack(_ directory: URL) -> AccountBackupStack {
         AccountBackupStack(
-            accountDataDirectory: directory, databasePolicy: .conservative, identityResolver: nil,
+            accountDataDirectory: directory, databasePolicy: .conservative, identityResolver: FakeIdentityResolver(),
             uploader: MockUploader(), tagAdder: nil, editReplacement: nil, albumOperations: NoRemoteAlbums())
     }
 
