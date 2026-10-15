@@ -229,6 +229,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+      - name: Start the simulator
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          IOS_TEST_ACTION: boot-simulator
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
       - uses: ./.github/actions/prepare-apple-build
         id: prepare
         with:
@@ -262,6 +269,7 @@ jobs:
           IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
           IOS_TEST_PREPARED: "1"
           IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-hosted.xcresult
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
         run: bash ./scripts/verify-ios-app-tests.sh
       - name: Report simulator test counts
         if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
@@ -293,6 +301,13 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         run: bash .github/scripts/runner_state.sh start
+      - name: Start the simulator
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          IOS_TEST_ACTION: boot-simulator
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
       - uses: ./.github/actions/prepare-apple-build
         id: prepare
         with:
@@ -320,6 +335,7 @@ jobs:
           IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
           IOS_TEST_PREPARED: "1"
           IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui.xcresult
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
         run: bash .github/scripts/run_ui_tests_with_retry.sh bash ./scripts/verify-ios-app-tests.sh ui
       - name: Report simulator test counts
         if: ${{ !cancelled() && steps.ui.outcome == 'success' }}
