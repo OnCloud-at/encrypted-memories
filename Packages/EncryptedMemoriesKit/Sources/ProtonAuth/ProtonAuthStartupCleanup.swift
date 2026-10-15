@@ -8,7 +8,7 @@ import PhotosCore
 public final class ProtonAuthStartupCleanup {
     /// What a sign-in request may do now.
     public enum SignInAdmission: Equatable, Sendable {
-        /// No cleanup runs and the last one succeeded.
+        /// No cleanup runs, the last one succeeded, and no sign-out purge is pending.
         case proceed
         /// A cleanup runs; it decides what follows.
         case waitForCleanup
@@ -16,7 +16,7 @@ public final class ProtonAuthStartupCleanup {
         case cleanUpFirst
     }
 
-    /// True after a cleanup succeeded; false before the first one and after a failed one.
+    /// True after a cleanup succeeded; false before the first one, while one runs, and after a failed one.
     public private(set) var succeeded = false
     private var task: Task<Void, Never>?
     private let claimPurge: () -> BackupLocalDataPurge.Claim?

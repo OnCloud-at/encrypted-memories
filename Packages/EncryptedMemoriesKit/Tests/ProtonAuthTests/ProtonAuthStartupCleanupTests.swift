@@ -28,6 +28,28 @@ import Testing
         #expect(await fixture.gate.plaintextPurgeArguments == [true], "the plaintext purge result reaches the cleanup")
     }
 
+    @Test func theClaimedSignOutPurgeReachesTheCleanup() async throws {
+        let suite = "startup-cleanup-claim-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+        let received = ClaimBox()
+        let cleanup = ProtonAuthStartupCleanup(
+            claimPurge: { BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [root]) },
+            isPurgePending: { BackupLocalDataPurge.isPurgePending(defaults: defaults) },
+            run: { claim, _ in
+                await received.set(claim != nil)
+                return true
+            })
+        let finished = Finished()
+
+        cleanup.begin { finished.results.append($0) }
+        await finished.wait()
+
+        #expect(await received.hadClaim == true, "the armed purge is handed to the cleanup that deletes the data")
+    }
+
     @Test func theResultIsRecordedBeforeTheHostHearsIt() async {
         let fixture = Fixture()
         let finished = Finished()
@@ -127,6 +149,11 @@ private actor CleanupGate {
             waiters.removeFirst().resume(returning: succeeded)
         }
     }
+}
+
+private actor ClaimBox {
+    private(set) var hadClaim: Bool?
+    func set(_ value: Bool) { hadClaim = value }
 }
 
 private final class Counter: @unchecked Sendable {
