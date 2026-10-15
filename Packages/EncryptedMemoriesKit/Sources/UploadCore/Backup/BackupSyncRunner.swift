@@ -143,6 +143,8 @@ public actor BackupSyncRunner {
         var itemFractionWeight: Double
     }
     private var activeTransfers: [String: ActiveTransfer] = [:]
+    /// Bytes sent since this runner exists. Unlike the sum over `activeTransfers`, it never drops when an item ends.
+    private var transferredByteCount: Int64 = 0
     /// Stage high-water marks remain until the item settles, so identity, materialization, upload, and
     /// primary-to-secondary handoffs cannot make continued-processing progress go backwards.
     private struct ActiveExecution {
@@ -2499,6 +2501,8 @@ public actor BackupSyncRunner {
     }
 
     private func emitProgress() {
+        // Every rebuild of `progress` starts from a summary; the counter is stamped here, at the one exit.
+        progress.transferredByteCount = transferredByteCount
         onProgress?(progress)
     }
 
@@ -2713,6 +2717,8 @@ public actor BackupSyncRunner {
         // One-percent quantization bounds actor/UI churn while advancing for each SDK block.
         let quantized = floor(clamped * 100) / 100
         guard quantized > transfer.byteFraction else { return }
+        transferredByteCount +=
+            Self.bytes(of: transfer, at: quantized) - Self.bytes(of: transfer, at: transfer.byteFraction)
         transfer.byteFraction = quantized
         activeTransfers[key] = transfer
         updateExecutionUploadFraction(
@@ -2720,6 +2726,10 @@ public actor BackupSyncRunner {
             fraction: transfer.itemBaseFraction + transfer.itemFractionWeight * transfer.byteFraction
         )
         publishActiveTransferProgress()
+    }
+
+    private static func bytes(of transfer: ActiveTransfer, at fraction: Double) -> Int64 {
+        Int64((Double(transfer.totalBytes) * fraction).rounded(.down))
     }
 
     private func endActiveTransfer(key: String, generation: UUID) {

@@ -368,6 +368,7 @@ private struct MobilePhotoBackupSections: View {
             VStack(alignment: .leading, spacing: 3) {
                 subtitleSlot(display, reservesSpace: true)
                 transferSlot(display, reservesSpace: true)
+                leftSlot(display)
                 progressSlot(display)
             }
             .transition(.opacity.combined(with: .move(edge: .top)))
@@ -424,6 +425,21 @@ private struct MobilePhotoBackupSections: View {
                 .contentTransition(.numericText())
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    /// Items left and upload speed. The slot is always present in the progress layout, so a changing speed or a
+    /// vanishing count cannot move the bar.
+    @ViewBuilder private func leftSlot(_ display: BackupStatusPresentation) -> some View {
+        let left = display.localizedLeftLine
+        Text(verbatim: left ?? "\u{00a0}")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(ProtonColor.textWeak)
+            .contentTransition(.numericText())
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel(display.localizedLeftAccessibilityLabel ?? "")
+            .accessibilityAddTraits(.updatesFrequently)
+            .accessibilityHidden(left == nil)
+            .accessibilityIdentifier("backup.left")
     }
 
     /// The row's single icon. Only `.activity` spins - there is never a second activity indicator.

@@ -70,6 +70,7 @@ public actor BackupStatusProjector {
     private var latestRunnerProgress: BackupSyncProgress?
     private var lastRawPhase: BackupStatus.Phase?
     private var lastPublishedAt = Date.distantPast
+    private var speedEstimator = BackupUploadSpeedEstimator()
 
     public init(
         queue: any UploadBackupSyncQueueStore,
@@ -116,6 +117,7 @@ public actor BackupStatusProjector {
         latestRunnerProgress = nil
         lastRawPhase = nil
         lastPublishedAt = .distantPast
+        speedEstimator.reset()
 
         let stream = self.stream
         streamTask = Task { [weak self] in
@@ -172,6 +174,11 @@ public actor BackupStatusProjector {
             isUserPaused: context.isUserPaused,
             executionOpportunityIssue: context.executionOpportunityIssue
         )
+        if Self.sendsBytes(rawStatus.phase) {
+            speedEstimator.record(bytes: event.progress.transferredByteCount, at: now())
+        } else {
+            speedEstimator.reset()
+        }
         let phaseChanged = rawStatus.phase != lastRawPhase
         lastRawPhase = rawStatus.phase
         let issueChanged =
@@ -266,12 +273,17 @@ public actor BackupStatusProjector {
             )
         }
 
-        let status = BackupStatus(
+        var status = BackupStatus(
             progress: progress,
             isScanning: context.isScanning,
             isUserPaused: context.isUserPaused,
             executionOpportunityIssue: context.executionOpportunityIssue
         )
+        if Self.sendsBytes(status.phase) {
+            status.uploadSpeedBytesPerSecond = speedEstimator.speed(at: now())
+        } else {
+            speedEstimator.reset()
+        }
         let projection = BackupStatusProjection(
             generation: generation,
             revision: contextRevision,
@@ -283,6 +295,11 @@ public actor BackupStatusProjector {
             await handler(projection)
         }
         return projection
+    }
+
+    /// Only these phases can show an upload speed. Every other phase makes the next resume start fresh.
+    private static func sendsBytes(_ phase: BackupStatus.Phase) -> Bool {
+        phase == .checking || phase == .uploading
     }
 
     private func outstandingSnapshot(

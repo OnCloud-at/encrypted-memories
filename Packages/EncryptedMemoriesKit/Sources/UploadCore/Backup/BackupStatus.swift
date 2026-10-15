@@ -91,6 +91,11 @@ public struct BackupStatus: Sendable, Equatable {
     /// Ephemeral byte progress for resources currently moving.
     public var activeTransfer: BackupActiveTransferProgress?
     public var activeExecutionItemEquivalents: Double = 0
+    /// Rows the backup still works on: waiting, being checked or being uploaded. Failed, missing, dismissed and
+    /// draft-blocked rows are not counted.
+    public var remainingCount = 0
+    /// Smoothed upload speed. Only the projector knows it; it is nil whenever the backup does not send.
+    public var uploadSpeedBytesPerSecond: Double?
     /// Dominant typed reason for unfinished work and the next time Core can honestly retry it.
     public var outstandingIssue: BackupIssueKind?
     public var nextAttemptAt: Date?
@@ -165,6 +170,7 @@ public struct BackupStatus: Sendable, Equatable {
         skippedRemoteDeletions = progress.skippedRemoteDeletions
         sourceMissing = progress.sourceMissing
         waitingRetry = progress.blocked
+        remainingCount = progress.waiting + progress.checking + progress.uploading
         settled = progress.settled
         activeTransfer = progress.activeTransfer
         activeExecutionItemEquivalents = max(

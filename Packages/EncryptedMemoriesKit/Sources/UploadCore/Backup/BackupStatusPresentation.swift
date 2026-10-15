@@ -58,6 +58,10 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     /// bar represents this same transfer instead of an imperceptible one-item step across a large library.
     public var activeTransferFraction: Double?
     public var nextAttemptAt: Date?
+    /// Rows still to work on (waiting, checking, uploading). See `BackupStatus.remainingCount`.
+    public var remainingCount = 0
+    /// Smoothed upload speed; only set while the phase checks or uploads.
+    public var uploadSpeedBytesPerSecond: Double?
     /// Queue-wide dedupe-index failure. Kept separate from item failures so hosts do not open an empty
     /// per-photo failure list for an account/service problem.
     public var remoteIndexPreparationFailed: Bool
@@ -211,6 +215,11 @@ public struct BackupStatusPresentation: Sendable, Equatable {
             activeTransferPercent = min(100, max(0, Int((fraction * 100).rounded(.down))))
         }
         executionOpportunityIssue = status.executionOpportunityIssue
+        remainingCount = status.remainingCount
+        // A speed belongs to a sending phase only; a stale value never shows while paused or waiting.
+        if status.phase == .checking || status.phase == .uploading {
+            uploadSpeedBytesPerSecond = status.uploadSpeedBytesPerSecond
+        }
         if status.remoteContentIndexHealth.shouldWarn {
             degradedDedupeUnresolvedCount = status.remoteContentIndexHealth.unresolvedCount
         }
@@ -311,6 +320,26 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var localizedTransferDetail: String? {
         guard let activeTransferPercent else { return nil }
         return L10n.string("backup.progress_transferring \(activeTransferPercent)")
+    }
+
+    /// "3,766 left · 3.2 MB/s", or "3,766 left" without a speed. Only in the progress layout, so the row reserves
+    /// its slot; nil when nothing is left.
+    public var localizedLeftLine: String? {
+        guard detailLayout == .progress, remainingCount > 0 else { return nil }
+        guard let speedText else { return L10n.string("backup.detail_left \(remainingCount)") }
+        return L10n.string("backup.detail_left_speed \(remainingCount) \(speedText)")
+    }
+
+    /// The same two values as one sentence for VoiceOver: "3,766 left, 3.2 MB per second".
+    public var localizedLeftAccessibilityLabel: String? {
+        guard detailLayout == .progress, remainingCount > 0 else { return nil }
+        guard let speedText else { return L10n.string("backup.detail_left \(remainingCount)") }
+        return L10n.string("backup.detail_left_speed_spoken \(remainingCount) \(speedText)")
+    }
+
+    private var speedText: String? {
+        guard let speed = uploadSpeedBytesPerSecond, speed >= 1 else { return nil }
+        return L10n.fileSize(Int64(speed.rounded()))
     }
 
     /// The bar follows the percentage immediately above it while bytes move. Otherwise it remains the
