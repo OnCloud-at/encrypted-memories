@@ -18,7 +18,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
     private let cover: (PhotoUID) -> Cover
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// `accent` colors the checkmark and the border of the photo to keep and the progress indicator.
+    /// `accent` colors the checkmark and the border of the photo to keep.
     /// `cornerRadius` is the corner radius of `cover`. `canOpen` tells whether the library shows a photo yet, so
     /// the viewer can open it; a host whose library is not observed passes a `libraryRevision` that changes with the
     /// photos it shows, so a copy that was not ready redraws. `onOpen` receives a photo and the ID of its group.
@@ -96,7 +96,6 @@ public struct ExactDuplicatesView<Cover: View>: View {
             } actions: {
                 if let line = model.checkLine {
                     progressRow(line, showsTitle: false)
-                        .frame(maxWidth: 320)
                         .accessibilityIdentifier("duplicates.checkProgress")
                 }
             }
@@ -118,36 +117,15 @@ public struct ExactDuplicatesView<Cover: View>: View {
             Text(L10n.string("duplicates.loading_message"))
         } actions: {
             progressRow(line, showsTitle: false)
-                .frame(maxWidth: 320)
         }
         .frame(maxWidth: Self.readableWidth)
         .accessibilityIdentifier("duplicates.loading")
     }
 
     private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {
-        ExactDuplicatesWaitingProgressLayout {
-            ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent, alignment: .center)
+        ActivityProgressStateLayout {
+            ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, alignment: .center)
         }
-    }
-}
-
-/// Sizes the waiting indicator from its available action area without measuring and feeding a frame back into
-/// layout. The bar remains centered and fits even when a narrow window cannot provide the preferred minimum.
-private struct ExactDuplicatesWaitingProgressLayout: Layout {
-    private func lineWidth(in available: CGFloat) -> CGFloat {
-        min(available, max(120, available * 0.7))
-    }
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let available = min(320, max(0, proposal.width ?? 320))
-        let line = subviews[0].sizeThatFits(ProposedViewSize(width: lineWidth(in: available), height: nil))
-        return CGSize(width: available, height: line.height)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        subviews[0].place(
-            at: CGPoint(x: bounds.midX, y: bounds.minY), anchor: .top,
-            proposal: ProposedViewSize(width: lineWidth(in: bounds.width), height: nil))
     }
 }
 
@@ -157,7 +135,6 @@ private struct ExactDuplicatesWaitingProgressLayout: Layout {
 private struct ExactDuplicatesProgressRow: View {
     let line: ExactDuplicatesModel.ProgressLine
     var showsTitle = true
-    let accent: Color
     var alignment: HorizontalAlignment = .leading
     var identifier: String?
     var stop: (() -> Void)?
@@ -166,9 +143,8 @@ private struct ExactDuplicatesProgressRow: View {
     var body: some View {
         let row = ActivityProgressRow(
             title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
-            showsIndeterminateProgress: true, alignment: alignment
+            showsIndeterminateProgress: true, alignment: alignment, accessibilityName: line.title
         )
-        .tint(accent)
         .accessibilityIdentifier(identifier ?? "")
         if let stop {
             HStack(alignment: .center, spacing: 12) {
@@ -228,7 +204,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
                 VStack(alignment: .leading, spacing: 12) {
                     ExactDuplicatesSummary(model: model)
                         .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
-                    ExactDuplicatesStatusRows(model: model, accent: accent, margin: margin)
+                    ExactDuplicatesStatusRows(model: model, margin: margin)
                 }
                 .padding(.bottom, DuplicatesLayout.cards ? 0 : 10)
                 ForEach(groups, id: \.element.id) { index, group in
@@ -373,7 +349,6 @@ private struct ExactDuplicatesSummary: View {
 /// that could not read every photo, and a retry when the check stopped.
 private struct ExactDuplicatesStatusRows: View {
     let model: ExactDuplicatesModel
-    let accent: Color
     let margin: CGFloat
 
     private var hasRows: Bool {
@@ -406,11 +381,11 @@ private struct ExactDuplicatesStatusRows: View {
     @ViewBuilder private var rows: some View {
         if let line = model.mergeAllLine {
             ExactDuplicatesProgressRow(
-                line: line, accent: accent, identifier: "duplicates.mergeProgress", stop: stop,
+                line: line, identifier: "duplicates.mergeProgress", stop: stop,
                 canStop: model.canStopMergeAll)
         }
         if let line = model.checkLine {
-            ExactDuplicatesProgressRow(line: line, accent: accent).accessibilityIdentifier("duplicates.checkProgress")
+            ExactDuplicatesProgressRow(line: line).accessibilityIdentifier("duplicates.checkProgress")
         }
         if let note = model.stillCheckingNote {
             Label(note, systemImage: "hourglass")
@@ -420,7 +395,7 @@ private struct ExactDuplicatesStatusRows: View {
         if let line = model.rankingLine {
             // Merge All ranks the groups that nobody scrolled to first; Stop already applies.
             ExactDuplicatesProgressRow(
-                line: line, accent: accent, identifier: "duplicates.rankingProgress", stop: stop,
+                line: line, identifier: "duplicates.rankingProgress", stop: stop,
                 canStop: model.canStopMergeAll)
         }
         if let note = model.metadataCheckNote {

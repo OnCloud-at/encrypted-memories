@@ -3064,7 +3064,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Fotos, die Sie zu Proton hochladen, erscheinen hier."
+            "value": "Fotos, die du zu Proton hochlädst, erscheinen hier."
           }
         }
       }
@@ -3206,7 +3206,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ihre Mediathek konnte nicht geladen werden"
+            "value": "Deine Mediathek konnte nicht geladen werden"
           }
         }
       }
@@ -3965,7 +3965,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Fotos werden zu Ihrer Mediathek hinzugefügt."
+            "value": "Fotos werden zu deiner Mediathek hinzugefügt."
           }
         }
       }
@@ -4101,7 +4101,7 @@
       "comment": "Shown when a selected folder or one of its subfolders cannot be read. %@ is the folder name.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Upload stopped because %@ could not be read. Check its permissions and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Upload wurde beendet, weil %@ nicht gelesen werden konnte. Prüfen Sie die Berechtigungen und versuchen Sie es erneut." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Der Upload wurde beendet, weil %@ nicht gelesen werden konnte. Prüfe die Berechtigungen und versuche es erneut." } }
       }
     },
     "upload.folder_error_missing %@": {
@@ -4109,7 +4109,7 @@
       "comment": "Shown when a selected file or subfolder disappears during enumeration. %@ is its name.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Upload stopped because %@ is no longer available. Select the folder again and retry." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Upload wurde beendet, weil %@ nicht mehr verfügbar ist. Wählen Sie den Ordner erneut aus und versuchen Sie es noch einmal." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Der Upload wurde beendet, weil %@ nicht mehr verfügbar ist. Wähle den Ordner erneut aus und versuche es noch einmal." } }
       }
     },
     "upload.folder_error_transient %@": {
@@ -4117,7 +4117,7 @@
       "comment": "Shown for another filesystem error during folder enumeration. %@ is the affected name.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Upload could not finish reading %@. Try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Upload konnte %@ nicht vollständig lesen. Versuchen Sie es erneut." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Der Upload konnte %@ nicht vollständig lesen. Versuche es erneut." } }
       }
     },
     "action.dismiss": {
@@ -4194,7 +4194,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Uploads, die Sie über die Symbolleiste starten, erscheinen hier."
+            "value": "Uploads, die du über die Symbolleiste startest, erscheinen hier."
           }
         }
       }
@@ -5597,8 +5597,8 @@
       "extractionState": "manual",
       "comment": "Shown instead of StoreKit's technical error when no tip products are available for the current build or storefront.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Tips are currently unavailable. Please try again later." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Trinkgelder sind derzeit nicht verfügbar. Bitte später erneut versuchen." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Tips are currently unavailable." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Trinkgelder sind derzeit nicht verfügbar." } }
       }
     },
     "search.for_you": {

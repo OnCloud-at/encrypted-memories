@@ -43,10 +43,16 @@ public struct RetryButton: View {
                     .font(.footnote)
                     .tint(ProtonColor.primary)
             #else
-                button
-                    .controlSize(.small)
-                    .font(.footnote)
-                    .tint(ProtonColor.primary)
+                // At least 44 pt high, so the small text stays easy to tap. Inside a list a tap anywhere in the row
+                // still retries; a row that also holds a message grows by the extra height of the button.
+                Button(action: action) {
+                    Text(Self.title)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .controlSize(.small)
+                .font(.footnote)
+                .tint(ProtonColor.primary)
             #endif
         case .system:
             button

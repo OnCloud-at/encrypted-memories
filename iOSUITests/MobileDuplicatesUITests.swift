@@ -205,6 +205,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertLessThanOrEqual(
             progress.frame.width, app.staticTexts["Looking for identical copies in your library."].frame.width)
+        XCTAssertEqual(progress.label, "Checking duplicates", "VoiceOver names the bar after the waiting state")
         let percent = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH '%'")).firstMatch
         XCTAssertTrue(percent.exists)
         XCTAssertEqual(percent.frame.midX, progress.frame.midX, accuracy: 1, "the percentage stays centered")

@@ -565,7 +565,7 @@ private struct BackendErrorView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
             HStack(spacing: 10) {
-                RetryButton(.prominent, action: retry).frame(width: 120)
+                RetryButton(.prominent, action: retry).frame(minWidth: 120)
                 Button(L10n.string("action.sign_out")) { confirmSignOut = true }
                     .buttonStyle(.plain)
                     .foregroundStyle(ProtonColor.textHint)

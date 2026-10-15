@@ -210,11 +210,11 @@ struct MainView: View {
                 NavigationSplitView(columnVisibility: $columnVisibility) {
                     SidebarView(
                         albums: albums,
-                        isLoadingAlbums: albumActions.showsInitialAlbumLoadingPlaceholder,
+                        isLoadingAlbums: albumActions.showsAlbumLoadingPlaceholder,
                         albumCatalogFailed: albumCatalogFailed,
                         sharedAlbums: albumActions.sharedAlbums,
                         sharedAlbumPresentation: albumActions.presentation(for:),
-                        isLoadingSharedAlbums: albumActions.showsInitialSharedAlbumLoadingPlaceholder,
+                        isLoadingSharedAlbums: albumActions.showsSharedAlbumLoadingPlaceholder,
                         sharedAlbumCatalogFailed: albumActions.sharedLoadErrorMessage != nil,
                         canLeaveSharedAlbum: albumActions.canLeaveSharedAlbum,
                         canCreateAlbum: albumActions.canCreate,

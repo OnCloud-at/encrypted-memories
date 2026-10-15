@@ -312,8 +312,7 @@ public struct SmartSearchSettingsSection: View {
                 }
             }
 
-            ProgressView(value: presentation.progressFraction ?? 0)
-                .progressViewStyle(.linear)
+            ActivityProgressBar(fraction: presentation.progressFraction ?? 0)
                 .opacity(presentation.progressFraction == nil ? 0 : 1)
                 .accessibilityHidden(presentation.progressFraction == nil)
         }
