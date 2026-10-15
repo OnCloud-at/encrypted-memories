@@ -113,7 +113,11 @@ final class MetalGridScrollHost: NSView {
     private let resizeSettleDuration: CFTimeInterval = 0.22
     /// Sidebar open/close clock: the full Metal surface interpolates to the canonical obstructed layout.
     private var sidebarResizeStart: CFTimeInterval = 0
-    private let sidebarResizeDuration: CFTimeInterval = 0.22
+    /// Clock of the sidebar transition. Tests replace it to step a transition without waiting.
+    var sidebarClock: () -> CFTimeInterval = CACurrentMediaTime
+    /// The enclosing split view's sidebar edge, read per frame while a sidebar toggle runs. Nil otherwise, and
+    /// when the grid is not hosted in a split view (the coordinator then runs its own clock).
+    private var sidebarEdgeSource: SplitViewSidebarEdgeSource?
 
     // Live focus-row pinch gesture state (engine-owned GridZoomTransaction).
     private var pinchActive = false
@@ -1063,7 +1067,11 @@ final class MetalGridScrollHost: NSView {
             return
         }
         if coordinator.isCommitBridging { advanceCommitBridge() }
-        if coordinator.isSidebarResizing { advanceSidebarResize() }
+        if coordinator.isSidebarResizing {
+            advanceSidebarResize()
+        } else {
+            sidebarEdgeSource = nil  // a superseded or finished transition leaves no edge source behind
+        }
         if coordinator.isResizeSettling { advanceResizeSettle() }
         if coordinator.gridTransition.activeKind == .click { requestFrame() }
         if coordinator.isOverviewClickDissolving { requestFrame() }
@@ -1096,11 +1104,11 @@ final class MetalGridScrollHost: NSView {
     /// Advance the sidebar open/close transition. Its last frame is the canonical target geometry, so committing
     /// the engine inset cannot produce a second resize; a release morph remains only for future column reflows.
     private func advanceSidebarResize() {
-        let t =
-            sidebarResizeDuration > 0 ? min(1, (CACurrentMediaTime() - sidebarResizeStart) / sidebarResizeDuration) : 1
-        coordinator.presentationSidebarProgress = CGFloat(t)
+        let arrived = coordinator.advanceSidebarResize(
+            elapsed: sidebarClock() - sidebarResizeStart, measuredEdge: sidebarEdgeSource?.edge())
         requestFrame()
-        guard t >= 1 else { return }
+        guard arrived else { return }
+        sidebarEdgeSource = nil
         let (settleScroll, animating) = coordinator.endSidebarResize()  // commits the inset + bottom-anchored scroll
         coordinator.liveResizeChanged?(false)
         stickToBottom = false
@@ -1218,7 +1226,8 @@ final class MetalGridScrollHost: NSView {
         if window != nil, !inLiveResize, oldFrame != .zero,
             coordinator.beginSidebarResize(fromInset: oldValue, toInset: eventLeadingInset)
         {
-            sidebarResizeStart = CACurrentMediaTime()
+            sidebarResizeStart = sidebarClock()
+            sidebarEdgeSource = SplitViewSidebarEdgeSource(hostedIn: self)
             coordinator.liveResizeChanged?(true)
             requestFrame()
             return
