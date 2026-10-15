@@ -25,7 +25,7 @@ struct MobileAlbumSyncScreen: View {
                     Section {
                         Text(message)
                             .font(.footnote)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(controller.lastMessageStyle == .information ? Color.secondary : Color.red)
                     }
                 }
             }

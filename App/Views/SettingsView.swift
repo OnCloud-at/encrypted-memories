@@ -940,7 +940,7 @@ private struct AlbumSyncSection: View {
             if let message = controller.lastMessage {
                 Text(message)
                     .font(.system(size: 11))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(controller.lastMessageStyle == .information ? Color.secondary : Color.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {

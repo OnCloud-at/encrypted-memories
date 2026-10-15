@@ -112,6 +112,13 @@ public final class AlbumSyncController {
     public private(set) var isSyncing = false
     public private(set) var pendingConflict: PendingConflict?
     public private(set) var lastMessage: String?
+    /// How the hosts show `lastMessage`: a Stop result is information, everything else an error.
+    public private(set) var lastMessageStyle: MessageStyle = .error
+
+    public enum MessageStyle: Sendable, Equatable {
+        case error
+        case information
+    }
 
     /// False when the mapping store or the dedupe manifest could not open - sync then refuses to
     /// run rather than risking duplicate albums or duplicate uploads.
@@ -141,6 +148,8 @@ public final class AlbumSyncController {
     private var changePendingDuringSync = false
     private var remoteAlbumsChangedDuringBatch = false
     private var onRemoteAlbumsChanged: (@MainActor @Sendable () -> Void)?
+    /// Whether the person pressed Stop during the current batch.
+    private var stopState = AlbumSyncStopState()
 
     public init(
         configuration: Configuration,
@@ -221,7 +230,7 @@ public final class AlbumSyncController {
             availableAlbums = try await localSource.listAlbums()
             libraryWasRead = true
         } catch {
-            lastMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
         reloadSelection()
         startObservingChangesIfNeeded()
@@ -335,6 +344,7 @@ public final class AlbumSyncController {
     }
 
     public func stopSync() {
+        stopState.stopPressed(isSyncing: isSyncing, queuedAlbums: queuedAlbumIDs.count)
         queuedAlbumIDs.removeAll()
         changeDebounceTask?.cancel()
         changeDebounceTask = nil
@@ -369,6 +379,7 @@ public final class AlbumSyncController {
         for id in ids where !queuedAlbumIDs.contains(id) {
             queuedAlbumIDs.append(id)
         }
+        if isSyncing { stopState.albumsAdded(ids) }
         startBatchIfIdle()
     }
 
@@ -376,7 +387,8 @@ public final class AlbumSyncController {
         guard !isShuttingDown, let runner, !isSyncing, !queuedAlbumIDs.isEmpty else { return }
         isSyncing = true
         remoteAlbumsChangedDuringBatch = false
-        lastMessage = nil
+        stopState.batchStarted()
+        setMessage(nil)
 
         syncTask = Task { [weak self] in
             while let album = self?.dequeueNextAlbum() {
@@ -384,19 +396,26 @@ public final class AlbumSyncController {
                     let report = try await runner.sync(album: album, resolution: .automatic)
                     self?.recordFinishedRun(report.problems, albumID: album.id)
                     self?.remoteAlbumsChangedDuringBatch = true
+                    self?.showStopResult(after: .finished(report))
                 } catch let error as AlbumSyncError {
                     switch error {
                     case .nameConflict(let existing):
                         self?.recordConflict(album: album, existing: existing)
                     case .stopped:
-                        self?.queuedAlbumIDs.removeAll()
+                        self?.dropQueueAfterStop()
+                        self?.showStopResult(after: .stopped)
                         self?.reloadSelection()
                     default:
-                        self?.lastMessage = error.errorDescription
+                        self?.setMessage(error.errorDescription)
                         self?.reloadSelection()
                     }
                 } catch {
-                    self?.lastMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    if self?.stopState.endsAsStop(error) == true {
+                        self?.dropQueueAfterStop()
+                        self?.showStopResult(after: .cancelled)
+                    } else {
+                        self?.setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                    }
                     self?.reloadSelection()
                 }
             }
@@ -404,11 +423,30 @@ public final class AlbumSyncController {
         }
     }
 
+    /// After a Stop, the message line says that the sync stopped, or that the album finished when the batch that was
+    /// already sent completed it. Without a Stop nothing changes.
+    private func showStopResult(after outcome: AlbumSyncStopState.Outcome) {
+        let current = AlbumSyncStopState.Message(text: lastMessage, style: lastMessageStyle)
+        guard let next = stopState.message(after: outcome, current: current) else { return }
+        setMessage(next.text, style: next.style)
+    }
+
+    func setMessage(_ message: String?, style: MessageStyle = .error) {
+        lastMessage = message
+        lastMessageStyle = style
+    }
+
+    /// A stopped album ends: the waiting albums go, except the ones added after Stop.
+    private func dropQueueAfterStop() {
+        queuedAlbumIDs.removeAll { !stopState.keepsAfterStop($0) }
+    }
+
     private func dequeueNextAlbum() -> LocalAlbumSummary? {
         while !queuedAlbumIDs.isEmpty {
             let id = queuedAlbumIDs.removeFirst()
             guard let row = selectedAlbums.first(where: { $0.id == id }) else { continue }
             if libraryWasRead, row.state == .missingLocally { continue }
+            if stopState.nextAlbumStarted(), lastMessageStyle == .information { setMessage(nil) }
             return LocalAlbumSummary(id: row.id, title: row.title, assetCount: row.assetCount ?? 0)
         }
         return nil
@@ -478,7 +516,7 @@ public final class AlbumSyncController {
             libraryWasRead = true
             reloadSelection()
         } catch {
-            lastMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
     }
 
@@ -539,7 +577,7 @@ public final class AlbumSyncController {
     }
 
     private func reportMappingStoreUnavailable() {
-        lastMessage = AlbumSyncError.mappingStoreUnavailable.errorDescription
+        setMessage(AlbumSyncError.mappingStoreUnavailable.errorDescription)
     }
 
     #if DEBUG
