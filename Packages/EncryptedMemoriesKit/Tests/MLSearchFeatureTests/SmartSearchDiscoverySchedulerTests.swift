@@ -9,6 +9,9 @@ import TimelineCore
 @testable import MLSearchFeature
 
 @MainActor @Suite struct SmartSearchDiscoverySchedulerTests {
+    /// The production retry delays scaled from seconds to milliseconds, for a test that exhausts the save budget.
+    private static let shortRetryDelays: [Duration] = [.milliseconds(1), .milliseconds(2), .milliseconds(4)]
+
     #if DEBUG
         @Test func crawlingSearchAndSupportShareBoundedClassifications() async throws {
             let index = PhotoLocationIndex()
@@ -991,9 +994,9 @@ import TimelineCore
         let items = (0..<8).map {
             PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
         }
-        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
-            nil
-        }
+        let scheduler = SmartSearchDiscoveryScheduler(
+            runtimeState: LibraryRuntimeState(), debounce: .zero, retryDelays: Self.shortRetryDelays
+        ) { _, _ in nil }
         defer { scheduler.reset() }
         func apply(settled: Int) {
             scheduler.update(
