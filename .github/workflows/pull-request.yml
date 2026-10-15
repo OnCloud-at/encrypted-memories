@@ -424,7 +424,9 @@ jobs:
     name: Cancel a queue run after a failure
     if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    # The longest queue runs took 123 minutes, because the macOS jobs wait for a runner. The loop ends by itself after
+    # 165 minutes, and the job limit is only the backstop.
+    timeout-minutes: 175
     permissions:
       actions: write
     steps:
@@ -436,17 +438,30 @@ jobs:
           set -uo pipefail
           workers=("Repository hygiene" "Package verification and style" "iOS verification" "iOS UI verification" "macOS verification")
           own="Cancel a queue run after a failure"
-          while true; do
+          deadline=$((SECONDS + 9900))
+          read_errors=0
+          while (( SECONDS < deadline )); do
             if ! lines="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
               --jq '.jobs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>&1)"; then
-              echo "The jobs of the run could not be read; trying again: $lines"
+              read_errors=$((read_errors + 1))
+              echo "The jobs of the run could not be read ($read_errors): $lines"
+              # A read that keeps failing means that nothing is watched: end red, so that it is seen.
+              (( read_errors < 20 )) || exit 1
               sleep 30
               continue
             fi
-            failed="$(printf '%s\n' "$lines" | awk -F'\t' -v own="$own" '$1 != own && $3 == "failure" { print $1 }')"
+            read_errors=0
+            # A job that failed, or the first worker (the hygiene job has no result job) that ended without success.
+            failed="$(printf '%s\n' "$lines" | awk -F'\t' -v own="$own" -v first="${workers[0]}" '
+              $1 != own && ($3 == "failure" || ($1 == first && $2 == "completed" && $3 != "success")) { print $1 }')"
             if [[ -n "$failed" ]]; then
               echo "A job failed: $failed"
-              gh run cancel "$GITHUB_RUN_ID" || echo "The cancel request failed."
+              if ! output="$(gh run cancel "$GITHUB_RUN_ID" 2>&1)"; then
+                echo "$output"
+                # A run that is already cancelled or completed needs no cancel.
+                grep -qiE 'HTTP 409|already|cannot be cancelled' <<< "$output" && exit 0
+                exit 1
+              fi
               exit 0
             fi
             unfinished=0
@@ -460,6 +475,7 @@ jobs:
             fi
             sleep 30
           done
+          echo "The watch ended at its time limit."
 
   code-quality:
     name: Swift style
