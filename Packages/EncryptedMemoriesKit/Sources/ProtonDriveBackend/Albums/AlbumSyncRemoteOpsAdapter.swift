@@ -51,7 +51,10 @@ struct ProtonAlbumSyncRemoteOps: AlbumSyncRemoteAlbumOps {
             alreadyMember: result.alreadyMemberCount,
             failed: result.failedCount,
             firstFailureMessage: result.firstFailureMessage,
-            failedLinkIDs: result.outcomes.filter { if case .failed = $0.value { true } else { false } }.map(\.key)
+            failedLinkIDs: result.outcomes.filter { if case .failed = $0.value { true } else { false } }.map(\.key),
+            failureMessages: result.outcomes.compactMapValues { outcome in
+                if case .failed(_, let message) = outcome { message } else { nil }
+            }
         )
     }
 }

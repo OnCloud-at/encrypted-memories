@@ -116,19 +116,23 @@ public struct AlbumSyncAttachResult: Sendable, Equatable {
     public var firstFailureMessage: String?
     /// Remote link ids of the photos that could not be attached, one per failure.
     public var failedLinkIDs: [String]
+    /// The reason of each failed link id, when the backend names one.
+    public var failureMessages: [String: String]
 
     public init(
         attached: Int = 0,
         alreadyMember: Int = 0,
         failed: Int = 0,
         firstFailureMessage: String? = nil,
-        failedLinkIDs: [String] = []
+        failedLinkIDs: [String] = [],
+        failureMessages: [String: String] = [:]
     ) {
         self.attached = attached
         self.alreadyMember = alreadyMember
         self.failed = failed
         self.firstFailureMessage = firstFailureMessage
         self.failedLinkIDs = failedLinkIDs
+        self.failureMessages = failureMessages
     }
 
     public static func += (lhs: inout AlbumSyncAttachResult, rhs: AlbumSyncAttachResult) {
@@ -136,6 +140,7 @@ public struct AlbumSyncAttachResult: Sendable, Equatable {
         lhs.alreadyMember += rhs.alreadyMember
         lhs.failed += rhs.failed
         lhs.failedLinkIDs += rhs.failedLinkIDs
+        lhs.failureMessages.merge(rhs.failureMessages) { first, _ in first }
         if lhs.firstFailureMessage == nil { lhs.firstFailureMessage = rhs.firstFailureMessage }
     }
 }

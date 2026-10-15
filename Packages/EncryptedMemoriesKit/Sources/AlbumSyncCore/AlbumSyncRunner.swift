@@ -262,9 +262,11 @@ public actor AlbumSyncRunner {
 
     /// Attaches `candidates` in chunks for progress and Stop granularity, adding to `earlier`. The backend batches to
     /// the API limit.
+    /// An alternate round publishes no failure count: its failures can still resolve, and the count is published once
+    /// the rounds end.
     private func attach(
         _ candidates: [AlbumSyncAttachCandidate], localAlbumID: String, remoteAlbumID: String,
-        after earlier: AlbumSyncAttachResult, alreadyMember: Int
+        after earlier: AlbumSyncAttachResult, alreadyMember: Int, publishesFailures: Bool = true
     ) async throws -> AlbumSyncAttachResult {
         var total = earlier
         var index = 0
@@ -277,8 +279,10 @@ public actor AlbumSyncRunner {
             index += chunk.count
             progress.attachDone = total.attached
             progress.alreadyMember = alreadyMember + total.alreadyMember
-            progress.attachFailed = total.failed
-            progress.message = total.firstFailureMessage
+            if publishesFailures {
+                progress.attachFailed = total.failed
+                progress.message = total.firstFailureMessage
+            }
             publish()
         }
         return total
@@ -310,7 +314,7 @@ public actor AlbumSyncRunner {
             let before = result.failedLinkIDs.count
             result = try await attach(
                 round.map(\.candidate), localAlbumID: localAlbumID, remoteAlbumID: remoteAlbumID, after: result,
-                alreadyMember: plan.alreadyMember)
+                alreadyMember: plan.alreadyMember, publishesFailures: false)
             let failedNow = Set(result.failedLinkIDs.dropFirst(before))
             waiting = []
             for (planned, candidate) in round {
@@ -329,8 +333,11 @@ public actor AlbumSyncRunner {
                 result.failed -= 1
             }
         }
-        if result.failed == 0 { result.firstFailureMessage = nil }
         if !resolved.isEmpty {
+            // The first message could belong to a resolved failure; keep only a reason of a failure that remains.
+            result.firstFailureMessage = result.failedLinkIDs.lazy.compactMap { result.failureMessages[$0] }.first
+        }
+        if !first.failedLinkIDs.isEmpty, result.failedLinkIDs != first.failedLinkIDs {
             progress.attachFailed = result.failed
             progress.message = result.firstFailureMessage
             publish()
