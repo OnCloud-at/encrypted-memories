@@ -60,6 +60,10 @@ Later backup passes never offer it again, and Apple Photos keeps it. The Backup 
 under **Excluded from Backup**; choose **Back Up Again** to put one back into the backup. Exclusions are
 stored per device.
 
+## Hidden photos
+
+Photos that you hide in the Photos app are not backed up. The backup leaves them out on purpose, so a hidden photo does not appear in your Proton Drive photos.
+
 ## Limited Photos access
 
 When iOS or iPadOS grants limited access, only selected library items can be backed up. Use **Change selection…** on the Backup page to change the allowed set.
