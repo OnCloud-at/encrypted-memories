@@ -3625,6 +3625,84 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.map(\.additionalMetadata), [[metadata], [metadata]])
     }
 
+    private func seedRealImageEntry(model: String?, truncated: Bool = false) throws -> UploadBackupSyncQueueEntry {
+        let url = tempDir.appendingPathComponent("camera-\(UUID().uuidString).jpg")
+        try CameraDeviceFixtures.write(to: url, model: model)
+        if truncated { try Data(contentsOf: url).prefix(12).write(to: url) }
+        let entry = UploadBackupSyncQueueEntry(
+            source: .file(url),
+            revision: UploadBackupRevision(date: resolver.defaultModified),
+            originalFilename: url.lastPathComponent,
+            byteCount: 4,
+            state: .discovered,
+            updatedAt: clock.now.addingTimeInterval(-60)
+        )
+        queueStore.upsert(entry)
+        return entry
+    }
+
+    func testTheCameraModelOfTheStagedFileFillsTheMissingDeviceOnEveryUpload() async throws {
+        let entry = try seedRealImageEntry(model: "TESTCAM")
+        let media = PhotoUploadAdditionalMetadata(name: "Media", utf8JsonValue: Data(#"{"Width":4032}"#.utf8))
+        let camera = PhotoUploadAdditionalMetadata(
+            name: "Camera", utf8JsonValue: Data(#"{"CaptureTime":"2026-07-05T10:00:00.000Z"}"#.utf8))
+        resolver.setAdditionalMetadata([camera, media], for: entry.source.identifier)
+        resolver.setSecondaries(["clip.mov"], for: entry.source.identifier)
+        // The motion clip is a video by its media type, whatever its bytes hold: it is not read.
+        try CameraDeviceFixtures.write(
+            to: URL(fileURLWithPath: entry.source.identifier + "#clip.mov"), model: "CLIPCAM")
+
+        _ = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
+        let primary = try XCTUnwrap(uploader.requests.first { $0.mainPhotoUID == nil })
+        XCTAssertEqual(primary.additionalMetadata.map(\.name), ["Camera", "Media"])
+        let sent = try JSONDecoder().decode(
+            PhotoUploadMetadataEncoder.Camera.self, from: primary.additionalMetadata[0].utf8JsonValue)
+        XCTAssertEqual(sent.device, "TESTCAM")
+        XCTAssertEqual(sent.captureTime, "2026-07-05T10:00:00.000Z")
+        let secondary = try XCTUnwrap(uploader.requests.first { $0.mainPhotoUID != nil })
+        XCTAssertEqual(secondary.additionalMetadata, [camera, media], "a video uploads with its metadata as before")
+    }
+
+    func testTheCameraModelAlsoFillsTheDeviceOfAnImageThatUploadsNextToThePrimary() async throws {
+        let entry = try seedRealImageEntry(model: "MAINCAM")
+        resolver.setBurstMembers(["burst.jpg"], for: entry.source.identifier)
+        try CameraDeviceFixtures.write(
+            to: URL(fileURLWithPath: entry.source.identifier + "#burst.jpg"), model: "BURSTCAM")
+
+        _ = await makeRunner().runUntilDrained()
+
+        func device(of request: PhotoUploadRequest) throws -> String? {
+            let section = try XCTUnwrap(request.additionalMetadata.first { $0.name == "Camera" })
+            return try JSONDecoder().decode(PhotoUploadMetadataEncoder.Camera.self, from: section.utf8JsonValue).device
+        }
+        XCTAssertEqual(try device(of: XCTUnwrap(uploader.requests.first { $0.mainPhotoUID == nil })), "MAINCAM")
+        XCTAssertEqual(try device(of: XCTUnwrap(uploader.requests.first { $0.mainPhotoUID != nil })), "BURSTCAM")
+    }
+
+    func testADeviceFromThePhotoLibraryIsNeverReplacedByTheFile() async throws {
+        let entry = try seedRealImageEntry(model: "FILECAM")
+        let camera = PhotoUploadAdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"Library"}"#.utf8))
+        resolver.setAdditionalMetadata([camera], for: entry.source.identifier)
+
+        _ = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.additionalMetadata), [[camera]])
+    }
+
+    func testABackupNeverFailsBecauseTheFileHasNoReadableMetadata() async throws {
+        let withoutModel = try seedRealImageEntry(model: nil)
+        let truncated = try seedRealImageEntry(model: "TESTCAM", truncated: true)
+
+        _ = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(state(of: withoutModel), .completed)
+        XCTAssertEqual(state(of: truncated), .completed)
+        XCTAssertEqual(uploader.requests.count, 2)
+        XCTAssertTrue(uploader.requests.allSatisfy { $0.additionalMetadata.isEmpty })
+    }
+
     private func trashedPairedVideo() -> RemotePhotoDuplicate {
         RemotePhotoDuplicate(
             nameHash: "nh(live.mov)",

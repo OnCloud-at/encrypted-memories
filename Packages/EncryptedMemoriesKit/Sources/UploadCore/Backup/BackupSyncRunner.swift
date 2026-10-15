@@ -1283,7 +1283,9 @@ public actor BackupSyncRunner {
             captureTime: resolved.captureDate,
             modificationDate: resolved.descriptor.modificationDate,
             tags: Self.primaryTags(for: resolved.secondaries),
-            additionalMetadata: resolved.additionalMetadata + (lineage.map { [$0.additionalMetadata] } ?? [])
+            additionalMetadata: PhotoUploadMetadataEncoder.fillingCameraDevice(
+                in: resolved.additionalMetadata, mediaType: resolved.mediaType, fileURL: descriptor.fileURL)
+                + (lineage.map { [$0.additionalMetadata] } ?? [])
         )
         .applying(identity: preflightResult.identity)
         .replacingExistingDraft(preflightResult.decision == .uploadReplacingDraft)
@@ -1950,7 +1952,8 @@ public actor BackupSyncRunner {
             captureTime: secondary.descriptor.modificationDate,
             modificationDate: descriptor.modificationDate,
             tags: Self.secondaryTags(for: descriptor.source.resource),
-            additionalMetadata: secondary.additionalMetadata,
+            additionalMetadata: PhotoUploadMetadataEncoder.fillingCameraDevice(
+                in: secondary.additionalMetadata, mediaType: secondary.mediaType, fileURL: descriptor.fileURL),
             mainPhotoUID: primaryUID
         )
         .applying(identity: identity)
