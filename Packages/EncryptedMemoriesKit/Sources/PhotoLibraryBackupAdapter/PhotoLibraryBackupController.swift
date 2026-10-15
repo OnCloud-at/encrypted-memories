@@ -1012,12 +1012,28 @@ public final class PhotoLibraryBackupController {
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) async -> BackupSyncProgress {
+        await reconcileWhileScanning(
+            drain: { await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent) },
+            isQueueOperational: { await runner.isQueueOperational() },
+            scanDone: scanDone, queue: queue, coalescing: coalescing, clock: clock, now: now)
+    }
+
+    /// The same loop over any drain, so a test can count the drains of a row that stays due.
+    nonisolated static func reconcileWhileScanning(
+        drain: @escaping @Sendable () async -> BackupSyncProgress,
+        isQueueOperational: @escaping @Sendable () async -> Bool,
+        scanDone: BackupScanSignal,
+        queue: UploadBackupSyncQueueManifestStore,
+        coalescing: TimeInterval,
+        clock: any BackupSchedulerClock,
+        now: @escaping @Sendable () -> Date
+    ) async -> BackupSyncProgress {
         // Subscribe before the first drain, so a row enqueued after a drain wakes the next one.
         let follower = scanDone.wake.follow(queue.changes())
         defer { follower.cancel() }
         while !Task.isCancelled {
-            let progress = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
-            guard await runner.isQueueOperational() else { return progress }
+            let progress = await drain()
+            guard await isQueueOperational() else { return progress }
             // A failed remote index cannot safely dedupe anything, and a closed runtime policy has
             // no eligible transport. End this pass and let the controller's typed retry scheduler
             // choose the next attempt instead of draining again at every queue write.
@@ -1027,11 +1043,10 @@ public final class PhotoLibraryBackupController {
             if await scanDone.isDone() {
                 // The scan may have enqueued rows between our last claim and its done-signal; one more
                 // drain guarantees they upload before we return.
-                let tail = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
-                return tail
+                return await drain()
             }
-            // Rows that are due now but were not taken (a full disk, a dismissed recheck) wait for the next write
-            // or the end of the scan instead of a hot loop. Cancellation wakes the wait.
+            // A row that is already due (its date passed after the drain's last claim) wakes the next drain at once;
+            // the pause below keeps that to one drain per `coalescing` seconds. Cancellation wakes the wait.
             await scanDone.wake.wait(atMost: nextDueDelay(in: queue, now: now()), clock: clock)
             // Writes of the same scan chunk drain together. A scan that ended before the pause drains at once; one that
             // ends during it, and a stored date, drain at most `coalescing` seconds later.
@@ -1040,14 +1055,19 @@ public final class PhotoLibraryBackupController {
         return BackupSyncProgress()
     }
 
-    /// Seconds until the next persisted retry date or draft re-check, or nil when nothing waits for a date.
+    /// The longest timed wait of the drain: the runner's longest park (Proton storage, 6 h). A later or damaged date
+    /// wakes the drain after this time, which then reads the dates again; a sleep never gets an unbounded value.
+    nonisolated static let longestDueWait: TimeInterval = 6 * 3600
+
+    /// Seconds until the earliest persisted retry date or draft re-check, 0 when one is already due, or nil when
+    /// nothing waits for a date. A due date counts: as the minimum it would otherwise hide every later date.
     nonisolated static func nextDueDelay(in queue: UploadBackupSyncQueueManifestStore, now: Date) -> TimeInterval? {
         // A blocked draft stores its re-check date as `updatedAt`, as the runner's own wait reads it.
         let dates = [
             queue.nextRunnableDate(excludingSourcesOf: []), queue.earliestEntry(in: .blockedByDraft)?.updatedAt,
         ]
-        guard let next = dates.compactMap({ $0 }).filter({ $0 > now }).min() else { return nil }
-        return next.timeIntervalSince(now)
+        guard let next = dates.compactMap({ $0 }).min() else { return nil }
+        return min(longestDueWait, max(0, next.timeIntervalSince(now)))
     }
 
     /// Runs the scan phase through the persistent catalog driver. `nonisolated` keeps SQLite and

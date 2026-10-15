@@ -957,6 +957,78 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         await reconcile.value
     }
 
+    /// A row whose date passed after the drain's last claim is due now. It must wake the next drain at once and must
+    /// not hide a later date by being the earliest one.
+    func testADueRowWakesTheDrainAtOnce() throws {
+        XCTAssertTrue(queue.upsert(runnableEntry("due", at: clock.now.addingTimeInterval(-1))))
+        XCTAssertTrue(queue.upsert(runnableEntry("later", at: clock.now.addingTimeInterval(30))))
+        XCTAssertEqual(PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now), 0)
+    }
+
+    /// The pending grid keeps the store's one legacy observer; the controller's loops subscribe through `changes()`.
+    /// Both hear the same committed write, and clearing the legacy observer (the grid closes) ends no subscription.
+    func testTheLegacyObserverAndChangeSubscribersBothHearAWrite() async throws {
+        let legacy = IntBox()
+        queue.setChangeObserver { _ in legacy.value += 1 }
+        var subscription = queue.changes().makeAsyncIterator()
+
+        XCTAssertTrue(queue.upsert(runnableEntry("first", at: clock.now)))
+        let first = await subscription.next()
+        XCTAssertNotNil(first)
+        XCTAssertEqual(legacy.value, 1)
+
+        queue.setChangeObserver(nil)
+        XCTAssertTrue(queue.upsert(runnableEntry("second", at: clock.now)))
+        let second = await subscription.next()
+        XCTAssertNotNil(second, "the subscription outlives the legacy observer")
+        XCTAssertEqual(legacy.value, 1)
+    }
+
+    /// A far-future or damaged date must not reach the clock as an unbounded sleep.
+    func testAFarFutureDateWaitsAtMostTheLongestPark() throws {
+        XCTAssertTrue(queue.upsert(runnableEntry("far", at: .distantFuture)))
+        XCTAssertEqual(
+            PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now),
+            PhotoLibraryBackupController.longestDueWait)
+        XCTAssertEqual(PhotoLibraryBackupController.longestDueWait, 6 * 3600)
+    }
+
+    /// A row that stays due but is never taken wakes the loop again and again. The pause after each wake bounds that to
+    /// one drain per `coalescing` seconds of the scheduler clock; it must never spin.
+    func testARowThatStaysDueDrainsAtMostOncePerPause() async throws {
+        XCTAssertTrue(queue.upsert(runnableEntry("stuck", at: clock.now.addingTimeInterval(-1))))
+        let queue = self.queue!
+        let testClock = clock!
+        let start = testClock.now
+        let scanDone = BackupScanSignal()
+        let drains = IntBox()
+        let reconcile = Task {
+            await PhotoLibraryBackupController.reconcileWhileScanning(
+                drain: {
+                    drains.value += 1  // Takes nothing: the row stays due.
+                    return BackupSyncProgress()
+                },
+                isQueueOperational: { true }, scanDone: scanDone, queue: queue, coalescing: 1, clock: testClock,
+                now: { testClock.now })
+        }
+        // Twenty seconds of scheduler time pass only through the loop's own pauses.
+        try await waitForCondition { testClock.now >= start.addingTimeInterval(20) }
+        await scanDone.markDone()
+        reconcile.cancel()
+        _ = await reconcile.value
+
+        let elapsed = testClock.now.timeIntervalSince(start)
+        XCTAssertGreaterThanOrEqual(elapsed, 20, "the due row kept waking the drain")
+        XCTAssertLessThanOrEqual(
+            drains.value, Int(elapsed) + 2, "at most one drain per pause, plus the first and the tail drain")
+    }
+
+    private func runnableEntry(_ id: String, at date: Date) -> UploadBackupSyncQueueEntry {
+        UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: id), revision: .init(rawValue: 1),
+            originalFilename: "\(id).heic", state: .discovered, updatedAt: date)
+    }
+
     func testNothingWaitsForADateWhenNoRowIsDueLater() throws {
         XCTAssertNil(PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now))
         // The runner parks a draft with its re-check date as `updatedAt`.

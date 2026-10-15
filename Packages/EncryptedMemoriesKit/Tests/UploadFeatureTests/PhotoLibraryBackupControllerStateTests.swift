@@ -427,6 +427,67 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await fixture.controller.shutdown()
         }
 
+        func testSeveralOpenListsEachGetTheLastReadAndLeaveNothingBehind() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-several")
+            defer { fixture.cleanup() }
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let first = ShownProblemLists()
+            let second = ShownProblemLists()
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            let followers = [first, second].map { shown in
+                Task {
+                    await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                    shown.ended = true
+                }
+            }
+            try await waitForCondition { !first.lists.isEmpty && !second.lists.isEmpty }
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 2)
+
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            clock.releaseAll()
+            try await waitForCondition { first.ended && second.ended }
+            for follower in followers {
+                follower.cancel()
+                await follower.value
+            }
+            XCTAssertEqual(first.lists.count, 2, "each open list reads once more at the end of the pass")
+            XCTAssertEqual(second.lists.count, 2)
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 0)
+            await fixture.controller.shutdown()
+        }
+
+        func testAListClosedWhileItWaitsLeavesNothingBehind() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-closed")
+            defer { fixture.cleanup() }
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let shown = ShownProblemLists()
+            let follow = Task {
+                await fixture.controller.followProblemList(clock: HeldBackupSleepClock(clock: BackupTestClock())) {
+                    shown.lists.append($0)
+                }
+                shown.ended = true
+            }
+            try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 1)
+
+            follow.cancel()  // The person closes the list while it waits for the next write.
+            try await waitForCondition { shown.ended }
+            await follow.value
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 0)
+            XCTAssertTrue(fixture.controller.isSyncing, "closing the list does not touch the pass")
+
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            await fixture.controller.shutdown()
+        }
+
         private func quotaEntry(_ name: String) -> UploadBackupSyncQueueEntry {
             .init(
                 source: .init(kind: .photoLibraryAsset, identifier: name), revision: .init(rawValue: 1),

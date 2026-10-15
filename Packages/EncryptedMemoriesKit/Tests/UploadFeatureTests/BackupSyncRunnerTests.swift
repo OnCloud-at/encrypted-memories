@@ -2533,6 +2533,24 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
+    /// The scan drain waits for a parked draft's re-check date. It reads the date that the runner's own park write
+    /// stored, not a hand-built row.
+    func testTheScanDrainWaitsForTheRunnersOwnDraftRecheckDate() async throws {
+        let entry = seedEntry("draft.jpg")
+        let hashes = expectedHashes(id: "draft.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(nameHash: hashes.nameHash, contentHash: nil, linkState: .draft, linkID: nil)
+        ]
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        let parked = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(parked.state, .blockedByDraft)
+        let recheck = try XCTUnwrap(BackupIssueRecord.decode(parked.lastError)?.nextAttemptAt)
+        XCTAssertGreaterThan(recheck, clock.now)
+        let delay = try XCTUnwrap(PhotoLibraryBackupController.nextDueDelay(in: queueStore, now: clock.now))
+        XCTAssertEqual(delay, recheck.timeIntervalSince(clock.now), accuracy: 0.001, "the drain wakes at the re-check")
+    }
+
     func testManualRetryRechecksDraftImmediatelyWithoutBlindUpload() async throws {
         let entry = seedEntry("manual-draft.jpg")
         let hashes = expectedHashes(id: "manual-draft.jpg")
