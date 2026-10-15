@@ -57,6 +57,9 @@ import Testing
 
     @Test func evidenceIsSharedAndReplacedOnlyWhenCoordinatesChange() async {
         let index = PhotoLocationIndex()
+        #if DEBUG
+            index.warmingPriorityForTesting = .userInitiated
+        #endif
         index.replaceAll(Self.library())
         let evidence = index.placeEvidence()
         #expect(index.placeEvidence() === evidence)
@@ -76,6 +79,9 @@ import Testing
     @Test func supportExportContainsOnlyAnonymousCountsAndRoundedSpans() async throws {
         let sources = SupportDiagnosticsSources()
         let index = PhotoLocationIndex(supportSources: sources)
+        #if DEBUG
+            index.warmingPriorityForTesting = .userInitiated
+        #endif
         index.replaceAll(Self.library())
         let data = try await SupportDiagnosticsExporter.makeJSONData(sources: sources)
         let report = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -131,9 +137,11 @@ import Testing
     #if DEBUG
         @Test func replacingSnapshotWarmsTheSharedEvidenceWithoutAConsumer() async throws {
             let index = PhotoLocationIndex()
+            index.warmingPriorityForTesting = .userInitiated
             index.replaceAll(Self.library())
             let evidence = index.placeEvidence()
-            for _ in 0..<200 where !evidence.hasAnalyzed { try await Task.sleep(for: .milliseconds(5)) }
+            // The index owns the warming task; awaiting it needs no time limit.
+            try #require(await evidence.waitForWarming())
             try #require(evidence.hasAnalyzed)
             #expect(evidence.analyzedOnMainThread == false)
             #expect(index.placeEvidence() === evidence)
@@ -142,12 +150,14 @@ import Testing
 
         @Test func crawlWarmsOnlyTheCompletedSnapshot() async throws {
             let index = PhotoLocationIndex()
+            index.warmingPriorityForTesting = .userInitiated
             index.updateScanProgress(PhotoLocationScanProgress(phase: .scanning))
             index.merge(Self.library())
             let evidence = index.placeEvidence()
             #expect(!evidence.hasAnalyzed)
             index.updateScanProgress(PhotoLocationScanProgress(phase: .completed))
-            for _ in 0..<200 where !evidence.hasAnalyzed { try await Task.sleep(for: .milliseconds(5)) }
+            // The index owns the warming task; awaiting it needs no time limit.
+            try #require(await evidence.waitForWarming())
             try #require(evidence.hasAnalyzed)
             #expect(evidence.analyzedOnMainThread == false)
             #expect(index.placeEvidence() === evidence)
