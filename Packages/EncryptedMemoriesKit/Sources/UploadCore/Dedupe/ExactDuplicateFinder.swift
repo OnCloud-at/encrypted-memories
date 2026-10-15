@@ -561,7 +561,8 @@ public struct ExactDuplicateFinder: Sendable {
 
     /// Runs `body`, which empties Recently Deleted, while no merge of this finder runs, and holds new merges until it
     /// ends. A merge that trashed its copies between the check of the open merges and the emptying would lose them for
-    /// good. Throws `CancellationError` without running `body` when the task is cancelled while it waits.
+    /// good. Throws `CancellationError` without running `body` when the task is cancelled while it waits; a cancellation
+    /// that arrives as the turn passes to it can still run `body`, which then still checks the open merges first.
     public func excludingMerges(_ body: () async throws -> Void) async throws {
         try await mergeTurns.runOrThrow(body)
     }
@@ -1230,7 +1231,7 @@ final class ExactDuplicateTurns: @unchecked Sendable {
     }
 
     /// Runs `body` like `run(_:)`. Throws `CancellationError` without running it when the task is cancelled while it
-    /// waits.
+    /// waits. A cancellation that arrives as the turn passes to it can still run `body`.
     func runOrThrow<T>(_ body: () async throws -> T) async throws -> T {
         guard await enter() else { throw CancellationError() }
         defer { leave() }
