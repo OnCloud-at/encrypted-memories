@@ -331,9 +331,12 @@ final class AppModel {
     /// `makeFacade` succeeded, and a failed scope recovery shut its facade down first. So two backends never work on
     /// the account's files, a retry starts only without a facade, and only after the failed preparation ended.
     func retryBackend() {
-        guard scopeRecoveryTask == nil, facade == nil, case .failed = backend,
-            case .signedIn(let session) = auth
-        else { return }
+        guard scopeRecoveryTask == nil, case .failed = backend, case .signedIn(let session) = auth else { return }
+        guard facade == nil else {
+            DebugLog.log("backend retry: a failed state still holds a facade; the retry starts nothing")
+            assertionFailure("A failed backend state must not hold a facade")
+            return
+        }
         let failed = backendTask
         Task {
             await backendRetry.run(
@@ -343,7 +346,8 @@ final class AppModel {
                     await failed?.value
                 },
                 start: { [weak self] in
-                    guard let self, self.scopeRecoveryTask == nil, self.facade == nil,
+                    // Another preparation that began meanwhile keeps running; the retry starts no second one.
+                    guard let self, self.scopeRecoveryTask == nil, self.facade == nil, self.backendTask == nil,
                         case .signedIn(let current) = self.auth, current == session
                     else { return }
                     self.prepareBackend(session)
