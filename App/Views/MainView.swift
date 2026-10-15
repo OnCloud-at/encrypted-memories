@@ -1547,10 +1547,11 @@ struct MainView: View {
                     } description: {
                         Text(L10n.string("map.scan_failed_message"))
                     } actions: {
-                        // The same restart as after a reconnect, so a failed scan can start again like on iPhone.
+                        // Scans the whole library again, like the automatic start and the iPhone map; the route
+                        // left under the map may hold only an album, a tag or Recently Deleted.
                         RetryButton(.prominent) {
                             OfflineLibraryManager.shared.restartLocationCrawl(
-                                items: timelineModel.allItems, metadata: backend)
+                                items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
                         }
                     }
                 case .completed:
