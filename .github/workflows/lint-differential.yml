@@ -1,0 +1,118 @@
+name: Lint differential (scratch, not for merge)
+
+on:
+  pull_request:
+    paths:
+      - ".github/lint-differential/**"
+      - ".github/workflows/lint-differential.yml"
+
+permissions:
+  contents: read
+
+env:
+  SWIFT_VERSION: "6.4.0"
+  SWIFT_SHA256: 69f7b2b4dbce6090b6c92194b71149a057e16269093b5a9dded38afc4a05094e
+  SWIFTLINT_VERSION: "0.65.1"
+  SWIFTLINT_LINUX_SHA256: caeed6f4a679c35539ffaf124f6c4ab4a8416917f7d8796279dc52b74026059d
+  SWIFTLINT_SHA256: c1e429b0599cf1b516f369a2d9ec04eaf0e436f3c12b637df8851fa52ff694d0
+
+jobs:
+  linux:
+    name: Linux verdicts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install the pinned Swift toolchain and SwiftLint
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          name="swift-$SWIFT_VERSION-RELEASE-ubuntu24.04"
+          curl --fail --location --silent --show-error \
+            "https://download.swift.org/swift-$SWIFT_VERSION-release/ubuntu2404/swift-$SWIFT_VERSION-RELEASE/$name.tar.gz" \
+            --output "$RUNNER_TEMP/swift.tar.gz"
+          echo "$SWIFT_SHA256  $RUNNER_TEMP/swift.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/swift"
+          tar -xzf "$RUNNER_TEMP/swift.tar.gz" -C "$RUNNER_TEMP/swift" --strip-components=1 \
+            "$name/usr/bin/swift-format" "$name/usr/lib"
+          curl --fail --location --silent --show-error \
+            "https://github.com/realm/SwiftLint/releases/download/$SWIFTLINT_VERSION/swiftlint_linux_amd64.zip" \
+            --output "$RUNNER_TEMP/swiftlint.zip"
+          echo "$SWIFTLINT_LINUX_SHA256  $RUNNER_TEMP/swiftlint.zip" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/swiftlint"
+          unzip -q "$RUNNER_TEMP/swiftlint.zip" -d "$RUNNER_TEMP/swiftlint"
+          echo "install seconds: $(( $(date +%s) - start ))"
+          "$RUNNER_TEMP/swift/usr/bin/swift-format" --version || true
+          df -h / | tail -1
+      - name: Record the verdicts
+        run: |
+          set -uo pipefail
+          export LINUX_SOURCEKIT_LIB_PATH="$RUNNER_TEMP/swift/usr/lib"
+          start=$(date +%s)
+          bash .github/lint-differential/run_all.sh "$RUNNER_TEMP/swift/usr/bin/swift-format" \
+            "$RUNNER_TEMP/swiftlint/swiftlint-static" "$RUNNER_TEMP/out"
+          echo "run seconds: $(( $(date +%s) - start ))"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: linux-verdicts
+          path: ${{ runner.temp }}/out
+
+  macos:
+    name: macOS runner verdicts
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-swiftlint
+      - name: Select Xcode 27
+        run: sudo xcode-select --switch /Applications/Xcode.app
+      - name: Record the verdicts
+        run: |
+          set -uo pipefail
+          xcodebuild -version
+          xcrun swiftc --version 2>&1 | head -2
+          xcrun swift-format --version || true
+          bash .github/lint-differential/run_all.sh "$(xcrun --find swift-format)" "$(command -v swiftlint)" "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: macos-verdicts
+          path: ${{ runner.temp }}/out
+
+  compare:
+    name: Compare
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/verdicts
+      - name: Compare the verdicts
+        run: |
+          set -uo pipefail
+          status=0
+          v="$RUNNER_TEMP/verdicts"
+          for file in corpus-swift-format corpus-swiftlint repository-swift-format repository-swiftlint repository-count; do
+            if diff -u "$v/macos-verdicts/$file.txt" "$v/linux-verdicts/$file.txt"; then
+              echo "same: $file"
+            else
+              echo "DIFFERENT: $file"; status=1
+            fi
+          done
+          for pair in "corpus-swift-format:expected-macos-swift-format" "corpus-swiftlint:expected-macos-swiftlint"; do
+            if diff -u ".github/lint-differential/${pair#*:}.txt" "$v/linux-verdicts/${pair%%:*}.txt"; then
+              echo "same as the local Xcode 27.1 reference: ${pair%%:*}"
+            else
+              echo "DIFFERENT from the local reference: ${pair%%:*}"
+            fi
+          done
+          exit $status

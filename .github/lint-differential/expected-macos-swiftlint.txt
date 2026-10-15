@@ -1,0 +1,31 @@
+== 00-clean.swift exit 0
+== custom-em-dash-in-comment.swift exit 2
+custom-em-dash-in-comment.swift:1:8: error: Comment punctuation Violation: Use direct punctuation in code comments. (no_em_dash_in_comments)
+== custom-em-dash-in-string.swift exit 0
+== custom-narrative-comment-study.swift exit 2
+custom-narrative-comment-study.swift:1:6: error: Public code comments Violation: Keep comments focused on the code contract. (no_internal_narrative_in_comments)
+== custom-narrative-comment.swift exit 2
+custom-narrative-comment.swift:1:24: error: Public code comments Violation: Keep comments focused on the code contract. (no_internal_narrative_in_comments)
+== custom-narrative-in-doc-comment.swift exit 0
+== custom-narrative-word-in-code.swift exit 0
+== duplicate-imports.swift exit 2
+duplicate-imports.swift:2:1: error: Duplicate Imports Violation: Imports should be unique (duplicate_imports)
+== empty-xctest-method.swift exit 2
+empty-xctest-method.swift:4:5: error: Empty XCTest Method Violation: Empty XCTest method should be avoided (empty_xctest_method)
+== fatal-error-message.swift exit 2
+fatal-error-message.swift:1:1: error: Unavailable Function Violation: Unimplemented functions should be marked as unavailable (unavailable_function)
+fatal-error-message.swift:2:5: error: Fatal Error Message Violation: A fatalError call should have a message (fatal_error_message)
+== orphaned-doc-comment.swift exit 2
+orphaned-doc-comment.swift:1:1: error: Orphaned Doc Comment Violation: A doc comment should be attached to a declaration (orphaned_doc_comment)
+== syntax-error.swift exit 0
+== trailing-newline-extra.swift exit 2
+trailing-newline-extra.swift:2:1: error: Trailing Newline Violation: Files should have a single trailing newline (trailing_newline)
+== trailing-newline-missing.swift exit 2
+trailing-newline-missing.swift:1:1: error: Trailing Newline Violation: Files should have a single trailing newline (trailing_newline)
+== trailing-whitespace.swift exit 2
+trailing-whitespace.swift:1:10: error: Trailing Whitespace Violation: Lines should not have trailing whitespace (trailing_whitespace)
+== unavailable-function.swift exit 2
+unavailable-function.swift:5:14: error: Unavailable Function Violation: Unimplemented functions should be marked as unavailable (unavailable_function)
+== unused-optional-binding.swift exit 2
+unused-optional-binding.swift:2:12: error: Unused Optional Binding Violation: Prefer `!= nil` over `let _ =` (unused_optional_binding)
+== yoda-condition.swift exit 0
