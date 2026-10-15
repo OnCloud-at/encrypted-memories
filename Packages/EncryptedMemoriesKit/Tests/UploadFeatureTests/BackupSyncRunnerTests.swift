@@ -3603,21 +3603,45 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.map(\.additionalMetadata), [[metadata], [metadata]])
     }
 
-    func testTrashedSecondaryNeverMarksLivePhotoBackedUp() async throws {
+    private func trashedPairedVideo() -> RemotePhotoDuplicate {
+        RemotePhotoDuplicate(
+            nameHash: "nh(live.mov)",
+            contentHash: expectedContentHash(path: "/backup/live.heic#live.mov"),
+            linkState: .trashed,
+            linkID: "trashed-paired"
+        )
+    }
+
+    func testATrashedFileOfAnotherPhotoLetsTheLivePhotoBackUp() async throws {
+        // The trashed file has the video's name and bytes but belongs to another photo entry, for example a video
+        // that was once uploaded on its own. The person did not delete this Live Photo.
         let entry = seedEntry("live.heic")
         resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
-        checker.remoteItemsByNameHash["nh(live.mov)"] = [
-            RemotePhotoDuplicate(
-                nameHash: "nh(live.mov)",
-                contentHash: expectedContentHash(path: "/backup/live.heic#live.mov"),
-                linkState: .trashed,
-                linkID: "trashed-paired"
-            )
-        ]
+        checker.remoteItemsByNameHash["nh(live.mov)"] = [trashedPairedVideo()]
 
         let progress = await makeRunner().runUntilDrained()
 
-        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"])
+        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic", "live.mov"])
+        XCTAssertEqual(uploader.requests.last?.mainPhotoUID, testUID("live.heic"))
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(progress.backedUp, 1)
+    }
+
+    func testATrashedCopyOfTheSameLivePhotoStaysTheDeletionByThePerson() async throws {
+        // The Live Photo's main photo is already in Proton; the person trashed its video there on its own.
+        let entry = seedEntry("live.heic")
+        resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(live.heic)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(live.heic)", contentHash: expectedContentHash(path: "/backup/live.heic"),
+                linkState: .active, linkID: "existing-main")
+        ]
+        checker.remoteItemsByNameHash["nh(live.mov)"] = [trashedPairedVideo()]
+        checker.relatedLinkIDsByMainLinkID["existing-main"] = ["trashed-paired"]
+
+        let progress = await makeRunner().runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty, "nothing uploads")
         XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
         XCTAssertEqual(progress.backedUp, 0)
         XCTAssertNil(
