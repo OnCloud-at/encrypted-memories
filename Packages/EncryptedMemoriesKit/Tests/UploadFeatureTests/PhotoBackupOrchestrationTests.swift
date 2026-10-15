@@ -994,33 +994,58 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
     }
 
     /// A row that stays due but is never taken wakes the loop again and again. The pause after each wake bounds that to
-    /// one drain per `coalescing` seconds of the scheduler clock; it must never spin.
+    /// one drain per `coalescing` seconds of the scheduler clock; it must never spin. The scan ends inside the pause that
+    /// reaches 20 seconds, so the count is exact however late the test thread runs: the first drain, one per pause, and
+    /// the tail drain after the end of the scan.
     func testARowThatStaysDueDrainsAtMostOncePerPause() async throws {
         XCTAssertTrue(queue.upsert(runnableEntry("stuck", at: clock.now.addingTimeInterval(-1))))
         let queue = self.queue!
-        let testClock = clock!
-        let start = testClock.now
+        let start = clock.now
         let scanDone = BackupScanSignal()
+        let pauses = ScanEndingClock(clock: clock, end: start.addingTimeInterval(20), scanDone: scanDone)
         let drains = IntBox()
         let reconcile = Task {
             await PhotoLibraryBackupController.reconcileWhileScanning(
                 drain: {
                     drains.value += 1  // Takes nothing: the row stays due.
+                    // A loop that drains without pausing never reaches the end of the scan; this ends it instead.
+                    if drains.value > 1_000 { await scanDone.markDone() }
                     return BackupSyncProgress()
                 },
-                isQueueOperational: { true }, scanDone: scanDone, queue: queue, coalescing: 1, clock: testClock,
-                now: { testClock.now })
+                isQueueOperational: { true }, scanDone: scanDone, queue: queue, coalescing: 1, clock: pauses,
+                now: { pauses.now })
         }
-        // Twenty seconds of scheduler time pass only through the loop's own pauses.
-        try await waitForCondition { testClock.now >= start.addingTimeInterval(20) }
-        await scanDone.markDone()
-        reconcile.cancel()
+        // The loop ends by itself after the tail drain. The limit only ends a loop that waits forever.
+        let hangLimit = Task {
+            try await Task.sleep(for: .seconds(300))
+            reconcile.cancel()
+        }
         _ = await reconcile.value
+        hangLimit.cancel()
 
-        let elapsed = testClock.now.timeIntervalSince(start)
-        XCTAssertGreaterThanOrEqual(elapsed, 20, "the due row kept waking the drain")
-        XCTAssertLessThanOrEqual(
-            drains.value, Int(elapsed) + 2, "at most one drain per pause, plus the first and the tail drain")
+        XCTAssertEqual(clock.now.timeIntervalSince(start), 20, "twenty one-second pauses end the scan")
+        XCTAssertEqual(drains.value, 22, "at most one drain per pause, plus the first and the tail drain")
+    }
+
+    /// The test's scheduler clock: it advances like `BackupTestClock` and ends the scan inside the pause that reaches
+    /// `end`, so the test needs no polling of the clock.
+    private final class ScanEndingClock: BackupSchedulerClock, Sendable {
+        private let clock: BackupTestClock
+        private let end: Date
+        private let scanDone: BackupScanSignal
+
+        init(clock: BackupTestClock, end: Date, scanDone: BackupScanSignal) {
+            self.clock = clock
+            self.end = end
+            self.scanDone = scanDone
+        }
+
+        var now: Date { clock.now }
+
+        func sleep(for seconds: TimeInterval) async throws {
+            try await clock.sleep(for: seconds)
+            if clock.now >= end { await scanDone.markDone() }
+        }
     }
 
     private func runnableEntry(_ id: String, at date: Date) -> UploadBackupSyncQueueEntry {
