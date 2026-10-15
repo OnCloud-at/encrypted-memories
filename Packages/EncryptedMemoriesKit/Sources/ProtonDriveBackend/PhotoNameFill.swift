@@ -11,6 +11,8 @@ enum PhotoNameFill {
     struct Outcome: Equatable, Sendable {
         var requests = 0
         var recorded = 0
+        /// Names not written because a rename or removal arrived while their batch was read.
+        var superseded = 0
         /// The backfill stopped before it covered every photo: the runtime withdrew permission.
         var deferred = false
     }
@@ -62,6 +64,7 @@ enum PhotoNameFill {
             if decrypt == nil { decrypt = try await nameKey() }
             guard let decrypt else { return outcome }
             let batch = Array(missing[start..<min(start + size, missing.count)])
+            let token = store.forgetToken
             let links = try await ProtonRequestContext.$priority.withValue(.maintenance) {
                 try await fetch(batch)
             }
@@ -72,8 +75,12 @@ enum PhotoNameFill {
             for nodeID in batch where names[PhotoUID(volumeID: volumeID, nodeID: nodeID)] == nil {
                 names[PhotoUID(volumeID: volumeID, nodeID: nodeID)] = ""
             }
-            guard store.record(names) else { throw PhotoNameFillError.storeUnavailable }
-            outcome.recorded += names.count
+            switch store.record(names, unlessForgottenSince: token) {
+            case .written: outcome.recorded += names.count
+            // A rename or removal arrived during the read; the batch stays without rows and the next backfill reads it.
+            case .superseded: outcome.superseded += names.count
+            case .failed: throw PhotoNameFillError.storeUnavailable
+            }
             await Task.yield()
         }
         return outcome
@@ -82,4 +89,41 @@ enum PhotoNameFill {
 
 enum PhotoNameFillError: Error {
     case storeUnavailable
+}
+
+/// Runs the name backfill as its own task, after the metadata pass that scheduled it returned. The pass therefore
+/// publishes its page results, and a newer inventory starts its pass, without waiting for name reads. A newer backfill
+/// cancels the running one and starts after it ended; nothing starts after `close()`.
+final class PhotoNameBackfillQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var closed = false
+
+    func schedule(_ operation: @escaping @Sendable () async -> Void) {
+        lock.withLock {
+            guard !closed else { return }
+            let previous = task
+            previous?.cancel()
+            task = Task(priority: .background) {
+                await previous?.value
+                guard !Task.isCancelled else { return }
+                await operation()
+            }
+        }
+    }
+
+    /// Cancels the running backfill and admits no new one.
+    func close() {
+        let current = lock.withLock {
+            closed = true
+            return task
+        }
+        current?.cancel()
+    }
+
+    /// Returns when the last scheduled backfill ended.
+    func wait() async {
+        let current = lock.withLock { task }
+        await current?.value
+    }
 }

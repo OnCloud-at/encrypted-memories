@@ -10,17 +10,27 @@ import SQLite3
 /// stops repeated requests and never matches a query. A photo without a row still needs its name.
 ///
 /// The file lives in the account library directory, so the sign-out purge removes it with `library-v1.sqlite`.
-/// The decrypted index is built on first use and kept in memory; `releaseMemory()` and every memory budget below
-/// normal drop it, and the next use reads the file again. Names never reach logs or diagnostics, only counts do.
+/// A search builds the decrypted index on its first query and keeps it until the search ends (`endSearch()`), a write
+/// changes the file, or the memory budget falls below normal; while the budget stays below normal no index is kept.
+/// Names never reach logs or diagnostics, only counts do.
 public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable {
     public static let databaseFileName = "photo-names-v1.sqlite"
+
+    public enum WriteResult: Equatable, Sendable {
+        case written
+        /// A name was forgotten after the caller took its token; nothing was written, so a later read fetches it again.
+        case superseded
+        case failed
+    }
 
     private let lock = NSLock()
     private var db: OpaquePointer?
     private let key: SymmetricKey
     private let transient = SQLiteStoreSchemaGate.transientDestructor
     private var cachedIndex: PhotoNameIndex?
+    private var cachesIndex = true
     private var revision: UInt64 = 0
+    private var forgetCount: UInt64 = 0
     private var memoryRegistration: MemoryPressureRegistration?
 
     public init?(
@@ -100,18 +110,25 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
         }
     }
 
-    /// Stores names in one transaction; an empty name records an unreadable one. False leaves the file unchanged.
+    /// Taken before a name read; `record(_:unlessForgottenSince:)` rejects the read when a name was forgotten meanwhile.
+    public var forgetToken: UInt64 {
+        lock.withLock { forgetCount }
+    }
+
+    /// Stores names in one transaction; an empty name records an unreadable one. With a token, nothing is written when
+    /// a name was forgotten since the token, because the read may predate a rename. Only `.written` changes the file.
     @discardableResult
-    public func record(_ names: [PhotoUID: String]) -> Bool {
-        guard !names.isEmpty else { return true }
+    public func record(_ names: [PhotoUID: String], unlessForgottenSince token: UInt64? = nil) -> WriteResult {
+        guard !names.isEmpty else { return .written }
         return lock.withLock {
-            guard let db else { return false }
+            guard let db else { return .failed }
+            if let token, token != forgetCount { return .superseded }
             var sealed: [(PhotoUID, Data)] = []
             sealed.reserveCapacity(names.count)
             for (uid, name) in names {
                 guard let box = try? AES.GCM.seal(Data(name.utf8), using: key, authenticating: Self.binding(uid)),
                     let combined = box.combined
-                else { return false }
+                else { return .failed }
                 sealed.append((uid, combined))
             }
             let written = transaction(db) {
@@ -133,10 +150,10 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
                 }
                 return true
             }
-            guard written else { return false }
+            guard written else { return .failed }
             revision &+= 1
-            cachedIndex = cachedIndex?.updating(names: names, removing: [], revision: revision)
-            return true
+            cachedIndex = nil
+            return .written
         }
     }
 
@@ -149,13 +166,14 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
             let removed = transaction(db) { deleteRows(db, uids) }
             guard removed else { return false }
             revision &+= 1
-            cachedIndex = cachedIndex?.updating(names: [:], removing: uids, revision: revision)
+            forgetCount &+= 1
+            cachedIndex = nil
             return true
         }
     }
 
-    /// The decrypted index, read from the file on first use after open or `releaseMemory()`. A row that does not
-    /// open (another key, damage) is removed, so the next metadata pass reads that name again.
+    /// The decrypted index for an open search, read from the file when no index is kept. A row that does not open
+    /// (another key, damage) is removed, so the next metadata pass reads that name again.
     public func index() -> PhotoNameIndex {
         lock.withLock {
             if let cachedIndex { return cachedIndex }
@@ -190,21 +208,24 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
                 PhotoDiagnostics.shared.increment("photoNames.unreadableRowRemoved", by: unreadable.count)
             }
             let index = PhotoNameIndex(normalizedNames: names, revision: revision)
-            // A partial read is served once but not kept, so the next search reads the file again.
-            if complete { cachedIndex = index }
+            // A partial read is served once but not kept, so the next query reads the file again.
+            if complete, cachesIndex { cachedIndex = index }
             return index
         }
     }
 
-    /// Drops the decrypted names from memory. The sealed file stays.
-    public func releaseMemory() {
+    /// The search ended: the store keeps no decrypted names. The sealed file stays.
+    public func endSearch() {
         lock.withLock { cachedIndex = nil }
     }
 
-    /// Any tier below normal (memory pressure, heat, or the app in the background) drops the decrypted names.
+    /// Any tier below normal (memory pressure, heat, or the app in the background) drops the decrypted names and keeps
+    /// none until the budget is normal again.
     @MainActor public func respondToMemoryBudget(_ tier: MemoryBudgetTier) {
-        guard tier != .normal else { return }
-        releaseMemory()
+        lock.withLock {
+            cachesIndex = tier == .normal
+            if !cachesIndex { cachedIndex = nil }
+        }
     }
 
     private static func binding(_ uid: PhotoUID) -> Data {

@@ -142,10 +142,12 @@ public actor TimelineSearchProjectionCoordinator {
 }
 
 /// The file names a search projection needs: the backend's name index while a text query is active, and nil
-/// otherwise, so no screen holds decrypted names outside a search.
+/// otherwise. An empty query ends the search in the backend too, so no decrypted names stay outside a search.
 public enum TimelineFileNameSearchSource {
     public static func names(forQuery query: String, from backend: Any?) async -> PhotoNameIndex? {
-        guard !TimelineSearchQuery(query).isEmpty, let provider = backend as? any PhotoNameSearchProvider else {
+        guard let provider = backend as? any PhotoNameSearchProvider else { return nil }
+        guard !TimelineSearchQuery(query).isEmpty else {
+            await provider.endPhotoNameSearch()
             return nil
         }
         return await provider.photoNameIndex()

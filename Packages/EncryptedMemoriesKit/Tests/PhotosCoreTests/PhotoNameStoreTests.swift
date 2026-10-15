@@ -12,7 +12,7 @@ import Testing
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_3350.HEIC", second: ""]))
+        #expect(store.record([first: "IMG_3350.HEIC", second: ""]) == .written)
         store.close()
 
         let reopened = try #require(makeStore(directory))
@@ -28,7 +28,7 @@ import Testing
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "Geheimnis_Urlaub.JPG"]))
+        #expect(store.record([first: "Geheimnis_Urlaub.JPG"]) == .written)
         store.close()
 
         let needle = Data("Geheimnis_Urlaub".utf8)
@@ -42,7 +42,7 @@ import Testing
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG", second: "IMG_2.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG", second: "IMG_2.JPG"]) == .written)
         store.close()
         try execute(
             directory,
@@ -59,7 +59,7 @@ import Testing
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
         store.close()
 
         let other = try #require(PhotoNameStore(directory: directory, accountUID: "account", keyPassword: "other"))
@@ -71,7 +71,7 @@ import Testing
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG", second: "IMG_2.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG", second: "IMG_2.JPG"]) == .written)
         let before = store.index()
         #expect(store.forget([first]))
 
@@ -86,35 +86,66 @@ import Testing
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
         _ = store.index()
-        #expect(store.record([first: "Strand.JPG"]))
+        #expect(store.record([first: "Strand.JPG"]) == .written)
         #expect(store.index().normalizedName(of: first) == "strand.jpg")
     }
 
-    @Test func releaseMemoryDropsTheIndexAndTheNextUseReadsTheFile() throws {
+    /// A search keeps its index until it ends; afterwards the store holds no decrypted names.
+    @Test func endingTheSearchDropsTheIndexAndTheNextQueryReadsTheFile() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
         let loaded = store.index()
         #expect(store.index() == loaded)
 
-        store.releaseMemory()
+        store.endSearch()
         let reloaded = store.index()
         #expect(reloaded != loaded)
         #expect(reloaded.normalizedName(of: first) == "img_1.jpg")
+    }
+
+    /// A write drops the kept index instead of copying it, so a backfill never copies the names of an open search.
+    @Test func aWriteDropsTheKeptIndex() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try #require(makeStore(directory))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
+        let loaded = store.index()
+        #expect(store.record([second: "IMG_2.JPG"]) == .written)
+        let afterRecord = store.index()
+        #expect(afterRecord != loaded)
+        #expect(afterRecord.normalizedName(of: second) == "img_2.jpg")
+        #expect(store.forget([first]))
+        #expect(store.index() != afterRecord)
+    }
+
+    /// A name read that started before a forget may hold the old name; it writes nothing, and the photo stays without
+    /// a row, so the next read fetches its new name.
+    @Test func aReadOlderThanAForgetWritesNothing() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try #require(makeStore(directory))
+        let token = store.forgetToken
+        #expect(store.forget([first]))
+
+        #expect(store.record([first: "IMG_OLD.JPG"], unlessForgottenSince: token) == .superseded)
+        #expect(store.recordedNodeIDs(volumeID: "vol") == [])
+        #expect(store.record([first: "IMG_NEW.JPG"], unlessForgottenSince: store.forgetToken) == .written)
+        #expect(store.index().normalizedName(of: first) == "img_new.jpg")
     }
 
     @Test func aClosedStoreServesNoNames() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
         store.close()
         #expect(store.index().isEmpty)
         #expect(store.recordedNodeIDs(volumeID: "vol") == nil)
-        #expect(!store.record([second: "IMG_2.JPG"]))
+        #expect(store.record([second: "IMG_2.JPG"]) == .failed)
     }
 
     /// The store sits in the account library directory, which the sign-out purge removes as a whole.
@@ -123,7 +154,7 @@ import Testing
         defer { try? FileManager.default.removeItem(at: base) }
         let directory = LibraryDatabaseLocation.prepareAccountDirectory(uid: "account", in: base)
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
         store.close()
         #expect(FileManager.default.fileExists(atPath: directory.appendingPathComponent(PhotoNameStore.databaseFileName).path))
 
@@ -138,7 +169,7 @@ import Testing
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(makeStore(directory))
-        #expect(store.record([first: "IMG_1.JPG"]))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
         _ = store.index()
         let path = directory.resolvingSymlinksInPath().appendingPathComponent(PhotoNameStore.databaseFileName).path
         #expect(openHandles(toPathsStartingWith: path) > 0)
@@ -183,14 +214,14 @@ import Testing
 }
 
 @Suite struct PhotoNameStoreMemoryPressureTests {
-    @MainActor @Test func aReducedMemoryBudgetDropsTheDecryptedNames() throws {
+    @MainActor @Test func aReducedMemoryBudgetDropsTheDecryptedNamesAndKeepsNone() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "PhotoNameStoreMemoryTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = try #require(PhotoNameStore(directory: directory, accountUID: "account", keyPassword: "secret"))
         let uid = PhotoUID(volumeID: "vol", nodeID: "node")
-        #expect(store.record([uid: "IMG_1.JPG"]))
+        #expect(store.record([uid: "IMG_1.JPG"]) == .written)
         let governor = MemoryPressureGovernor()
         let registration = governor.register(store)
         defer { registration.end() }
@@ -199,9 +230,19 @@ import Testing
         governor.update(MemoryConditions(pressure: .normal))
         #expect(store.index() == loaded)
         governor.update(MemoryConditions(isBackgrounded: true))
-        let reloaded = store.index()
-        #expect(reloaded != loaded)
-        #expect(reloaded.normalizedName(of: uid) == "img_1.jpg")
+        let reduced = store.index()
+        #expect(reduced != loaded)
+        #expect(reduced.normalizedName(of: uid) == "img_1.jpg")
+        // Below normal, each query reads the file and nothing stays kept, also after the search ends.
+        #expect(store.index() != reduced)
+        store.endSearch()
+        #expect(store.index() != reduced)
+
+        governor.update(MemoryConditions(pressure: .normal))
+        let kept = store.index()
+        #expect(store.index() == kept)
+        store.endSearch()
+        #expect(store.index() != kept)
     }
 }
 

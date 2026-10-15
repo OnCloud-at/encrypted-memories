@@ -61,16 +61,6 @@ public struct PhotoNameIndex: Sendable, Hashable {
         return storage.names[Self.key(uid)]
     }
 
-    /// A copy with names added or replaced (an empty name removes the entry) and the given photos removed.
-    package func updating(names: [PhotoUID: String], removing removed: Set<PhotoUID>, revision: UInt64) -> PhotoNameIndex {
-        var updated = storage.names
-        for uid in removed { updated[Self.key(uid)] = nil }
-        for (uid, name) in names {
-            updated[Self.key(uid)] = name.isEmpty ? nil : SearchTextNormalization.normalize(name)
-        }
-        return PhotoNameIndex(normalizedNames: updated, revision: revision)
-    }
-
     static func key(_ uid: PhotoUID) -> Int { uid.hashValue }
 
     public static func == (lhs: PhotoNameIndex, rhs: PhotoNameIndex) -> Bool {
@@ -83,7 +73,9 @@ public struct PhotoNameIndex: Sendable, Hashable {
     }
 }
 
-/// Optional backend capability: the file name index of the open library, for search.
+/// Optional backend capability: the file name index of the open library, for search. A screen calls
+/// `endPhotoNameSearch()` when its query ends, so no decrypted names stay in memory outside a search.
 public protocol PhotoNameSearchProvider: Sendable {
     func photoNameIndex() async -> PhotoNameIndex
+    func endPhotoNameSearch() async
 }

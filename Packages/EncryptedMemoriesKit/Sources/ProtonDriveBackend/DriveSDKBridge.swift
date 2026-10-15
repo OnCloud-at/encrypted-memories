@@ -80,6 +80,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let recentlyDeletedStore: RecentlyDeletedListingStore
     /// The sealed file names of the library, which search matches.
     private nonisolated let photoNames: PhotoNameStore?
+    private nonisolated let photoNameBackfill = PhotoNameBackfillQueue()
+    /// Names whose removal failed; the next library load removes them again.
+    private var pendingNameForgets = Set<PhotoUID>()
     private var librarySupport = LibrarySyncSupportSnapshot()
     private var recentlyDeleted: RecentlyDeletedIdentities
     /// Low-priority trash listing after the library lost photos, so photos trashed elsewhere get their
@@ -234,6 +237,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             metadataReconciliation.retire()
             trashListingTask?.cancel()
             quotaRefresh?.cancel()
+            photoNameBackfill.close()
         }
         await shutdownGate.run { [weak self] in
             await self?.performShutdown()
@@ -282,6 +286,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             return service
         }
         await dedupeService?.shutdown()
+        await photoNameBackfill.wait()
         timelineOrderStore?.close()
         timelineStore?.close()
         photoNames?.close()
@@ -440,12 +445,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         recentlyDeleted.eventsLost()
                     }
                 if removalsChanged { recentlyDeletedStore.save(recentlyDeleted.persisted) }
-                // A changed file may carry a new name; without a stored name the next metadata pass reads it again.
-                if let remoteChanges {
-                    photoNames?.forget(
-                        Set(remoteChanges.active.union(remoteChanges.removed).map {
+                // A changed file may carry a new name; without a stored name the next name read fetches it again.
+                if let remoteChanges, let photoNames {
+                    let changed = pendingNameForgets.union(
+                        remoteChanges.active.union(remoteChanges.removed).map {
                             PhotoUID(volumeID: root.volumeID, nodeID: $0)
-                        }))
+                        })
+                    pendingNameForgets = photoNames.forget(changed) ? [] : changed
+                    if !pendingNameForgets.isEmpty {
+                        DebugLog.log("timeline: file names not removed count=\(pendingNameForgets.count); next load retries")
+                    }
                 }
                 var entries: [PhotosListEntry]
                 if continuityRecoveryRequired {
@@ -962,6 +971,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             guard let self else { return }
             _ = try? await self.withOpenSession(cause: .reconcile, replacing: true) { bridge in
                 await bridge.reconcileTimelineMetadata(pass: pass)
+                // After the pass published its pages; the backfill never holds up a newer pass.
+                if bridge.metadataReconciliation.isCurrent(pass) {
+                    bridge.schedulePhotoNameBackfill(items: pass.inventory.items)
+                }
             }
         }
     }
@@ -1026,6 +1039,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 }
                 let candidates = page.filter { $0.uid.volumeID == context.volumeID }
                 if candidates.isEmpty { continue }
+                let nameToken = photoNames?.forgetToken
                 let links = try await ProtonRequestContext.$priority.withValue(.maintenance) {
                     try await driveSession.fetchPhotoLinksMetadata(
                         shareID: context.shareID, linkIDs: candidates.map { $0.uid.nodeID })
@@ -1043,10 +1057,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 }
                 changed = changed || (result?.changedRows ?? 0) > 0
                 if let photoNames, let nameKey = try await passRootKey(context) {
-                    photoNames.record(
-                        PhotoNameFill.names(
-                            in: links, requested: Set(candidates.map(\.uid.nodeID)), volumeID: context.volumeID,
-                            decrypt: { try? self.crypto.decryptName($0, parent: nameKey) }))
+                    let names = PhotoNameFill.names(
+                        in: links, requested: Set(candidates.map(\.uid.nodeID)), volumeID: context.volumeID,
+                        decrypt: { try? self.crypto.decryptName($0, parent: nameKey) })
+                    // A failed or superseded write leaves the photos without rows; the name backfill reads them.
+                    if photoNames.record(names, unlessForgottenSince: nameToken) == .failed {
+                        DebugLog.log("timeline: file names not saved count=\(names.count); backfill retries")
+                    }
                 }
                 var order: [PhotoUID: TimelineOrderMetadata] = [:]
                 if candidates.contains(where: \.needsOrder) {
@@ -1079,30 +1096,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     timelineOrderStore?.record(order, classifiedUIDs: Set(evidence.keys)) == false
                 {
                     throw TimelineOrderMetadataError.unavailable
-                }
-            }
-            if let photoNames, metadataReconciliation.isCurrent(pass) {
-                let context: PhotosShareContext
-                if let resolvedContext { context = resolvedContext } else { context = try await photosShareContext() }
-                let outcome = try await requestGovernor.causes.run(.photoNames, replacing: true) {
-                    try await PhotoNameFill.backfill(
-                        nodeIDs: pass.inventory.items.compactMap {
-                            $0.uid.volumeID == context.volumeID ? $0.uid.nodeID : nil
-                        },
-                        volumeID: context.volumeID, store: photoNames,
-                        permits: {
-                            !self.isShutDown && self.metadataReconciliation.isCurrent(pass)
-                                && PhotoNameFill.permits(LibraryRuntimeState.shared.snapshot())
-                        },
-                        nameKey: {
-                            guard let key = try await passRootKey(context) else { return nil }
-                            let crypto = self.crypto
-                            return { try? crypto.decryptName($0, parent: key) }
-                        },
-                        fetch: { try await self.driveSession.fetchPhotoLinksMetadata(shareID: context.shareID, linkIDs: $0) })
-                }
-                if outcome.requests > 0 {
-                    DebugLog.log("timeline: file names read requests=\(outcome.requests) deferred=\(outcome.deferred)")
                 }
             }
         } catch is CancellationError {
@@ -1283,6 +1276,49 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     nonisolated func photoNameIndex() async -> PhotoNameIndex {
         photoNames?.index() ?? .empty
+    }
+
+    nonisolated func endPhotoNameSearch() async {
+        photoNames?.endSearch()
+    }
+
+    /// Reads the names that no metadata page delivered, as its own operation after the pass returned.
+    private func schedulePhotoNameBackfill(items: [PhotoItem]) {
+        guard let photoNames, !isShutDown else { return }
+        photoNameBackfill.schedule { [weak self] in
+            _ = try? await self?.withOpenSession(cause: .photoNames, replacing: true) { bridge in
+                await bridge.backfillPhotoNames(items: items, store: photoNames)
+            }
+        }
+    }
+
+    private func backfillPhotoNames(items: [PhotoItem], store: PhotoNameStore) async {
+        do {
+            let context = try await photosShareContextImpl()
+            let outcome = try await PhotoNameFill.backfill(
+                nodeIDs: items.compactMap { $0.uid.volumeID == context.volumeID ? $0.uid.nodeID : nil },
+                volumeID: context.volumeID, store: store,
+                permits: { !self.isShutDown && PhotoNameFill.permits(LibraryRuntimeState.shared.snapshot()) },
+                nameKey: {
+                    // The stream source keeps the root key for the session, so a key read after a pass sends no request.
+                    let source = try await self.fileSource()
+                    let key = try await ProtonRequestContext.$priority.withValue(.maintenance) {
+                        try await source.nodeKey(ofLinkID: context.rootLinkID)
+                    }
+                    let crypto = self.crypto
+                    return { try? crypto.decryptName($0, parent: key) }
+                },
+                fetch: { try await self.driveSession.fetchPhotoLinksMetadata(shareID: context.shareID, linkIDs: $0) })
+            if outcome.requests > 0 {
+                DebugLog.log(
+                    "timeline: file names read requests=\(outcome.requests) superseded=\(outcome.superseded) deferred=\(outcome.deferred)"
+                )
+            }
+        } catch is CancellationError {
+            DebugLog.log("timeline: file name read cancelled; the next pass resumes it")
+        } catch {
+            DebugLog.log("timeline: file name read paused after a recoverable failure; the next pass resumes it")
+        }
     }
 
     // MARK: - LibraryStatsProvider

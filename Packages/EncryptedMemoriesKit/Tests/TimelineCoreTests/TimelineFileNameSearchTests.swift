@@ -7,11 +7,14 @@ import Testing
 
 @Suite struct TimelineFileNameSearchTests {
     private let named = PhotoItem(
-        uid: PhotoUID(volumeID: "v", nodeID: "kx"), captureTime: Date(timeIntervalSince1970: 10), mediaType: "image/heic")
+        uid: PhotoUID(volumeID: "v", nodeID: "kx"), captureTime: Date(timeIntervalSince1970: 10),
+        mediaType: "image/heic")
     private let renamed = PhotoItem(
-        uid: PhotoUID(volumeID: "v", nodeID: "ky"), captureTime: Date(timeIntervalSince1970: 20), mediaType: "image/jpeg")
+        uid: PhotoUID(volumeID: "v", nodeID: "ky"), captureTime: Date(timeIntervalSince1970: 20),
+        mediaType: "image/jpeg")
     private let unnamed = PhotoItem(
-        uid: PhotoUID(volumeID: "v", nodeID: "kz"), captureTime: Date(timeIntervalSince1970: 30), mediaType: "image/jpeg")
+        uid: PhotoUID(volumeID: "v", nodeID: "kz"), captureTime: Date(timeIntervalSince1970: 30),
+        mediaType: "image/jpeg")
 
     private var names: PhotoNameIndex {
         PhotoNameIndex(names: [named.uid: "IMG_3350.HEIC", renamed.uid: "Ärger am Strand.jpg"], revision: 1)
@@ -21,6 +24,26 @@ import Testing
     func aNameOrPartOfItFindsThePhotoInAnyCase(query: String) {
         #expect(uids(query, names: names).contains(named.uid))
         #expect(!uids(query, names: names).contains(unnamed.uid))
+    }
+
+    /// A kind word inside a file name does not filter the named photo out: a JPEG named film_001.jpg is found.
+    @Test(arguments: [
+        ("film_001.jpg", "film_001"), ("film_001.jpg", "FILM_001.JPG"), ("raw_0001.jpg", "raw_0001"),
+        ("video_2.jpg", "video"), ("herz.jpg", "herz.jpg"), ("Favorite 3.jpg", "favorite"),
+    ])
+    func aKindWordInTheNameFindsTheNamedPhoto(name: String, query: String) {
+        let index = PhotoNameIndex(names: [renamed.uid: name], revision: 1)
+        #expect(uids(query, names: index).contains(renamed.uid))
+    }
+
+    @Test func aKindWordStillFindsItsKindWithoutAName() {
+        let video = PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "kv"), captureTime: Date(timeIntervalSince1970: 40),
+            mediaType: "video/quicktime")
+        let found = TimelineSearch.filter(
+            [section([named, video])], query: "film", context: TimelineSearchContext(photoNames: names)
+        ).flatMap(\.items).map(\.uid)
+        #expect(found == [video.uid])
     }
 
     @Test func diacriticsAndCaseFoldInTheName() {
@@ -35,14 +58,14 @@ import Testing
 
     @Test func aRenamedPhotoIsFoundByItsNewNameOnly() {
         let before = PhotoNameIndex(names: [renamed.uid: "IMG_0001.JPG"], revision: 1)
-        let after = before.updating(names: [renamed.uid: "Strand.jpg"], removing: [], revision: 2)
+        let after = PhotoNameIndex(names: [renamed.uid: "Strand.jpg"], revision: 2)
         #expect(uids("IMG_0001", names: before) == [renamed.uid])
         #expect(uids("IMG_0001", names: after).isEmpty)
         #expect(uids("strand", names: after) == [renamed.uid])
     }
 
     @Test func aRemovedNameNoLongerMatches() {
-        let after = names.updating(names: [:], removing: [named.uid], revision: 2)
+        let after = PhotoNameIndex(names: [renamed.uid: "Ärger am Strand.jpg"], revision: 2)
         #expect(uids("3350", names: after).isEmpty)
     }
 
@@ -115,6 +138,16 @@ import Testing
         #expect(lookups.load(ordering: .relaxed) == count + 1)
     }
 
+    /// A screen asks for names only while its query has search terms; an empty query ends the backend's search.
+    @Test func theNameSourceEndsTheSearchWhenTheQueryEnds() async {
+        let index = names
+        let provider = RecordingNameProvider(index: index)
+        #expect(await TimelineFileNameSearchSource.names(forQuery: "3350", from: provider) == index)
+        #expect(await TimelineFileNameSearchSource.names(forQuery: "  ", from: provider) == nil)
+        #expect(await TimelineFileNameSearchSource.names(forQuery: "x", from: "not a provider") == nil)
+        #expect(provider.calls == ["index", "end"])
+    }
+
     private func uids(_ query: String, names: PhotoNameIndex?) -> Set<PhotoUID> {
         Set(
             TimelineSearch.filter(
@@ -135,5 +168,24 @@ import Testing
 
     private func section(_ items: [PhotoItem]) -> TimelineSection {
         TimelineSection(id: "library", date: .distantPast, title: "", items: items)
+    }
+}
+
+private final class RecordingNameProvider: PhotoNameSearchProvider, @unchecked Sendable {
+    private let index: PhotoNameIndex
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    init(index: PhotoNameIndex) { self.index = index }
+
+    var calls: [String] { lock.withLock { recorded } }
+
+    func photoNameIndex() async -> PhotoNameIndex {
+        lock.withLock { recorded.append("index") }
+        return index
+    }
+
+    func endPhotoNameSearch() async {
+        lock.withLock { recorded.append("end") }
     }
 }

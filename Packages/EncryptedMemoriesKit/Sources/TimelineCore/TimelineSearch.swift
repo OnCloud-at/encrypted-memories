@@ -103,7 +103,8 @@ public enum TimelineSearch {
 public struct TimelineSearchQuery: Equatable, Sendable {
     private enum Term: Equatable, Sendable {
         case text(String)
-        case smart(SmartKind)
+        /// A kind word such as `film` or `raw`; the typed token also matches a file name that contains it.
+        case smart(SmartKind, token: String)
     }
 
     private enum SmartKind: Equatable, Sendable {
@@ -132,7 +133,7 @@ public struct TimelineSearchQuery: Equatable, Sendable {
         tokens = Self.tokens(from: raw)
         terms = tokens.map { token in
             if let smart = Self.smartKind(for: token) {
-                .smart(smart)
+                .smart(smart, token: token)
             } else {
                 .text(token)
             }
@@ -143,15 +144,15 @@ public struct TimelineSearchQuery: Equatable, Sendable {
 
     func matches(item: PhotoItem, in section: TimelineSection, context: TimelineSearchContext) -> Bool {
         var haystack = Self.searchText(for: item, in: section)
-        if let name = context.photoNames?.normalizedName(of: item.uid) {
-            haystack += " " + name
-        }
+        let name = context.photoNames?.normalizedName(of: item.uid)
+        if let name { haystack += " " + name }
         return terms.allSatisfy { term in
             switch term {
             case .text(let token):
                 haystack.contains(token)
-            case .smart(let smart):
+            case .smart(let smart, let token):
                 Self.matches(smart, item: item, section: section, haystack: haystack, context: context)
+                    || name?.contains(token) == true
             }
         }
     }
