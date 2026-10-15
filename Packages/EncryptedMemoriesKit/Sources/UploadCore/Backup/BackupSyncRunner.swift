@@ -2616,9 +2616,12 @@ public actor BackupSyncRunner {
         let reservation = try await reserveNetwork(for: request)
         defer { reservation.release() }
         // The wait can last long. A source that was removed or excluded meanwhile does not upload, and a device that
-        // left Wi-Fi while the backup must wait for it does not start. The row returns to the queue without an attempt.
+        // left Wi-Fi while the backup must wait for it does not start. The reservation has the kind that the setting
+        // had before the wait: if the setting changed meanwhile, the transfer would run with the wrong kind of access.
+        // In each case the row returns to the queue without an attempt and the next claim reserves again.
         guard await admitsTransfer(for: source) else { throw CancellationError() }
-        _ = try transferNetwork()
+        let network = try transferNetwork()
+        guard network.usesMobileData == request.allowsExpensiveNetwork else { throw CancellationError() }
         var reservedRequest = request
         reservedRequest.networkReservation = reservation
         let request = reservedRequest

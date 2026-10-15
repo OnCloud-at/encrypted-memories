@@ -921,6 +921,15 @@ final class NetworkChangingUploader: PhotoUploading, @unchecked Sendable {
     func cancel(token: UUID) async { await inner.cancel(token: token) }
 }
 
+/// The "Use Cellular Data" setting, changed by a test while a pass runs.
+final class SettingBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Bool
+    init(usesMobileData: Bool) { current = usesMobileData }
+    var value: Bool { lock.withLock { current } }
+    func set(_ value: Bool) { lock.withLock { current = value } }
+}
+
 final class BackupProgressBox: @unchecked Sendable {
     private let lock = NSLock()
     private var progress: BackupSyncProgress?
@@ -1938,6 +1947,30 @@ final class BackupSyncRunnerTests: XCTestCase {
         let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(row.state, .queuedForUpload)
         XCTAssertEqual(row.attempts, 0, "no try is used")
+    }
+
+    func testATransferWhoseSettingChangedDuringItsWaitReservesAgainWithTheRightKindAndUsesNoTry() async throws {
+        let entry = seedEntry("setting-changed-while-waiting.jpg")
+        let setting = SettingBox(usesMobileData: true)
+        // A running transfer that avoids expensive networks holds back the transfer that may use them.
+        let running = try await uploader.admission.reserve(allowsExpensiveNetwork: false)
+        defer { running.release() }
+        let runner = makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: setting.value) })
+        let pass = Task { await runner.runUntilDrained() }
+        try await waitUntilWaiting(uploader.admission)
+
+        // Mobile data goes off while the transfer waits. It was reserved as one that may use cellular data.
+        setting.set(false)
+        running.release()
+        await endWithin(pass, runner: runner)
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(
+            uploader.requests.map(\.allowsExpensiveNetwork), [false],
+            "the upload runs with the kind that the setting has now: no cellular access")
+        XCTAssertEqual(uploader.reserveCalls, 2, "the first reservation ended unused and the next claim reserved again")
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
+        XCTAssertEqual(uploader.uploadsWithoutTheirReservation, [])
     }
 
     /// True when the pass ends within `limit`.
