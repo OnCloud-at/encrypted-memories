@@ -1794,6 +1794,7 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(uploader.requests.map(\.name), ["waits-for-the-person.jpg"])
+        XCTAssertEqual(uploader.reserveCalls, 1, "the wait is no stalled transfer: the stall watchdog ended no attempt")
         XCTAssertEqual(uploader.uploadsWithoutTheirReservation, [])
     }
 

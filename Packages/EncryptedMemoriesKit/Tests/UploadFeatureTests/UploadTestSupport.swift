@@ -59,8 +59,12 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
     /// How long a test waits for a reservation before it fails. A reservation that nobody releases would otherwise
     /// keep the test, and the build lane behind it, waiting for good.
     var reservationTimeout: Duration = .seconds(20)
+    private var _reserveCalls = 0
+    /// How often a caller asked for a reservation. A transfer that the watchdog ends asks again for its next attempt.
+    var reserveCalls: Int { lock.withLock { _reserveCalls } }
 
     func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        lock.withLock { _reserveCalls += 1 }
         let timeout = reservationTimeout
         let admission = admission
         return try await withThrowingTaskGroup(of: UploadNetworkReservation?.self) { group in
