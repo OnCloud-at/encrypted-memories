@@ -1816,6 +1816,151 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(trash.emptied, 1, "without an open merge the trash is emptied")
     }
 
+    /// A merge that trashed its copies while Recently Deleted is emptied would lose them for good before their check.
+    func testAMergeWaitsWhileRecentlyDeletedIsEmptied() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        let finder = finder
+        let trash = GatedServerTrash(server: server)
+        let emptying = Task { [directory] in
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        }
+        try await waitUntil { trash.arrivals == 1 }
+
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        try await waitUntil { finder.mergeTurns.waiting == 1 }
+        XCTAssertEqual(state(of: duplicate), .active, "the merge trashes nothing while the trash is emptied")
+        trash.gate.open()
+        try await emptying.value
+        let outcome = try await merging.value
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [duplicate], keptDuplicates: [:]))
+        XCTAssertEqual(state(of: duplicate), .trashed, "the merged copy stays in Recently Deleted")
+        XCTAssertEqual(state(of: kept), .active)
+    }
+
+    /// Emptying Recently Deleted waits for a running merge and then empties, instead of failing on its open record.
+    func testEmptyingRecentlyDeletedWaitsForARunningMerge() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        let remote = TrashStoppingRemote(base: server)
+        let finder = finder(remote: remote)
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        // The merge recorded its trash and holds before the check of its kept photo.
+        try await waitUntil { state(of: duplicate) == .trashed }
+        let trash = CountingTrash()
+
+        let emptying = Task { [directory] in
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        }
+        try await waitUntil { finder.mergeTurns.waiting == 1 }
+        XCTAssertEqual(trash.emptied, 0, "the trash is not emptied while the merge runs")
+        remote.gate.open()
+        let outcome = try await merging.value
+        try await emptying.value
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [duplicate], keptDuplicates: [:]))
+        XCTAssertEqual(trash.emptied, 1, "the trash is emptied after the merge checked its kept photo")
+    }
+
+    /// An emptying that waits for a merge and is cancelled deletes nothing.
+    func testACancelledEmptyingThatWaitsForAMergeDeletesNothing() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        let remote = TrashStoppingRemote(base: server)
+        let finder = finder(remote: remote)
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        try await waitUntil { state(of: duplicate) == .trashed }
+        let trash = CountingTrash()
+        let emptying = Task { [directory] in
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        }
+        try await waitUntil { finder.mergeTurns.waiting == 1 }
+
+        emptying.cancel()
+        // The cancelled emptying leaves the queue at once; the merge is released only afterwards, so a waiter that
+        // stayed would fail the checks below instead of hanging the test.
+        try await waitUntil { finder.mergeTurns.waiting == 0 }
+        remote.gate.open()
+        do {
+            try await emptying.value
+            XCTFail("a cancelled emptying throws")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        _ = try await merging.value
+
+        XCTAssertEqual(trash.emptied, 0)
+        XCTAssertEqual(finder.mergeTurns.waiting, 0)
+    }
+
+    /// An emptying whose task is cancelled exactly as the merge hands the turn over deletes nothing.
+    func testAnEmptyingCancelledAsTheTurnPassesToItDeletesNothing() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        let remote = TrashStoppingRemote(base: server)
+        let finder = finder(remote: remote)
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        try await waitUntil { state(of: duplicate) == .trashed }
+        let trash = CountingTrash()
+        let emptying = Task { [directory] in
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        }
+        try await waitUntil { finder.mergeTurns.waiting == 1 }
+        // The merge leaves the queue and hands the turn over; the cancellation lands before the emptying resumes.
+        finder.mergeTurns.onHandOver = { emptying.cancel() }
+
+        remote.gate.open()
+        _ = try await merging.value
+        do {
+            try await emptying.value
+            XCTFail("a cancelled emptying throws")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertEqual(trash.emptied, 0, "a cancelled emptying deletes nothing")
+        XCTAssertEqual(finder.mergeTurns.waiting, 0)
+    }
+
+    /// A merge that is cancelled while Recently Deleted is emptied trashes nothing.
+    func testAMergeCancelledWhileRecentlyDeletedIsEmptiedTrashesNothing() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        let finder = finder
+        let trash = GatedServerTrash(server: server)
+        let emptying = Task { [directory] in
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        }
+        try await waitUntil { trash.arrivals == 1 }
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        try await waitUntil { finder.mergeTurns.waiting == 1 }
+
+        merging.cancel()
+        try await waitUntil { finder.mergeTurns.waiting == 0 }
+        trash.gate.open()
+        try await emptying.value
+        do {
+            _ = try await merging.value
+            XCTFail("a cancelled merge throws")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertEqual(state(of: duplicate), .active, "the cancelled merge trashes nothing")
+        XCTAssertEqual(state(of: kept), .active)
+    }
+
     func testADamagedMergeJournalBlocksOneEmptyAndMovesAside() async throws {
         for merger in [true, false] {
             let trash = CountingTrash()
@@ -3138,6 +3283,26 @@ private actor PageCollector {
 private actor ProgressLog {
     private(set) var steps: [UploadRemoteIndexPreparationProgress] = []
     func append(_ step: UploadRemoteIndexPreparationProgress) { steps.append(step) }
+}
+
+/// Empties the trash of the server once its gate opens, and counts the emptyings that arrived.
+private final class GatedServerTrash: TrashProvider, @unchecked Sendable {
+    let server: EditScenarioServer
+    let gate = FinderGate()
+    private let lock = NSLock()
+    private var count = 0
+
+    init(server: EditScenarioServer) { self.server = server }
+
+    var arrivals: Int { lock.withLock { count } }
+
+    func trash(_ uids: [PhotoUID]) async throws {}
+    func restore(_ uids: [PhotoUID]) async throws {}
+    func emptyTrash() async throws {
+        lock.withLock { count += 1 }
+        await gate.pass()
+        server.personEmptyTrash()
+    }
 }
 
 private final class CountingTrash: TrashProvider, @unchecked Sendable {

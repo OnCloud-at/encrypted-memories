@@ -13,10 +13,16 @@ public enum RecentlyDeletedEmptying {
         _ trash: any TrashProvider, checkingMergesWith duplicates: (any ExactDuplicateMerging)?,
         accountDataDirectory: URL?
     ) async throws {
-        let noOpenMerge: Bool
         if let duplicates {
-            noOpenMerge = await duplicates.confirmNoPendingMerges()
-        } else if let accountDataDirectory {
+            // A merge that trashed its copies after the check and before the emptying would lose them for good.
+            try await duplicates.excludingMerges {
+                guard await duplicates.confirmNoPendingMerges() else { throw PendingMergeCheck() }
+                try await trash.emptyTrash()
+            }
+            return
+        }
+        let noOpenMerge: Bool
+        if let accountDataDirectory {
             noOpenMerge = ExactDuplicateMergeJournalFileStore(accountDataDirectory: accountDataDirectory)
                 .confirmsNoOpenMerge()
         } else {
