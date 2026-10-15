@@ -39,6 +39,22 @@ final class ViewerInfoLocationTests: XCTestCase {
         XCTAssertEqual(location.markerTitle, " Known place ")
     }
 
+    func testLocationSectionHasContentOnlyWithANameOrCoordinates() {
+        let noCoordinates = PhotoMetadata()
+        for name: String? in [nil, "", " ", "\n\u{00A0}"] {
+            let location = ViewerInfoLocation(metadata: noCoordinates, placeName: name, mapAndPlacesEnabled: true)
+            XCTAssertFalse(location.hasContent, "a blank name without coordinates leaves the section empty")
+        }
+        let hidden = ViewerInfoLocation(metadata: noCoordinates, placeName: "Known place", mapAndPlacesEnabled: false)
+        XCTAssertFalse(hidden.hasContent, "Map and Places off hides the name; nothing else is left")
+        let named = ViewerInfoLocation(metadata: noCoordinates, placeName: "Known place", mapAndPlacesEnabled: true)
+        XCTAssertTrue(named.hasContent)
+        for enabled in [true, false] {
+            let located = ViewerInfoLocation(metadata: metadata, placeName: " ", mapAndPlacesEnabled: enabled)
+            XCTAssertTrue(located.hasContent, "stored coordinates are always shown")
+        }
+    }
+
     func testNoLocationShowsNeitherMapNorCoordinates() {
         let location = ViewerInfoLocation(metadata: PhotoMetadata(), placeName: nil, mapAndPlacesEnabled: true)
         XCTAssertNil(location.placeName)
