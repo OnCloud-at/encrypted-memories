@@ -23,7 +23,7 @@ public final class ProtonAuthStartupCleanup {
     private let isPurgePending: () -> Bool
     private let run: @Sendable (BackupLocalDataPurge.Claim?, Bool?) async -> Bool
 
-    public init() {
+    public convenience init() {
         self.init(
             claimPurge: { BackupLocalDataPurge.claimSignOutPurge() },
             isPurgePending: { BackupLocalDataPurge.isPurgePending() },
