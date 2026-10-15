@@ -440,7 +440,12 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     /// True while a build has not ended.
     var hasUnfinishedRemoteContentIndexBuild: Bool { !unfinishedRemoteContentIndexBuilds.isEmpty }
 
+    /// The builds that have not ended.
+    var unfinishedRemoteContentIndexBuildCount: Int { unfinishedRemoteContentIndexBuilds.count }
+
     func invalidateCachedRemoteState() async {
+        // Callers that hold the service directly can reach it after the shutdown. The stores may be closed by then.
+        guard !isShutDown else { return }
         remoteContentIndexGeneration += 1
         lastRemoteContentRefreshAt = nil
         remoteContentIndexTask?.cancel()
@@ -451,7 +456,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     }
 
     func recordUploaded(contentHash: String, remoteLinkID: String) async {
-        guard let material = try? await resolveMaterial() else { return }
+        // The check follows the `await`: a shutdown can begin while the material resolves.
+        guard let material = try? await resolveMaterial(), !isShutDown else { return }
         _ = contentIndexStore.upsertRemoteContentRecord(
             UploadRemoteContentIndexRecord(
                 contentHash: contentHash,
