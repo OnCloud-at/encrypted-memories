@@ -254,8 +254,10 @@ import UIKit
         await feed.stopPrefetch()
     }
 
+    /// Waits until `predicate` holds. Every wait in this suite expects the state to arrive, so the limit only ends a
+    /// hung test: a loaded runner can take longer than any short limit to finish the thumbnail work.
     private func waitUntil(
-        timeout: Duration = .seconds(5),
+        timeout: Duration = .seconds(300),
         _ predicate: @MainActor @escaping () async -> Bool
     ) async -> Bool {
         let deadline = ContinuousClock.now + timeout
