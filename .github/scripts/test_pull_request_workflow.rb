@@ -20,7 +20,7 @@ class PullRequestWorkflowTests < Minitest::Test
     # These workflow expressions contain only context lookups and boolean operators.
     source = expression.sub(/\A\$\{\{\s*/, "").sub(/\s*\}\}\z/, "")
     source = source.gsub("always()", "true").gsub("!cancelled()", "true")
-    source = source.gsub(/(?:github|inputs|runner)\.[a-z_.]+/) { |path| context.fetch(path, nil).inspect }
+    source = source.gsub(/(?:github|inputs|runner|needs)\.[a-z_.\-]+/) { |path| context.fetch(path, nil).inspect }
     eval(source)
   end
 
@@ -37,6 +37,56 @@ class PullRequestWorkflowTests < Minitest::Test
       refute_nil job, name
       assert job["if"].nil? || evaluate(job["if"], {"github.event_name" => "merge_group"}), name
     end
+  end
+
+  def test_a_pull_request_is_checked_for_style_on_linux_and_every_other_event_on_the_macos_runner
+    jobs = @workflow.fetch("jobs")
+    linux = jobs.fetch("swift-style-linux")
+    macos = jobs.fetch("package-verification")
+    result = jobs.fetch("code-quality")
+    assert_equal "ubuntu-24.04", linux.fetch("runs-on")
+    assert_equal "Swift style", result.fetch("name")
+    assert_includes REQUIRED_CHECKS, result.fetch("name")
+    refute_includes REQUIRED_CHECKS, linux.fetch("name")
+    {"pull_request" => [true, false], "merge_group" => [false, true], "workflow_dispatch" => [false, true]}
+      .each do |event, (on_linux, on_macos)|
+        context = {"github.event_name" => event}
+        assert_equal on_linux, evaluate(linux.fetch("if"), context), "Linux job, #{event}"
+        assert_equal on_macos, macos.fetch("if", "${{ true }}").then { |condition| evaluate(condition, context) }, "macOS job, #{event}"
+      end
+    assert_equal %w[package-verification swift-style-linux], result.fetch("needs").sort
+    assert_equal "${{ always() }}", result.fetch("if")
+    # The result job takes the verdict of the job that ran for the event, and nothing else.
+    step = result.fetch("steps").first
+    assert_equal({"EVENT" => "${{ github.event_name }}", "LINUX_RESULT" => "${{ needs.swift-style-linux.outputs.style }}",
+                  "MACOS_RESULT" => "${{ needs.package-verification.outputs.style }}"}, step.fetch("env"))
+    verdicts = ["", "success", "failure", "skipped"]
+    {"pull_request" => "LINUX_RESULT", "merge_group" => "MACOS_RESULT", "workflow_dispatch" => "MACOS_RESULT"}
+      .each do |event, decisive|
+        verdicts.product(verdicts).each do |linux_verdict, macos_verdict|
+          env = {"EVENT" => event, "LINUX_RESULT" => linux_verdict, "MACOS_RESULT" => macos_verdict}
+          _out, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"))
+          expected = env.fetch(decisive) == "success"
+          assert_equal expected, status.success?, "#{event}: Linux #{linux_verdict.inspect}, macOS #{macos_verdict.inspect}"
+        end
+      end
+    [linux, macos].each do |job|
+      style = job.fetch("steps").find { |step| step["id"] == "style" }
+      assert_equal "bash scripts/verify-swift-style.sh", style.fetch("run")
+      assert_equal "${{ steps.style.outcome }}", job.fetch("outputs").fetch("style")
+    end
+    # The pinned tools: a hash for every download, and the SwiftLint version of the macOS action.
+    install = linux.fetch("steps").find { |step| step["name"] == "Install the Swift toolchain and SwiftLint" }
+    env = install.fetch("env")
+    assert_match(/\A\h{64}\z/, env.fetch("SWIFT_SHA256"))
+    assert_match(/\A\h{64}\z/, env.fetch("SWIFTLINT_SHA256"))
+    assert_equal 2, install.fetch("run").scan("sha256sum --check").length
+    action = YAML.load_file(File.join(WORKFLOWS, "../actions/install-swiftlint/action.yml"))
+    assert_equal action.fetch("runs").fetch("steps").first.fetch("env").fetch("SWIFTLINT_VERSION"), env.fetch("SWIFTLINT_VERSION")
+    style = linux.fetch("steps").find { |step| step["id"] == "style" }
+    assert_equal "${{ runner.temp }}/swift/usr/lib", style.fetch("env").fetch("LINUX_SOURCEKIT_LIB_PATH")
+    refute_nil style.fetch("env").fetch("SWIFT_FORMAT_EXECUTABLE")
+    refute_nil style.fetch("env").fetch("SWIFTLINT_EXECUTABLE")
   end
 
   def test_every_diff_step_uses_event_commits
@@ -102,8 +152,9 @@ class PullRequestWorkflowTests < Minitest::Test
         assert evaluate(condition, {"github.event_name" => event})
       end
     end
+    # The style of a pull request runs on Linux (swift-style-linux); the macOS job runs it with the tests in the queue.
     package = jobs.fetch("package-verification")
-    refute package.key?("if")
+    refute evaluate(package.fetch("if"), {"github.event_name" => "pull_request"})
     tests = package.fetch("steps").find { |step| step["id"] == "tests" }
     refute evaluate(tests.fetch("if"), {"github.event_name" => "pull_request"})
   end
