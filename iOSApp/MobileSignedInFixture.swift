@@ -21,6 +21,8 @@ import UploadCore
     @MainActor final class MobileSignedInFixture {
         static let sectionNames = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
         nonisolated static let videoNodeID = "zeta-video"
+        /// The one original that every fixture photo offers as the original of its edit.
+        nonisolated static let editedOriginalUID = PhotoUID(volumeID: "fixture", nodeID: "edited-original")
 
         let session = ProtonSession(
             uid: "fixture-account", accessToken: "fixture-access", refreshToken: "fixture-refresh",
@@ -79,6 +81,11 @@ import UploadCore
                 sections.append(
                     TimelineSection(id: "fixture-\(name)", date: sectionDate, title: "Fixture \(name)", items: items))
             }
+            let original = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 160)).image { context in
+                UIColor.gray.setFill()
+                context.fill(CGRect(x: 0, y: 0, width: 160, height: 160))
+            }
+            thumbnails[Self.editedOriginalUID] = original.jpegData(compressionQuality: 0.8)
             self.sections = sections
             backend = MobileFixtureBackend(sections: sections, thumbnails: thumbnails)
             cache = ThumbnailCache(rootDirectory: cacheDirectory)
@@ -651,5 +658,14 @@ import UploadCore
         }
         func metadataRowCount() async -> Int { sections.reduce(0) { $0 + $1.items.count } }
         func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {}
+    }
+
+    /// Every fixture photo is an edit with an original, so the UI tests can show it; the video has none.
+    extension MobileFixtureBackend: EditedPhotoOriginalProviding {
+        func editedOriginal(of item: PhotoItem) async throws -> PhotoItem? {
+            guard !item.isVideo else { return nil }
+            return PhotoItem(
+                uid: MobileSignedInFixture.editedOriginalUID, captureTime: item.captureTime, mediaType: "image/jpeg")
+        }
     }
 #endif

@@ -6392,6 +6392,38 @@
         "en": { "stringUnit": { "state": "translated", "value": "Check your connection and try again." } },
         "de": { "stringUnit": { "state": "translated", "value": "Prüfe deine Verbindung und versuche es erneut." } }
       }
+    },
+    "viewer.show_original": {
+      "comment": "Viewer command that shows the unedited original of a photo edited in Photos.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Show Original" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Original zeigen" } }
+      }
+    },
+    "viewer.show_edited": {
+      "comment": "Viewer command that returns from the original to the edited version of the photo.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Show Edited" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bearbeitung zeigen" } }
+      }
+    },
+    "viewer.original_badge": {
+      "comment": "Short visible badge while the viewer shows the unedited original of an edited photo.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "ORIGINAL" } },
+        "de": { "stringUnit": { "state": "translated", "value": "ORIGINAL" } }
+      }
+    },
+    "viewer.original_badge_a11y": {
+      "comment": "Accessibility label for the badge shown while the viewer shows the unedited original.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Showing the original" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Original wird angezeigt" } }
+      }
     }
   },
   "version": "1.0"

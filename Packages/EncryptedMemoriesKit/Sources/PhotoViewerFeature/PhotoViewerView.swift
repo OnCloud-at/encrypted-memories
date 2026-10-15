@@ -268,7 +268,10 @@ public struct PhotoViewerView: View {
                     canGoNext: model.canNavigateNext,
                     goPrevious: { model.previousInContext() },
                     goNext: { model.nextInContext() },
-                    close: onClose
+                    close: onClose,
+                    canShowOriginal: model.canShowOriginal,
+                    isShowingOriginal: model.isShowingOriginal,
+                    toggleOriginal: { model.toggleOriginal() }
                 )
         )
         .onAppear {
@@ -379,10 +382,25 @@ public struct PhotoViewerView: View {
             .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
     }
 
+    /// Marks the original of an edited photo, in the same native label style as the Live badge.
+    private var originalBadge: some View {
+        Label(L10n.string("viewer.original_badge"), systemImage: "wand.and.rays.inverse")
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .glassEffect(in: Capsule())
+            .padding(.top, 14)
+            .padding(.leading, 14)
+            .accessibilityLabel(L10n.string("viewer.original_badge_a11y"))
+    }
+
     @ViewBuilder private var mediaBadges: some View {
         VStack(alignment: .leading, spacing: 8) {
             if model.current.isLivePhoto {
                 livePhotoBadge
+            }
+            if model.isShowingOriginal {
+                originalBadge
             }
             if model.isLoadingBurst || model.hasBurstFilmstrip {
                 burstBadge

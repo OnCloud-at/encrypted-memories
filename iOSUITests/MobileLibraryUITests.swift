@@ -69,6 +69,35 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(wait(for: album, "isEnabled == false"), "the album does not hold the photo")
     }
 
+    /// Every fixture photo is an edit with an original. The More menu shows the original, marks it with a badge, and
+    /// returns to the edited version.
+    func testTheViewerShowsTheOriginalOfAnEditedPhotoAndTheEditAgain() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        firstPhoto.tap()
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10), "the viewer did not open")
+
+        let more = app.buttons.matching(NSPredicate(format: "label == 'More actions' OR label == 'More'")).firstMatch
+        let showOriginal = app.buttons["Show Original"]
+        // The viewer asks for the original once the photo stayed on screen, so the item appears after a short wait.
+        XCTAssertTrue(more.waitForExistence(timeout: 10), "the viewer shows no More menu")
+        more.tap()
+        if !showOriginal.waitForExistence(timeout: 5) {
+            app.tap()
+            more.tap()
+        }
+        XCTAssertTrue(showOriginal.waitForExistence(timeout: 10), "the More menu offers no Show Original")
+        showOriginal.tap()
+
+        let badge = app.descendants(matching: .any)["Showing the original"]
+        XCTAssertTrue(badge.waitForExistence(timeout: 10), "the original carries no badge")
+
+        more.tap()
+        let showEdited = app.buttons["Show Edited"]
+        XCTAssertTrue(showEdited.waitForExistence(timeout: 10), "the More menu offers no Show Edited")
+        showEdited.tap()
+        XCTAssertTrue(wait(for: badge, "exists == false", timeout: 10), "the edited version still carries the badge")
+    }
+
     func testSelectingPhotosShowsTheirActionsAndDoneEndsTheSelection() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         app.buttons["Select"].tap()

@@ -1098,7 +1098,8 @@ struct MainView: View {
             originalsCache: offline.originalsCache,
             cacheOriginals: offline.offlineEnabled,
             originalsCapBytes: offline.originalsCapBytes,
-            allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails)
+            allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails,
+            editedOriginalProvider: backend as? any EditedPhotoOriginalProviding)
     }
 
     /// Shows local photos on their way to Proton in the whole-library grid.
