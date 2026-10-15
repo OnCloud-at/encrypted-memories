@@ -862,7 +862,11 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: .undetermined))
         let uploader = MockUploader()
         let recorder = RecoveryIdentityRecorder()
-        let executor = try networkExecutor(signals: .mobileDataOff(runtime), recorder: recorder, uploader: uploader)
+        // The poll of the paused runner never fires, so only the runtime change can end the wait.
+        let poll = HeldBackupSleepClock(clock: BackupTestClock())
+        defer { poll.releaseAll() }
+        let executor = try networkExecutor(
+            signals: .mobileDataOff(runtime), recorder: recorder, uploader: uploader, clock: poll)
         let waiting = expectation(description: "the album backup reports the Wi-Fi wait")
         waiting.assertForOverFulfill = false
         let finished = expectation(description: "the album backup returns after the Wi-Fi path")
@@ -882,8 +886,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
 
         runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
 
-        // The paused runner checks the network again after its poll interval of 30 seconds.
-        await fulfillment(of: [finished], timeout: 60)
+        // The runtime change wakes the paused runner; its 30-second poll is held above.
+        await fulfillment(of: [finished], timeout: 10)
         XCTAssertEqual(try result.value?.get(), AlbumSyncBackupReport())
         XCTAssertEqual(recorder.records.count, 1)
         XCTAssertTrue(uploader.requests.isEmpty)
@@ -892,7 +896,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
     /// The album run of `testAlbumExecutorRecoversBeforeResetKeepsCurrentRunCountsAndNeverCallsUploader`: a saved
     /// receipt and a photo that is not in the library.
     private func networkExecutor(
-        signals: BackupRuntimeSignalSource, recorder: RecoveryIdentityRecorder, uploader: MockUploader
+        signals: BackupRuntimeSignalSource, recorder: RecoveryIdentityRecorder, uploader: MockUploader,
+        clock: any BackupSchedulerClock = BackupContinuousClock()
     ) throws -> PhotoAlbumBackupExecutor {
         let source = source("network")
         let descriptor = descriptor(source: source, filename: "network.heic", fileExists: false)
@@ -904,7 +909,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             identityResolver: recorder,
             uploader: uploader,
             resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
-            runtimeSignals: signals
+            runtimeSignals: signals,
+            clock: clock
         )
     }
 
