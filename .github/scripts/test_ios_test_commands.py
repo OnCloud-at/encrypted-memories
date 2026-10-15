@@ -233,6 +233,28 @@ if sys.argv[1:3] == ['simctl', 'bootstatus']:
                     self.assertIn('-parallel-testing-enabled', self.commands[-1])
                     self.assertEqual(self.commands[-1][self.commands[-1].index('-parallel-testing-worker-count') + 1], '2')
 
+    def test_test_actions_skip_the_simulator_diagnostics_collection_and_the_build_does_not(self):
+        for mode in ['hosted', 'ui']:
+            for action in ['test', 'test-without-building']:
+                with self.subTest(mode=mode, action=action):
+                    result = self.run_script(mode, IOS_TEST_ACTION=action, IOS_TEST_PREPARED='1',
+                                             IOS_TEST_SCHEME='EncryptedMemoriesMobileCI')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    invocation = self.commands[-1]
+                    self.assertEqual(invocation[-1], action)
+                    self.assertEqual(invocation[invocation.index('-collect-test-diagnostics') + 1], 'never')
+                    self.assertEqual(invocation.count('-collect-test-diagnostics'), 1)
+        for mode in ['hosted', 'ui']:
+            with self.subTest(mode=mode, run='local default'):
+                result = self.run_script(mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                invocation = self.commands[-1]
+                self.assertEqual(invocation[invocation.index('-collect-test-diagnostics') + 1], 'never')
+        result = self.run_script(IOS_TEST_ACTION='build-for-testing', IOS_TEST_PREPARED='1',
+                                 IOS_TEST_SCHEME='EncryptedMemoriesMobileCI')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('-collect-test-diagnostics', self.commands[-1])
+
     def test_invalid_action_fails_before_xcodebuild(self):
         result = self.run_script(IOS_TEST_ACTION='archive')
         self.assertEqual(result.returncode, 64)
@@ -261,6 +283,8 @@ if sys.argv[1:3] == ['simctl', 'bootstatus']:
         self.assertEqual(arguments[arguments.index('--output') + 1], str(self.root / 'diagnostics'))
         self.assertIn('-only-testing:EncryptedMemoriesMobileUITests', self.commands[-1])
         self.assertEqual(self.commands[-1][self.commands[-1].index('-parallel-testing-enabled') + 1], 'NO')
+        wrapped = arguments[arguments.index('--') + 1:]
+        self.assertEqual(wrapped[wrapped.index('-collect-test-diagnostics') + 1], 'never')
 
     def test_diagnostics_reject_parallel_clones_and_unknown_destination_ownership(self):
         for options in [{'IOS_TEST_PARALLEL_WORKERS': '2'},

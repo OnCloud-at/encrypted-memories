@@ -222,6 +222,13 @@ fi
 if [[ -n "${IOS_TEST_RESULT_BUNDLE_PATH:-}" ]]; then
   set -- "$@" -resultBundlePath "$IOS_TEST_RESULT_BUNDLE_PATH"
 fi
+# Do not collect simulator diagnostics. In the passing hosted unit test job of queue run 38688241064, xcodebuild
+# waited 600 seconds after the last test for "Failure collecting diagnostics from simulator" and got no answer.
+# The collection is skipped when no test run asks for it; the trigger in a passing run is not known. The flag also
+# drops the simulator sysdiagnose from the result bundle of a failed run. The test results stay.
+if [[ "$ACTION" != "build-for-testing" ]]; then
+  set -- "$@" -collect-test-diagnostics never
+fi
 if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_DIAGNOSTICS_PATH:-}" ]]; then
   if [[ "${IOS_TEST_PARALLEL_WORKERS:-1}" != "1" || -z "${SIMULATOR_UDID:-}" ]]; then
     echo "[ios-tests] diagnostics require one simulator with an explicit device ID." >&2
