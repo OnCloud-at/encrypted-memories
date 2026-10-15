@@ -3026,6 +3026,172 @@ struct ThumbnailFeedCoreTests {
             #expect(store.snapshot.isEmpty, "an old feed must not checkpoint a post-switch disk probe")
         }
 
+        @Test func priorityRequestCanRetryAfterClearInterruptsItsDiskProbe() async throws {
+            let uid = Self.uid("priority-probe-clear")
+            let cache = Self.cache("priority-probe-clear")
+            let sessionLease = cache.captureSessionLease()
+            let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
+            let feed = ThumbnailFeedCore(
+                cache: cache,
+                loader: loader,
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
+            )
+            let probeGate = BlockingDiskProbeHook()
+            let clearGate = BlockingDiskProbeHook()
+            defer {
+                probeGate.release.signal()
+                clearGate.release.signal()
+            }
+            feed.setDiskProbeHookForTesting { probeGate.wait() }
+            await cache.setClearHookForTesting { clearGate.wait() }
+
+            #expect(await feed.requestPriority(uid))
+            try #require(await Self.waitForLeaseTest { probeGate.hasEntered })
+            let clearTask = Task.detached { await cache.clear() }
+            try #require(await Self.waitForLeaseTest { clearGate.hasEntered })
+            #expect(!cache.isCurrentSessionLease(sessionLease))
+            clearGate.release.signal()
+            await clearTask.value
+            probeGate.release.signal()
+            try #require(await Self.waitForLeaseTest { await !feed.downloadCountersForTesting().workersRunning })
+            #expect(await loader.requestCount() == 0)
+            #expect(cache.isCurrentSessionLease(sessionLease))
+            feed.setDiskProbeHookForTesting(nil)
+            await cache.setClearHookForTesting(nil)
+
+            #expect(await feed.requestPriority(uid))
+            let delivered = await Self.waitForLeaseTest { cache.has(uid) }
+            #expect(delivered, "a priority reservation must not hide a retry after its disk probe was invalidated")
+            #expect(await loader.requestCount() == 1)
+            await feed.stopPrefetchAndWait()
+        }
+
+        @Test func priorityRequestCanRetryAfterWorkerLosesLeaseWhileWaitingForDownloadSlot() async throws {
+            let first = Self.uid("priority-slot-first")
+            let waiting = Self.uid("priority-slot-waiting")
+            let cache = Self.cache("priority-slot-clear")
+            let sessionLease = cache.captureSessionLease()
+            let loader = ControlledLateLoader(payloads: [waiting: Self.pngData(width: 8, height: 8)])
+            let feed = ThumbnailFeedCore(
+                cache: cache,
+                loader: loader,
+                configuration: Self.configuration(
+                    downloadConcurrencyLimit: 2,
+                    batchSize: 1,
+                    downloadTimeoutSeconds: 30
+                )
+            )
+            let slotWaits = Counter()
+            let clearGate = BlockingDiskProbeHook()
+            defer {
+                clearGate.release.signal()
+                Task { await loader.release() }
+            }
+            await feed.setDownloadSlotWaitHookForTesting { slotWaits.increment() }
+            await cache.setClearHookForTesting { clearGate.wait() }
+
+            #expect(await feed.requestPriority(first))
+            try #require(await Self.waitForLeaseTest { await loader.isWaiting() })
+            #expect(await feed.requestPriority(waiting))
+            try #require(await Self.waitForLeaseTest { slotWaits.value() > 0 })
+            let clearTask = Task.detached { await cache.clear() }
+            try #require(await Self.waitForLeaseTest { clearGate.hasEntered })
+            #expect(!cache.isCurrentSessionLease(sessionLease))
+            await loader.release()
+            try #require(await Self.waitForLeaseTest { await !feed.downloadCountersForTesting().workersRunning })
+            #expect(await loader.requestCount() == 1)
+            clearGate.release.signal()
+            await clearTask.value
+            #expect(cache.isCurrentSessionLease(sessionLease))
+            await cache.setClearHookForTesting(nil)
+
+            #expect(await feed.requestPriority(waiting))
+            let delivered = await Self.waitForLeaseTest { cache.has(waiting) }
+            #expect(delivered, "a worker that loses its lease must release its priority reservation")
+            #expect(await loader.requestedOrder() == [first, waiting])
+            await feed.stopPrefetchAndWait()
+            #expect(await feed.downloadCountersForTesting().downloadInFlight == 0)
+        }
+
+        @Test func priorityReservationInNewGenerationSurvivesOldProbeCompletion() async throws {
+            let uid = Self.uid("priority-restarted-probe")
+            let loader = ControlledLateLoader(payloads: [:])
+            let feed = ThumbnailFeedCore(
+                cache: Self.cache("priority-restarted-probe"),
+                loader: loader,
+                configuration: Self.configuration(
+                    downloadConcurrencyLimit: 1,
+                    batchSize: 1,
+                    downloadTimeoutSeconds: 30
+                )
+            )
+            let probeGate = BlockingDiskProbeHook()
+            defer {
+                probeGate.release.signal()
+                Task { await loader.release() }
+            }
+            feed.setDiskProbeHookForTesting { probeGate.wait() }
+            #expect(await feed.requestPriority(uid))
+            try #require(await Self.waitForLeaseTest { probeGate.hasEntered })
+
+            feed.setDiskProbeHookForTesting(nil)
+            await feed.startPrefetch([])
+            try #require(await Self.waitForLeaseTest { await loader.isWaiting() })
+            probeGate.release.signal()
+            await feed.waitForRetiredWorkersForTesting()
+
+            #expect(await feed.requestPriority(uid))
+            #expect(
+                await feed.prefetchStatus().currentQueueLength == 0,
+                "old probe cleanup must preserve the replacement generation's active reservation")
+            #expect(await loader.requestCount() == 1)
+            await loader.release()
+            await feed.stopPrefetchAndWait()
+        }
+
+        /// `crawlRuns` selects the `takeBatch` branch: without a crawl the batch passes through
+        /// `finishDiskProbeBatch`, with a crawl and no visible demand it takes the regular path.
+        @Test(arguments: [false, true])
+        func priorityReservationOfADownloadingBatchStaysUntilTheLoadEnds(crawlRuns: Bool) async throws {
+            let uid = Self.uid("priority-handed-over-\(crawlRuns)")
+            let cache = Self.cache("priority-handed-over-\(crawlRuns)")
+            let loader = ControlledLateLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
+            let feed = ThumbnailFeedCore(
+                cache: cache,
+                loader: loader,
+                configuration: Self.configuration(
+                    downloadConcurrencyLimit: 1,
+                    batchSize: 1,
+                    downloadTimeoutSeconds: 30
+                )
+            )
+            defer { Task { await loader.release() } }
+            // An idle-crawl request records no visible demand, which would send the batch down the other branch.
+            let requestedPriority: ThumbnailPriority = crawlRuns ? .idleLibraryCrawl : .visibleNow
+            if crawlRuns { await feed.startPrefetch([]) }
+
+            #expect(await feed.requestPriority(uid, priority: requestedPriority))
+            try #require(await Self.waitForLeaseTest { await loader.isWaiting() })
+
+            #expect(await feed.requestPriority(uid, priority: requestedPriority))
+            #expect(
+                await feed.prefetchStatus().currentQueueLength == 0,
+                "a batch handed to the download keeps its reservation, so a repeated request queues nothing")
+            await loader.release()
+            #expect(await Self.waitForLeaseTest { cache.has(uid) })
+            #expect(await loader.requestCount() == 1)
+            await feed.stopPrefetchAndWait()
+        }
+
+        private static func waitForLeaseTest(_ condition: @Sendable () async -> Bool) async -> Bool {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while ContinuousClock.now < deadline {
+                if await condition() { return true }
+                await Task.yield()
+            }
+            return await condition()
+        }
+
         @Test func workerThatLosesItsLeaseWhileWaitingForADownloadSlotLeavesNoDownloadCounters() async throws {
             let uids = ["lease-lost-a", "lease-lost-b"].map { Self.uid($0) }
             let cache = Self.cache("lease-lost-while-waiting-for-a-slot")

@@ -687,11 +687,22 @@ public actor ThumbnailCache {
         return remaining.isEmpty
     }
 
+    #if DEBUG
+        private var clearHookForTesting: (@Sendable () -> Void)?
+
+        package func setClearHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            clearHookForTesting = hook
+        }
+    #endif
+
     /// Erases the on-disk cache (keeps the account key - re-crawl refills). Used by "Delete Offline Cache".
     public func clear() {
         // Advance before removing files. A late non-cooperative loader can still invoke its callback,
         // but its captured token will fail the write fence instead of recreating stale data.
         writerGeneration.invalidateAndPerform {
+            #if DEBUG
+                clearHookForTesting?()
+            #endif
             memory.removeAllObjects()
             validated.clearAll()
             if purgeDirectoryContents() { diskUsage.reset() } else { diskUsage.invalidate() }

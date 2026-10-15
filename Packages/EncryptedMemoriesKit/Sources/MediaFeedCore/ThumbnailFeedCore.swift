@@ -522,6 +522,7 @@ public actor ThumbnailFeedCore {
     #if DEBUG
         /// Deterministic test-only gate for a disk probe. It is absent from release builds.
         private nonisolated let testingHooks = ThumbnailFeedCoreTestingHooks()
+        private var downloadSlotWaitHookForTesting: (@Sendable () -> Void)?
     #endif
 
     public init(
@@ -2157,6 +2158,9 @@ public actor ThumbnailFeedCore {
         while !Task.isCancelled, generation == prefetchGeneration {
             guard ownerLeaseIsCurrent() else { return }
             let work = await takeBatch()
+            // Every exit of this iteration gives the returned reservations back; the download path below also
+            // releases them as soon as the load ends.
+            defer { releasePriorityReservations(for: work.uids, generation: generation) }
             guard ownerLeaseIsCurrent() else { return }
             // Local pending photos load from the device on their own queue; an iCloud wait never holds back
             // Proton downloads or counts against the network pacing.
@@ -2222,6 +2226,9 @@ public actor ThumbnailFeedCore {
                 continue
             }
             while activeDownloaders + timedOutLoaders >= targetConcurrency, !Task.isCancelled {
+                #if DEBUG
+                    downloadSlotWaitHookForTesting?()
+                #endif
                 try? await Task.sleep(for: .milliseconds(60))
             }
             if Task.isCancelled { return }
@@ -2489,6 +2496,18 @@ public actor ThumbnailFeedCore {
         var batchPriority = ThumbnailPriority.idleLibraryCrawl
         var diskHits: [PhotoUID] = []
         var diskMisses: [PhotoUID] = []
+        // A batch that ends empty (lost lease, fenced or aborted probe) never reaches the worker's own release,
+        // so every priority reservation not handed over in the returned batch is given back here. The generation
+        // is the one that reserved, so a newer generation keeps its own reservation.
+        let reservationGeneration = prefetchGeneration
+        var reservedPriority: [PhotoUID] = []
+        var handedOver = Set<PhotoUID>()
+        defer {
+            releasePriorityReservations(
+                for: reservedPriority.filter { !handedOver.contains($0) },
+                generation: reservationGeneration
+            )
+        }
         while candidates.count < configuration.batchSize, !priority.isEmpty {
             let bestIndex =
                 priority.indices.min {
@@ -2516,6 +2535,7 @@ public actor ThumbnailFeedCore {
                     priority: itemPriority,
                     generation: prefetchGeneration
                 ))
+            reservedPriority.append(uid)
             candidates.append(uid)
         }
 
@@ -2530,6 +2550,7 @@ public actor ThumbnailFeedCore {
                 writerGeneration: probeGeneration,
                 forceAuthentication: startupAuthenticationPending
             )
+            handedOver = Set(batch.uids)
             if startupAuthenticationPending,
                 sequentialIndex >= sequential.count,
                 candidates.isEmpty || batch.probedDisk
@@ -2610,6 +2631,7 @@ public actor ThumbnailFeedCore {
         if forceAuthentication, sequentialIndex >= sequential.count {
             completeStartupAuthentication()
         }
+        handedOver = Set(diskMisses)
         return BatchWork(uids: diskMisses, priority: batchPriority, probedDisk: !candidates.isEmpty)
     }
 
@@ -3466,6 +3488,15 @@ public actor ThumbnailFeedCore {
 
         /// Debug-only seam that reports refreshes which ran a chunked `cache.has` sweep.
         func coverageFullScanCountForTesting() -> Int { coverageFullScans }
+
+        func waitForRetiredWorkersForTesting() async {
+            let tasks = retiredWorkerTasks
+            for task in tasks { await task.value }
+        }
+
+        func setDownloadSlotWaitHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            downloadSlotWaitHookForTesting = hook
+        }
 
         /// Debug-only seam that reports the download counters and whether any worker task still runs.
         func downloadCountersForTesting() -> (activeDownloaders: Int, downloadInFlight: Int, workersRunning: Bool) {
