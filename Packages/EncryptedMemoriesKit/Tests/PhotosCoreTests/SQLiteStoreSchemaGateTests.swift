@@ -107,38 +107,159 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         XCTAssertEqual(sqlite3_column_int(statement, 0), 2)
     }
 
-    func testOnlyADatabaseThatAnotherConnectionLocksCountsAsHeld() throws {
+    // MARK: Files that cannot be checked now
+
+    private let markerSchema = "CREATE TABLE marker (version INTEGER NOT NULL);"
+    private let noWaitPolicy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+
+    private func markerVersionIsCurrent(_ db: OpaquePointer?) -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT version FROM marker;", -1, &statement, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1
+    }
+
+    private func openMarkerStore(
+        at url: URL, verifyVersion: ((OpaquePointer?) -> Bool)? = nil,
+        copyItem: @escaping (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) }
+    ) -> SQLiteRebuildableStoreOutcome {
+        SQLiteStoreSchemaGate.openRebuildableStoreOutcome(
+            at: url, schemaSQL: markerSchema, policy: noWaitPolicy,
+            verifyVersion: verifyVersion ?? markerVersionIsCurrent,
+            stampVersion: { sqlite3_exec($0, "INSERT INTO marker VALUES (1);", nil, nil, nil) == SQLITE_OK },
+            copyItem: copyItem)
+    }
+
+    private func marker(at url: URL) throws -> URL {
+        guard case .opened(let handle) = openMarkerStore(at: url) else {
+            XCTFail("the store opens")
+            return url
+        }
+        sqlite3_close(handle)
+        return url
+    }
+
+    /// Another connection that holds the file exclusively until `COMMIT`.
+    private func exclusiveHolder(of url: URL) throws -> OpaquePointer {
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        return try XCTUnwrap(blocker)
+    }
+
+    private func release(_ blocker: OpaquePointer) {
+        sqlite3_exec(blocker, "COMMIT;", nil, nil, nil)
+        sqlite3_close(blocker)
+    }
+
+    private func isRetryLater(_ outcome: SQLiteRebuildableStoreOutcome) -> Bool {
+        if case .retryLater = outcome { return true }
+        return false
+    }
+
+    private func isFailed(_ outcome: SQLiteRebuildableStoreOutcome) -> Bool {
+        if case .failed = outcome { return true }
+        return false
+    }
+
+    func testAFileThatAnotherConnectionHoldsStaysAndOpensAgainWithItsRows() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try marker(at: directory.appendingPathComponent("held.sqlite"))
+        let blocker = try exclusiveHolder(of: url)
 
-        let missing = directory.appendingPathComponent("missing.sqlite")
-        XCTAssertFalse(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: missing), "a missing file is not held")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path), "the check creates no file")
+        XCTAssertEqual(
+            SQLiteStoreSchemaGate.compatibility(
+                at: url, schemaSQL: markerSchema, busyTimeoutMs: 0, versionIsCurrent: markerVersionIsCurrent),
+            .retryLater)
+        XCTAssertTrue(isRetryLater(openMarkerStore(at: url)), "a held file is not replaced")
+        release(blocker)
 
-        let text = directory.appendingPathComponent("text.sqlite")
-        try Data("not a database".utf8).write(to: text)
-        XCTAssertFalse(
-            SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: text), "a file that is no database is not held")
-
-        let database = directory.appendingPathComponent("held.sqlite")
-        var owner: OpaquePointer?
-        XCTAssertEqual(sqlite3_open(database.path, &owner), SQLITE_OK)
-        defer { sqlite3_close(owner) }
-        XCTAssertEqual(sqlite3_exec(owner, "CREATE TABLE marker (value INTEGER);", nil, nil, nil), SQLITE_OK)
-        XCTAssertFalse(
-            SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: database),
-            "a readable database without a lock is not held")
-
-        XCTAssertEqual(sqlite3_exec(owner, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
-        XCTAssertEqual(sqlite3_exec(owner, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
-        XCTAssertTrue(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: database), "an exclusive lock holds the file")
-        XCTAssertEqual(sqlite3_exec(owner, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        guard case .opened(let reopened) = openMarkerStore(at: url) else { return XCTFail("the file opens again") }
+        defer { sqlite3_close(reopened) }
+        XCTAssertTrue(markerVersionIsCurrent(reopened), "the rows are still there")
     }
 
-    /// A rollback journal that a crashed writer left behind needs a writer to recover it. A read-only check cannot
-    /// recover it and does not count the file as held, so the store replaces such a cache as before.
-    func testADatabaseWithAHotRollbackJournalDoesNotCountAsHeld() throws {
+    func testALockThatStartsInTheMiddleOfTheInspectionIsNoOtherSchema() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // A rollback journal: a reader holds no lock between two statements, so a second connection can take the
+        // file in the middle of the inspection. (In WAL mode an open reader keeps a second connection out.)
+        let url = directory.appendingPathComponent("middle.sqlite")
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &raw), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                raw,
+                "PRAGMA journal_mode=DELETE; CREATE TABLE marker (version INTEGER NOT NULL); "
+                    + "INSERT INTO marker VALUES (1);", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(raw)
+        var blocker: OpaquePointer?
+
+        // The schema read has finished. Now another connection takes the file, before the version read.
+        let compatibility = SQLiteStoreSchemaGate.compatibility(
+            at: url, schemaSQL: markerSchema, busyTimeoutMs: 0,
+            versionIsCurrent: { db in
+                blocker = try? self.exclusiveHolder(of: url)
+                return self.markerVersionIsCurrent(db)
+            })
+        let held = try XCTUnwrap(blocker)
+        defer { release(held) }
+
+        XCTAssertEqual(compatibility, .retryLater, "a busy version read is not another schema")
+    }
+
+    func testALockThatStartsBeforeTheReadWriteVerificationKeepsTheFile() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try marker(at: directory.appendingPathComponent("verify.sqlite"))
+        var calls = 0
+        var blocker: OpaquePointer?
+
+        // The first call is the read-only inspection. The second call verifies the read-write connection.
+        let outcome = openMarkerStore(
+            at: url,
+            verifyVersion: { db in
+                calls += 1
+                if calls == 2 { blocker = try? self.exclusiveHolder(of: url) }
+                return self.markerVersionIsCurrent(db)
+            })
+        let held = try XCTUnwrap(blocker)
+
+        XCTAssertEqual(calls, 2)
+        XCTAssertTrue(isRetryLater(outcome), "a busy verification is not another schema")
+        release(held)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the file was not replaced")
+        guard case .opened(let reopened) = openMarkerStore(at: url) else { return XCTFail("the file opens again") }
+        defer { sqlite3_close(reopened) }
+        XCTAssertTrue(markerVersionIsCurrent(reopened), "the rows are still there")
+    }
+
+    func testAFileWithAnotherSchemaIsStillReplaced() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("other.sqlite")
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &raw), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(raw, "CREATE TABLE other (x INTEGER);", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(raw)
+
+        guard case .opened(let replaced) = openMarkerStore(at: url) else { return XCTFail("the file is replaced") }
+        defer { sqlite3_close(replaced) }
+        XCTAssertTrue(markerVersionIsCurrent(replaced))
+    }
+
+    /// A crashed writer leaves a rollback journal that only a writer can recover. The gate never writes to a populated
+    /// original, so a store that holds such a file replaces it, as before.
+    func testADatabaseWithAHotRollbackJournalIsStillReplaced() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -163,13 +284,17 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         let header = try FileHandle(forReadingFrom: URL(fileURLWithPath: crashed.path + "-journal")).read(upToCount: 8)
         XCTAssertEqual(header, Data([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]), "the journal is hot")
 
-        XCTAssertFalse(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: crashed), "a hot journal is no hold")
+        XCTAssertEqual(
+            SQLiteStoreSchemaGate.compatibility(
+                at: crashed, schemaSQL: markerSchema, busyTimeoutMs: 0, versionIsCurrent: markerVersionIsCurrent),
+            .unavailable, "a read-only check cannot recover the journal, and that is no lock")
+        XCTAssertTrue(isFailed(openMarkerStore(at: crashed)), "the store may replace the file")
         XCTAssertTrue(
-            FileManager.default.fileExists(atPath: crashed.path + "-journal"), "the read-only check recovers nothing")
+            FileManager.default.fileExists(atPath: crashed.path + "-journal"), "the check itself recovers nothing")
     }
 
-    /// A WAL database whose shared-memory file cannot be created cannot be opened for now. It does not count as held.
-    func testAWALDatabaseWithoutAWritableSharedMemoryFileDoesNotCountAsHeld() throws {
+    /// A WAL database whose shared-memory file cannot be created cannot be opened for now. It is no lock either.
+    func testAWALDatabaseWithoutAWritableSharedMemoryFileIsStillReplaced() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -193,6 +318,49 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
         XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path + "-shm"), "no shared-memory file exists")
 
-        XCTAssertFalse(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: copy), "an unopenable file is no hold")
+        XCTAssertEqual(
+            SQLiteStoreSchemaGate.compatibility(
+                at: copy, schemaSQL: markerSchema, busyTimeoutMs: 0, versionIsCurrent: markerVersionIsCurrent),
+            .unavailable)
+        XCTAssertTrue(isFailed(openMarkerStore(at: copy)), "the store may replace the file")
+    }
+
+    // MARK: A copy that fails
+
+    /// Opens a file that a read-only check cannot read, so the gate falls back to the inspection of a copy.
+    private func fileThatNeedsACopy(in directory: URL) throws -> URL {
+        let url = try marker(at: directory.appendingPathComponent("needs-copy.sqlite"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+        addTeardownBlock { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
+        return url
+    }
+
+    func testACopyThatFindsNoRoomKeepsTheFileForALaterOpen() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try fileThatNeedsACopy(in: directory)
+        let noRoom = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+
+        XCTAssertTrue(
+            isRetryLater(openMarkerStore(at: url, copyItem: { _, _ in throw noRoom })),
+            "a full disk says nothing about the file")
+        let posix = NSError(
+            domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError,
+            userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))])
+        XCTAssertTrue(isRetryLater(openMarkerStore(at: url, copyItem: { _, _ in throw posix })), "also as POSIX ENOSPC")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the file stays")
+    }
+
+    func testACopyThatFailsForAnotherReasonKeepsItsEarlierMeaning() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try fileThatNeedsACopy(in: directory)
+        let denied = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+
+        XCTAssertTrue(
+            isFailed(openMarkerStore(at: url, copyItem: { _, _ in throw denied })),
+            "an unreadable file is not a full disk: the store may replace it")
     }
 }

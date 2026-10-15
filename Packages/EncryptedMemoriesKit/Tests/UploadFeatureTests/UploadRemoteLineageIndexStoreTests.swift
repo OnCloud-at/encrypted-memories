@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import SQLite3
 import XCTest
 
@@ -27,6 +28,30 @@ final class UploadRemoteLineageIndexStoreTests: XCTestCase {
         XCTAssertEqual(reopened.replacingMainLinkIDs(ofReplacedLink: "old", hashKeyEpoch: "epoch"), ["main"])
         XCTAssertEqual(reopened.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")), .complete)
         XCTAssertTrue(reopened.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "other").isEmpty)
+    }
+
+    /// Another connection holds the file exclusively longer than the busy timeout. The derived index is never
+    /// deleted for that, and it opens again with its rows once the lock is gone.
+    func testAFileThatAnotherConnectionHoldsIsKeptAndOpensAgainWithItsRows() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        XCTAssertTrue(replace(store, links: [identity("main")]))
+        store.close()
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+
+        let noWait = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        let busy = UploadRemoteLineageIndexStore(url: url, policy: noWait)
+        busy?.close()
+        XCTAssertEqual(sqlite3_exec(blocker, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(blocker)
+
+        XCTAssertNil(busy, "the store is unavailable while the lock lasts")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the index is not deleted")
+        let reopened = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch"), ["main"])
     }
 
     func testReplacingMainReadReturnsAncestorsOnlyForItsEpoch() throws {
