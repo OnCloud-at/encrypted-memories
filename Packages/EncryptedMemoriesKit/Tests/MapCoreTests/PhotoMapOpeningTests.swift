@@ -30,11 +30,7 @@ import Testing
                 return query.coordinates(
                     in: GeoBoundingBox(minLatitude: -90, maxLatitude: 90, minLongitude: -180, maxLongitude: 180))
             }
-            let deadline = ContinuousClock.now + .seconds(5)
-            while !pause.hasEntered && ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            try #require(pause.hasEntered)
+            try #require(await pause.entered.happens(), "The analysis must reach its pause")
             time = 10
             index.merge(points(1000..<1100))
             index.beforePlaceAnalysisForTesting = nil
@@ -68,11 +64,7 @@ import Testing
             var time: CFTimeInterval = 0
             index.nowForTesting = { time }
             loader.attach(map)
-            let deadline = ContinuousClock.now + .seconds(5)
-            while !pause.hasEntered && ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            try #require(pause.hasEntered)
+            try #require(await pause.entered.happens(), "The analysis must reach its pause")
             time = 1
             index.merge(points(1000..<1050))
             let laterEvidence = index.placeEvidence()
@@ -111,11 +103,7 @@ import Testing
             index.beforePlaceAnalysisForTesting = { pause.wait() }
             defer { pause.release() }
             loader.refreshIfChanged(revision: index.revision)
-            let deadline = ContinuousClock.now + .seconds(5)
-            while !pause.hasEntered && ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            try #require(pause.hasEntered)
+            try #require(await pause.entered.happens(), "The analysis must reach its pause")
             var region = map.region
             region.center.longitude += 0.001
             map.setRegion(region, animated: false)
@@ -178,10 +166,8 @@ import Testing
             #expect(index.placeEvidence() === previous)
             #expect(pinCount() == 2000)
             index.updateScanProgress(PhotoLocationScanProgress(phase: .completed))
-            let deadline = ContinuousClock.now + .seconds(5)
-            while pinCount() != 2050 && ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(10))
-            }
+            // The scan observer reloads the map on its own; the test only waits for the pins.
+            _ = await eventually { pinCount() == 2050 }
             #expect(pinCount() == 2050, "Completion must reload without another coordinate revision")
             #expect(index.placeEvidence().analysisStartsForTesting == 1)
         }
@@ -211,16 +197,12 @@ import Testing
             } else {
                 loader.attach(map)
             }
-            let deadline = ContinuousClock.now + .seconds(5)
-            while !gate.entered && ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            defer { gate.released = true }
-            try #require(gate.entered)
+            defer { gate.release() }
+            try #require(await gate.entered.happens(), "The framing must reach its pause")
             loader.reloadVisible()
             await loader.waitForReloadForTesting()
             #expect(map.annotations.isEmpty, "The first pins must wait for the dense-core frame")
-            gate.released = true
+            gate.release()
             await loader.waitForFramingForTesting()
             await loader.waitForReloadForTesting()
             #expect(map.annotations.compactMap { $0 as? PhotoMapAnnotation }.count == 1)
@@ -229,31 +211,29 @@ import Testing
         }
     }
 
-    @MainActor private final class FramingPause {
-        var entered = false
-        var released = false
+    /// Holds the framing worker until the test releases it, or until the worker is cancelled.
+    private final class FramingPause: Sendable {
+        let entered = AsyncTestSignal()
+        private let released = AsyncTestSignal()
         func pause() async {
-            entered = true
-            let deadline = ContinuousClock.now + .seconds(10)
-            while !released && ContinuousClock.now < deadline && !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(10))
-            }
+            entered.fire()
+            await released.wait()
         }
+        func release() { released.fire() }
     }
 
+    /// Blocks the analysis worker until the test releases it. Every test releases it in a `defer`. The worker blocks a
+    /// thread of the shared pool, so the hang limit also releases it: a full pool must not stop the limit of `happens()`.
     private final class AnalysisPause: @unchecked Sendable {
+        let entered = AsyncTestSignal()
         private let condition = NSCondition()
-        private var entered = false
         private var released = false
-        var hasEntered: Bool { condition.withLock { entered } }
         func wait() {
+            entered.fire()
             condition.lock()
             defer { condition.unlock() }
-            entered = true
-            let deadline = Date().addingTimeInterval(10)
-            while !released {
-                if !condition.wait(until: deadline) { break }
-            }
+            let deadline = Date(timeIntervalSinceNow: TimeInterval(AsyncTestSignal.hangLimit.components.seconds))
+            while !released && condition.wait(until: deadline) {}
         }
         func release() {
             condition.withLock {
