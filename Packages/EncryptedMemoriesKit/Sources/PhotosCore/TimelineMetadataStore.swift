@@ -1163,6 +1163,12 @@ public final class TimelineMetadataStore {
         writeMeta(Self.metaRelatedVideoRuleKey, relatedVideoRuleMark(rule))
     }
 
+    /// Whether `rule` chose the related videos of the stored timeline (`markRelatedVideosChosen(by:)` after the last
+    /// save). False after a save that was not marked, so a load must read the types again.
+    public func relatedVideosChosen(by rule: String) -> Bool {
+        readMeta(Self.metaRelatedVideoRuleKey) == relatedVideoRuleMark(rule)
+    }
+
     private func relatedVideoRuleMark(_ rule: String) -> String {
         "\(rule)@\(readMetaInt(Self.metaGenerationKey) ?? 0)"
     }
