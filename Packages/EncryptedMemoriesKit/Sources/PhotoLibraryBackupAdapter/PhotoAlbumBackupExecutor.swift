@@ -24,6 +24,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
     private let stopFenceAcquired: (@Sendable () async -> Void)?
     private let stopFenceBarrier: (@Sendable () async -> Void)?
     private let runtimeSignals: BackupRuntimeSignalSource
+    private let clock: any BackupSchedulerClock
 
     private let lock = NSLock()
     private struct ActiveOperation {
@@ -50,6 +51,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         stopFenceAcquired = nil
         stopFenceBarrier = nil
         runtimeSignals = .apple
+        clock = BackupContinuousClock()
     }
 
     init(
@@ -61,7 +63,8 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         proofCatalog: (any UploadBackupAssetCatalog)? = nil,
         stopFenceAcquired: (@Sendable () async -> Void)? = nil,
         stopFenceBarrier: (@Sendable () async -> Void)? = nil,
-        runtimeSignals: BackupRuntimeSignalSource = .apple
+        runtimeSignals: BackupRuntimeSignalSource = .apple,
+        clock: any BackupSchedulerClock = BackupContinuousClock()
     ) {
         self.accountDataDirectory = accountDataDirectory
         self.databasePolicy = databasePolicy
@@ -72,6 +75,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         self.stopFenceAcquired = stopFenceAcquired
         self.stopFenceBarrier = stopFenceBarrier
         self.runtimeSignals = runtimeSignals
+        self.clock = clock
     }
 
     public func ensureBackedUp(
@@ -182,7 +186,8 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
             identityResolver: identityResolver,
             uploader: uploader,
             throttleInputs: runtimeSignals.current,
-            runtimeChanges: runtimeSignals.updates
+            runtimeChanges: runtimeSignals.updates,
+            clock: clock
         )
         lock.withLock { activeRunner = runner }
         defer { lock.withLock { activeRunner = nil } }
