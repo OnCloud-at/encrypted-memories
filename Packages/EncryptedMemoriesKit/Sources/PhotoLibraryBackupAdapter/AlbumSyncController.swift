@@ -379,7 +379,7 @@ public final class AlbumSyncController {
         for id in ids where !queuedAlbumIDs.contains(id) {
             queuedAlbumIDs.append(id)
         }
-        if isSyncing, stopState.albumAdded(), lastMessageStyle == .information { setMessage(nil) }
+        if isSyncing { stopState.albumsAdded(ids) }
         startBatchIfIdle()
     }
 
@@ -402,7 +402,7 @@ public final class AlbumSyncController {
                     case .nameConflict(let existing):
                         self?.recordConflict(album: album, existing: existing)
                     case .stopped:
-                        self?.queuedAlbumIDs.removeAll()
+                        self?.dropQueueAfterStop()
                         self?.showStopResult(after: .stopped)
                         self?.reloadSelection()
                     default:
@@ -411,7 +411,7 @@ public final class AlbumSyncController {
                     }
                 } catch {
                     if self?.stopState.endsAsStop(error) == true {
-                        self?.queuedAlbumIDs.removeAll()
+                        self?.dropQueueAfterStop()
                         self?.showStopResult(after: .cancelled)
                     } else {
                         self?.setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -436,11 +436,17 @@ public final class AlbumSyncController {
         lastMessageStyle = style
     }
 
+    /// A stopped album ends: the waiting albums go, except the ones added after Stop.
+    private func dropQueueAfterStop() {
+        queuedAlbumIDs.removeAll { !stopState.keepsAfterStop($0) }
+    }
+
     private func dequeueNextAlbum() -> LocalAlbumSummary? {
         while !queuedAlbumIDs.isEmpty {
             let id = queuedAlbumIDs.removeFirst()
             guard let row = selectedAlbums.first(where: { $0.id == id }) else { continue }
             if libraryWasRead, row.state == .missingLocally { continue }
+            if stopState.nextAlbumStarted(), lastMessageStyle == .information { setMessage(nil) }
             return LocalAlbumSummary(id: row.id, title: row.title, assetCount: row.assetCount ?? 0)
         }
         return nil

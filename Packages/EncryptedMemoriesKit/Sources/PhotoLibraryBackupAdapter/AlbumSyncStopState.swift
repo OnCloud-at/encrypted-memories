@@ -21,10 +21,14 @@ struct AlbumSyncStopState: Equatable {
     private(set) var isRequested = false
     /// Stop removed albums that were still waiting in the batch.
     private(set) var droppedQueuedAlbums = false
+    /// Albums that joined the batch after Stop, for example from the name-conflict dialog. They run after the stopped
+    /// album ends.
+    private(set) var addedAfterStop: Set<String> = []
 
     mutating func batchStarted() {
         isRequested = false
         droppedQueuedAlbums = false
+        addedAfterStop = []
     }
 
     mutating func stopPressed(isSyncing: Bool, queuedAlbums: Int) {
@@ -33,9 +37,21 @@ struct AlbumSyncStopState: Equatable {
         if queuedAlbums > 0 { droppedQueuedAlbums = true }
     }
 
-    /// An album joins the running batch after Stop, for example from the name-conflict dialog. Its run is not stopped,
-    /// so the Stop no longer applies. Returns true when the stop text should clear.
-    mutating func albumAdded() -> Bool {
+    /// Albums join the running batch. After Stop they wait until the stopped album ends; the Stop still applies to
+    /// that album.
+    mutating func albumsAdded(_ ids: [String]) {
+        guard isRequested else { return }
+        addedAfterStop.formUnion(ids)
+    }
+
+    /// Whether a queued album stays when the stopped album ends.
+    func keepsAfterStop(_ id: String) -> Bool {
+        addedAfterStop.contains(id)
+    }
+
+    /// The next album of the batch starts. Its run is not stopped, so the Stop ends. Returns true when the stop text
+    /// should clear.
+    mutating func nextAlbumStarted() -> Bool {
         guard isRequested else { return false }
         batchStarted()
         return true

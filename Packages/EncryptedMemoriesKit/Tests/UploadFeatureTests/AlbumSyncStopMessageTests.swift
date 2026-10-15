@@ -88,11 +88,29 @@ final class AlbumSyncStopMessageTests: XCTestCase {
         XCTAssertNil(state.message(after: .finished(report()), current: none))
     }
 
-    func testAnAlbumAddedAfterStopEndsTheStop() {
-        var state = stopped(queuedAlbums: 1)
-        XCTAssertTrue(state.albumAdded())
+    func testAnAlbumAddedAfterStopWaitsAndTheStopStillAppliesToTheRunningAlbum() {
+        var state = stopped()
+        state.albumsAdded(["added"])
+        XCTAssertTrue(state.keepsAfterStop("added"), "the added album runs after the stopped album ends")
+        XCTAssertFalse(state.keepsAfterStop("dropped"))
+        XCTAssertTrue(state.endsAsStop(CancellationError()), "the running album is still stopped")
+        XCTAssertEqual(state.message(after: .stopped, current: none), .init(text: stoppedText, style: .information))
+    }
+
+    func testTheNextAlbumEndsTheStop() {
+        var state = stopped()
+        state.albumsAdded(["added"])
+        XCTAssertTrue(state.nextAlbumStarted())
+        XCTAssertFalse(state.endsAsStop(CancellationError()))
         XCTAssertNil(state.message(after: .finished(report()), current: none))
-        XCTAssertFalse(state.albumAdded(), "without a Stop adding an album changes nothing")
+        XCTAssertFalse(state.nextAlbumStarted(), "without a Stop the next album changes nothing")
+    }
+
+    func testAlbumsAddedWithoutAStopAreNotKeptAsAddedAfterStop() {
+        var state = AlbumSyncStopState()
+        state.batchStarted()
+        state.albumsAdded(["added"])
+        XCTAssertFalse(state.keepsAfterStop("added"))
     }
 
     func testAnErrorAfterAStopMessageShowsAsAnErrorAgain() async throws {
