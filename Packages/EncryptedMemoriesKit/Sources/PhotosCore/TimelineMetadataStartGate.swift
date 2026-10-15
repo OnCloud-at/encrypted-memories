@@ -13,13 +13,21 @@ public final class TimelineMetadataStartGate: @unchecked Sendable {
     private let lock = NSLock()
     private let startLimit: Duration
     private let limit: Duration
+    private let sleep: @Sendable (Duration) async throws -> Void
     private var state = State.waitingForBuild
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var timer: Task<Void, Never>?
 
-    public init(startLimit: Duration = defaultStartLimit, limit: Duration = defaultLimit) {
+    public convenience init(startLimit: Duration = defaultStartLimit, limit: Duration = defaultLimit) {
+        self.init(startLimit: startLimit, limit: limit, sleep: { try await Task.sleep(for: $0) })
+    }
+
+    /// The sleeper is a test seam: a test holds each wait and releases it, so no assertion depends on the speed of
+    /// the machine.
+    init(startLimit: Duration, limit: Duration, sleep: @escaping @Sendable (Duration) async throws -> Void) {
         self.startLimit = startLimit
         self.limit = max(limit, startLimit)
+        self.sleep = sleep
     }
 
     /// The first full build began; from now on only `limit` bounds the wait.
@@ -52,9 +60,9 @@ public final class TimelineMetadataStartGate: @unchecked Sendable {
                     guard state != .open, !Task.isCancelled else { return false }
                     waiters[id] = continuation
                     if timer == nil {
-                        timer = Task { [weak self, startLimit, limit] in
-                            try? await Task.sleep(for: startLimit)
-                            if self?.isBuilding == true { try? await Task.sleep(for: limit - startLimit) }
+                        timer = Task { [weak self, startLimit, limit, sleep] in
+                            try? await sleep(startLimit)
+                            if self?.isBuilding == true { try? await sleep(limit - startLimit) }
                             self?.open()
                         }
                     }

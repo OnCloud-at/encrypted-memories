@@ -27,7 +27,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
             await fixture.run(pass)
         }
         reconciliation.schedule(inventory(2), operation: operation)
-        await fulfillment(of: [fixture.started], timeout: 10)
+        await awaitEvent(fixture.started, "the first pass reaching the network phase")
         for count in 3...12 { reconciliation.schedule(inventory(count), operation: operation) }
         let beforeRelease = await fixture.counts()
         XCTAssertEqual(beforeRelease.started, 1, "inventory changes must not displace the network phase")
@@ -60,7 +60,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
             await fixture.run($0, reconciliation: reconciliation)
         }
         reconciliation.schedule(initial, operation: operation)
-        await fulfillment(of: [fixture.requested], timeout: 10)
+        await awaitEvent(fixture.requested, "the first MIME request")
         // B is queued before A commits its first MIME response.
         reconciliation.schedule(latest, operation: operation)
         let before = try await fixture.result()
@@ -85,7 +85,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         let reconciliation = TimelineMetadataReconciliation()
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         reconciliation.schedule(inventory(2), operation: operation)
-        await fulfillment(of: [fixture.started], timeout: 10)
+        await awaitEvent(fixture.started, "the first pass reaching the network phase")
         reconciliation.schedule(inventory(3), operation: operation)
         reconciliation.schedule(inventory(2), operation: operation)
         await fixture.release()
@@ -103,7 +103,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         let initial = inventory(2)
         reconciliation.schedule(initial, operation: operation)
-        await fulfillment(of: [fixture.started], timeout: 10)
+        await awaitEvent(fixture.started, "the first pass reaching the network phase")
         let reversed = TimelineMetadataReconciliation.Inventory(
             items: Array(initial.items.reversed()), classifiedNodeIDs: [], libraryID: initial.libraryID)
         for _ in 0..<20 { reconciliation.schedule(reversed, operation: operation) }
@@ -122,7 +122,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         let initial = inventory(2)
         let latest = inventory(5)
         reconciliation.schedule(initial) { await fixture.run($0) }
-        await fulfillment(of: [fixture.started], timeout: 10)
+        await awaitEvent(fixture.started, "the first pass reaching the network phase")
         reconciliation.schedule(latest) { await fixture.run($0) }
         let visible = await fixture.enrich(latest.items)
         XCTAssertEqual(visible.map(\.uid), latest.items.map(\.uid))
@@ -157,7 +157,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         let reconciliation = TimelineMetadataReconciliation()
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         reconciliation.schedule(inventory(2), operation: operation)
-        await fulfillment(of: [fixture.started], timeout: 10)
+        await awaitEvent(fixture.started, "the first pass reaching the network phase")
         for count in 3...12 { reconciliation.schedule(inventory(count), operation: operation) }
         // The same account admission barrier is used by the production owner before teardown.
         fixture.admission.closeAdmission()
@@ -182,11 +182,11 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
     private func assertCancellationOutsideLock(replacingLibrary: Bool) async {
         let reconciliation = TimelineMetadataReconciliation()
-        let started = XCTestExpectation(description: "cancellation handler registered")
-        let finished = XCTestExpectation(description: "cancelled pass finished")
+        let started = AsyncTestSignal()
+        let finished = AsyncTestSignal()
         reconciliation.schedule(inventory(2)) { pass in
             await withTaskCancellationHandler {
-                started.fulfill()
+                started.fire()
                 try? await Task.sleep(for: .seconds(30))
             } onCancel: {
                 let queried = DispatchSemaphore(value: 0)
@@ -194,19 +194,20 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
                     XCTAssertFalse(reconciliation.isCurrent(pass))
                     queried.signal()
                 }
+                // The query is a plain read; the bound only ends a deadlock, so machine load never reaches it.
                 XCTAssertEqual(
-                    queried.wait(timeout: .now() + 2), .success,
+                    queried.wait(timeout: .now() + 60), .success,
                     "cancellation handlers must be able to read the coordinator without waiting for its lock")
             }
-            finished.fulfill()
+            finished.fire()
         }
-        await fulfillment(of: [started], timeout: 10)
+        await awaitEvent(started, "the registration of the cancellation handler")
         if replacingLibrary {
             reconciliation.schedule(inventory(2, library: "second")) { _ in }
         } else {
             reconciliation.retire()
         }
-        await fulfillment(of: [finished], timeout: 10)
+        await awaitEvent(finished, "the end of the cancelled pass")
         await reconciliation.waitForCurrentPass()
     }
 
@@ -215,10 +216,10 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         let reconciliation = TimelineMetadataReconciliation()
         let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { await fixture.run($0) }
         reconciliation.schedule(inventory(2), operation: operation)
-        await fulfillment(of: [fixture.started], timeout: 10)
+        await awaitEvent(fixture.started, "the first pass reaching the network phase")
         for count in 3...12 { reconciliation.schedule(inventory(count), operation: operation) }
         reconciliation.schedule(inventory(3, library: "second"), operation: operation)
-        await fulfillment(of: [fixture.cancelled], timeout: 10)
+        await awaitEvent(fixture.cancelled, "the cancellation of the old pass")
         await fixture.release()
         await reconciliation.waitForCurrentPass()
         let result = await fixture.result()
@@ -231,8 +232,8 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 }
 
 private actor ReconciliationFixture {
-    nonisolated let started = XCTestExpectation(description: "first pass reached the network phase")
-    nonisolated let cancelled = XCTestExpectation(description: "old pass was cancelled")
+    nonisolated let started = AsyncTestSignal()
+    nonisolated let cancelled = AsyncTestSignal()
     nonisolated let admission = JoinedShutdownGate()
     private let store: TimelineOrderMetadataStore
     private var startedCount = 0
@@ -251,7 +252,7 @@ private actor ReconciliationFixture {
         startedCount += 1
         let items = pass.inventory.items
         guard await store.synchronizeInChunks(items, isClassified: { _ in true }) else { return }
-        if startedCount == 1 { started.fulfill() }
+        if startedCount == 1 { started.fire() }
         do {
             try await networkRequest()
             try Task.checkCancellation()
@@ -269,7 +270,7 @@ private actor ReconciliationFixture {
             publications.append(store.enrich(items))
         } catch is CancellationError {
             cancelledCount += 1
-            if cancelledCount == 1 { cancelled.fulfill() }
+            if cancelledCount == 1 { cancelled.fire() }
         } catch {
             XCTFail("unexpected pass failure: \(error)")
         }
@@ -305,7 +306,7 @@ private actor ReconciliationFixture {
 }
 
 private actor MIMEReconciliationFixture {
-    nonisolated let requested = XCTestExpectation(description: "first MIME request awaits its response")
+    nonisolated let requested = AsyncTestSignal()
     private let timeline: TimelineMetadataStore
     private let order: TimelineOrderMetadataStore?
     private var requests: [[[PhotoUID]]] = []
@@ -332,7 +333,7 @@ private actor MIMEReconciliationFixture {
                 if index == 0, requests[index].count == 1, !released {
                     await withCheckedContinuation {
                         response = $0
-                        requested.fulfill()
+                        requested.fire()
                     }
                 }
                 let evidence = Dictionary(
