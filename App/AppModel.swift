@@ -138,6 +138,8 @@ final class AppModel {
     }
     private let photoBackupScheduler = MacPhotoBackupScheduler()
     private var backendTask: Task<Void, Never>?
+    /// One retry of the backend at a time; the failed preparation ends before the next one starts.
+    @ObservationIgnored private let backendRetry = BackendRetrySequence()
     private var scopeRecoveryTask: Task<Void, Never>?
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
@@ -325,9 +327,32 @@ final class AppModel {
         }
     }
 
+    /// Retries a failed preparation. A failed preparation leaves no facade: `prepareBackend` assigns one only after
+    /// `makeFacade` succeeded, and a failed scope recovery shut its facade down first. So two backends never work on
+    /// the account's files, a retry starts only without a facade, and only after the failed preparation ended.
     func retryBackend() {
-        guard scopeRecoveryTask == nil else { return }
-        if case .signedIn(let session) = auth { prepareBackend(session) }
+        guard scopeRecoveryTask == nil, case .failed = backend, case .signedIn(let session) = auth else { return }
+        guard facade == nil else {
+            DebugLog.log("backend retry: a failed state still holds a facade; the retry starts nothing")
+            assertionFailure("A failed backend state must not hold a facade")
+            return
+        }
+        let failed = backendTask
+        Task {
+            await backendRetry.run(
+                retire: { [weak self] in
+                    // A sign-out must still find a preparation that replaced the failed one meanwhile.
+                    if self?.backendTask == failed { self?.backendTask = nil }
+                    await failed?.value
+                },
+                start: { [weak self] in
+                    // Another preparation that began meanwhile keeps running; the retry starts no second one.
+                    guard let self, self.scopeRecoveryTask == nil, self.facade == nil, self.backendTask == nil,
+                        case .signedIn(let current) = self.auth, current == session
+                    else { return }
+                    self.prepareBackend(session)
+                })
+        }
     }
 
     /// A terminal Drive scope event invalidates every local projection for that volume. Keep authentication,
