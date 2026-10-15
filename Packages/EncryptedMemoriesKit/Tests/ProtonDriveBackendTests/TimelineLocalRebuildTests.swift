@@ -17,12 +17,14 @@ struct TimelineLocalRebuildTests {
         pendingUploads: Bool = false,
         unmaterializedEvidence: Bool = false,
         awaitingLibrary: Bool = false,
+        restored: Bool = false,
         continuityRecovery: Bool = false
     ) -> TimelineLocalRebuild.Conditions {
         TimelineLocalRebuild.Conditions(
             basis: basis, currentEventToken: eventToken, currentRevisions: revisions,
             hasPendingLocalUploads: pendingUploads, hasUnmaterializedLocalEvidence: unmaterializedEvidence,
-            hasPhotosAwaitingLibrary: awaitingLibrary, continuityRecoveryRequired: continuityRecovery)
+            hasPhotosAwaitingLibrary: awaitingLibrary, hasRestoredPhotos: restored,
+            continuityRecoveryRequired: continuityRecovery)
     }
 
     private static func item(
@@ -38,24 +40,39 @@ struct TimelineLocalRebuildTests {
     /// Counts the store reads that a plan makes.
     private final class Reads: @unchecked Sendable {
         private let lock = NSLock()
+        private var tokens = 0
+        private var rules = 0
         private var items = 0
         private var evidence = 0
+        var tokenReads: Int { lock.withLock { tokens } }
+        var ruleReads: Int { lock.withLock { rules } }
         var itemReads: Int { lock.withLock { items } }
         var evidenceReads: Int { lock.withLock { evidence } }
+        func token() { lock.withLock { tokens += 1 } }
+        func rule() { lock.withLock { rules += 1 } }
         func item() { lock.withLock { items += 1 } }
         func evidenceRead() { lock.withLock { evidence += 1 } }
+        var total: Int { tokenReads + ruleReads + itemReads + evidenceReads }
     }
 
     private static func plan(
         _ conditions: TimelineLocalRebuild.Conditions,
         storedToken: String? = persistedToken,
+        motionRuleIsCurrent: Bool = true,
         stored: [PhotoItem]? = [item("a")],
         evidence: [String: String] = [:],
         reads: Reads = Reads()
     ) -> [TimelineSection]? {
         TimelineLocalRebuild.plan(
             conditions,
-            storedValidationToken: { storedToken },
+            storedValidationToken: {
+                reads.token()
+                return storedToken
+            },
+            motionRuleIsCurrent: {
+                reads.rule()
+                return motionRuleIsCurrent
+            },
             storedItems: {
                 reads.item()
                 return stored
@@ -90,28 +107,92 @@ struct TimelineLocalRebuildTests {
             ("an upload waits for the listing", Self.conditions(pendingUploads: true)),
             ("evidence of an upload waits for the listing", Self.conditions(unmaterializedEvidence: true)),
             ("a trashed photo waits for the listing", Self.conditions(awaitingLibrary: true)),
+            ("a restored photo waits to be listed", Self.conditions(restored: true)),
             ("the event history was reset", Self.conditions(continuityRecovery: true)),
         ]
         for (reason, conditions) in ineligible {
             let reads = Reads()
             #expect(Self.plan(conditions, reads: reads) == nil, "\(reason)")
-            // The stored inventory is not even read when the conditions say no.
-            #expect(reads.itemReads == 0 && reads.evidenceReads == 0, "\(reason)")
+            // The conditions come first: nothing of the store is read when they say no, not even its token.
+            #expect(reads.total == 0, "\(reason)")
         }
     }
 
     @Test func aStoredInventoryOfAnotherCursorIsNotUsed() {
         let other = TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-6")
-        #expect(Self.plan(Self.conditions(), storedToken: other) == nil)
-        #expect(Self.plan(Self.conditions(), storedToken: nil) == nil)
-        #expect(Self.plan(Self.conditions(), storedToken: Self.cursor) == nil)
+        for token in [other, nil, Self.cursor] {
+            let reads = Reads()
+            #expect(Self.plan(Self.conditions(), storedToken: token, reads: reads) == nil)
+            // Only the token is read; the rule mark and the items wait for it.
+            #expect(reads.tokenReads == 1 && reads.ruleReads == 0 && reads.itemReads == 0)
+        }
+    }
+
+    @Test func aLivePhotoWithAnUnreadMotionKeepsTheListing() {
+        // The Live control shows, but no video is named: a listing reads the related types again for it.
+        let unread = [Self.item("a"), Self.item("live", live: true, related: nil)]
+        let reads = Reads()
+        #expect(Self.plan(Self.conditions(), stored: unread, reads: reads) == nil)
+        #expect(reads.itemReads == 1 && reads.evidenceReads == 0)
+        #expect(TimelineLocalRebuild.hasUnreadLiveMotion(unread))
+        // A read motion, a photo that is no Live Photo and a Live Photo without a video do not hold it back.
+        let settled = [
+            Self.item("a"), Self.item("live", live: true, related: "motion"), Self.item("edit", live: false),
+        ]
+        #expect(!TimelineLocalRebuild.hasUnreadLiveMotion(settled))
+        #expect(Self.plan(Self.conditions(), stored: settled) != nil)
+    }
+
+    @Test func aStoredCopyThatTheCurrentMotionRuleDidNotChooseKeepsTheListing() {
+        let reads = Reads()
+        #expect(Self.plan(Self.conditions(), motionRuleIsCurrent: false, reads: reads) == nil)
+        #expect(reads.ruleReads == 1 && reads.itemReads == 0)
+    }
+
+    @Test func theBasisIsTheRawCursorOfASavedLoadAndOfNothingElse() throws {
+        let revisions = TimelineLocalRevisions(mediaType: 1, order: 1)
+        let commit = TimelineLoadCommitPolicy.decide(
+            startEventToken: Self.cursor, endEventToken: Self.cursor, enrichmentComplete: true)
+        let basis = try #require(
+            TimelineLocalRebuild.basis(
+                persistedValidationToken: commit.persistedValidationToken, eventToken: commit.monitorBaseline,
+                revisions: revisions, saved: true))
+        // The raw cursor, not the prefixed token that is stored beside the inventory: the save adds the prefix.
+        #expect(basis.eventToken == Self.cursor)
+        #expect(commit.persistedValidationToken == Self.cursor)
+        #expect(
+            TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: basis.eventToken)
+                == Self.persistedToken)
+        let later = TimelineLocalRevisions(mediaType: 2, order: 1)
+        #expect(Self.plan(Self.conditions(basis: basis, revisions: later)) != nil)
+        // A basis made from the prefixed token never matches the raw cursor of the next load.
+        let prefixed = TimelineLoadBasis(eventToken: Self.persistedToken, revisions: revisions)
+        #expect(Self.plan(Self.conditions(basis: prefixed, revisions: later)) == nil)
+
+        // No save, no basis: a failed save or an incomplete enrichment leaves the next load to list.
+        #expect(
+            TimelineLocalRebuild.basis(
+                persistedValidationToken: commit.persistedValidationToken, eventToken: commit.monitorBaseline,
+                revisions: revisions, saved: false) == nil)
+        let incomplete = TimelineLoadCommitPolicy.decide(
+            startEventToken: Self.cursor, endEventToken: Self.cursor, enrichmentComplete: false)
+        #expect(incomplete.persistedValidationToken == nil)
+        #expect(
+            TimelineLocalRebuild.basis(
+                persistedValidationToken: incomplete.persistedValidationToken, eventToken: incomplete.monitorBaseline,
+                revisions: revisions, saved: true) == nil)
+    }
+
+    @Test func aRebuildHasItsOwnLabelInTheSupportReport() {
+        #expect(LibrarySyncSupportSnapshot.SourcePath.localStore.rawValue == "localStore")
+        #expect(LibrarySyncSupportSnapshot.SourcePath.localStore != .cache)
     }
 
     @Test func aFailedOrEmptyStoreReadKeepsTheListing() {
         #expect(Self.plan(Self.conditions(), stored: nil) == nil)
         #expect(Self.plan(Self.conditions(), stored: []) == nil)
         let throwing = TimelineLocalRebuild.plan(
-            Self.conditions(), storedValidationToken: { Self.persistedToken },
+            Self.conditions(), storedValidationToken: { Self.persistedToken }, motionRuleIsCurrent: { true },
             storedItems: { throw CocoaError(.fileReadCorruptFile) }, mediaTypeEvidence: { [:] })
         #expect(throwing == nil)
     }
@@ -177,12 +258,19 @@ struct TimelineLocalRebuildTests {
         let sections = TimelineLocalRebuild.plan(
             conditions,
             storedValidationToken: { store.validationToken() },
+            motionRuleIsCurrent: { true },
             storedItems: { try store.cachedTimelineSnapshot()?.sections.flatMap(\.items) },
             mediaTypeEvidence: { store.mediaTypeEvidenceForDisplay(volumeID: "vol").types })
         let rebuilt = try #require(sections?.first?.items)
         #expect(rebuilt.map(\.uid.nodeID) == ["a", "b", "c"])
         #expect(rebuilt.map(\.isVideo) == [false, true, false])
         #expect(rebuilt[1].tags.contains(.videos))
+
+        // The rule mark of the motion choice: set after a marked save, void after any later changed save.
+        #expect(!store.relatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        #expect(store.relatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        #expect(store.relatedVideosChosen(by: "another.rule") == false)
 
         // Once this rebuild is the basis, the same revisions are a plain refresh again.
         let next = TimelineLoadBasis(eventToken: Self.cursor, revisions: after)
@@ -192,6 +280,9 @@ struct TimelineLocalRebuildTests {
         // A save for another cursor makes the stored inventory unusable.
         #expect(store.save(items, validationToken: "photos-inventory-v2:event-8").succeeded)
         #expect(!TimelineLocalRebuild.isEligible(conditions, storedValidationToken: store.validationToken()))
+        // A changed save without a new mark voids the mark, so the next load reads the types again.
+        #expect(store.save(items + [Self.item("d", at: 4)], validationToken: Self.persistedToken).succeeded)
+        #expect(!store.relatedVideosChosen(by: LivePhotoMotionLinks.rule))
     }
 
     @Test func theSourcePolicyChoosesTheStoreOnlyWhereTheSDKCacheWasChosen() {

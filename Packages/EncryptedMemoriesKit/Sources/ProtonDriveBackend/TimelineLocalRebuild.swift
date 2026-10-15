@@ -8,8 +8,9 @@ struct TimelineLocalRevisions: Equatable, Sendable {
     let order: Int
 }
 
-/// What the last persisted timeline load of this backend was built from: the server event cursor of the listing and
-/// the local revisions that were current when its sections were grouped.
+/// What the last persisted timeline load of this backend was built from: the server event cursor of the listing (the
+/// raw cursor, without the prefix of the stored validation token) and the local revisions that were current when its
+/// sections were grouped.
 struct TimelineLoadBasis: Equatable, Sendable {
     let eventToken: String
     let revisions: TimelineLocalRevisions
@@ -25,41 +26,77 @@ enum TimelineLocalRebuild {
     /// The facts that decide whether the stored inventory can stand in for a listing.
     struct Conditions {
         let basis: TimelineLoadBasis?
+        /// The raw server event cursor of this load.
         let currentEventToken: String
         let currentRevisions: TimelineLocalRevisions
         let hasPendingLocalUploads: Bool
         let hasUnmaterializedLocalEvidence: Bool
         let hasPhotosAwaitingLibrary: Bool
+        /// A photo restored here waits to be listed by the library twice.
+        let hasRestoredPhotos: Bool
         let continuityRecoveryRequired: Bool
     }
 
-    /// Whether the stored inventory may be used. All of these must hold:
+    /// The facts that need no store read. All of these must hold:
     /// - the last persisted load of this backend ran for the same server event cursor;
     /// - only a local revision differs from that load (a load with nothing changed keeps the existing source);
-    /// - the stored inventory carries the validation token of that cursor, so it is the result of that load;
-    /// - no upload, local evidence, trash wait or continuity recovery needs a listing.
-    static func isEligible(_ conditions: Conditions, storedValidationToken: String?) -> Bool {
+    /// - no upload, local evidence, trash wait, restore or continuity recovery needs a listing.
+    static func passesConditions(_ conditions: Conditions) -> Bool {
         guard !conditions.hasPendingLocalUploads, !conditions.hasUnmaterializedLocalEvidence,
-            !conditions.hasPhotosAwaitingLibrary, !conditions.continuityRecoveryRequired,
+            !conditions.hasPhotosAwaitingLibrary, !conditions.hasRestoredPhotos,
+            !conditions.continuityRecoveryRequired,
             let basis = conditions.basis,
             basis.eventToken == conditions.currentEventToken,
             basis.revisions != conditions.currentRevisions
         else { return false }
-        return storedValidationToken
-            == TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: conditions.currentEventToken)
+        return true
     }
 
-    /// The sections to publish, or nil when the existing sources must run. The store reads happen only when the
-    /// conditions hold, and a failed or empty read gives nil, so a damaged store never replaces a listing.
+    /// Whether the stored inventory carries the validation token of this cursor, so it is the result of that load.
+    static func storedInventoryIsOf(eventToken: String, storedValidationToken: String?) -> Bool {
+        storedValidationToken == TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: eventToken)
+    }
+
+    /// Whether the stored inventory may be used, from the facts alone.
+    static func isEligible(_ conditions: Conditions, storedValidationToken: String?) -> Bool {
+        passesConditions(conditions)
+            && storedInventoryIsOf(
+                eventToken: conditions.currentEventToken, storedValidationToken: storedValidationToken)
+    }
+
+    /// A Live Photo whose motion is not read: it shows the Live control but names no video. A listing reads the
+    /// related types again for it (`LivePhotoMotion.unknown`); a stored copy would keep it unread.
+    static func hasUnreadLiveMotion(_ items: [PhotoItem]) -> Bool {
+        items.contains { $0.isLivePhoto && $0.relatedVideoID == nil }
+    }
+
+    /// The sections to publish, or nil when the existing sources must run. The reads happen in order and only as far
+    /// as needed: first the conditions, then the stored token, then the motion rule mark, then the stored items. A
+    /// failed or empty read, a stored copy that the current motion rule did not choose and a Live Photo with an
+    /// unread motion all give nil, so a damaged or incomplete store never replaces a listing.
     static func plan(
         _ conditions: Conditions,
         storedValidationToken: () -> String?,
+        motionRuleIsCurrent: () -> Bool,
         storedItems: () throws -> [PhotoItem]?,
         mediaTypeEvidence: () -> [String: String]
     ) -> [TimelineSection]? {
-        guard isEligible(conditions, storedValidationToken: storedValidationToken()) else { return nil }
-        guard let stored = try? storedItems(), !stored.isEmpty else { return nil }
+        guard passesConditions(conditions),
+            storedInventoryIsOf(
+                eventToken: conditions.currentEventToken, storedValidationToken: storedValidationToken()),
+            motionRuleIsCurrent()
+        else { return nil }
+        guard let stored = try? storedItems(), !stored.isEmpty, !hasUnreadLiveMotion(stored) else { return nil }
         return sections(from: stored, mediaTypeEvidence: mediaTypeEvidence())
+    }
+
+    /// The basis for the next load: the raw cursor and the revisions of a load whose inventory was saved. A load
+    /// that was not saved (incomplete enrichment, failed save) leaves no basis, so the next load lists.
+    static func basis(
+        persistedValidationToken: String?, eventToken: String, revisions: TimelineLocalRevisions, saved: Bool
+    ) -> TimelineLoadBasis? {
+        guard saved, persistedValidationToken != nil else { return nil }
+        return TimelineLoadBasis(eventToken: eventToken, revisions: revisions)
     }
 
     /// The stored items with the media-type evidence applied, grouped like a listing: one section, canonical order,

@@ -364,8 +364,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
                     hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty,
                     hasPhotosAwaitingLibrary: recentlyDeleted.hasPhotosAwaitingLibrary,
+                    hasRestoredPhotos: recentlyDeleted.hasRestoredPhotos,
                     continuityRecoveryRequired: continuityRecoveryRequired),
                 storedValidationToken: { [timelineStore] in timelineStore?.validationToken() },
+                motionRuleIsCurrent: { [timelineStore] in
+                    timelineStore?.relatedVideosChosen(by: LivePhotoMotionLinks.rule) ?? false
+                },
                 storedItems: { [timelineStore] in
                     try timelineStore?.cachedTimelineSnapshot()?.sections.flatMap(\.items)
                 },
@@ -483,11 +487,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 DebugLog.log("timeline: authoritative photos listing returned \(reconciliationItems.count) items ✓")
 
             case .localStore:
-                supportSource = .cache
+                supportSource = .localStore
                 guard let localSections else { throw TimelineLocalRebuildUnavailableError() }
                 sections = localSections
                 reconciliationItems = localSections.flatMap(\.items)
-                librarySupport.listedPhotoCount = reconciliationItems.count
                 // No listing ran: the burst catalog of the last load stays valid for the same server cursor.
                 burstMemberIDs = [:]
                 burstEntries = nil
@@ -676,8 +679,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             // and the token must describe the evidence these sections were grouped with.
             let tokenRevisions = source == .localStore ? revisionsAtStart : localRevisions()
             let validationToken = monitorToken(remoteToken: commit.monitorBaseline, revisions: tokenRevisions)
-            timelineLoadBasis =
-                loadPersisted ? TimelineLoadBasis(eventToken: commit.monitorBaseline, revisions: tokenRevisions) : nil
+            timelineLoadBasis = TimelineLocalRebuild.basis(
+                persistedValidationToken: commit.persistedValidationToken, eventToken: commit.monitorBaseline,
+                revisions: tokenRevisions, saved: loadPersisted)
             if timelineLostPhotos {
                 // Photos left the library, maybe into the trash on another device. List the trash before the caller
                 // publishes the smaller library, so the cache sweep keeps the thumbnails of photos now in the trash.
@@ -699,8 +703,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 if recentlyDeleted.libraryRefreshed(lists: libraryUIDs.contains) { await reportRecentlyDeleted() }
             }
             librarySupport.lastSuccessfulLoad = .init(timestamp: Date(), sourcePath: supportSource)
+            // A rebuild lists nothing, so its event carries no count of listed photos.
             recordSupportEvent(
-                .libraryLoadSucceeded, sourcePath: supportSource, count: librarySupport.listedPhotoCount)
+                .libraryLoadSucceeded, sourcePath: supportSource,
+                count: source == .localStore ? nil : librarySupport.listedPhotoCount)
             return TimelineLoadSnapshot(sections: sections, validationToken: validationToken)
         } catch is TimelineContinuityRecoveryPendingError {
             librarySupport.lastFailedLoad = .init(
@@ -2705,13 +2711,13 @@ enum DriveBridgeError: LocalizedError {
     }
 }
 
-/// The SDK reported that this event scope is no longer accessible. Retrying the same scope cannot
-/// recover, so the shared monitor stops until account lifecycle creates a new backend instance.
 /// The local rebuild source was chosen without sections. The plan and the source choice make this unreachable.
 private struct TimelineLocalRebuildUnavailableError: LocalizedError {
     var errorDescription: String? { "The local timeline rebuild had no sections." }
 }
 
+/// The SDK reported that this event scope is no longer accessible. Retrying the same scope cannot
+/// recover, so the shared monitor stops until account lifecycle creates a new backend instance.
 private struct DriveEventScopeAccessLostError: LocalizedError, LibraryChangeTerminalError {
     var errorDescription: String? {
         String(localized: "error.no_photos_library")
