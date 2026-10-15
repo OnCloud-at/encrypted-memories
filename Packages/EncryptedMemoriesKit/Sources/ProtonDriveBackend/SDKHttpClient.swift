@@ -281,7 +281,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     static func label(for request: URLRequest, scope: ProtonRequestScope) -> ProtonRequestLabel {
         let method = request.httpMethod ?? "GET"
         guard scope == .api else { return .storage(method: method) }
-        return .api(method: method, path: request.url?.path ?? "")
+        // The encoded path: a decoded segment could take the shape of a route word and be kept.
+        return .api(method: method, path: request.url?.path(percentEncoded: true) ?? "")
     }
 
     private static func canRetryAfterRateLimit(method: String) -> Bool {

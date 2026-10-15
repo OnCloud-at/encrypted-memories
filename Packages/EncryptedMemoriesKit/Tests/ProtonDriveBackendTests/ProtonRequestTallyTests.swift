@@ -35,6 +35,68 @@ struct ProtonRequestTallyTests {
         }
     }
 
+    @Test(arguments: [
+        // (path, expected endpoint)
+        ("/drive/volumes/550e8400-e29b-41d4-a716-446655440000/photos", "/drive/volumes/{id}/photos"),
+        ("/drive/shares/1234567/links", "/drive/shares/{id}/links"),
+        ("/drive/links/0123456789abcdef0123456789abcdef", "/drive/links/{id}"),
+        (
+            "/drive/links/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/revisions",
+            "/drive/links/{id}/revisions"
+        ),
+        ("/drive/files/Holiday photo.jpg", "/drive/files/{id}"),
+        ("/drive/files/café", "/drive/files/{id}"),
+        ("/drive/files/my%20photo", "/drive/files/{id}"),
+        ("/drive/events/latest#fragment", "/drive/events/{id}"),
+        ("https://drive-api.proton.me/drive/shares", "/{id}/{id}/drive/shares"),
+        ("", "/"),
+        ("//drive//shares//", "/drive/shares"),
+        ("/drive/shares/", "/drive/shares"),
+    ])
+    func endpointTemplatesHideEveryIdentifierShape(path: String, expected: String) {
+        #expect(ProtonRequestLabel.api(method: "GET", path: path).endpoint == expected)
+    }
+
+    @Test func aLowercaseOnlyIdentifierOfRouteWordLengthIsKeptByTheShapeRule() {
+        // The rule keeps the shape of a route word; it does not know the route words. Proton identifiers carry
+        // digits or capitals, so they never take this shape. This test records the limit instead of hiding it.
+        let word = "abcdefghijklmnopqrstuv"
+        #expect(word.count == 22)
+        let endpoint = ProtonRequestLabel.api(method: "GET", path: "/drive/shares/\(word)").endpoint
+        #expect(endpoint == "/drive/shares/\(word)")
+    }
+
+    @Test func onlyASCIILettersCountAsRouteWordLetters() {
+        // "b" followed by a combining long solidus overlay compares as a Character between "a" and "z".
+        let combined = "ab\u{0338}cdef"
+        #expect(!ProtonRequestLabel.isFixedWord(Substring(combined)))
+        #expect(ProtonRequestLabel.api(method: "GET", path: "/drive/\(combined)").endpoint == "/drive/{id}")
+        #expect(!ProtonRequestLabel.isFixedWord(Substring("v\u{0664}")))
+    }
+
+    @Test func requestLabelsComeFromThePathOrNothingForStorage() throws {
+        func request(_ url: String, method: String = "GET") throws -> URLRequest {
+            var request = URLRequest(url: try #require(URL(string: url)))
+            request.httpMethod = method
+            return request
+        }
+        let api = try request(
+            "https://drive-api.proton.me/drive/v2/volumes/AbC123==/trash_multiple?Page=1#top", method: "POST")
+        #expect(
+            SDKHttpClient.label(for: api, scope: .api)
+                == ProtonRequestLabel(method: "POST", endpoint: "/drive/v2/volumes/{id}/trash_multiple"))
+        let encoded = try request("https://drive-api.proton.me/drive/files/my%20photo.jpg")
+        #expect(SDKHttpClient.label(for: encoded, scope: .api).endpoint == "/drive/files/{id}")
+        // An encoded segment that decodes to a route-word shape is still an identifier.
+        let encodedWord = try request("https://drive-api.proton.me/drive/shares/%61%62%63%64/links")
+        #expect(SDKHttpClient.label(for: encodedWord, scope: .api).endpoint == "/drive/shares/{id}/links")
+        let storage = try request("https://storage.proton.me/blocks/AbC123?token=secret", method: "PUT")
+        #expect(
+            SDKHttpClient.label(for: storage, scope: .storageUpload)
+                == ProtonRequestLabel(method: "PUT", endpoint: "<storage>"))
+        #expect(SDKHttpClient.label(for: storage, scope: .storageDownload).endpoint == "<storage>")
+    }
+
     @Test func statusCodesFallIntoTheReportedClasses() {
         let cases: [(Int?, ProtonRequestStatusClass)] = [
             (nil, .transport), (200, .success), (204, .success), (302, .redirect), (401, .unauthorized),
@@ -173,8 +235,12 @@ struct ProtonRequestTallyTests {
 
     @Test func aNonFiniteRetryAfterNeverReachesTheReport() async throws {
         let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        // Both permits first: after a 429 the governor holds the scope for the cooldown.
         let permit = try await governor.acquire(scope: .api)
+        let negative = try await governor.acquire(scope: .api)
         await governor.finish(permit, statusCode: 429, retryAfter: .infinity)
+        // A negative wait means nothing and is not a maximum either.
+        await governor.finish(negative, statusCode: 429, retryAfter: -5)
         let snapshot = await governor.requestSupportSnapshot()
         let api = try #require(snapshot.scopes.first { $0.scope == "api" })
         #expect(api.maximumRetryAfterSeconds == nil)

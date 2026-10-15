@@ -55,16 +55,20 @@ struct ProtonRequestLabel: Sendable, Equatable {
         ProtonRequestLabel(method: normalizedMethod(method), endpoint: storageEndpoint)
     }
 
-    /// A fixed word is 3 to 32 lowercase letters with `_` or `-`, or a version such as `v4`. Proton identifiers are
-    /// long mixed-case base64 strings, so they never match; a short segment counts as an identifier.
+    /// A path word is kept when it has the shape of a route word: 3 to 32 ASCII lowercase letters, underscores or
+    /// hyphens, or a version such as `v4`. Identifiers carry digits or capitals and become `{id}`. This is a shape
+    /// rule, not a list: a lowercase-only identifier of that length would be kept. Proton identifiers are mixed-case
+    /// base64 or hex with digits, and every route word of the app and the SDK core is a fixed lowercase word.
     static func isFixedWord(_ segment: Substring) -> Bool {
-        if segment.count > 1, segment.count <= 4, segment.first == "v",
-            segment.dropFirst().allSatisfy({ ("0"..."9").contains($0) })
+        // Unicode scalars, not Characters: a letter with a combining mark would compare as a lowercase letter.
+        let scalars = segment.unicodeScalars
+        if (2...4).contains(scalars.count), scalars.first == "v",
+            scalars.dropFirst().allSatisfy({ ("0"..."9").contains($0) })
         {
             return true
         }
-        guard (3...32).contains(segment.count) else { return false }
-        return segment.allSatisfy { ("a"..."z").contains($0) || $0 == "_" || $0 == "-" }
+        guard (3...32).contains(scalars.count) else { return false }
+        return scalars.allSatisfy { ("a"..."z").contains($0) || $0 == "_" || $0 == "-" }
     }
 
     private static func normalizedMethod(_ method: String) -> String {
@@ -156,7 +160,7 @@ struct ProtonRequestCauseBinding: Sendable {
     }
 }
 
-/// Per-session request counts kept by the governor. Counts only: the keys hold code-owned names and endpoint templates.
+/// Request counts kept by the governor since the backend was last built. Counts only: the keys hold code-owned names and endpoint templates.
 struct ProtonRequestTally: Sendable {
     struct Key: Hashable, Sendable {
         let scope: ProtonRequestScope
@@ -203,8 +207,8 @@ struct ProtonRequestTally: Sendable {
         scope: ProtonRequestScope, retryAfter: TimeInterval?, cooldownFrom start: Date, until end: Date
     ) {
         var totals = scopes[scope] ?? ScopeTotals()
-        // A malformed header can parse as infinity, which a JSON report cannot hold.
-        if let retryAfter, retryAfter.isFinite {
+        // A malformed header can parse as infinity, which a JSON report cannot hold; a negative wait means nothing.
+        if let retryAfter, retryAfter.isFinite, retryAfter >= 0 {
             totals.maximumRetryAfter = max(totals.maximumRetryAfter ?? 0, retryAfter)
         }
         totals.cooldownSeconds += max(0, end.timeIntervalSince(start))
