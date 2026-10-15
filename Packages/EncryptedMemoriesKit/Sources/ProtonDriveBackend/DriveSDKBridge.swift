@@ -56,6 +56,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// work across awaits; without this, foreground lifecycle, upload refresh and a second Mac window can all
     /// enumerate the same 20k-item library concurrently.
     private var timelineLoadTask: (generation: UInt64, task: Task<TimelineLoadSnapshot, any Error>)?
+    /// What the last persisted load was built from. A later load for the same server cursor whose local revisions
+    /// differ is rebuilt from the local store instead of a listing (`TimelineLocalRebuild`).
+    private var timelineLoadBasis: TimelineLoadBasis?
     private var timelineLoadGeneration: UInt64 = 0
     /// Three-pass quiet-window proof for a full Photos listing after event history becomes unusable. This state
     /// is intentionally memory-only; a relaunch restarts proof instead of trusting a partially observed window.
@@ -338,6 +341,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             let startEventToken = try eventCursor(from: startEventProbe)
             try checkTimelineLoad(generation: generation)
             DebugLog.log("timeline: photos root \(root.volumeID.prefix(8))…/\(root.nodeID.prefix(8))… - enumerating")
+            // Read before the evidence below, so a token built from them never claims newer evidence than the sections.
+            let revisionsAtStart = localRevisions()
             let mediaTypeRead =
                 timelineStore?.mediaTypeEvidenceForDisplay(volumeID: root.volumeID)
                 ?? (types: [:], canRefine: true)
@@ -350,6 +355,21 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     volumeID: root.volumeID
                 ) ?? []
             var enrichmentComplete = true
+            // Only the local evidence changed since the last load for this server cursor: rebuild without a listing.
+            let localSections = TimelineLocalRebuild.plan(
+                TimelineLocalRebuild.Conditions(
+                    basis: timelineLoadBasis,
+                    currentEventToken: startEventToken,
+                    currentRevisions: revisionsAtStart,
+                    hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
+                    hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty,
+                    hasPhotosAwaitingLibrary: recentlyDeleted.hasPhotosAwaitingLibrary,
+                    continuityRecoveryRequired: continuityRecoveryRequired),
+                storedValidationToken: { [timelineStore] in timelineStore?.validationToken() },
+                storedItems: { [timelineStore] in
+                    try timelineStore?.cachedTimelineSnapshot()?.sections.flatMap(\.items)
+                },
+                mediaTypeEvidence: { mediaTypeEvidence })
             let source =
                 continuityRecoveryRequired
                 ? TimelineInventorySource.authoritativePhotosList
@@ -357,7 +377,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     cachedEventToken: cachedValidationToken,
                     currentEventToken: currentValidationToken,
                     hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
-                    hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty
+                    hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty,
+                    canRebuildLocally: localSections != nil
                 )
             var sections: [TimelineSection]
             var reconciliationItems: [PhotoItem]
@@ -460,6 +481,19 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 )
                 reconciliationItems = sections.flatMap(\.items)
                 DebugLog.log("timeline: authoritative photos listing returned \(reconciliationItems.count) items ✓")
+
+            case .localStore:
+                supportSource = .cache
+                guard let localSections else { throw TimelineLocalRebuildUnavailableError() }
+                sections = localSections
+                reconciliationItems = localSections.flatMap(\.items)
+                librarySupport.listedPhotoCount = reconciliationItems.count
+                // No listing ran: the burst catalog of the last load stays valid for the same server cursor.
+                burstMemberIDs = [:]
+                burstEntries = nil
+                authoritativeInventoryFingerprint = nil
+                DebugLog.log(
+                    "timeline: rebuilt \(reconciliationItems.count) items from the local store; no listing ✓")
 
             case .sdkCache:
                 supportSource = .sdkCache
@@ -575,6 +609,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 }
                 endEventToken = qualification.endCursor
                 continuityRecoveryQualified = qualification.recoveryQualified
+            } else if source == .localStore {
+                // Nothing was listed, so no event can fall between a listing and a second probe.
+                endEventToken = startEventToken
+                continuityRecovery.reset()
             } else {
                 let endEventProbe = try await volumeEventProbe(
                     volumeID: root.volumeID,
@@ -599,6 +637,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             if continuityRecoveryQualified, commit.persistedValidationToken == nil {
                 throw TimelineContinuityRecoveryPendingError()
             }
+            var loadPersisted = false
             if let persistedToken = commit.persistedValidationToken {
                 try checkTimelineLoad(generation: generation)
                 let cacheSaved = try continuityRecovery.persist(
@@ -611,6 +650,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         )
                     )
                 }
+                loadPersisted = cacheSaved
                 if source == .authoritativePhotosList, cacheSaved,
                     timelineStore?.pruneUnmaterializedMediaTypeEvidence(volumeID: root.volumeID) == false
                 {
@@ -634,7 +674,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             }
             // Read before the awaits below: the media-type reconciliation may publish a newer revision meanwhile,
             // and the token must describe the evidence these sections were grouped with.
-            let validationToken = monitorToken(remoteToken: commit.monitorBaseline)
+            let tokenRevisions = source == .localStore ? revisionsAtStart : localRevisions()
+            let validationToken = monitorToken(remoteToken: commit.monitorBaseline, revisions: tokenRevisions)
+            timelineLoadBasis =
+                loadPersisted ? TimelineLoadBasis(eventToken: commit.monitorBaseline, revisions: tokenRevisions) : nil
             if timelineLostPhotos {
                 // Photos left the library, maybe into the trash on another device. List the trash before the caller
                 // publishes the smaller library, so the cache sweep keeps the thumbnails of photos now in the trash.
@@ -832,8 +875,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         return cursor
     }
 
-    private func monitorToken(remoteToken: String) -> String {
-        "\(remoteToken)#media=\(timelineStore?.mediaTypeEvidenceRevision() ?? 0)#order=\(timelineOrderStore?.revision ?? 0)"
+    private func localRevisions() -> TimelineLocalRevisions {
+        TimelineLocalRevisions(
+            mediaType: timelineStore?.mediaTypeEvidenceRevision() ?? 0, order: timelineOrderStore?.revision ?? 0)
+    }
+
+    private func monitorToken(remoteToken: String, revisions: TimelineLocalRevisions? = nil) -> String {
+        let revisions = revisions ?? localRevisions()
+        return "\(remoteToken)#media=\(revisions.mediaType)#order=\(revisions.order)"
     }
 
     /// Returns the files that the events after the cached inventory token made active or removed. The Photos
@@ -2658,6 +2707,11 @@ enum DriveBridgeError: LocalizedError {
 
 /// The SDK reported that this event scope is no longer accessible. Retrying the same scope cannot
 /// recover, so the shared monitor stops until account lifecycle creates a new backend instance.
+/// The local rebuild source was chosen without sections. The plan and the source choice make this unreachable.
+private struct TimelineLocalRebuildUnavailableError: LocalizedError {
+    var errorDescription: String? { "The local timeline rebuild had no sections." }
+}
+
 private struct DriveEventScopeAccessLostError: LocalizedError, LibraryChangeTerminalError {
     var errorDescription: String? {
         String(localized: "error.no_photos_library")
