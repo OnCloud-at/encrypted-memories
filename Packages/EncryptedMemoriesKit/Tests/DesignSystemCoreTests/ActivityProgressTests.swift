@@ -11,6 +11,12 @@ import Testing
         #expect(ActivityProgressBar.clamped(.infinity) == 0)
     }
 
+    @Test func everyBarHasAVoiceOverNameFromItsTitleOrItsCaller() {
+        #expect(ActivityProgressRow.barName("Checking", "Ignored") == "Checking")
+        #expect(ActivityProgressRow.barName(nil, "Checking duplicates") == "Checking duplicates")
+        #expect(ActivityProgressRow.barName(nil, nil) == nil)
+    }
+
     @Test func stateLineUsesSeventyPercentOfTheReadableWidth() {
         // A wide window offers more than the readable width; the line stays at 70 % of it.
         #expect(ActivityProgressStateLayout.availableWidth(for: 1_200) == 320)

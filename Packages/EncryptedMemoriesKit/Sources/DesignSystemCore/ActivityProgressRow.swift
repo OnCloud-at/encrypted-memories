@@ -9,11 +9,15 @@ public struct ActivityProgressRow: View {
     private let fraction: Double?
     private let showsIndeterminateProgress: Bool
     private let alignment: HorizontalAlignment
+    private let accessibilityName: String?
 
+    /// `accessibilityName` names the bar for VoiceOver when the row shows no title, for example because the
+    /// surrounding view shows it; the visible count line then stays a separate text.
     public init(
         title: String?, detail: String? = nil, fraction: Double? = nil, showsIndeterminateProgress: Bool = false,
-        alignment: HorizontalAlignment = .leading
+        alignment: HorizontalAlignment = .leading, accessibilityName: String? = nil
     ) {
+        self.accessibilityName = accessibilityName
         self.title = title
         self.detail = detail
         self.fraction = fraction.map(ActivityProgressBar.clamped)
@@ -44,11 +48,14 @@ public struct ActivityProgressRow: View {
                     .monospacedDigit()
             }
             if let fraction {
-                // VoiceOver names the bar after the title. Without a title the visible count line says what the
-                // bar counts, so the bar keeps the system's reading of its percentage and nothing is read twice.
-                ActivityProgressBar(fraction: fraction, accessibilityLabel: title)
+                ActivityProgressBar(fraction: fraction, accessibilityLabel: Self.barName(title, accessibilityName))
             }
         }
+    }
+
+    /// VoiceOver names the bar after the row's title, else after the name the caller gives for an untitled row.
+    nonisolated static func barName(_ title: String?, _ accessibilityName: String?) -> String? {
+        title ?? accessibilityName
     }
 }
 

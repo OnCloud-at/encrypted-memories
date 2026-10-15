@@ -49,7 +49,9 @@ public struct UploadQueuePanel: View {
                     .disabled(!UploadQueuePresentation.canClearFinished(s))
             }
             if s.total > 0 {
-                ActivityProgressRow(title: nil, detail: s.summaryText, fraction: s.totalProgress)
+                ActivityProgressRow(
+                    title: nil, detail: s.summaryText, fraction: s.totalProgress,
+                    accessibilityName: L10n.string("upload.queue_title"))
             }
             if let error = coordinator.latestFolderEnumerationError {
                 HStack(alignment: .top, spacing: 8) {
@@ -122,7 +124,9 @@ public struct UploadQueuePanel: View {
 
     @ViewBuilder private func statusLine(_ item: UploadItem) -> some View {
         if case .uploading(let p) = item.state {
-            ActivityProgressRow(title: nil, detail: L10n.string("upload.state_uploading \(Int(p * 100))"), fraction: p)
+            ActivityProgressRow(
+                title: nil, detail: L10n.string("upload.state_uploading \(Int(p * 100))"), fraction: p,
+                accessibilityName: item.displayName)
         } else {
             Text(item.state.label)
                 .font(.caption)

@@ -143,7 +143,7 @@ private struct ExactDuplicatesProgressRow: View {
     var body: some View {
         let row = ActivityProgressRow(
             title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
-            showsIndeterminateProgress: true, alignment: alignment
+            showsIndeterminateProgress: true, alignment: alignment, accessibilityName: line.title
         )
         .accessibilityIdentifier(identifier ?? "")
         if let stop {
