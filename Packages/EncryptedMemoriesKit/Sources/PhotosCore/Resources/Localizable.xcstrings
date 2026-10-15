@@ -1192,6 +1192,30 @@
         "de": { "stringUnit": { "state": "translated", "value": "Überträgt Daten · %lld %%" } }
       }
     },
+    "backup.detail_left %lld": {
+      "extractionState": "manual",
+      "comment": "Backup status line while a pass runs: how many photos and videos are still to back up (waiting, being checked or being uploaded).",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%lld left" } },
+        "de": { "stringUnit": { "state": "translated", "value": "noch %lld" } }
+      }
+    },
+    "backup.detail_left_speed %lld %@": {
+      "extractionState": "manual",
+      "comment": "Backup status line: items still to back up and the current upload speed. The second value is a file size such as 3.2 MB; the text adds the per-second unit.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%lld left · %@/s" } },
+        "de": { "stringUnit": { "state": "translated", "value": "noch %lld · %@/s" } }
+      }
+    },
+    "backup.detail_left_speed_spoken %lld %@": {
+      "extractionState": "manual",
+      "comment": "VoiceOver reading of the status line with items left and upload speed. The second value is a file size such as 3.2 MB.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%lld left, %@ per second" } },
+        "de": { "stringUnit": { "state": "translated", "value": "noch %lld, %@ pro Sekunde" } }
+      }
+    },
     "backup.fail_reason_generic": {
       "extractionState": "manual",
       "comment": "Fallback reason for a failed backup item when no specific error message was stored.",

@@ -601,6 +601,7 @@ private struct PhotoLibraryBackupSection: View {
                             .contentTransition(.opacity)
                         subtitleSlot(display)
                         transferSlot(display)
+                        leftSlot(display)
                         if let reason = display.localizedWaitingForWiFiDetail {
                             Text(reason)
                                 .font(.caption)
@@ -738,6 +739,20 @@ private struct PhotoLibraryBackupSection: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(ProtonColor.primary)
                 .contentTransition(.numericText())
+        }
+    }
+
+    /// Items left and upload speed. The progress layout reserves the slot, so a changing speed cannot move the bar.
+    @ViewBuilder private func leftSlot(_ display: BackupStatusPresentation) -> some View {
+        if display.detailLayout == .progress {
+            let left = display.localizedLeftLine
+            Text(verbatim: left ?? "\u{00a0}")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(ProtonColor.textWeak)
+                .contentTransition(.numericText())
+                .accessibilityLabel(display.localizedLeftAccessibilityLabel ?? "")
+                .accessibilityAddTraits(.updatesFrequently)
+                .accessibilityHidden(left == nil)
         }
     }
 

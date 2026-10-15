@@ -3804,6 +3804,28 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: entry), .completed)
     }
 
+    func testSentByteCounterNeverDropsWhenAnItemEnds() async throws {
+        for name in ["first.mov", "second.mov", "third.mov"] { _ = seedEntry(name) }
+        let recorder = BackupProgressRecorder()
+        let runner = makeRunner(uploader: MockUploader(deliverProgress: true))
+        await runner.setOnProgress { recorder.append($0) }
+
+        _ = await runner.runUntilDrained()
+        let snapshots = recorder.snapshots
+        let counters = snapshots.map(\.transferredByteCount)
+
+        XCTAssertEqual(counters, counters.sorted(), "the counter only grows, also when an item leaves the active set")
+        let sums = snapshots.map { $0.activeTransfer?.completedBytes ?? 0 }
+        XCTAssertTrue(
+            zip(sums, sums.dropFirst()).contains { $0 > $1 },
+            "the fixture must contain a moment where the active sum drops: an item ended")
+        let finalCount = try XCTUnwrap(counters.last)
+        XCTAssertGreaterThan(finalCount, 0)
+        XCTAssertGreaterThanOrEqual(
+            finalCount, sums.max() ?? 0,
+            "everything that moved while items were active is still counted after they ended")
+    }
+
     func testPreparationAndUploadProgressHandoffIsMonotonicAndNeverDoubleCountsTerminalItem() async throws {
         let entry = seedEntry("prepared.mov")
         resolver.setDeferredMaterialization(for: entry.source.identifier)
