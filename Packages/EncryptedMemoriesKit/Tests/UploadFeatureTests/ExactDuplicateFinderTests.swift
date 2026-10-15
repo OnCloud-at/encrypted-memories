@@ -1884,17 +1884,50 @@ final class ExactDuplicateFinderTests: XCTestCase {
         try await waitUntil { finder.mergeTurns.waiting == 1 }
 
         emptying.cancel()
+        // The cancelled emptying leaves the queue at once; the merge is released only afterwards, so a waiter that
+        // stayed would fail the checks below instead of hanging the test.
+        try await waitUntil { finder.mergeTurns.waiting == 0 }
+        remote.gate.open()
         do {
             try await emptying.value
             XCTFail("a cancelled emptying throws")
         } catch {
             XCTAssertTrue(error is CancellationError)
         }
-        remote.gate.open()
         _ = try await merging.value
 
         XCTAssertEqual(trash.emptied, 0)
         XCTAssertEqual(finder.mergeTurns.waiting, 0)
+    }
+
+    /// A merge that is cancelled while Recently Deleted is emptied trashes nothing.
+    func testAMergeCancelledWhileRecentlyDeletedIsEmptiedTrashesNothing() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        let finder = finder
+        let trash = GatedServerTrash(server: server)
+        let emptying = Task { [directory] in
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        }
+        try await waitUntil { trash.arrivals == 1 }
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        try await waitUntil { finder.mergeTurns.waiting == 1 }
+
+        merging.cancel()
+        try await waitUntil { finder.mergeTurns.waiting == 0 }
+        trash.gate.open()
+        try await emptying.value
+        do {
+            _ = try await merging.value
+            XCTFail("a cancelled merge throws")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertEqual(state(of: duplicate), .active, "the cancelled merge trashes nothing")
+        XCTAssertEqual(state(of: kept), .active)
     }
 
     func testADamagedMergeJournalBlocksOneEmptyAndMovesAside() async throws {

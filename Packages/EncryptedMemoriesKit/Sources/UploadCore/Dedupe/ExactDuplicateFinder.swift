@@ -1220,7 +1220,7 @@ final class ExactDuplicateTurns: @unchecked Sendable {
     /// The callers that wait for their turn.
     var waiting: Int { lock.withLock { waiters.count } }
 
-    /// Runs `check` once no earlier check runs. A task that is cancelled while it waits leaves the queue and runs no
+    /// Runs `check` once no earlier caller runs. A task that is cancelled while it waits leaves the queue and runs no
     /// check. A cancellation that arrives as the turn passes to it can still start the check, which then stops before
     /// its first merge.
     func run(_ check: () async -> Void) async {
@@ -1260,7 +1260,7 @@ final class ExactDuplicateTurns: @unchecked Sendable {
         }
     }
 
-    /// Hands the turn to the next waiting check.
+    /// Hands the turn to the next waiting caller.
     private func leave() {
         let next = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
             guard !waiters.isEmpty else {
