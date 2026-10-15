@@ -17,8 +17,21 @@ report_path() {
   printf '%8.1f GiB  %s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "$path"
 }
 
+# The size of each folder directly inside a folder, for the report only: it is not added to the total.
+report_children() {
+  local path="$1"
+  local child size_kib
+  [[ -d "$path" ]] || return 0
+  while IFS= read -r child; do
+    size_kib="$(du -sk "$child" 2>/dev/null | awk '{print $1}')"
+    [[ -n "$size_kib" ]] || continue
+    printf '%8.2f GiB    %s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "${child#"$path"/}"
+  done < <(find "$path" -mindepth 1 -maxdepth 1 -print | sort)
+}
+
 echo "Canonical Encrypted Memories build storage:"
 report_path "$ENCRYPTED_MEMORIES_BUILD_ROOT"
+report_children "$ENCRYPTED_MEMORIES_BUILD_ROOT"
 report_path "$ROOT/Packages/EncryptedMemoriesKit/.build"
 report_path "$ROOT/Vendor/sdk-swift/.build"
 
