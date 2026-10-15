@@ -1300,7 +1300,10 @@ struct MainView: View {
         }
         Task { await loadAlbums() }
         model.refreshLibrarySources()
-        OfflineLibraryManager.shared.restartLocationCrawl(items: timelineModel.allItems, metadata: backend)
+        // The whole library, like the automatic start: the route open under the map may be an album, a tag or
+        // Recently Deleted.
+        OfflineLibraryManager.shared.restartLocationCrawl(
+            items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
     }
 
     private var gridFillOrder: GridFillOrder {
