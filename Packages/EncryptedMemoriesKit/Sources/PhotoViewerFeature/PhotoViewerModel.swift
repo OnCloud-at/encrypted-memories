@@ -114,6 +114,10 @@ public final class PhotoViewerModel {
     private var requestedSharpPixelSize = 0
     private var originalLoadGeneration: UInt64 = 0
     private var burstSelection = BurstSelectionModel()
+    private let editedOriginalProvider: (any EditedPhotoOriginalProviding)?
+    private let editedOriginalLookup = EditedPhotoOriginalLookup()
+    /// The originals of edited photos that this viewer found, and whether the page shows one.
+    public private(set) var editedOriginal = EditedPhotoOriginalState()
 
     public var burstItems: [PhotoItem] { burstSelection.items }
     public var burstIndex: Int? { burstSelection.selectedIndex }
@@ -128,7 +132,8 @@ public final class PhotoViewerModel {
         burstProvider: BurstGroupProvider? = nil,
         previewCache: ThumbnailCache? = nil, originalsCache: ThumbnailCache? = nil,
         cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
-        allowsVisibleDuplicateThumbnails: Bool = false
+        allowsVisibleDuplicateThumbnails: Bool = false,
+        editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil
     ) {
         self.items = items
         self.index = index
@@ -147,6 +152,7 @@ public final class PhotoViewerModel {
         )
         self.knownLocationUIDs = knownLocationUIDs
         self.burstProvider = burstProvider
+        self.editedOriginalProvider = editedOriginalProvider
         self.previewCache = previewCache
         self.originalsCache = originalsCache
         self.cacheOriginals = cacheOriginals
@@ -261,7 +267,17 @@ public final class PhotoViewerModel {
 
     public var baseCurrent: PhotoItem { items[index] }
     public var current: PhotoItem {
-        burstSelection.current(fallback: baseCurrent)
+        burstSelection.current(fallback: editedOriginal.displayed(baseCurrent))
+    }
+    /// The page is an edited photo whose original this viewer found.
+    public var canShowOriginal: Bool { editedOriginal.canShowOriginal(of: baseCurrent.uid) }
+    public var isShowingOriginal: Bool { editedOriginal.isShowingOriginal(of: baseCurrent.uid) }
+
+    /// Switches the page between the edited version and its original.
+    public func toggleOriginal() {
+        guard canShowOriginal else { return }
+        editedOriginal.toggle(baseCurrent.uid)
+        loadDisplayedItem(current)
     }
     public var canGoNext: Bool { index < items.count - 1 }
     public var canGoPrevious: Bool { index > 0 }
@@ -297,6 +313,7 @@ public final class PhotoViewerModel {
         metadataTask?.cancel()
         albumMembershipTask?.cancel()
         placeTask?.cancel()
+        editedOriginalLookup.cancel()
         titleMetadataCoordinator.cancelAll()
         isLoadingOriginal = false
         video.teardown()
@@ -507,11 +524,16 @@ public final class PhotoViewerModel {
         burstTask?.cancel()
         burstSelection.reset()
         let item = baseCurrent
+        editedOriginal.pageChanged(to: item.uid)
+        editedOriginalLookup.settled(on: item, provider: editedOriginalProvider) { [weak self] base, original in
+            self?.editedOriginal.record(original, of: base.uid)
+        }
         burstSelection.seedKnownGroup(
             for: item,
             knownItems: pageIndex.items(withUIDs: item.burstMemberUIDs, from: items)
         )
-        loadDisplayedItem(item)
+        // A reload of the same page keeps its original on screen.
+        loadDisplayedItem(editedOriginal.displayed(item))
         loadBurstGroupIfNeeded(for: item)
     }
 

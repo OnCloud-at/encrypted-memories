@@ -43,6 +43,8 @@ struct MobilePhotoViewer: View {
     @State private var index: Int
     @State private var chromeVisible = true
     @State private var burstSelection = BurstSelectionModel()
+    @State private var editedOriginal = EditedPhotoOriginalState()
+    @State private var editedOriginalLookup = EditedPhotoOriginalLookup()
     @State private var selection = MobileGridSelectionController()
     @State private var isRestoring = false
     @State private var showRestoreError = false
@@ -154,7 +156,8 @@ struct MobilePhotoViewer: View {
                 MobileViewerPager(
                     count: items.count, revision: itemsRevision, id: { items[$0].uid }, index: $index
                 ) { i, isCurrent in
-                    let item = items[i]
+                    // The page of an edited photo shows its original while the person asks for it.
+                    let item = editedOriginal.displayed(items[i])
                     MobileViewerPage(
                         item: item,
                         isCurrent: isCurrent,
@@ -188,7 +191,13 @@ struct MobilePhotoViewer: View {
             // The Live Photo status sits on the media inside the safe area, below the navigation bar.
             .overlay(alignment: .topLeading) {
                 if currentBaseItem?.isLivePhoto == true {
-                    viewerLiveIndicator
+                    viewerBadge(.live)
+                }
+            }
+            // The original of an edited photo is marked in the same place; such a photo is never a Live Photo.
+            .overlay(alignment: .topLeading) {
+                if let base = currentBaseItem, editedOriginal.isShowingOriginal(of: base.uid) {
+                    viewerBadge(.original)
                 }
             }
             // A series shows its photo count in the same place; a burst is never a Live Photo.
@@ -293,13 +302,17 @@ struct MobilePhotoViewer: View {
             cancelViewerMutationPresentation()
             liveTextHighlighted = false
             visibleThumbnail?.select(uid)
+            editedOriginal.pageChanged(to: uid)
+            lookUpEditedOriginal()
         }
         // A full-screen cover over the viewer, such as the series selection, ends the access of the shown copy.
         .onAppear { visibleThumbnail?.reopen(currentBaseItem?.uid) }
+        .onAppear { lookUpEditedOriginal() }
         .onDisappear {
             cancelViewerMutationPresentation()
             titleMetadataCoordinator.cancelAll()
             visibleThumbnail?.end()
+            editedOriginalLookup.cancel()
         }
         .animation(
             MobileViewerMotionPolicy.animation(.smooth(duration: 0.24), reduceMotion: reduceMotion),
@@ -468,9 +481,9 @@ struct MobilePhotoViewer: View {
         )
     }
 
-    /// The Live Photo status leaves with the chrome and never steals paging, press or dismiss gestures.
-    private var viewerLiveIndicator: some View {
-        MobileLiveBadge()
+    /// A media status badge leaves with the chrome and never steals paging, press or dismiss gestures.
+    private func viewerBadge(_ badge: MobileViewerBadge) -> some View {
+        badge
             .padding(16)
             .opacity(chromeVisible ? 1 : 0)
             .allowsHitTesting(false)
@@ -611,6 +624,18 @@ struct MobilePhotoViewer: View {
         }
         .disabled(currentBaseItem == nil || selection.isBusy)
 
+        if let base = currentBaseItem, editedOriginal.canShowOriginal(of: base.uid) {
+            let showing = editedOriginal.isShowingOriginal(of: base.uid)
+            Button {
+                editedOriginal.toggle(base.uid)
+            } label: {
+                Label(
+                    showing ? L10n.string("viewer.show_edited") : L10n.string("viewer.show_original"),
+                    systemImage: showing ? "wand.and.rays" : "wand.and.rays.inverse"
+                )
+            }
+        }
+
         if currentBaseItem?.uid != nil, liveTextUID == currentBaseItem?.uid {
             Button {
                 liveTextHighlighted.toggle()
@@ -721,8 +746,10 @@ struct MobilePhotoViewer: View {
         }
     }
 
+    /// Shares what the page shows: the original of an edited photo while it is shown.
     private func shareCurrentItem() {
-        guard let item = currentBaseItem, libraryModel.backend != nil else { return }
+        guard let base = currentBaseItem, libraryModel.backend != nil else { return }
+        let item = editedOriginal.displayed(base)
         let items = burstBelongsToCurrentPage ? burstSelection.exportItems(current: item) : [item]
         selection.startShare(
             items: items, backend: libraryModel.viewerMedia,
@@ -910,6 +937,15 @@ struct MobilePhotoViewer: View {
                     dismiss()
                 }
             )
+        }
+    }
+
+    /// Asks for the original of the settled page, once it stayed for the dwell; see `EditedPhotoOriginalLookup`.
+    private func lookUpEditedOriginal() {
+        editedOriginalLookup.settled(
+            on: currentBaseItem, provider: libraryModel.backend as? any EditedPhotoOriginalProviding
+        ) { base, original in
+            editedOriginal.record(original, of: base.uid)
         }
     }
 
@@ -2781,12 +2817,28 @@ private struct MobileMotionPlayerLayer: UIViewRepresentable {
     }
 }
 
-/// The small "LIVE" affordance shown on a Live Photo page - signals the press-and-hold-to-play interaction.
-private struct MobileLiveBadge: View {
+/// A small status badge on the media: "LIVE" signals the press-and-hold-to-play interaction of a Live Photo,
+/// "ORIGINAL" marks the shown original of an edited photo.
+private struct MobileViewerBadge: View {
+    let title: String
+    let systemImage: String
+    let accessibilityLabel: String
+
+    static var live: MobileViewerBadge {
+        MobileViewerBadge(
+            title: L10n.string("viewer.live_badge"), systemImage: "livephoto",
+            accessibilityLabel: L10n.string("viewer.live_photo_a11y"))
+    }
+    static var original: MobileViewerBadge {
+        MobileViewerBadge(
+            title: L10n.string("viewer.original_badge"), systemImage: "wand.and.rays.inverse",
+            accessibilityLabel: L10n.string("viewer.original_badge_a11y"))
+    }
+
     var body: some View {
         HStack(spacing: 4) {
-            Image(systemName: "livephoto")
-            Text(L10n.string("viewer.live_badge"))
+            Image(systemName: systemImage)
+            Text(title)
                 .font(.caption2.weight(.semibold))
         }
         .foregroundStyle(.white)
@@ -2794,6 +2846,6 @@ private struct MobileLiveBadge: View {
         .padding(.vertical, 4)
         .glassEffect(in: Capsule())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
+        .accessibilityLabel(accessibilityLabel)
     }
 }

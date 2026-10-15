@@ -11,6 +11,8 @@ enum ProtonRequestCause: String, CaseIterable, Sendable {
     case thumbnails
     case viewer
     case viewerMetadata = "viewer.metadata"
+    /// The lookup of the hidden original of an edited photo in the viewer.
+    case viewerOriginal = "viewer.original"
     case export
     case favorites
     case trashList = "trash.list"

@@ -1,5 +1,6 @@
 import Foundation
 import ImageIO
+import PhotoViewerCore
 import PhotosCore
 import Testing
 import UniformTypeIdentifiers
@@ -125,6 +126,33 @@ struct MobileShareExportTests {
         }
     }
 
+    /// The viewer shares the shown original of an edited photo through the same export as every photo, so the location
+    /// rule applies to the original too.
+    @Test(arguments: [nil, false] as [Bool?])
+    func shareOfAShownOriginalFollowsTheLocationPreference(storedValue: Bool?) async throws {
+        try await SharingLocationPreferenceLease.with(storedValue: storedValue) {
+            let edited = item("edited")
+            let original = item("original")
+            var state = EditedPhotoOriginalState()
+            state.record(original, of: edited.uid)
+            state.toggle(edited.uid)
+            let bytes = try LocatedShareTestImage.makeLocatedJPEG()
+
+            // Only the original has bytes, so a share of the edited version fails.
+            let result = await MobileMediaExporter.exportOriginals(
+                [state.displayed(edited)], backend: ImageShareTestBackend(bytes: bytes, onlyFor: original.uid))
+            defer { MobileMediaExporter.cleanup(result.urls) }
+            #expect(result.failed == 0)
+            let shared = try Data(contentsOf: try #require(result.urls.first))
+            if storedValue == false {
+                #expect(shared == bytes)
+            } else {
+                #expect(LocatedShareTestImage.locationProperties(of: shared) == nil)
+                #expect(LocatedShareTestImage.lensModel(of: shared) == LocatedShareTestImage.lensModel)
+            }
+        }
+    }
+
     @Test func diskFullDuringADownloadStopsTheShare() async throws {
         let backend = ShareExportTestBackend()
         let result = await MobileMediaExporter.exportOriginals(
@@ -205,10 +233,13 @@ private actor ShareExportTestBackend: OriginalFileProvider, PhotoMetadataProvide
 
 private struct ImageShareTestBackend: OriginalFileProvider, PhotoMetadataProvider {
     let bytes: Data
+    /// When set, only this photo has bytes; every other photo fails to download.
+    var onlyFor: PhotoUID?
 
     func writeOriginal(
         for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
+        if let onlyFor, uid != onlyFor { throw CocoaError(.fileReadNoSuchFile) }
         try bytes.write(to: destination)
         onProgress(1)
     }

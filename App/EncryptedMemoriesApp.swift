@@ -272,8 +272,8 @@ private struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
-/// Previous photo, Next photo and Close for the open viewer. The commands are disabled while no viewer has
-/// focus, and Close carries the Esc equivalent, which the responder chain alone does not guarantee.
+/// Previous photo, Next photo, Close and Show Original for the open viewer. The commands are disabled while no viewer
+/// has focus, and Close carries the Esc equivalent, which the responder chain alone does not guarantee.
 private struct PhotoViewerNavigationCommands: Commands {
     @FocusedValue(\.photoViewerNavigation) private var navigation
 
@@ -289,6 +289,12 @@ private struct PhotoViewerNavigationCommands: Commands {
             Button(L10n.string("viewer.close_photo")) { navigation?.close() }
                 .keyboardShortcut(.cancelAction)
                 .disabled(navigation == nil)
+            Divider()
+            let showsOriginal = navigation?.isShowingOriginal == true
+            Button(showsOriginal ? L10n.string("viewer.show_edited") : L10n.string("viewer.show_original")) {
+                navigation?.toggleOriginal()
+            }
+            .disabled(navigation?.canShowOriginal != true)
         }
     }
 }

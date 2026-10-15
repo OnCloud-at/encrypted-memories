@@ -206,6 +206,23 @@ struct ProtonRequestTallyTests {
         #expect(unattributed?.count == 2)
     }
 
+    /// The viewer's lookup of an edited photo's original counts under its own code-owned name.
+    @Test func theOriginalLookupOfTheViewerCountsUnderItsOwnCause() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let label = ProtonRequestLabel.api(method: "POST", path: "/drive/photos/volumes/\(Self.volumeID)/links")
+        try await governor.causes.run(.viewerOriginal) {
+            let permit = try await governor.acquire(scope: .api, label: label)
+            await governor.finish(permit, statusCode: 200)
+        }
+        let counts = await governor.requestSupportSnapshot().counts
+        #expect(
+            counts == [
+                .init(
+                    scope: "api", method: "POST", endpoint: "/drive/photos/volumes/{id}/links",
+                    cause: "viewer.original", status: "2xx", count: 1)
+            ])
+    }
+
     @Test func anEnclosingCauseWinsUnlessTheWorkReplacesIt() async throws {
         let scopes = ProtonRequestCauseScopes()
         let nested = await scopes.run(.duplicatesMerge) {

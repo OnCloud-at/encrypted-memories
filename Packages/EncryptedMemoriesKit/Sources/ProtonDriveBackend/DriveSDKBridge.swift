@@ -16,7 +16,7 @@ private typealias LibraryPhotoTag = PhotosCore.PhotoTag
 actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailProvider, ThumbnailBatchLoader,
     PriorityThumbnailBatchLoader, FullMediaProvider, OriginalByteStreamProvider, OriginalFileProvider,
     VideoStreamProvider, PhotoMetadataProvider, BurstGroupProvider, PhotoLibraryProvider, FavoritesProvider,
-    PhotoLibrarySaving, TrashProvider, LibraryStatsProvider
+    PhotoLibrarySaving, TrashProvider, LibraryStatsProvider, EditedPhotoOriginalProviding
 {
     private let photosClient: EncryptedMemoriesClient
     private let uploadClientUID: String
@@ -44,6 +44,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private var burstCatalogLookup: [String: [String]] = [:]
     /// The related files of a series that the viewer checked for a frame type, so a reopen reads no metadata again.
     private var burstFrameVerdicts = BurstFrameVerdicts()
+    /// The related files of every photo of the last authoritative listing, by main link ID. Nil until such a listing;
+    /// the SDK cache path keeps related files only for series.
+    private var relatedLinkIDsByMain: [String: [String]]?
+    /// The answer of `editedOriginal(of:)` for each photo in this session, "no original" included. The bridge lives for
+    /// one signed-in session, so a sign-out or another account starts empty.
+    private var editedOriginals: [String: PhotoItem?] = [:]
     /// The types of related files that chose the motion of a Live Photo, so a refresh reads no metadata again.
     private var livePhotoMotionLinks = LivePhotoMotionLinks()
     /// Account-scoped single flight for authoritative enumeration. Actor reentrancy alone does not serialize
@@ -438,6 +444,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     unlistedUploads.isEmpty ? [] : try await filesTheListingMustShow(unlistedUploads)
                 burstMemberIDs = Self.burstMemberLookup(from: entries)
                 burstEntries = entries
+                relatedLinkIDsByMain = Dictionary(
+                    entries.map { ($0.linkID, $0.relatedLinkIDs) }, uniquingKeysWith: { first, _ in first })
+                // A new authoritative listing follows remote changes, so an earlier answer can be stale.
+                editedOriginals = [:]
                 let motions = try await livePhotoMotions(
                     of: Self.livePhotos(in: entries), volumeID: root.volumeID, evidence: mediaTypeEvidence,
                     allowMetadataRequests: mediaTypeRead.canRefine)
@@ -1028,6 +1038,50 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             },
             uniquingKeysWith: { first, _ in first }
         )
+    }
+
+    /// The original of an edited photo of the own library, or nil. Each answer is kept for the session. A photo of
+    /// the last authoritative listing without related files costs no request; otherwise one read of the photo's
+    /// related files when no such listing ran, and one batched name read when it has related files.
+    private func editedOriginalImpl(of item: PhotoItem) async throws -> PhotoItem? {
+        if let known = editedOriginals[item.uid.nodeID] { return known }
+        let root = try await resolvePhotosRoot()
+        guard item.uid.volumeID == root.volumeID else { return nil }
+        let related: [String]
+        if let listed = relatedLinkIDsByMain {
+            related = listed[item.uid.nodeID] ?? []
+        } else {
+            let metadata = try await driveSession.fetchAlbumPhotoMetadata(
+                volumeID: root.volumeID, linkIDs: [item.uid.nodeID])
+            // Without the complete list the answer stays open, and the next viewer may ask again.
+            guard let main = metadata.first(where: { $0.link.linkID == item.uid.nodeID }),
+                main.photo?.hasCompleteRelatedPhotoLinkIDs == true
+            else { return nil }
+            related = main.relatedPhotoLinkIDs
+        }
+        guard !related.isEmpty else {
+            editedOriginals[item.uid.nodeID] = .some(nil)
+            return nil
+        }
+        guard let shareID = photosShareID, let keySource = try? await fileSource() else { return nil }
+        var links: [AlbumPhotoLinkBody] = []
+        for batch in Self.metadataBatches([item.uid.nodeID] + related) {
+            links += try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
+        }
+        // Photos are children of the photos root, whose key decrypts their names.
+        let rootKey = try await keySource.nodeKey(ofLinkID: root.nodeID)
+        let files = Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
+        guard let mainName = files[item.uid.nodeID]?.name else { return nil }
+        let linkID = EditedPhotoOriginal.linkID(
+            mainName: mainName, isVideo: item.isVideo,
+            related: related.map { EditedPhotoOriginal.RelatedFile(linkID: $0, name: files[$0]?.name) })
+        let original = linkID.map {
+            PhotoItem(
+                uid: PhotoUID(volumeID: root.volumeID, nodeID: $0), captureTime: item.captureTime,
+                mediaType: files[$0]?.mimeType ?? item.mediaType, durationSeconds: item.durationSeconds)
+        }
+        editedOriginals[item.uid.nodeID] = .some(original)
+        return original
     }
 
     /// A listing without the given photos: its sections, and the burst entries that the burst catalog reads. A kept
@@ -1806,6 +1860,18 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     // MARK: - PhotoMetadataProvider
+
+    // MARK: - EditedPhotoOriginalProviding
+
+    func editedOriginal(of item: PhotoItem) async throws -> PhotoItem? {
+        guard item.mayHaveEditedOriginal else { return nil }
+        // An extra the person did not ask for: the lowest request class.
+        return try await ProtonRequestContext.$priority.withValue(.maintenance) {
+            try await withOpenSession(cause: .viewerOriginal) { bridge in
+                try await bridge.editedOriginalImpl(of: item)
+            }
+        }
+    }
 
     func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
         try await withOpenSession(cause: .viewerMetadata) { bridge in
