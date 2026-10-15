@@ -45,10 +45,7 @@ import Testing
     }
 
     private func settle(_ presenter: PendingTimelinePresenter) async -> PendingTimelinePresentation {
-        for _ in 0..<200 {
-            await Task.yield()
-            try? await Task.sleep(for: .milliseconds(2))
-        }
+        await presenter.waitUntilIdle()
         return presenter.current
     }
 
@@ -589,8 +586,8 @@ import Testing
         let gate = EditMembershipGate()
         let harness = try EditPendingHarness(
             date: base, membershipInterval: .seconds(60),
-            sleep: { _ in
-                await gate.wait()
+            sleep: { duration in
+                await gate.wait(duration)
             })
         defer { harness.closeStores() }
         let presenter = PendingTimelinePresenter(
@@ -614,6 +611,8 @@ import Testing
         harness.enqueue(revision: 2, state: .completed)
         presenter.setRemote(TimelineSnapshot(orderedItems: [earlier, uploaded]))
         #expect(await settle(presenter).items.map(\.uid) == [earlier.uid])
+        // The coordinator handled the new rows and holds their membership publish for the rest of the 60 s interval.
+        await gate.waitForSleep(in: .seconds(1) ... .seconds(60))
         #expect(await harness.coordinator.currentSnapshot().membershipRevision == initial.membershipRevision)
         await gate.release()
         let settled = await harness.wait { $0.tiles.first?.isSettled == true }
@@ -1516,10 +1515,20 @@ private final class TestClock: @unchecked Sendable {
 private actor EditMembershipGate {
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var released = false
+    private var requested: [Duration] = []
 
-    func wait() async {
+    func wait(_ duration: Duration = .zero) async {
+        requested.append(duration)
         guard !released else { return }
         await withCheckedContinuation { waiters.append($0) }
+    }
+
+    /// Returns once a sleep with a duration in `range` was requested, or after 5 seconds without one.
+    func waitForSleep(in range: ClosedRange<Duration>) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !requested.contains(where: range.contains), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
     }
 
     func release() {

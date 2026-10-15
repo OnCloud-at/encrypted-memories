@@ -203,6 +203,8 @@ public final class PendingTimelinePresenter {
     private var restored: [PhotoUID: Set<Replacement>] = [:]
     private var waitingForTile: [Replacement: Date] = [:]
     private var tileWaitTask: Task<Void, Never>?
+    /// The tile wait was already over when it started, so its rebuild follows without a timer.
+    private var tileWaitIsDue = false
     package nonisolated static let tileWaitLimit: TimeInterval = 5
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (Duration) async throws -> Void
@@ -238,6 +240,24 @@ public final class PendingTimelinePresenter {
     }
 
     public var current: PendingTimelinePresentation { presentation }
+
+    /// Tests: returns when no merge runs and no tile wait that is already over still has to rebuild. A tile
+    /// wait that is not over yet does not count. Gives up after `rounds` merges, so a rebuild that never stops
+    /// shows up in the caller's checks instead of hanging the test.
+    package func waitUntilIdle(rounds: Int = 64) async {
+        for _ in 0..<rounds {
+            if let task = computeTask {
+                await task.value
+                // A merge that ended without applying leaves its task; nothing else will clear it.
+                guard computeTask != task else { return }
+            } else if tileWaitIsDue, let task = tileWaitTask {
+                await task.value
+                guard computeTask != nil || tileWaitTask != task else { return }
+            } else {
+                return
+            }
+        }
+    }
 
     /// The canonical Proton timeline of the whole-library route.
     public func setRemote(_ snapshot: TimelineSnapshot) {
@@ -287,6 +307,7 @@ public final class PendingTimelinePresenter {
         waitingForTile.removeAll()
         tileWaitTask?.cancel()
         tileWaitTask = nil
+        tileWaitIsDue = false
         restored.removeAll()
         tileRevisions.removeAll()
         contentEpochs.removeAll()
@@ -364,8 +385,10 @@ public final class PendingTimelinePresenter {
         waitingForTile = result.waitingForTile
         tileWaitTask?.cancel()
         tileWaitTask = nil
+        tileWaitIsDue = false
         if let deadline = result.heldTileDeadlines.min() {
             let remaining = max(0, deadline.timeIntervalSince(now()))
+            tileWaitIsDue = remaining == 0
             tileWaitTask = Task { [weak self, sleep] in
                 try? await sleep(.seconds(remaining))
                 guard !Task.isCancelled else { return }
