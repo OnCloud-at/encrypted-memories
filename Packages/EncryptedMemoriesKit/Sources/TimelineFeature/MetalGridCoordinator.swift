@@ -1063,8 +1063,19 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private(set) var presentationSidebarTargetSlots: [GridRenderSlot] = []
     private var presentationSidebarSlotPairs: [(source: GridRenderSlot, target: GridRenderSlot)] = []
     private var presentationSidebarTargetScroll: CGFloat = 0
-    /// Normalized sidebar-resize progress advanced by the display link.
-    var presentationSidebarProgress: CGFloat = 0
+    /// The raw sidebar width the transition starts from (`toEventInset` is its end).
+    private var presentationSidebarFromEventInset: CGFloat = 0
+    /// Shaped fraction (0...1) between the captured source and the canonical target that the presentation draws.
+    /// With a measured sidebar edge it is the real fraction of the sidebar's travel, so the grid never leads or
+    /// trails the sidebar; without one it follows the clock with `easeInOutCubic`. It never decreases.
+    private(set) var presentationSidebarFraction: CGFloat = 0
+
+    /// Duration of the clock-driven transition, used while no sidebar edge is measured.
+    nonisolated static let sidebarClockDuration: CFTimeInterval = 0.22
+    /// A transition that follows a measured edge ends at the latest after this time, even if the edge never arrives.
+    nonisolated static let sidebarFollowDeadline: CFTimeInterval = 0.6
+    /// The measured edge counts as arrived within this distance of the destination width (points).
+    nonisolated static let sidebarArrivalTolerance: CGFloat = 0.5
 
     /// The layout inset (points) for a given sidebar obstruction width = the width plus, for a normal level with a
     /// sidebar, the breathing gap, plus the standard outer left margin - so the scale fills to exactly where the
@@ -1158,9 +1169,31 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 )
                 return (source, target)
             })
-        presentationSidebarProgress = 0
+        presentationSidebarFromEventInset = fromInset
+        presentationSidebarFraction = 0
         presentationSidebarActive = true
         return true
+    }
+
+    /// Advances the sidebar transition by one display frame and returns true once it has arrived.
+    ///
+    /// `measuredEdge` is the real right edge of the sidebar in the same width terms as `fromInset`/`toInset` of
+    /// `beginSidebarResize`, or nil when the host cannot read it. A measured edge sets the fraction directly, so the
+    /// grid follows the sidebar's own curve and duration. Without one, the clock runs `sidebarClockDuration` with
+    /// `easeInOutCubic`. `elapsed` is the time since the transition began.
+    @discardableResult
+    func advanceSidebarResize(elapsed: CFTimeInterval, measuredEdge: CGFloat?) -> Bool {
+        let clock = CGFloat(min(1, max(0, elapsed / Self.sidebarClockDuration)))
+        let travel = presentationSidebarToEventInset - presentationSidebarFromEventInset
+        var fraction = Self.easeInOutCubic(clock)
+        var arrived = clock >= 1
+        if let edge = measuredEdge, abs(travel) > Self.sidebarArrivalTolerance {
+            fraction = min(1, max(0, (edge - presentationSidebarFromEventInset) / travel))
+            arrived = abs(edge - presentationSidebarToEventInset) <= Self.sidebarArrivalTolerance
+        }
+        if elapsed >= Self.sidebarFollowDeadline { arrived = true }
+        presentationSidebarFraction = arrived ? 1 : max(presentationSidebarFraction, fraction)
+        return arrived
     }
 
     /// Commit the sidebar transition at `toInset`. The last presented frame already equals the settled target; the
@@ -1207,7 +1240,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// Presents the sidebar resize snapshot at the current source-to-target interpolation.
     private func drawSidebarResize(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         // Fixed gaps cannot be represented by one uniformly scaled quad, so keep this on bounded per-cell groups.
-        let scaled = sidebarPresentationSlots(viewportSize: viewportSize, progress: presentationSidebarProgress)
+        let scaled = sidebarPresentationSlots(viewportSize: viewportSize, fraction: presentationSidebarFraction)
         let flatUIDs = dataSource.flatUIDs
         let (sourceVisible, sourceOverscan) = MetalGridFrameComposer.classifyVisibility(
             slots: scaled,
@@ -1318,9 +1351,15 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         return scaled
     }
 
-    /// Returns sidebar presentation geometry at normalized host progress.
-    func sidebarPresentationSlots(viewportSize _: CGSize, progress: CGFloat) -> [GridRenderSlot] {
-        let q = Self.easeInOutCubic(min(1, max(0, progress)))
+    /// Returns sidebar presentation geometry at normalized clock progress, shaped with `easeInOutCubic`.
+    func sidebarPresentationSlots(viewportSize: CGSize, progress: CGFloat) -> [GridRenderSlot] {
+        sidebarPresentationSlots(
+            viewportSize: viewportSize, fraction: Self.easeInOutCubic(min(1, max(0, progress))))
+    }
+
+    /// Returns sidebar presentation geometry at a shaped fraction (0 = captured source, 1 = canonical target).
+    func sidebarPresentationSlots(viewportSize _: CGSize, fraction: CGFloat) -> [GridRenderSlot] {
+        let q = min(1, max(0, fraction))
         return presentationSidebarSlotPairs.map { pair in
             let s = pair.source.rect
             let t = pair.target.rect
