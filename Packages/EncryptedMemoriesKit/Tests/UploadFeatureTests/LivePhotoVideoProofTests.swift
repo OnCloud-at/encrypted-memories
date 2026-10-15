@@ -274,6 +274,76 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "own-video"))
     }
 
+    func testTheTrashedVideoOfAnotherLivePhotoIsNoDeletionOfTheVideo() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("other-trashed-video")]
+        checker.relatedLinkIDsByMainLinkID["other-main"] = ["other-trashed-video"]
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .upload, "a trashed copy under another main photo says nothing about this one")
+    }
+
+    func testAnUnrelatedTrashedFileNextToAForeignDraftLetsTheDraftDecide() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video"), foreignDraft()]
+        checker.relatedLinkIDsByMainLinkID["live-main"] = []
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: "foreign-draft"))
+    }
+
+    func testALinkListedActiveAndTrashedNeedsAStatedRoleLikeAnActiveCopy() async throws {
+        let rows = [activeRow("twin-video"), trashedRow("twin-video")]
+        // Stated role under this Live Photo: the copy settles.
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = rows
+        checker.relatedLinkIDsByMainLinkID["live-main"] = ["twin-video"]
+        var result = try await pipeline.resolve(video())
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "twin-video"))
+
+        // Stated role under another photo: neither row decides.
+        let other = UploadDedupePipeline(store: FakeIdentityStore(), hasher: hasher, checker: checker)
+        checker.relatedLinkIDsByMainLinkID = ["other-main": ["twin-video"]]
+        result = try await other.resolve(video())
+        XCTAssertEqual(result.decision, .upload)
+        await other.uploadDidFail(video())
+
+        // Unstated role: the active row needs a role, so the check fails instead of keeping the trashed meaning.
+        let unstated = UploadDedupePipeline(store: FakeIdentityStore(), hasher: hasher, checker: checker)
+        checker.linkVisibilityByID["twin-video"] = RemoteLinkVisibility(
+            isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+        do {
+            let decision = try await unstated.resolve(video()).decision
+            XCTFail("a link that a row lists as active needs a stated role: \(decision)")
+        } catch {}
+    }
+
+    func testAFailedRoleReadForAnOnlyTrashedCopyFailsTheCheckAndReleasesIt() async throws {
+        // A trashed copy now needs its role read. A failed read leaves the video for a later try, not a wrong skip.
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [trashedRow("trashed-video")]
+        checker.linkVisibilityError = UploadError.backend("link roles unavailable")
+
+        do {
+            let result = try await pipeline.resolve(video())
+            XCTFail("a failed read must not decide the video: \(result.decision)")
+        } catch {
+            XCTAssertEqual(
+                (error as? UploadError)?.localizedDescription,
+                UploadError.backend("link roles unavailable").localizedDescription)
+        }
+        try await assertTheClaimsOfTheVideoAreReleased()
+    }
+
+    func testATrashedCopyWithoutALinkKeepsItsMeaning() async throws {
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.MOV)", contentHash: videoContentHash, linkState: .trashed, linkID: nil)
+        ]
+
+        let result = try await pipeline.resolve(video())
+
+        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: nil))
+    }
+
     func testUnrelatedActiveAndTrashedFilesLeaveTheVideoToUpload() async throws {
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [activeRow("standalone-video"), trashedRow("trashed-video")]
         checker.relatedLinkIDsByMainLinkID["live-main"] = []
