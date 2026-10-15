@@ -155,6 +155,7 @@ jobs:
           python3 .github/scripts/test_review_pull_request.py
           python3 .github/scripts/test_review_advisory.py
           python3 .github/scripts/test_review_replay.py
+          bash .github/scripts/test_run_ui_tests_with_retry.sh
 
       - name: Lint GitHub Actions workflows
         env:
@@ -283,6 +284,11 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+      - name: Record the runner state at the start
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh start
       - uses: ./.github/actions/prepare-apple-build
         id: prepare
         with:
@@ -310,7 +316,7 @@ jobs:
           IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
           IOS_TEST_PREPARED: "1"
           IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui.xcresult
-        run: bash ./scripts/verify-ios-app-tests.sh ui
+        run: bash .github/scripts/run_ui_tests_with_retry.sh bash ./scripts/verify-ios-app-tests.sh ui
       - name: Report simulator test counts
         if: ${{ !cancelled() && steps.ui.outcome == 'success' }}
         env:
@@ -328,6 +334,17 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
+      - name: Retain the result of the first attempt after a retry
+        if: ${{ always() && steps.ui.outputs.retried == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ui-attempt1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ios-ui-attempt1.xcresult
+            ${{ runner.temp }}/ios-ui-attempt1.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
       - name: Retain UI latency diagnostics
         if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.collect_ui_diagnostics }}
         continue-on-error: true
@@ -338,6 +355,11 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
+      - name: Record the runner state at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh end
       - if: always()
         run: bash ./scripts/report-build-storage.sh
 
