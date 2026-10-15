@@ -33,7 +33,7 @@ public struct TipJarView: View {
     private var storeContent: some View {
         switch productLoadState {
         case .loading:
-            ProgressView()
+            ProgressSpinner()
                 .frame(maxWidth: .infinity, alignment: .center)
         case .loaded:
             StoreView(products: products) { product in

@@ -30,9 +30,7 @@ public struct ActivityProgressRow: View {
             if title != nil || (fraction == nil && showsIndeterminateProgress) {
                 HStack(spacing: 8) {
                     if fraction == nil, showsIndeterminateProgress {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(ProtonColor.primary)
+                        ProgressSpinner(accessibilityLabel: Self.spinnerName(title, accessibilityName))
                     }
                     if let title {
                         Text(title)
@@ -56,6 +54,11 @@ public struct ActivityProgressRow: View {
     /// VoiceOver names the bar after the row's title, else after the name the caller gives for an untitled row.
     nonisolated static func barName(_ title: String?, _ accessibilityName: String?) -> String? {
         title ?? accessibilityName
+    }
+
+    /// The spinner of an untitled row is named after the caller's name; next to a visible title it keeps "Loading".
+    nonisolated static func spinnerName(_ title: String?, _ accessibilityName: String?) -> String? {
+        title == nil ? accessibilityName : nil
     }
 }
 

@@ -437,7 +437,7 @@ struct MobilePhotoViewer: View {
                     viewerActionMenu
                 } label: {
                     if selection.isBusy || isRestoring {
-                        ProgressView()
+                        ProgressSpinner()
                     } else {
                         Label(String(localized: "viewer.more_actions_a11y"), systemImage: "ellipsis")
                     }

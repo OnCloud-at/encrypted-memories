@@ -92,10 +92,9 @@ struct MobileViewerInfoSheet: View {
                 .accessibilityLabel(L10n.string("infopanel.info"))
 
         case .loading:
-            ProgressView()
+            ProgressSpinner(accessibilityLabel: L10n.string("infopanel.info"))
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
-                .accessibilityLabel(L10n.string("infopanel.info"))
 
         case .loaded(let metadata):
             loadedMetadataSection(metadata)
@@ -200,9 +199,7 @@ struct MobileViewerInfoSheet: View {
                     .textCase(.uppercase)
 
                 if isLoadingAlbumMemberships {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel(L10n.string("infopanel.albums"))
+                    ProgressSpinner(accessibilityLabel: L10n.string("infopanel.albums"))
                 } else if albumMembershipsLoadFailed {
                     Label(
                         L10n.string("infopanel.albums_load_failed"),

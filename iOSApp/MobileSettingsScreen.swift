@@ -228,7 +228,7 @@ struct MobileSettingsScreen: View {
                 HStack {
                     Text(String(localized: "settings.clear_cache"))
                     Spacer()
-                    if isClearingCache { ProgressView().controlSize(.small) }
+                    if isClearingCache { ProgressSpinner() }
                 }
             }
             .disabled(isClearingCache)
@@ -333,7 +333,7 @@ private struct MobileBugReportSheet: View {
                                 systemImage: "square.and.arrow.down"
                             )
                             Spacer()
-                            if isPreparingReport { ProgressView().controlSize(.small) }
+                            if isPreparingReport { ProgressSpinner() }
                         }
                     }
                     .disabled(isPreparingReport)
