@@ -795,10 +795,9 @@ import TimelineCore
         }
         let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
         apply(first, revision: 50)
-        for _ in 0..<6_000 where !first.discovery.lastRefreshCompleted || first.isRefreshing {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        try #require(first.discovery.lastRefreshCompleted)
+        // The 50,000-photo pass takes minutes on a loaded machine; the limit only ends a hung test.
+        try await waitUntilHangLimit { first.discovery.lastRefreshCompleted && !first.isRefreshing }
+        try #require(first.discovery.lastRefreshCompleted && !first.isRefreshing)
         let expected = first.discovery.forYou
         try #require(expected.contains { !$0.representativeUIDs.isEmpty })
         first.reset()
@@ -814,9 +813,8 @@ import TimelineCore
             #expect(!relaunched.discovery.hasComputed)
             runtime.update { $0.memoryPressure = .normal }
         }
-        for _ in 0..<6_000 where !relaunched.discovery.hasComputed {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        try await waitUntilHangLimit { relaunched.discovery.hasComputed }
+        try #require(relaunched.discovery.hasComputed)
         #expect(
             relaunched.discovery.forYou == expected, "relaunch must preserve completed suggestions without inference")
         #expect(relaunched.discovery.computedContent?.timelineRevision == 1)
@@ -1394,6 +1392,12 @@ import TimelineCore
         update(semanticComplete: true, aggregateReady: true)
         for _ in 0..<200 where await probe.calls < 1 { try await Task.sleep(for: .milliseconds(5)) }
         #expect(await probe.calls == 1)
+    }
+
+    /// Waits until `condition` holds. The limit is far above any loaded machine and only ends a hung test.
+    private func waitUntilHangLimit(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(300)
+        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
     }
 
     private func visualSnapshot(settled: Int, ready: Bool) -> MLSmartSearchSnapshot {
