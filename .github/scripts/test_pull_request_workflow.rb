@@ -152,6 +152,52 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes inputs.fetch("name"), "github.run_id"
     assert_includes inputs.fetch("name"), "github.run_attempt"
   end
+
+  def test_the_ui_job_retries_only_a_runner_bootstrap_failure_and_keeps_the_gate_exact
+    job = @workflow.fetch("jobs").fetch("ios-ui-verification")
+    steps = job.fetch("steps")
+    ui = steps.find { |step| step["id"] == "ui" }
+    wrapper = "bash .github/scripts/run_ui_tests_with_retry.sh"
+    assert_equal "#{wrapper} bash ./scripts/verify-ios-app-tests.sh ui", ui.fetch("run")
+    %w[continue-on-error shell working-directory].each { |key| refute ui.key?(key), "The UI step must not set #{key}" }
+    [@workflow["env"], job["env"], ui["env"]].compact.each do |env|
+      refute env.key?("UI_TEST_MAX_RETRIES"), "The workflow keeps the retry count of the script"
+    end
+    assert_equal "${{ steps.ui.outcome }}", job.fetch("outputs").fetch("ui")
+    # The wrapper keeps the first attempt next to this bundle, under the name that the upload step collects.
+    assert_equal "${{ runner.temp }}/ios-ui.xcresult", ui.fetch("env").fetch("IOS_TEST_RESULT_BUNDLE_PATH")
+    assert_equal 90, job.fetch("timeout-minutes")
+    # The runner state is informational: it never decides the result, and it runs at the start and at the end.
+    start = steps.find { |step| step["name"] == "Record the runner state at the start" }
+    finish = steps.find { |step| step["name"] == "Record the runner state at the end" }
+    assert_equal "bash .github/scripts/runner_state.sh start", start.fetch("run")
+    assert_equal "bash .github/scripts/runner_state.sh end", finish.fetch("run")
+    assert_equal "${{ !cancelled() }}", start.fetch("if")
+    assert_equal "always()", finish.fetch("if")
+    [start, finish].each do |step|
+      assert_equal true, step.fetch("continue-on-error")
+      assert_equal 2, step.fetch("timeout-minutes")
+    end
+    prepare = steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    assert_operator steps.index(start), :<, prepare
+    assert_operator steps.index(finish), :>, steps.index(ui)
+    # The first attempt's bundle and log are kept when a retry happened, even if the second attempt passes.
+    failed = steps.find { |step| step["name"] == "Retain failed UI test results" }
+    kept = steps.find { |step| step["name"] == "Retain the result of the first attempt after a retry" }
+    assert_equal "${{ always() && steps.ui.outputs.retried == 'true' }}", kept.fetch("if")
+    assert_equal failed.fetch("uses"), kept.fetch("uses")
+    # A failed upload of the first attempt must not turn a passing retry red.
+    assert_equal true, kept.fetch("continue-on-error")
+    assert_includes kept.fetch("with").fetch("name"), "github.run_id"
+    assert_includes kept.fetch("with").fetch("name"), "github.run_attempt"
+    assert_includes kept.fetch("with").fetch("path"), "ios-ui-attempt1.xcresult"
+    assert_includes kept.fetch("with").fetch("path"), "ios-ui-attempt1.log"
+    # The bash test of the wrapper runs in the hygiene job.
+    hygiene_steps = @workflow.fetch("jobs").fetch("repository-hygiene").fetch("steps")
+    hygiene = hygiene_steps.find { |step| step["name"] == "Test GitHub automation" }
+    assert_includes hygiene.fetch("run"), "bash .github/scripts/test_run_ui_tests_with_retry.sh"
+  end
+
   def diagnostic_steps
     steps = @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("steps")
     [steps.find { |step| step["name"] == "Configure UI latency diagnostics" },
