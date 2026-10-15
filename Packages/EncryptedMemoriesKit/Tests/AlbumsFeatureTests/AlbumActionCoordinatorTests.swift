@@ -108,6 +108,41 @@ final class AlbumActionCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.showsSharedAlbumLoadingPlaceholder)
     }
 
+    /// A retry after a failure that finds no albums ends on the empty list, without the loading row or the error.
+    @MainActor
+    func testRetryThatFindsNoAlbumsShowsTheEmptyList() async {
+        struct Offline: Error {}
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        backend.listError = Offline()
+        let coordinator = AlbumActionCoordinator(repository: repository(backend))
+        await coordinator.refresh()
+        XCTAssertNotNil(coordinator.loadErrorMessage)
+
+        backend.listError = nil
+        await coordinator.refresh()
+        XCTAssertTrue(coordinator.albums.isEmpty)
+        XCTAssertNil(coordinator.loadErrorMessage)
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder, "an empty result shows the empty list")
+    }
+
+    /// A retry after a failure that finds albums shows them, without the loading row or the error.
+    @MainActor
+    func testRetryThatFindsAlbumsShowsThem() async {
+        struct Offline: Error {}
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        backend.listError = Offline()
+        let coordinator = AlbumActionCoordinator(repository: repository(backend))
+        await coordinator.refresh()
+        XCTAssertNotNil(coordinator.loadErrorMessage)
+
+        backend.listError = nil
+        backend.albums = [AlbumSummary(id: "album", title: "Holidays", photoCount: 3, coverPhotoID: nil)]
+        await coordinator.refresh()
+        XCTAssertEqual(coordinator.albums.map(\.title), ["Holidays"])
+        XCTAssertNil(coordinator.loadErrorMessage)
+        XCTAssertFalse(coordinator.showsAlbumLoadingPlaceholder)
+    }
+
     /// A reload of an empty list that loaded fine keeps the empty list on screen; only a retry after a failure shows
     /// the loading row.
     @MainActor
