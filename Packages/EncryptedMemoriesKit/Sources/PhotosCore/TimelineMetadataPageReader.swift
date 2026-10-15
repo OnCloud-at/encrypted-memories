@@ -38,7 +38,7 @@ public final class TimelineMetadataPageReader {
                 inventory.items, isClassified: { self.classifiedNodeIDs.contains($0.nodeID) }) == true
         guard isCurrent(), !Task.isCancelled else { throw CancellationError() }
         if !useOrderCache, let orderStore, orderStore.rebuildRevision == initialRebuildRevision {
-            orderStore.rebuild()
+            orderStore.rebuildUnlessBusy()
         }
         preparedRebuildRevision = orderStore?.rebuildRevision ?? 0
     }

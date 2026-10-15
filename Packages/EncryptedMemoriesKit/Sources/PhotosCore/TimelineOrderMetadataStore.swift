@@ -15,6 +15,8 @@ public final class TimelineOrderMetadataStore {
     private var db: OpaquePointer?
     private let url: URL
     private let policy: LibraryDatabasePolicy
+    /// Remembers that a statement of this connection met a lock that did not clear within the busy timeout.
+    private let busyRecorder: SQLiteBusyRecorder
     private let transient = SQLiteStoreSchemaGate.transientDestructor
     private var synchronizedInventory: InventorySignature?
     private var needsPublication = true
@@ -70,8 +72,10 @@ public final class TimelineOrderMetadataStore {
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         self.url = url
         self.policy = policy
-        func open() -> OpaquePointer? {
-            SQLiteStoreSchemaGate.openRebuildableStore(
+        let recorder = SQLiteBusyRecorder(timeoutMs: policy.busyTimeoutMs)
+        busyRecorder = recorder
+        func open() -> SQLiteRebuildableStoreOutcome {
+            SQLiteStoreSchemaGate.openRebuildableStoreOutcome(
                 at: url, schemaSQL: Self.schema, policy: policy,
                 verifyVersion: { handle in
                     var stmt: OpaquePointer?
@@ -83,27 +87,55 @@ public final class TimelineOrderMetadataStore {
                 },
                 stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK })
         }
-        db = open()
-        // A cache that another connection holds for now stays on disk, so the next open of the store, at the next
-        // launch or sign-in, can read it. Every other failed open replaces the cache as before.
-        if db == nil, !SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: url),
-            SQLiteStoreSchemaGate.removeDatabaseFiles(at: url)
-        {
-            db = open()
+        switch open() {
+        case .opened(let handle):
+            db = handle
+        case .retryLater:
+            // The file may be fine: another connection holds it, or the inspection had no room to copy it. It stays
+            // on disk, so the next open of the store, at the next launch or sign-in, can read it.
+            return nil
+        case .failed:
+            // Every other failed open replaces the cache.
+            guard SQLiteStoreSchemaGate.removeDatabaseFiles(at: url), case .opened(let handle) = open() else {
+                return nil
+            }
+            db = handle
         }
-        guard db != nil else { return nil }
-        var check: OpaquePointer?
-        let valid =
-            sqlite3_prepare_v2(db, "PRAGMA quick_check;", -1, &check, nil) == SQLITE_OK
-            && sqlite3_step(check) == SQLITE_ROW
-            && sqlite3_column_text(check, 0).map { String(cString: $0) } == "ok"
-        sqlite3_finalize(check)
-        if !valid {
+        recorder.install(on: db)
+        switch Self.check(db, recorder: recorder) {
+        case .healthy:
+            break
+        case .busy:
+            // A lock that did not clear says nothing about the file. It stays for the next open.
+            close()
+            return nil
+        case .damaged:
             close()
             guard SQLiteStoreSchemaGate.removeDatabaseFiles(at: url) else { return nil }
-            db = open()
-            guard db != nil else { return nil }
+            guard case .opened(let handle) = open() else { return nil }
+            db = handle
+            recorder.install(on: db)
         }
+    }
+
+    enum CacheCheck: Equatable {
+        case healthy
+        case damaged
+        /// The check met a lock that did not clear within the busy timeout, so it proves nothing about the file.
+        case busy
+    }
+
+    /// SQLite's own integrity check of the opened cache. `recorder` must be installed on `db`.
+    static func check(_ db: OpaquePointer?, recorder: SQLiteBusyRecorder) -> CacheCheck {
+        recorder.reset()
+        var statement: OpaquePointer?
+        let prepared = sqlite3_prepare_v2(db, "PRAGMA quick_check;", -1, &statement, nil) == SQLITE_OK
+        let step = prepared ? sqlite3_step(statement) : SQLITE_ERROR
+        let healthy =
+            step == SQLITE_ROW && sqlite3_column_text(statement, 0).map { String(cString: $0) } == "ok"
+        sqlite3_finalize(statement)
+        if healthy { return .healthy }
+        return recorder.takeGaveUp() ? .busy : .damaged
     }
 
     deinit { close() }
@@ -126,8 +158,22 @@ public final class TimelineOrderMetadataStore {
         let replacement = TimelineOrderMetadataStore(url: url, policy: policy)
         db = replacement?.db
         replacement?.db = nil
+        // The connection came with the busy handler of the replacement store, which ends with it.
+        if db != nil { busyRecorder.install(on: db) }
         PhotoDiagnostics.shared.increment("timeline.order.cacheRebuild")
         return db != nil
+    }
+
+    /// Rebuilds the cache after a failed read or write, unless the failure was a lock that did not clear within the
+    /// busy timeout. A lock clears by itself, so the cache and its rows stay, and the next pass tries again. Every
+    /// other failure rebuilds, as `rebuild()` does. Returns whether the cache was rebuilt and is available again.
+    @discardableResult
+    public func rebuildUnlessBusy() -> Bool {
+        if busyRecorder.takeGaveUp() {
+            PhotoDiagnostics.shared.increment("timeline.order.cacheKeptBusy")
+            return false
+        }
+        return rebuild()
     }
 
     private static let schema = """
@@ -195,6 +241,7 @@ public final class TimelineOrderMetadataStore {
     }
 
     private func beginSynchronization(signature: InventorySignature) -> UInt64? {
+        busyRecorder.reset()
         synchronizationGeneration &+= 1
         synchronization = nil
         synchronizedInventory = nil
@@ -347,6 +394,7 @@ public final class TimelineOrderMetadataStore {
     /// The key frontier prevents a failed or omitted link from retrying repeatedly inside one pass.
     public func nextPage(after cursor: PhotoUID? = nil, limit: Int = pageSize) throws -> [Candidate] {
         guard db != nil else { throw TimelineOrderMetadataError.unavailable }
+        busyRecorder.reset()
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, Self.workSQL, -1, &stmt, nil) == SQLITE_OK else {
             throw TimelineOrderMetadataError.readFailed
@@ -377,6 +425,7 @@ public final class TimelineOrderMetadataStore {
     public func record(_ values: [PhotoUID: TimelineOrderMetadata], classifiedUIDs: Set<PhotoUID> = []) -> Bool {
         lastRecordChangedOrder = false
         guard db != nil else { return false }
+        busyRecorder.reset()
         var lookup: OpaquePointer?
         guard
             sqlite3_prepare_v2(
@@ -401,6 +450,10 @@ public final class TimelineOrderMetadataStore {
         }
         guard needsWrite else { return true }
         PhotoDiagnostics.shared.increment("timeline.order.recordWrite")
+        // A statement that is still open holds a read transaction. SQLite then fails the write lock at once, without
+        // the busy handler, so the write would neither wait for the lock nor tell that it met one.
+        sqlite3_finalize(lookup)
+        lookup = nil
         guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
         var stmt: OpaquePointer?
         guard
@@ -464,6 +517,7 @@ public final class TimelineOrderMetadataStore {
 
     private func publishCompletedSeconds(containing uid: PhotoUID?) throws -> Bool {
         guard db != nil else { throw TimelineOrderMetadataError.unavailable }
+        busyRecorder.reset()
         guard inventoryComplete, needsPublication else { return false }
         PhotoDiagnostics.shared.increment(uid == nil ? "timeline.order.publishPass" : "timeline.order.publishSecond")
         guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {

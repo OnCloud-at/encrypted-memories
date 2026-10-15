@@ -14,6 +14,9 @@ public enum SQLiteStoreSchemaCompatibility: Sendable, Equatable {
     case current
     case incompatible
     case unavailable
+    /// The check could not finish now, and the file may be fine: another connection holds it for longer than the busy
+    /// timeout, or the temporary copy for the inspection could not be made, for example on a full disk.
+    case retryLater
 }
 
 private enum SQLiteStoreOpenResult {
@@ -21,6 +24,16 @@ private enum SQLiteStoreOpenResult {
     /// The file holds another schema or version.
     case incompatible
     /// The file could not be read, created, or initialized.
+    case failed
+    /// The file may be fine, but it could not be checked now. See `SQLiteStoreSchemaCompatibility.retryLater`.
+    case retryLater
+}
+
+/// The result of opening a rebuildable store.
+public enum SQLiteRebuildableStoreOutcome {
+    case opened(OpaquePointer)
+    /// The file stays on disk untouched, and the next open reads it again.
+    case retryLater
     case failed
 }
 
@@ -64,6 +77,7 @@ public enum SQLiteStoreSchemaGate {
 
     /// Opens a rebuildable cache. A file with another schema is deleted together with its WAL and shared-memory
     /// files and created once more. A read, create, or delete failure returns `nil` and leaves the file in place.
+    /// A file that cannot be checked now (`retryLater`) also returns `nil` and stays untouched.
     public static func openRebuildableStore(
         at url: URL,
         schemaSQL: String,
@@ -72,6 +86,26 @@ public enum SQLiteStoreSchemaGate {
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool
     ) -> OpaquePointer? {
+        guard
+            case .opened(let handle) = openRebuildableStoreOutcome(
+                at: url, schemaSQL: schemaSQL, policy: policy, enforceForeignKeys: enforceForeignKeys,
+                verifyVersion: verifyVersion, stampVersion: stampVersion)
+        else { return nil }
+        return handle
+    }
+
+    /// Like `openRebuildableStore`, and it tells a file that stays on disk for a later open (`retryLater`) from a
+    /// failure that a caller may repair by removing the file.
+    public static func openRebuildableStoreOutcome(
+        at url: URL,
+        schemaSQL: String,
+        policy: LibraryDatabasePolicy,
+        enforceForeignKeys: Bool = false,
+        verifyVersion: (OpaquePointer?) -> Bool,
+        stampVersion: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil
+    ) -> SQLiteRebuildableStoreOutcome {
         func open() -> SQLiteStoreOpenResult {
             openStore(
                 at: url,
@@ -79,38 +113,22 @@ public enum SQLiteStoreSchemaGate {
                 policy: policy,
                 enforceForeignKeys: enforceForeignKeys,
                 verifyVersion: verifyVersion,
-                stampVersion: stampVersion
+                stampVersion: stampVersion,
+                copyItem: copyItem,
+                createDirectory: createDirectory
             )
         }
         switch open() {
         case .opened(let handle):
-            return handle
+            return .opened(handle)
         case .failed:
-            return nil
+            return .failed
+        case .retryLater:
+            return .retryLater
         case .incompatible:
-            guard removeDatabaseFiles(at: url), case .opened(let handle) = open() else { return nil }
-            return handle
+            guard removeDatabaseFiles(at: url), case .opened(let handle) = open() else { return .failed }
+            return .opened(handle)
         }
-    }
-
-    /// True when another connection holds the database at `url` for now: SQLite answers a read of its schema with
-    /// busy or locked. Such a file is not unusable; the next open can read it.
-    public static func isHeldByAnotherConnection(at url: URL) -> Bool {
-        var handle: OpaquePointer?
-        defer { sqlite3_close(handle) }
-        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK
-        else { return false }
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
-        let result: Int32
-        if sqlite3_prepare_v2(handle, "SELECT count(*) FROM sqlite_schema;", -1, &statement, nil) != SQLITE_OK {
-            result = sqlite3_errcode(handle)
-        } else {
-            result = sqlite3_step(statement)
-        }
-        // Without a shared cache this probe meets only busy codes; the mask also accepts extended busy codes.
-        let primary = result & 0xFF
-        return primary == SQLITE_BUSY || primary == SQLITE_LOCKED
     }
 
     /// Removes a database file and its `-wal` and `-shm` files. Missing files count as removed.
@@ -137,16 +155,21 @@ public enum SQLiteStoreSchemaGate {
         includeMemoryTuning: Bool = true,
         enforceForeignKeys: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
-        stampVersion: (OpaquePointer?) -> Bool
+        stampVersion: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil
     ) -> SQLiteStoreOpenResult {
         let compatibility = compatibility(
             at: url,
             schemaSQL: schemaSQL,
             busyTimeoutMs: policy.busyTimeoutMs,
-            versionIsCurrent: verifyVersion
+            versionIsCurrent: verifyVersion,
+            copyItem: copyItem,
+            createDirectory: createDirectory
         )
         guard compatibility != .incompatible else { return .incompatible }
         guard compatibility != .unavailable else { return .failed }
+        guard compatibility != .retryLater else { return .retryLater }
         var opened: OpaquePointer?
         let flags =
             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
@@ -155,7 +178,9 @@ public enum SQLiteStoreSchemaGate {
             sqlite3_close(opened)
             return .failed
         }
-        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        // The verification below waits as long as the busy timeout and tells a lock from another schema.
+        let busy = SQLiteBusyRecorder(timeoutMs: policy.busyTimeoutMs)
+        busy.install(on: handle)
         if enforceForeignKeys {
             sqlite3_exec(handle, "PRAGMA foreign_keys=ON;", nil, nil, nil)
         }
@@ -177,13 +202,13 @@ public enum SQLiteStoreSchemaGate {
                 matchesCurrentSchema(handle, schemaSQL: schemaSQL)
             else {
                 sqlite3_close(handle)
-                return .incompatible
+                return busy.gaveUp ? .retryLater : .incompatible
             }
             configureConnection(handle, policy: policy, includeMemoryTuning: includeMemoryTuning)
         case .incompatible:
             sqlite3_close(handle)
             return .incompatible
-        case .unavailable:
+        case .unavailable, .retryLater:
             sqlite3_close(handle)
             return .failed
         }
@@ -197,7 +222,9 @@ public enum SQLiteStoreSchemaGate {
         at url: URL,
         schemaSQL: String,
         busyTimeoutMs: Int = 5_000,
-        versionIsCurrent: (OpaquePointer?) -> Bool
+        versionIsCurrent: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil
     ) -> SQLiteStoreSchemaCompatibility {
         guard FileManager.default.fileExists(atPath: url.path) else { return .empty }
         var inspection: OpaquePointer?
@@ -206,37 +233,54 @@ public enum SQLiteStoreSchemaGate {
             let inspection
         else {
             sqlite3_close(inspection)
-            return compatibilityOfWritableCopy(at: url, busyTimeoutMs: busyTimeoutMs)
+            return compatibilityOfWritableCopy(
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory)
         }
         defer { sqlite3_close(inspection) }
-        sqlite3_busy_timeout(inspection, Int32(clamping: busyTimeoutMs))
+        // A statement that meets a lock waits as long as the busy timeout. If the lock stays, no answer of this
+        // inspection is reliable: the file may be fine, and the caller must not replace it.
+        let busy = SQLiteBusyRecorder(timeoutMs: busyTimeoutMs)
+        busy.install(on: inspection)
         switch state(of: inspection) {
         case .empty:
-            guard let version = userVersion(of: inspection) else { return .unavailable }
+            guard let version = userVersion(of: inspection) else { return busy.gaveUp ? .retryLater : .unavailable }
+            if busy.gaveUp { return .retryLater }
             return version == 0 ? .empty : .incompatible
         case .populated:
-            return versionIsCurrent(inspection)
+            let current =
+                versionIsCurrent(inspection)
                 && matchesCurrentSchema(inspection, schemaSQL: schemaSQL)
-                ? .current : .incompatible
+            if busy.gaveUp { return .retryLater }
+            return current ? .current : .incompatible
         case .unavailable:
-            return compatibilityOfWritableCopy(at: url, busyTimeoutMs: busyTimeoutMs)
+            if busy.gaveUp { return .retryLater }
+            return compatibilityOfWritableCopy(
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory)
         }
+    }
+
+    /// The private directory of a recovery inspection. A test passes its own `createDirectory` to simulate a full disk.
+    private static func createInspectionDirectory(_ url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
     }
 
     /// A read-write schema read can roll back a hot journal. Preserve the original and all its sidecars,
     /// even when recovery finds a populated database that this build must refuse to open.
     private static func compatibilityOfWritableCopy(
         at url: URL,
-        busyTimeoutMs: Int
+        busyTimeoutMs: Int,
+        copyItem: (URL, URL) throws -> Void,
+        createDirectory: ((URL) throws -> Void)?
     ) -> SQLiteStoreSchemaCompatibility {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteStoreInspection-\(UUID().uuidString)", isDirectory: true)
         do {
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            try (createDirectory ?? Self.createInspectionDirectory)(directory)
         } catch {
             logger.error("SQLite could not create its temporary recovery inspection.")
-            return .unavailable
+            // A full disk says nothing about the file, so it stays. Any other failure keeps its earlier meaning.
+            return isOutOfSpace(error) ? .retryLater : .unavailable
         }
 
         var compatibility = SQLiteStoreSchemaCompatibility.unavailable
@@ -245,12 +289,14 @@ public enum SQLiteStoreSchemaGate {
             for suffix in ["", "-journal", "-wal", "-shm"] {
                 let original = URL(fileURLWithPath: url.path + suffix)
                 if suffix.isEmpty || FileManager.default.fileExists(atPath: original.path) {
-                    try FileManager.default.copyItem(at: original, to: URL(fileURLWithPath: copy.path + suffix))
+                    try copyItem(original, URL(fileURLWithPath: copy.path + suffix))
                 }
             }
             compatibility = emptyCompatibility(at: copy, busyTimeoutMs: busyTimeoutMs)
         } catch {
             logger.error("SQLite could not copy the database and journals for recovery inspection.")
+            // A full disk says nothing about the file, so it stays. An unreadable file keeps its earlier meaning.
+            compatibility = isOutOfSpace(error) ? .retryLater : .unavailable
         }
         do {
             try FileManager.default.removeItem(at: directory)
@@ -259,6 +305,20 @@ public enum SQLiteStoreSchemaGate {
             return .unavailable
         }
         return compatibility
+    }
+
+    /// True when the file system had no room for a write: Cocoa's out-of-space error, or POSIX `ENOSPC` or `EDQUOT`
+    /// underneath it.
+    static func isOutOfSpace(_ error: any Error) -> Bool {
+        var current: NSError? = error as NSError
+        while let nsError = current {
+            if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileWriteOutOfSpaceError { return true }
+            if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOSPC) || nsError.code == Int(EDQUOT) {
+                return true
+            }
+            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return false
     }
 
     private static func emptyCompatibility(at url: URL, busyTimeoutMs: Int) -> SQLiteStoreSchemaCompatibility {

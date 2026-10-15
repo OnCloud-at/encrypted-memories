@@ -224,6 +224,139 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
         XCTAssertEqual(try store.nextPage().count, 2, "the cache opens again with its rows")
     }
 
+    private let noWaitPolicy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+
+    /// Another connection that holds the file exclusively until `COMMIT`.
+    private func exclusiveHolder(of url: URL) throws -> OpaquePointer {
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        return try XCTUnwrap(blocker)
+    }
+
+    func testAQuickCheckThatMeetsALockIsNoDamage() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        try filledCache(at: url, policy: noWaitPolicy)
+        let blocker = try exclusiveHolder(of: url)
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &raw), SQLITE_OK)
+        defer { sqlite3_close(raw) }
+        let recorder = SQLiteBusyRecorder(timeoutMs: 0)
+        recorder.install(on: raw)
+
+        XCTAssertEqual(TimelineOrderMetadataStore.check(raw, recorder: recorder), .busy)
+        XCTAssertEqual(sqlite3_exec(blocker, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(blocker)
+        XCTAssertEqual(TimelineOrderMetadataStore.check(raw, recorder: recorder), .healthy)
+    }
+
+    func testAQuickCheckOfADamagedCacheStillFindsTheDamage() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        try filledCache(at: url, policy: noWaitPolicy)
+        let handle = try FileHandle(forUpdating: url)
+        let size = try handle.seekToEnd()
+        try handle.seek(toOffset: 4_096)
+        try handle.write(contentsOf: Data(repeating: 0xFF, count: Int(size) - 4_096))
+        try handle.close()
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &raw), SQLITE_OK)
+        defer { sqlite3_close(raw) }
+        let recorder = SQLiteBusyRecorder(timeoutMs: 0)
+        recorder.install(on: raw)
+
+        XCTAssertEqual(TimelineOrderMetadataStore.check(raw, recorder: recorder), .damaged)
+    }
+
+    func testAWriteThatMeetsALockKeepsTheCacheAndItsRows() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+        defer { store.close() }
+        let items = [photo("a"), photo("b")]
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: []))
+        var writer: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &writer), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(writer, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+
+        XCTAssertFalse(store.record([items[0].uid: .init(exactCaptureTime: Date(timeIntervalSince1970: 500.2))]))
+        let revision = store.rebuildRevision
+        XCTAssertFalse(store.rebuildUnlessBusy(), "a lock clears by itself: the cache stays")
+        XCTAssertEqual(store.rebuildRevision, revision, "no rebuild happened")
+        XCTAssertEqual(sqlite3_exec(writer, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(writer)
+
+        XCTAssertEqual(try store.nextPage().map(\.uid), items.map(\.uid), "the rows are still there")
+        XCTAssertTrue(store.record([items[0].uid: .init(exactCaptureTime: Date(timeIntervalSince1970: 500.2))]))
+    }
+
+    func testAnotherFailureStillRebuildsTheCache() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+        defer { store.close() }
+        let items = [photo("a"), photo("b")]
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: Set(items.map(\.uid))))
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "DROP TABLE photo_order;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+
+        XCTAssertThrowsError(try store.nextPage())
+        XCTAssertTrue(store.rebuildUnlessBusy(), "a failure that is no lock rebuilds, as before")
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: Set(items.map(\.uid))))
+        XCTAssertEqual(try store.nextPage().map(\.uid), items.map(\.uid))
+    }
+
+    func testAnEarlierLockDoesNotHoldBackTheRebuildAfterALaterFailure() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+        defer { store.close() }
+        let items = [photo("a"), photo("b")]
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: Set(items.map(\.uid))))
+        var writer: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &writer), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(writer, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertFalse(store.record([items[0].uid: .init(exactCaptureTime: Date(timeIntervalSince1970: 500.2))]))
+        XCTAssertEqual(sqlite3_exec(writer, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        // The lock is gone. Later, the table breaks for another reason.
+        XCTAssertEqual(sqlite3_exec(writer, "DROP TABLE photo_order;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(writer)
+
+        XCTAssertThrowsError(try store.nextPage())
+        XCTAssertTrue(store.rebuildUnlessBusy(), "the earlier lock is forgotten")
+    }
+
+    /// A crashed writer leaves a rollback journal that only a writer can recover. The store replaces such a cache.
+    func testACacheWithAHotRollbackJournalIsStillReplaced() throws {
+        let directory = try directory()
+        let source = directory.appendingPathComponent("source.sqlite")
+        try filledCache(at: source, policy: noWaitPolicy)
+        var writer: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(source.path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        for statement in [
+            "PRAGMA journal_mode=DELETE;", "PRAGMA synchronous=FULL;",
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) "
+                + "INSERT INTO photo_order(vol, node, t, second) SELECT 'v', 'n' || i, i, i FROM c;",
+            "PRAGMA cache_size=2;", "PRAGMA cache_spill=1;", "BEGIN;",
+            "UPDATE photo_order SET identity = hex(randomblob(400));",
+        ] {
+            XCTAssertEqual(sqlite3_exec(writer, statement, nil, nil, nil), SQLITE_OK, statement)
+        }
+        // A copy taken while the write runs is what a crash leaves: changed pages and the journal that undoes them.
+        let crashed = directory.appendingPathComponent("crashed.sqlite")
+        try FileManager.default.copyItem(at: source, to: crashed)
+        try FileManager.default.copyItem(
+            at: URL(fileURLWithPath: source.path + "-journal"), to: URL(fileURLWithPath: crashed.path + "-journal"))
+        XCTAssertEqual(sqlite3_exec(writer, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        let header = try FileHandle(forReadingFrom: URL(fileURLWithPath: crashed.path + "-journal")).read(upToCount: 8)
+        XCTAssertEqual(header, Data([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]), "the journal is hot")
+
+        let store = try XCTUnwrap(
+            TimelineOrderMetadataStore(url: crashed, policy: noWaitPolicy), "a new cache replaces it")
+        defer { store.close() }
+        XCTAssertEqual(try store.nextPage().count, 0, "the earlier rows are gone, as before")
+    }
+
     func testOneHundredThousandPhotosUseBoundedPagesAndRetainTheUpgradeTimeline() throws {
         let store = try XCTUnwrap(TimelineOrderMetadataStore(url: directory().appendingPathComponent("order.sqlite")))
         defer { store.close() }
