@@ -257,7 +257,10 @@ final class ExactDuplicatesModelTests: XCTestCase {
             finder.rankGate.close()
             let scans = finder.scanCalls
             let reload = Task { await model.load(checkAllGroups: true) }
-            await waitUntil({ finder.scanCalls == scans + 1 }, "a replacement scan tests the fingerprint cache")
+            // The fake counts the scan before the model publishes it; the replacement list is out once its check waits.
+            await waitUntil(
+                { finder.scanCalls == scans + 1 && finder.rankGate.hasWaiters },
+                "a replacement scan tests the fingerprint cache")
             XCTAssertEqual(model.groups.map(\.scanGroup), [affected], "cancelled fingerprints cannot split a new scan")
             finder.rankGate.open()
             await reload.value
