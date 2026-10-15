@@ -1,7 +1,8 @@
 import Foundation
 
-/// Request counts since the backend was last built (sign-in, launch or a backend rebuild) for a support report. Every string is a code-owned name or an
-/// endpoint template without identifiers; the report never holds a URL, an identifier or a name.
+/// Request counts since the backend was last built (sign-in, launch or a backend rebuild) for a support report.
+/// Every string is a code-owned name or an endpoint template without identifiers; the report never holds a URL,
+/// an identifier or a name.
 public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
     public struct Count: Codable, Sendable, Equatable {
         public let scope: String

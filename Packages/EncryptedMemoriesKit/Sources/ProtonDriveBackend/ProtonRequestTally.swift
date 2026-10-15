@@ -160,7 +160,8 @@ struct ProtonRequestCauseBinding: Sendable {
     }
 }
 
-/// Request counts kept by the governor since the backend was last built. Counts only: the keys hold code-owned names and endpoint templates.
+/// Request counts kept by the governor since the backend was last built. Counts only: the keys hold code-owned names
+/// and endpoint templates.
 struct ProtonRequestTally: Sendable {
     struct Key: Hashable, Sendable {
         let scope: ProtonRequestScope
