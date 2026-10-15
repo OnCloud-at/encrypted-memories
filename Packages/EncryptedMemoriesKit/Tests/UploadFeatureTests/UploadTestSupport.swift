@@ -56,8 +56,23 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
     /// Names of uploads that started without an active reservation of `admission` for their network kind.
     var uploadsWithoutTheirReservation: [String] { lock.withLock { _uploadsWithoutTheirReservation } }
 
+    /// How long a test waits for a reservation before it fails. A reservation that nobody releases would otherwise
+    /// keep the test, and the build lane behind it, waiting for good.
+    var reservationTimeout: Duration = .seconds(20)
+
     func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
-        try await admission.reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+        let timeout = reservationTimeout
+        let admission = admission
+        return try await withThrowingTaskGroup(of: UploadNetworkReservation?.self) { group in
+            group.addTask { try await admission.reserve(allowsExpensiveNetwork: allowsExpensiveNetwork) }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                return nil
+            }
+            defer { group.cancelAll() }
+            if let reservation = try await group.next() ?? nil { return reservation }
+            throw UploadError.backend("The test uploader waited \(timeout) for its network reservation")
+        }
     }
 
     init(
