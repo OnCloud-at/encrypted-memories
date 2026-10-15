@@ -56,18 +56,16 @@
             window.setContentSize(NSSize(width: 1_080, height: 720))
             Self.showUnseen(window)
             defer { window.orderOut(nil) }
-            try await Task.sleep(for: .milliseconds(1_000))
+            await Self.waitForFilmstrip(beside: sidebar, in: controller.view)
             XCTAssertTrue(viewer.hasBurstFilmstrip || itemFilmstripLabel != nil)
 
             for width in [1_080.0, 900, 1_300, 1_080] {
                 window.setContentSize(NSSize(width: width, height: 720))
                 for _ in 0..<2 {
-                    withAnimation(.easeInOut(duration: 0.22)) { sidebar.toggle() }
-                    try await Task.sleep(for: .milliseconds(600))
+                    await Self.toggle(sidebar, laidOutIn: controller.view)
                 }
             }
-            withAnimation(.easeInOut(duration: 0.22)) { sidebar.toggle() }
-            try await Task.sleep(for: .milliseconds(600))
+            await Self.toggle(sidebar, laidOutIn: controller.view)
             XCTAssertEqual(sidebar.visibility, .detailOnly)
 
             // The filmstrip panel keeps its look: 20 points from each side of the viewer, its photos 12 points inside.
@@ -91,7 +89,7 @@
             var widths: [CGFloat] = []
             for width in [1_080.0, 1_300] {
                 window.setContentSize(NSSize(width: width, height: 720))
-                try await Task.sleep(for: .milliseconds(800))
+                await Self.waitForFilmstrip(in: controller.view, x: 32, width: width - 64)
                 controller.view.layoutSubtreeIfNeeded()
                 widths.append(controller.sizeThatFits(in: NSSize(width: 0, height: 720)).width)
             }
@@ -104,6 +102,75 @@
             window.alphaValue = 0
             window.ignoresMouseEvents = true
             window.orderFrontRegardless()
+        }
+
+        /// Toggles the sidebar with the library window's real animation, waits until SwiftUI reports the animation
+        /// removed, and then until the filmstrip and the sidebar pane reached their frames. A completion that never
+        /// comes ends the wait after 5 seconds.
+        private static func toggle(_ sidebar: SidebarState, laidOutIn view: NSView) async {
+            await withCheckedContinuation { continuation in
+                let resumption = Resumption(continuation)
+                let timeout = Task {
+                    try? await Task.sleep(for: .seconds(5))
+                    guard !Task.isCancelled else { return }
+                    print("ExactDuplicatesViewerSidebarTests: no animation completion after 5 s")
+                    resumption.resume()
+                }
+                withAnimation(.easeInOut(duration: 0.22), completionCriteria: .removed) {
+                    sidebar.toggle()
+                } completion: {
+                    timeout.cancel()
+                    resumption.resume()
+                }
+            }
+            await waitForFilmstrip(beside: sidebar, in: view)
+        }
+
+        /// The library window route: the viewer starts beside a visible sidebar. AppKit collapses the sidebar pane of
+        /// the split view while the sidebar is hidden, and opens it to a width that stops changing while it shows.
+        private static func waitForFilmstrip(beside sidebar: SidebarState, in view: NSView) async {
+            let hidden = sidebar.visibility == .detailOnly
+            let leading: CGFloat = hidden ? 0 : 220
+            await waitForFilmstrip(in: view, x: leading + 32, width: view.bounds.width - leading - 64) {
+                guard let pane = sidebarSplit(in: view)?.arrangedSubviews.first else { return nil }
+                let paneHidden = pane.isHidden || pane.frame.width < 1
+                guard paneHidden == hidden else { return nil }
+                return paneHidden ? 0 : pane.frame.width
+            }
+        }
+
+        /// Waits until the filmstrip in `view` shows at `x` with `width` in window coordinates, and `pane` reports the
+        /// same value, on three polls in a row, polling every 10 ms. `pane` returns nil while it is not ready. A layout
+        /// that keeps a measured width in view state reaches this frame only after that state changed, so the wait
+        /// also covers such an update. After 5 seconds the wait ends with a log line, and the checks after it decide.
+        private static func waitForFilmstrip(
+            in view: NSView, x: CGFloat, width: CGFloat, pane: () -> CGFloat? = { 0 }
+        ) async {
+            let deadline = ContinuousClock.now + .seconds(5)
+            var polls = 0
+            var lastPane: CGFloat?
+            var frame: CGRect?
+            while polls < 3, ContinuousClock.now < deadline, !Task.isCancelled {
+                view.layoutSubtreeIfNeeded()
+                frame = filmstrip(in: view).map { $0.convert($0.bounds, to: nil) }
+                let paneState = pane()
+                if let frame, abs(frame.minX - x) < 1, abs(frame.width - width) < 1, let paneState,
+                    paneState == lastPane || polls == 0
+                {
+                    polls += 1
+                } else {
+                    polls = 0
+                }
+                lastPane = paneState
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            if polls < 3 {
+                let last = frame.map { "\($0)" } ?? "none"
+                let paneText = lastPane.map { "\($0)" } ?? "not ready"
+                print(
+                    "ExactDuplicatesViewerSidebarTests: filmstrip not at x \(x), width \(width) after 5 s; "
+                        + "last frame \(last), sidebar pane \(paneText)")
+            }
         }
 
         private func makeFeed() throws -> ThumbnailFeed {
@@ -125,6 +192,20 @@
             }
         }
 
+        /// The split view of the navigation split view; its first pane is the sidebar. The viewer's inspector has its
+        /// own split view, which contains the filmstrip.
+        private static func sidebarSplit(in view: NSView) -> NSSplitView? {
+            let strip = filmstrip(in: view)
+            func search(_ view: NSView) -> NSSplitView? {
+                if let split = view as? NSSplitView, strip.map({ !$0.isDescendant(of: split) }) ?? true { return split }
+                for subview in view.subviews {
+                    if let found = search(subview) { return found }
+                }
+                return nil
+            }
+            return search(view)
+        }
+
         /// The scroll view of the native filmstrip collection.
         private static func filmstrip(in view: NSView) -> NSScrollView? {
             if let scroll = view as? NSScrollView, scroll.documentView is NSCollectionView { return scroll }
@@ -132,6 +213,19 @@
                 if let found = filmstrip(in: subview) { return found }
             }
             return nil
+        }
+    }
+
+    /// Resumes a waiting test once, from whichever event comes first.
+    @MainActor
+    private final class Resumption {
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        init(_ continuation: CheckedContinuation<Void, Never>) { self.continuation = continuation }
+
+        func resume() {
+            continuation?.resume()
+            continuation = nil
         }
     }
 
