@@ -16,8 +16,8 @@ do-not-use-semicolons.swift:1:10: error: [DoNotUseSemicolons] remove ';'
 dont-repeat-type-in-static-properties.swift:2:16: error: [DontRepeatTypeInStaticProperties] remove the suffix 'Color' from the name of the variable 'defaultColor'
 == end-of-line-comment-spacing.swift exit 1
 end-of-line-comment-spacing.swift:1:10: error: [Spacing] add 1 space
-== file-scoped-declaration-privacy.swift exit 0
-
+== file-scoped-declaration-privacy.swift exit 1
+file-scoped-declaration-privacy.swift:1:1: error: [FileScopedDeclarationPrivacy] replace 'fileprivate' with 'private' on file-scoped declarations
 == fully-indirect-enum.swift exit 1
 fully-indirect-enum.swift:1:1: error: [FullyIndirectEnum] declare enum 'E' itself as indirect when all cases are indirect
 fully-indirect-enum.swift:2:5: note: remove 'indirect' here
@@ -46,15 +46,15 @@ no-assignment-in-expressions.swift:3:12: error: [NoAssignmentInExpressions] move
 no-assignment-in-expressions.swift:3:12: error: [NoAssignmentInExpressions] move this assignment expression into its own statement
 == no-block-comments.swift exit 1
 no-block-comments.swift:1:1: error: [NoBlockComments] replace this block comment with line comments
-== no-cases-with-only-fallthrough.swift exit 0
-
+== no-cases-with-only-fallthrough.swift exit 1
+no-cases-with-only-fallthrough.swift:3:5: error: [NoCasesWithOnlyFallthrough] combine this fallthrough-only 'case' and the following 'case' into a single 'case'
 == no-empty-lines-opening-closing-braces.swift exit 1
 no-empty-lines-opening-closing-braces.swift:1:11: error: [NoEmptyLinesOpeningClosingBraces] remove empty line after '{'
 == no-empty-trailing-closure-parentheses.swift exit 1
 no-empty-trailing-closure-parentheses.swift:3:10: error: [Spacing] remove 1 space
 no-empty-trailing-closure-parentheses.swift:3:6: error: [NoEmptyTrailingClosureParentheses] remove the empty parentheses following 'f'
-== no-labels-in-case-patterns.swift exit 0
-
+== no-labels-in-case-patterns.swift exit 1
+no-labels-in-case-patterns.swift:6:13: error: [NoLabelsInCasePatterns] remove the label 'x' from this 'case' pattern
 == no-parens-around-conditions.swift exit 1
 no-parens-around-conditions.swift:2:8: error: [NoParensAroundConditions] remove the parentheses around this expression
 no-parens-around-conditions.swift:2:8: error: [NoParensAroundConditions] remove the parentheses around this expression
@@ -62,8 +62,8 @@ no-parens-around-conditions.swift:2:8: error: [NoParensAroundConditions] remove 
 no-playground-literals.swift:2:9: error: [NoPlaygroundLiterals] replace '#colorLiteral' with a call to an initializer on 'NSColor' or 'UIColor'
 == no-void-return-on-function-signature.swift exit 1
 no-void-return-on-function-signature.swift:1:13: error: [NoVoidReturnOnFunctionSignature] remove the explicit return type 'Void' from this function
-== one-case-per-line.swift exit 0
-
+== one-case-per-line.swift exit 1
+one-case-per-line.swift:2:10: error: [OneCasePerLine] move 'a' to its own 'case' declaration
 == one-variable-declaration-per-line.swift exit 1
 one-variable-declaration-per-line.swift:1:1: error: [OneVariableDeclarationPerLine] split this variable declaration to introduce only one variable per 'var'
 == only-one-trailing-closure-argument.swift exit 1

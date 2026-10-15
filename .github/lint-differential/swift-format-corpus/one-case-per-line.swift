@@ -1,3 +1,3 @@
 enum E {
-    case a, b
+    case a(Int), b
 }

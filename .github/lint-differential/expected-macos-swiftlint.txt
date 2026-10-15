@@ -28,4 +28,5 @@ trailing-whitespace.swift:1:10: error: Trailing Whitespace Violation: Lines shou
 unavailable-function.swift:5:14: error: Unavailable Function Violation: Unimplemented functions should be marked as unavailable (unavailable_function)
 == unused-optional-binding.swift exit 2
 unused-optional-binding.swift:2:12: error: Unused Optional Binding Violation: Prefer `!= nil` over `let _ =` (unused_optional_binding)
-== yoda-condition.swift exit 0
+== yoda-condition.swift exit 2
+yoda-condition.swift:2:8: error: Yoda Condition Violation: The constant literal should be placed on the right-hand side of the comparison operator (yoda_condition)

@@ -2,7 +2,9 @@ func f(_ x: Int) {
     switch x {
     case 1:
         fallthrough
-    default:
+    case 2:
         print(x)
+    default:
+        break
     }
 }

@@ -1,3 +1,5 @@
-func f(_ x: Int) -> Bool {
-    return 3 == x
+func f(_ x: Int) {
+    if 3 == x {
+        print(1)
+    }
 }

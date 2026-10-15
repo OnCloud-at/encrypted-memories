@@ -3,7 +3,7 @@ enum E {
 }
 func f(_ e: E) {
     switch e {
-    case .a(x: let v):
-        print(v)
+    case .a(x: let x):
+        print(x)
     }
 }
