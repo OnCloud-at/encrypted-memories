@@ -72,6 +72,9 @@ public final class LocationCrawlSession {
     private var inventoryTask: Task<LocationCrawlInventory, Never>?
     private var inventoryRevision: UInt64 = 0
     private var crawlInventoryRevision: UInt64 = 0
+    /// How often an admitted start reached the crawl. A rejected start never touches it: `crawl.start` retires the
+    /// crawl that runs, so a stale start must stop before it.
+    private(set) var crawlStartsForTesting = 0
 
     public init(
         platform: Platform,
@@ -149,6 +152,7 @@ public final class LocationCrawlSession {
             }
             guard sessionLease.map(store.isCurrentSessionLease) ?? true, self.admits(crawlGeneration, start)
             else { return }
+            self.crawlStartsForTesting += 1
             await crawl.start(
                 uids: inventory.uids,
                 captureDates: inventory.captureDates,

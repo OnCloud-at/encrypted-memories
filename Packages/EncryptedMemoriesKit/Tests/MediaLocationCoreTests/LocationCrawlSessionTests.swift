@@ -13,9 +13,12 @@ import Testing
         session.updateInventory(fixture.items)
 
         session.start(items: fixture.items, fixture.start())
+        let first = session.startingTask
         session.start(items: fixture.items, fixture.start())
+        #expect(session.startingTask == first, "a repeated start keeps the running start")
         try await waitUntil { session.index.scanProgress.phase == .completed }
 
+        #expect(session.crawlStartsForTesting == 1)
         #expect(fixture.probes.value() == fixture.items.count, "a repeated start does not crawl twice")
         #expect(session.isStarted)
     }
@@ -30,7 +33,8 @@ import Testing
         session.pause()
         await starter?.value
 
-        #expect(fixture.probes.value() == 0, "the paused start ended without probing")
+        #expect(session.crawlStartsForTesting == 0, "the paused start never reached the crawl")
+        #expect(fixture.probes.value() == 0)
         #expect(!session.isStarted)
     }
 
@@ -43,6 +47,7 @@ import Testing
         let earlier = session.invalidate()
         await earlier?.value
 
+        #expect(session.crawlStartsForTesting == 0, "the invalidated start never reached the crawl")
         #expect(fixture.probes.value() == 0)
         #expect(!session.isStarted, "the next configuration may start the crawl again")
     }
@@ -71,7 +76,8 @@ import Testing
         current.set(false)
         await starter?.value
 
-        #expect(fixture.probes.value() == 0, "the stale start ended without probing")
+        #expect(session.crawlStartsForTesting == 0, "the stale start never reached the crawl")
+        #expect(fixture.probes.value() == 0)
     }
 
     @Test func aStoreSessionIsRequiredWhenThePlatformAsksForIt() async throws {
@@ -81,7 +87,8 @@ import Testing
 
         session.start(items: fixture.items, fixture.start())
         await session.startingTask?.value
-        #expect(fixture.probes.value() == 0, "without the account's restored location cache nothing is probed")
+        #expect(session.crawlStartsForTesting == 0, "without the account's restored location cache no crawl starts")
+        #expect(fixture.probes.value() == 0)
 
         fixture.store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
         session.prepareRestart()
@@ -113,6 +120,7 @@ import Testing
         let starter = session.retire()
         await starter?.value
 
+        #expect(session.crawlStartsForTesting == 0)
         #expect(fixture.probes.value() == 0)
         #expect(!session.isStarted)
         #expect(session.startingTask == nil)
@@ -133,7 +141,8 @@ import Testing
         #expect(!session.isStarted)
         #expect(session.startingTask != nil, "the teardown joins the start task")
         await starter?.value
-        #expect(fixture.probes.value() == 0, "the host's account check rejects the start")
+        #expect(session.crawlStartsForTesting == 0, "the host's account check rejects the start")
+        #expect(fixture.probes.value() == 0)
     }
 }
 
