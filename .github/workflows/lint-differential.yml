@@ -50,9 +50,10 @@ jobs:
         run: |
           set -uo pipefail
           export LINUX_SOURCEKIT_LIB_PATH="$RUNNER_TEMP/swift/usr/lib"
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/swift/usr/lib/swift/linux:$RUNNER_TEMP/swift/usr/lib"
           start=$(date +%s)
           bash .github/lint-differential/run_all.sh "$RUNNER_TEMP/swift/usr/bin/swift-format" \
-            "$RUNNER_TEMP/swiftlint/swiftlint-static" "$RUNNER_TEMP/out"
+            "$RUNNER_TEMP/swiftlint/swiftlint" "$RUNNER_TEMP/out"
           echo "run seconds: $(( $(date +%s) - start ))"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
