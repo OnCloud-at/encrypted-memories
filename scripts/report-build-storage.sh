@@ -11,22 +11,23 @@ report_path() {
   local path="$1"
   local size_kib
   [[ -e "$path" ]] || return 0
-  size_kib="$(du -sk "$path" 2>/dev/null | awk '{print $1}')"
+  size_kib="$(du -sk "$path" 2>/dev/null | awk '{print $1}')" || true
   [[ -n "$size_kib" ]] || return 0
   total_kib=$((total_kib + size_kib))
   printf '%8.1f GiB  %s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "$path"
 }
 
 # The size of each folder directly inside a folder, for the report only: it is not added to the total.
+# A folder that disappears or cannot be read while it is measured is skipped; it never ends the report.
 report_children() {
-  local path="$1"
+  local path="${1%/}"
   local child size_kib
   [[ -d "$path" ]] || return 0
-  while IFS= read -r child; do
-    size_kib="$(du -sk "$child" 2>/dev/null | awk '{print $1}')"
+  while IFS= read -r -d '' child; do
+    size_kib="$(du -sk "$child" 2>/dev/null | awk '{print $1}')" || true
     [[ -n "$size_kib" ]] || continue
     printf '%8.2f GiB    %s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "${child#"$path"/}"
-  done < <(find "$path" -mindepth 1 -maxdepth 1 -print | sort)
+  done < <(find "$path" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
 }
 
 echo "Canonical Encrypted Memories build storage:"
