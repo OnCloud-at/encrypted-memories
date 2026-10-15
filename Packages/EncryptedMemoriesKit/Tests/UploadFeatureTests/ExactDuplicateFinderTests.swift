@@ -1900,6 +1900,37 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(finder.mergeTurns.waiting, 0)
     }
 
+    /// An emptying whose task is cancelled exactly as the merge hands the turn over deletes nothing.
+    func testAnEmptyingCancelledAsTheTurnPassesToItDeletesNothing() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        let remote = TrashStoppingRemote(base: server)
+        let finder = finder(remote: remote)
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        try await waitUntil { state(of: duplicate) == .trashed }
+        let trash = CountingTrash()
+        let emptying = Task { [directory] in
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        }
+        try await waitUntil { finder.mergeTurns.waiting == 1 }
+        // The merge leaves the queue and hands the turn over; the cancellation lands before the emptying resumes.
+        finder.mergeTurns.onHandOver = { emptying.cancel() }
+
+        remote.gate.open()
+        _ = try await merging.value
+        do {
+            try await emptying.value
+            XCTFail("a cancelled emptying throws")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertEqual(trash.emptied, 0, "a cancelled emptying deletes nothing")
+        XCTAssertEqual(finder.mergeTurns.waiting, 0)
+    }
+
     /// A merge that is cancelled while Recently Deleted is emptied trashes nothing.
     func testAMergeCancelledWhileRecentlyDeletedIsEmptiedTrashesNothing() async throws {
         let kept = server.seedLink(digest: digest("a"))

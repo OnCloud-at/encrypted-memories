@@ -561,10 +561,13 @@ public struct ExactDuplicateFinder: Sendable {
 
     /// Runs `body`, which empties Recently Deleted, while no merge of this finder runs, and holds new merges until it
     /// ends. A merge that trashed its copies between the check of the open merges and the emptying would lose them for
-    /// good. Throws `CancellationError` without running `body` when the task is cancelled while it waits; a cancellation
-    /// that arrives as the turn passes to it can still run `body`, which then still checks the open merges first.
+    /// good. Throws `CancellationError` without running `body` when the task is cancelled while it waits, also when the
+    /// cancellation arrives as the turn passes to it: a cancelled emptying deletes nothing.
     public func excludingMerges(_ body: () async throws -> Void) async throws {
-        try await mergeTurns.runOrThrow(body)
+        try await mergeTurns.runOrThrow {
+            try Task.checkCancellation()
+            try await body()
+        }
     }
 
     private func mergeInTurn(
@@ -1220,6 +1223,12 @@ final class ExactDuplicateTurns: @unchecked Sendable {
 
     /// The callers that wait for their turn.
     var waiting: Int { lock.withLock { waiters.count } }
+    /// Runs as the turn passes to a waiter, before the waiter resumes. Tests use it to cancel the waiter in that moment.
+    var onHandOver: (@Sendable () -> Void)? {
+        get { lock.withLock { handOver } }
+        set { lock.withLock { handOver = newValue } }
+    }
+    private var handOver: (@Sendable () -> Void)?
 
     /// Runs `check` once no earlier caller runs. A task that is cancelled while it waits leaves the queue and runs no
     /// check. A cancellation that arrives as the turn passes to it can still start the check, which then stops before
@@ -1270,6 +1279,7 @@ final class ExactDuplicateTurns: @unchecked Sendable {
             }
             return waiters.removeFirst().continuation
         }
+        if next != nil { onHandOver?() }
         next?.resume(returning: true)
     }
 }
