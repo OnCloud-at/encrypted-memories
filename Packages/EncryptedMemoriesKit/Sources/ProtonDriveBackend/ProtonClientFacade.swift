@@ -225,7 +225,8 @@ public final class ProtonClientFacade {
             accountDatabasePolicy: bridge.uploadManifestPolicy,
             albumSyncRemoteOps: ProtonAlbumSyncRemoteOps(
                 service: albumWrite,
-                listProvider: { try await albumsRepo.listAlbums() }
+                listProvider: { try await albumsRepo.listAlbums() },
+                duplicateChecker: identityComposition.duplicateChecker
             ),
             accountInfoRefresher: { try await bridge.refreshAccountInfo() },
             shutdownHandler: {
