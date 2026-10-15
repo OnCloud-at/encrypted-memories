@@ -148,8 +148,8 @@ public final class AlbumSyncController {
     private var changePendingDuringSync = false
     private var remoteAlbumsChangedDuringBatch = false
     private var onRemoteAlbumsChanged: (@MainActor @Sendable () -> Void)?
-    /// The person pressed Stop during the current batch.
-    private var stopRequestedByUser = false
+    /// Whether the person pressed Stop during the current batch.
+    private var stopState = AlbumSyncStopState()
 
     public init(
         configuration: Configuration,
@@ -344,7 +344,7 @@ public final class AlbumSyncController {
     }
 
     public func stopSync() {
-        if isSyncing { stopRequestedByUser = true }
+        stopState.stopPressed(isSyncing: isSyncing, queuedAlbums: queuedAlbumIDs.count)
         queuedAlbumIDs.removeAll()
         changeDebounceTask?.cancel()
         changeDebounceTask = nil
@@ -379,6 +379,7 @@ public final class AlbumSyncController {
         for id in ids where !queuedAlbumIDs.contains(id) {
             queuedAlbumIDs.append(id)
         }
+        if isSyncing, stopState.albumAdded(), lastMessageStyle == .information { setMessage(nil) }
         startBatchIfIdle()
     }
 
@@ -386,7 +387,7 @@ public final class AlbumSyncController {
         guard !isShuttingDown, let runner, !isSyncing, !queuedAlbumIDs.isEmpty else { return }
         isSyncing = true
         remoteAlbumsChangedDuringBatch = false
-        stopRequestedByUser = false
+        stopState.batchStarted()
         setMessage(nil)
 
         syncTask = Task { [weak self] in
@@ -395,21 +396,26 @@ public final class AlbumSyncController {
                     let report = try await runner.sync(album: album, resolution: .automatic)
                     self?.recordFinishedRun(report.problems, albumID: album.id)
                     self?.remoteAlbumsChangedDuringBatch = true
-                    self?.showStopResult(finished: report)
+                    self?.showStopResult(after: .finished(report))
                 } catch let error as AlbumSyncError {
                     switch error {
                     case .nameConflict(let existing):
                         self?.recordConflict(album: album, existing: existing)
                     case .stopped:
                         self?.queuedAlbumIDs.removeAll()
-                        self?.showStopResult(finished: nil)
+                        self?.showStopResult(after: .stopped)
                         self?.reloadSelection()
                     default:
                         self?.setMessage(error.errorDescription)
                         self?.reloadSelection()
                     }
                 } catch {
-                    self?.setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                    if self?.stopState.endsAsStop(error) == true {
+                        self?.queuedAlbumIDs.removeAll()
+                        self?.showStopResult(after: .cancelled)
+                    } else {
+                        self?.setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                    }
                     self?.reloadSelection()
                 }
             }
@@ -419,16 +425,10 @@ public final class AlbumSyncController {
 
     /// After a Stop, the message line says that the sync stopped, or that the album finished when the batch that was
     /// already sent completed it. Without a Stop nothing changes.
-    private func showStopResult(finished report: AlbumSyncReport?) {
-        guard stopRequestedByUser else { return }
-        setMessage(Self.messageAfterStop(finished: report), style: .information)
-    }
-
-    /// The text after a Stop: `nil` when the run ended anyway with photos that need attention, because the album row
-    /// already says so.
-    static func messageAfterStop(finished report: AlbumSyncReport?) -> String? {
-        guard let report else { return L10n.string("albumsync.error_stopped") }
-        return report.isFullySynced ? L10n.string("albumsync.phase_completed") : nil
+    private func showStopResult(after outcome: AlbumSyncStopState.Outcome) {
+        let current = AlbumSyncStopState.Message(text: lastMessage, style: lastMessageStyle)
+        guard let next = stopState.message(after: outcome, current: current) else { return }
+        setMessage(next.text, style: next.style)
     }
 
     func setMessage(_ message: String?, style: MessageStyle = .error) {

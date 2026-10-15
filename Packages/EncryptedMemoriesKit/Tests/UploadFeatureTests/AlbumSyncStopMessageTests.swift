@@ -25,19 +25,74 @@ final class AlbumSyncStopMessageTests: XCTestCase {
             unattachable: unattachable, trashedSkipped: 0, incomplete: incomplete)
     }
 
+    private let stoppedText = L10n.string("albumsync.error_stopped")
+    private let syncedText = L10n.string("albumsync.phase_completed")
+    private let none = AlbumSyncStopState.Message(text: nil, style: .error)
+
+    private func stopped(queuedAlbums: Int = 0) -> AlbumSyncStopState {
+        var state = AlbumSyncStopState()
+        state.batchStarted()
+        state.stopPressed(isSyncing: true, queuedAlbums: queuedAlbums)
+        return state
+    }
+
     func testAStoppedRunSaysThatTheSyncStopped() {
-        XCTAssertEqual(
-            AlbumSyncController.messageAfterStop(finished: nil), L10n.string("albumsync.error_stopped"))
+        XCTAssertEqual(stopped().message(after: .stopped, current: none), .init(text: stoppedText, style: .information))
+    }
+
+    func testAStopThatTheBackupReportsAsCancellationSaysThatTheSyncStopped() {
+        let state = stopped()
+        XCTAssertTrue(state.endsAsStop(CancellationError()))
+        XCTAssertEqual(state.message(after: .cancelled, current: none), .init(text: stoppedText, style: .information))
+    }
+
+    func testACancellationWithoutAStopStaysAnError() {
+        var state = AlbumSyncStopState()
+        state.batchStarted()
+        XCTAssertFalse(state.endsAsStop(CancellationError()))
+        XCTAssertNil(state.message(after: .cancelled, current: none))
     }
 
     func testAStoppedRunThatFinishedTheAlbumSaysAlbumSynced() {
         XCTAssertEqual(
-            AlbumSyncController.messageAfterStop(finished: report()), L10n.string("albumsync.phase_completed"))
+            stopped().message(after: .finished(report()), current: none), .init(text: syncedText, style: .information))
     }
 
-    func testAStoppedRunThatEndedWithPhotosThatNeedAttentionAddsNoMessage() {
-        XCTAssertNil(AlbumSyncController.messageAfterStop(finished: report(unattachable: 1)))
-        XCTAssertNil(AlbumSyncController.messageAfterStop(finished: report(incomplete: 1)))
+    func testAStopThatDroppedQueuedAlbumsSaysThatTheSyncStoppedAlsoWhenTheCurrentAlbumFinished() {
+        XCTAssertEqual(
+            stopped(queuedAlbums: 2).message(after: .finished(report()), current: none),
+            .init(text: stoppedText, style: .information))
+    }
+
+    func testAStoppedRunThatEndedWithPhotosThatNeedAttentionKeepsTheLine() {
+        XCTAssertNil(stopped().message(after: .finished(report(unattachable: 1)), current: none))
+        XCTAssertNil(stopped().message(after: .finished(report(incomplete: 1)), current: none))
+    }
+
+    func testAStopResultNeverReplacesARealError() {
+        let error = AlbumSyncStopState.Message(text: "network failed", style: .error)
+        XCTAssertNil(stopped().message(after: .stopped, current: error))
+        XCTAssertNil(stopped().message(after: .finished(report()), current: error))
+    }
+
+    func testWithoutAStopNothingChanges() {
+        var state = AlbumSyncStopState()
+        state.stopPressed(isSyncing: false, queuedAlbums: 0)
+        XCTAssertNil(state.message(after: .finished(report()), current: none))
+        XCTAssertNil(state.message(after: .stopped, current: none))
+    }
+
+    func testANewBatchForgetsTheStop() {
+        var state = stopped(queuedAlbums: 1)
+        state.batchStarted()
+        XCTAssertNil(state.message(after: .finished(report()), current: none))
+    }
+
+    func testAnAlbumAddedAfterStopEndsTheStop() {
+        var state = stopped(queuedAlbums: 1)
+        XCTAssertTrue(state.albumAdded())
+        XCTAssertNil(state.message(after: .finished(report()), current: none))
+        XCTAssertFalse(state.albumAdded(), "without a Stop adding an album changes nothing")
     }
 
     func testAnErrorAfterAStopMessageShowsAsAnErrorAgain() async throws {
