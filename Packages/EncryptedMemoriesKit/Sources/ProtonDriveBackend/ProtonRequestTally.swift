@@ -31,6 +31,8 @@ enum ProtonRequestCause: String, CaseIterable, Sendable {
     /// it: series dissolution, duplicate merge and edit replacement all use them.
     case carryOver = "carryover"
     case photosRoot = "photos.root"
+    /// The one-time read of the file names that search matches.
+    case photoNames = "photo.names"
     /// Session-gated work that normally reads only local stores.
     case local
 }

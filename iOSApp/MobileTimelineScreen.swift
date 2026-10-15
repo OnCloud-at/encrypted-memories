@@ -60,6 +60,7 @@ struct MobileTimelineScreen: View {
     /// Identity of the lifecycle the coordinator is bound to - a new session rebinds it.
     @State private var semanticQueryLifecycle: ObjectIdentifier?
     @State private var searchProjection: TimelineSearchProjection?
+    @State private var photoNames: PhotoNameIndex?
     @State private var searchCoordinator = TimelineSearchProjectionCoordinator()
     /// Apple-style stacked library refinements. Core evaluates these off-main with AND semantics across
     /// independent groups and OR semantics within the media-kind group.
@@ -164,6 +165,9 @@ struct MobileTimelineScreen: View {
                 .onDisappear {
                     searchDebounceTask?.cancel()
                     searchDebounceTask = nil
+                }
+                .task(id: nameQuery) {
+                    photoNames = await TimelineFileNameSearchSource.names(forQuery: nameQuery, from: model.backend)
                 }
                 .task(id: searchProjectionRequest) { await resolveSearchProjection() }
                 .onChange(of: hasProjectionCriteria) { _, hasCriteria in
@@ -619,6 +623,11 @@ struct MobileTimelineScreen: View {
         return semanticQuery?.rankedUIDs.map(Set.init)
     }
 
+    /// The text query that file names can match; a structured suggestion has none.
+    private var nameQuery: String {
+        committedSuggestionMatches == nil ? normalizedCommittedSearchText : ""
+    }
+
     private var searchKey: TimelineSearchProjectionKey {
         if let committedSuggestionMatches {
             // A structured suggestion replaces the text query: its title is display text, not search terms.
@@ -634,7 +643,7 @@ struct MobileTimelineScreen: View {
         return TimelineSearchProjectionKey(
             sourceRevision: model.timelineRevision,
             query: normalizedCommittedSearchText,
-            context: TimelineSearchContext(favoriteUIDs: model.favoriteUIDs),
+            context: TimelineSearchContext(favoriteUIDs: model.favoriteUIDs, photoNames: photoNames),
             semanticMatches: committedSemanticMatches,
             refinement: refinement
         )

@@ -4,10 +4,13 @@ import PhotosCore
 public struct TimelineSearchContext: Hashable, Sendable {
     public var activeFilter: PhotoFilter?
     public var favoriteUIDs: Set<PhotoUID>
+    /// The decrypted file names of the library; a text query also matches the name of a photo.
+    public var photoNames: PhotoNameIndex?
 
-    public init(activeFilter: PhotoFilter? = nil, favoriteUIDs: Set<PhotoUID> = []) {
+    public init(activeFilter: PhotoFilter? = nil, favoriteUIDs: Set<PhotoUID> = [], photoNames: PhotoNameIndex? = nil) {
         self.activeFilter = activeFilter
         self.favoriteUIDs = favoriteUIDs
+        self.photoNames = photoNames
     }
 }
 
@@ -122,9 +125,12 @@ public struct TimelineSearchQuery: Equatable, Sendable {
     }
 
     private let terms: [Term]
+    /// Every token as typed, smart tokens included; a file name match compares these with the name.
+    private let tokens: [String]
 
     public init(_ raw: String) {
-        terms = Self.tokens(from: raw).map { token in
+        tokens = Self.tokens(from: raw)
+        terms = tokens.map { token in
             if let smart = Self.smartKind(for: token) {
                 .smart(smart)
             } else {
@@ -136,7 +142,10 @@ public struct TimelineSearchQuery: Equatable, Sendable {
     public var isEmpty: Bool { terms.isEmpty }
 
     func matches(item: PhotoItem, in section: TimelineSection, context: TimelineSearchContext) -> Bool {
-        let haystack = Self.searchText(for: item, in: section)
+        var haystack = Self.searchText(for: item, in: section)
+        if let name = context.photoNames?.normalizedName(of: item.uid) {
+            haystack += " " + name
+        }
         return terms.allSatisfy { term in
             switch term {
             case .text(let token):
@@ -145,6 +154,46 @@ public struct TimelineSearchQuery: Equatable, Sendable {
                 Self.matches(smart, item: item, section: section, haystack: haystack, context: context)
             }
         }
+    }
+
+    /// Whether every token of the query appears in the file name of `uid`, as a prefix or a substring.
+    public func matchesName(of uid: PhotoUID, in names: PhotoNameIndex) -> Bool {
+        guard !tokens.isEmpty, let name = names.normalizedName(of: uid) else { return false }
+        return tokens.allSatisfy { name.contains($0) }
+    }
+
+    /// Whether a query reads as a file name, so that name hits lead the result. It holds when the trimmed query has
+    /// no white space, contains a digit, `_` or `.`, and is not a plain date or number of the date search: a day or
+    /// month (one or two digits), a year from 1900 to 2099, `2019-05`, `2019-05-01`, `1.5.2019` or `01.05.2019`.
+    ///
+    /// `IMG_33`, `3350`, `.HEIC` and `DSC01234` read as names; `sunset`, `paris 2019`, `IMG 3350` and `2019` do not.
+    public static func looksLikeFileName(_ raw: String) -> Bool {
+        let query = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, query.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+        guard query.rangeOfCharacter(from: fileNameMarks) != nil else { return false }
+        return !isDateQuery(query)
+    }
+
+    private static let fileNameMarks = CharacterSet.decimalDigits.union(CharacterSet(charactersIn: "_."))
+
+    private static func isDateQuery(_ query: String) -> Bool {
+        func isNumber(_ part: Substring, digits: ClosedRange<Int>) -> Bool {
+            digits.contains(part.count) && part.allSatisfy { $0.isASCII && $0.isNumber }
+        }
+        func isYear(_ part: Substring) -> Bool {
+            isNumber(part, digits: 4...4) && (part.hasPrefix("19") || part.hasPrefix("20"))
+        }
+        let whole = Substring(query)
+        if isNumber(whole, digits: 1...2) || isYear(whole) { return true }
+        let dashed = whole.split(separator: "-", omittingEmptySubsequences: false)
+        if (2...3).contains(dashed.count), isYear(dashed[0]),
+            dashed.dropFirst().allSatisfy({ isNumber($0, digits: 1...2) })
+        {
+            return true
+        }
+        let dotted = whole.split(separator: ".", omittingEmptySubsequences: false)
+        return dotted.count == 3 && isNumber(dotted[0], digits: 1...2) && isNumber(dotted[1], digits: 1...2)
+            && isYear(dotted[2])
     }
 
     private static func matches(
@@ -248,8 +297,7 @@ public struct TimelineSearchQuery: Equatable, Sendable {
     }
 
     private static func normalize(_ text: String) -> String {
-        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: normalizeLocale)
-            .lowercased()
+        SearchTextNormalization.normalize(text)
     }
 
     private static let gregorianUTC: Calendar = {
@@ -257,8 +305,6 @@ public struct TimelineSearchQuery: Equatable, Sendable {
         calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
         return calendar
     }()
-
-    private static let normalizeLocale = Locale(identifier: "en_US_POSIX")
 
     private static let monthNamesEN = [
         "january", "february", "march", "april", "may", "june",

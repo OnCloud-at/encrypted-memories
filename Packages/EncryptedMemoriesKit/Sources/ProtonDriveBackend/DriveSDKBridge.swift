@@ -17,7 +17,7 @@ private typealias LibraryPhotoTag = PhotosCore.PhotoTag
 actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailProvider, ThumbnailBatchLoader,
     PriorityThumbnailBatchLoader, FullMediaProvider, OriginalByteStreamProvider, OriginalFileProvider,
     VideoStreamProvider, PhotoMetadataProvider, BurstGroupProvider, PhotoLibraryProvider, FavoritesProvider,
-    PhotoLibrarySaving, TrashProvider, LibraryStatsProvider, EditedPhotoOriginalProviding
+    PhotoLibrarySaving, TrashProvider, LibraryStatsProvider, EditedPhotoOriginalProviding, PhotoNameSearchProvider
 {
     private let photosClient: EncryptedMemoriesClient
     private let uploadClientUID: String
@@ -78,6 +78,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private nonisolated let identitiesOutsideInventoryObserver = IdentitiesOutsideInventoryObserver()
     /// The last Recently Deleted listing on disk, so the route opens offline and its thumbnails survive a launch.
     private let recentlyDeletedStore: RecentlyDeletedListingStore
+    /// The sealed file names of the library, which search matches.
+    private nonisolated let photoNames: PhotoNameStore?
     private var librarySupport = LibrarySyncSupportSnapshot()
     private var recentlyDeleted: RecentlyDeletedIdentities
     /// Low-priority trash listing after the library lost photos, so photos trashed elsewhere get their
@@ -179,6 +181,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             keyPassword: session.keyPassword
         )
         self.recentlyDeletedStore = recentlyDeletedStore
+        let photoNames = PhotoNameStore(
+            directory: libraryDirectory, accountUID: session.uid, keyPassword: session.keyPassword,
+            policy: policy.libraryDatabasePolicy)
+        self.photoNames = photoNames
+        Task { @MainActor in photoNames?.registerForMemoryPressure(.shared) }
         self.recentlyDeleted = RecentlyDeletedIdentities(persisted: recentlyDeletedStore.load() ?? .init())
         self.uploadManifestPolicy = policy.libraryDatabasePolicy
         // Keep the optional native SDK cache in memory. SDK 0.31.1 only frees the managed client handle;
@@ -277,6 +284,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         await dedupeService?.shutdown()
         timelineOrderStore?.close()
         timelineStore?.close()
+        photoNames?.close()
         await photosClient.shutdown()
     }
 
@@ -432,6 +440,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         recentlyDeleted.eventsLost()
                     }
                 if removalsChanged { recentlyDeletedStore.save(recentlyDeleted.persisted) }
+                // A changed file may carry a new name; without a stored name the next metadata pass reads it again.
+                if let remoteChanges {
+                    photoNames?.forget(
+                        Set(remoteChanges.active.union(remoteChanges.removed).map {
+                            PhotoUID(volumeID: root.volumeID, nodeID: $0)
+                        }))
+                }
                 var entries: [PhotosListEntry]
                 if continuityRecoveryRequired {
                     entries = try await continuityRecovery.fetchInventory(
@@ -978,6 +993,22 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             var resolvedContext: PhotosShareContext?
             var rootKey: UnlockableKey?
             var attemptedRootKey = false
+            // Order data and file names share one root key read per pass.
+            func passRootKey(_ context: PhotosShareContext) async throws -> UnlockableKey? {
+                guard !attemptedRootKey else { return rootKey }
+                attemptedRootKey = true
+                do {
+                    let source = try await fileSource()
+                    rootKey = try await ProtonRequestContext.$priority.withValue(.maintenance) {
+                        try await source.nodeKey(ofLinkID: context.rootLinkID)
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    DebugLog.log("timeline: order key unavailable; MIME reconciliation continues")
+                }
+                return rootKey
+            }
             let decoder = TimelineOrderMetadataDecoder()
             while true {
                 try Task.checkCancellation()
@@ -1011,21 +1042,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         userInfo: [NSLocalizedDescriptionKey: "media type checkpoint could not be saved"])
                 }
                 changed = changed || (result?.changedRows ?? 0) > 0
+                if let photoNames, let nameKey = try await passRootKey(context) {
+                    photoNames.record(
+                        PhotoNameFill.names(
+                            in: links, requested: Set(candidates.map(\.uid.nodeID)), volumeID: context.volumeID,
+                            decrypt: { try? self.crypto.decryptName($0, parent: nameKey) }))
+                }
                 var order: [PhotoUID: TimelineOrderMetadata] = [:]
                 if candidates.contains(where: \.needsOrder) {
-                    if !attemptedRootKey {
-                        attemptedRootKey = true
-                        do {
-                            let source = try await fileSource()
-                            rootKey = try await ProtonRequestContext.$priority.withValue(.maintenance) {
-                                try await source.nodeKey(ofLinkID: context.rootLinkID)
-                            }
-                        } catch is CancellationError {
-                            throw CancellationError()
-                        } catch {
-                            DebugLog.log("timeline: order key unavailable; MIME reconciliation continues")
-                        }
-                    }
+                    _ = try await passRootKey(context)
                     let requested = Dictionary(uniqueKeysWithValues: candidates.map { ($0.uid.nodeID, $0) })
                     for link in links {
                         try Task.checkCancellation()
@@ -1054,6 +1079,30 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     timelineOrderStore?.record(order, classifiedUIDs: Set(evidence.keys)) == false
                 {
                     throw TimelineOrderMetadataError.unavailable
+                }
+            }
+            if let photoNames, metadataReconciliation.isCurrent(pass) {
+                let context: PhotosShareContext
+                if let resolvedContext { context = resolvedContext } else { context = try await photosShareContext() }
+                let outcome = try await requestGovernor.causes.run(.photoNames, replacing: true) {
+                    try await PhotoNameFill.backfill(
+                        nodeIDs: pass.inventory.items.compactMap {
+                            $0.uid.volumeID == context.volumeID ? $0.uid.nodeID : nil
+                        },
+                        volumeID: context.volumeID, store: photoNames,
+                        permits: {
+                            !self.isShutDown && self.metadataReconciliation.isCurrent(pass)
+                                && PhotoNameFill.permits(LibraryRuntimeState.shared.snapshot())
+                        },
+                        nameKey: {
+                            guard let key = try await passRootKey(context) else { return nil }
+                            let crypto = self.crypto
+                            return { try? crypto.decryptName($0, parent: key) }
+                        },
+                        fetch: { try await self.driveSession.fetchPhotoLinksMetadata(shareID: context.shareID, linkIDs: $0) })
+                }
+                if outcome.requests > 0 {
+                    DebugLog.log("timeline: file names read requests=\(outcome.requests) deferred=\(outcome.deferred)")
                 }
             }
         } catch is CancellationError {
@@ -1228,6 +1277,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 })
         }
         return active
+    }
+
+    // MARK: - PhotoNameSearchProvider
+
+    nonisolated func photoNameIndex() async -> PhotoNameIndex {
+        photoNames?.index() ?? .empty
     }
 
     // MARK: - LibraryStatsProvider
