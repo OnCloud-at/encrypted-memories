@@ -75,4 +75,12 @@ actual_swiftlint_version="$($swiftlint version)"
   exit 69
 }
 
-"$swiftlint" lint --strict --config "$ROOT/.swiftlint.yml" "${source_files[@]}"
+status=0
+output="$("$swiftlint" lint --strict --config "$ROOT/.swiftlint.yml" "${source_files[@]}" 2>&1)" || status=$?
+printf '%s\n' "$output"
+[[ $status -eq 0 ]] || exit "$status"
+# Without SourceKit, SwiftLint skips the comment rules and still succeeds. That would be a check that does not run.
+if grep -q "Skipping enabled rule" <<< "$output"; then
+  echo "A SwiftLint rule was skipped, so the style check is incomplete." >&2
+  exit 1
+fi
