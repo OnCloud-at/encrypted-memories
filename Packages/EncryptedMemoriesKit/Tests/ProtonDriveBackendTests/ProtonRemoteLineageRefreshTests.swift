@@ -202,11 +202,12 @@ extension DriveSessionStubSuite {
                 }
                 return clock.now - start
             }
-            func preparation() -> (Task<Void, Never>, LockedOutcome) {
+            let laterProgress = LockedOutcome()
+            func preparation(reporting reported: LockedOutcome? = nil) -> (Task<Void, Never>, LockedOutcome) {
                 let cancelled = LockedOutcome()
                 let task = Task {
                     do {
-                        try await service.prepareRemoteIndex { _ in }
+                        try await service.prepareRemoteIndex { _ in reported?.set(true) }
                         cancelled.set(false)
                     } catch {
                         cancelled.set(error is CancellationError)
@@ -229,7 +230,11 @@ extension DriveSessionStubSuite {
                 await gate.wait()
                 released.set(true)
             }
-            let (later, laterCancelled) = preparation()
+            let (later, laterCancelled) = preparation(reporting: laterProgress)
+            // The later preparation reports loading just before it joins the running build.
+            while laterProgress.value == nil, clock.now - begin < .seconds(20) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
             try await Task.sleep(for: .milliseconds(300))
             #expect(listings() == 1, "a later preparation joins the running build")
             #expect(released.value == nil, "the metadata pass stays held while the build runs")
@@ -243,6 +248,68 @@ extension DriveSessionStubSuite {
             let passWait = try await waitedFor(released)
             #expect(released.value == true, "the end of the build releases the metadata pass: \(passWait)")
             pass.cancel()
+        }
+
+        /// Sign-out closes the account's stores after the shutdown of its work. A build that a cancelled waiter left
+        /// running must end first, and no build starts after the shutdown.
+        @Test func theShutdownEndsTheRunningBuildAndStartsNoOther() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let service = makeService(content: content, lineage: lineage)
+            func listings() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
+            }
+            let clock = ContinuousClock()
+            let window = Task { try await service.prepareRemoteIndex { _ in } }
+            let begin = clock.now
+            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(listings() == 1, "the build reached its library listing")
+            window.cancel()
+            _ = await window.result
+
+            // The hanging listing ends only when the shutdown cancels the build.
+            let ended = LockedOutcome()
+            let shutdown = Task {
+                await service.shutdown()
+                ended.set(true)
+            }
+            let stopped = clock.now
+            while ended.value == nil, clock.now - stopped < .seconds(5) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(ended.value == true, "the shutdown ended the running build")
+            shutdown.cancel()
+
+            let requestsBefore = StubURLProtocol.requests().count
+            let afterShutdown = LockedOutcome()
+            let late = Task {
+                do {
+                    try await service.prepareRemoteIndex { _ in }
+                    afterShutdown.set(false)
+                } catch {
+                    afterShutdown.set(error is CancellationError)
+                }
+            }
+            let asked = clock.now
+            while afterShutdown.value == nil, clock.now - asked < .seconds(5) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            late.cancel()
+            #expect(afterShutdown.value == true, "a preparation after the shutdown ends with a cancellation")
+            #expect(StubURLProtocol.requests().count == requestsBefore, "no build starts after the shutdown")
         }
 
         /// A build that ended no longer counts as running: once its result is no longer current, the next preparation
@@ -821,6 +888,55 @@ extension DriveSessionStubSuite {
             let log = await events.entries
             #expect(log.contains("build indexing"), "\(log)")
             #expect(Array(log.suffix(2)) == ["build ready", "metadata pass"], "\(log)")
+        }
+
+        /// A refresh for an asset proof is no first full build. It ends while no preparation waits, and the pass stays held
+        /// for the preparation that builds the index.
+        @Test func aRefreshForAnAssetProofKeepsTheTimelineMetadataPassHeld() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            defer { pass.cancel() }
+
+            _ = try await service.findRemoteAssetProofs(for: [
+                UploadBackupExternalIdentity(identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
+            ])
+            #expect(
+                StubURLProtocol.requests().contains { $0.path.hasPrefix("/drive/volumes/vol1/events") },
+                "the proof lookup refreshed the index")
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(released.value == nil, "the pass stays held for the first full build")
+
+            // A pass that is already cancelled starts no refresh, also when the index is no longer current.
+            await service.remoteMainsChangedHere()
+            let requestsBefore = StubURLProtocol.requests().count
+            let cancelledPass = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                try await service.prepareRemoteIndex { _ in }
+            }
+            await #expect(throws: CancellationError.self) { try await cancelledPass.value }
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(StubURLProtocol.requests().count == requestsBefore, "the cancelled pass started no refresh")
         }
 
         @Test func aFailedFirstBuildReleasesTheTimelineMetadataPass() async throws {
