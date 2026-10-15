@@ -65,6 +65,10 @@ public struct UploadBackendCapabilities: Sendable, Equatable {
 public protocol PhotoUploading: Sendable {
     var capabilities: UploadBackendCapabilities { get }
 
+    /// Waits until an upload of this network kind may start; see `UploadNetworkAdmission`. Every caller reserves before
+    /// it calls `upload` and puts the reservation into `PhotoUploadRequest.networkReservation`.
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation
+
     /// Uploads one file to the photo library, returning the new photo's identifier.
     func upload(
         _ request: PhotoUploadRequest,
@@ -82,6 +86,11 @@ public protocol PhotoUploading: Sendable {
 }
 
 public extension PhotoUploading {
+    /// A reservation that coordinates with nothing. The production uploader shares one admission per account.
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        try await UploadNetworkAdmission().reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
+
     func pause(token: UUID) async throws {}
     func resume(token: UUID) async throws {}
     func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {}
