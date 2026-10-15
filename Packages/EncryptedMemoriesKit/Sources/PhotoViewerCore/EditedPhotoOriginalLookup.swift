@@ -8,11 +8,6 @@ public struct EditedPhotoOriginalState: Equatable, Sendable {
 
     public init() {}
 
-    /// Only a plain photo or video can offer its original: a Live Photo or a series keeps it in more than one file.
-    public static func qualifies(_ item: PhotoItem) -> Bool {
-        !item.isLivePhoto && !item.isBurstCandidate
-    }
-
     public func canShowOriginal(of base: PhotoUID) -> Bool { originals[base] != nil }
 
     public func isShowingOriginal(of base: PhotoUID) -> Bool {
@@ -82,7 +77,7 @@ public final class EditedPhotoOriginalLookup {
         found: @escaping @MainActor (PhotoItem, PhotoItem) -> Void
     ) {
         cancel()
-        guard let item, let provider, EditedPhotoOriginalState.qualifies(item), !answered.contains(item.uid) else {
+        guard let item, let provider, item.mayHaveEditedOriginal, !answered.contains(item.uid) else {
             return
         }
         pending = Task { [sleep, admits] in
