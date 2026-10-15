@@ -20,9 +20,10 @@ final class SQLiteBusyRecorderTests: XCTestCase {
     }
 
     /// Calls the handler as SQLite does for one locked statement, until it gives up. Returns the number of calls.
+    /// A handler that never gives up ends after 10,000 calls, so the test fails instead of hanging.
     private func exhaust(_ recorder: SQLiteBusyRecorder) -> Int {
         var attempts = 0
-        while recorder.shouldRetry(afterAttempts: attempts) { attempts += 1 }
+        while attempts < 10_000, recorder.shouldRetry(afterAttempts: attempts) { attempts += 1 }
         return attempts
     }
 

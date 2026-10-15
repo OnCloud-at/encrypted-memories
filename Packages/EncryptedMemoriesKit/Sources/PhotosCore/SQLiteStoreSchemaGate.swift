@@ -103,7 +103,8 @@ public enum SQLiteStoreSchemaGate {
         enforceForeignKeys: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool,
-        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) }
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil
     ) -> SQLiteRebuildableStoreOutcome {
         func open() -> SQLiteStoreOpenResult {
             openStore(
@@ -113,7 +114,8 @@ public enum SQLiteStoreSchemaGate {
                 enforceForeignKeys: enforceForeignKeys,
                 verifyVersion: verifyVersion,
                 stampVersion: stampVersion,
-                copyItem: copyItem
+                copyItem: copyItem,
+                createDirectory: createDirectory
             )
         }
         switch open() {
@@ -154,14 +156,16 @@ public enum SQLiteStoreSchemaGate {
         enforceForeignKeys: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool,
-        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) }
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil
     ) -> SQLiteStoreOpenResult {
         let compatibility = compatibility(
             at: url,
             schemaSQL: schemaSQL,
             busyTimeoutMs: policy.busyTimeoutMs,
             versionIsCurrent: verifyVersion,
-            copyItem: copyItem
+            copyItem: copyItem,
+            createDirectory: createDirectory
         )
         guard compatibility != .incompatible else { return .incompatible }
         guard compatibility != .unavailable else { return .failed }
@@ -219,7 +223,8 @@ public enum SQLiteStoreSchemaGate {
         schemaSQL: String,
         busyTimeoutMs: Int = 5_000,
         versionIsCurrent: (OpaquePointer?) -> Bool,
-        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) }
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil
     ) -> SQLiteStoreSchemaCompatibility {
         guard FileManager.default.fileExists(atPath: url.path) else { return .empty }
         var inspection: OpaquePointer?
@@ -228,7 +233,8 @@ public enum SQLiteStoreSchemaGate {
             let inspection
         else {
             sqlite3_close(inspection)
-            return compatibilityOfWritableCopy(at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem)
+            return compatibilityOfWritableCopy(
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory)
         }
         defer { sqlite3_close(inspection) }
         // A statement that meets a lock waits as long as the busy timeout. If the lock stays, no answer of this
@@ -248,8 +254,15 @@ public enum SQLiteStoreSchemaGate {
             return current ? .current : .incompatible
         case .unavailable:
             if busy.gaveUp { return .retryLater }
-            return compatibilityOfWritableCopy(at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem)
+            return compatibilityOfWritableCopy(
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory)
         }
+    }
+
+    /// The private directory of a recovery inspection. A test passes its own `createDirectory` to simulate a full disk.
+    private static func createInspectionDirectory(_ url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
     }
 
     /// A read-write schema read can roll back a hot journal. Preserve the original and all its sidecars,
@@ -257,13 +270,13 @@ public enum SQLiteStoreSchemaGate {
     private static func compatibilityOfWritableCopy(
         at url: URL,
         busyTimeoutMs: Int,
-        copyItem: (URL, URL) throws -> Void
+        copyItem: (URL, URL) throws -> Void,
+        createDirectory: ((URL) throws -> Void)?
     ) -> SQLiteStoreSchemaCompatibility {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteStoreInspection-\(UUID().uuidString)", isDirectory: true)
         do {
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            try (createDirectory ?? Self.createInspectionDirectory)(directory)
         } catch {
             logger.error("SQLite could not create its temporary recovery inspection.")
             // A full disk says nothing about the file, so it stays. Any other failure keeps its earlier meaning.

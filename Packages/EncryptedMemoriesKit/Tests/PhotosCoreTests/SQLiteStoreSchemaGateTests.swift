@@ -123,13 +123,14 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
 
     private func openMarkerStore(
         at url: URL, verifyVersion: ((OpaquePointer?) -> Bool)? = nil,
-        copyItem: @escaping (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) }
+        copyItem: @escaping (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil
     ) -> SQLiteRebuildableStoreOutcome {
         SQLiteStoreSchemaGate.openRebuildableStoreOutcome(
             at: url, schemaSQL: markerSchema, policy: noWaitPolicy,
             verifyVersion: verifyVersion ?? markerVersionIsCurrent,
             stampVersion: { sqlite3_exec($0, "INSERT INTO marker VALUES (1);", nil, nil, nil) == SQLITE_OK },
-            copyItem: copyItem)
+            copyItem: copyItem, createDirectory: createDirectory)
     }
 
     private func marker(at url: URL) throws -> URL {
@@ -350,6 +351,24 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
             userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))])
         XCTAssertTrue(isRetryLater(openMarkerStore(at: url, copyItem: { _, _ in throw posix })), "also as POSIX ENOSPC")
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the file stays")
+    }
+
+    func testAnInspectionDirectoryThatFindsNoRoomKeepsTheFileForALaterOpen() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try fileThatNeedsACopy(in: directory)
+        let noRoom = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+
+        XCTAssertTrue(
+            isRetryLater(openMarkerStore(at: url, createDirectory: { _ in throw noRoom })),
+            "a full disk says nothing about the file")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "the file stays")
+
+        let denied = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        XCTAssertTrue(
+            isFailed(openMarkerStore(at: url, createDirectory: { _ in throw denied })),
+            "another failure keeps its earlier meaning")
     }
 
     func testACopyThatFailsForAnotherReasonKeepsItsEarlierMeaning() throws {
