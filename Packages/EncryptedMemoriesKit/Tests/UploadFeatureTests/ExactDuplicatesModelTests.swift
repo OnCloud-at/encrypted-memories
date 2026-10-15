@@ -295,6 +295,50 @@ final class ExactDuplicatesModelTests: XCTestCase {
         }
     }
 
+    /// A scroll page that read the metadata before a merge can resume while the merge reports its trash, before the
+    /// reload starts. Its old metadata must not decide the group of the replacement scan.
+    func testARankingPageThatResumesBeforeTheReloadCannotRefillForgottenMetadata() async {
+        let three = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: [a1, a2, a3])
+        let left = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: [a1, a3])
+        // The opening ranks the first two pages; the group sits after them, so only a scroll page reads it.
+        var initial = manyGroups(60)
+        initial[48] = three
+        let finder = FakeDuplicateFinder(scans: [
+            .init(groups: initial, coverage: .complete), .init(groups: [left], coverage: .complete),
+        ])
+        // The merge trashes a2, and a3 stays because its details changed since the ranking.
+        finder.outcomes[three.id] = .merged(kept: a1, trashed: [a2], keptDuplicates: [a3: .differentDetails])
+        let trashReport = BuildGate()
+        let model = ExactDuplicatesModel(finder: finder) { _ in await trashReport.pass() }
+        await model.load()
+        let delivery = BuildGate()
+        delivery.close()
+        finder.beforeRankingPage = { _ in await delivery.pass() }
+        model.groupAppeared(three.id)
+        await waitUntil({ delivery.hasWaiters }, "a scroll page has read the old metadata")
+        finder.beforeRankingPage = nil
+        finder.mergeGate.close()
+        let merge = Task { await model.merge(groupID: three.id) }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the merge ranked the group")
+        finder.fingerprints[a3] = ExactDuplicateFingerprint(pixelWidth: 42)
+        trashReport.close()
+        finder.mergeGate.open()
+        await waitUntil({ trashReport.hasWaiters }, "the merge reports its trash before the reload")
+
+        delivery.open()
+        await waitUntil({ finder.activeRankings == 0 }, "the scroll page finishes before the reload")
+        finder.rankGate.close()
+        trashReport.open()
+        await waitUntil(
+            { finder.scanCalls == 2 && model.groups.map(\.members) == [[a1, a3]] }, "the reload shows the copies left")
+
+        XCTAssertFalse(model.groups[0].isRanked, "the old metadata cannot check the copies left")
+        XCTAssertNil(model.knownDuplicateCount)
+        finder.rankGate.open()
+        await merge.value
+        XCTAssertEqual(model.groups, [], "fresh metadata shows that the copies left have different details")
+    }
+
     func testALateRankingPageCannotCheckAGroupAfterAnInvalidatingMergeReload() async {
         let initial = manyGroups(60)
         let affected = initial[48]
