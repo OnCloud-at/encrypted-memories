@@ -106,4 +106,93 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
         XCTAssertEqual(sqlite3_column_int(statement, 0), 2)
     }
+
+    func testOnlyADatabaseThatAnotherConnectionLocksCountsAsHeld() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let missing = directory.appendingPathComponent("missing.sqlite")
+        XCTAssertFalse(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: missing), "a missing file is not held")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path), "the check creates no file")
+
+        let text = directory.appendingPathComponent("text.sqlite")
+        try Data("not a database".utf8).write(to: text)
+        XCTAssertFalse(
+            SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: text), "a file that is no database is not held")
+
+        let database = directory.appendingPathComponent("held.sqlite")
+        var owner: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &owner), SQLITE_OK)
+        defer { sqlite3_close(owner) }
+        XCTAssertEqual(sqlite3_exec(owner, "CREATE TABLE marker (value INTEGER);", nil, nil, nil), SQLITE_OK)
+        XCTAssertFalse(
+            SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: database),
+            "a readable database without a lock is not held")
+
+        XCTAssertEqual(sqlite3_exec(owner, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(owner, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertTrue(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: database), "an exclusive lock holds the file")
+        XCTAssertEqual(sqlite3_exec(owner, "COMMIT;", nil, nil, nil), SQLITE_OK)
+    }
+
+    /// A rollback journal that a crashed writer left behind needs a writer to recover it. A read-only check cannot
+    /// recover it and does not count the file as held, so the store replaces such a cache as before.
+    func testADatabaseWithAHotRollbackJournalDoesNotCountAsHeld() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.sqlite")
+        var writer: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(source.path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        for statement in [
+            "PRAGMA journal_mode=DELETE;", "PRAGMA synchronous=FULL;", "CREATE TABLE t (x BLOB);",
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 2000) "
+                + "INSERT INTO t SELECT randomblob(500) FROM c;",
+            "PRAGMA cache_size=2;", "PRAGMA cache_spill=1;", "BEGIN;", "UPDATE t SET x = randomblob(500);",
+        ] {
+            XCTAssertEqual(sqlite3_exec(writer, statement, nil, nil, nil), SQLITE_OK, statement)
+        }
+        // A copy taken while the write runs is what a crash leaves: changed pages and the journal that undoes them.
+        let crashed = directory.appendingPathComponent("crashed.sqlite")
+        try FileManager.default.copyItem(at: source, to: crashed)
+        try FileManager.default.copyItem(
+            at: URL(fileURLWithPath: source.path + "-journal"), to: URL(fileURLWithPath: crashed.path + "-journal"))
+        XCTAssertEqual(sqlite3_exec(writer, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        let header = try FileHandle(forReadingFrom: URL(fileURLWithPath: crashed.path + "-journal")).read(upToCount: 8)
+        XCTAssertEqual(header, Data([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]), "the journal is hot")
+
+        XCTAssertFalse(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: crashed), "a hot journal is no hold")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: crashed.path + "-journal"), "the read-only check recovers nothing")
+    }
+
+    /// A WAL database whose shared-memory file cannot be created cannot be opened for now. It does not count as held.
+    func testAWALDatabaseWithoutAWritableSharedMemoryFileDoesNotCountAsHeld() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.sqlite")
+        var writer: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(source.path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        for statement in [
+            "PRAGMA journal_mode=WAL;", "PRAGMA wal_autocheckpoint=0;", "CREATE TABLE t (x INTEGER);",
+            "INSERT INTO t VALUES (1);",
+        ] {
+            XCTAssertEqual(sqlite3_exec(writer, statement, nil, nil, nil), SQLITE_OK, statement)
+        }
+        let locked = directory.appendingPathComponent("locked", isDirectory: true)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        let copy = locked.appendingPathComponent("copy.sqlite")
+        try FileManager.default.copyItem(at: source, to: copy)
+        try FileManager.default.copyItem(
+            at: URL(fileURLWithPath: source.path + "-wal"), to: URL(fileURLWithPath: copy.path + "-wal"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path + "-shm"), "no shared-memory file exists")
+
+        XCTAssertFalse(SQLiteStoreSchemaGate.isHeldByAnotherConnection(at: copy), "an unopenable file is no hold")
+    }
 }

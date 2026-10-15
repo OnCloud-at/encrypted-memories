@@ -183,6 +183,47 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
         }
     }
 
+    // MARK: - Issue 447: a cache that another connection holds is kept
+
+    private func filledCache(at url: URL, policy: LibraryDatabasePolicy) throws {
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: policy))
+        XCTAssertTrue(store.synchronize([photo("a"), photo("b")], classifiedUIDs: []))
+        store.close()
+    }
+
+    func testACacheThatCannotBeReadIsStillReplaced() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        try filledCache(at: url, policy: policy)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: policy), "a new cache replaces it")
+        defer { store.close() }
+
+        XCTAssertEqual(try store.nextPage().count, 0, "the earlier rows are gone, as before")
+    }
+
+    func testACacheThatAnotherConnectionHoldsIsKeptAndOpensAgainLater() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        try filledCache(at: url, policy: policy)
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "PRAGMA locking_mode=EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN EXCLUSIVE;", nil, nil, nil), SQLITE_OK)
+
+        let busy = TimelineOrderMetadataStore(url: url, policy: policy)
+        let busyOpened = busy != nil
+        busy?.close()
+        XCTAssertEqual(sqlite3_exec(blocker, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(blocker)
+
+        XCTAssertFalse(busyOpened, "a busy cache stays unavailable for now")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: policy))
+        defer { store.close() }
+        XCTAssertEqual(try store.nextPage().count, 2, "the cache opens again with its rows")
+    }
+
     func testOneHundredThousandPhotosUseBoundedPagesAndRetainTheUpgradeTimeline() throws {
         let store = try XCTUnwrap(TimelineOrderMetadataStore(url: directory().appendingPathComponent("order.sqlite")))
         defer { store.close() }

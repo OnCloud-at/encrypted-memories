@@ -93,6 +93,26 @@ public enum SQLiteStoreSchemaGate {
         }
     }
 
+    /// True when another connection holds the database at `url` for now: SQLite answers a read of its schema with
+    /// busy or locked. Such a file is not unusable; the next open can read it.
+    public static func isHeldByAnotherConnection(at url: URL) -> Bool {
+        var handle: OpaquePointer?
+        defer { sqlite3_close(handle) }
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK
+        else { return false }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        let result: Int32
+        if sqlite3_prepare_v2(handle, "SELECT count(*) FROM sqlite_schema;", -1, &statement, nil) != SQLITE_OK {
+            result = sqlite3_errcode(handle)
+        } else {
+            result = sqlite3_step(statement)
+        }
+        // Without a shared cache this probe meets only busy codes; the mask also accepts extended busy codes.
+        let primary = result & 0xFF
+        return primary == SQLITE_BUSY || primary == SQLITE_LOCKED
+    }
+
     /// Removes a database file and its `-wal` and `-shm` files. Missing files count as removed.
     public static func removeDatabaseFiles(at url: URL) -> Bool {
         guard !url.hasDirectoryPath else { return false }
