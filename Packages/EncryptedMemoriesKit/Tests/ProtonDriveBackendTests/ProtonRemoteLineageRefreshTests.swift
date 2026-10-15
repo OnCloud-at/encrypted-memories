@@ -270,7 +270,8 @@ extension DriveSessionStubSuite {
             routeEmptyEvents(from: "one", to: "two")
             StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
             StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
-            let service = makeService(content: content, lineage: lineage)
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             func listings() -> Int {
                 StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
             }
@@ -286,12 +287,23 @@ extension DriveSessionStubSuite {
             let ended = LockedOutcome()
             let shutdown = Task {
                 await service.shutdown()
-                ended.set(true)
+                // The shutdown returns only after the build ended, so no build can touch the stores after it.
+                ended.set(!(await service.hasUnfinishedRemoteContentIndexBuild))
             }
             let stopped = clock.now
             while ended.value == nil, clock.now - stopped < .seconds(5) { try await Task.sleep(for: .milliseconds(10)) }
             #expect(ended.value == true, "the shutdown ended the running build")
             shutdown.cancel()
+            // The cancelled build ended, so the metadata pass that the cancelled preparation left held is released.
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            defer { pass.cancel() }
+            let shut = clock.now
+            while released.value == nil, clock.now - shut < .seconds(5) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(released.value == true, "the shutdown cancelled the build")
 
             let requestsBefore = StubURLProtocol.requests().count
             let afterShutdown = LockedOutcome()
@@ -310,6 +322,102 @@ extension DriveSessionStubSuite {
             late.cancel()
             #expect(afterShutdown.value == true, "a preparation after the shutdown ends with a cancellation")
             #expect(StubURLProtocol.requests().count == requestsBefore, "no build starts after the shutdown")
+        }
+
+        /// An invalidation cancels a build without waiting for it. The shutdown still waits for that build, so it cannot
+        /// touch the stores after the shutdown.
+        @Test func theShutdownWaitsForABuildThatAnInvalidationCancelled() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let service = makeService(content: content, lineage: lineage)
+            func listings() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
+            }
+            let clock = ContinuousClock()
+            let pass = Task { try await service.prepareRemoteIndex { _ in } }
+            let begin = clock.now
+            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(listings() == 1, "the build reached its library listing")
+
+            await service.invalidateCachedRemoteState()
+            await service.shutdown()
+
+            #expect(
+                !(await service.hasUnfinishedRemoteContentIndexBuild),
+                "the cancelled build ended before the shutdown returned")
+            _ = await pass.result
+        }
+
+        /// A preparation that needs the first full build can stop while a shorter refresh runs. The end of that refresh
+        /// is not the end of the first full build, so the timeline metadata pass stays held.
+        @Test func theEndOfAShorterRefreshKeepsThePassHeldForTheFirstFullBuild() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            StubURLProtocol.hang("GET /drive/volumes/vol1/events/one")
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            func eventReads() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/events/one") }.count
+            }
+            let clock = ContinuousClock()
+            // An asset proof starts the shorter refresh of the events, which hangs.
+            let proof = Task {
+                try await service.findRemoteAssetProofs(for: [
+                    UploadBackupExternalIdentity(identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
+                ])
+            }
+            let begin = clock.now
+            while eventReads() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(eventReads() == 1, "the shorter refresh reads the events")
+            // The preparation needs the lineage rebuild, waits for the running refresh and then stops.
+            let loading = LockedOutcome()
+            let preparation = Task { try await service.prepareRemoteIndex { _ in loading.set(true) } }
+            while loading.value == nil, clock.now - begin < .seconds(20) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            preparation.cancel()
+            _ = await preparation.result
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            defer { pass.cancel() }
+
+            // The refresh ends without the lineage rebuild.
+            await service.invalidateCachedRemoteState()
+            _ = await proof.result
+            try await Task.sleep(for: .milliseconds(300))
+
+            #expect(released.value == nil, "the pass stays held for the first full build")
         }
 
         /// A build that ended no longer counts as running: once its result is no longer current, the next preparation
