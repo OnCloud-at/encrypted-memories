@@ -168,6 +168,119 @@ extension DriveSessionStubSuite {
             #expect(!later.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "the rebuild runs once")
         }
 
+        /// A background window that expires while its pass waits for the index build must end at once. The build
+        /// itself keeps running: a later preparation joins it instead of starting a second one, and the timeline
+        /// metadata pass stays held until the build ends.
+        @Test func aCancelledIndexPreparationStopsWaitingAndTheBuildKeepsRunning() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            func listings() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
+            }
+            let clock = ContinuousClock()
+            func waitedFor(_ outcome: LockedOutcome) async throws -> Duration {
+                let start = clock.now
+                while outcome.value == nil, clock.now - start < .seconds(5) {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                return clock.now - start
+            }
+            func preparation() -> (Task<Void, Never>, LockedOutcome) {
+                let cancelled = LockedOutcome()
+                let task = Task {
+                    do {
+                        try await service.prepareRemoteIndex { _ in }
+                        cancelled.set(false)
+                    } catch {
+                        cancelled.set(error is CancellationError)
+                    }
+                }
+                return (task, cancelled)
+            }
+
+            let (window, windowCancelled) = preparation()
+            let begin = clock.now
+            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(listings() == 1, "the build reached its library listing")
+            window.cancel()
+            let windowWait = try await waitedFor(windowCancelled)
+            #expect(windowCancelled.value == true, "the expired window ended with a cancellation")
+            #expect(windowWait < .seconds(2), "the expired window stopped waiting at once: \(windowWait)")
+
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            let (later, laterCancelled) = preparation()
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(listings() == 1, "a later preparation joins the running build")
+            #expect(released.value == nil, "the metadata pass stays held while the build runs")
+            later.cancel()
+            let laterWait = try await waitedFor(laterCancelled)
+            #expect(laterCancelled.value == true, "the joined preparation ended with a cancellation")
+            #expect(laterWait < .seconds(2), "the joined preparation stopped waiting at once: \(laterWait)")
+
+            // The end of the build, here through an invalidation, releases the metadata pass.
+            await service.invalidateCachedRemoteState()
+            let passWait = try await waitedFor(released)
+            #expect(released.value == true, "the end of the build releases the metadata pass: \(passWait)")
+            pass.cancel()
+        }
+
+        /// A build that ended no longer counts as running: once its result is no longer current, the next preparation
+        /// refreshes the index again instead of reusing the ended build.
+        @Test func anEndedBuildLetsTheNextPreparationRefreshAgain() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            routeEmptyEvents(from: "two", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            let service = makeService(content: content, lineage: lineage)
+            func eventReads() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/events") }.count
+            }
+
+            try await service.prepareRemoteIndex { _ in }
+            let afterFirst = eventReads()
+            #expect(afterFirst > 0, "the first preparation reads the events")
+            // A trash of main photos on this device makes the refreshed index no longer current.
+            await service.remoteMainsChangedHere()
+            try await service.prepareRemoteIndex { _ in }
+
+            #expect(eventReads() > afterFirst, "the next preparation refreshes again")
+        }
+
         /// A merge trashes main photos while the library check runs. The trash is a later event than the build, so the
         /// staged build stays and resumes where it stopped; a full invalidation still discards it.
         @Test func aTrashOfMainPhotosKeepsTheStagedBuildAndTheBuildResumes() async throws {
@@ -698,6 +811,8 @@ extension DriveSessionStubSuite {
             reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
 
             try await service.prepareRemoteIndex { step in
+                // The last progress comes a moment after the build ends; the pass still starts only after it.
+                if step.phase == .ready { try? await Task.sleep(for: .milliseconds(500)) }
                 await events.append("build \(step.phase)")
                 if step.phase == .indexing { try? await Task.sleep(for: .milliseconds(1_500)) }
             }
@@ -962,6 +1077,14 @@ extension DriveSessionStubSuite {
                 progress: { _ in })
         }
     }
+}
+
+/// One outcome that a test reads while the code under test still runs: nil until it is set.
+private final class LockedOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool?
+    var value: Bool? { lock.withLock { stored } }
+    func set(_ value: Bool) { lock.withLock { stored = value } }
 }
 
 /// The SDK's exact duplicate query, which these tests never reach.
