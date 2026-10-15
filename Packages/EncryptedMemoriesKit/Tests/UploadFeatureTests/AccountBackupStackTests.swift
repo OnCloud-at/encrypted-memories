@@ -1,9 +1,10 @@
 import AlbumSyncCore
 import Foundation
-import PhotoLibraryBackupAdapter
 import PhotosCore
 import UploadCore
 import XCTest
+
+@testable import PhotoLibraryBackupAdapter
 
 @MainActor
 final class AccountBackupStackTests: XCTestCase {
@@ -50,7 +51,12 @@ final class AccountBackupStackTests: XCTestCase {
         await stack.shutdownUnused()
 
         XCTAssertFalse(store.isOperational(), "the pending store is closed")
-        XCTAssertFalse(stack.photoBackup.isAvailable, "the photo backup is shut down")
+        XCTAssertFalse(stack.photoBackup.isAvailable)
+        #if DEBUG
+            // A closed pending store alone already makes the backup unavailable; its own queue store proves the shutdown.
+            XCTAssertEqual(
+                stack.photoBackup.queueStoreForTesting?.isOperational(), false, "the photo backup is shut down")
+        #endif
         XCTAssertFalse(stack.albumSync.isAvailable, "album sync is shut down")
     }
 
