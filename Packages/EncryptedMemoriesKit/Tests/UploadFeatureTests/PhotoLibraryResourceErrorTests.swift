@@ -6,6 +6,28 @@ import XCTest
 @testable import UploadCore
 
 final class PhotoLibraryResourceErrorTests: XCTestCase {
+    func testOnlyAPhotoThatAnAnsweringLibraryNoLongerListsLeavesTheCatalog() {
+        // A library without access, on an offline volume or not loaded yet proves nothing about a photo.
+        for listed in [true, false] {
+            XCTAssertFalse(
+                PhotoLibraryResourceResolver.photosNoLongerLists(
+                    "asset", libraryAnswers: { false }, listsAsset: { _ in listed }))
+        }
+        // A photo that Photos still lists, for example a series photo of another main photo, stays.
+        XCTAssertFalse(
+            PhotoLibraryResourceResolver.photosNoLongerLists(
+                "asset", libraryAnswers: { true }, listsAsset: { _ in true }))
+        var asked: [String] = []
+        XCTAssertTrue(
+            PhotoLibraryResourceResolver.photosNoLongerLists(
+                "asset", libraryAnswers: { true },
+                listsAsset: {
+                    asked.append($0)
+                    return false
+                }))
+        XCTAssertEqual(asked, ["asset"], "Photos is asked about this photo")
+    }
+
     func testAnUnreadableResourceOfAListedPhotoIsCheckedAgainBeforeItCountsAsMissing() {
         // The asset still exists; only its file cannot be read. It takes the checks of a missing resource, so it
         // never leaves the queue and returns through catalog recovery on every pass.

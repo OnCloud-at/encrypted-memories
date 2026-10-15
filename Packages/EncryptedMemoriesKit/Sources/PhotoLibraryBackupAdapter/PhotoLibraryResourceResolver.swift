@@ -306,6 +306,18 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         return PHAsset.fetchAssets(with: options).firstObject != nil
     }
 
+    /// True when a photo that the backup could not resolve is gone from Photos: the library answers asset queries and
+    /// does not list the photo. A library without access, on an offline volume or not loaded yet proves nothing, and a
+    /// photo that Photos still lists, for example a series photo of another main photo, stays in the catalog.
+    static func photosNoLongerLists(
+        _ identifier: String,
+        libraryAnswers: () -> Bool = libraryAnswersAssetQueries,
+        listsAsset: (String) -> Bool = { PhotoKitAssetMapper.asset(withLocalIdentifier: $0) != nil }
+    ) -> Bool {
+        guard libraryAnswers() else { return false }
+        return !listsAsset(identifier)
+    }
+
     /// The backup plan of the asset as Photos lists it now. Nil when the asset has no backup work of its own: a series
     /// photo that belongs to another main photo. An asset that lists no main file takes the checks of a file that
     /// Photos reports as missing, so it never leaves the queue and comes back through catalog recovery on every pass.
