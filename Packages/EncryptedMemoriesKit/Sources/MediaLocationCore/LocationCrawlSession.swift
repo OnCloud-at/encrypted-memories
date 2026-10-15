@@ -10,8 +10,8 @@ public final class LocationCrawlSession {
     public struct Platform: Sendable, Equatable {
         /// How long the thumbnail crawl runs alone before GPS probing starts.
         public var headStart: Duration
-        /// Stops an earlier crawl and requires a current store session before the delayed start. Without it, the
-        /// account configuration stops the earlier crawl.
+        /// Stops an earlier crawl and requires a current store session before the delayed start. Without it, the host
+        /// stops an earlier crawl itself (on macOS, the account configuration; after a pause, the privacy stop).
         public var requiresStoreSession: Bool
 
         public init(headStart: Duration, requiresStoreSession: Bool) {
@@ -61,7 +61,8 @@ public final class LocationCrawlSession {
     public let crawl: LocationCrawl
     public let index: PhotoLocationIndex
     public let store: PhotoLocationStore
-    /// True from a start until a pause, a restart or the retirement.
+    /// True from a start until `pause`, `prepareRestart`, `invalidate`, `retire`, `resetForTeardown`, or a restart
+    /// for a newer inventory.
     public private(set) var isStarted = false
     private let platform: Platform
     private let isEnabled: @MainActor () -> Bool
@@ -206,6 +207,7 @@ public final class LocationCrawlSession {
 
     /// Ends the session's work for the account teardown and forgets its inventory. The caller joins the returned
     /// start task, then cancels `crawl`.
+    @discardableResult
     public func retire() -> Task<Void, Never>? {
         let starter = startTask
         generation &+= 1

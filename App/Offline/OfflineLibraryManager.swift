@@ -169,12 +169,12 @@ final class OfflineLibraryManager {
         context.configure(cache, previewCache, originalsCache)
         let previousCrawlStarted = locationCrawl.isStarted
         let accountChanged = previousAccountUID != nil && previousAccountUID != context.accountUID
-        let previousStarter = locationCrawl.invalidate()
         locationConfigurationGeneration &+= 1
         let configurationGeneration = locationConfigurationGeneration
         configuredAccountUID = context.accountUID
         let previousConfiguration = locationConfigurationTask
         previousConfiguration?.cancel()
+        let previousStarter = locationCrawl.invalidate()
         if accountChanged {
             locationIndex.replaceAll([])
             locationIndex.updateScanProgress(PhotoLocationScanProgress())
@@ -237,10 +237,10 @@ final class OfflineLibraryManager {
     func stopForAccountTeardown() async {
         originalsCapGate.closeAdmission()
         let retiringStatsSession = statsTeardownSession
-        let activeLocationCrawlStarter = locationCrawl.retire()
         let activeLocationConfiguration = locationConfigurationTask
         let activeFeed = feed
         locationConfigurationGeneration &+= 1
+        let activeLocationCrawlStarter = locationCrawl.retire()
         activeLocationConfiguration?.cancel()
         locationConfigurationTask = nil
         locationIndex.replaceAll([])

@@ -1047,7 +1047,7 @@ final class MobileLibraryModel {
                 accountUID: accountUID,
                 location: LocationCrawl.metadataProbe(backend),
                 visibleDemand: { await feed?.hasVisibleThumbnailPressure() ?? false },
-                yieldsAlways: { await MainActor.run { !self.applicationIsActive } },
+                yieldsAlways: { [weak self] in await MainActor.run { !(self?.applicationIsActive ?? false) } },
                 log: { DebugLog.log($0) },
                 isCurrent: { [weak self] in loadGeneration == self?.loadToken && self?.session?.uid == accountUID },
                 restartForNewerInventory: { [weak self] in self?.startLocationCrawlIfNeeded() }
@@ -1141,7 +1141,7 @@ final class MobileLibraryModel {
         let activeUploadRefreshCoordinator = uploadRefreshCoordinator
         let activeChangeMonitor = libraryChangeMonitor
         let activeLocationCrawl = locationCrawl.crawl
-        let activeLocationCrawlStarter = locationCrawl.retire()
+        let activeLocationCrawlStarter = locationCrawl.startingTask
         searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
@@ -1160,6 +1160,7 @@ final class MobileLibraryModel {
         seriesDissolutionTask = nil
         favoriteState.reset(keepingFavorites: true)
         let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
+        locationCrawl.retire()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating

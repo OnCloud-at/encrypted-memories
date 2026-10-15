@@ -26,10 +26,11 @@ import Testing
         let session = fixture.session(headStart: .milliseconds(200))
 
         session.start(items: fixture.items, fixture.start())
+        let starter = session.startingTask
         session.pause()
-        try await Task.sleep(for: .milliseconds(400))
+        await starter?.value
 
-        #expect(fixture.probes.value() == 0)
+        #expect(fixture.probes.value() == 0, "the paused start ended without probing")
         #expect(!session.isStarted)
     }
 
@@ -66,10 +67,11 @@ import Testing
         let current = Flag(true)
 
         session.start(items: fixture.items, fixture.start(isCurrent: { current.get() }))
+        let starter = session.startingTask
         current.set(false)
-        try await Task.sleep(for: .milliseconds(250))
+        await starter?.value
 
-        #expect(fixture.probes.value() == 0)
+        #expect(fixture.probes.value() == 0, "the stale start ended without probing")
     }
 
     @Test func aStoreSessionIsRequiredWhenThePlatformAsksForIt() async throws {
@@ -78,7 +80,7 @@ import Testing
         let session = fixture.session(requiresStoreSession: true)
 
         session.start(items: fixture.items, fixture.start())
-        try await Task.sleep(for: .milliseconds(200))
+        await session.startingTask?.value
         #expect(fixture.probes.value() == 0, "without the account's restored location cache nothing is probed")
 
         fixture.store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
