@@ -204,6 +204,8 @@ jobs:
         if: ${{ !cancelled() && github.event_name != 'pull_request' }}
         with:
           build-profile: package
+          # A queue run saves to its own temporary branch (gh-readonly-queue/...), which no other run can read.
+          save-cache: ${{ github.event_name != 'merge_group' }}
           measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
       - name: Run all package and SDK tests
         id: tests
@@ -230,6 +232,8 @@ jobs:
         id: prepare
         with:
           build-profile: app
+          # A queue run saves to its own temporary branch (gh-readonly-queue/...), which no other run can read.
+          save-cache: ${{ github.event_name != 'merge_group' }}
           measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
       - name: Verify iOS shared architecture
         id: architecture

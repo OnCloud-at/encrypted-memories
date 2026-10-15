@@ -121,11 +121,21 @@ class PullRequestWorkflowTests < Minitest::Test
       .find { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
     assert_equal "false", macos.fetch("with").fetch("save-cache")
     refute macos.fetch("with").fetch("measure-cache", false)
-    refute_equal "false", ios.fetch("with").fetch("save-cache", "true")
+    # A queue run saves nothing: its cache would belong to its own temporary branch, which no other run reads.
+    package = @workflow.fetch("jobs").fetch("package-verification").fetch("steps")
+      .find { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    [ios, package].each do |step|
+      saves = step.fetch("with").fetch("save-cache")
+      {"merge_group" => false, "workflow_dispatch" => true}.each do |event, expected|
+        assert_equal expected, evaluate(saves, {"github.event_name" => event}), "#{event}: #{saves}"
+      end
+    end
     assert_includes ios.fetch("with").fetch("measure-cache"), "inputs.measure_cache"
     action = YAML.load_file(File.join(WORKFLOWS, "../actions/prepare-apple-build/action.yml"))
-    save = action.fetch("runs").fetch("steps").find { |step| step["name"] == "Save resolved Xcode dependencies" }
-    assert_includes save.fetch("if"), "inputs.save-cache != 'false'"
+    ["Save resolved SwiftPM dependencies", "Save resolved Xcode dependencies"].each do |name|
+      save = action.fetch("runs").fetch("steps").find { |step| step["name"] == name }
+      assert_includes save.fetch("if"), "inputs.save-cache != 'false'", name
+    end
   end
 
   def test_failed_ui_jobs_retain_the_complete_result_bundle
