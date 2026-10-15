@@ -73,9 +73,32 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
                 try await Task.sleep(for: timeout)
                 return nil
             }
-            defer { group.cancelAll() }
-            if let reservation = try await group.next() ?? nil { return reservation }
+            let first: UploadNetworkReservation?
+            do {
+                first = try await group.next() ?? nil
+            } catch {
+                group.cancelAll()
+                await Self.releaseLateReservations(of: &group)
+                throw error
+            }
+            group.cancelAll()
+            await Self.releaseLateReservations(of: &group)
+            if let first { return first }
             throw UploadError.backend("The test uploader waited \(timeout) for its network reservation")
+        }
+    }
+
+    /// A reservation that arrives while the wait ends goes back at once, so no test keeps a place by accident.
+    private static func releaseLateReservations(
+        of group: inout ThrowingTaskGroup<UploadNetworkReservation?, any Error>
+    ) async {
+        while true {
+            do {
+                guard let late = try await group.next() else { return }
+                late?.release()
+            } catch {
+                continue
+            }
         }
     }
 

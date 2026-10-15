@@ -271,6 +271,8 @@ public actor BackupSyncRunner {
             sourceKeys.contains(where: { key.hasPrefix($0 + "|") }) ? token : nil
         }
         let joins = tokens.compactMap { inFlightJoins[$0] }
+        // A transfer that still waits for the network has no join yet; ending its wait ends the transfer.
+        for token in tokens { networkWaits[token]?.cancel() }
         // Make the local deletion authoritative before awaiting native cancellation. The actor can
         // re-enter while a join is suspended; leaving the row until afterwards lets the active drain
         // return one stale item even though this removal already tombstoned every completion callback.
@@ -567,7 +569,10 @@ public actor BackupSyncRunner {
     /// Cancels the running transfers through the stop path, without ending the pass. Each row returns to the queue
     /// without an attempt, and no new item starts until Wi-Fi returns.
     private func stopTransfersThatMustWaitForWiFi() async {
-        guard isRunning, !inFlightJoins.isEmpty, throttleInputs().waitsForWiFi else { return }
+        guard isRunning, !inFlightJoins.isEmpty || !networkWaits.isEmpty, throttleInputs().waitsForWiFi else {
+            return
+        }
+        for wait in networkWaits.values { wait.cancel() }
         let joins = Array(inFlightJoins.values)
         await withTaskGroup(of: Void.self) { group in
             for join in joins {
@@ -1291,6 +1296,7 @@ public actor BackupSyncRunner {
         request.allowsExpensiveNetwork = network.usesMobileData
 
         let uid = try await uploadWithWatchdog(
+            source: entry.source,
             request,
             progressKey: key,
             itemBaseFraction: 0,
@@ -1958,6 +1964,7 @@ public actor BackupSyncRunner {
         .replacingExistingDraft(replacingDraft)
         request.allowsExpensiveNetwork = network.usesMobileData
         return try await uploadWithWatchdog(
+            source: descriptor.source,
             request,
             progressKey: entryKey,
             itemBaseFraction: Double(1 + completedSecondaries) / Double(totalResourceCount),
@@ -2598,6 +2605,7 @@ public actor BackupSyncRunner {
     /// returned as a retryable transport timeout, while a slow transfer can run indefinitely as
     /// long as the backend continues to report progress.
     private func uploadWithWatchdog(
+        source: UploadSourceIdentity,
         _ request: PhotoUploadRequest,
         progressKey: String,
         itemBaseFraction: Double,
@@ -2607,6 +2615,10 @@ public actor BackupSyncRunner {
         // started is neither a stall nor a try.
         let reservation = try await reserveNetwork(for: request)
         defer { reservation.release() }
+        // The wait can last long. A source that was removed or excluded meanwhile does not upload, and a device that
+        // left Wi-Fi while the backup must wait for it does not start. The row returns to the queue without an attempt.
+        guard await admitsTransfer(for: source) else { throw CancellationError() }
+        _ = try transferNetwork()
         var reservedRequest = request
         reservedRequest.networkReservation = reservation
         let request = reservedRequest
