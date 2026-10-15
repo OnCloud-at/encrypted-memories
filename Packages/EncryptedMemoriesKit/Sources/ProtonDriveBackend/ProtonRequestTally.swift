@@ -33,8 +33,8 @@ enum ProtonRequestCause: String, CaseIterable, Sendable {
     case local
 }
 
-/// Method and endpoint template of one request. The template keeps only fixed path words; identifiers and the query
-/// never leave the transport.
+/// Method and endpoint template of one request. The template keeps only path words that have the shape of a route word
+/// (see `isFixedWord`); the host, the query and the fragment are dropped.
 struct ProtonRequestLabel: Sendable, Equatable {
     static let storageEndpoint = "<storage>"
     static let maximumSegments = 8
@@ -43,7 +43,14 @@ struct ProtonRequestLabel: Sendable, Equatable {
     let endpoint: String
 
     static func api(method: String, path: String) -> ProtonRequestLabel {
-        let pathOnly = path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+        var rest = Substring(path)
+        // An input with a scheme is a full URL: its host is not part of the route.
+        if let marker = rest.range(of: "://"), isScheme(rest[..<marker.lowerBound]) {
+            let afterScheme = rest[marker.upperBound...]
+            rest = afterScheme.firstIndex(where: { "/?#".contains($0) }).map { afterScheme[$0...] } ?? ""
+        }
+        // The query and the fragment are not part of the route, whatever they contain.
+        let pathOnly = rest.prefix { $0 != "?" && $0 != "#" }
         let segments = pathOnly.split(separator: "/").prefix(maximumSegments).map {
             isFixedWord($0) ? String($0) : "{id}"
         }
@@ -55,10 +62,22 @@ struct ProtonRequestLabel: Sendable, Equatable {
         ProtonRequestLabel(method: normalizedMethod(method), endpoint: storageEndpoint)
     }
 
+    /// A URL scheme: an ASCII letter, then ASCII letters, digits, `+`, `-` or `.`.
+    private static func isScheme(_ value: Substring) -> Bool {
+        guard let first = value.unicodeScalars.first, ("a"..."z").contains(first) || ("A"..."Z").contains(first) else {
+            return false
+        }
+        let punctuation = "+-.".unicodeScalars
+        return value.unicodeScalars.allSatisfy {
+            ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0) || punctuation.contains($0)
+        }
+    }
+
     /// A path word is kept when it has the shape of a route word: 3 to 32 ASCII lowercase letters, underscores or
     /// hyphens, or a version such as `v4`. Identifiers carry digits or capitals and become `{id}`. This is a shape
-    /// rule, not a list: a lowercase-only identifier of that length would be kept. Proton identifiers are mixed-case
-    /// base64 or hex with digits, and every route word of the app and the SDK core is a fixed lowercase word.
+    /// rule, a heuristic and not a list: a lowercase-only token of that length in a path segment would be kept.
+    /// Proton identifiers are mixed-case base64 or hex with digits, and every route word of the app and the SDK core
+    /// is a fixed lowercase word.
     static func isFixedWord(_ segment: Substring) -> Bool {
         // Unicode scalars, not Characters: a letter with a combining mark would compare as a lowercase letter.
         let scalars = segment.unicodeScalars
@@ -160,8 +179,9 @@ struct ProtonRequestCauseBinding: Sendable {
     }
 }
 
-/// Request counts kept by the governor since the backend was last built. Counts only: the keys hold code-owned names
-/// and endpoint templates.
+/// Request counts kept by the governor. They last since the latest construction of the backend; a rebuild starts them
+/// again. The keys hold causes, status classes and endpoint templates made of route shapes (see
+/// `ProtonRequestLabel.isFixedWord` for the limit of that rule).
 struct ProtonRequestTally: Sendable {
     struct Key: Hashable, Sendable {
         let scope: ProtonRequestScope

@@ -408,7 +408,7 @@ actor ProtonRequestGovernor {
         )
     }
 
-    /// Counts of this session plus the live state of every scope, for the support report.
+    /// Counts since the backend was built plus the live state of every scope, for the support report.
     func requestSupportSnapshot() -> RemoteRequestSupportSnapshot {
         let live = snapshot()
         let counts = tally.counts

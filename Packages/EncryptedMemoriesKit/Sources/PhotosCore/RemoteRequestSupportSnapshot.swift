@@ -1,8 +1,10 @@
 import Foundation
 
-/// Request counts since the backend was last built (sign-in, launch or a backend rebuild) for a support report.
-/// Every string is a code-owned name or an endpoint template without identifiers; the report never holds a URL,
-/// an identifier or a name.
+/// Request counts for a support report. They last since the latest construction of the backend (sign-in, launch or
+/// a rebuild); a rebuild starts them again.
+/// The report holds only route shapes, causes, status classes and counts. The route shape is a heuristic: a path word
+/// is kept when it looks like a route word (3 to 32 lowercase letters, underscores or hyphens), so a token of that
+/// shape inside a path segment would be kept.
 public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
     public struct Count: Codable, Sendable, Equatable {
         public let scope: String

@@ -47,8 +47,19 @@ struct ProtonRequestTallyTests {
         ("/drive/files/Holiday photo.jpg", "/drive/files/{id}"),
         ("/drive/files/café", "/drive/files/{id}"),
         ("/drive/files/my%20photo", "/drive/files/{id}"),
-        ("/drive/events/latest#fragment", "/drive/events/{id}"),
-        ("https://drive-api.proton.me/drive/shares", "/{id}/{id}/drive/shares"),
+        // The fragment is dropped like the query, whatever it contains.
+        ("/drive/events/latest#fragment", "/drive/events/latest"),
+        ("/drive/events/latest#note/alice", "/drive/events/latest"),
+        ("/drive/shares?next=/alice/x", "/drive/shares"),
+        // An input with a scheme is a full URL: only its path is segmented, never its host.
+        ("https://drive-api.proton.me/drive/shares", "/drive/shares"),
+        ("https://alice/drive/shares", "/drive/shares"),
+        ("https://alice", "/"),
+        ("https://alice?x/drive", "/"),
+        ("ftp://alice#frag/drive/shares", "/"),
+        // "://" inside the query or the fragment is no scheme.
+        ("/drive/shares?next=https://alice/x", "/drive/shares"),
+        ("/drive/shares#http://alice/y", "/drive/shares"),
         ("", "/"),
         ("//drive//shares//", "/drive/shares"),
         ("/drive/shares/", "/drive/shares"),
@@ -239,7 +250,8 @@ struct ProtonRequestTallyTests {
         let permit = try await governor.acquire(scope: .api)
         let negative = try await governor.acquire(scope: .api)
         await governor.finish(permit, statusCode: 429, retryAfter: .infinity)
-        // A negative wait means nothing and is not a maximum either.
+        // A negative value that reaches the tally directly is not a maximum either. A negative header never does:
+        // the parser reads it as 0 seconds (see the next test).
         await governor.finish(negative, statusCode: 429, retryAfter: -5)
         let snapshot = await governor.requestSupportSnapshot()
         let api = try #require(snapshot.scopes.first { $0.scope == "api" })
@@ -247,6 +259,21 @@ struct ProtonRequestTallyTests {
         #expect(api.totalCooldownSeconds.isFinite)
         // The support report encodes with the default strategy, which throws on a non-finite number.
         _ = try JSONEncoder().encode(snapshot)
+    }
+
+    @Test func aNegativeRetryAfterHeaderCountsAsZeroSeconds() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let url = try #require(URL(string: "https://drive-api.invalid/drive/shares"))
+        let response = try #require(
+            HTTPURLResponse(
+                url: url, statusCode: 429, httpVersion: "HTTP/1.1", headerFields: ["Retry-After": "-5"]))
+        // The production parser clamps the header before the tally sees it.
+        let seconds = try #require(ProtonRetryAfter.seconds(from: response))
+        #expect(seconds == 0)
+        let permit = try await governor.acquire(scope: .api)
+        await governor.finish(permit, statusCode: 429, retryAfter: seconds)
+        let api = try #require(await governor.requestSupportSnapshot().scopes.first { $0.scope == "api" })
+        #expect(api.maximumRetryAfterSeconds == 0)
     }
 
     @Test func servicesOutsideTheBridgeNameTheirCauseThroughTheirShutdownGate() async throws {
