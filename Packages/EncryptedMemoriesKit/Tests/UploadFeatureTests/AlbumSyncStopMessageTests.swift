@@ -64,6 +64,30 @@ final class AlbumSyncStopMessageTests: XCTestCase {
             .init(text: stoppedText, style: .information))
     }
 
+    func testAStopThatDroppedQueuedAlbumsSaysThatTheSyncStoppedAlsoWhenTheRunNeedsAttention() {
+        let state = stopped(queuedAlbums: 1)
+        XCTAssertEqual(
+            state.message(after: .finished(report(unattachable: 1)), current: none),
+            .init(text: stoppedText, style: .information))
+        XCTAssertEqual(
+            state.message(after: .finished(report(incomplete: 1)), current: none),
+            .init(text: stoppedText, style: .information))
+    }
+
+    func testASecondStopChangesNothing() {
+        var once = stopped()
+        var twice = stopped()
+        twice.stopPressed(isSyncing: true, queuedAlbums: 0)
+        XCTAssertEqual(twice, once)
+
+        once = stopped(queuedAlbums: 2)
+        twice = stopped(queuedAlbums: 2)
+        twice.stopPressed(isSyncing: true, queuedAlbums: 0)
+        XCTAssertEqual(twice, once, "a second Stop keeps the dropped albums")
+        XCTAssertEqual(
+            twice.message(after: .finished(report()), current: none), .init(text: stoppedText, style: .information))
+    }
+
     func testAStoppedRunThatEndedWithPhotosThatNeedAttentionKeepsTheLine() {
         XCTAssertNil(stopped().message(after: .finished(report(unattachable: 1)), current: none))
         XCTAssertNil(stopped().message(after: .finished(report(incomplete: 1)), current: none))
