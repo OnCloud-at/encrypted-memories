@@ -148,6 +148,8 @@ public final class ProtonClientFacade {
                 await librarySources.revokeAdditionalSource(for: album)
             }
         )
+        let albumCarryOver = AlbumRepositorySeriesCarryOver(
+            repository: albumsRepo, requestCause: bridge.requestCause(.carryOver))
 
         // Uploads: pure manager over the SDK uploader (the bridge) + the album-attaching shim +
         // the universal dedupe pipeline (hash, duplicate check, then skip or upload), so every upload
@@ -183,7 +185,7 @@ public final class ProtonClientFacade {
             photoTagAdder: bridge,
             seriesDissolution: bridge.makeSeriesDissolution(
                 duplicateChecker: identityComposition.duplicateChecker,
-                albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
+                albums: albumCarryOver
             ),
             editedPhotoReplacement: {
                 guard let checker = identityComposition.duplicateChecker,
@@ -192,7 +194,7 @@ public final class ProtonClientFacade {
                 else { return nil }
                 return EditedPhotoReplacement(
                     remote: bridge,
-                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
+                    albums: albumCarryOver,
                     relations: checker,
                     identities: identities,
                     journal: journal
@@ -206,14 +208,15 @@ public final class ProtonClientFacade {
                 else { return nil }
                 return ExactDuplicateFinder(
                     checker: checker,
-                    resolver: identityResolver,
+                    resolver: (identityResolver as? ShutdownGatedUploadIdentityResolver)?
+                        .naming(bridge.requestCause(.duplicatesRead)) ?? identityResolver,
                     index: index,
                     identities: identities,
                     journal: journal,
                     mergeJournal: ExactDuplicateMergeJournalFileStore(
                         accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent()),
                     remote: bridge,
-                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
+                    albums: albumCarryOver,
                     log: { DebugLog.log($0) }
                 )
             }(),

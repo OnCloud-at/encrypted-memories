@@ -83,7 +83,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         content.onStreamError = { streamError.set($0) }
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: .storageUpload)
+            permit = try await requestGovernor.acquire(
+                scope: .storageUpload, label: .storage(method: method))
         } catch {
             return .failure(error as NSError)
         }
@@ -109,7 +110,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     data: data, headers: Self.headerPairs(http), statusCode: http.statusCode
                 ))
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             // Prefer a stream-side error (encryption/producer) over the generic transport error.
             return .failure((streamError.value ?? error) as NSError)
         }
@@ -185,7 +187,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: .storageDownload)
+            permit = try await requestGovernor.acquire(
+                scope: .storageDownload, label: .storage(method: method))
         } catch {
             return .failure(error as NSError)
         }
@@ -211,7 +214,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     statusCode: http.statusCode
                 ))
         } catch {
-            completion.finish(statusCode: nil)
+            completion.finish(statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             return .failure(error as NSError)
         }
     }
@@ -227,7 +230,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     ) async -> Result<HttpClientResponse, NSError> {
         let permit: ProtonRequestGovernor.Permit
         do {
-            permit = try await requestGovernor.acquire(scope: scope)
+            permit = try await requestGovernor.acquire(scope: scope, label: Self.label(for: request, scope: scope))
         } catch {
             return .failure(error as NSError)
         }
@@ -269,9 +272,17 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     data: data, headers: Self.headerPairs(http), statusCode: http.statusCode
                 ))
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             return .failure(error as NSError)
         }
+    }
+
+    static func label(for request: URLRequest, scope: ProtonRequestScope) -> ProtonRequestLabel {
+        let method = request.httpMethod ?? "GET"
+        guard scope == .api else { return .storage(method: method) }
+        // The encoded path: a decoded segment could take the shape of a route word and be kept.
+        return .api(method: method, path: request.url?.path(percentEncoded: true) ?? "")
     }
 
     private static func canRetryAfterRateLimit(method: String) -> Bool {
@@ -400,7 +411,7 @@ struct PermitFinishingAsyncSequence: AsyncSequence {
                 }
                 return value
             } catch {
-                completion.finish(statusCode: nil)
+                completion.finish(statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
                 throw error
             }
         }
@@ -442,14 +453,14 @@ final class StreamPermitCompletion: @unchecked Sendable {
         }
     }
 
-    func finish(statusCode: Int?, retryAfter: TimeInterval? = nil) {
+    func finish(statusCode: Int?, retryAfter: TimeInterval? = nil, cancelled: Bool = false) {
         let shouldFinish = lock.withLock {
             guard !completed else { return false }
             completed = true
             return true
         }
         guard shouldFinish else { return }
-        Task { await governor.finish(permit, statusCode: statusCode, retryAfter: retryAfter) }
+        Task { await governor.finish(permit, statusCode: statusCode, retryAfter: retryAfter, cancelled: cancelled) }
     }
 
     deinit {

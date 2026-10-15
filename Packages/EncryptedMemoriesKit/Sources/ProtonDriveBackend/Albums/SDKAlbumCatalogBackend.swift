@@ -259,17 +259,20 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     private let maximumConcurrentNodeLoads: Int
     private let admission: JoinedShutdownGate?
     private let sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache
+    private let requestCause: ProtonRequestCauseBinding?
 
     init(
         client: any SDKPhotoCatalogClient,
         maximumConcurrentNodeLoads: Int = 4,
         admission: JoinedShutdownGate? = nil,
-        sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
+        sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache(),
+        requestCause: ProtonRequestCauseBinding? = nil
     ) {
         self.client = client
         self.maximumConcurrentNodeLoads = max(1, maximumConcurrentNodeLoads)
         self.admission = admission
         self.sharedAlbumSnapshotCache = sharedAlbumSnapshotCache
+        self.requestCause = requestCause
     }
 
     func listAlbums() async throws -> [AlbumSummary] {
@@ -425,6 +428,13 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     }
 
     private func withAdmission<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard let requestCause else { return try await admitted(operation) }
+        return try await requestCause.run { try await admitted(operation) }
+    }
+
+    private func admitted<T: Sendable>(
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         guard let admission else { return try await operation() }

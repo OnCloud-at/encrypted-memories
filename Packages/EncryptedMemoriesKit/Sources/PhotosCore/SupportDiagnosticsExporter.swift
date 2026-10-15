@@ -57,6 +57,8 @@ public enum SupportDiagnosticsExporter {
         let runtime: Runtime
         let resources: Resources
         let diagnostics: PhotoDiagnosticsSupportSnapshot
+        /// Nil without a signed-in session.
+        let requests: RemoteRequestSupportSnapshot?
     }
 
     public static func makeJSONData(
@@ -115,7 +117,8 @@ public enum SupportDiagnosticsExporter {
                 maximumConcurrentPermits: metrics.maximumConcurrentPermits,
                 maximumWaitMilliseconds: metrics.maximumWaitMilliseconds
             ),
-            diagnostics: diagnostics.supportSnapshot()
+            diagnostics: diagnostics.supportSnapshot(),
+            requests: await sources.requestSnapshot()
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

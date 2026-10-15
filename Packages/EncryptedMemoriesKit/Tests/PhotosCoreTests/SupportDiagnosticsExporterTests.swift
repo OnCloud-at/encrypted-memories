@@ -142,6 +142,33 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         XCTAssertEqual(runtimeSection["networkAvailableInterfaces"] as? [String], ["cellular", "other"])
     }
 
+    func testExportContainsTheRegisteredRequestCountsOnly() async throws {
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        let runtime = LibraryRuntimeState()
+        let coordinator = LibraryResourceCoordinator(runtimeState: runtime)
+        func export() async throws -> [String: Any] {
+            let data = try await SupportDiagnosticsExporter.makeJSONData(
+                runtimeState: runtime, resourceCoordinator: coordinator,
+                diagnostics: PhotoDiagnostics(debugConsoleLogsEnabled: false),
+                bundle: Bundle(for: Self.self), sources: sources, trail: SupportEventTrail())
+            return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+        let signedOut = try await export()
+        XCTAssertNil(signedOut["requests"])
+
+        let source = FixedRequestSource()
+        sources.registerRequests(source)
+        let signedIn = try await export()
+        let requests = try XCTUnwrap(signedIn["requests"] as? [String: Any])
+        let counts = try XCTUnwrap(requests["counts"] as? [[String: Any]])
+        XCTAssertEqual(counts.count, 1)
+        XCTAssertEqual(counts.first?["endpoint"] as? String, "/core/v4/users")
+        XCTAssertEqual(counts.first?["cause"] as? String, "account")
+        XCTAssertEqual(counts.first?["count"] as? Int, 2)
+        let scopes = try XCTUnwrap(requests["scopes"] as? [[String: Any]])
+        XCTAssertEqual(scopes.first?["peakInFlight"] as? Int, 3)
+    }
+
     /// The VPN rule needs the used and available interface types from the owner's device. Types only.
     func testResourceStateEventCarriesTheNetworkInterfaceTypes() async throws {
         let diagnostics = PhotoDiagnostics.shared
@@ -208,5 +235,23 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         XCTAssertNil(event?.fields["ocrText"])
         XCTAssertNil(event?.fields["query"])
         XCTAssertNil(event?.fields["modelInput"])
+    }
+}
+
+private final class FixedRequestSource: RemoteRequestSupportSource {
+    func remoteRequestSupportSnapshot() async -> RemoteRequestSupportSnapshot {
+        RemoteRequestSupportSnapshot(
+            counts: [
+                .init(
+                    scope: "api", method: "GET", endpoint: "/core/v4/users", cause: "account", status: "2xx",
+                    count: 2)
+            ],
+            overflowRequests: 0,
+            scopes: [
+                .init(
+                    scope: "api", inFlight: 0, queued: 0, concurrencyLimit: 4, admissionIntervalMilliseconds: 0,
+                    admittedLastMinute: 2, rateLimitedLastMinute: 0, peakInFlight: 3,
+                    maximumRetryAfterSeconds: nil, totalCooldownSeconds: 0)
+            ])
     }
 }

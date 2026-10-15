@@ -98,13 +98,14 @@ final class DriveSession: @unchecked Sendable {
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
 
-        let permit = try await requestGovernor.acquire(scope: .api)
+        let permit = try await requestGovernor.acquire(scope: .api, label: .api(method: method, path: path))
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await urlSession.data(for: req)
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {
@@ -169,7 +170,9 @@ final class DriveSession: @unchecked Sendable {
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "ResponseType": "token", "GrantType": "refresh_token", "RefreshToken": s.refreshToken,
         ])
-        guard let permit = try? await requestGovernor.acquire(scope: .api, priority: .immediate)
+        guard
+            let permit = try? await requestGovernor.acquire(
+                scope: .api, priority: .immediate, label: .api(method: "POST", path: "/auth/v4/refresh"))
         else { return false }
         guard let (data, response) = try? await urlSession.data(for: req),
             let http = response as? HTTPURLResponse
@@ -323,13 +326,15 @@ extension DriveSession {
             for (k, v) in authHeaders() { req.setValue(v, forHTTPHeaderField: k) }
         }
         let permit = try await requestGovernor.acquire(
-            scope: .storageDownload, priority: priority, priorityHandle: priorityHandle)
+            scope: .storageDownload, priority: priority, priorityHandle: priorityHandle,
+            label: .storage(method: "GET"))
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await storageSession.data(for: req)
         } catch {
-            await requestGovernor.finish(permit, statusCode: nil)
+            await requestGovernor.finish(
+                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {
