@@ -296,44 +296,218 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         func testAnOpenProblemListFollowsANewReasonWhileAPassRuns() async throws {
             let fixture = try makeControllerFixture(prefix: "backup-problem-follow")
             defer { fixture.cleanup() }
-            let queue = try XCTUnwrap(
-                UploadBackupSyncQueueManifestStore(
-                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            // The controller is the only owner of its queue file, so its own store reports every write.
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let shown = ShownProblemLists()
+            // The coalescing pause never ends: only a queue write can bring the next read.
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            let follow = Task {
+                await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                shown.ended = true
+            }
+            try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertFalse(shown.lists[0].offersUserRetry)
+
+            // The pass gives a photo a reason that the person resolves; no count of the status changes.
+            XCTAssertTrue(queue.upsert(quotaEntry("quota")))
+            let deadline = Date().addingTimeInterval(10)
+            while shown.lists.last?.offersUserRetry != true, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertEqual(shown.lists.last?.offersUserRetry, true, "Try again appears without waiting for a timer")
+
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            clock.releaseAll()
+            try await waitForCondition { shown.ended }
+            follow.cancel()
+            await follow.value
+            XCTAssertFalse(fixture.controller.isSyncing, "following ends with the pass")
+            await fixture.controller.shutdown()
+        }
+
+        func testWritesDuringTheCoalescingPauseShowOnceAfterIt() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-coalesce")
+            defer { fixture.cleanup() }
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let shown = ShownProblemLists()
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            let follow = Task {
+                await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                shown.ended = true
+            }
+            try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertTrue(queue.upsert(quotaEntry("first")))
+            try await waitForCondition { shown.lists.count == 2 }
+            try await waitForCondition { clock.isWaiting }
+
+            // Two writes inside the pause: neither shows until the pause ends, then both show in one read.
+            XCTAssertTrue(queue.upsert(quotaEntry("second")))
+            XCTAssertTrue(queue.upsert(quotaEntry("third")))
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(shown.lists.count, 2, "writes inside the pause wait for it")
+            clock.releaseAll()
+            try await waitForCondition { shown.lists.count == 3 }
+            if shown.lists.count >= 3 {
+                XCTAssertEqual(Set(shown.lists[2].map(\.filename)), ["first.heic", "second.heic", "third.heic"])
+            }
+
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            try await waitForCondition { shown.ended }
+            follow.cancel()
+            await follow.value
+            await fixture.controller.shutdown()
+        }
+
+        func testTheEndOfThePassReadsTheListOnceMore() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-end")
+            defer { fixture.cleanup() }
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let shown = ShownProblemLists()
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            let follow = Task {
+                await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                shown.ended = true
+            }
+            try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 1)
+
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            try await waitForCondition { shown.ended }
+            clock.releaseAll()
+            follow.cancel()
+            await follow.value
+            XCTAssertEqual(shown.lists.count, 2, "the end of the pass shows the final list once, without a write")
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 0, "a closed list leaves nothing behind")
+            await fixture.controller.shutdown()
+        }
+
+        func testAPassThatEndsDuringThePauseStillShowsItsLastWrites() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-end-in-pause")
+            defer { fixture.cleanup() }
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let shown = ShownProblemLists()
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            let follow = Task {
+                await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                shown.ended = true
+            }
+            try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertTrue(queue.upsert(quotaEntry("first")))
+            try await waitForCondition { shown.lists.count == 2 }
+            try await waitForCondition { clock.isWaiting }
+
+            // The last write of the pass and the end of the pass both fall into the pause.
+            XCTAssertTrue(queue.upsert(quotaEntry("last")))
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            clock.releaseAll()
+            try await waitForCondition { shown.ended }
+            follow.cancel()
+            await follow.value
+            XCTAssertEqual(shown.lists.count, 3, "the end of the pass reads once more after the pause")
+            XCTAssertEqual(shown.lists.last.map { Set($0.map(\.filename)) }, ["first.heic", "last.heic"])
+            await fixture.controller.shutdown()
+        }
+
+        func testSeveralOpenListsEachGetTheLastReadAndLeaveNothingBehind() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-several")
+            defer { fixture.cleanup() }
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let first = ShownProblemLists()
+            let second = ShownProblemLists()
+            let clock = HeldBackupSleepClock(clock: BackupTestClock())
+            let followers = [first, second].map { shown in
+                Task {
+                    await fixture.controller.followProblemList(clock: clock) { shown.lists.append($0) }
+                    shown.ended = true
+                }
+            }
+            try await waitForCondition { !first.lists.isEmpty && !second.lists.isEmpty }
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 2)
+
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            clock.releaseAll()
+            try await waitForCondition { first.ended && second.ended }
+            for follower in followers {
+                follower.cancel()
+                await follower.value
+            }
+            XCTAssertEqual(first.lists.count, 2, "each open list reads once more at the end of the pass")
+            XCTAssertEqual(second.lists.count, 2)
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 0)
+            await fixture.controller.shutdown()
+        }
+
+        func testAListClosedWhileItWaitsLeavesNothingBehind() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-closed")
+            defer { fixture.cleanup() }
             let pass = Task<Void, Never> {
                 while !Task.isCancelled { await Task.yield() }
             }
             XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
             let shown = ShownProblemLists()
             let follow = Task {
-                await fixture.controller.followProblemList(interval: .milliseconds(10)) { shown.lists.append($0) }
+                await fixture.controller.followProblemList(clock: HeldBackupSleepClock(clock: BackupTestClock())) {
+                    shown.lists.append($0)
+                }
+                shown.ended = true
             }
-            while shown.lists.isEmpty { await Task.yield() }
-            XCTAssertFalse(shown.lists[0].offersUserRetry)
+            try await waitForCondition { !shown.lists.isEmpty }
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 1)
 
-            // The pass gives a photo a reason that the person resolves; no count of the status changes.
-            XCTAssertTrue(
-                queue.upsert(
-                    .init(
-                        source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
-                        originalFilename: "quota.heic", state: .discovered,
-                        lastError: BackupIssueRecord(kind: .accountStorage, detail: "full").persistedValue,
-                        updatedAt: Date().addingTimeInterval(3_600))))
-            let deadline = Date().addingTimeInterval(10)
-            while shown.lists.last?.offersUserRetry != true, Date() < deadline {
-                try await Task.sleep(for: .milliseconds(5))
-            }
-            XCTAssertEqual(shown.lists.last?.offersUserRetry, true, "Try again appears while the pass runs")
+            follow.cancel()  // The person closes the list while it waits for the next write.
+            try await waitForCondition { shown.ended }
+            await follow.value
+            XCTAssertEqual(fixture.controller.passStateWakeCountForTesting, 0)
+            XCTAssertTrue(fixture.controller.isSyncing, "closing the list does not touch the pass")
 
             pass.cancel()
             await fixture.controller.finishSyncForTesting(runID: "run")
-            await follow.value
-            XCTAssertFalse(fixture.controller.isSyncing, "following ends with the pass")
             await fixture.controller.shutdown()
+        }
+
+        private func quotaEntry(_ name: String) -> UploadBackupSyncQueueEntry {
+            .init(
+                source: .init(kind: .photoLibraryAsset, identifier: name), revision: .init(rawValue: 1),
+                originalFilename: "\(name).heic", state: .discovered,
+                lastError: BackupIssueRecord(kind: .accountStorage, detail: "full").persistedValue,
+                updatedAt: Date().addingTimeInterval(3_600))
+        }
+
+        private func waitForCondition(_ condition: () -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(10)
+            while !condition(), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertTrue(condition())
         }
     #endif
 
     @MainActor private final class ShownProblemLists {
         var lists: [[BackupFailedItem]] = []
+        var ended = false
     }
 
     func testAUserRetryLeavesARowThatTheRunnerClaimedMeanwhile() throws {

@@ -1,9 +1,9 @@
 import Foundation
-import PhotoLibraryBackupAdapter
 import PhotosCore
 import SQLite3
 import XCTest
 
+@testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
 /// Exercises the shared backup pass order without PhotoKit.
@@ -816,30 +816,20 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         _ = lockStore.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(-Self.lease))
         XCTAssertTrue(lockStore.acquire(owner: .foreground, runID: runID).didAcquire)
 
-        actor ScanSignal {
-            var done = false
-            func markDone() { done = true }
-            func isDone() -> Bool { done }
-        }
-        let scanDone = ScanSignal()
+        let scanDone = BackupScanSignal()
         let instantEnqueueRan = IntBox()
 
         // Break `self` capture for Swift 6 isolation (runner is a stored property to self.runner).
         // Local lets make the closure capture only the actor value, not self.
         let runner = self.runner!
 
-        // Concurrent reconcile loop (mirrors reconcileWhileScanning): drain, and if the scan isn't done
-        // yet, yield and drain again. This is the loop that must pick up the mid-pass-enqueued asset.
-        async let reconcile: Void = {
-            while !Task.isCancelled {
-                await runner.runUntilDrained(mode: .eligibleOnly)
-                if await scanDone.isDone() {
-                    await runner.runUntilDrained(mode: .eligibleOnly)
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000)
-            }
-        }()
+        // The controller's own reconcile loop drains concurrently with the scan and must pick up the
+        // mid-pass-enqueued asset. The test clock ends its coalescing pauses at once.
+        let queue = self.queue!
+        let testClock = clock!
+        async let reconcile: BackupSyncProgress = PhotoLibraryBackupController.reconcileWhileScanning(
+            runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: testClock,
+            now: { testClock.now })
 
         // Scan phase. The full scan enumerates A and B (C is not in `infos` yet; it is the
         // change-observer asset). Partway through the scan we run the targeted instant-enqueue for C:
@@ -860,7 +850,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         _ = try await sync.run(engine: engine, identifiers: nil)
         await scanDone.markDone()
 
-        await reconcile
+        _ = await reconcile
         lockStore.release(runID: runID)
 
         // All three are backed up in this pass. C was enqueued mid-pass and drained by the same reconcile loop.
@@ -875,6 +865,193 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             resolver.resolveCount(for: "A"), resolveCountA,
             "already-backed A is not re-uploaded (dedup preflight intact)")
         XCTAssertEqual(queue.summary().uploaded, 3)
+    }
+
+    /// While the scan runs, the drain loop waits for queue writes instead of polling. A photo enqueued after the
+    /// last drain wakes the next drain at once; the end of the scan alone would take until the whole library is read.
+    func testARowEnqueuedAfterTheLastDrainStartsAnotherDrainBeforeTheScanEnds() async throws {
+        let runner = self.runner!
+        let queue = self.queue!
+        let scanDone = BackupScanSignal()
+        // No timer may end the wait: the held clock never lets a sleep finish.
+        let held = HeldBackupSleepClock(clock: clock)
+        let testClock = clock!
+        let reconcile = Task {
+            await PhotoLibraryBackupController.reconcileWhileScanning(
+                runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: held,
+                now: { testClock.now })
+        }
+        try await waitForCondition { await scanDone.wake.isWaiting }
+
+        enumerator.infos = [photoInfo("C")]
+        let targeted = PhotoLibraryCatalogSync(
+            store: catalog, enumerator: enumerator, chunkSize: 50, now: { [clock] in clock!.now })
+        _ = try await targeted.run(engine: engine, identifiers: ["C"])
+
+        // The write woke the loop; it waits out the coalescing pause, so writes of the same chunk drain together.
+        try await waitForCondition { held.isWaiting }
+        XCTAssertTrue(uploader.requests.isEmpty, "the drain waits for the coalescing pause")
+        held.releaseAll()
+        try await waitForCondition { [uploader] in uploader!.requests.map(\.name) == ["IMG_C.HEIC"] }
+        let scanStillRuns = await !scanDone.isDone()
+        XCTAssertTrue(scanStillRuns, "C uploads while the scan still runs")
+        await scanDone.markDone()
+        reconcile.cancel()
+        _ = await reconcile.value
+        XCTAssertEqual(queue.summary().uploaded, 1)
+    }
+
+    /// A retry date that passes during a long scan wakes the drain at that date; no queue write happens.
+    func testARetryDateThatPassesDuringTheScanWakesTheDrain() async throws {
+        let runner = self.runner!
+        let queue = self.queue!
+        enumerator.infos = [photoInfo("D")]
+        let targeted = PhotoLibraryCatalogSync(
+            store: catalog, enumerator: enumerator, chunkSize: 50, now: { [clock] in clock!.now })
+        _ = try await targeted.run(engine: engine, identifiers: ["D"])
+        var entry = try XCTUnwrap(queue.entries(in: .discovered, updatedBefore: .distantFuture, limit: 10).first)
+        entry.updatedAt = clock.now.addingTimeInterval(30)
+        XCTAssertTrue(queue.upsert(entry))
+        XCTAssertEqual(
+            PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now), 30,
+            "the wait ends at the persisted retry date")
+
+        let scanDone = BackupScanSignal()
+        let held = HeldBackupSleepClock(clock: clock)
+        let testClock = clock!
+        let reconcile = Task {
+            await PhotoLibraryBackupController.reconcileWhileScanning(
+                runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: held,
+                now: { testClock.now })
+        }
+        try await waitForCondition { held.isWaiting }
+        XCTAssertTrue(uploader.requests.isEmpty, "D is not due yet")
+
+        held.releaseAll()  // The 30-second wait ends and the test clock moves to the retry date.
+        try await waitForCondition { [uploader] in uploader!.requests.map(\.name) == ["IMG_D.HEIC"] }
+        let scanStillRuns = await !scanDone.isDone()
+        XCTAssertTrue(scanStillRuns, "D uploads at its retry date, before the scan ends")
+        await scanDone.markDone()
+        reconcile.cancel()
+        _ = await reconcile.value
+    }
+
+    func testTheEndOfTheScanEndsAWaitingDrainWithoutAWrite() async throws {
+        let runner = self.runner!
+        let queue = self.queue!
+        let scanDone = BackupScanSignal()
+        let held = HeldBackupSleepClock(clock: clock)
+        let testClock = clock!
+        let ended = IntBox()
+        let reconcile = Task {
+            _ = await PhotoLibraryBackupController.reconcileWhileScanning(
+                runner: runner, scanDone: scanDone, workIntent: .automatic, queue: queue, clock: held,
+                now: { testClock.now })
+            ended.value = 1
+        }
+        try await waitForCondition { await scanDone.wake.isWaiting }
+
+        await scanDone.markDone()
+        try await waitForCondition { ended.value == 1 }
+        reconcile.cancel()
+        await reconcile.value
+    }
+
+    /// A row whose date passed after the drain's last claim is due now. It must wake the next drain at once and must
+    /// not hide a later date by being the earliest one.
+    func testADueRowWakesTheDrainAtOnce() throws {
+        XCTAssertTrue(queue.upsert(runnableEntry("due", at: clock.now.addingTimeInterval(-1))))
+        XCTAssertTrue(queue.upsert(runnableEntry("later", at: clock.now.addingTimeInterval(30))))
+        XCTAssertEqual(PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now), 0)
+    }
+
+    /// The pending grid keeps the store's one legacy observer; the controller's loops subscribe through `changes()`.
+    /// Both hear the same committed write, and clearing the legacy observer (the grid closes) ends no subscription.
+    func testTheLegacyObserverAndChangeSubscribersBothHearAWrite() async throws {
+        let legacy = IntBox()
+        queue.setChangeObserver { _ in legacy.value += 1 }
+        var subscription = queue.changes().makeAsyncIterator()
+
+        XCTAssertTrue(queue.upsert(runnableEntry("first", at: clock.now)))
+        let first = await subscription.next()
+        XCTAssertNotNil(first)
+        XCTAssertEqual(legacy.value, 1)
+
+        queue.setChangeObserver(nil)
+        XCTAssertTrue(queue.upsert(runnableEntry("second", at: clock.now)))
+        let second = await subscription.next()
+        XCTAssertNotNil(second, "the subscription outlives the legacy observer")
+        XCTAssertEqual(legacy.value, 1)
+    }
+
+    /// A far-future or damaged date must not reach the clock as an unbounded sleep.
+    func testAFarFutureDateWaitsAtMostTheLongestPark() throws {
+        XCTAssertTrue(queue.upsert(runnableEntry("far", at: .distantFuture)))
+        XCTAssertEqual(
+            PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now),
+            PhotoLibraryBackupController.longestDueWait)
+        XCTAssertEqual(PhotoLibraryBackupController.longestDueWait, 6 * 3600)
+    }
+
+    /// A row that stays due but is never taken wakes the loop again and again. The pause after each wake bounds that to
+    /// one drain per `coalescing` seconds of the scheduler clock; it must never spin.
+    func testARowThatStaysDueDrainsAtMostOncePerPause() async throws {
+        XCTAssertTrue(queue.upsert(runnableEntry("stuck", at: clock.now.addingTimeInterval(-1))))
+        let queue = self.queue!
+        let testClock = clock!
+        let start = testClock.now
+        let scanDone = BackupScanSignal()
+        let drains = IntBox()
+        let reconcile = Task {
+            await PhotoLibraryBackupController.reconcileWhileScanning(
+                drain: {
+                    drains.value += 1  // Takes nothing: the row stays due.
+                    return BackupSyncProgress()
+                },
+                isQueueOperational: { true }, scanDone: scanDone, queue: queue, coalescing: 1, clock: testClock,
+                now: { testClock.now })
+        }
+        // Twenty seconds of scheduler time pass only through the loop's own pauses.
+        try await waitForCondition { testClock.now >= start.addingTimeInterval(20) }
+        await scanDone.markDone()
+        reconcile.cancel()
+        _ = await reconcile.value
+
+        let elapsed = testClock.now.timeIntervalSince(start)
+        XCTAssertGreaterThanOrEqual(elapsed, 20, "the due row kept waking the drain")
+        XCTAssertLessThanOrEqual(
+            drains.value, Int(elapsed) + 2, "at most one drain per pause, plus the first and the tail drain")
+    }
+
+    private func runnableEntry(_ id: String, at date: Date) -> UploadBackupSyncQueueEntry {
+        UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: id), revision: .init(rawValue: 1),
+            originalFilename: "\(id).heic", state: .discovered, updatedAt: date)
+    }
+
+    func testNothingWaitsForADateWhenNoRowIsDueLater() throws {
+        XCTAssertNil(PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now))
+        // The runner parks a draft with its re-check date as `updatedAt`.
+        let recheck = clock.now.addingTimeInterval(90)
+        let draft = BackupIssueRecord(kind: .remoteDraft, detail: "draft", nextAttemptAt: recheck).persistedValue
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: .init(kind: .photoLibraryAsset, identifier: "draft"), revision: .init(rawValue: 1),
+                    originalFilename: "draft.heic", state: .blockedByDraft, lastError: draft, updatedAt: recheck)))
+        XCTAssertEqual(
+            PhotoLibraryBackupController.nextDueDelay(in: queue, now: clock.now), 90,
+            "a draft re-check wakes the drain at its date")
+    }
+
+    private func waitForCondition(_ condition: () async -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let met = await condition()
+        XCTAssertTrue(met, "condition not met within 10 seconds")
     }
 
     /// The `ON CONFLICT` upsert in the durable queue must not regress a row that is already claimed
