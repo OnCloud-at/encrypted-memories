@@ -218,7 +218,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    private nonisolated func requestCause(_ cause: ProtonRequestCause) -> ProtonRequestCauseBinding {
+    nonisolated func requestCause(_ cause: ProtonRequestCause) -> ProtonRequestCauseBinding {
         ProtonRequestCauseBinding(scopes: requestGovernor.causes, cause: cause)
     }
 
@@ -2501,7 +2501,7 @@ extension DriveSDKBridge: ExactDuplicateRemote {
     /// Reads the stored timeline, so ranking the photo to keep costs no request.
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
         let items =
-            (try? await withOpenSession(cause: .duplicatesRead) { bridge in
+            (try? await withOpenSession(cause: .local) { bridge in
                 bridge.timelineStore?.items(for: uids) ?? []
             }) ?? []
         return Dictionary(items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })
@@ -2551,7 +2551,7 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
     /// The series dissolution moves the photos of a dissolved series to the trash. This is no deletion by the person.
     func trashSeries(_ uids: [PhotoUID]) async throws {
         try await requestGovernor.causes.run(.series) { try await moveToTrash(uids) }
-        try await withOpenSession(cause: .series) { bridge in
+        try await withOpenSession(cause: .local) { bridge in
             // The cached bursts listing still names the trashed series; the next lookup must read it again.
             bridge.burstCatalogEntries = nil
             bridge.burstCatalogLookup = [:]

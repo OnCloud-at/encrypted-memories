@@ -11,7 +11,8 @@ public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
         /// The work that sent the request. A leading `~` marks a cause inferred from the work that was active when a
         /// native SDK callback sent the request; `a+b` names several such works.
         public let cause: String
-        /// `2xx`, `3xx`, `401`, `404`, `408`, `429`, `4xx`, `5xx` or `transport`.
+        /// `2xx`, `3xx`, `401`, `404`, `408`, `429`, `4xx`, `5xx`, `transport` (no HTTP answer) or `cancelled` (the
+        /// caller stopped waiting, for example for a thumbnail that scrolled away).
         public let status: String
         public let count: Int
 

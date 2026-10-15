@@ -1,3 +1,4 @@
+import AlbumCore
 import Foundation
 import PhotosCore
 import ProtonAuth
@@ -196,6 +197,37 @@ struct ProtonRequestTallyTests {
         #expect(causes == ["backup", "duplicates.merge"])
     }
 
+    @Test func theDuplicatesScreenNamesItsOwnIndexBuild() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let backup = ShutdownGatedUploadIdentityResolver(
+            base: RequestingResolver(governor: governor),
+            admission: JoinedShutdownGate(),
+            requestCause: ProtonRequestCauseBinding(scopes: governor.causes, cause: .backup)
+        )
+        let duplicates = backup.naming(ProtonRequestCauseBinding(scopes: governor.causes, cause: .duplicatesRead))
+        await duplicates.prime([])
+        await backup.prime([])
+        let causes = await governor.requestSupportSnapshot().counts.map(\.cause)
+        #expect(causes == ["backup", "duplicates.read"])
+    }
+
+    @Test func theAlbumCarryOverOfAMergeIsNotCountedAsAlbumWork() async throws {
+        let governor = ProtonRequestGovernor(summaryLog: { _ in })
+        let albumCause = ProtonRequestCauseBinding(scopes: governor.causes, cause: .albums)
+        let backend = RequestingAlbumBackend(governor: governor, cause: albumCause)
+        let carryOver = AlbumRepositorySeriesCarryOver(
+            repository: AlbumsRepository(catalogBackend: backend, writeBackend: backend),
+            requestCause: ProtonRequestCauseBinding(scopes: governor.causes, cause: .carryOver)
+        )
+        _ = try await carryOver.currentAlbums(containing: [PhotoUID(volumeID: "v", nodeID: "n")])
+        try await carryOver.addPhotos([PhotoUID(volumeID: "v", nodeID: "n")], toOwnAlbum: "album")
+        // The person's own album work keeps its cause.
+        _ = try await backend.listAlbums()
+        let counts = await governor.requestSupportSnapshot().counts
+        #expect(counts.map(\.cause) == ["albums", "carryover"])
+        #expect(counts.map(\.count) == [1, 2])
+    }
+
     @Test func oneSummaryLinePerMinuteCoversThePreviousMinute() async throws {
         let clock = TallyTestClock()
         let lines = SummaryRecorder()
@@ -329,6 +361,35 @@ private final class AlwaysOKURLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+/// Counts one request per call under the album services' own cause, like the real album backends.
+private struct RequestingAlbumBackend: AlbumCatalogBackend, AlbumWriteBackend {
+    let governor: ProtonRequestGovernor
+    let cause: ProtonRequestCauseBinding
+
+    private func request() async throws {
+        try await cause.run {
+            let permit = try await governor.acquire(scope: .api)
+            await governor.finish(permit, statusCode: 200)
+        }
+    }
+
+    func listAlbums() async throws -> [AlbumSummary] {
+        try await request()
+        return []
+    }
+    func listSharedWithMeAlbums() async throws -> [SharedAlbumSummary] { [] }
+    func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws {}
+    func albumMemberships(for photoUIDs: [PhotoUID]) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
+        try await request()
+        return [:]
+    }
+    func createAlbum(name: String) async throws -> AlbumID { AlbumID(name) }
+    func deleteAlbum(albumID: AlbumID) async throws {}
+    func addPhotos(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws { try await request() }
+    func removePhotos(_ photoUIDs: [PhotoUID], from albumID: AlbumID) async throws {}
+    func setAlbumCover(albumID: AlbumID, photoUID: PhotoUID) async throws {}
 }
 
 /// Holds every request until its task is cancelled, the way a scrolled-away thumbnail fetch ends.

@@ -99,6 +99,13 @@ struct ShutdownGatedUploadIdentityResolver: UploadIdentityResolving {
         }
     }
 
+    /// The same resolver for another feature, for example the Duplicates screen, which builds the same index.
+    func naming(_ cause: ProtonRequestCauseBinding) -> ShutdownGatedUploadIdentityResolver {
+        var resolver = self
+        resolver.requestCause = cause
+        return resolver
+    }
+
     private func admitted<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
         guard let requestCause else { return try await admission.withAdmission(operation) }
         return try await requestCause.run { try await admission.withAdmission(operation) }
