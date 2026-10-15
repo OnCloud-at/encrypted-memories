@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -9,10 +10,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReportBuildStorage(unittest.TestCase):
+    def setUp(self):
+        # A copy of the scripts in an empty checkout: the .build folders of the real checkout stay out of the total.
+        self.checkout = tempfile.TemporaryDirectory()
+        self.addCleanup(self.checkout.cleanup)
+        scripts = Path(self.checkout.name) / 'scripts'
+        scripts.mkdir()
+        for name in ['report-build-storage.sh', 'build-paths.sh']:
+            shutil.copy(ROOT / 'scripts' / name, scripts)
+
     def report(self, build_root):
         environment = dict(os.environ, ENCRYPTED_MEMORIES_BUILD_ROOT=str(build_root))
-        return subprocess.run(['bash', str(ROOT / 'scripts/report-build-storage.sh')], capture_output=True, text=True,
-                              env=environment, cwd=ROOT)
+        return subprocess.run(['bash', str(Path(self.checkout.name) / 'scripts/report-build-storage.sh')],
+                              capture_output=True, text=True, env=environment, cwd=self.checkout.name)
 
     def test_each_folder_of_the_build_root_is_listed_with_its_size_in_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -45,7 +55,7 @@ class ReportBuildStorage(unittest.TestCase):
             self.assertAlmostEqual(size, 64 / 1024, delta=0.01)
 
     def child_lines(self, result):
-        return [m.group(1) for line in result.stdout.splitlines() if (m := re.match(r'\s+[\d.]+ GiB {4}(.+)$', line))]
+        return [m.group(1) for line in result.stdout.splitlines() if (m := re.match(r'\s+[\d.?]+ GiB {4}(.+)$', line))]
 
     def test_only_folders_are_listed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -56,7 +66,7 @@ class ReportBuildStorage(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.child_lines(result), ['folder'])
 
-    def test_a_folder_that_cannot_be_read_does_not_end_the_report(self):
+    def test_a_folder_that_cannot_be_read_is_marked_and_does_not_end_the_report(self):
         if os.geteuid() == 0:
             self.skipTest('root reads every folder')
         with tempfile.TemporaryDirectory() as directory:
@@ -70,18 +80,42 @@ class ReportBuildStorage(unittest.TestCase):
             finally:
                 (root / 'a-locked').chmod(0o755)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(self.child_lines(result), ['b-open'])
+            # GNU du prints the readable part and BSD du prints nothing; both are marked, neither is dropped.
+            self.assertEqual(self.child_lines(result), ['a-locked (incomplete)', 'b-open'])
+            root_line = [line for line in result.stdout.splitlines() if line.endswith(str(root) + ' (incomplete)')]
+            self.assertEqual(len(root_line), 1, result.stdout)
             self.assertIn('Total reported build storage:', result.stdout)
 
-    def test_a_folder_name_with_a_newline_or_a_space_is_listed_once_and_whole(self):
+    def test_a_build_root_that_cannot_be_read_is_marked_and_does_not_end_the_report(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads every folder')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'build'
+            (root / 'inner').mkdir(parents=True)
+            root.chmod(0)
+            try:
+                result = self.report(root)
+            finally:
+                root.chmod(0o755)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, '')
+            self.assertEqual(len([line for line in result.stdout.splitlines() if line.endswith(str(root) + ' (incomplete)')]), 1)
+            self.assertEqual(self.child_lines(result), [])
+            self.assertIn('Total reported build storage:', result.stdout)
+
+    def test_a_folder_name_with_a_newline_or_a_space_is_listed_once_with_its_size(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'build'
             (root / 'with space').mkdir(parents=True)
             (root / 'two\nlines').mkdir()
+            (root / 'two\nlines/data').write_bytes(b'0' * 64 * 1024 * 1024)
             result = self.report(root)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, '')
             self.assertIn('with space', self.child_lines(result))
-            self.assertEqual(len([line for line in result.stdout.splitlines() if re.match(r'\s+[\d.]+ GiB {4}', line)]), 2)
+            self.assertEqual(len([line for line in result.stdout.splitlines() if re.match(r'\s+[\d.?]+ GiB {4}', line)]), 2)
+            newline_size = float(re.search(r'\s+([\d.]+) GiB {4}two$', result.stdout, re.MULTILINE).group(1))
+            self.assertAlmostEqual(newline_size, 64 / 1024, delta=0.01)
             self.assertIn('Total reported build storage:', result.stdout)
 
     def test_a_trailing_slash_on_the_build_root_does_not_change_the_names(self):

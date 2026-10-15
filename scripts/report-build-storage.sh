@@ -7,27 +7,42 @@ source "$ROOT/scripts/build-paths.sh"
 warn_gib="${ENCRYPTED_MEMORIES_BUILD_WARN_GIB:-100}"
 total_kib=0
 
+# Sets size_kib and incomplete in the caller. A path that cannot be read completely gets the note "(incomplete)": GNU du
+# prints the size of the readable part, BSD du prints nothing, and both exit with an error. The report goes on either way.
+measure_kib() {
+  local status=0
+  size_kib="$(du -sk "$1" 2>/dev/null | awk '{print $1; exit}')" || status=$?
+  incomplete=""
+  [[ "$status" -eq 0 ]] || incomplete=" (incomplete)"
+  return 0
+}
+
 report_path() {
   local path="$1"
-  local size_kib
+  local size_kib incomplete
   [[ -e "$path" ]] || return 0
-  size_kib="$(du -sk "$path" 2>/dev/null | awk '{print $1}')" || true
-  [[ -n "$size_kib" ]] || return 0
+  measure_kib "$path"
+  if [[ -z "$size_kib" ]]; then
+    [[ -z "$incomplete" ]] || printf '%8s GiB  %s%s\n' "?" "$path" "$incomplete"
+    return 0
+  fi
   total_kib=$((total_kib + size_kib))
-  printf '%8.1f GiB  %s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "$path"
+  printf '%8.1f GiB  %s%s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "$path" "$incomplete"
 }
 
 # The size of each folder directly inside a folder, for the report only: it is not added to the total.
-# A folder that disappears or cannot be read while it is measured is skipped; it never ends the report.
 report_children() {
   local path="${1%/}"
-  local child size_kib
+  local child size_kib incomplete
   [[ -d "$path" ]] || return 0
   while IFS= read -r -d '' child; do
-    size_kib="$(du -sk "$child" 2>/dev/null | awk '{print $1}')" || true
-    [[ -n "$size_kib" ]] || continue
-    printf '%8.2f GiB    %s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "${child#"$path"/}"
-  done < <(find "$path" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    measure_kib "$child"
+    if [[ -n "$size_kib" ]]; then
+      printf '%8.2f GiB    %s%s\n' "$(awk -v kib="$size_kib" 'BEGIN { print kib / 1048576 }')" "${child#"$path"/}" "$incomplete"
+    else
+      printf '%8s GiB    %s%s\n' "?" "${child#"$path"/}" "$incomplete"
+    fi
+  done < <(find "$path" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
 }
 
 echo "Canonical Encrypted Memories build storage:"
