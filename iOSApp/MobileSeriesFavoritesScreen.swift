@@ -288,7 +288,7 @@ struct MobileSeriesFavoritesScreen: View {
 
     @ViewBuilder private var progressOverlay: some View {
         if case .running(let progress) = model.operation {
-            ActivityProgressStateLayout {
+            ActivityProgressStateLayout(hugsLine: true) {
                 ActivityProgressRow(
                     title: nil, detail: progressText(progress), fraction: progress?.fraction ?? 0, alignment: .center)
             }

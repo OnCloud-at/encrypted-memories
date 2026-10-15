@@ -461,7 +461,7 @@ private struct MobilePhotoBackupSections: View {
     /// queue-wide completion. An empty reserved slot keeps the row stable. Scanning stays barless.
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
         if let fraction = display.progressBarFraction, display.isActive || display.accessory == .paused {
-            ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel ?? "")
+            ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel)
                 .frame(height: 4)
         } else {
             Color.clear.frame(height: 4)

@@ -90,13 +90,18 @@ public struct ActivityProgressBar: View {
 /// Sizes a progress line inside an empty, waiting or overlay state: 70 % of the state's width, counted up to the
 /// shared readable progress width, and at least 120 pt unless the state itself is narrower. Rows do not use this
 /// layout; their bar takes the full row width. The line stays centered and is never measured and fed back into layout.
+/// With `hugsLine`, the layout is as wide as its line, so a card around it hugs the bar; otherwise it fills the state.
 public struct ActivityProgressStateLayout: Layout {
     /// The one readable width of a progress line in a state.
     nonisolated static let readableWidth: CGFloat = 320
     nonisolated static let minimumWidth: CGFloat = 120
     nonisolated static let widthRatio: CGFloat = 0.7
 
-    public init() {}
+    private let hugsLine: Bool
+
+    public init(hugsLine: Bool = false) {
+        self.hugsLine = hugsLine
+    }
 
     nonisolated static func availableWidth(for proposal: CGFloat?) -> CGFloat {
         min(readableWidth, max(0, proposal ?? readableWidth))
@@ -106,15 +111,23 @@ public struct ActivityProgressStateLayout: Layout {
         min(available, max(minimumWidth, available * widthRatio))
     }
 
+    /// The width the layout reports for a proposed width: the state's width, or the line's width when it hugs it.
+    nonisolated static func reportedWidth(for proposal: CGFloat?, hugsLine: Bool) -> CGFloat {
+        let available = availableWidth(for: proposal)
+        return hugsLine ? lineWidth(in: available) : available
+    }
+
     public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let available = Self.availableWidth(for: proposal.width)
-        let line = subviews.first?.sizeThatFits(ProposedViewSize(width: Self.lineWidth(in: available), height: nil))
-        return CGSize(width: available, height: line?.height ?? 0)
+        let line = subviews.first?.sizeThatFits(
+            ProposedViewSize(width: Self.lineWidth(in: Self.availableWidth(for: proposal.width)), height: nil))
+        return CGSize(width: Self.reportedWidth(for: proposal.width, hugsLine: hugsLine), height: line?.height ?? 0)
     }
 
     public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        // A hugging layout is already as wide as its line; a state layout narrows the line inside its width.
+        let width = hugsLine ? bounds.width : Self.lineWidth(in: bounds.width)
         subviews.first?.place(
             at: CGPoint(x: bounds.midX, y: bounds.minY), anchor: .top,
-            proposal: ProposedViewSize(width: Self.lineWidth(in: bounds.width), height: nil))
+            proposal: ProposedViewSize(width: width, height: nil))
     }
 }

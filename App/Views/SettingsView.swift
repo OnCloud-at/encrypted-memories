@@ -746,7 +746,7 @@ private struct PhotoLibraryBackupSection: View {
             if let fraction = display.progressBarFraction,
                 display.isActive || display.accessory == .paused
             {
-                ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel ?? "")
+                ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel)
                     .controlSize(.small)
             } else {
                 Color.clear

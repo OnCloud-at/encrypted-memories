@@ -1,3 +1,4 @@
+import CoreGraphics
 import Testing
 
 @testable import DesignSystemCore
@@ -29,7 +30,15 @@ import Testing
         #expect(ActivityProgressStateLayout.availableWidth(for: -10) == 0)
     }
 
-    @Test func everySpinningSymbolSharesOnePeriod() {
-        #expect(ActivitySpin.period == 1.7)
+    @Test func everySpinningSymbolSharesOneSpeed() {
+        #expect(ActivitySpin.speed == 1 / 1.7)
+    }
+
+    @Test func aHuggingLayoutIsAsWideAsItsLineAndAStateLayoutFillsTheState() {
+        let proposals: [CGFloat] = [280, 320, 375, 500]
+        let state = proposals.map { ActivityProgressStateLayout.reportedWidth(for: $0, hugsLine: false) }
+        let hugging = proposals.map { ActivityProgressStateLayout.reportedWidth(for: $0, hugsLine: true) }
+        #expect(state == [280, 320, 320, 320])
+        #expect(zip(hugging, [196, 224, 224, 224]).allSatisfy { abs($0 - $1) < 0.001 })
     }
 }
