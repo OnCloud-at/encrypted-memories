@@ -143,6 +143,75 @@ final class UploadManagerTests: XCTestCase {
         XCTAssertEqual(snap.map(\.displayName), ["a.jpg", "b.jpg", "c.jpg", "d.jpg"])
     }
 
+    func testAManualUploadWaitsForARunningBackupTransferAndThenCompletes() async throws {
+        let (directory, urls) = try jpegs(["after-backup"])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let uploader = MockUploader(workDuration: .milliseconds(5), deliverProgress: false)
+        let backup = try await uploader.admission.reserve(allowsExpensiveNetwork: false)
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        await manager.enqueueFiles(urls, destination: .library)
+        try await waitUntilWaiting(uploader.admission)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(uploader.requests.count, 0, "no byte goes out beside the backup transfer")
+        let waiting = await manager.snapshot()
+        XCTAssertFalse(waiting.contains { $0.state.isTerminal }, "the upload waits; it does not fail")
+
+        backup.release()
+        let finished = await waitForAllTerminal(manager)
+
+        XCTAssertEqual(finished.map(\.state), [.completed])
+        XCTAssertEqual(uploader.uploadsWithoutTheirReservation, [])
+        XCTAssertEqual(uploader.requests.map(\.allowsExpensiveNetwork), [true])
+        XCTAssertFalse(
+            uploader.requests.contains { $0.networkReservation?.isActive == true },
+            "the manager releases the reservation")
+        await manager.shutdown()
+    }
+
+    func testCancellingAManualUploadEndsItsWaitForTheNetwork() async throws {
+        let (directory, urls) = try jpegs(["cancelled-while-waiting"])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let uploader = MockUploader(workDuration: .milliseconds(5), deliverProgress: false)
+        let backup = try await uploader.admission.reserve(allowsExpensiveNetwork: false)
+        defer { backup.release() }
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        let ids = await manager.enqueueFiles(urls, destination: .library)
+        try await waitUntilWaiting(uploader.admission)
+
+        await manager.cancel(try XCTUnwrap(ids.first))
+        let finished = await waitForAllTerminal(manager)
+
+        XCTAssertEqual(finished.map(\.state), [.cancelled])
+        XCTAssertEqual(uploader.requests.count, 0)
+        XCTAssertEqual(uploader.admission.waitingCount, 0, "the wait ended")
+        await manager.shutdown()
+    }
+
+    func testShutdownEndsAManualUploadThatWaitsForTheNetwork() async throws {
+        let (directory, urls) = try jpegs(["shut-down-while-waiting"])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let uploader = MockUploader(workDuration: .milliseconds(5), deliverProgress: false)
+        let backup = try await uploader.admission.reserve(allowsExpensiveNetwork: false)
+        defer { backup.release() }
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        await manager.enqueueFiles(urls, destination: .library)
+        try await waitUntilWaiting(uploader.admission)
+
+        await manager.shutdown()
+
+        XCTAssertEqual(uploader.requests.count, 0)
+        XCTAssertEqual(uploader.admission.waitingCount, 0, "the shutdown ended the wait")
+    }
+
+    private func waitUntilWaiting(_ admission: UploadNetworkAdmission) async throws {
+        let clock = ContinuousClock()
+        let start = clock.now
+        while admission.waitingCount == 0, clock.now - start < .seconds(10) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(admission.waitingCount, 1, "the upload waits for its network reservation")
+    }
+
     func testActiveManualUploadOwnsTransferDemandUntilItFinishes() async throws {
         let (directory, urls) = try jpegs(["active"])
         defer { try? FileManager.default.removeItem(at: directory) }

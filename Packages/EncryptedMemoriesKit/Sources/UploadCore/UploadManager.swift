@@ -1011,6 +1011,11 @@ public actor UploadManager: UploadManaging {
         _ request: PhotoUploadRequest,
         reportingProgressFor id: UploadQueueItemID
     ) async throws -> PhotoUID {
+        // The item keeps its current state while it waits for a running backup transfer to end.
+        let reservation = try await uploader.reserveNetwork(allowsExpensiveNetwork: request.allowsExpensiveNetwork)
+        defer { reservation.release() }
+        var request = request
+        request.networkReservation = reservation
         let (stream, continuation) = AsyncStream.makeStream(
             of: UploadProgress.self,
             bufferingPolicy: .bufferingNewest(1)

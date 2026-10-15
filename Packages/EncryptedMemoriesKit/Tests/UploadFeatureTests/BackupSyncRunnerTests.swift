@@ -1762,6 +1762,113 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.map(\.allowsExpensiveNetwork), [false, true])
     }
 
+    func testEveryBackupUploadCarriesTheReservationOfItsNetworkKind() async throws {
+        let wiFiOnly = seedEntry("reserved-wifi-only.jpg")
+        _ = await makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: false) }).runUntilDrained()
+        let anyNetwork = seedEntry("reserved-any-network.jpg")
+        _ = await makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: true) }).runUntilDrained()
+
+        XCTAssertEqual(state(of: wiFiOnly), .completed)
+        XCTAssertEqual(state(of: anyNetwork), .completed)
+        XCTAssertEqual(uploader.requests.count, 2)
+        XCTAssertEqual(uploader.uploadsWithoutTheirReservation, [], "every upload starts with its reservation")
+        XCTAssertFalse(
+            uploader.requests.contains { $0.networkReservation?.isActive == true },
+            "the runner releases every reservation")
+    }
+
+    func testABackupUploadWaitsForAnUploadThatThePersonStartedWithoutAStallOrATry() async throws {
+        let entry = seedEntry("waits-for-the-person.jpg")
+        let person = try await uploader.admission.reserve(allowsExpensiveNetwork: true)
+        let runner = makeRunner(
+            uploadStallTimeout: 0.1, uploadStallPollInterval: 0.02,
+            throttleInputs: { BackupThrottleInputs(usesMobileData: false) })
+        let pass = Task { await runner.runUntilDrained() }
+        try await waitUntilWaiting(uploader.admission)
+        // Much longer than the stall timeout: the wait for the network is no stalled transfer.
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(uploader.requests.count, 0, "no byte goes out beside the person's upload")
+
+        person.release()
+        await endWithin(pass, runner: runner)
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["waits-for-the-person.jpg"])
+        XCTAssertEqual(uploader.uploadsWithoutTheirReservation, [])
+    }
+
+    func testStopEndsAWaitForTheNetworkWithoutAnUpload() async throws {
+        let entry = seedEntry("stopped-while-waiting.jpg")
+        let person = try await uploader.admission.reserve(allowsExpensiveNetwork: true)
+        defer { person.release() }
+        let runner = makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: false) })
+        let pass = Task { await runner.runUntilDrained() }
+        try await waitUntilWaiting(uploader.admission)
+
+        await runner.stop()
+        let ended = await endsWithin(pass)
+        person.release()
+        _ = await pass.value
+
+        XCTAssertTrue(ended, "the stop ended the wait at once")
+        XCTAssertEqual(uploader.requests.count, 0)
+        XCTAssertEqual(uploader.admission.waitingCount, 0, "the wait ended")
+        XCTAssertNotEqual(state(of: entry), .completed)
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
+    }
+
+    func testAnExpiringWindowEndsAWaitForTheNetworkWithoutAnUpload() async throws {
+        let entry = seedEntry("expired-while-waiting.jpg")
+        let person = try await uploader.admission.reserve(allowsExpensiveNetwork: true)
+        defer { person.release() }
+        let runner = makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: false) })
+        let pass = Task { await runner.runUntilDrained() }
+        try await waitUntilWaiting(uploader.admission)
+
+        // The background window's expiry cancels the pass task.
+        pass.cancel()
+        let ended = await endsWithin(pass)
+        person.release()
+        _ = await pass.value
+
+        XCTAssertTrue(ended, "the cancellation ended the wait at once")
+        XCTAssertEqual(uploader.requests.count, 0)
+        XCTAssertEqual(uploader.admission.waitingCount, 0, "the wait ended")
+        XCTAssertNotEqual(state(of: entry), .completed)
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0, "no try is used")
+    }
+
+    /// True when the pass ends within `limit`.
+    private func endsWithin(_ pass: Task<BackupSyncProgress, Never>, limit: Duration = .seconds(5)) async -> Bool {
+        let clock = ContinuousClock()
+        let start = clock.now
+        let box = BackupProgressBox()
+        let watcher = Task { box.set(await pass.value) }
+        defer { watcher.cancel() }
+        while clock.now - start < limit {
+            if box.value != nil { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
+    /// Waits for the pass; a pass that does not end within `limit` fails the test and is stopped.
+    private func endWithin(_ pass: Task<BackupSyncProgress, Never>, runner: BackupSyncRunner) async {
+        let ended = await endsWithin(pass)
+        if !ended { await runner.stop() }
+        XCTAssertTrue(ended, "the pass ended")
+        _ = await pass.value
+    }
+
+    private func waitUntilWaiting(_ admission: UploadNetworkAdmission) async throws {
+        let clock = ContinuousClock()
+        let start = clock.now
+        while admission.waitingCount == 0, clock.now - start < .seconds(10) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(admission.waitingCount, 1, "the transfer waits for its network reservation")
+    }
+
     func testSustainedDiskPressureEndsPassRunnableNotFailed() async throws {
         // The volume stays full for the whole pass: no item can ever export.
         let a = seedEntry("a.jpg")

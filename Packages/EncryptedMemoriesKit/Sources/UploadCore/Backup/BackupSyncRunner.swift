@@ -129,6 +129,8 @@ public actor BackupSyncRunner {
     /// Join handles retain the unstructured upload task until native cancellation and upload
     /// settlement both finish. They also deduplicate every cancellation request for that upload.
     private var inFlightJoins: [UUID: BackupUploadJoin] = [:]
+    /// Transfers that wait for their network reservation. `stop()` ends these waits.
+    private var networkWaits: [UUID: Task<UploadNetworkReservation, any Error>] = [:]
     private var inFlightNames: [String: String] = [:]
     /// Sources removed from the local backup set while this actor was suspended in resolver or
     /// upload work. Their callbacks must not recreate a queue row after catalog removal.
@@ -237,6 +239,7 @@ public actor BackupSyncRunner {
     /// and every touched row is reverted to a runnable state for the next pass after settlement.
     public func stop() async {
         stopRequested = true
+        for wait in networkWaits.values { wait.cancel() }
         let joins = Array(inFlightJoins.values)
         await withTaskGroup(of: Void.self) { group in
             for join in joins {
@@ -2600,6 +2603,13 @@ public actor BackupSyncRunner {
         itemBaseFraction: Double,
         itemFractionWeight: Double
     ) async throws -> PhotoUID {
+        // The network reservation comes before the transfer and its watchdog: waiting for an upload that the person
+        // started is neither a stall nor a try.
+        let reservation = try await reserveNetwork(for: request)
+        defer { reservation.release() }
+        var reservedRequest = request
+        reservedRequest.networkReservation = reservation
+        let request = reservedRequest
         let activity = BackupUploadActivity()
         let race = BackupUploadRace()
         let uploader = uploader
@@ -2684,6 +2694,27 @@ public actor BackupSyncRunner {
             await join.cancelAndJoin()
             throw CancellationError()
         }
+    }
+
+    /// Waits for the network reservation of `request`. The wait ends with `CancellationError` when the pass is cancelled
+    /// or `stop()` runs.
+    private func reserveNetwork(for request: PhotoUploadRequest) async throws -> UploadNetworkReservation {
+        let uploader = uploader
+        let allowsExpensiveNetwork = request.allowsExpensiveNetwork
+        let wait = Task { try await uploader.reserveNetwork(allowsExpensiveNetwork: allowsExpensiveNetwork) }
+        networkWaits[request.cancellationToken] = wait
+        defer { networkWaits[request.cancellationToken] = nil }
+        if stopRequested { wait.cancel() }
+        let reservation = try await withTaskCancellationHandler {
+            try await wait.value
+        } onCancel: {
+            wait.cancel()
+        }
+        guard !stopRequested, !Task.isCancelled else {
+            reservation.release()
+            throw CancellationError()
+        }
+        return reservation
     }
 
     private func beginActiveTransfer(

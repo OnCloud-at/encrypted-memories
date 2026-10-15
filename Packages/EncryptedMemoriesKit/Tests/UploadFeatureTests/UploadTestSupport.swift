@@ -50,6 +50,15 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
     private let workDuration: Duration
     private let deliverProgress: Bool
     private let failNames: Set<String>
+    /// Like the production uploader, one admission for every upload of this uploader.
+    let admission = UploadNetworkAdmission()
+    private var _uploadsWithoutTheirReservation: [String] = []
+    /// Names of uploads that started without an active reservation of `admission` for their network kind.
+    var uploadsWithoutTheirReservation: [String] { lock.withLock { _uploadsWithoutTheirReservation } }
+
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        try await admission.reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
 
     init(
         capabilities: UploadBackendCapabilities = .init(
@@ -104,11 +113,16 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
     func upload(
         _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
+        let reserved =
+            request.networkReservation.map {
+                $0.isActive && admission.issued($0) && $0.allowsExpensiveNetwork == request.allowsExpensiveNetwork
+            } ?? false
         lock.withLock {
             concurrent += 1
             _peakConcurrent = max(_peakConcurrent, concurrent)
             _startedOrder.append(request.name)
             _requests.append(request)
+            if !reserved { _uploadsWithoutTheirReservation.append(request.name) }
         }
         defer { lock.withLock { concurrent -= 1 } }
 
