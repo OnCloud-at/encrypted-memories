@@ -10,8 +10,9 @@ public final class LocationCrawlSession {
     public struct Platform: Sendable, Equatable {
         /// How long the thumbnail crawl runs alone before GPS probing starts.
         public var headStart: Duration
-        /// Stops an earlier crawl and requires a current store session before the delayed start. Without it, the host
-        /// stops an earlier crawl itself (on macOS, the account configuration; after a pause, the privacy stop).
+        /// Stops an earlier crawl and requires a current store session before the delayed start. Without it, the
+        /// earlier crawl runs until `LocationCrawl.start` retires it, or until the account configuration or a pause
+        /// stops it.
         public var requiresStoreSession: Bool
 
         public init(headStart: Duration, requiresStoreSession: Bool) {
