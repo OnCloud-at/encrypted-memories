@@ -1490,7 +1490,11 @@ public final class ExactDuplicatesModel {
         }
     }
 
+    /// A scroll page that read the metadata before the merge can still publish while the merge reports its trash, before
+    /// the reload stops the ranking. Its publication ends first, so no old metadata come back. The worker keeps running;
+    /// its pages no longer publish until the reload stops it, or until it ends on its own.
     private func forgetFingerprints(of group: Group) {
+        rankingPublication.revoke(rankingWorkerToken)
         hasInvalidatedGroups = true
         for member in group.scanGroup.members { knownFingerprints[member] = nil }
     }
