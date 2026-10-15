@@ -896,7 +896,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             }
             if !isShutDown, !Task.isCancelled, metadataReconciliation.isCurrent(pass), pageReader.useOrderCache {
                 do { _ = try timelineOrderStore?.publishCompletedSeconds() } catch {
-                    timelineOrderStore?.rebuild()
+                    timelineOrderStore?.rebuildUnlessBusy()
                     DebugLog.log("timeline: could not publish completed order evidence")
                 }
             }
@@ -991,7 +991,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         } catch is CancellationError {
             DebugLog.log("timeline: metadata reconciliation cancelled; persisted pages will resume")
         } catch is TimelineOrderMetadataError {
-            timelineOrderStore?.rebuild()
+            timelineOrderStore?.rebuildUnlessBusy()
             DebugLog.log("timeline: order cache rebuilt after a failed page")
         } catch {
             DebugLog.log("timeline: metadata reconciliation paused after a recoverable failure")
@@ -1886,7 +1886,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             !timelineOrderStore.recordResolvedMetadata(
                 for: uid, metadata: read.timelineOrder, isClassified: metadata.mimeType != nil)
         {
-            timelineOrderStore.rebuild()
+            timelineOrderStore.rebuildUnlessBusy()
             DebugLog.log("timeline: could not persist order resolved by viewer")
         }
         if let mimeType = metadata.mimeType {
