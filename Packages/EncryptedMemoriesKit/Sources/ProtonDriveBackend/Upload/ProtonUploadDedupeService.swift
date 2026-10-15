@@ -66,6 +66,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private var remoteContentIndexTask: Task<Void, any Error>?
     /// Names the build in `remoteContentIndexTask`, so a build that ends clears only itself.
     private var remoteContentIndexBuild = 0
+    /// Every build that has not ended, also one that an invalidation cancelled. Shutdown waits for all of them.
+    private var unfinishedRemoteContentIndexBuilds: [Int: Task<Void, any Error>] = [:]
     /// A preparation stopped waiting while a build ran; the timeline metadata pass then waits for that build to end.
     private var metadataPassWaitsForBuild = false
     /// Set when the account's work ends. No build starts after it.
@@ -429,11 +431,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         isShutDown = true
         remoteContentIndexGeneration += 1
         lastRemoteContentRefreshAt = nil
-        let running = remoteContentIndexTask
         remoteContentIndexTask = nil
-        running?.cancel()
-        _ = await running?.result
+        let unfinished = Array(unfinishedRemoteContentIndexBuilds.values)
+        for build in unfinished { build.cancel() }
+        for build in unfinished { _ = await build.result }
     }
+
+    /// True while a build has not ended.
+    var hasUnfinishedRemoteContentIndexBuild: Bool { !unfinishedRemoteContentIndexBuilds.isEmpty }
 
     func invalidateCachedRemoteState() async {
         remoteContentIndexGeneration += 1
@@ -539,25 +544,33 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     material: material, session: session, crypto: crypto, store: store,
                     lineageStore: lineageStore, rebuildsMissingLineage: rebuildsMissingLineage, progress: report)
                 await self?.finishRemoteContentIndexBuild(
-                    build, generation: generation, leftAtStart: leftAtStart, succeeded: true)
+                    build, material: material, rebuiltLineage: rebuildsMissingLineage, generation: generation,
+                    leftAtStart: leftAtStart, succeeded: true)
             } catch {
                 await self?.finishRemoteContentIndexBuild(
-                    build, generation: generation, leftAtStart: leftAtStart, succeeded: false)
+                    build, material: material, rebuiltLineage: rebuildsMissingLineage, generation: generation,
+                    leftAtStart: leftAtStart, succeeded: false)
                 throw error
             }
         }
         remoteContentIndexTask = task
+        unfinishedRemoteContentIndexBuilds[build] = task
         try await task.valueUntilCancelled()
         guard remoteContentIndexGeneration == generation else { throw CancellationError() }
     }
 
-    private func finishRemoteContentIndexBuild(_ build: Int, generation: Int, leftAtStart: Int, succeeded: Bool) {
+    private func finishRemoteContentIndexBuild(
+        _ build: Int, material: Material, rebuiltLineage: Bool, generation: Int, leftAtStart: Int, succeeded: Bool
+    ) {
+        unfinishedRemoteContentIndexBuilds[build] = nil
         if remoteContentIndexGeneration == generation {
             if remoteContentIndexBuild == build { remoteContentIndexTask = nil }
             if succeeded, remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
         }
-        // A preparation that stopped waiting left the metadata pass held for the build; it starts when no build runs.
-        if metadataPassWaitsForBuild, remoteContentIndexTask == nil {
+        // A preparation that stopped waiting left the metadata pass held for the first full build. The pass starts
+        // when no build runs and that build ended: this one rebuilt the lineage, or no lineage rebuild is still due.
+        let firstFullBuildEnded = rebuiltLineage || !rebuildsMissingLineage(material: material)
+        if metadataPassWaitsForBuild, remoteContentIndexTask == nil, firstFullBuildEnded {
             metadataPassWaitsForBuild = false
             firstBuildGate?.open()
         }
