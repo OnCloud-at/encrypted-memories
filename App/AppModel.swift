@@ -531,22 +531,18 @@ final class AppModel {
                     return
                 }
                 facade = client
-                let pendingStore = PendingGridSession.openStore(
+                // The pending store, the photo backup and album sync are built the same way on iOS.
+                let stack = AccountBackupStack(
                     accountDataDirectory: client.accountDataDirectory,
-                    policy: client.accountDatabasePolicy
-                )
-                let photoBackup = PhotoLibraryBackupController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
+                    databasePolicy: client.accountDatabasePolicy,
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
                     tagAdder: client.photoTagAdder,
                     editReplacement: client.editedPhotoReplacement,
-                    pendingStore: pendingStore,
-                    requiresPendingStore: true
+                    albumOperations: client.albumSyncRemoteOps
                 )
+                let pendingStore = stack.pendingStore
+                let photoBackup = stack.photoBackup
                 photoBackupController = photoBackup
                 photoBackupScheduler.configure(controller: photoBackup)
                 // Watched folders share the pending store and the photo backup's event stream.
@@ -556,15 +552,7 @@ final class AppModel {
                 backupController = folderBackup
                 configurePendingGrid(
                     store: pendingStore, photoBackup: photoBackup, folderBackup: folderBackup, client: client)
-                let albumSync = AlbumSyncController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
-                    identityResolver: client.uploadIdentityResolver,
-                    uploader: client.photoUploader,
-                    remoteOps: client.albumSyncRemoteOps
-                )
+                let albumSync = stack.albumSync
                 albumSync.setRemoteAlbumsChangedHandler { [weak self] in
                     self?.albumCatalogRevision &+= 1
                 }
