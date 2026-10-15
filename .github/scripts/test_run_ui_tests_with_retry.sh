@@ -13,7 +13,17 @@ state="$here/runner_state.sh"
 work="$(mktemp -d)"
 trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
 failures=0
+# The hygiene job runs this test inside a step that has a real step summary and step output. No call of the test
+# may write there, so every call inherits files of the test, and the real files are compared at the end.
+real_summary="${GITHUB_STEP_SUMMARY:-}"
+real_output="${GITHUB_OUTPUT:-}"
+file_size() { if [[ -n "$1" && -f "$1" ]]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }
+real_summary_size="$(file_size "$real_summary")"
+real_output_size="$(file_size "$real_output")"
+export GITHUB_STEP_SUMMARY="$work/step-summary" GITHUB_OUTPUT="$work/step-output"
+: > "$GITHUB_STEP_SUMMARY"; : > "$GITHUB_OUTPUT"
 uuid='0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9'
+other_uuid='1B2C3D4E-5F60-7182-93A4-B5C6D7E8F900'
 
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 expect() { # description expected actual
@@ -79,6 +89,12 @@ printf '0|%s\n' "all tests passed" > "$case_dir/script"
 run_case
 expect 'pass: exit' 0 "$status"; expect 'pass: attempts' 1 "$(attempts)"
 lacks 'pass: no warning' "$case_dir/stdout" '::warning'; expect 'pass: no output flag' '' "$(cat "$case_dir/output")"
+
+# 1b. Without a command the wrapper refuses to run.
+new_case no_command
+env PATH="$case_dir/bin:$PATH" RUNNER_TEMP="$case_dir/temp" bash "$wrapper" > "$case_dir/stdout" 2>&1
+expect 'no command: exit' 64 "$?"
+contains 'no command: usage message' "$case_dir/stdout" 'Usage:'
 
 # 2. The runner bootstrap failure before any test case: one retry, the first bundle and log are kept.
 new_case bootstrap
@@ -171,6 +187,15 @@ for destination_line in '' '[ios-tests] scheme: X, destination: platform=iOS Sim
   expect "no id [$destination_line]: no shutdown" '' "$(cat "$case_dir/xcrun-calls")"
   [[ ! -e "$work/injected" ]] || fail 'the log text reached a shell'
 done
+new_case two_destinations
+{
+  printf '65|%s\\n%s\\n%s\n' "$destination" \
+    "[ios-tests] scheme: X, destination: platform=iOS Simulator,id=$other_uuid" "$bootstrap_line"
+  printf '0|ok\n'
+} > "$case_dir/script"
+run_case
+expect 'two destination lines: exit' 0 "$status"; expect 'two destination lines: attempts' 2 "$(attempts)"
+expect 'two destination lines: the first one wins' "simctl shutdown $uuid" "$(cat "$case_dir/xcrun-calls")"
 new_case shutdown_hangs
 { printf '65|%s\\n%s\n' "$destination" "$bootstrap_line"; printf '0|ok\n'; } > "$case_dir/script"
 started_at=$SECONDS
@@ -271,6 +296,9 @@ GITHUB_STEP_SUMMARY="$summary_file" bash "$state" end > /dev/null
 contains 'state: summary' "$summary_file" '== runner state (end) =='
 GITHUB_STEP_SUMMARY=/nonexistent/summary bash "$state" end > /dev/null 2>&1
 expect 'state with an unwritable summary: exit' 0 "$?"
+
+expect 'the real step summary was not written' "$real_summary_size" "$(file_size "$real_summary")"
+expect 'the real step output was not written' "$real_output_size" "$(file_size "$real_output")"
 
 if [[ $failures -gt 0 ]]; then echo "$failures check(s) failed" >&2; exit 1; fi
 echo "run_ui_tests_with_retry tests passed"

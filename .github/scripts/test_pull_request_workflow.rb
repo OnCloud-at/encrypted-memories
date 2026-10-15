@@ -176,6 +176,8 @@ class PullRequestWorkflowTests < Minitest::Test
     kept = steps.find { |step| step["name"] == "Retain the result of the first attempt after a retry" }
     assert_equal "${{ always() && steps.ui.outputs.retried == 'true' }}", kept.fetch("if")
     assert_equal failed.fetch("uses"), kept.fetch("uses")
+    # A failed upload of the first attempt must not turn a passing retry red.
+    assert_equal true, kept.fetch("continue-on-error")
     assert_includes kept.fetch("with").fetch("name"), "github.run_id"
     assert_includes kept.fetch("with").fetch("name"), "github.run_attempt"
     assert_includes kept.fetch("with").fetch("path"), "ios-ui-attempt1.xcresult"

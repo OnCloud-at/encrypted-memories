@@ -10,6 +10,10 @@ if [[ ! "$max_retries" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "UI_TEST_MAX_RETRIES must be a whole number." >&2
   exit 64
 fi
+if [[ $# -eq 0 ]]; then
+  echo "Usage: run_ui_tests_with_retry.sh <command> [arguments...]" >&2
+  exit 64
+fi
 # simctl can hang on a runner in the state that caused the failure; the shutdown never holds the job for longer.
 shutdown_seconds="${UI_TEST_SIMCTL_SECONDS:-60}"
 bundle="${IOS_TEST_RESULT_BUNDLE_PATH:-}"
