@@ -18,6 +18,12 @@ import Testing
         #expect(ActivityProgressRow.barName(nil, nil) == nil)
     }
 
+    @Test func theIndeterminateSpinnerIsNamedByTheCallerOnlyWhenTheRowShowsNoTitle() {
+        #expect(ActivityProgressRow.spinnerName(nil, "Checking duplicates") == "Checking duplicates")
+        #expect(ActivityProgressRow.spinnerName("Checking", "Ignored") == nil)
+        #expect(ActivityProgressRow.spinnerName(nil, nil) == nil)
+    }
+
     @Test func stateLineUsesSeventyPercentOfTheReadableWidth() {
         // A wide window offers more than the readable width; the line stays at 70 % of it.
         #expect(ActivityProgressStateLayout.availableWidth(for: 1_200) == 320)

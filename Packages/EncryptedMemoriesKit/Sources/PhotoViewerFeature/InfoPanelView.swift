@@ -109,7 +109,7 @@ struct InfoPanelView: View {
                 row(L10n.string("infopanel.type"), mime)
             }
             if metadataLoadState == .loading || metadataLoadState == .idle {
-                ProgressSpinner()
+                ProgressSpinner(accessibilityLabel: L10n.string("infopanel.info"))
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.top, 8)
             } else if metadataLoadState == .failed {
