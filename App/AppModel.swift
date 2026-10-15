@@ -122,8 +122,8 @@ final class AppModel {
 
     private let sessionStore: SessionKeychainStore
     private let authController: ProtonAuthController
-    private var startupPurgeBlocked: Bool
-    private var startupCleanupTask: Task<Void, Never>?
+    /// The startup and sign-in guard shared with iOS: no session starts before the sign-out purge and cleanup ended.
+    private let startupCleanup = ProtonAuthStartupCleanup()
     private var didBootstrap = false
     private let webAuthenticationSession = ManagedWebAuthenticationSession()
     private let webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
@@ -147,26 +147,16 @@ final class AppModel {
             store: store,
             authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)
         )
-        self.startupPurgeBlocked = true
-        self.startupCleanupTask = nil
         // Wire ProtonCore's CryptoGo to the patched GopenPGP implementation before any crypto runs.
         injectDefaultCryptoImplementation()
         beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
     }
 
     private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
-        guard startupCleanupTask == nil else { return }
-        let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
-        startupPurgeBlocked = true
+        guard !startupCleanup.isRunning else { return }
         auth = .checking
-        startupCleanupTask = Task { @MainActor [weak self] in
-            let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
-                claim: purgeClaim,
-                plaintextPurgeSucceeded: plaintextPurgeSucceeded
-            )
+        startupCleanup.begin(plaintextPurgeSucceeded: plaintextPurgeSucceeded) { [weak self] succeeded in
             guard let self else { return }
-            self.startupPurgeBlocked = !succeeded
-            self.startupCleanupTask = nil
             if succeeded, signInAfterCleanup {
                 self.signIn()
             } else {
@@ -178,10 +168,10 @@ final class AppModel {
 
     /// Restore a persisted session on launch.
     func bootstrap() {
-        guard startupCleanupTask == nil else { return }
+        guard !startupCleanup.isRunning else { return }
         guard !didBootstrap else { return }
         didBootstrap = true
-        guard !startupPurgeBlocked else {
+        guard startupCleanup.succeeded else {
             auth = .signedOut(error: L10n.string("auth.sign_in_failed"))
             return
         }
@@ -190,10 +180,14 @@ final class AppModel {
 
     func signIn() {
         guard !signOutBarrier.isRunning else { return }
-        guard startupCleanupTask == nil else { return }
-        guard !startupPurgeBlocked, !BackupLocalDataPurge.isPurgePending() else {
+        switch startupCleanup.admitSignIn() {
+        case .waitForCleanup:
+            return
+        case .cleanUpFirst:
             beginStartupCleanup(signInAfterCleanup: true)
             return
+        case .proceed:
+            break
         }
         authController.signIn(
             openURL: { [weak self] url in
@@ -228,9 +222,7 @@ final class AppModel {
         LibraryRuntimeState.shared.beginNewGeneration()
         AccountInfo.shared.clear()
         OfflineLibraryManager.shared.prepareForAccountTeardown()
-        BackupLocalDataPurge.requestPurgeOnSignOut(
-            persistentDomainName: Bundle.main.bundleIdentifier
-        )
+        ProtonAuthStartupCleanup.armPurgeForSignOut()
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         pendingSignOutPurgeClaim = purgeClaim
         let signedOutState = authController.signOut()
@@ -616,11 +608,7 @@ final class AppModel {
     }
 
     private func apply(_ state: ProtonAuthState, prepareBackendOnSignedIn: Bool) {
-        if case .authenticating = state {
-            // Keep the managed browser alive while the shared fork flow polls Proton.
-        } else {
-            webAuthenticationSession.cancel()
-        }
+        webAuthenticationSession.follow(state)
         switch state {
         case .checking:
             auth = .checking
