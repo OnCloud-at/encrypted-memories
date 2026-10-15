@@ -87,6 +87,9 @@ public actor BackupSyncRunner {
     /// Pushed runtime changes, such as a new network path. A change that makes the backup wait for Wi-Fi stops the
     /// transfers that already run, so their bytes do not continue on cellular data.
     private let runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)?
+    /// Records that the source no longer exists, before its row goes, so missing-source recovery does not queue it
+    /// again on every pass. Nil for sources without a catalog (folder backup, album scratch queues).
+    private let markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)?
     private let clock: any BackupSchedulerClock
     private let now: @Sendable () -> Date
 
@@ -175,6 +178,7 @@ public actor BackupSyncRunner {
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
         runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
+        markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)? = nil,
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         events: (any BackupItemEventSink)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
@@ -191,6 +195,7 @@ public actor BackupSyncRunner {
         self.configuration = configuration
         self.throttleInputs = throttleInputs
         self.runtimeChanges = runtimeChanges
+        self.markSourceUnavailable = markSourceUnavailable
         self.clock = clock
         self.now = now
     }
@@ -925,7 +930,9 @@ public actor BackupSyncRunner {
             checkingEntry = released
         }
         guard let resolved else {
-            discardMissingSource(checkingEntry, from: persistedState)
+            // The source has no backup work of its own now: the library no longer lists it, or it belongs to another
+            // photo. The catalog hook decides which.
+            discardMissingSource(checkingEntry, from: persistedState, sourceIsUnavailable: true)
             return
         }
         resourcePressureStreak = 0  // A successful export indicates available volume space.
@@ -2402,9 +2409,14 @@ public actor BackupSyncRunner {
 
     private func discardMissingSource(
         _ entry: UploadBackupSyncQueueEntry,
-        from oldState: UploadBackupSyncQueueState
+        from oldState: UploadBackupSyncQueueState,
+        sourceIsUnavailable: Bool = false
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
+        // Only a source that the library no longer lists leaves the catalog, before its row goes, so missing-source
+        // recovery does not queue it again on every pass. A file that is gone keeps the earlier recovery. A failed
+        // write keeps the earlier behavior too.
+        if sourceIsUnavailable { _ = markSourceUnavailable?(entry.source) }
         guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
             if queue.entry(for: entry.source, revision: entry.revision) != nil {
                 stopRequested = true

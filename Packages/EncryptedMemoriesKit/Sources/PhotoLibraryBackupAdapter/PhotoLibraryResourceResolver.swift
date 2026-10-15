@@ -80,11 +80,11 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             )
             throw UploadError.sourceNotReady(entry.originalFilename, until: until)
         }
-        guard let plan = PhotoBackupAssetPlanner.exportPlan(for: info),
-            let candidate = PhotoBackupAssetPlanner.candidate(for: info),
-            let primaryResource = PhotoKitAssetMapper.resource(for: plan.primary.role, of: asset)
-        else {
+        guard let (plan, candidate) = try Self.livePlan(for: info, filename: entry.originalFilename) else {
             return nil
+        }
+        guard let primaryResource = PhotoKitAssetMapper.resource(for: plan.primary.role, of: asset) else {
+            throw UploadError.sourceReportedMissing(plan.primary.uploadFilename)
         }
 
         // Stable descriptor dates: capture time drives the remote timeline; the descriptor's
@@ -135,10 +135,12 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 guard
                     let currentAsset = PHAsset.fetchAssets(
                         withLocalIdentifiers: [localIdentifier], options: nil
-                    ).firstObject,
-                    let resource = PhotoKitAssetMapper.resource(for: primaryRole, of: currentAsset)
+                    ).firstObject
                 else {
                     throw UploadError.fileMissing(plan.primary.uploadFilename)
+                }
+                guard let resource = PhotoKitAssetMapper.resource(for: primaryRole, of: currentAsset) else {
+                    throw UploadError.sourceReportedMissing(plan.primary.uploadFilename)
                 }
                 let export = try await Self.export(
                     resource,
@@ -180,7 +182,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     let member = PhotoKitAssetMapper.asset(
                         withLocalIdentifier: burstMembers[item.ordinal].localIdentifier)
                 else {
-                    throw UploadError.fileMissing(item.uploadFilename)
+                    throw UploadError.sourceReportedMissing(item.uploadFilename)
                 }
                 owner = member
                 role = burstMembers[item.ordinal].exportedRole
@@ -191,7 +193,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 ordinal = item.ordinal
             }
             guard let resource = PhotoKitAssetMapper.resource(for: role, ordinal: ordinal, of: owner) else {
-                throw UploadError.fileMissing(item.uploadFilename)
+                throw UploadError.sourceReportedMissing(item.uploadFilename)
             }
             let identity = try await readIdentity(
                 resource, filename: item.uploadFilename, tracking: exportedURLs, readAdmission: readAdmission
@@ -212,13 +214,17 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let ownerModifiedAtResolve = owner.modificationDate
             let materializer: @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor = {
                 progress in
+                guard let currentAsset = PhotoKitAssetMapper.asset(withLocalIdentifier: ownerIdentifier) else {
+                    // A series member is an asset of its own; the main photo is still listed.
+                    throw isBurstMember
+                        ? UploadError.sourceReportedMissing(filename) : UploadError.fileMissing(filename)
+                }
                 guard
-                    let currentAsset = PhotoKitAssetMapper.asset(withLocalIdentifier: ownerIdentifier),
                     let currentResource = PhotoKitAssetMapper.resource(
                         for: role, ordinal: ordinal, of: currentAsset
                     )
                 else {
-                    throw UploadError.fileMissing(filename)
+                    throw UploadError.sourceReportedMissing(filename)
                 }
                 let export = try await Self.export(
                     currentResource,
@@ -289,6 +295,42 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             materializeWithProgress: primaryMaterializer,
             cleanup: { for url in exportedURLs.urls { tempStore.discard(url) } }
         )
+    }
+
+    /// True while Photos grants access and lists at least one asset. An empty asset query proves a source gone only then.
+    static func libraryAnswersAssetQueries() -> Bool {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited else { return false }
+        let options = PHFetchOptions()
+        options.fetchLimit = 1
+        return PHAsset.fetchAssets(with: options).firstObject != nil
+    }
+
+    /// True when a photo that the backup could not resolve is gone from Photos: the library answers asset queries and
+    /// does not list the photo. A library without access, on an offline volume or not loaded yet proves nothing, and a
+    /// photo that Photos still lists, for example a series photo of another main photo, stays in the catalog.
+    static func photosNoLongerLists(
+        _ identifier: String,
+        libraryAnswers: () -> Bool = libraryAnswersAssetQueries,
+        listsAsset: (String) -> Bool = { PhotoKitAssetMapper.asset(withLocalIdentifier: $0) != nil }
+    ) -> Bool {
+        guard libraryAnswers() else { return false }
+        return !listsAsset(identifier)
+    }
+
+    /// The backup plan of the asset as Photos lists it now. Nil when the asset has no backup work of its own: a series
+    /// photo that belongs to another main photo. An asset that lists no main file takes the checks of a file that
+    /// Photos reports as missing, so it never leaves the queue and comes back through catalog recovery on every pass.
+    static func livePlan(
+        for info: PhotoBackupAssetInfo, filename: String
+    ) throws -> (PhotoBackupExportPlan, UploadBackupAssetCandidate)? {
+        guard let plan = PhotoBackupAssetPlanner.exportPlan(for: info),
+            let candidate = PhotoBackupAssetPlanner.candidate(for: info)
+        else {
+            if info.resources.contains(where: { $0.role == .burstMainReference }) { return nil }
+            throw UploadError.sourceReportedMissing(filename)
+        }
+        return (plan, candidate)
     }
 
     private static func isUniqueCloudIdentifier(_ identifier: String?, localIdentifier: String) -> Bool {
@@ -568,7 +610,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
     }
 
     /// Converts stable PhotoKit failure codes into Core upload categories. Waits and storage conditions stay
-    /// retryable; errors that prove the resource is gone remove it from backup work.
+    /// retryable. A file that Photos cannot hand out while the asset is still listed is checked again a few times and
+    /// then shown as missing.
     static func normalizedPhotoKitError(_ error: Error, filename: String) -> Error {
         let nsError = error as NSError
         guard nsError.domain == PHPhotosErrorDomain,
@@ -577,7 +620,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
 
         switch code {
         case .identifierNotFound, .invalidResource:
-            return UploadError.fileMissing(filename)
+            return UploadError.sourceReportedMissing(filename)
         case .missingResource:
             // A download from iCloud that stops part-way can also report a missing resource, so the photo is not
             // treated as gone at once.

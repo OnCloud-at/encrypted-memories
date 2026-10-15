@@ -333,6 +333,10 @@ public final class PhotoLibraryBackupController {
                 configuration: .init(retry: retryPolicy),
                 throttleInputs: runtimeSignals.current,
                 runtimeChanges: runtimeSignals.updates,
+                markSourceUnavailable: { source in
+                    guard PhotoLibraryResourceResolver.photosNoLongerLists(source.identifier) else { return false }
+                    return catalogStore.recordUnavailableSource(source, at: Date())
+                },
                 events: pendingRecorder
             )
         } else {
