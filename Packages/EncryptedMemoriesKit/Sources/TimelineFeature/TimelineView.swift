@@ -263,7 +263,8 @@ public struct TimelineView: View {
         TimelineSearchProjectionKey(
             sourceRevision: model.contentRevision,
             query: projectionQuery,
-            context: TimelineSearchContext(activeFilter: model.filter, favoriteUIDs: favoriteUIDs, photoNames: photoNames),
+            context: TimelineSearchContext(
+                activeFilter: model.filter, favoriteUIDs: favoriteUIDs, photoNames: photoNames),
             semanticMatches: requiredUIDs == nil ? semanticMatches : nil,
             refinement: refinement,
             requiredUIDs: requiredUIDs

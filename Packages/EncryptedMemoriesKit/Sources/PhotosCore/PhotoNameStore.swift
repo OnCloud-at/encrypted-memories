@@ -110,7 +110,8 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
         }
     }
 
-    /// Taken before a name read; `record(_:unlessForgottenSince:)` rejects the read when a name was forgotten meanwhile.
+    /// Taken before a name read; `record(_:unlessForgottenSince:)` rejects the read when a name was forgotten
+    /// meanwhile.
     public var forgetToken: UInt64 {
         lock.withLock { forgetCount }
     }

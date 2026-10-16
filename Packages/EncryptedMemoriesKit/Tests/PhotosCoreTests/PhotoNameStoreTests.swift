@@ -156,7 +156,8 @@ import Testing
         let store = try #require(makeStore(directory))
         #expect(store.record([first: "IMG_1.JPG"]) == .written)
         store.close()
-        #expect(FileManager.default.fileExists(atPath: directory.appendingPathComponent(PhotoNameStore.databaseFileName).path))
+        let file = directory.appendingPathComponent(PhotoNameStore.databaseFileName)
+        #expect(FileManager.default.fileExists(atPath: file.path))
 
         #expect(LibraryDatabaseLocation.purgeAccountData(uid: "account", in: base))
         #expect(!FileManager.default.fileExists(atPath: directory.path))

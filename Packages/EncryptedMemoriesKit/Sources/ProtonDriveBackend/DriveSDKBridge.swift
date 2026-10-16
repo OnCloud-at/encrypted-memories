@@ -453,7 +453,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         })
                     pendingNameForgets = photoNames.forget(changed) ? [] : changed
                     if !pendingNameForgets.isEmpty {
-                        DebugLog.log("timeline: file names not removed count=\(pendingNameForgets.count); next load retries")
+                        let count = pendingNameForgets.count
+                        DebugLog.log("timeline: file names not removed count=\(count); next load retries")
                     }
                 }
                 var entries: [PhotosListEntry]
@@ -1300,7 +1301,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 volumeID: context.volumeID, store: store,
                 permits: { !self.isShutDown && PhotoNameFill.permits(LibraryRuntimeState.shared.snapshot()) },
                 nameKey: {
-                    // The stream source keeps the root key for the session, so a key read after a pass sends no request.
+                    // The stream source keeps the root key for the session, so a key read after a pass sends no
+                    // request.
                     let source = try await self.fileSource()
                     let key = try await ProtonRequestContext.$priority.withValue(.maintenance) {
                         try await source.nodeKey(ofLinkID: context.rootLinkID)
@@ -1311,7 +1313,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 fetch: { try await self.driveSession.fetchPhotoLinksMetadata(shareID: context.shareID, linkIDs: $0) })
             if outcome.requests > 0 {
                 DebugLog.log(
-                    "timeline: file names read requests=\(outcome.requests) superseded=\(outcome.superseded) deferred=\(outcome.deferred)"
+                    "timeline: file names read requests=\(outcome.requests) superseded=\(outcome.superseded) "
+                        + "deferred=\(outcome.deferred)"
                 )
             }
         } catch is CancellationError {
