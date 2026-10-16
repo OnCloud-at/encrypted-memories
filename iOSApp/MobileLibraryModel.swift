@@ -1474,31 +1474,19 @@ final class MobileLibraryModel {
                     dimensions: PhotoDimensionCoalescer(store: backend),
                     targetPixels: 288
                 )
-                let pendingStore = PendingGridSession.openStore(
+                // The pending store, the photo backup and album sync are built the same way on macOS.
+                let stack = AccountBackupStack(
                     accountDataDirectory: client.accountDataDirectory,
-                    policy: client.accountDatabasePolicy
-                )
-                let photoBackup = PhotoLibraryBackupController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
+                    databasePolicy: client.accountDatabasePolicy,
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
                     tagAdder: client.photoTagAdder,
                     editReplacement: client.editedPhotoReplacement,
-                    pendingStore: pendingStore,
-                    requiresPendingStore: true
+                    albumOperations: client.albumSyncRemoteOps
                 )
-                let albumSync = AlbumSyncController(
-                    configuration: .init(
-                        accountDataDirectory: client.accountDataDirectory,
-                        databasePolicy: client.accountDatabasePolicy
-                    ),
-                    identityResolver: client.uploadIdentityResolver,
-                    uploader: client.photoUploader,
-                    remoteOps: client.albumSyncRemoteOps
-                )
+                let pendingStore = stack.pendingStore
+                let photoBackup = stack.photoBackup
+                let albumSync = stack.albumSync
                 albumSync.setRemoteAlbumsChangedHandler { [weak self] in
                     guard let self,
                         loadGeneration == self.loadToken,
@@ -1511,9 +1499,7 @@ final class MobileLibraryModel {
                     loadGeneration == self.loadToken,
                     self.session == session
                 else {
-                    await photoBackup.shutdown()
-                    pendingStore?.close()
-                    await albumSync.shutdown()
+                    await stack.shutdownUnused()
                     await client.shutdown()
                     return
                 }
