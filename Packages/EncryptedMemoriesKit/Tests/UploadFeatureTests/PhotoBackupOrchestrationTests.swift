@@ -895,6 +895,8 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         try await waitForCondition { [uploader] in uploader!.requests.map(\.name) == ["IMG_C.HEIC"] }
         let scanStillRuns = await !scanDone.isDone()
         XCTAssertTrue(scanStillRuns, "C uploads while the scan still runs")
+        // A cancel while the upload is in flight returns the row to the queue; wait until the queue shows it as uploaded.
+        try await waitForCondition { queue.summary().uploaded == 1 }
         await scanDone.markDone()
         reconcile.cancel()
         _ = await reconcile.value
