@@ -102,6 +102,9 @@
             UpgradeTestProbe.checkpoint("backup.remoteReceipt")
             return PhotoUID(volumeID: "upgrade-fixture", nodeID: link.id)
         }
+        func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+            try await UploadNetworkAdmission().reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+        }
         func cancel(token: UUID) async {}
         func librarySourceLocators() async throws -> [AlbumNodeIdentifier] { [] }
         func librarySourceItems(for album: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] { [] }

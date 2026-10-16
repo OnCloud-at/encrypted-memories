@@ -344,6 +344,9 @@ import UploadCore
         func upload(
             _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
         ) async throws -> PhotoUID { throw MobileFixtureError.unavailable }
+        func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+            try await UploadNetworkAdmission().reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+        }
         func cancel(token: UUID) async {}
         func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
             throw MobileFixtureError.unavailable

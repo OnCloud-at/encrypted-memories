@@ -24,6 +24,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let driveSession: DriveSession
     private let requestGovernor = ProtonRequestGovernor()
     private let expensiveUploadAccess = ExpensiveUploadAccess()
+    /// Keeps uploads that avoid expensive networks apart from uploads that may use them, so `expensiveUploadAccess`
+    /// always describes every running upload.
+    private nonisolated let uploadNetworkAdmission = UploadNetworkAdmission()
     private nonisolated let sharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
     private var photosRoot: SDKNodeUid?
     private var photosShareID: String?
@@ -2258,6 +2261,10 @@ extension DriveSDKBridge: PhotoDimensionRecording {
 /// + streams blocks (through `SDKHttpClient.requestUploadToStorage`), and returns the new node id. The
 /// queue/state-machine lives in the pure `UploadManager`; this is just the transport.
 extension DriveSDKBridge: PhotoUploading {
+    nonisolated func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        try await uploadNetworkAdmission.reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
+
     nonisolated var capabilities: UploadBackendCapabilities {
         // The SDK exposes operation-level pause/resume, but we drive uploads through the `uploadPhoto`
         // convenience (no held operation), so in-flight pause isn't wired: queued items pause at the
@@ -2415,6 +2422,14 @@ extension DriveSDKBridge: PhotoUploading {
     ) async throws -> PhotoUID {
         guard !isShutDown else { throw CancellationError() }
         try Task.checkCancellation()
+        // Fails closed: an upload without its reservation could run beside an upload of the other network kind and
+        // send its bytes on a network that it must avoid.
+        guard let reservation = request.networkReservation, reservation.isActive,
+            uploadNetworkAdmission.issued(reservation),
+            reservation.allowsExpensiveNetwork == request.allowsExpensiveNetwork
+        else {
+            throw UploadError.backend("The upload started without its network reservation")
+        }
         expensiveUploadAccess.begin(allowsExpensiveNetwork: request.allowsExpensiveNetwork)
         defer { expensiveUploadAccess.end(allowsExpensiveNetwork: request.allowsExpensiveNetwork) }
         onProgress(UploadProgress(phase: .preparing))

@@ -506,6 +506,9 @@ public struct PhotoUploadRequest: Sendable {
     /// False when this backup upload must not use cellular data or Personal Hotspot. The transport then lets the
     /// system refuse the bytes on such a network. Uploads that the person starts keep the default.
     public var allowsExpensiveNetwork = true
+    /// The upload's place in the account's `UploadNetworkAdmission`. The production uploader refuses a request without
+    /// an active reservation of its own admission and of the same network kind.
+    public var networkReservation: UploadNetworkReservation?
 
     public init(
         queueItemID: UploadQueueItemID,
@@ -556,6 +559,7 @@ public struct PhotoUploadRequest: Sendable {
             mainPhotoUID: mainPhotoUID
         )
         request.allowsExpensiveNetwork = allowsExpensiveNetwork
+        request.networkReservation = networkReservation
         return request
     }
 
@@ -576,6 +580,7 @@ public struct PhotoUploadRequest: Sendable {
             mainPhotoUID: mainPhotoUID
         )
         request.allowsExpensiveNetwork = allowsExpensiveNetwork
+        request.networkReservation = networkReservation
         return request
     }
 }

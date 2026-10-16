@@ -54,6 +54,12 @@ final class SeriesDissolutionTests: XCTestCase {
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
 
         XCTAssertEqual(server.uploads.map(\.name), ["m2.HEIC", "m4.HEIC"], "the copies keep the original filenames")
+        XCTAssertEqual(
+            server.reservedAtUpload, [true, true],
+            "the person started the dissolution, so its copies may use any network")
+        XCTAssertFalse(
+            server.uploads.contains { $0.networkReservation?.isActive == true },
+            "every copy upload releases its reservation")
         for upload in server.uploads {
             XCTAssertNil(upload.mainPhotoUID, "a kept favorite is a standalone photo, not a related photo")
             XCTAssertEqual(upload.tags, [], "a kept favorite carries no bursts tag")
@@ -622,11 +628,24 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     // PhotoUploading
 
+    let admission = UploadNetworkAdmission()
+    private var _reservedAtUpload: [Bool] = []
+    /// For each upload: it started with an active reservation of `admission` that may use expensive networks.
+    var reservedAtUpload: [Bool] { lock.withLock { _reservedAtUpload } }
+
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        try await admission.reserve(allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
+
     func upload(
         _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
         let bytes = try Data(contentsOf: request.fileURL)
+        let reserved =
+            request.networkReservation.map { $0.isActive && admission.issued($0) && $0.allowsExpensiveNetwork }
+            ?? false
         return try lock.withLock {
+            _reservedAtUpload.append(reserved)
             _uploads.append(request)
             if let left = uploadFailures[request.name], left > 0 {
                 uploadFailures[request.name] = left - 1

@@ -577,7 +577,7 @@ public actor SeriesDissolutionOrchestrator {
         case .upload(let replacingDraft):
             let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
             let token = UUID()
-            let request = PhotoUploadRequest(
+            var request = PhotoUploadRequest(
                 queueItemID: UUID(),
                 cancellationToken: token,
                 fileURL: fileURL,
@@ -593,11 +593,15 @@ public actor SeriesDissolutionOrchestrator {
                 overrideExistingDraft: replacingDraft
             )
             let uploader = self.uploader
+            let reservation = try await uploader.reserveNetwork(allowsExpensiveNetwork: request.allowsExpensiveNetwork)
+            defer { reservation.release() }
+            request.networkReservation = reservation
+            let reservedRequest = request
             let cancellation = BackupUploadCancellation()
             let uid: PhotoUID
             do {
                 uid = try await withTaskCancellationHandler {
-                    try await uploader.upload(request) { progress in
+                    try await uploader.upload(reservedRequest) { progress in
                         if progress.phase == .uploading { onProgress(0.5 + progress.fraction * 0.5) }
                     }
                 } onCancel: {
