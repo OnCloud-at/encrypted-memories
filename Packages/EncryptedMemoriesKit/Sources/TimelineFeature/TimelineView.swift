@@ -45,6 +45,7 @@ public struct TimelineView: View {
     private let initialViewportPlacement: TimelineInitialViewportPlacement
     @State private var searchProjection: TimelineSearchProjection?
     @State private var searchCoordinator: TimelineSearchProjectionCoordinator
+    @State private var photoNames: PhotoNameIndex?
     @State private var monthMarkers: [TimelineDateMarker] = []
     @State private var monthMarkerRevision: Int?
 
@@ -187,6 +188,9 @@ public struct TimelineView: View {
         }
         .background(timelineSurfaceBackground)
         .task { await model.load() }
+        .task(id: projectionQuery) {
+            photoNames = await TimelineFileNameSearchSource.names(forQuery: projectionQuery, from: metadataProvider)
+        }
         .task(id: searchProjectionRequest) { await resolveSearchProjection() }
         .task(id: markerRequest) { await resolveMonthMarkers(for: markerRequest) }
         .onChange(of: hasSearchQuery) { _, hasQuery in
@@ -250,11 +254,17 @@ public struct TimelineView: View {
         requiredUIDs != nil || !TimelineSearchQuery(normalizedSearchText).isEmpty || refinement.isActive
     }
 
+    /// A structured suggestion replaces the text query: its title is display text, not search terms.
+    private var projectionQuery: String {
+        requiredUIDs == nil ? normalizedSearchText : ""
+    }
+
     private var searchKey: TimelineSearchProjectionKey {
         TimelineSearchProjectionKey(
             sourceRevision: model.contentRevision,
-            query: requiredUIDs == nil ? normalizedSearchText : "",
-            context: TimelineSearchContext(activeFilter: model.filter, favoriteUIDs: favoriteUIDs),
+            query: projectionQuery,
+            context: TimelineSearchContext(
+                activeFilter: model.filter, favoriteUIDs: favoriteUIDs, photoNames: photoNames),
             semanticMatches: requiredUIDs == nil ? semanticMatches : nil,
             refinement: refinement,
             requiredUIDs: requiredUIDs
