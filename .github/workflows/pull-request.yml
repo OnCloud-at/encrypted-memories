@@ -148,6 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/test_require_merge_queue.py
+          python3 .github/scripts/test_cancel_superseded_queue_run.py
           python3 -B .github/scripts/test_collect_ui_wait_diagnostics.py
           python3 .github/scripts/test_ios_test_commands.py
           python3 .github/scripts/test_report_build_storage.py
@@ -542,6 +543,50 @@ jobs:
             sleep 30
           done
           echo "The watch ended at its time limit."
+
+  # A merge-group entry can leave the queue while its run keeps waiting for macOS runners: another
+  # commit replaces the entry, or the pull request closes. Those superseded runs waste the shared
+  # runner slots (issue #717). Like the failure watchdog above, this job has no checkout and runs no
+  # code of the pull request: it reads the decision script from the base commit of the merge group,
+  # which is the tip of main. The job can never fail, because the failure watchdog cancels the run
+  # when any job of it fails: an error of this job appears in its log only. Reading the script from
+  # the repository needs contents: read in addition to the actions: write of the cancel.
+  cancel-superseded-run:
+    name: Cancel a superseded queue run
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-24.04
+    # The same limits as the failure watchdog: the loop of the script ends by itself after 165 minutes.
+    timeout-minutes: 175
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Cancel the run when its entry left the merge queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SCRIPT_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -uo pipefail
+          # Read the decision script from the base commit of the merge group, never from the pull request.
+          if ! content="$(gh api "repos/$GH_REPO/contents/.github/scripts/cancel_superseded_queue_run.py?ref=$SCRIPT_SHA" --jq .content)"; then
+            echo "The decision script is not readable at the base commit $SCRIPT_SHA, so the run is not watched."
+            exit 0
+          fi
+          if ! printf '%s' "$content" | base64 --decode > "$RUNNER_TEMP/cancel_superseded_queue_run.py"; then
+            echo "The decision script could not be decoded, so the run is not watched."
+            exit 0
+          fi
+          python3 "$RUNNER_TEMP/cancel_superseded_queue_run.py" \
+            --head-sha "$HEAD_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --worker "Repository hygiene" \
+            --worker "Package verification and style" \
+            --worker "iOS verification" \
+            --worker "iOS UI verification" \
+            --worker "macOS verification" \
+            || echo "The watch could not run, so the run is not cancelled by it."
 
   code-quality:
     name: Swift style

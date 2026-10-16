@@ -46,6 +46,8 @@ class PullRequestWorkflowTests < Minitest::Test
     repository-hygiene package-verification ios-verification ios-ui-verification macos-verification
   ].freeze
   WATCHDOG = "cancel-on-failure"
+  # Stops a run whose merge-queue entry is gone (issue #717); it is a watchdog too, not a result job.
+  SUPERSEDED_WATCHDOG = "cancel-superseded-run"
   # Runs only for pull requests, so the queue watchdog never waits for it; it is a worker, not a result job.
   PULL_REQUEST_ONLY_WORKERS = %w[swift-style-linux].freeze
 
@@ -53,13 +55,16 @@ class PullRequestWorkflowTests < Minitest::Test
     @workflow.fetch("jobs").fetch(WATCHDOG)
   end
 
-  def test_only_the_queue_watchdog_may_write_actions_and_it_runs_no_code_of_the_pull_request
+  def test_only_the_queue_watchdogs_may_write_actions_and_run_no_code_of_the_pull_request
     assert_equal({"contents" => "read"}, @workflow.fetch("permissions"))
     jobs = @workflow.fetch("jobs")
     jobs.each do |name, job|
       scopes = job.fetch("permissions", {})
       if name == WATCHDOG
         assert_equal({"actions" => "write"}, scopes, "the watchdog has no other scope, also no contents")
+      elsif name == SUPERSEDED_WATCHDOG
+        assert_equal({"actions" => "write", "contents" => "read"}, scopes,
+                     "the superseded-run watchdog writes only actions and reads only contents")
       else
         refute scopes.key?("actions"), "#{name} must not request an actions scope"
         assert_empty scopes.values - %w[read], "#{name} stays read-only"
@@ -72,9 +77,11 @@ class PullRequestWorkflowTests < Minitest::Test
     refute_match(%r{\./|scripts/|\.github/|\bbash \S+\.sh|\bsource\b|\bcurl\b}, steps.first.fetch("run"))
     environment = {"GH_TOKEN" => "${{ github.token }}", "GH_REPO" => "${{ github.repository }}"}
     assert_equal environment, steps.first.fetch("env")
-    # No result job waits for it, and it is not a required check.
-    jobs.each { |name, job| refute_includes Array(job["needs"]), WATCHDOG, name }
-    refute_includes REQUIRED_CHECKS, watchdog.fetch("name")
+    # No result job waits for a watchdog, and no watchdog is a required check.
+    [WATCHDOG, SUPERSEDED_WATCHDOG].each do |watchdog_id|
+      jobs.each { |name, job| refute_includes Array(job["needs"]), watchdog_id, name }
+      refute_includes REQUIRED_CHECKS, jobs.fetch(watchdog_id).fetch("name"), watchdog_id
+    end
     assert_equal "ubuntu-24.04", watchdog.fetch("runs-on")
     # The longest queue run took 123 minutes. The loop ends before the job limit, which stays below the 180 minute
     # check timeout of the queue.
@@ -99,6 +106,115 @@ class PullRequestWorkflowTests < Minitest::Test
     listed = script[/^workers=\((.*)\)$/, 1].scan(/"([^"]+)"/).flatten
     assert_equal names, listed
     assert_includes script, %(own="#{watchdog.fetch('name')}")
+  end
+
+  # The second watchdog stops a run whose merge-queue entry is gone (issue #717). It must not run code of the pull
+  # request either: it has no checkout, and its decision script is read from the base commit of the merge group.
+  def test_the_superseded_run_watchdog_reads_only_trusted_code_and_cancels_only_its_own_run
+    job = @workflow.fetch("jobs").fetch(SUPERSEDED_WATCHDOG)
+    assert_equal "Cancel a superseded queue run", job.fetch("name")
+    {"merge_group" => true, "pull_request" => false, "workflow_dispatch" => false}.each do |event, expected|
+      assert_equal expected, evaluate(job.fetch("if"), {"github.event_name" => event}), event
+    end
+    assert_equal "ubuntu-24.04", job.fetch("runs-on")
+    limit = job.fetch("timeout-minutes")
+    assert_operator limit, :>=, 150
+    assert_operator limit, :<=, 180
+    steps = job.fetch("steps")
+    assert_equal 1, steps.length
+    step = steps.first
+    assert_empty step.keys - %w[name env run]
+    environment = {"GH_TOKEN" => "${{ github.token }}", "GH_REPO" => "${{ github.repository }}",
+                   "SCRIPT_SHA" => "${{ github.event.merge_group.base_sha }}",
+                   "HEAD_SHA" => "${{ github.event.merge_group.head_sha }}"}
+    assert_equal environment, step.fetch("env")
+    script = step.fetch("run")
+    # No checkout and no action: the decision script is read from the base commit of the merge group, which is
+    # the tip of main, never from the pull request.
+    assert_match(%r{repos/\$GH_REPO/contents/\.github/scripts/cancel_superseded_queue_run\.py\?ref=\$SCRIPT_SHA}, script)
+    assert_includes script, %q(--head-sha "$HEAD_SHA")
+    assert_includes script, %q(--run-id "$GITHUB_RUN_ID")
+    assert_equal 1, script.scan("python3").length
+    # The jobs that make a run finishing are the worker jobs of this workflow.
+    names = WORKER_JOBS.map { |id| @workflow.fetch("jobs").fetch(id).fetch("name") }
+    listed = script.scan(/--worker "([^"]+)"/).flatten
+    assert_equal names, listed
+    # The job can never fail: the failure watchdog of the run cancels the run when any job of it fails.
+    assert_match(/\|\| echo/, script)
+    assert_includes script, "exit 0"
+    # The decision script and its tests live in the repository and run in the hygiene job.
+    assert File.exist?(File.expand_path("cancel_superseded_queue_run.py", __dir__))
+    hygiene = @workflow.fetch("jobs").fetch("repository-hygiene").fetch("steps")
+                       .find { |s| s["name"] == "Test GitHub automation" }
+    assert_includes hygiene.fetch("run"), "python3 .github/scripts/test_cancel_superseded_queue_run.py"
+  end
+
+  # Runs the real step of the superseded-run watchdog with a fake `gh`. The fetch and the decode of the
+  # decision script run for real, and the watch ends in the first iteration, so nothing sleeps.
+  def run_superseded_watchdog(entry_oids:, worker_status:, contents_ok: true, cancel_exit: 0, cancel_message: "")
+    step = @workflow.fetch("jobs").fetch(SUPERSEDED_WATCHDOG).fetch("steps").first
+    script = File.expand_path("cancel_superseded_queue_run.py", __dir__)
+    Dir.mktmpdir do |dir|
+      bin = File.join(dir, "bin")
+      Dir.mkdir(bin)
+      File.write(File.join(dir, "script.sh"), step.fetch("run"))
+      nodes = entry_oids.map { |oid| {"state" => "BUILDABLE", "headCommit" => {"oid" => oid}} }
+      File.write(File.join(dir, "queue.json"),
+                 JSON.generate([{"data" => {"repository" => {"mergeQueue" => {"entries" => {"nodes" => nodes}}}}}]))
+      rows = WORKER_JOBS.map do |id|
+        {"name" => @workflow.fetch("jobs").fetch(id).fetch("name"), "status" => worker_status, "conclusion" => nil}
+      end
+      File.write(File.join(dir, "jobs.json"), JSON.generate([{"jobs" => rows}]))
+      File.write(File.join(bin, "gh"), <<~SH)
+        #!/usr/bin/env bash
+        args="$*"
+        if [[ "$1 $2" == "run cancel" ]]; then
+          echo "$3" >> "#{dir}/cancelled"
+          [[ -z "#{cancel_message}" ]] || echo "#{cancel_message}" >&2
+          exit "#{cancel_exit}"
+        fi
+        if [[ "$args" == *"contents/.github/scripts/cancel_superseded_queue_run.py"* ]]; then
+          [[ #{contents_ok} == true ]] || { echo "HTTP 404" >&2; exit 1; }
+          base64 < "#{script}"
+          exit 0
+        fi
+        if [[ "$args" == *graphql* ]]; then
+          cat "#{dir}/queue.json"
+          exit 0
+        fi
+        if [[ "$args" == */jobs* ]]; then
+          cat "#{dir}/jobs.json"
+          exit 0
+        fi
+        echo "2026-01-01T00:00:00Z"
+      SH
+      FileUtils.chmod(0o755, File.join(bin, "gh"))
+      env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "GH_REPO" => "owner/repo", "GITHUB_RUN_ID" => "4242",
+             "GH_TOKEN" => "unused", "RUNNER_TEMP" => dir.to_s, "SCRIPT_SHA" => "0" * 40, "HEAD_SHA" => "f" * 40}
+      out, status = Timeout.timeout(30) { Open3.capture2e(env, "bash", File.join(dir, "script.sh")) }
+      cancelled = File.exist?(File.join(dir, "cancelled")) ? File.read(File.join(dir, "cancelled")).split : []
+      [status.exitstatus, cancelled, out]
+    end
+  end
+
+  def test_the_superseded_watchdog_ends_green_and_cancels_only_the_own_run
+    # The entry is gone, the run is old, and the workers run: one cancel of the own run, then the job ends green.
+    status, cancelled, out = run_superseded_watchdog(entry_oids: ["e" * 40], worker_status: "in_progress")
+    assert_equal [0, ["4242"]], [status, cancelled]
+    assert_includes out, "The run is cancelled."
+    # Every worker is complete: the run merged or is finishing, so nothing is cancelled.
+    status, cancelled, out = run_superseded_watchdog(entry_oids: ["e" * 40, "f" * 40], worker_status: "completed")
+    assert_equal [0, []], [status, cancelled]
+    assert_includes out, "All worker jobs finished without a failure."
+    # A cancel of an already ended run counts as a success.
+    status, cancelled, = run_superseded_watchdog(entry_oids: ["e" * 40], worker_status: "in_progress",
+                                                cancel_exit: 1, cancel_message: "HTTP 409: already completed")
+    assert_equal [0, ["4242"]], [status, cancelled]
+    # A failed fetch of the decision script ends green and cancels nothing.
+    status, cancelled, out = run_superseded_watchdog(entry_oids: ["e" * 40], worker_status: "in_progress",
+                                                    contents_ok: false)
+    assert_equal [0, []], [status, cancelled]
+    assert_includes out, "is not readable"
   end
 
   # Runs the real script of the watchdog with a fake `gh` and no waiting. Each element of `responses` is the answer
@@ -207,7 +323,8 @@ class PullRequestWorkflowTests < Minitest::Test
 
   def test_every_result_job_runs_also_when_a_worker_job_is_cancelled
     results = @workflow.fetch("jobs").reject do |id, _|
-      WORKER_JOBS.include?(id) || PULL_REQUEST_ONLY_WORKERS.include?(id) || id == WATCHDOG
+      WORKER_JOBS.include?(id) || PULL_REQUEST_ONLY_WORKERS.include?(id) ||
+        [WATCHDOG, SUPERSEDED_WATCHDOG].include?(id)
     end
     PULL_REQUEST_ONLY_WORKERS.each do |id|
       refute evaluate(@workflow.fetch("jobs").fetch(id).fetch("if"), {"github.event_name" => "merge_group"}), id
