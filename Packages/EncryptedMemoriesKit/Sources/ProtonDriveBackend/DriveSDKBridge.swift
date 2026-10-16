@@ -2777,6 +2777,17 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         }
     }
 
+    func memberRoles(of uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
+        guard !uids.isEmpty else { return [:] }
+        return try await withOpenSession(cause: .series) { bridge in
+            let context = try await bridge.photosShareContext()
+            let links = try await bridge.driveSession.fetchLinkVisibility(
+                shareID: context.shareID, linkIDs: uids.map(\.nodeID))
+            return Dictionary(
+                uids.compactMap { uid in links[uid.nodeID].map { (uid, $0) } }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
         // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.

@@ -3758,6 +3758,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Ein gesicherter Favorit konnte nicht bestätigt werden. Die Serie wurde nicht in den Papierkorb bewegt." } }
       }
     },
+    "error.series_member_role_unknown": {
+      "extractionState": "manual",
+      "comment": "Keep Only Favorites stopped before any change: the server did not report how a burst photo belongs to the burst.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The burst could not be checked and was not changed. Try again later." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Serie konnte nicht geprüft werden und wurde nicht verändert. Versuche es später erneut." } }
+      }
+    },
     "error.series_trash_not_confirmed": {
       "extractionState": "manual",
       "comment": "The trash request returned, but the burst photos were still in the library.",

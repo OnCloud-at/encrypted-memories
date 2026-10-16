@@ -342,22 +342,71 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.activeRelatedNodeIDs(ofMain: "m3"), ["m4"])
     }
 
-    func testAnActiveMemberWithoutARoleStopsTheTrashStepBeforeAnyWrite() async throws {
+    func testAnActiveMemberWithoutARoleStopsBeforeAnyCopySoTheUserCanLeave() async throws {
         server.withholdPhotoRole(["m3"])
         do {
             try await makeOrchestrator().keepOnlyFavorites(
                 seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
             XCTFail("an unknown role must not decide the trash")
         } catch let error as SeriesDissolutionError {
-            XCTAssertEqual(error, .trashNotConfirmed)
+            XCTAssertEqual(error, .memberRoleUnknown)
+        }
+        XCTAssertEqual(server.uploads.count, 0, "no copy exists before the roles are known")
+        XCTAssertEqual(server.trashCalls, [])
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
+
+        // The user answers the failure with Cancel.
+        try await makeOrchestrator().abandon(seriesMainUID: main)
+
+        XCTAssertEqual(try journalStore.pendingJournals(), [])
+        XCTAssertEqual(server.activeCopyUIDs, [])
+    }
+
+    func testARoleThatIsUnknownInTheTrashStepStopsItBeforeAnyTrashWrite() async throws {
+        server.failNextTrash()
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+        server.withholdPhotoRole(["m3"])
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        XCTAssertThrowsError(try XCTUnwrap(outcomes.first).result.get()) { error in
+            XCTAssertEqual(error as? SeriesDissolutionError, .trashNotConfirmed)
         }
         XCTAssertEqual(server.trashCalls, [], "neither the main photo nor the member moves")
         XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
 
         server.withholdPhotoRole([])
-        let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertNoThrow(try XCTUnwrap(outcomes.first).result.get())
+        let retried = try await makeOrchestrator().resumePending()
+        XCTAssertNoThrow(try XCTUnwrap(retried.first).result.get())
         XCTAssertEqual(server.trashCalls, [[main]])
+    }
+
+    func testAnInactiveMemberWithoutARoleDoesNotBlock() async throws {
+        server.markTrashed(["m3"])
+        server.withholdPhotoRole(["m3"])
+
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.trashCalls, [[main]])
+        XCTAssertEqual(try journalStore.pendingJournals(), [])
+    }
+
+    func testAResumedTrashStepSendsOnlyThePhotosThatAreStillActive() async throws {
+        server.makeStandalone(["m2", "m3", "m4"])
+        server.failNextTrash()
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+        // The earlier attempt moved part of the trash set before it stopped.
+        server.markTrashed(["m1", "m3"])
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        XCTAssertNoThrow(try XCTUnwrap(outcomes.first).result.get())
+        XCTAssertEqual(
+            server.trashCalls.map { $0.map(\.nodeID) }, [["m2", "m4"]], "a trashed photo is never sent again")
+        XCTAssertEqual(server.trashListingNodeIDs, ["m1", "m2", "m3", "m4"])
     }
 
     func testAMemberThatIsGoneForGoodIsSkipped() async throws {
@@ -715,6 +764,11 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         lock.withLock { Set(uids.filter { nodes[$0.nodeID]?.state == .active }) }
+    }
+
+    func memberRoles(of uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
+        let links = try await linkVisibility(of: uids.map(\.nodeID))
+        return Dictionary(uniqueKeysWithValues: uids.compactMap { uid in links[uid.nodeID].map { (uid, $0) } })
     }
 
     func trashSeries(_ uids: [PhotoUID]) async throws {
