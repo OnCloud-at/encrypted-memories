@@ -46,8 +46,8 @@ def jobs_answer(states):
     return {"total_count": len(rows), "jobs": rows}
 
 
-def run_state(age, answer):
-    return {"run_age_seconds": age, "jobs_answer": answer}
+def run_state(age, answer, entry_seen=True):
+    return {"run_age_seconds": age, "jobs_answer": answer, "entry_seen": entry_seen}
 
 
 def next_answer(items):
@@ -108,9 +108,28 @@ class FakeGh(script.Gh):
         return True, self.started_at
 
 
+class MergedDuringTheReadGh(FakeGh):
+    """The entry is present at the first poll and merges before the second queue read."""
+
+    def __init__(self):
+        super().__init__([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer("in_progress")])
+        self.merged = False
+
+    def call(self, argv):
+        text = " ".join(argv)
+        if "graphql" in text:
+            ok, output = super().call(argv)
+            if OTHER_SHA in output:
+                self.merged = True
+            return ok, output
+        if "/jobs" in text and self.merged:
+            return True, json.dumps(jobs_answer("completed"))
+        return super().call(argv)
+
+
 class DecideTests(unittest.TestCase):
-    def decide(self, head_sha, queue_answer, age, answer, workers=WORKERS):
-        return script.decide(head_sha, queue_answer, run_state(age, answer), workers)
+    def decide(self, head_sha, queue_answer, age, answer, workers=WORKERS, entry_seen=True):
+        return script.decide(head_sha, queue_answer, run_state(age, answer, entry_seen), workers)
 
     def test_entry_present_keeps_the_run(self):
         self.assertEqual(
@@ -125,6 +144,12 @@ class DecideTests(unittest.TestCase):
     def test_entry_gone_and_old_run_cancels(self):
         self.assertEqual(
             script.CANCEL, self.decide(HEAD_SHA, [queue_page([OTHER_SHA])], 7200, jobs_answer("in_progress"))
+        )
+
+    def test_an_entry_that_was_never_seen_stays(self):
+        self.assertEqual(
+            script.UNKNOWN,
+            self.decide(HEAD_SHA, [queue_page([OTHER_SHA])], 7200, jobs_answer("in_progress"), entry_seen=False),
         )
 
     def test_entry_gone_but_young_run_stays(self):
@@ -153,6 +178,21 @@ class DecideTests(unittest.TestCase):
     def test_rate_limited_answer_stays(self):
         answer = [{"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}]
         self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, answer, 7200, jobs_answer("in_progress")))
+
+    def test_errors_with_partial_data_stay(self):
+        page = dict(queue_page([OTHER_SHA]), errors=[{"message": "partial answer"}])
+        self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [page], 7200, jobs_answer("in_progress")))
+
+    def test_a_null_node_or_head_commit_stays(self):
+        for node in (None, {"state": "BUILDABLE", "headCommit": None}, {"state": "BUILDABLE"}):
+            page = queue_page([OTHER_SHA])
+            page["data"]["repository"]["mergeQueue"]["entries"]["nodes"].append(node)
+            self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [page], 7200, jobs_answer("in_progress")))
+
+    def test_an_upper_case_oid_does_not_count_as_the_entry(self):
+        self.assertEqual(
+            script.UNKNOWN, self.decide(HEAD_SHA, [queue_page([HEAD_SHA.upper()])], 7200, jobs_answer("in_progress"))
+        )
 
     def test_missing_field_stays(self):
         self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [{"data": None}], 7200, jobs_answer("in_progress")))
@@ -196,14 +236,30 @@ class WatchTests(unittest.TestCase):
         return status, clock
 
     def test_cancels_only_the_own_run_when_the_entry_is_gone(self):
-        gh = FakeGh([[queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(True, "")])
+        gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(True, "")])
         status, clock = self.watch(gh)
         self.assertEqual(0, status)
         self.assertEqual([["run", "cancel", "4242"]], gh.cancel_calls)
-        self.assertEqual([], clock.sleeps)
+        self.assertEqual([script.POLL_INTERVAL_SECONDS], clock.sleeps)
+
+    def test_an_entry_that_was_never_in_the_queue_is_not_cancelled(self):
+        gh = FakeGh([[queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(True, "")])
+        status, _ = self.watch(gh)
+        self.assertEqual(0, status)
+        self.assertEqual([], gh.cancel_calls)
+
+    def test_a_run_whose_entry_merged_during_the_read_is_not_cancelled(self):
+        gh = MergedDuringTheReadGh()
+        status, _ = self.watch(gh)
+        self.assertEqual(0, status)
+        self.assertEqual([], gh.cancel_calls)
 
     def test_a_cancel_that_answers_already_completed_is_a_success(self):
-        gh = FakeGh([[queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(False, "HTTP 409: cannot be cancelled, already completed")])
+        gh = FakeGh(
+            [[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]],
+            [jobs_answer("in_progress")],
+            [(False, "HTTP 409: cannot be cancelled, already completed")],
+        )
         status, _ = self.watch(gh)
         self.assertEqual(0, status)
         self.assertEqual(1, len(gh.cancel_calls))
@@ -222,17 +278,23 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([], gh.cancel_calls)
 
     def test_a_failed_cancel_is_tried_again(self):
-        gh = FakeGh([[queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(False, "HTTP 500: boom"), (True, "")])
+        gh = FakeGh(
+            [[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]],
+            [jobs_answer("in_progress")],
+            [(False, "HTTP 500: boom"), (True, "")],
+        )
         status, _ = self.watch(gh, Clock(iterations=6))
         self.assertEqual(0, status)
         self.assertEqual(2, len(gh.cancel_calls))
 
     def test_a_young_run_is_not_cancelled_until_it_is_old_enough(self):
         started_epoch = script.parse_epoch(STARTED_AT)
-        gh = FakeGh([[queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(True, "")])
-        status, _ = self.watch(gh, Clock(epochs=[started_epoch + 300, started_epoch + script.MINIMUM_RUN_AGE_SECONDS]))
+        gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(True, "")])
+        young, old = started_epoch + 300, started_epoch + script.MINIMUM_RUN_AGE_SECONDS
+        status, clock = self.watch(gh, Clock(epochs=[young, young, old]))
         self.assertEqual(0, status)
         self.assertEqual(1, len(gh.cancel_calls))
+        self.assertEqual([script.POLL_INTERVAL_SECONDS] * 2, clock.sleeps)
 
     def test_a_failed_queue_read_leads_to_no_cancel(self):
         gh = FakeGh([(False, "HTTP 502: bad gateway")], [jobs_answer("in_progress")], [(True, "")])
@@ -267,7 +329,10 @@ class CliTests(unittest.TestCase):
 
 class GhTimeoutTests(unittest.TestCase):
     def test_a_hung_gh_call_counts_as_a_failed_read(self):
+        timeouts = []
+
         def hang(*args, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
             raise subprocess.TimeoutExpired(cmd=["gh"], timeout=script.GH_CALL_TIMEOUT_SECONDS)
 
         original = script.subprocess.run
@@ -278,6 +343,7 @@ class GhTimeoutTests(unittest.TestCase):
             script.subprocess.run = original
         self.assertFalse(ok)
         self.assertIn("did not answer", output)
+        self.assertEqual([script.GH_CALL_TIMEOUT_SECONDS], timeouts)
 
 
 if __name__ == "__main__":

@@ -129,9 +129,12 @@ class PullRequestWorkflowTests < Minitest::Test
                    "HEAD_SHA" => "${{ github.event.merge_group.head_sha }}"}
     assert_equal environment, step.fetch("env")
     script = step.fetch("run")
-    # No checkout and no action: the decision script is read from the base commit of the merge group, which is
-    # the tip of main, never from the pull request.
+    # No checkout and no action: the decision script is read from the base commit of the merge group, never from
+    # the head of the pull request. For a later entry that base commit is the head of the entry ahead.
     assert_match(%r{repos/\$GH_REPO/contents/\.github/scripts/cancel_superseded_queue_run\.py\?ref=\$SCRIPT_SHA}, script)
+    # The fetch of the decision script is bounded: a hung read must not hold the job for its whole limit.
+    assert_match(/limit gh api "repos\/\$GH_REPO\/contents\//, script)
+    assert_includes script, %q(timeout 60 "$@")
     assert_includes script, %q(--head-sha "$HEAD_SHA")
     assert_includes script, %q(--run-id "$GITHUB_RUN_ID")
     assert_equal 1, script.scan("python3").length
@@ -150,17 +153,22 @@ class PullRequestWorkflowTests < Minitest::Test
   end
 
   # Runs the real step of the superseded-run watchdog with a fake `gh`. The fetch and the decode of the
-  # decision script run for real, and the watch ends in the first iteration, so nothing sleeps.
-  def run_superseded_watchdog(entry_oids:, worker_status:, contents_ok: true, cancel_exit: 0, cancel_message: "")
+  # decision script run for real. The first queue read lists `entry_oids`, every later read lists `later_oids`.
+  # A `sitecustomize` makes the real script skip its 60 second waits, and every case ends by itself.
+  def run_superseded_watchdog(entry_oids:, worker_status:, later_oids: nil, contents_ok: true, cancel_exit: 0,
+                              cancel_message: "")
     step = @workflow.fetch("jobs").fetch(SUPERSEDED_WATCHDOG).fetch("steps").first
     script = File.expand_path("cancel_superseded_queue_run.py", __dir__)
     Dir.mktmpdir do |dir|
       bin = File.join(dir, "bin")
       Dir.mkdir(bin)
       File.write(File.join(dir, "script.sh"), step.fetch("run"))
-      nodes = entry_oids.map { |oid| {"state" => "BUILDABLE", "headCommit" => {"oid" => oid}} }
-      File.write(File.join(dir, "queue.json"),
-                 JSON.generate([{"data" => {"repository" => {"mergeQueue" => {"entries" => {"nodes" => nodes}}}}}]))
+      [["queue.0.json", entry_oids], ["queue.1.json", later_oids || entry_oids]].each do |file, oids|
+        nodes = oids.map { |oid| {"state" => "BUILDABLE", "headCommit" => {"oid" => oid}} }
+        File.write(File.join(dir, file),
+                   JSON.generate([{"data" => {"repository" => {"mergeQueue" => {"entries" => {"nodes" => nodes}}}}}]))
+      end
+      File.write(File.join(dir, "sitecustomize.py"), "import time\ntime.sleep = lambda seconds: None\n")
       rows = WORKER_JOBS.map do |id|
         {"name" => @workflow.fetch("jobs").fetch(id).fetch("name"), "status" => worker_status, "conclusion" => nil}
       end
@@ -179,7 +187,9 @@ class PullRequestWorkflowTests < Minitest::Test
           exit 0
         fi
         if [[ "$args" == *graphql* ]]; then
-          cat "#{dir}/queue.json"
+          n=$(cat "#{dir}/queue-reads" 2>/dev/null || echo 0)
+          echo $((n + 1)) > "#{dir}/queue-reads"
+          cat "#{dir}/queue.$((n > 0 ? 1 : 0)).json"
           exit 0
         fi
         if [[ "$args" == */jobs* ]]; then
@@ -190,7 +200,8 @@ class PullRequestWorkflowTests < Minitest::Test
       SH
       FileUtils.chmod(0o755, File.join(bin, "gh"))
       env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "GH_REPO" => "owner/repo", "GITHUB_RUN_ID" => "4242",
-             "GH_TOKEN" => "unused", "RUNNER_TEMP" => dir.to_s, "SCRIPT_SHA" => "0" * 40, "HEAD_SHA" => "f" * 40}
+             "GH_TOKEN" => "unused", "RUNNER_TEMP" => dir.to_s, "SCRIPT_SHA" => "0" * 40, "HEAD_SHA" => "f" * 40,
+             "PYTHONPATH" => dir.to_s}
       out, status = Timeout.timeout(30) { Open3.capture2e(env, "bash", File.join(dir, "script.sh")) }
       cancelled = File.exist?(File.join(dir, "cancelled")) ? File.read(File.join(dir, "cancelled")).split : []
       [status.exitstatus, cancelled, out]
@@ -198,8 +209,10 @@ class PullRequestWorkflowTests < Minitest::Test
   end
 
   def test_the_superseded_watchdog_ends_green_and_cancels_only_the_own_run
-    # The entry is gone, the run is old, and the workers run: one cancel of the own run, then the job ends green.
-    status, cancelled, out = run_superseded_watchdog(entry_oids: ["e" * 40], worker_status: "in_progress")
+    # The entry was in the queue and is gone, the run is old, and the workers run: one cancel of the own run,
+    # then the job ends green.
+    status, cancelled, out = run_superseded_watchdog(entry_oids: ["f" * 40], later_oids: ["e" * 40],
+                                                    worker_status: "in_progress")
     assert_equal [0, ["4242"]], [status, cancelled]
     assert_includes out, "The run is cancelled."
     # Every worker is complete: the run merged or is finishing, so nothing is cancelled.
@@ -207,7 +220,8 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal [0, []], [status, cancelled]
     assert_includes out, "All worker jobs finished without a failure."
     # A cancel of an already ended run counts as a success.
-    status, cancelled, = run_superseded_watchdog(entry_oids: ["e" * 40], worker_status: "in_progress",
+    status, cancelled, = run_superseded_watchdog(entry_oids: ["f" * 40], later_oids: ["e" * 40],
+                                                worker_status: "in_progress",
                                                 cancel_exit: 1, cancel_message: "HTTP 409: already completed")
     assert_equal [0, ["4242"]], [status, cancelled]
     # A failed fetch of the decision script ends green and cancels nothing.

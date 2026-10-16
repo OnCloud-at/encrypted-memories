@@ -548,7 +548,8 @@ jobs:
   # commit replaces the entry, or the pull request closes. Those superseded runs waste the shared
   # runner slots (issue #717). Like the failure watchdog above, this job has no checkout and runs no
   # code of the pull request: it reads the decision script from the base commit of the merge group,
-  # which is the tip of main. The job can never fail, because the failure watchdog cancels the run
+  # which is the tip of main, or for a later entry the head of the entry ahead. The job can never
+  # fail, because the failure watchdog cancels the run
   # when any job of it fails: an error of this job appears in its log only. Reading the script from
   # the repository needs contents: read in addition to the actions: write of the cancel.
   cancel-superseded-run:
@@ -569,8 +570,10 @@ jobs:
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
           set -uo pipefail
+          # A hung read must not hold the job: GNU timeout exists on the Linux runner, without it the read is unlimited.
+          limit() { if command -v timeout > /dev/null 2>&1; then timeout 60 "$@"; else "$@"; fi; }
           # Read the decision script from the base commit of the merge group, never from the pull request.
-          if ! content="$(gh api "repos/$GH_REPO/contents/.github/scripts/cancel_superseded_queue_run.py?ref=$SCRIPT_SHA" --jq .content)"; then
+          if ! content="$(limit gh api "repos/$GH_REPO/contents/.github/scripts/cancel_superseded_queue_run.py?ref=$SCRIPT_SHA" --jq .content)"; then
             echo "The decision script is not readable at the base commit $SCRIPT_SHA, so the run is not watched."
             exit 0
           fi

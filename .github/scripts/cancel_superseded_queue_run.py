@@ -162,6 +162,10 @@ def decide(head_sha, queue_answer, run_state, worker_names):
         return UNKNOWN
     if head_sha in oids:
         return KEEP
+    if run_state.get("entry_seen") is not True:
+        # Only an entry that this watch once saw in the queue can have left it. A head commit that
+        # was never listed may belong to another queue, or may not match the queue answer at all.
+        return UNKNOWN
     rows = worker_rows(run_state.get("jobs_answer"), worker_names)
     if rows is None:
         return UNKNOWN
@@ -236,6 +240,7 @@ def watch(head_sha, run_id, worker_names, repository, gh, sleep=time.sleep,
     """
     owner, _, name = repository.partition("/")
     run_started_epoch = None
+    entry_seen = False
     deadline = monotonic() + LOOP_DEADLINE_SECONDS
     while monotonic() < deadline:
         if run_started_epoch is None:
@@ -243,12 +248,16 @@ def watch(head_sha, run_id, worker_names, repository, gh, sleep=time.sleep,
             if started is not None:
                 run_started_epoch = started
         age = None if run_started_epoch is None else int(epoch() - run_started_epoch)
-        jobs_answer = gh.jobs_answer(run_id)
+        # The queue first: when a merged entry is gone from this read, the jobs read after it
+        # shows every worker complete, so the run of a merged pull request is never cancelled.
         queue_answer = gh.queue_answer(owner, name)
+        jobs_answer = gh.jobs_answer(run_id)
         if all_workers_complete(jobs_answer, worker_names):
             print("All worker jobs finished without a failure.")
             return 0
-        run_state = {"run_age_seconds": age, "jobs_answer": jobs_answer}
+        oids = queue_head_oids(queue_answer)
+        entry_seen = entry_seen or (oids is not None and head_sha in oids)
+        run_state = {"run_age_seconds": age, "jobs_answer": jobs_answer, "entry_seen": entry_seen}
         decision = decide(head_sha, queue_answer, run_state, worker_names)
         if decision == CANCEL:
             print("The entry of this run ({}) is no longer in the merge queue of {}.".format(head_sha, QUEUE_BRANCH))
