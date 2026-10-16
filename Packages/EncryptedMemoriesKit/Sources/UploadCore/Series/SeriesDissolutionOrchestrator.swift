@@ -85,8 +85,8 @@ extension PhotoCarryOverRemote {
 /// Remote reads and the trash write of a series dissolution.
 public protocol SeriesDissolutionRemote: OriginalFileProvider, PhotoCarryOverRemote {
     func source(for member: PhotoUID) async throws -> SeriesMemberSource
-    /// Moves the photos to the Proton trash, where the user can restore them. The dissolution passes only the main
-    /// photo of the series: its related photos follow it into the trash and come back with its restore.
+    /// Moves the photos to the Proton trash, where the user can restore them. The dissolution passes no related photo:
+    /// related photos follow their main photo into the trash and come back with its restore.
     func trashSeries(_ uids: [PhotoUID]) async throws
 }
 
@@ -409,15 +409,14 @@ public actor SeriesDissolutionOrchestrator {
         }
 
         onProgress(.init(step: .movingSeriesToTrash, fraction: 0.9))
-        // Only the main photo moves to the trash. Proton hides its related photos with it and brings them back when
-        // the person restores it, so Recently Deleted restores the whole series. A related photo trashed on its own
-        // would not show there and could not come back. The related photos keep their own active state, so the
-        // main photo alone confirms the step. A resumed trash step skips a main photo that is already trashed.
-        if try await remote.activeUIDs(among: [mainUID]).contains(mainUID) {
-            try await remote.trashSeries([mainUID])
-            // A trash request has reported success before while its photo stayed active. Only the server's
+        let trashed = try await photosToTrash(journal)
+        // A resumed trash step skips photos that an earlier attempt already moved.
+        let remaining = try await remote.activeUIDs(among: trashed)
+        if !remaining.isEmpty {
+            try await remote.trashSeries(trashed.filter(remaining.contains))
+            // A trash request has reported success before while its photos stayed active. Only the server's
             // state ends the operation; otherwise the journal stays for the next attempt.
-            guard try await remote.activeUIDs(among: [mainUID]).isEmpty else {
+            guard try await remote.activeUIDs(among: trashed).isEmpty else {
                 throw SeriesDissolutionError.trashNotConfirmed
             }
         }
@@ -425,6 +424,29 @@ public actor SeriesDissolutionOrchestrator {
         await duplicateChecker.invalidateCachedRemoteState()
         onProgress(.init(step: .movingSeriesToTrash, fraction: 1))
         return journal.favorites.compactMap(\.copyUID)
+    }
+
+    /// The photos of the series that move to the trash: the main photo and every member without a main photo. A series
+    /// can join photos that are no related photos of the main photo: burst photos that only their capture times group,
+    /// or a second main photo with related photos of its own. A related photo never moves on its own. Proton hides it
+    /// with its main photo and brings it back when the person restores that main photo; a related photo trashed on its
+    /// own would not come back with the series. Related photos keep their own active state, so only the photos in
+    /// this list confirm the step. A member that the server no longer knows is skipped. An active member whose role
+    /// the server does not report stops the step before any trash write, and the journal stays for the next attempt.
+    private func photosToTrash(_ journal: SeriesDissolutionJournal) async throws -> [PhotoUID] {
+        let mainUID = journal.seriesMainUID
+        let members = journal.seriesUIDs.filter { $0 != mainUID }
+        let visibility = try await duplicateChecker.linkVisibility(of: members.map(\.nodeID))
+        var trashed = [mainUID]
+        for member in members {
+            guard let link = visibility[member.nodeID] else { continue }
+            guard link.hasExplicitPhotoState else {
+                if link.isActive { throw SeriesDissolutionError.trashNotConfirmed }
+                continue
+            }
+            if link.mainPhotoLinkID == nil { trashed.append(member) }
+        }
+        return trashed
     }
 
     /// A retry may carry another selection while no series photo is trashed yet. Confirmed copies of favorites
