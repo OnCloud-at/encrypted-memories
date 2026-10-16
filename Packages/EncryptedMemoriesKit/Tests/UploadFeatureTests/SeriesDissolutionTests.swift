@@ -67,7 +67,7 @@ final class SeriesDissolutionTests: XCTestCase {
         }
         XCTAssertEqual(server.uploads.map(\.captureTime), [server.captureTime(of: "m2"), server.captureTime(of: "m4")])
         XCTAssertEqual(server.uploads.first?.additionalMetadata.map(\.name), ["Camera"])
-        XCTAssertEqual(server.trashCalls, [series], "the main photo and every member move to the trash together")
+        XCTAssertEqual(server.trashCalls, [[main]], "the members follow the main photo into the trash")
         XCTAssertEqual(Set(copies), server.activeCopyUIDs)
         XCTAssertEqual(try journalStore.pendingJournals(), [], "a finished operation leaves no journal")
         XCTAssertEqual(
@@ -105,7 +105,7 @@ final class SeriesDissolutionTests: XCTestCase {
             server.uploads.map(\.name), ["m2.HEIC", "m4.HEIC", "m4.HEIC"],
             "the confirmed favorite must not upload again; only the failed one repeats")
         XCTAssertEqual(server.activeCopyUIDs.count, 2)
-        XCTAssertEqual(server.trashCalls, [series])
+        XCTAssertEqual(server.trashCalls, [[main]])
         XCTAssertEqual(try journalStore.pendingJournals(), [])
     }
 
@@ -125,7 +125,7 @@ final class SeriesDissolutionTests: XCTestCase {
 
         XCTAssertEqual(server.uploads.count, 1, "the retry finds the committed copy and uploads nothing")
         XCTAssertEqual(Set(copies), server.activeCopyUIDs)
-        XCTAssertEqual(server.trashCalls, [series])
+        XCTAssertEqual(server.trashCalls, [[main]])
     }
 
     func testCrashDuringTheTrashStepResumesWithoutCopyingAgain() async throws {
@@ -136,17 +136,15 @@ final class SeriesDissolutionTests: XCTestCase {
             XCTFail("the trash step fails")
         } catch {}
         XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
-        // Half of the series already moved before the failure.
-        server.markTrashed(["m1", "m2"])
+        // The main photo already moved before the failure.
+        server.markTrashed(["m1"])
 
         let outcomes = try await makeOrchestrator().resumePending()
 
         XCTAssertEqual(outcomes.map(\.seriesUIDs), [series], "the host learns which series left the library")
         XCTAssertEqual(try outcomes.first?.result.get().count, 1)
         XCTAssertEqual(server.uploads.count, 1)
-        XCTAssertEqual(
-            server.trashCalls.last, [member("m3"), member("m4")],
-            "the resumed trash step skips photos that are already in the trash")
+        XCTAssertEqual(server.trashCalls, [], "the resumed trash step skips a main photo that is already in the trash")
         XCTAssertEqual(try journalStore.pendingJournals(), [])
     }
 
@@ -206,7 +204,7 @@ final class SeriesDissolutionTests: XCTestCase {
 
         XCTAssertFalse(copies.contains(confirmed))
         XCTAssertEqual(Set(copies), server.activeCopyUIDs, "both favorites exist as active standalone photos")
-        XCTAssertEqual(server.trashCalls, [series])
+        XCTAssertEqual(server.trashCalls, [[main]])
     }
 
     func testARetryMayChangeTheSelectionWhileTheSeriesIsUntouched() async throws {
@@ -238,7 +236,7 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(
             server.albumMembers("album-shared"), ["m1"],
             "a shared album lies in a foreign volume; the operation never writes there")
-        XCTAssertEqual(server.trashCalls, [series])
+        XCTAssertEqual(server.trashCalls, [[main]])
     }
 
     func testAMemberThatIsFavoritedAloneOnlyTagsItsOwnCopy() async throws {
@@ -267,7 +265,7 @@ final class SeriesDissolutionTests: XCTestCase {
 
         XCTAssertEqual(server.uploads.count, 1, "the confirmed copy is reused instead of uploaded again")
         XCTAssertEqual(server.albumMembers("album-own"), expected(["m1"], copies))
-        XCTAssertEqual(server.trashCalls, [series])
+        XCTAssertEqual(server.trashCalls, [[main]])
     }
 
     func testTheCarryoverRunsBeforeTheSeriesReachesTheTrash() async throws {
@@ -280,16 +278,57 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.events, [.upload, .favorite, .albumAdd, .trash])
     }
 
+    // MARK: Only the main photo moves to the trash
+
+    func testOnlyTheMainPhotoMovesToTheTrashSoARestoreBringsTheWholeSeriesBack() async throws {
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+
+        XCTAssertEqual(server.trashCalls, [[main]], "the frames stay linked to the main photo")
+        XCTAssertEqual(Set(copies), server.activeCopyUIDs)
+        XCTAssertEqual(try journalStore.pendingJournals(), [], "the main photo alone confirms the trash step")
+        XCTAssertEqual(server.trashListingNodeIDs, ["m1"], "Recently Deleted lists the series once")
+
+        // The person restores the series from Recently Deleted.
+        server.restoreFromTrash("m1")
+
+        XCTAssertEqual(
+            server.activeRelatedNodeIDs(ofMain: "m1"), ["m2", "m3", "m4"], "the series returns with every frame")
+    }
+
+    func testATrashStepOfAnEarlierBuildThatTrashedFramesMovesOnlyTheMainPhoto() async throws {
+        server.failNextTrash()
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m3")])
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
+        // An earlier build trashed every photo of the series and stopped after some frames.
+        server.markTrashed(["m2", "m3"])
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        XCTAssertNoThrow(try outcomes.first?.result.get())
+        XCTAssertEqual(server.trashCalls, [[main]], "the frames that are still active are never trashed on their own")
+        XCTAssertEqual(try journalStore.pendingJournals(), [])
+        server.restoreFromTrash("m1")
+        XCTAssertEqual(server.activeRelatedNodeIDs(ofMain: "m1"), ["m4"])
+    }
+
     // MARK: Server-side membership and the trash confirmation
 
     func testAMemberThatOnlyTheServerKnowsMovesToTheTrashWithTheSeries() async throws {
         server.addRemoteRow(name: "m5.HEIC", contentOf: "m3", state: .active, linkID: "m5", clientUID: nil)
         server.addServerRelatedNodeIDs(["m1", "m2", "m3", "m4", "m5"])  // m5 arrived after the caller read the series
+        server.failNextTrash()
 
-        _ = try await makeOrchestrator().keepOnlyFavorites(
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
 
-        XCTAssertEqual(server.trashCalls.first?.map(\.nodeID).sorted(), ["m1", "m2", "m3", "m4", "m5"])
+        let journal = try XCTUnwrap(try journalStore.journal(forSeries: main))
+        XCTAssertEqual(journal.seriesUIDs.map(\.nodeID).sorted(), ["m1", "m2", "m3", "m4", "m5"])
+        _ = try await makeOrchestrator().resumePending()
+        XCTAssertEqual(server.trashCalls, [[main]])
+        server.restoreFromTrash("m1")
+        XCTAssertEqual(server.activeRelatedNodeIDs(ofMain: "m1"), ["m2", "m3", "m4", "m5"])
     }
 
     func testARetryKeepsAMemberThatOnlyTheJournalKnows() async throws {
@@ -300,10 +339,13 @@ final class SeriesDissolutionTests: XCTestCase {
             seriesMainUID: main, seriesUIDs: full, favoriteUIDs: [member("m2")])
 
         // The retry passes the shorter list that the timeline still shows.
-        _ = try await makeOrchestrator().keepOnlyFavorites(
+        server.failNextTrash()
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
 
-        XCTAssertEqual(server.trashCalls.first?.map(\.nodeID).sorted(), ["m1", "m2", "m3", "m4", "m5"])
+        let journal = try XCTUnwrap(try journalStore.journal(forSeries: main))
+        XCTAssertEqual(journal.phase, .trashingSeries)
+        XCTAssertEqual(journal.seriesUIDs.map(\.nodeID).sorted(), ["m1", "m2", "m3", "m4", "m5"])
     }
 
     func testASeriesThatStaysActiveAfterTheTrashRequestKeepsItsJournal() async throws {
@@ -464,6 +506,10 @@ final class SeriesDissolutionTests: XCTestCase {
 
 /// In-memory Proton for the dissolution seams: nodes with names, bytes and states, the duplicates endpoint,
 /// uploads and the trash. Thread-safe; failure injection models errors and crashes.
+///
+/// A related photo keeps its own state, as on Proton (probes of 2026-10-04): trashing the main photo leaves its
+/// related photos active but hidden from the photos and trash listings, and restoring the main photo brings them
+/// back. A related photo trashed on its own stays trashed after that restore and never shows in the trash listing.
 private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryOver, PhotoUploading,
     UploadDuplicateChecking, @unchecked Sendable
 {
@@ -475,6 +521,8 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
         var state: RemotePhotoDuplicate.LinkState
         var clientUID: String?
         var isCopy: Bool
+        /// The main photo of a related photo; nil for a main or a standalone photo.
+        var mainNodeID: String?
     }
 
     let capabilities = UploadBackendCapabilities.sdkUploader
@@ -496,10 +544,16 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var _serverRelatedNodeIDs = Set<String>()
     private var _trashRemainsActive = false
 
+    private let seriesMainNodeID: String?
+
+    /// The first node is the main photo of the series; the others are its related photos.
     init(ownVolumeID: String, seriesNodeIDs: [String]) {
         self.ownVolumeID = ownVolumeID
+        seriesMainNodeID = seriesNodeIDs.first
         for id in seriesNodeIDs {
-            nodes[id] = Node(name: "\(id).HEIC", bytes: Data("bytes-of-\(id)".utf8), state: .active, isCopy: false)
+            nodes[id] = Node(
+                name: "\(id).HEIC", bytes: Data("bytes-of-\(id)".utf8), state: .active, isCopy: false,
+                mainNodeID: id == seriesMainNodeID ? nil : seriesMainNodeID)
         }
     }
 
@@ -512,6 +566,21 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
         }
     }
 
+    /// What Recently Deleted lists: trashed photos without a main photo. A series shows once, as its main photo.
+    var trashListingNodeIDs: Set<String> {
+        lock.withLock { Set(nodes.filter { $0.value.state == .trashed && $0.value.mainNodeID == nil }.map(\.key)) }
+    }
+
+    /// The related photos that a series shows while its main photo is active.
+    func activeRelatedNodeIDs(ofMain mainNodeID: String) -> Set<String> {
+        lock.withLock {
+            Set(nodes.filter { $0.value.mainNodeID == mainNodeID && $0.value.state == .active }.map(\.key))
+        }
+    }
+
+    /// The person restores a photo from Recently Deleted. Only the restored node changes its state.
+    func restoreFromTrash(_ id: String) { lock.withLock { nodes[id]?.state = .active } }
+
     func captureTime(of id: String) -> Date {
         Date(timeIntervalSince1970: 1_700_000_000 + Double(id.unicodeScalars.last?.value ?? 0))
     }
@@ -523,7 +592,16 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     func addAlbum(_ albumID: String, volumeID: String, members: [String]) {
         lock.withLock { _albums[albumID] = (volumeID, Set(members)) }
     }
-    func addServerRelatedNodeIDs(_ ids: [String]) { lock.withLock { _serverRelatedNodeIDs.formUnion(ids) } }
+    /// The server's related photos of the main photo; a node outside the series becomes one of its related photos.
+    func addServerRelatedNodeIDs(_ ids: [String]) {
+        lock.withLock {
+            _serverRelatedNodeIDs.formUnion(ids)
+            for id in ids where id != seriesMainNodeID && nodes[id]?.mainNodeID == nil {
+                nodes[id]?.mainNodeID = seriesMainNodeID
+            }
+        }
+    }
+
     func failNextFavoriteWrite() { lock.withLock { favoriteFailures = 1 } }
     func failNextAlbumWrite() { lock.withLock { albumFailures = 1 } }
     /// The next trash request reports success while its photos stay active, as Proton did in the field.

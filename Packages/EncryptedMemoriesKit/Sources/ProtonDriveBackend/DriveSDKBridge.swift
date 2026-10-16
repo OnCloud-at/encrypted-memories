@@ -2789,7 +2789,8 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         try await requestGovernor.causes.run(.carryOver) { try await setFavorites(uids, true) }
     }
 
-    /// The series dissolution moves the photos of a dissolved series to the trash. This is no deletion by the person.
+    /// The series dissolution moves the main photo of a dissolved series to the trash; its frames follow it. This is no
+    /// deletion by the person.
     func trashSeries(_ uids: [PhotoUID]) async throws {
         try await requestGovernor.causes.run(.series) { try await moveToTrash(uids) }
         try await withOpenSession(cause: .local) { bridge in

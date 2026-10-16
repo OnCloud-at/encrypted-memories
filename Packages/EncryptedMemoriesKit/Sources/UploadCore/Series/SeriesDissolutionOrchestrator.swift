@@ -85,7 +85,8 @@ extension PhotoCarryOverRemote {
 /// Remote reads and the trash write of a series dissolution.
 public protocol SeriesDissolutionRemote: OriginalFileProvider, PhotoCarryOverRemote {
     func source(for member: PhotoUID) async throws -> SeriesMemberSource
-    /// Moves the photos to the Proton trash, where the user can restore them.
+    /// Moves the photos to the Proton trash, where the user can restore them. The dissolution passes only the main
+    /// photo of the series: its related photos follow it into the trash and come back with its restore.
     func trashSeries(_ uids: [PhotoUID]) async throws
 }
 
@@ -391,7 +392,7 @@ public actor SeriesDissolutionOrchestrator {
 
         if journal.phase == .copyingFavorites {
             // The server's related photos of the main photo are authoritative. A member that the caller did not
-            // know is excluded from the copy rule and moves to the trash with the rest of the series.
+            // know is excluded from the copy rule and leaves the library with the main photo.
             try await addServerMembers(to: &journal)
             try await copyPendingFavorites(&journal, onProgress: onProgress)
             // A copy can vanish between its confirmation and now (a crash, then a manual delete). Check the
@@ -408,13 +409,15 @@ public actor SeriesDissolutionOrchestrator {
         }
 
         onProgress(.init(step: .movingSeriesToTrash, fraction: 0.9))
-        // A resumed trash step skips photos that an earlier attempt already moved.
-        let remaining = try await remote.activeUIDs(among: journal.seriesUIDs)
-        if !remaining.isEmpty {
-            try await remote.trashSeries(journal.seriesUIDs.filter(remaining.contains))
-            // A trash request has reported success before while its photos stayed active. Only the server's
+        // Only the main photo moves to the trash. Proton hides its related photos with it and brings them back when
+        // the person restores it, so Recently Deleted restores the whole series. A related photo trashed on its own
+        // would not show there and could not come back. The related photos keep their own active state, so the
+        // main photo alone confirms the step. A resumed trash step skips a main photo that is already trashed.
+        if try await remote.activeUIDs(among: [mainUID]).contains(mainUID) {
+            try await remote.trashSeries([mainUID])
+            // A trash request has reported success before while its photo stayed active. Only the server's
             // state ends the operation; otherwise the journal stays for the next attempt.
-            guard try await remote.activeUIDs(among: journal.seriesUIDs).isEmpty else {
+            guard try await remote.activeUIDs(among: [mainUID]).isEmpty else {
                 throw SeriesDissolutionError.trashNotConfirmed
             }
         }
