@@ -20,7 +20,7 @@ SCHEME="${IOS_TEST_SCHEME:-$TEST_TARGET}"
 ACTION="${IOS_TEST_ACTION:-test}"
 PREPARED="${IOS_TEST_PREPARED:-0}"
 case "$ACTION" in
-  test|build-for-testing|test-without-building) ;;
+  test|build-for-testing|test-without-building|boot-simulator) ;;
   *) echo "[ios-tests] unsupported IOS_TEST_ACTION." >&2; exit 64 ;;
 esac
 case "$PREPARED" in
@@ -162,6 +162,20 @@ else
 fi
 export DEVELOPER_DIR
 
+# CI starts the simulator at the beginning of the job, while the dependencies and the test bundles build, so the
+# boot is done when the tests start. The wait below still covers a boot that has not finished.
+if [[ "$ACTION" == "boot-simulator" ]]; then
+  if [[ -z "$SIMULATOR_UDID" ]]; then
+    echo "[ios-tests] no simulator to start."
+    exit 0
+  fi
+  echo "[ios-tests] starting $SIMULATOR_NAME"
+  # The test run reads this record and shuts down a device that it does not test, so that two simulators never run.
+  if [[ -n "${IOS_TEST_BOOT_RECORD:-}" ]]; then echo "$SIMULATOR_UDID" > "$IOS_TEST_BOOT_RECORD" || true; fi
+  xcrun simctl boot "$SIMULATOR_UDID" || echo "[ios-tests] the start failed; the test run boots the simulator itself."
+  exit 0
+fi
+
 encryptedmemories_acquire_build_lock "verify-ios-app-tests ${1:-hosted}"
 
 # CI prepares the pinned graph once for both test bundles. Local commands still generate and resolve it.
@@ -190,6 +204,22 @@ else
 
 fi
 
+# After a prepared build, the test run starts from the test run file of that build. That skips loading the project and
+# resolving its package graph. The file holds the environment and the test bundles of the scheme.
+# CI has just built it, so a missing or ambiguous file is an error: the run must not start another way.
+XCTESTRUN=""
+if [[ "$ACTION" == "test-without-building" && "$PREPARED" == "1" ]]; then
+  XCTESTRUN_MATCHES=()
+  for candidate in "$DERIVED_DATA/Build/Products/${SCHEME}_"*.xctestrun; do
+    [[ -f "$candidate" ]] && XCTESTRUN_MATCHES+=("$candidate")
+  done
+  if [[ ${#XCTESTRUN_MATCHES[@]} -ne 1 ]]; then
+    echo "[ios-tests] expected one test run file ${SCHEME}_*.xctestrun in the build products, found ${#XCTESTRUN_MATCHES[@]}." >&2
+    exit 66
+  fi
+  XCTESTRUN="${XCTESTRUN_MATCHES[0]}"
+fi
+
 # Without this, xcodebuild boots a cold simulator on demand and the first test launches the app while the
 # boot still runs; on CI that launch times out ("Failed to get background assertion"). Boot first and wait
 # until the boot, data migration included, is complete.
@@ -200,19 +230,35 @@ if [[ "$ACTION" != "build-for-testing" && -n "${SIMULATOR_UDID:-}" ]]; then
     echo "[ios-tests] the simulator did not finish booting within 10 minutes." >&2
     exit 1
   fi
+  # A simulator that an earlier start step booted, but that this run does not test, would run next to it for the whole job.
+  if [[ -n "${IOS_TEST_BOOT_RECORD:-}" && -s "$IOS_TEST_BOOT_RECORD" ]]; then
+    STARTED_UDID="$(head -n 1 "$IOS_TEST_BOOT_RECORD")"
+    if [[ "$STARTED_UDID" != "$SIMULATOR_UDID" ]]; then
+      echo "[ios-tests] the start step booted $STARTED_UDID, but the tests use $SIMULATOR_UDID; shutting the first one down."
+      xcrun simctl shutdown "$STARTED_UDID" || echo "[ios-tests] the shutdown failed; the tests go on."
+    fi
+  fi
 fi
 
 echo "[ios-tests] scheme: $SCHEME, destination: $DESTINATION"
-set -- xcrun xcodebuild \
-  -project "$ROOT/EncryptedMemories.xcodeproj" \
-  -scheme "$SCHEME" \
-  -destination "$DESTINATION" \
-  -derivedDataPath "$DERIVED_DATA" \
-  -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
-  -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
-  -disableAutomaticPackageResolution \
-  -skipPackagePluginValidation \
-  CODE_SIGNING_ALLOWED=NO
+if [[ -n "$XCTESTRUN" ]]; then
+  echo "[ios-tests] test run file: ${XCTESTRUN##*/}"
+  set -- xcrun xcodebuild \
+    -xctestrun "$XCTESTRUN" \
+    -destination "$DESTINATION" \
+    -derivedDataPath "$DERIVED_DATA"
+else
+  set -- xcrun xcodebuild \
+    -project "$ROOT/EncryptedMemories.xcodeproj" \
+    -scheme "$SCHEME" \
+    -destination "$DESTINATION" \
+    -derivedDataPath "$DERIVED_DATA" \
+    -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
+    -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+    -disableAutomaticPackageResolution \
+    -skipPackagePluginValidation \
+    CODE_SIGNING_ALLOWED=NO
+fi
 if [[ "$ACTION" != "build-for-testing" && "$SCHEME" == "EncryptedMemoriesMobileCI" ]]; then
   set -- "$@" "-only-testing:$TEST_TARGET"
 fi
@@ -229,6 +275,7 @@ fi
 if [[ "$ACTION" != "build-for-testing" ]]; then
   set -- "$@" -collect-test-diagnostics never
 fi
+TEST_STATUS=0
 if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_DIAGNOSTICS_PATH:-}" ]]; then
   if [[ "${IOS_TEST_PARALLEL_WORKERS:-1}" != "1" || -z "${SIMULATOR_UDID:-}" ]]; then
     echo "[ios-tests] diagnostics require one simulator with an explicit device ID." >&2
@@ -237,7 +284,26 @@ if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_DIAGN
   DIAGNOSTIC_SIMULATOR="$SIMULATOR_UDID"
   python3 "$ROOT/.github/scripts/collect_ui_wait_diagnostics.py" \
     --simulator "$DIAGNOSTIC_SIMULATOR" --output "$IOS_TEST_DIAGNOSTICS_PATH" -- \
-    "$@" -parallel-testing-enabled NO "$ACTION"
+    "$@" -parallel-testing-enabled NO "$ACTION" || TEST_STATUS=$?
 else
-  "$@" "$ACTION"
+  "$@" "$ACTION" || TEST_STATUS=$?
+fi
+[[ "$TEST_STATUS" -eq 0 ]] || exit "$TEST_STATUS"
+
+# A test run that executed no test is a failure, however xcodebuild ended: a test run file or a selection that matches
+# nothing must not pass, and neither must a run in which every test was skipped. The numbers come from the result bundle,
+# so the check needs IOS_TEST_RESULT_BUNDLE_PATH (CI sets it in both test steps).
+if [[ "$ACTION" != "build-for-testing" && -n "${IOS_TEST_RESULT_BUNDLE_PATH:-}" ]]; then
+  EXECUTED_TESTS=""
+  if RESULT_SUMMARY="$(xcrun xcresulttool get test-results summary --path "$IOS_TEST_RESULT_BUNDLE_PATH" 2>/dev/null)"; then
+    EXECUTED_TESTS="$(printf '%s' "$RESULT_SUMMARY" | python3 -c '
+import json, sys
+summary = json.load(sys.stdin)
+print(sum(int(summary.get(key, 0)) for key in ("passedTests", "failedTests", "expectedFailures")), summary["totalTestCount"])' 2>/dev/null || true)"
+  fi
+  if [[ ! "$EXECUTED_TESTS" =~ ^[1-9][0-9]*\ [0-9]+$ ]]; then
+    echo "[ios-tests] the test run executed no test (passed, failed and expected failures: ${EXECUTED_TESTS%% *}); this is a failure." >&2
+    exit 70
+  fi
+  echo "[ios-tests] executed tests: ${EXECUTED_TESTS%% *} (${EXECUTED_TESTS##* } in total, skipped ones included)"
 fi

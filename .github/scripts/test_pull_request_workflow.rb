@@ -440,6 +440,45 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes hygiene.fetch("run"), "bash .github/scripts/test_run_ui_tests_with_retry.sh"
   end
 
+  def test_both_simulator_jobs_start_the_simulator_before_the_dependencies_and_never_depend_on_it
+    %w[ios-verification ios-ui-verification].each do |name|
+      job = @workflow.fetch("jobs").fetch(name)
+      steps = job.fetch("steps")
+      boot = steps.find { |step| step.dig("env", "IOS_TEST_ACTION") == "boot-simulator" }
+      refute_nil boot, "#{name} must start the simulator"
+      assert_equal "bash ./scripts/verify-ios-app-tests.sh", boot.fetch("run"), name
+      # The test step reads the record of the start step and shuts down a device that it does not test.
+      record = "${{ runner.temp }}/simulator-udid"
+      assert_equal record, boot.fetch("env").fetch("IOS_TEST_BOOT_RECORD"), name
+      test_step = steps.find { |step| step.dig("env", "IOS_TEST_ACTION") == "test-without-building" }
+      assert_equal record, test_step.fetch("env").fetch("IOS_TEST_BOOT_RECORD"), name
+      # A failed start never fails the job: the test run boots the simulator itself, as before.
+      assert_equal true, boot.fetch("continue-on-error"), name
+      assert_equal 2, boot.fetch("timeout-minutes"), name
+      refute boot.key?("id"), "No step may depend on the start of the simulator in #{name}"
+      assert_nil boot["if"], name
+      # The boot runs while the dependencies and the test bundles build.
+      prepare = steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+      build = steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "build-for-testing" }
+      assert_operator steps.index(boot), :<, prepare, name
+      assert_operator steps.index(boot), :<, build, name
+      job.fetch("outputs", {}).each_value { |value| refute_includes value, boot.fetch("name"), name }
+      steps.each { |step| refute_includes step["if"].to_s, "Start the simulator", name }
+    end
+  end
+
+  def test_the_test_steps_keep_a_result_bundle_so_that_a_run_without_tests_fails
+    {"ios-verification" => ["tests", "ios-hosted.xcresult"], "ios-ui-verification" => ["ui", "ios-ui.xcresult"]}
+      .each do |name, (id, bundle)|
+      step = @workflow.fetch("jobs").fetch(name).fetch("steps").find { |candidate| candidate["id"] == id }
+      env = step.fetch("env")
+      assert_equal "test-without-building", env.fetch("IOS_TEST_ACTION"), name
+      assert_equal "1", env.fetch("IOS_TEST_PREPARED"), name
+      # The script counts the executed tests in this bundle and fails the step when there are none.
+      assert_equal "${{ runner.temp }}/#{bundle}", env.fetch("IOS_TEST_RESULT_BUNDLE_PATH"), name
+    end
+  end
+
   def diagnostic_steps
     steps = @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("steps")
     [steps.find { |step| step["name"] == "Configure UI latency diagnostics" },
