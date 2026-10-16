@@ -2777,6 +2777,17 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         }
     }
 
+    func memberRoles(of uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
+        guard !uids.isEmpty else { return [:] }
+        return try await withOpenSession(cause: .series) { bridge in
+            let context = try await bridge.photosShareContext()
+            let links = try await bridge.driveSession.fetchLinkVisibility(
+                shareID: context.shareID, linkIDs: uids.map(\.nodeID))
+            return Dictionary(
+                uids.compactMap { uid in links[uid.nodeID].map { (uid, $0) } }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
         // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
@@ -2789,7 +2800,8 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         try await requestGovernor.causes.run(.carryOver) { try await setFavorites(uids, true) }
     }
 
-    /// The series dissolution moves the photos of a dissolved series to the trash. This is no deletion by the person.
+    /// The series dissolution moves the main photos of a dissolved series to the trash; their related photos follow them.
+    /// This is no deletion by the person.
     func trashSeries(_ uids: [PhotoUID]) async throws {
         try await requestGovernor.causes.run(.series) { try await moveToTrash(uids) }
         try await withOpenSession(cause: .local) { bridge in
