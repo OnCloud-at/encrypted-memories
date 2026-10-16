@@ -1931,7 +1931,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         let person = try await uploader.admission.reserve(allowsExpensiveNetwork: true)
         defer { person.release() }
         // No pushed changes: only the check after the wait can see the new network.
-        let runner = makeRunner(throttleInputs: { BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: false) })
+        let runner = makeRunner(
+            throttleInputs: { BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: false) })
         let pass = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
         try await waitUntilWaiting(uploader.admission)
 
