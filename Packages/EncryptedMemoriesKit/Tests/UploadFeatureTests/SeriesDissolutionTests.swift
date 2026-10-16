@@ -342,44 +342,36 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.activeRelatedNodeIDs(ofMain: "m3"), ["m4"])
     }
 
-    func testAnActiveMemberWithoutARoleStopsBeforeAnyCopySoTheUserCanLeave() async throws {
+    func testAnActiveMemberWithoutARoleStaysInTheLibraryAndTheRestFinishes() async throws {
+        server.makeStandalone(["m3"])
         server.withholdPhotoRole(["m3"])
-        do {
-            try await makeOrchestrator().keepOnlyFavorites(
-                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
-            XCTFail("an unknown role must not decide the trash")
-        } catch let error as SeriesDissolutionError {
-            XCTAssertEqual(error, .memberRoleUnknown)
-        }
-        XCTAssertEqual(server.uploads.count, 0, "no copy exists before the roles are known")
-        XCTAssertEqual(server.trashCalls, [])
-        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
 
-        // The user answers the failure with Cancel.
-        try await makeOrchestrator().abandon(seriesMainUID: main)
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
 
-        XCTAssertEqual(try journalStore.pendingJournals(), [])
-        XCTAssertEqual(server.activeCopyUIDs, [])
+        XCTAssertEqual(server.trashCalls, [[main]], "a member without role data is no trash target")
+        let active = try await server.activeUIDs(among: [member("m3")])
+        XCTAssertEqual(active, [member("m3")], "the member stays in the library untouched")
+        XCTAssertEqual(Set(copies), server.activeCopyUIDs)
+        XCTAssertEqual(server.uploads.count, 1)
+        XCTAssertEqual(try journalStore.pendingJournals(), [], "the confirmation ignores the member")
     }
 
-    func testARoleThatIsUnknownInTheTrashStepStopsItBeforeAnyTrashWrite() async throws {
+    func testARoleThatIsUnknownInTheTrashStepLeavesTheMemberAndFinishes() async throws {
+        server.makeStandalone(["m3"])
         server.failNextTrash()
         _ = try? await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
         server.withholdPhotoRole(["m3"])
 
         let outcomes = try await makeOrchestrator().resumePending()
 
-        XCTAssertThrowsError(try XCTUnwrap(outcomes.first).result.get()) { error in
-            XCTAssertEqual(error as? SeriesDissolutionError, .trashNotConfirmed)
-        }
-        XCTAssertEqual(server.trashCalls, [], "neither the main photo nor the member moves")
-        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
-
-        server.withholdPhotoRole([])
-        let retried = try await makeOrchestrator().resumePending()
-        XCTAssertNoThrow(try XCTUnwrap(retried.first).result.get())
+        XCTAssertNoThrow(try XCTUnwrap(outcomes.first).result.get())
         XCTAssertEqual(server.trashCalls, [[main]])
+        let active = try await server.activeUIDs(among: [member("m3")])
+        XCTAssertEqual(active, [member("m3")])
+        XCTAssertEqual(try journalStore.pendingJournals(), [])
     }
 
     func testAnInactiveMemberWithoutARoleDoesNotBlock() async throws {

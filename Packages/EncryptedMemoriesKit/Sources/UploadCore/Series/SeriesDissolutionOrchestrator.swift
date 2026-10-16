@@ -209,9 +209,6 @@ public enum SeriesDissolutionError: LocalizedError, Equatable {
     case copyNotConfirmed
     /// The trash request returned, but a photo of the series is still active. The operation stays pending.
     case trashNotConfirmed
-    /// The server did not report whether an active photo of the series belongs to a main photo. Nothing was copied
-    /// or moved in this attempt; the user can try again or leave the operation.
-    case memberRoleUnknown
 
     public var errorDescription: String? {
         switch self {
@@ -221,7 +218,6 @@ public enum SeriesDissolutionError: LocalizedError, Equatable {
         case .blockedByForeignDraft(let name): L10n.string("error.series_draft_blocked \(name)")
         case .copyNotConfirmed: L10n.string("error.series_copy_not_confirmed")
         case .trashNotConfirmed: L10n.string("error.series_trash_not_confirmed")
-        case .memberRoleUnknown: L10n.string("error.series_member_role_unknown")
         }
     }
 }
@@ -400,9 +396,6 @@ public actor SeriesDissolutionOrchestrator {
             // The server's related photos of the main photo are authoritative. A member that the caller did not
             // know is excluded from the copy rule and leaves the library with the main photo.
             try await addServerMembers(to: &journal)
-            // The roles decide the trash step and cannot change after an upload. An unknown role stops here, before
-            // any library write, while the user can still leave the operation.
-            _ = try await photosToTrash(journal, unknownRole: .memberRoleUnknown)
             try await copyPendingFavorites(&journal, onProgress: onProgress)
             // A copy can vanish between its confirmation and now (a crash, then a manual delete). Check the
             // server, copy again once, and only then allow the trash step.
@@ -418,7 +411,7 @@ public actor SeriesDissolutionOrchestrator {
         }
 
         onProgress(.init(step: .movingSeriesToTrash, fraction: 0.9))
-        let trashed = try await photosToTrash(journal, unknownRole: .trashNotConfirmed)
+        let trashed = try await photosToTrash(journal)
         // A resumed trash step skips photos that an earlier attempt already moved.
         let remaining = try await remote.activeUIDs(among: trashed)
         if !remaining.isEmpty {
@@ -440,21 +433,15 @@ public actor SeriesDissolutionOrchestrator {
     /// or a second main photo with related photos of its own. A related photo never moves on its own. Proton hides it
     /// with its main photo and brings it back when the person restores that main photo; a related photo trashed on its
     /// own would not come back with the series. Related photos keep their own active state, so only the photos in
-    /// this list confirm the step. A member that the server no longer knows is skipped. An active member whose role
-    /// the server does not report throws `unknownRole` before any write of the caller.
-    private func photosToTrash(
-        _ journal: SeriesDissolutionJournal, unknownRole: SeriesDissolutionError
-    ) async throws -> [PhotoUID] {
+    /// this list confirm the step. A member that the server no longer knows is skipped. A member whose role the server
+    /// does not report is skipped as well: it stays in the library untouched, and nothing is shown.
+    private func photosToTrash(_ journal: SeriesDissolutionJournal) async throws -> [PhotoUID] {
         let mainUID = journal.seriesMainUID
         let members = journal.seriesUIDs.filter { $0 != mainUID }
         let roles = members.isEmpty ? [:] : try await remote.memberRoles(of: members)
         var trashed = [mainUID]
         for member in members {
-            guard let link = roles[member] else { continue }
-            guard link.hasExplicitPhotoState else {
-                if link.isActive { throw unknownRole }
-                continue
-            }
+            guard let link = roles[member], link.hasExplicitPhotoState else { continue }
             if link.mainPhotoLinkID == nil { trashed.append(member) }
         }
         return trashed
