@@ -167,6 +167,7 @@ struct MobileViewerInfoSheet: View {
                         ) {
                             Marker(mapTitle, coordinate: coordinate)
                         }
+                        .id(location.mapIdentity)
                         .frame(maxWidth: .infinity)
                         .aspectRatio(1.55, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
