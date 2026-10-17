@@ -371,11 +371,23 @@ package enum MetalGridFrameComposer {
                 ))
         }
 
+        // The selection badge leaves a corner that an active reserved region (the iPhone Duo fold) covers, for a
+        // visible corner that no duration or RAW label uses.
+        let overlay = decorations.overlay(uid)
+        var selectionCorner = TileCorner.bottomTrailing
+        if decorations.selectionMode, !decorations.reservedRegions.isEmpty {
+            let labels =
+                hasThumbnail
+                ? GridThumbnailOverlayPolicy.layouts(for: overlay, in: displayed, bottomTrailingInset: 0)
+                    .map(\.backgroundRect)
+                : []
+            selectionCorner = decorations.reservedRegions.badgeCorner(
+                in: displayed, side: badge, inset: pad, avoiding: labels)
+        }
         let bottomTrailingInset =
-            decorations.selectionMode || decorations.favorites.contains(uid)
+            (decorations.selectionMode && selectionCorner == .bottomTrailing) || decorations.favorites.contains(uid)
             ? badge + pad
             : 0
-        let overlay = decorations.overlay(uid)
         let overlayLayouts =
             hasThumbnail
             ? GridThumbnailOverlayPolicy.layouts(
@@ -451,22 +463,19 @@ package enum MetalGridFrameComposer {
             }
         }
 
-        let bottomRight = CGRect(
-            x: displayed.maxX - badge - pad,
-            y: displayed.maxY - badge - pad,
-            width: badge,
-            height: badge
-        )
+        let bottomRight = TileCorner.bottomTrailing.badgeRect(in: displayed, side: badge, inset: pad)
         // Reserve the bottom-trailing badge area when placing a duration label.
         if decorations.favorites.contains(uid), !decorations.selectionMode {
             favorite.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
         }
         if decorations.selectionMode {
-            // Checkmark badge, bottom-right (filled+accent when selected, empty circle otherwise).
+            // Checkmark badge, bottom-right unless a reserved region covers it (filled+accent when selected, empty
+            // circle otherwise).
+            let checkRect = selectionCorner.badgeRect(in: displayed, side: badge, inset: pad)
             if isSelected {
-                checkFilled.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+                checkFilled.append(MetalGridQuad(rect: checkRect, radius: 0, alpha: drawAlpha))
             } else {
-                checkEmpty.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+                checkEmpty.append(MetalGridQuad(rect: checkRect, radius: 0, alpha: drawAlpha))
             }
         }
     }
@@ -485,6 +494,8 @@ package struct MetalGridDecorations<ID: Hashable> {
     package var overlay: @MainActor (ID) -> GridThumbnailOverlay
     /// The animated upload badge for a photo and the badge the backup reports; nil draws the badge as is.
     package var uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)?
+    /// Active reserved regions of the viewport, in viewport coordinates; selection badges stay clear of them.
+    package var reservedRegions: ReservedRegionLayout
 
     package init(
         accent: SIMD4<Float>,
@@ -493,7 +504,8 @@ package struct MetalGridDecorations<ID: Hashable> {
         selected: Set<ID>,
         favorites: Set<ID>,
         overlay: @escaping @MainActor (ID) -> GridThumbnailOverlay,
-        uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil
+        uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil,
+        reservedRegions: ReservedRegionLayout = .none
     ) {
         self.accent = accent
         self.accentGlyphColor = accentGlyphColor
@@ -502,6 +514,7 @@ package struct MetalGridDecorations<ID: Hashable> {
         self.favorites = favorites
         self.overlay = overlay
         self.uploadBadgeFrame = uploadBadgeFrame
+        self.reservedRegions = reservedRegions
     }
 }
 

@@ -343,6 +343,49 @@ import Testing
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func selectionBadgeLeavesACornerThatAnActiveFoldCovers() throws {
+        let cache = try #require(makeCache())
+        let image = try #require(makeImage())
+        let photo = uid("fold-photo")
+        cache.beginFrame(pinned: [photo])
+        cache.uploadVisible(wanted: [photo]) { _ in image }
+
+        func badge(_ regions: ReservedRegionLayout) throws -> CGRect {
+            let out = MetalGridFrameComposer.buildGroups(
+                slots: [slot(0, y: 0)], flatUIDs: [photo], cache: cache,
+                displayMode: .squareFillCrop, cornerRadius: 11,
+                decorations: MetalGridDecorations(
+                    accent: SIMD4(0, 0, 1, 1),
+                    accentGlyphColor: .white,
+                    selectionMode: true,
+                    selected: [],
+                    favorites: [],
+                    overlay: { _ in .empty },
+                    reservedRegions: regions
+                )
+            )
+            // Thumbnail, then the empty selection circle.
+            #expect(out.groups.count == 2)
+            return try #require(out.groups.last?.quads.first).rect
+        }
+
+        // The iPhone Duo fold in the book pose crosses the tile's trailing edge.
+        let fold = ReservedRegionArea(
+            kind: .division, frame: CGRect(x: 80, y: 0, width: 40, height: 400), isActive: true)
+        let open = try badge(.none)
+        let viewport = CGRect(x: 0, y: 0, width: 400, height: 400)
+        let folded = try badge(ReservedRegionLayout(areas: [fold], bounds: viewport))
+        let fullyOpen = try badge(
+            ReservedRegionLayout(
+                areas: [ReservedRegionArea(kind: .division, frame: fold.frame, isActive: false)], bounds: viewport))
+
+        #expect(open.midX > 50 && open.midY > 50)
+        #expect(folded.midX < 50 && folded.midY > 50)
+        #expect(!folded.intersects(fold.frame))
+        #expect(fullyOpen == open)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
     func favoriteHeartUsesSameBottomRightPositionForPhotoAndVideo() throws {
         let cache = try #require(makeCache())
         let image = try #require(makeImage())
