@@ -452,15 +452,16 @@ extension DriveSession {
     /// in `Responses[].Response`. A failed move must be detected from the body; ignoring it turns every
     /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
     /// The state and the main photo of each link. A link that the server no longer knows is absent from the result.
+    /// `retryOnRateLimit` false answers a rate limit with an error at once, for a read that has a cheaper fallback.
     func fetchLinkVisibility(
-        shareID: String, linkIDs: [String]
+        shareID: String, linkIDs: [String], retryOnRateLimit: Bool = true
     ) async throws -> [String: TimelineRemoteVisibilityRequirement.Link] {
         var result: [String: TimelineRemoteVisibilityRequirement.Link] = [:]
         for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let data = try await send(
                 "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": chunk],
-                retryOnRateLimit: true)
+                retryOnRateLimit: retryOnRateLimit)
             for link in try JSONDecoder().decode(LinkVisibilityResponse.self, from: data).links {
                 guard let id = link.linkID else { continue }
                 result[id] = .init(

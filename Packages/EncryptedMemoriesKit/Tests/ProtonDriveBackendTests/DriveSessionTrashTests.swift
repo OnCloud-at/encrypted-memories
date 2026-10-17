@@ -457,6 +457,37 @@ extension DriveSessionStubSuite {
             }
         }
 
+        @Test func aLinkVisibilityReadWithoutRateLimitRetryFailsAtTheFirstRateLimit() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.routeSequence(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                responses: [
+                    (status: 429, json: #"{"Code":2028,"Error":"Too many requests"}"#),
+                    (status: 200, json: #"{"Code":1000,"Links":[]}"#),
+                ])
+
+            await #expect(throws: (any Error).self) {
+                try await makeSession().fetchLinkVisibility(
+                    shareID: "share1", linkIDs: ["photo"], retryOnRateLimit: false)
+            }
+            #expect(StubURLProtocol.requests().count == 1, "the read does not wait for a second attempt")
+        }
+
+        @Test func aLinkVisibilityReadRetriesOnceAfterARateLimitByDefault() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.routeSequence(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                responses: [
+                    (status: 429, json: #"{"Code":2028,"Error":"Too many requests"}"#),
+                    (status: 200, json: #"{"Code":1000,"Links":[{"LinkID":"photo","State":1}]}"#),
+                ])
+
+            let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["photo"])
+
+            #expect(links["photo"]?.isActive == true)
+            #expect(StubURLProtocol.requests().count == 2)
+        }
+
         @Test func linkVisibilityRejectsAResponseWithoutLinks() async throws {
             StubURLProtocol.reset()
             StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: #"{"Code":1000}"#)
