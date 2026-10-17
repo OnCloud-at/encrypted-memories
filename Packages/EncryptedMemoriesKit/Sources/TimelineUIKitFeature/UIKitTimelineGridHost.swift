@@ -1666,7 +1666,6 @@
                 cache: textureCache,
                 visibleIDs: ids.visible,
                 overscanIDs: ids.overscan,
-                pinOverscan: true,
                 effectiveUploadPixels: uploadPixels,
                 allowUpgrade: allowUpgrade,
                 now: now,
