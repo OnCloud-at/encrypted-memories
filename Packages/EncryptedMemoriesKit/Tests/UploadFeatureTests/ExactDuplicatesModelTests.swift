@@ -1823,6 +1823,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(
             model.metadataCheckNote, L10n.string("duplicates.groups_checked \(48.formatted()) \(200.formatted())"))
         XCTAssertNil(model.copyCountText)
+        XCTAssertEqual(model.mergeAllTitle, L10n.string("duplicates.merge_all_title_unchecked"))
         XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
         for index in stride(from: 48, to: 200, by: 48) {
             model.groupAppeared(groups[index].id)
@@ -1899,6 +1900,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.filter(\.isRanked).count, 48)
         XCTAssertNil(model.knownDuplicateCount)
         XCTAssertNil(model.copyCountText)
+        XCTAssertEqual(model.mergeAllTitle, L10n.string("duplicates.merge_all_title_unchecked"))
         XCTAssertEqual(model.mergeAllConfirmTitle, L10n.string("duplicates.merge"))
     }
 

@@ -35,7 +35,7 @@ Tap or click a copy to open it in the viewer. The viewer shows the other copies 
 
 **Merge All** merges every group. It is dimmed while the check runs.
 
-Select **Merge All**. An alert asks you to confirm. If every group was checked, the title shows the number of copies. If a group could not be checked, the title says **Merge Duplicates?** and shows no number. Merge All then checks that group first and shows **Checking duplicates** with **Stop**. Select **Merge** to continue or **Cancel** to stop.
+Select **Merge All**. An alert asks you to confirm. If every group was checked, the title shows the number of copies. If a group could not be checked, the title says **Merge Duplicates?** and shows no number. Select **Merge** to continue or **Cancel** to stop. After you select **Merge**, Merge All checks that group first and shows **Checking duplicates** with **Stop**.
 
 The app merges the groups in batches. The screen shows **Merging Duplicates** and a count, for example **320 of 1,404 groups**. Select **Stop** to stop after the batch that runs. The app then shows **Merging stopped. X of Y groups were merged.** The groups that were not merged stay in the list. Start Merge All again to merge them.
 
