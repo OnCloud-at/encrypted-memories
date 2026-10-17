@@ -386,8 +386,8 @@
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
         var isApplyingProgrammaticScroll = false
-        /// One-shot per content set: fires once the first fully-populated on-screen frame is drawn (every visible
-        /// cell resident or unfetchable), mirroring the macOS coordinator. Reset when a new non-empty UID set lands.
+        /// One-shot per content set: fires once the first settled frame with a resident visible thumbnail is drawn,
+        /// mirroring the macOS coordinator. Reset when a new non-empty UID set lands.
         private var firstContentReported = false
         /// Guards the deferred main-queue readiness callback. A cached frame may finish on the same runloop turn
         /// that authoritative UIDs replace it; only the generation that actually rendered may acknowledge itself.
@@ -412,8 +412,9 @@
 
         public private(set) var isMetal3Capable = false
 
-        /// Called on the main actor the first time every visible cell is drawn for the current content - the shell's
-        /// signal that the launch/loading UI can lift onto a real grid (never blank cells). One-shot per content set.
+        /// Called on the main actor the first time a visible thumbnail is drawn for the current content - the shell's
+        /// signal that the launch/loading UI can lift onto a real grid. The remaining thumbnails may still load.
+        /// One-shot per content set.
         public var onFirstContentReady: (() -> Void)?
 
         /// Called on the main actor when the user taps a photo cell, with the tapped item. The shell presents the viewer.
@@ -1513,16 +1514,9 @@
             drawableWaitMs: Double,
             now: Double = CACurrentMediaTime()
         ) -> GridRenderOutcome {
-            let feed = thumbnailFeed
-            let missing = newestFirst(
-                uids.filter { uid in
-                    !textureCache.isResident(uid) && !(feed?.isKnownUnfetchable(uid) ?? false)
-                })
+            let (missing, ramReadyMissing) = missingRetryableTiles(in: uids, isResident: textureCache.isResident)
             scheduleWarmIfNeeded(
                 missing, pixelSize: transitionUploadPixels(slotSidePoints: slotSidePoints, textureCache: textureCache))
-            let ramReadyMissing = missing.reduce(into: 0) { count, uid in
-                if feed?.memoryCGImage(for: uid) != nil { count += 1 }
-            }
             perf.noteDraw(
                 visible: uids.count, missing: missing.count,
                 ramHitGpuMiss: ramReadyMissing, saturated: textureCache.residencySaturatedThisFrame,
@@ -1704,11 +1698,8 @@
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
             renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
 
-            let missingVisible = newestFirst(
-                ids.visible.filter { uid in
-                    !textureCache.isResident(uid) && !(feed?.isKnownUnfetchable(uid) ?? false)
-                }
-            )
+            let (missingVisible, ramReadyMissing) = missingRetryableTiles(
+                in: ids.visible, isResident: textureCache.isResident)
             // The first visible thumbnail tells the shell to lift the loading UI onto the grid. Remaining
             // thumbnails continue loading behind the presented grid.
             // One-shot per content set; deferred to the next runloop tick so it never mutates observed shell
@@ -1735,9 +1726,6 @@
             // when its bytes land, so we idle through that wait instead of spinning full frames the whole time.
             // RAM-decoded but not yet GPU-resident (the `ramHitGpuMissing` diagnostic): these tiles can fill on
             // the very next frames within the upload budget - a persistent count means upload-budget starvation.
-            let ramReadyMissing = missingVisible.reduce(into: 0) { count, uid in
-                if feed?.memoryCGImage(for: uid) != nil { count += 1 }
-            }
             let uploadPending = ramReadyMissing > 0
             // Residency saturation means neither a deferred upload nor a deferred upgrade can make progress until the
             // streaming window changes (scroll/zoom, which re-arm on their own), so both are gated on it - matching
