@@ -237,20 +237,14 @@ public struct CompositeBackupResourceResolver: BackupResourceResolving {
     }
 
     public func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
-        guard let resolver = resolvers[entry.source.kind] else {
-            throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
-        }
-        return try await resolver.resolve(entry)
+        try await resolver(for: entry).resolve(entry)
     }
 
     public func resolve(
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> BackupResolvedResource? {
-        guard let resolver = resolvers[entry.source.kind] else {
-            throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
-        }
-        return try await resolver.resolve(entry, onPreparationProgress: onPreparationProgress)
+        try await resolver(for: entry).resolve(entry, onPreparationProgress: onPreparationProgress)
     }
 
     public func resolve(
@@ -258,11 +252,15 @@ public struct CompositeBackupResourceResolver: BackupResourceResolving {
         onPreparationProgress: @escaping BackupResourcePreparationHandler,
         readAdmission: @escaping BackupResourceReadAdmission
     ) async throws -> BackupResolvedResource? {
+        try await resolver(for: entry).resolve(
+            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission)
+    }
+
+    private func resolver(for entry: UploadBackupSyncQueueEntry) throws -> any BackupResourceResolving {
         guard let resolver = resolvers[entry.source.kind] else {
             throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
         }
-        return try await resolver.resolve(
-            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission)
+        return resolver
     }
 }
 
