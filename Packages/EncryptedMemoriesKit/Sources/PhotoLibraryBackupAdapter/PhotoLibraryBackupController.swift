@@ -237,7 +237,7 @@ public final class PhotoLibraryBackupController {
         /// machine without an authorization record a real scan waits for an answer that never comes.
         private var passBodyForTesting: (@Sendable () async -> Void)?
         /// Replaces only the PhotoKit scan of a started pass; the runner still drains the queue.
-        private var scanBodyForTesting: (@Sendable () async -> Void)?
+        private var scanBodyForTesting: (@Sendable () async throws -> Void)?
         /// Replaces the real sleep of the wait for the first network path, so a test decides when the wait ends.
         private var firstNetworkPathSleepForTesting: (@Sendable (Duration) async -> Void)?
         /// Ended passes whose completion (status projection and the next wake) still runs.
@@ -849,7 +849,7 @@ public final class PhotoLibraryBackupController {
         #if DEBUG
             let scanBody = scanBodyForTesting
         #else
-            let scanBody: (@Sendable () async -> Void)? = nil
+            let scanBody: (@Sendable () async throws -> Void)? = nil
         #endif
 
         // The task inherits the main actor, but all heavy phases (`scan`, `runUntilDrained`) are
@@ -881,7 +881,7 @@ public final class PhotoLibraryBackupController {
             )
             do {
                 if let scanBody {
-                    await scanBody()
+                    try await scanBody()
                 } else {
                     try await Self.replayCatalogIfQueueNeedsRecovery(
                         catalogStore: catalogStore,
@@ -900,7 +900,7 @@ public final class PhotoLibraryBackupController {
             } catch is CancellationError {
                 // The one-shot completion signal below releases the reconcile loop cleanly.
             } catch {
-                self?.reportSyncMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                self?.reportScanFailure(error)
             }
             self?.finishScanPhase()
 
@@ -1249,7 +1249,7 @@ public final class PhotoLibraryBackupController {
             accessState = state
         }
 
-        internal func replaceScanForTesting(_ body: @escaping @Sendable () async -> Void) {
+        internal func replaceScanForTesting(_ body: @escaping @Sendable () async throws -> Void) {
             scanBodyForTesting = body
         }
 
@@ -1911,6 +1911,22 @@ public final class PhotoLibraryBackupController {
 
     private func reportSyncMessage(_ message: String) {
         lastMessage = message
+    }
+
+    /// The catalog sync throws technical English text. People see the localized local-state message, as for the
+    /// missing-source recovery; the technical text stays in the diagnostics.
+    private func reportScanFailure(_ error: Error) {
+        PhotoDiagnostics.shared.increment("backup.scan.failed")
+        let detail: String
+        if let error = error as? UploadError, case .backend(let text) = error {
+            detail = text
+        } else {
+            // The domain and the code are fixed values; the description of a system error can hold a path.
+            let bridged = error as NSError
+            detail = "\(bridged.domain) \(bridged.code)"
+        }
+        PhotoDiagnostics.shared.emitDebug("BackupSync", ["scanError": detail])
+        reportSyncMessage(L10n.string("backup.error_local_state_unavailable"))
     }
 
     private func refreshFromQueue() {
