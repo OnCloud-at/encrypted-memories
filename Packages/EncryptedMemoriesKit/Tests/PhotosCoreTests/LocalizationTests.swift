@@ -231,7 +231,7 @@ final class LocalizationTests: XCTestCase {
         let cov = try loadCatalog(appCatalog).coverage
         let reps = [
             "login.tagline", "sidebar.all_photos", "settings.library_tab", "menu.upload_photos",
-            "action.refresh", "alert.trash_confirmation_title_other %lld",
+            "alert.trash_confirmation_title_other %lld",
             "a11y.download_count_selected_originals %lld",
         ]
         for key in reps {

@@ -5,7 +5,7 @@ import SwiftUI
 struct MacSettingsTabs: NSViewControllerRepresentable {
     struct Tab {
         enum ID: String {
-            case account, support, library, smartSearch, backup, privacy, labs, diagnostics
+            case account, support, library, smartSearch, backup, privacy, labs
         }
 
         let id: ID

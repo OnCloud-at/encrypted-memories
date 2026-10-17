@@ -6,7 +6,7 @@ Open the **Photos** tab and select the account button. Settings shows your accou
 
 ## Mac
 
-Open **Encrypted Memories → Settings…**. Native tabs separate Proton Account, Support, Library, Smart Search, Backup, Privacy, Labs, and Diagnostics.
+Open **Encrypted Memories → Settings…**. Native tabs separate Proton Account, Support, Library, Smart Search, Backup, Privacy, and Labs.
 
 ## Privacy
 
@@ -19,6 +19,8 @@ The **Privacy** page (iPhone and iPad) or tab (Mac) has these switches:
 | **Blur App Preview** | On | iPhone and iPad only. Hides app content in the App Switcher. |
 
 The page also links to the Privacy Policy.
+
+On the Mac, **Report a problem** is at the bottom of the Privacy tab. It exports the support report.
 
 **Use Cellular Data** for backups is on the Backup page. It is off by default. See [[Backup and Photo Library Sync|Backup-and-Album-Sync]].
 
