@@ -63,8 +63,8 @@ struct InfoPanelView: View {
                         .font(.headline)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if location.showsMap, let metadata {
-                    mapSection(metadata, title: location.markerTitle)
+                if location.showsMap, let metadata, let mapLabel = location.mapAccessibilityLabel {
+                    mapSection(metadata, title: location.markerTitle, accessibilityLabel: mapLabel)
                 }
                 Text(coordinates)
                     .font(mapAndPlacesEnabled ? .subheadline : .body)
@@ -75,7 +75,7 @@ struct InfoPanelView: View {
         }
     }
 
-    @ViewBuilder private func mapSection(_ m: PhotoMetadata, title: String) -> some View {
+    @ViewBuilder private func mapSection(_ m: PhotoMetadata, title: String, accessibilityLabel: String) -> some View {
         let coord = CLLocationCoordinate2D(latitude: m.latitude!, longitude: m.longitude!)
         Map(
             initialPosition: .region(
@@ -89,6 +89,8 @@ struct InfoPanelView: View {
         .frame(height: 150)
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .allowsHitTesting(false)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private var fileSection: some View {
