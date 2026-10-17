@@ -404,6 +404,10 @@ public final class TimelineViewModel {
     #endif
 
     public func load() async {
+        // Every way out of the first load that publishes no baseline (a failure, a cancellation, a route switch, a
+        // route without a timeline, content that another route already published) leaves the empty seed. The
+        // monitor's first probe then refreshes instead of silently adopting the server token.
+        defer { if initialLibraryChangeToken == nil { initialLibraryChangeToken = "" } }
         guard filter.hasTimeline else { return }
         if let initialLoadTask {
             await initialLoadTask.value
@@ -597,7 +601,6 @@ public final class TimelineViewModel {
         if !force, case .loaded = state { return }  // load once
         initialLoadFailureReason = nil
         var cacheValidation = TimelineCacheValidation.refreshRequired(monitorBaseline: nil)
-        var authoritativeLoadSucceeded = false
         var hadInventoryBaseline = allRouteSnapshot != nil
 
         // Show the in-memory `.all` snapshot when available. The first visit or a relaunch uses the
@@ -627,13 +630,9 @@ public final class TimelineViewModel {
                         currentProjection = await normalizeOffMain(current.sections, for: .all)
                     }
                     cacheValidation = validation.validation
-                    guard !Task.isCancelled, filter == .all, shownRevisions == shownTimelineRevisions else {
-                        initialLibraryChangeToken = ""
-                        return
-                    }
+                    guard !Task.isCancelled, filter == .all, shownRevisions == shownTimelineRevisions else { return }
                     if case .terminalFailure = cacheValidation {
                         initialLoadFailureReason = .scopeAccessLost
-                        initialLibraryChangeToken = ""
                         return
                     }
                     if case .validated(let token) = cacheValidation, let currentProjection {
@@ -674,7 +673,6 @@ public final class TimelineViewModel {
             // user's scroll position) untouched.
             await applyAllContent(projection)
             initialLibraryChangeToken = refreshed.monitorBaseline(afterPublishing: true)
-            authoritativeLoadSucceeded = true
         } catch {
             // A cancelled owner cannot publish. A backend cancellation of an active read is a load failure.
             guard !Task.isCancelled, filter == .all else { return }
@@ -683,11 +681,6 @@ public final class TimelineViewModel {
             // Keep showing the cached timeline on a refresh error; surface failure only if we have
             // nothing to show.
             if case .loaded = state {} else { state = .failed(error.localizedDescription) }
-        }
-        if !force {
-            if !authoritativeLoadSucceeded {
-                initialLibraryChangeToken = ""
-            }
         }
     }
 

@@ -241,6 +241,112 @@ import Testing
         await feed.stopPrefetch()
     }
 
+    @MainActor
+    @Test(
+        .timeLimit(.minutes(1)),
+        arguments: [RouteSwitchHold.cachedRead, .validation, .serverFetch, .failingServerFetch])
+    func aRouteSwitchDuringTheFirstLoadLeavesARetrySeedThatRefreshesOnTheFirstProbe(
+        hold: RouteSwitchHold
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = RouteSwitchStartupRepository(hold: hold)
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let model = TimelineViewModel(repository: repository, feed: feed)
+        let loading = Task { await model.load() }
+        #expect(await repository.waitUntilHeld(), "The first load must reach the held \(hold) step")
+        await model.select(.tag(.favorites))
+        await repository.release()
+        await loading.value
+        #expect(model.filter == .tag(.favorites))
+        #expect(model.initialLibraryChangeToken == "", "A route switch must not leave the monitor without a seed")
+        let (probed, published) = await tokensPublishedByAMonitor(seededBy: model.initialLibraryChangeToken)
+        #expect(probed)
+        #expect(published == ["b"], "The first probe must refresh exactly once")
+        await feed.stopPrefetch()
+    }
+
+    @MainActor @Test(.timeLimit(.minutes(1)))
+    func aScopeLossInTheFirstLoadLeavesARetrySeed() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let model = TimelineViewModel(repository: RouteSwitchStartupRepository(hold: .terminalValidation), feed: feed)
+
+        await model.load()
+
+        #expect(model.initialLoadFailureReason == .scopeAccessLost)
+        #expect(model.initialLibraryChangeToken == "")
+        await feed.stopPrefetch()
+    }
+
+    @MainActor @Test(.timeLimit(.minutes(1)))
+    func aTokenFromAnotherLoadIsNotOverwrittenWhenTheFirstLoadLeavesOnARouteSwitch() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = RouteSwitchStartupRepository(hold: .firstServerFetchOnly)
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let model = TimelineViewModel(repository: repository, feed: feed)
+        let loading = Task { await model.load() }
+        #expect(await repository.waitUntilHeld())
+        await model.select(.tag(.favorites))
+        await model.select(.all)
+        #expect(model.initialLibraryChangeToken == "forced-token", "The load of All Photos published its token")
+        await model.select(.tag(.favorites))
+
+        await repository.release()
+        await loading.value
+
+        #expect(model.initialLibraryChangeToken == "forced-token", "The first load must not replace a published token")
+        await feed.stopPrefetch()
+    }
+
+    @MainActor @Test(.timeLimit(.minutes(1)))
+    func aLoadAfterAFilteredRouteShowedContentStillLeavesARetrySeed() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = RouteSwitchStartupRepository(hold: nil)
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let photo = PhotoItem(
+            uid: .init(volumeID: "fixture", nodeID: "favorite"), captureTime: Date(timeIntervalSince1970: 1_000),
+            mediaType: "image/jpeg")
+        let section = TimelineSection(id: "s", date: photo.captureTime, title: "", items: [photo])
+        let model = TimelineViewModel(
+            repository: repository, feed: feed, library: SingleSectionLibrary(sections: [section]))
+        await model.select(.tag(.favorites))
+        guard case .loaded = model.state else {
+            Issue.record("The filtered route must have published content")
+            return
+        }
+
+        await model.load()
+
+        #expect(model.initialLibraryChangeToken == "", "The load-once check must not skip the seed")
+        let (probed, published) = await tokensPublishedByAMonitor(seededBy: model.initialLibraryChangeToken)
+        #expect(probed)
+        #expect(published == ["b"])
+        await feed.stopPrefetch()
+    }
+
+    @MainActor @Test(.timeLimit(.minutes(1)), arguments: [PhotoFilter.map, .duplicates])
+    func aLaunchOnARouteWithoutATimelineLeavesARetrySeed(route: PhotoFilter) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = RouteSwitchStartupRepository(hold: nil)
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let model = TimelineViewModel(repository: repository, feed: feed)
+        await model.select(route)
+
+        await model.load()
+
+        #expect(model.initialLibraryChangeToken == "")
+        let (probed, published) = await tokensPublishedByAMonitor(seededBy: model.initialLibraryChangeToken)
+        #expect(probed)
+        #expect(published == ["b"])
+        #expect(await repository.fetches == 0, "A route without a timeline loads nothing")
+        await feed.stopPrefetch()
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func stored110ValidationTokenSeedsAnUnchangedMonitorWithoutListing() async throws {
         let provider = WarmLaunchProvider()
@@ -353,6 +459,104 @@ private actor UnpairedStartupRepository: PhotosRepository, LibraryChangeTokenPro
         return []
     }
     func libraryChangeToken() async throws -> String { "b" }
+}
+
+/// The step of the first load that stays suspended while a test acts. `nil` holds nothing.
+enum RouteSwitchHold: Sendable {
+    case cachedRead
+    case validation
+    case serverFetch
+    case failingServerFetch
+    /// Only the first fetch stays suspended; a later one returns at once with "forced-token".
+    case firstServerFetchOnly
+    /// The cache validation reports that the cached scope is gone.
+    case terminalValidation
+}
+
+private actor RouteSwitchStartupRepository: PhotosRepository, LibraryChangeTokenProvider {
+    private struct Failure: Error {}
+    private static let cachedToken = "a-cache"
+    private let hold: RouteSwitchHold?
+    private var entered = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var fetches = 0
+
+    init(hold: RouteSwitchHold?) { self.hold = hold }
+
+    func cachedTimelineSnapshot() async -> CachedTimelineSnapshot? {
+        switch hold {
+        case .cachedRead:
+            await holdUntilReleased()
+            return CachedTimelineSnapshot(sections: [], validationToken: Self.cachedToken)
+        case .validation, .terminalValidation:
+            return CachedTimelineSnapshot(sections: [], validationToken: Self.cachedToken)
+        default:
+            return nil
+        }
+    }
+    func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String {
+        if hold == .terminalValidation { throw TimelineCacheValidationTerminalError() }
+        if hold == .validation { await holdUntilReleased() }
+        return Self.cachedToken
+    }
+    func libraryChangeToken() async throws -> String { Self.cachedToken }
+    func loadTimeline() async throws -> [TimelineSection] { try await loadTimelineSnapshot().sections }
+    func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
+        fetches += 1
+        switch hold {
+        case .serverFetch, .failingServerFetch:
+            await holdUntilReleased()
+            if hold == .failingServerFetch { throw Failure() }
+            return TimelineLoadSnapshot(sections: [], validationToken: "a#media=0#order=0")
+        case .firstServerFetchOnly:
+            if fetches == 1 {
+                await holdUntilReleased()
+                return TimelineLoadSnapshot(sections: [], validationToken: "first-token")
+            }
+            return TimelineLoadSnapshot(sections: [], validationToken: "forced-token")
+        default:
+            return TimelineLoadSnapshot(sections: [], validationToken: "a#media=0#order=0")
+        }
+    }
+    private func holdUntilReleased() async {
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func waitUntilHeld() async -> Bool { await waitUntil { await self.entered } }
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private struct SingleSectionLibrary: PhotoLibraryProvider {
+    let sections: [TimelineSection]
+    func timeline(filter: PhotoFilter) async throws -> [TimelineSection] { sections }
+}
+
+/// Starts a monitor with `seed` and returns whether it probed three times and which tokens its refreshes published.
+private func tokensPublishedByAMonitor(seededBy seed: String?) async -> (probed: Bool, published: [String]) {
+    let provider = CatchUpProvider()
+    let monitor = LibraryChangeMonitor()
+    await monitor.start(
+        provider: provider, policy: .init(interval: .milliseconds(1), failureInterval: .milliseconds(1)),
+        initialToken: seed
+    ) {
+        .refreshed(token: await provider.publishCurrentSnapshot())
+    }
+    let probed = await waitUntil { await provider.probeCount >= 3 }
+    await monitor.stop()
+    return (probed, await provider.publishedTokens)
+}
+
+/// Polls until `condition` holds or ten seconds pass. A `.timeLimit` cannot stop a `Task.yield` loop.
+private func waitUntil(_ condition: @Sendable () async -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now + .seconds(10)
+    while ContinuousClock.now < deadline {
+        if await condition() { return true }
+        await Task.yield()
+    }
+    return await condition()
 }
 
 private struct NoCatchUpThumbnails: ThumbnailBatchLoader {
