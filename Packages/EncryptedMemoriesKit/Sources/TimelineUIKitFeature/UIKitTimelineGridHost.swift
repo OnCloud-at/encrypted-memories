@@ -942,9 +942,7 @@
             // Register the GPU texture cache with the shared memory governor. On pressure the cache sheds offscreen but never
             // the visible pinned set, so what is on screen stays drawable - mirroring the macOS coordinator.
             if let cache {
-                texturePressureRegistration = UIKitMemoryPressureCoordinator.shared.attach(
-                    cache, key: "gridTextureCache"
-                ) { [weak cache] tier in
+                texturePressureRegistration = UIKitMemoryPressureCoordinator.shared.attach(cache) { [weak cache] tier in
                     cache?.setResidencyPressureScale(tier.budgetScale)
                 }
             }
