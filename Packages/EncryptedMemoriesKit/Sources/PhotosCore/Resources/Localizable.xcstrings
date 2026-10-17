@@ -371,6 +371,23 @@
         "en": { "stringUnit": { "state": "translated", "value": "The item could not be prepared." } }
       }
     },
+    "auth.checking_session": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Deine Sitzung wird überprüft …"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking your session…"
+          }
+        }
+      }
+    },
     "auth.saved_session_invalid": {
       "extractionState": "manual",
       "localizations": {

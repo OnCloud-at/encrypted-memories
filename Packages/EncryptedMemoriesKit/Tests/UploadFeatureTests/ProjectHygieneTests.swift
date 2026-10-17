@@ -381,17 +381,14 @@ final class ProjectHygieneTests: XCTestCase {
         )
     }
 
-    /// A literal key that no catalog owns renders as the raw key, for example as a VoiceOver label.
+    /// `L10n.string` reads the package catalog only. A literal key that this catalog lacks renders as the raw
+    /// key, for example as a VoiceOver label, even when an app catalog holds it.
     func testEveryLiteralLocalizationKeyHasACatalogEntry() throws {
-        var known = Set<String>()
-        for path in [
-            "App/Localizable.xcstrings", "iOSApp/Localizable.xcstrings",
-            "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Resources/Localizable.xcstrings",
-        ] {
-            let data = try Data(contentsOf: repoRoot.appendingPathComponent(path))
-            let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-            known.formUnion(try XCTUnwrap(catalog["strings"] as? [String: Any]).keys)
-        }
+        let data = try Data(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Resources/Localizable.xcstrings"))
+        let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let known = Set(try XCTUnwrap(catalog["strings"] as? [String: Any]).keys)
         let literal = try NSRegularExpression(pattern: #"L10n\.string\(\s*"((?:[^"\\]|\\.)*)""#)
         var checked = 0
         var missing: [String] = []

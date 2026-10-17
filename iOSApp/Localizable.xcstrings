@@ -285,23 +285,6 @@
         }
       }
     },
-    "auth.checking_session": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Deine Sitzung wird überprüft …"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Checking your session…"
-          }
-        }
-      }
-    },
     "auth.sign_in_prompt": {
       "extractionState": "manual",
       "localizations": {
