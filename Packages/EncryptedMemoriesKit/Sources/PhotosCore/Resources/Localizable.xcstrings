@@ -6067,28 +6067,6 @@
         }
       }
     },
-    "duplicates.merge_all_confirm %lld": {
-      "comment": "Confirming button of Merge All. The count is every copy of every group, kept copies included.",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "variations": {
-            "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "Merge %lld Exact Copy" } },
-              "other": { "stringUnit": { "state": "translated", "value": "Merge %lld Exact Copies" } }
-            }
-          }
-        },
-        "de": {
-          "variations": {
-            "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "%lld exakte Kopie zusammenführen" } },
-              "other": { "stringUnit": { "state": "translated", "value": "%lld exakte Kopien zusammenführen" } }
-            }
-          }
-        }
-      }
-    },
     "duplicates.group_title %lld": {
       "comment": "Section title of one group of identical photos.",
       "extractionState": "manual",

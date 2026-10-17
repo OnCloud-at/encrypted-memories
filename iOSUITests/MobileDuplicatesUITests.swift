@@ -272,6 +272,9 @@ final class MobileDuplicatesUITests: XCTestCase {
             waitUntilGone(alert, "Cancel dismisses the alert")
             revealGroup(0, scrollingUp: false)
             revealGroup(1)
+            // A merge that Cancel failed to stop would remove the group.
+            let merged = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: group(1))
+            XCTAssertEqual(XCTWaiter.wait(for: [merged], timeout: 4), .timedOut, "Cancel starts no merge")
             app.terminate()
         }
     }
