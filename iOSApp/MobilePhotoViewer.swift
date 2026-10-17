@@ -233,7 +233,7 @@ struct MobilePhotoViewer: View {
             // Register the viewer's transient display cache with the shared memory governor (identity-keyed:
             // a newly opened viewer replaces the previous registration; the weak capture makes a dismissed
             // viewer's handler a no-op). Under `.minimal` the store purges every page except the visible one.
-            UIKitMemoryPressureCoordinator.shared.attach(imageStore, key: "viewerImageStore") {
+            UIKitMemoryPressureCoordinator.shared.attach(imageStore) {
                 [weak imageStore] tier in
                 imageStore?.applyMemoryPressure(scale: tier.budgetScale, purge: tier.requiresImmediatePurge)
             }
