@@ -239,6 +239,70 @@ import TimelineCore
         await runtime.shutdown()
     }
 
+    @Test(.timeLimit(.minutes(2)))
+    func favoritesFollowTheRemoteSetOnlyWhenARefreshReturnsANewLibraryToken() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        try #require(fixture.items.count >= 4)
+        let (a, b, c, d) = (fixture.items[0].uid, fixture.items[1].uid, fixture.items[2].uid, fixture.items[3].uid)
+        let probe = MobileRemoteFavoriteProbe(sections: fixture.sections, members: [a])
+        defer { Task { await probe.release() } }
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: { await probe.snapshot() },
+                favoriteLoader: { await probe.loadFavorites() },
+                favoriteWriter: { uids, favorite in await probe.write(uids, favorite: favorite) }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        let runtime = try await installRuntime(model, fixture: fixture)
+        model.settleIsolatedLibraryForTesting()
+        try await waitUntil { model.favoriteFilterAvailability == .available && model.favoriteUIDs == [a] }
+
+        // The first refresh brings the first token: one read. A refresh with the same token reads nothing.
+        _ = await model.refreshIsolatedLibraryForTesting()
+        try await waitUntil { await probe.reads == 2 }
+        _ = await model.refreshIsolatedLibraryForTesting()
+        _ = await model.refreshIsolatedLibraryForTesting()
+
+        // Another device removes a and adds b.
+        await probe.remoteChange(to: [b])
+        _ = await model.refreshIsolatedLibraryForTesting()
+        try await waitUntil { model.favoriteUIDs == [b] }
+        #expect(await probe.reads == 3, "unchanged refreshes before the change read nothing")
+
+        // Another device adds a again.
+        await probe.remoteChange(to: [a, b])
+        _ = await model.refreshIsolatedLibraryForTesting()
+        try await waitUntil { model.favoriteUIDs == [a, b] }
+
+        // A local favorite made while the read for the next change runs survives the older response. The shown set
+        // is [a, b, c] meanwhile; the response removes a and keeps b and the newer local c.
+        await probe.holdNextRead()
+        await probe.remoteChange(to: [b])
+        _ = await model.refreshIsolatedLibraryForTesting()
+        try await waitUntil { await probe.isHolding }
+        #expect(await model.toggleFavorite([c]))
+        await probe.release()
+        try await waitUntil { model.favoriteUIDs == [b, c] }
+        #expect(model.favoriteFilterAvailability == .available)
+        #expect(model.favoriteMutationsInFlight.isEmpty)
+        #expect(await probe.reads == 5)
+
+        // Another change that moves the token while a read runs is read right after that read ends.
+        await probe.holdNextRead()
+        await probe.remoteChange(to: [b, c])
+        _ = await model.refreshIsolatedLibraryForTesting()
+        try await waitUntil { await probe.isHolding }
+        await probe.remoteChange(to: [b, c, d])
+        _ = await model.refreshIsolatedLibraryForTesting()
+        await probe.release()
+        try await waitUntil { model.favoriteUIDs == [b, c, d] }
+        #expect(await probe.reads == 7)
+        await runtime.shutdown()
+    }
+
     private func installRuntime(
         _ model: MobileLibraryModel, fixture: MobileSignedInFixture, generation: UInt64 = 0,
         authority: SourceInventoryAuthority = .authoritative
@@ -285,6 +349,48 @@ private actor MobileCatchUpProbe {
     func snapshot() -> TimelineLoadSnapshot {
         loads += 1
         return TimelineLoadSnapshot(sections: sections, validationToken: current)
+    }
+}
+
+/// The favorites of an account that another device changes. Every change moves the library token.
+private actor MobileRemoteFavoriteProbe {
+    let sections: [TimelineSection]
+    private var members: Set<PhotoUID>
+    private var tokenNumber = 0
+    private(set) var reads = 0
+    private var holdsNextRead = false
+    private(set) var isHolding = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    init(sections: [TimelineSection], members: Set<PhotoUID>) {
+        self.sections = sections
+        self.members = members
+    }
+    func remoteChange(to members: Set<PhotoUID>) {
+        self.members = members
+        tokenNumber += 1
+    }
+    /// A write of this device reaches the server set. Its library token is not tracked here.
+    func write(_ uids: [PhotoUID], favorite: Bool) {
+        if favorite { members.formUnion(uids) } else { members.subtract(uids) }
+    }
+    func snapshot() -> TimelineLoadSnapshot {
+        TimelineLoadSnapshot(sections: sections, validationToken: "token-\(tokenNumber)")
+    }
+    func holdNextRead() { holdsNextRead = true }
+    func loadFavorites() async -> Set<PhotoUID> {
+        reads += 1
+        let response = members
+        if holdsNextRead {
+            holdsNextRead = false
+            isHolding = true
+            await withCheckedContinuation { continuation = $0 }
+            isHolding = false
+        }
+        return response
+    }
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 
