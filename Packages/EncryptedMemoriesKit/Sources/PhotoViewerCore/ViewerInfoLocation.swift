@@ -13,6 +13,9 @@ public struct ViewerInfoLocation {
         guard showsMap, let coordinateText else { return nil }
         return "\(markerTitle), \(coordinateText)"
     }
+    /// Identity of the Info map. `Map(initialPosition:)` applies its camera only when a map first appears, so
+    /// each host gives its map this value: a photo with other coordinates then gets a new map at its own place.
+    public var mapIdentity: String? { showsMap ? coordinateText : nil }
 
     public init(metadata: PhotoMetadata?, placeName: String?, mapAndPlacesEnabled: Bool) {
         self.placeName = mapAndPlacesEnabled ? PlaceNameText.displayable(placeName) : nil

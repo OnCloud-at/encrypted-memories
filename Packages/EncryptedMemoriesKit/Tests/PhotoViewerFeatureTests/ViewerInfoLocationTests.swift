@@ -72,6 +72,25 @@ final class ViewerInfoLocationTests: XCTestCase {
         XCTAssertNil(none.mapAccessibilityLabel, "no stored coordinates shows no map")
     }
 
+    func testMapIdentityChangesWithTheStoredCoordinates() {
+        func identity(_ latitude: Double, _ longitude: Double, name: String? = "Known place") -> String? {
+            let metadata = PhotoMetadata(latitude: latitude, longitude: longitude)
+            return ViewerInfoLocation(metadata: metadata, placeName: name, mapAndPlacesEnabled: true).mapIdentity
+        }
+        XCTAssertNotNil(identity(48.3, 14.2))
+        XCTAssertNotEqual(identity(48.3, 14.2), identity(40.71, -74.0), "another place needs a new map")
+        XCTAssertNotEqual(identity(48.3, 14.2), identity(48.3, 14.3))
+        XCTAssertNotEqual(identity(48.3, 14.2), identity(48.4, 14.2))
+        XCTAssertEqual(identity(48.3, 14.2), identity(48.3, 14.2, name: nil), "the place name does not rebuild the map")
+    }
+
+    func testMapIdentityExistsOnlyWhereTheMapIsShown() {
+        let off = ViewerInfoLocation(metadata: metadata, placeName: "Known place", mapAndPlacesEnabled: false)
+        XCTAssertNil(off.mapIdentity)
+        let none = ViewerInfoLocation(metadata: PhotoMetadata(), placeName: nil, mapAndPlacesEnabled: true)
+        XCTAssertNil(none.mapIdentity)
+    }
+
     func testNoLocationShowsNeitherMapNorCoordinates() {
         let location = ViewerInfoLocation(metadata: PhotoMetadata(), placeName: nil, mapAndPlacesEnabled: true)
         XCTAssertNil(location.placeName)
