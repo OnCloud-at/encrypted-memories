@@ -1831,8 +1831,23 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func restore(_ uids: [PhotoUID]) async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
             let root = try await bridge.resolvePhotosRoot()
-            try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
-            // A listing can drop these photos before the library lists them again; their thumbnails stay.
+            _ = try await TrashedRelatedPhotos.restore(
+                uids, candidates: bridge.recentlyDeleted.trashedRelatedPhotos(of: uids),
+                readLinks: { linkIDs in
+                    let context = try await bridge.photosShareContextImpl()
+                    // A rate limit must not hold back the restore of the main photo; it comes back alone then.
+                    return try await bridge.driveSession.fetchLinkVisibility(
+                        shareID: context.shareID, linkIDs: linkIDs, retryOnRateLimit: false)
+                },
+                rereadLinks: { linkIDs in
+                    let context = try await bridge.photosShareContextImpl()
+                    return try await bridge.driveSession.fetchLinkVisibility(shareID: context.shareID, linkIDs: linkIDs)
+                },
+                restore: { photos in
+                    try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: photos.map(\.nodeID))
+                })
+            // A listing can drop these photos before the library lists them again; their thumbnails stay. Their related
+            // photos come back inside them and never showed in Recently Deleted.
             bridge.recentlyDeleted.restored(uids)
             bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
             await bridge.reportRecentlyDeleted()
@@ -1867,9 +1882,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         guard !isShutDown else { throw CancellationError() }
         let ticket = recentlyDeleted.beginListing()
         let root = try await resolvePhotosRoot()
-        let links = try await driveSession.listTrash(volumeID: root.volumeID)
+        let files = try await driveSession.listTrash(volumeID: root.volumeID)
             .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
-            .filter { $0.mainPhotoLinkID == nil }  // hide Live-Photo paired videos, like the timeline
+        // Hide related photos (Live Photo videos, series frames), like the timeline; a restore of the main takes them.
+        let (links, related) = TrashedRelatedPhotos.split(files, volumeID: root.volumeID)
         let photos =
             links
             .compactMap { l -> PhotoItem? in
@@ -1887,7 +1903,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let stored = recentlyDeleted.persisted
         switch recentlyDeleted.received(photos, ticket: ticket) {
         case .applied:
-            break
+            recentlyDeleted.listedRelatedPhotos(related)
         case .overtakenByChange:
             // Photos that left the library meanwhile may still lack a listing. A background listing follows; when
             // this is the background listing itself, the next library refresh starts it.
