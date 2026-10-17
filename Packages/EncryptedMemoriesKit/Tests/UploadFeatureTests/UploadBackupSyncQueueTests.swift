@@ -1503,19 +1503,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             ("en", "The backup cannot continue on this device right now. Please restart the app."),
             ("de", "Das Backup kann auf diesem Gerät gerade nicht weitermachen. Bitte starte die App neu."),
         ] {
-            let bundle = L10n.resourceBundle
-            let translated: String?
-            if let path = bundle.path(forResource: language, ofType: "lproj"), let localized = Bundle(path: path) {
-                translated = localized.localizedString(forKey: key, value: nil, table: nil)
-            } else {
-                let url = try XCTUnwrap(bundle.url(forResource: "Localizable", withExtension: "xcstrings"))
-                let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-                let strings = catalog["strings"] as? [String: Any]
-                let entry = strings?[key] as? [String: Any]
-                let localizations = entry?["localizations"] as? [String: Any]
-                let localization = localizations?[language] as? [String: Any]
-                translated = (localization?["stringUnit"] as? [String: Any])?["value"] as? String
-            }
+            let translated = try catalogTranslation(of: key, language: language)
             XCTAssertEqual(translated, expected, language, file: file, line: line)
             XCTAssertFalse(error.localizedDescription.contains("Backup queue"), language, file: file, line: line)
         }

@@ -1146,6 +1146,55 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        /// Runs one pass whose scan throws `error`, and returns what the person would read afterwards.
+        private func messageAfterAScan(throwing error: Error) async throws -> String? {
+            let fixture = try makeControllerFixture(
+                prefix: "backup-scan-failure", identityResolver: FakeIdentityResolver(),
+                runtimeSignals: .wiFiWithMobileDataOff)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.setEnabledForTesting()
+            controller.setAccessStateForTesting(.full)
+            let scans = PassCounter()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                throw error
+            }
+
+            controller.syncNow()
+            let finished = await waitUntil { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(finished, "the pass must run its scan")
+            let message = controller.lastMessage
+            await controller.shutdown()
+            return message
+        }
+
+        func testScanFailureShowsTheLocalizedLocalStateMessageInsteadOfTheTechnicalText() async throws {
+            let technical = "Photo library scan state could not be saved"
+            let failures: [Error] = [
+                UploadError.backend(technical), UploadError.backend("Photo library catalog could not be updated"),
+                CocoaError(.fileWriteUnknown),
+            ]
+            for failure in failures {
+                let message = try await messageAfterAScan(throwing: failure)
+                XCTAssertEqual(message, L10n.string("backup.error_local_state_unavailable"), "\(failure)")
+            }
+            let key = "backup.error_local_state_unavailable"
+            for language in ["en", "de"] {
+                let translated = try XCTUnwrap(try catalogTranslation(of: key, language: language), language)
+                XCTAssertFalse(translated.contains("Photo library"), language)
+                XCTAssertNotEqual(translated, technical, language)
+            }
+            XCTAssertEqual(
+                try catalogTranslation(of: key, language: "de"),
+                "Das Backup kann auf diesem Gerät gerade nicht weitermachen. Bitte starte die App neu.")
+        }
+
+        func testCancelledScanShowsNoMessage() async throws {
+            let message = try await messageAfterAScan(throwing: CancellationError())
+            XCTAssertNil(message)
+        }
+
         func testActivationDoesNotStartAPassWhileBackupIsPaused() async throws {
             let fixture = try makeControllerFixture(prefix: "photo-backup-activation-paused", enabled: true)
             defer { fixture.cleanup() }
