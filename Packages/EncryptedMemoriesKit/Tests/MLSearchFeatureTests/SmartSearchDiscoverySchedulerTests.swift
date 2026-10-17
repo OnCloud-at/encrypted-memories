@@ -996,23 +996,37 @@ import TimelineCore
             runtimeState: LibraryRuntimeState(), debounce: .zero, retryDelays: Self.shortRetryDelays
         ) { _, _ in nil }
         defer { scheduler.reset() }
-        func apply(settled: Int) {
+        func apply(_ snapshot: MLSmartSearchSnapshot) {
             scheduler.update(
                 sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
                 timelineRevision: 1, favoriteUIDs: Set(items.map(\.uid)), coordinates: [],
-                snapshot: visualSnapshot(settled: settled, ready: true), indexedAssetCount: { 8 },
+                snapshot: snapshot, indexedAssetCount: { 8 },
                 searchEvidence: { await probe.query(sensitive: items[0].uid) },
                 cacheAccess: { await cache.access() })
         }
-        apply(settled: 8)
+        // The visual index stays complete, so the content and the cache key stay equal; only the scheduler key
+        // changes while index work runs, and the update gets past its early return.
+        func indexing() -> MLSmartSearchSnapshot {
+            let complete = visualSnapshot(settled: 8, ready: true)
+            let progress = MLSmartSearchAggregateProgress(
+                totalWorkUnits: 100, settledWorkUnits: 20, permanentlyUnavailableAssets: 0)
+            return MLSmartSearchSnapshot(
+                isEnabled: true, selectedModelID: complete.selectedModelID, phase: complete.phase,
+                installedModelBytes: 0, availableModels: [], isSearchAvailable: true,
+                indexingState: .waiting(progress))
+        }
+        apply(visualSnapshot(settled: 8, ready: true))
         for _ in 0..<2_000 where await cache.saves < 4 || scheduler.isRefreshing {
             try await Task.sleep(for: .milliseconds(5))
         }
         try #require(await cache.saves == 4)
-        apply(settled: 20)
-        try await Task.sleep(for: .milliseconds(50))
-        apply(settled: 40)
-        try await Task.sleep(for: .milliseconds(50))
+        for _ in 0..<2 {
+            apply(indexing())
+            apply(visualSnapshot(settled: 8, ready: true))
+            #if DEBUG
+                await scheduler.waitForRefreshForTesting()
+            #endif
+        }
         #expect(await cache.saves == 4, "index progress must not renew an exhausted disk-write budget")
         #expect(await probe.calls == 1)
         #expect(scheduler.discovery.hasComputed, "failed persistence must retain usable rows")
