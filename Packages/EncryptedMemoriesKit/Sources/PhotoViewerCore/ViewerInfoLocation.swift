@@ -8,6 +8,11 @@ public struct ViewerInfoLocation {
     public let showsMap: Bool
     /// Whether the location section has anything to show: a usable place name or the stored coordinates.
     public var hasContent: Bool { placeName != nil || coordinateText != nil }
+    /// What VoiceOver reads for the map: the marker title and the stored coordinates. Nil without a map.
+    public var mapAccessibilityLabel: String? {
+        guard showsMap, let coordinateText else { return nil }
+        return "\(markerTitle), \(coordinateText)"
+    }
 
     public init(metadata: PhotoMetadata?, placeName: String?, mapAndPlacesEnabled: Bool) {
         self.placeName = mapAndPlacesEnabled ? PlaceNameText.displayable(placeName) : nil

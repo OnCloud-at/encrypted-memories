@@ -55,6 +55,23 @@ final class ViewerInfoLocationTests: XCTestCase {
         }
     }
 
+    func testMapAccessibilityLabelNamesTheMarkerAndTheStoredCoordinates() {
+        let coordinates = PhotoCoordinateText.format(latitude: 48.3, longitude: 14.2)
+        let named = ViewerInfoLocation(metadata: metadata, placeName: "Known place", mapAndPlacesEnabled: true)
+        XCTAssertEqual(named.mapAccessibilityLabel, "Known place, \(coordinates)")
+        for name: String? in [nil, "", " "] {
+            let unnamed = ViewerInfoLocation(metadata: metadata, placeName: name, mapAndPlacesEnabled: true)
+            XCTAssertEqual(unnamed.mapAccessibilityLabel, "\(L10n.string("map.cluster_title")), \(coordinates)")
+        }
+    }
+
+    func testMapAccessibilityLabelExistsOnlyWhereTheMapIsShown() {
+        let off = ViewerInfoLocation(metadata: metadata, placeName: "Known place", mapAndPlacesEnabled: false)
+        XCTAssertNil(off.mapAccessibilityLabel, "Map and Places off shows no map")
+        let none = ViewerInfoLocation(metadata: PhotoMetadata(), placeName: "Known place", mapAndPlacesEnabled: true)
+        XCTAssertNil(none.mapAccessibilityLabel, "no stored coordinates shows no map")
+    }
+
     func testNoLocationShowsNeitherMapNorCoordinates() {
         let location = ViewerInfoLocation(metadata: PhotoMetadata(), placeName: nil, mapAndPlacesEnabled: true)
         XCTAssertNil(location.placeName)

@@ -155,7 +155,7 @@ struct MobileViewerInfoSheet: View {
                 if let latitude = metadata?.latitude, let longitude = metadata?.longitude,
                     let coordinates = location.coordinateText
                 {
-                    if location.showsMap {
+                    if location.showsMap, let mapLabel = location.mapAccessibilityLabel {
                         let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
                         let mapTitle = location.markerTitle
                         Map(
@@ -171,9 +171,7 @@ struct MobileViewerInfoSheet: View {
                         .aspectRatio(1.55, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(
-                            Text("\(mapTitle), \(coordinates)")
-                        )
+                        .accessibilityLabel(Text(mapLabel))
                     }
 
                     Text(coordinates)
