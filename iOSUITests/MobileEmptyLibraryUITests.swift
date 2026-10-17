@@ -9,8 +9,11 @@ final class MobileEmptyLibraryUITests: XCTestCase {
         app = nil
     }
 
-    private func launch(_ scenario: String) {
+    /// The backup sheet of the "empty" scenario reads the real Photos access of the simulator. A denied state that an
+    /// earlier run left behind hides the enable button, so the test that needs it starts from an unanswered state.
+    private func launch(_ scenario: String, resetPhotosAccess: Bool = false) {
         app = UITestApplication.make()
+        if resetPhotosAccess { app.resetAuthorizationStatus(for: .photos) }
         app.launchArguments += [
             "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesLibraryLoadFixture", scenario,
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US", "-EncryptedMemoriesDarkAppearance",
@@ -19,7 +22,7 @@ final class MobileEmptyLibraryUITests: XCTestCase {
     }
 
     func testCompletelyEmptyLibraryOpensBackupSettings() {
-        launch("empty")
+        launch("empty", resetPhotosAccess: true)
         XCTAssertTrue(app.staticTexts["No photos yet"].waitForExistence(timeout: 60))
         let backup = app.buttons["library.empty.backup"]
         XCTAssertTrue(backup.waitForExistence(timeout: 20))
