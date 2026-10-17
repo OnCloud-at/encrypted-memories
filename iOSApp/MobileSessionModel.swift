@@ -50,7 +50,7 @@ final class MobileSessionModel: ObservableObject {
             authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)
         )
         isCheckingSession = true
-        statusText = String(localized: "auth.checking_session")
+        statusText = L10n.string("auth.checking_session")
         protectedDataObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.protectedDataDidBecomeAvailableNotification,
             object: nil,
@@ -157,7 +157,7 @@ final class MobileSessionModel: ObservableObject {
             isCheckingSession = true
             isSigningOut = false
             errorText = nil
-            statusText = String(localized: "auth.checking_session")
+            statusText = L10n.string("auth.checking_session")
         case .signedOut(let error):
             session = nil
             isSigningIn = false
