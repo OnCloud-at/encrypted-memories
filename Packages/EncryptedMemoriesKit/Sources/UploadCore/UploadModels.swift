@@ -543,27 +543,18 @@ public struct PhotoUploadRequest: Sendable {
     /// The same request with the dedupe pipeline's findings applied: the Proton-corrected name
     /// (what actually gets hashed remotely) and the integrity digest.
     public func applying(identity: UploadIdentity) -> PhotoUploadRequest {
-        var request = PhotoUploadRequest(
-            queueItemID: queueItemID,
-            cancellationToken: cancellationToken,
-            fileURL: fileURL,
+        copy(
             name: identity.correctedName,
-            mediaType: mediaType,
-            fileSize: fileSize,
-            captureTime: captureTime,
-            modificationDate: modificationDate,
-            tags: tags,
-            additionalMetadata: additionalMetadata,
             expectedSHA1: identity.sha1Digest,
-            overrideExistingDraft: overrideExistingDraft,
-            mainPhotoUID: mainPhotoUID
+            overrideExistingDraft: overrideExistingDraft
         )
-        request.allowsExpensiveNetwork = allowsExpensiveNetwork
-        request.networkReservation = networkReservation
-        return request
     }
 
     public func replacingExistingDraft(_ shouldReplace: Bool) -> PhotoUploadRequest {
+        copy(name: name, expectedSHA1: expectedSHA1, overrideExistingDraft: shouldReplace)
+    }
+
+    private func copy(name: String, expectedSHA1: Data?, overrideExistingDraft: Bool) -> PhotoUploadRequest {
         var request = PhotoUploadRequest(
             queueItemID: queueItemID,
             cancellationToken: cancellationToken,
@@ -576,7 +567,7 @@ public struct PhotoUploadRequest: Sendable {
             tags: tags,
             additionalMetadata: additionalMetadata,
             expectedSHA1: expectedSHA1,
-            overrideExistingDraft: shouldReplace,
+            overrideExistingDraft: overrideExistingDraft,
             mainPhotoUID: mainPhotoUID
         )
         request.allowsExpensiveNetwork = allowsExpensiveNetwork
