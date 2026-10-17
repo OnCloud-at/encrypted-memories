@@ -5,7 +5,7 @@ import UploadCore
 /// The platform adapter's view of local albums (PhotoKit on Apple platforms). Permission handling
 /// stays in the platform layer: these calls are made only after access is granted.
 public protocol AlbumSyncLocalAlbumSource: Sendable {
-    /// User-created albums, in the platform's display order.
+    /// User-created albums, sorted alphabetically by title (PhotoKit exposes no cross-folder user order).
     func listAlbums() async throws -> [LocalAlbumSummary]
     /// Typed contents of one album in stable display order. May be large; implementations must
     /// enumerate chunked and never load asset bytes. `.present([])` and `.missing` are distinct.
