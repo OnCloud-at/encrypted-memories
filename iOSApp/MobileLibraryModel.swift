@@ -950,11 +950,12 @@ final class MobileLibraryModel {
         Task { await sourceAnalysisRuntime.refresh() }
     }
 
-    /// Unknown favorites can recover through existing refresh signals without reloading the account.
-    /// The task owner coalesces startup and refresh calls; known membership needs no further server read.
+    /// Unknown favorites can recover through existing refresh signals without reloading the account. Known
+    /// favorites are read again only after a refresh returned a new library token. The task owner coalesces
+    /// startup and refresh calls.
     private func loadFavoritesIfNeeded() {
         guard favoriteLoadTask == nil,
-            favoriteFilterAvailability != .available,
+            favoriteState.needsRead,
             !isSigningOut, !isRecoveringScope,
             let backend, let session
         else { return }
@@ -969,6 +970,8 @@ final class MobileLibraryModel {
             else { return }
             self.favoriteLoadTask = nil
             self.favoriteState.finishLoad(loaded, for: read)
+            // A refresh may have returned a newer token while this read ran. A failed read waits for the next signal.
+            if loaded != nil { self.loadFavoritesIfNeeded() }
         }
     }
 
@@ -1829,6 +1832,8 @@ final class MobileLibraryModel {
             // The same opaque server event token covers album mutations. Reuse this central foreground
             // refresh instead of adding a second poller; Collections reloads through its existing revision key.
             albumCatalogRevision &+= 1
+            // Another device's favorite change moves the same token, so refreshLibrarySources reads them again.
+            favoriteState.observeLibraryToken(refreshed.validationToken)
             refreshLibrarySources()
             return .init(outcome: .refreshed(token: refreshed.validationToken), failureReason: nil)
         } catch is CancellationError {
