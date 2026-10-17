@@ -384,6 +384,9 @@ public actor ThumbnailFeedCore {
     /// be declared settled until these reservations return, even if their source queues are already empty.
     private var diskProbeBatchesInFlight = 0
     private var downloadInFlight = 0
+    /// The photos of each crawl batch that is downloading, by batch. Only `loadDirectDecoded` reads it, to count
+    /// a direct load that overlaps a batch (`thumb.directLoadOverlapsBatch`). It never delays a load.
+    private var batchesInFlight: [UUID: Set<PhotoUID>] = [:]
     private var lastErrors: [String] = []
     private var prefetchEnabled = true
     private var prefetchPaused = false
@@ -1433,6 +1436,9 @@ public actor ThumbnailFeedCore {
         let writerGeneration = access?.cacheGeneration ?? cache.captureWriterGeneration()
         guard cache.isCurrentWriterGeneration(writerGeneration) else { return nil }
         diagnostics.recordNetworkRequestDuringPinch()
+        if batchesInFlight.values.contains(where: { $0.contains(uid) }) {
+            diagnostics.increment("thumb.directLoadOverlapsBatch")
+        }
         let result: ThumbnailBatchLoadResult
         if let priorityLoader = loader as? any PriorityThumbnailBatchLoader {
             result = await priorityLoader.loadThumbnails(for: [uid], priority: .visibleNow) { loadedUID, data in
@@ -1657,6 +1663,7 @@ public actor ThumbnailFeedCore {
         priority.removeAll()
         priorityByUID.removeAll()
         priorityReservations.removeAll(keepingCapacity: false)
+        batchesInFlight.removeAll(keepingCapacity: false)
         sequential.removeAll()
         withheldRetry.removeAll()
         withheldRequeues.removeAll()
@@ -2237,6 +2244,8 @@ public actor ThumbnailFeedCore {
             guard ownerLeaseIsCurrent() else { return }
             activeDownloaders += 1
             downloadInFlight += chunk.count
+            let batchID = UUID()
+            batchesInFlight[batchID] = Set(chunk)
             prefetchDownloadStarted += reportedCount(in: chunk)
             diagnostics.recordNetworkRequestDuringPinch()
             let writerGeneration = cache.captureWriterGeneration()
@@ -2263,11 +2272,12 @@ public actor ThumbnailFeedCore {
                 let taskID = UUID()
                 let tracker = Task { [weak self] in
                     _ = await lateLoader.value
-                    await self?.timedOutLoaderFinished(taskID: taskID, itemCount: chunk.count)
+                    await self?.timedOutLoaderFinished(taskID: taskID, batchID: batchID, itemCount: chunk.count)
                 }
                 timedOutLoaderTasks[taskID] = tracker
             } else {
                 downloadInFlight = max(0, downloadInFlight - chunk.count)
+                batchesInFlight[batchID] = nil
             }
             guard generation == prefetchGeneration, ownerLeaseIsCurrent() else { return }
             let completed = snapshot.delivered.count
@@ -2477,10 +2487,11 @@ public actor ThumbnailFeedCore {
         )
     }
 
-    private func timedOutLoaderFinished(taskID: UUID, itemCount: Int) {
+    private func timedOutLoaderFinished(taskID: UUID, batchID: UUID, itemCount: Int) {
         timedOutLoaderTasks[taskID] = nil
         timedOutLoaders = max(0, timedOutLoaders - 1)
         downloadInFlight = max(0, downloadInFlight - itemCount)
+        batchesInFlight[batchID] = nil
     }
 
     /// Reserves queue candidates on the actor, then yields it while the dedicated executor performs the actual

@@ -814,6 +814,58 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.requestCount() == 1)
     }
 
+    @Test func aDirectLoadOfAPhotoInADownloadingBatchIsCountedAndNeverHeldBack() async throws {
+        let inBatch = Self.uid("overlap-in-batch")
+        let other = Self.uid("overlap-other")
+        let payload = Self.pngData(width: 24, height: 24)
+        let diagnostics = PhotoDiagnostics()
+        let loader = PerUIDControlledLateLoader(payloads: [inBatch: payload, other: payload])
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("overlap"),
+            loader: loader,
+            configuration: Self.configuration(
+                downloadConcurrencyLimit: 1,
+                batchSize: 1,
+                downloadTimeoutSeconds: 30
+            ),
+            diagnostics: diagnostics
+        )
+        defer {
+            Task {
+                await loader.release(inBatch)
+                await loader.release(other)
+            }
+        }
+        let key = "thumb.directLoadOverlapsBatch"
+
+        #expect(await feed.requestPriority(inBatch))
+        try await Self.waitUntil { await loader.requestCount() == 1 }
+        #expect(await loader.requestCount() == 1, "the batch is downloading")
+
+        let elsewhere = Task { await feed.decoded(for: other) }
+        try await Self.waitUntil { await loader.requestCount() == 2 }
+        #expect(await loader.requestCount() == 2)
+        #expect(diagnostics.counter(key) == 0, "a photo outside the batch is no overlap")
+
+        let overlapping = Task { await feed.decoded(for: inBatch) }
+        try await Self.waitUntil { await loader.requestCount() == 3 }
+        #expect(await loader.requestCount() == 3, "the direct load does not wait for the batch")
+        #expect(diagnostics.counter(key) == 1)
+
+        await feed.stopPrefetch()
+        let afterStop = Task { await feed.decoded(for: inBatch) }
+        try await Self.waitUntil { await loader.requestCount() == 4 }
+        #expect(await loader.requestCount() == 4)
+        #expect(diagnostics.counter(key) == 1, "a stopped feed forgets its batches")
+
+        await loader.release(inBatch)
+        await loader.release(other)
+        #expect(await elsewhere.value != nil)
+        #expect(await overlapping.value != nil)
+        #expect(await afterStop.value != nil)
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func everyVisibleWarmPassUsesHighestPriority() async throws {
         let first = Self.uid("visible-warm-first")
         let later = Self.uid("visible-warm-later")

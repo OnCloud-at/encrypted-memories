@@ -298,6 +298,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         "perf.videoPrefetchDeduped",
         "perf.videoPrefetchScheduled",
         "thumb.decodedUpgrade",
+        "thumb.directLoadOverlapsBatch",
         "thumb.diskCacheHit",
         "thumb.diskCacheMiss",
         "thumb.diskDecodeFailed",
