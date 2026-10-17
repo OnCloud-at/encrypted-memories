@@ -323,7 +323,7 @@ private struct MobileAlbumRow: View {
                 Text(album.title)
                     .font(.body.weight(.medium))
                     .foregroundStyle(ProtonColor.textNorm)
-                Text("albums.photo_count \(album.photoCount)")
+                Text(L10n.string("albums.photo_count \(album.photoCount)"))
                     .font(.caption)
                     .foregroundStyle(ProtonColor.textWeak)
             }

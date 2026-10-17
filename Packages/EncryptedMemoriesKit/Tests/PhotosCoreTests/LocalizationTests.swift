@@ -245,7 +245,6 @@ final class LocalizationTests: XCTestCase {
         let cov = try loadCatalog(mobileCatalog).coverage
         let reps = [
             "tab.collections", "loading.library_title", "loading.preparing_count %lld",
-            "albums.photo_count %lld",
             "auth.sign_in_prompt",
             "viewer.share_action", "viewer.move_to_trash_action", "viewer.restore_action",
         ]
@@ -271,6 +270,7 @@ final class LocalizationTests: XCTestCase {
             "settings.bug_report_support_failed",
             "device.requires_metal3 %@",
             "device.unsupported_reassurance", "device.unsupported_title",
+            "albums.photo_count %lld",
         ]
         for key in reps {
             let langs = cov[key] ?? []
