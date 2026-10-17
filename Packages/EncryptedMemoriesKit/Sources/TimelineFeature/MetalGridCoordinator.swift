@@ -1729,20 +1729,13 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// while every other detent is cursor-aligned (anchor pinned under the cursor). Because these are a pure
     /// function of the (fixed) anchor + the detent, any two adjacent segments sharing a detent get the identical
     /// frame for it, which keeps adjacent segment boundaries identical.
-    private func pinchDetentParams(level lv: Int, viewportSize: CGSize) -> (phase: Int?, scrollY: CGFloat) {
-        if lv == pinchStartLevel { return (pinchStartPhase, pinchStartScrollY) }
-        guard let tx = zoomTransaction else { return (currentPhase(), pinchStartScrollY) }
-        let width = layoutWidth
-        let col = engine.cursorColumn(viewportX: tx.anchorViewportPoint.x, level: lv, width: width)
-        let phase = engine.columnPhase(forItem: tx.anchorGlobalIndex, targetColumn: col, level: lv, width: width)
-        let y = engine.anchoredScrollOffset(
-            flatIndex: tx.anchorGlobalIndex, localFraction: tx.anchorLocalFraction,
-            viewportPoint: tx.anchorViewportPoint, level: lv, width: width, columnPhase: phase
-        ).y
-        let clampedY = engine.clampScrollOffsetY(
-            y, level: lv, width: width,
-            viewportHeight: viewportSize.height, columnPhase: phase)
-        return (phase, clampedY)
+    private func pinchDetentParams(level lv: Int, viewportSize: CGSize) -> GridPinchDetentFrame {
+        if lv == pinchStartLevel { return GridPinchDetentFrame(phase: pinchStartPhase, scrollY: pinchStartScrollY) }
+        guard let tx = zoomTransaction else {
+            return GridPinchDetentFrame(phase: currentPhase(), scrollY: pinchStartScrollY)
+        }
+        return GridPinchDetentGeometry.cursorAlignedFrame(
+            level: lv, transaction: tx, engine: engine, width: layoutWidth, viewportHeight: viewportSize.height)
     }
 
     /// Builds the pinch plan for one adjacent source and target segment.
