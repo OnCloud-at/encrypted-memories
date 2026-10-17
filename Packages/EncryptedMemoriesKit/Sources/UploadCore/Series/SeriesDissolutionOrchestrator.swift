@@ -132,15 +132,23 @@ extension SeriesAlbumCarryOver {
     /// The albums of the own library that contain any of the photos, each once, in first-seen order. Shared
     /// albums are skipped: their writes cannot address a foreign volume.
     public func ownAlbumIDs(containing uids: [PhotoUID], ownVolumeID: String) async throws -> [String] {
-        let albumsByPhoto = try await albums(containing: uids)
+        let albumsByPhoto = try await ownAlbumIDsByPhoto(containing: uids, ownVolumeID: ownVolumeID)
         var albumIDs: [String] = []
         for uid in uids {
-            for album in albumsByPhoto[uid] ?? []
-            where album.volumeID == ownVolumeID && !albumIDs.contains(album.albumID) {
-                albumIDs.append(album.albumID)
+            for albumID in albumsByPhoto[uid] ?? [] where !albumIDs.contains(albumID) {
+                albumIDs.append(albumID)
             }
         }
         return albumIDs
+    }
+
+    /// The albums of the own library that contain each photo, with one read. Shared albums are skipped.
+    public func ownAlbumIDsByPhoto(
+        containing uids: [PhotoUID], ownVolumeID: String
+    ) async throws -> [PhotoUID: [String]] {
+        try await albums(containing: uids).mapValues { albums in
+            albums.filter { $0.volumeID == ownVolumeID }.map(\.albumID)
+        }
     }
 }
 
@@ -406,6 +414,8 @@ public actor SeriesDissolutionOrchestrator {
             }
             try await carryOverFavoriteAndAlbums(&journal)
             try await addServerMembers(to: &journal)
+            // The last chance to stop before the series leaves the library.
+            try Task.checkCancellation()
             journal.phase = .trashingSeries
             try journalStore.save(journal)
         }
@@ -524,9 +534,11 @@ public actor SeriesDissolutionOrchestrator {
     }
 
     /// Gives every copy what its source had in the library before the series leaves it: the favorite tag of its
-    /// member or of the main photo, and the own albums of the main photo. The server state is read on each
-    /// attempt. Each confirmed write is journaled, so a retry never adds a copy to the same album twice.
-    /// Shared albums are skipped: their writes cannot address a foreign volume.
+    /// member or of the main photo, and the own albums of its album source (see `albumSources`). The favorite tags are
+    /// read from the server on each attempt; the album memberships come from `albums`, which may answer from a cache.
+    /// Each confirmed write is journaled, so a retry never adds a copy to the same album twice. Shared albums are
+    /// skipped: their writes cannot address a foreign volume. A failed album write stops the operation before the
+    /// series leaves the library.
     private func carryOverFavoriteAndAlbums(_ journal: inout SeriesDissolutionJournal) async throws {
         try Task.checkCancellation()
         // Every copy is confirmed in this phase. A missing identifier would silently skip a carry-over write.
@@ -543,11 +555,17 @@ public actor SeriesDissolutionOrchestrator {
             try journalStore.save(journal)
         }
 
-        let ownAlbumIDs = try await albums.ownAlbumIDs(
-            containing: [mainUID], ownVolumeID: try await remote.ownPhotosVolumeID())
+        let sources = try await albumSources(of: journal)
+        let albumIDsBySource = try await albums.ownAlbumIDsByPhoto(
+            containing: Self.union(sources, []), ownVolumeID: try await remote.ownPhotosVolumeID())
+        var seenAlbumIDs = Set<String>()
+        let ownAlbumIDs = sources.flatMap { albumIDsBySource[$0] ?? [] }.filter { seenAlbumIDs.insert($0).inserted }
         for albumID in ownAlbumIDs {
             try Task.checkCancellation()
-            let missing = journal.favorites.indices.filter { !journal.favorites[$0].addedAlbumIDs.contains(albumID) }
+            let missing = journal.favorites.indices.filter {
+                albumIDsBySource[sources[$0]]?.contains(albumID) == true
+                    && !journal.favorites[$0].addedAlbumIDs.contains(albumID)
+            }
             guard !missing.isEmpty else { continue }
             try await albums.addPhotos(
                 try missing.map { try copyUID(of: journal.favorites[$0]) },
@@ -555,6 +573,20 @@ public actor SeriesDissolutionOrchestrator {
             )
             for index in missing { journal.favorites[index].addedAlbumIDs.append(albumID) }
             try journalStore.save(journal)
+        }
+    }
+
+    /// The photo whose own albums each copy joins, in the order of `journal.favorites`. A standalone member (no main
+    /// photo) has albums of its own. A related photo joins albums only through its main photo, so its copy takes the
+    /// albums of that main photo. A member whose role the server does not report takes the albums of the series main.
+    private func albumSources(of journal: SeriesDissolutionJournal) async throws -> [PhotoUID] {
+        let mainUID = journal.seriesMainUID
+        let members = Self.union(journal.favorites.map(\.memberUID).filter { $0 != mainUID }, [])
+        let roles = members.isEmpty ? [:] : try await remote.memberRoles(of: members)
+        return journal.favorites.map { favorite in
+            guard let link = roles[favorite.memberUID], link.hasExplicitPhotoState else { return mainUID }
+            guard let mainLinkID = link.mainPhotoLinkID else { return favorite.memberUID }
+            return PhotoUID(volumeID: favorite.memberUID.volumeID, nodeID: mainLinkID)
         }
     }
 

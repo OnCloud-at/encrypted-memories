@@ -249,6 +249,152 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.favoriteNodeIDs, ["m2", copyOfM2.nodeID])
     }
 
+    func testTheCopyOfAStandaloneMemberJoinsItsOwnAlbumsAndARelatedPhotoFollowsTheMainPhoto() async throws {
+        server.makeStandalone(["m2"])
+        server.addAlbum("album-of-m2", volumeID: "own", members: ["m2"])
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+        server.addAlbum("album-of-m4", volumeID: "own", members: ["m4"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+
+        let copyOfM2 = try XCTUnwrap(copies.first)
+        let copyOfM4 = try XCTUnwrap(copies.last)
+        XCTAssertEqual(
+            server.albumMembers("album-of-m2"), ["m2", copyOfM2.nodeID],
+            "a standalone member has albums of its own, and its copy keeps them")
+        XCTAssertEqual(
+            server.albumMembers("album-of-main"), ["m1", copyOfM4.nodeID],
+            "a related photo is in the albums of its main photo, and so is its copy")
+        XCTAssertEqual(
+            server.albumMembers("album-of-m4"), ["m4"], "a related photo joins no album through its own membership")
+        XCTAssertEqual(server.trashCalls.map { Set($0) }, [[main, member("m2")]])
+    }
+
+    func testTheCopyOfAStandaloneMemberDoesNotJoinAnAlbumOfTheMainPhoto() async throws {
+        server.makeStandalone(["m2", "m3", "m4"])
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.albumMembers("album-of-main"), ["m1"], "m2 was never in the album of the main photo")
+        XCTAssertFalse(server.events.contains(.albumAdd))
+    }
+
+    func testTheCopyOfARelatedPhotoOfASecondMainPhotoJoinsTheAlbumsOfThatMainPhoto() async throws {
+        server.makeStandalone(["m3"])
+        server.relate(["m4"], toMain: "m3")
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+        server.addAlbum("album-of-m3", volumeID: "own", members: ["m3"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m4")])
+
+        XCTAssertEqual(server.albumMembers("album-of-m3"), expected(["m3"], copies))
+        XCTAssertEqual(server.albumMembers("album-of-main"), ["m1"])
+    }
+
+    func testTheCopyOfAMemberWithoutARoleJoinsTheAlbumsOfTheSeriesMainPhoto() async throws {
+        server.makeStandalone(["m2"])
+        server.withholdPhotoRole(["m2"])
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.albumMembers("album-of-main"), expected(["m1"], copies))
+    }
+
+    func testACancellationInsideAnAlbumWriteStopsBeforeTheTrash() async throws {
+        server.addAlbum("album-own", volumeID: "own", members: ["m1"])
+        server.failAlbumWriteWithCancellation(to: "album-own")
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("a cancelled album write is no refused album")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertTrue(server.trashCalls.isEmpty)
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
+    }
+
+    func testTheCopyOfTheSeriesMainPhotoJoinsItsAlbums() async throws {
+        server.makeStandalone(["m2", "m3", "m4"])
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [main])
+
+        XCTAssertEqual(server.albumMembers("album-of-main"), expected(["m1"], copies))
+    }
+
+    func testTheCopyOfAStandaloneMemberSkipsItsSharedAlbums() async throws {
+        server.makeStandalone(["m2"])
+        server.addAlbum("album-shared", volumeID: "shared-volume", members: ["m2"])
+
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.albumMembers("album-shared"), ["m2"], "the operation never writes to a foreign volume")
+    }
+
+    func testTheCopyOfARelatedPhotoWhoseMainIsOutsideTheSeriesJoinsTheAlbumsOfThatMainPhoto() async throws {
+        server.relate(["m2"], toMain: "outside")
+        server.addAlbum("album-of-outside", volumeID: "own", members: ["outside"])
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.albumMembers("album-of-outside"), expected(["outside"], copies))
+        XCTAssertEqual(server.albumMembers("album-of-main"), ["m1"])
+    }
+
+    func testAFailedRoleReadKeepsTheSeries() async throws {
+        server.makeStandalone(["m2"])
+        server.failNextRoleRead()
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("without the roles the albums of a copy are unknown")
+        } catch {}
+
+        XCTAssertTrue(server.trashCalls.isEmpty)
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
+    }
+
+    func testAFailedAlbumReadKeepsTheSeries() async throws {
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+        server.failNextAlbumRead()
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("without the album memberships a copy would lose its albums")
+        } catch {}
+
+        XCTAssertTrue(server.trashCalls.isEmpty)
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
+    }
+
+    func testACancelAfterTheLastAlbumWriteStopsBeforeTheTrash() async throws {
+        server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
+        server.cancelAfterAlbumWrite(to: "album-of-main")
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("a cancelled operation must not finish")
+        } catch {}
+
+        XCTAssertTrue(server.trashCalls.isEmpty, "the series stays in the library")
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
+    }
+
     func testAFailedAlbumWriteKeepsTheSeriesAndTheRetryAddsEachCopyOnce() async throws {
         server.addAlbum("album-own", volumeID: "own", members: ["m1"])
         server.failNextAlbumWrite()
@@ -265,6 +411,30 @@ final class SeriesDissolutionTests: XCTestCase {
 
         XCTAssertEqual(server.uploads.count, 1, "the confirmed copy is reused instead of uploaded again")
         XCTAssertEqual(server.albumMembers("album-own"), expected(["m1"], copies))
+        XCTAssertEqual(server.trashCalls, [[main]])
+    }
+
+    func testACancelDuringAnAlbumWriteStopsBeforeTheTrashAndTheRetryAddsEachAlbumOnce() async throws {
+        server.addAlbum("album-a", volumeID: "own", members: ["m1"])
+        server.addAlbum("album-b", volumeID: "own", members: ["m1"])
+        server.cancelDuringAlbumWrite(to: "album-b")
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("a cancelled operation must not finish")
+        } catch {}
+        XCTAssertTrue(server.trashCalls.isEmpty, "a cancel is no refused album: the series stays")
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.albumMembers("album-a"), expected(["m1"], copies))
+        XCTAssertEqual(server.albumMembers("album-b"), expected(["m1"], copies))
+        XCTAssertEqual(
+            server.events.filter { $0 == .albumAdd }.count, 2,
+            "the journal keeps the confirmed album from a second add")
         XCTAssertEqual(server.trashCalls, [[main]])
     }
 
@@ -632,6 +802,11 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var trashFailures = 0
     private var favoriteFailures = 0
     private var albumFailures = 0
+    private var albumCancels = Set<String>()
+    private var albumCancellationErrors = Set<String>()
+    private var cancelsAfterAlbumWrite = Set<String>()
+    private var roleReadFailures = 0
+    private var albumReadFailures = 0
     private var _uploads: [PhotoUploadRequest] = []
     private var _trashCalls: [[PhotoUID]] = []
     private var _events: [Event] = []
@@ -711,6 +886,18 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     func failNextFavoriteWrite() { lock.withLock { favoriteFailures = 1 } }
     func failNextAlbumWrite() { lock.withLock { albumFailures = 1 } }
+    /// The next write to the album cancels the task that sends it, as a sign-out or a closed screen does. The network
+    /// layer reports that cancel as `URLError.cancelled`.
+    func cancelDuringAlbumWrite(to albumID: String) { lock.withLock { _ = albumCancels.insert(albumID) } }
+    /// The next write to the album ends with `CancellationError` while the task that sends it stays running, as a
+    /// cancel inside the SDK does.
+    func failAlbumWriteWithCancellation(to albumID: String) {
+        lock.withLock { _ = albumCancellationErrors.insert(albumID) }
+    }
+    /// The next write to the album succeeds, and then the task that sent it is cancelled.
+    func cancelAfterAlbumWrite(to albumID: String) { lock.withLock { _ = cancelsAfterAlbumWrite.insert(albumID) } }
+    func failNextRoleRead() { lock.withLock { roleReadFailures = 1 } }
+    func failNextAlbumRead() { lock.withLock { albumReadFailures = 1 } }
     /// The next trash request reports success while its photos stay active, as Proton did in the field.
     func acceptNextTrashWithoutEffect() { lock.withLock { _trashRemainsActive = true } }
 
@@ -759,6 +946,12 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     }
 
     func memberRoles(of uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
+        try lock.withLock {
+            if roleReadFailures > 0 {
+                roleReadFailures -= 1
+                throw UploadError.retryableBackend(code: 503, message: "role read unavailable")
+            }
+        }
         let links = try await linkVisibility(of: uids.map(\.nodeID))
         return Dictionary(uniqueKeysWithValues: uids.compactMap { uid in links[uid.nodeID].map { (uid, $0) } })
     }
@@ -797,8 +990,13 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     // SeriesAlbumCarryOver
 
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
-        lock.withLock {
-            _albums
+        try lock.withLock {
+            if albumReadFailures > 0 {
+                albumReadFailures -= 1
+                throw UploadError.retryableBackend(code: 503, message: "album read unavailable")
+            }
+            return
+                _albums
                 .filter { $0.value.members.contains(uid.nodeID) }
                 .map { SeriesAlbumReference(volumeID: $0.value.volumeID, albumID: $0.key) }
                 .sorted { $0.albumID < $1.albumID }
@@ -807,12 +1005,18 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
         try lock.withLock {
+            if albumCancels.remove(albumID) != nil {
+                withUnsafeCurrentTask { $0?.cancel() }
+                throw URLError(.cancelled)
+            }
+            if albumCancellationErrors.remove(albumID) != nil { throw CancellationError() }
             if albumFailures > 0 {
                 albumFailures -= 1
                 throw UploadError.retryableBackend(code: 503, message: "album write unavailable")
             }
             _events.append(.albumAdd)
             _albums[albumID]?.members.formUnion(uids.map(\.nodeID))
+            if cancelsAfterAlbumWrite.remove(albumID) != nil { withUnsafeCurrentTask { $0?.cancel() } }
         }
     }
 
