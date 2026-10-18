@@ -69,7 +69,12 @@ public final class TimelineOrderMetadataStore {
         }
     }
 
-    public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
+    public convenience init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
+        self.init(url: url, policy: policy, probe: .live)
+    }
+
+    /// `probe` answers whether a failed check says anything about the file. A test supplies it.
+    init?(url: URL, policy: LibraryDatabasePolicy, probe: SQLiteFailureProbe) {
         self.url = url
         self.policy = policy
         let recorder = SQLiteBusyRecorder(timeoutMs: policy.busyTimeoutMs)
@@ -85,13 +90,14 @@ public final class TimelineOrderMetadataStore {
                     defer { sqlite3_finalize(stmt) }
                     return sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1
                 },
-                stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK })
+                stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK },
+                probe: probe)
         }
         switch open() {
         case .opened(let handle):
             db = handle
         case .retryLater:
-            // The file may be fine: another connection holds it, or the inspection had no room to copy it. It stays
+            // The file may be fine: another connection holds it, or a full disk stopped the inspection. It stays
             // on disk, so the next open of the store, at the next launch or sign-in, can read it.
             return nil
         case .failed:
@@ -102,11 +108,12 @@ public final class TimelineOrderMetadataStore {
             db = handle
         }
         recorder.install(on: db)
-        switch Self.check(db, recorder: recorder) {
+        switch Self.check(db, recorder: recorder, probe: probe) {
         case .healthy:
             break
         case .busy:
-            // A lock that did not clear says nothing about the file. It stays for the next open.
+            // A lock that did not clear, or a failure such as a full disk, says nothing about the file. It stays for
+            // the next open.
             close()
             return nil
         case .damaged:
@@ -121,21 +128,28 @@ public final class TimelineOrderMetadataStore {
     enum CacheCheck: Equatable {
         case healthy
         case damaged
-        /// The check met a lock that did not clear within the busy timeout, so it proves nothing about the file.
+        /// The check could not verify the file, so it proves nothing about it: it met a lock that did not clear within
+        /// the busy timeout, or it failed in a way that says nothing about the file, such as a full disk. SQLite's
+        /// verdict on damage is a problem string or `SQLITE_CORRUPT`, never this.
         case busy
     }
 
     /// SQLite's own integrity check of the opened cache. `recorder` must be installed on `db`.
-    static func check(_ db: OpaquePointer?, recorder: SQLiteBusyRecorder) -> CacheCheck {
+    static func check(
+        _ db: OpaquePointer?, recorder: SQLiteBusyRecorder, probe: SQLiteFailureProbe = .live
+    ) -> CacheCheck {
         recorder.reset()
         var statement: OpaquePointer?
         let prepared = sqlite3_prepare_v2(db, "PRAGMA quick_check;", -1, &statement, nil) == SQLITE_OK
         let step = prepared ? sqlite3_step(statement) : SQLITE_ERROR
         let healthy =
             step == SQLITE_ROW && sqlite3_column_text(statement, 0).map { String(cString: $0) } == "ok"
+        // Only an error can keep the file; a problem string, or no row, is no error. The probe reads the connection
+        // before the finalize.
+        let keepsFile = probe.keepsFile(after: db, step: .quickCheck)
         sqlite3_finalize(statement)
         if healthy { return .healthy }
-        return recorder.takeGaveUp() ? .busy : .damaged
+        return recorder.takeGaveUp() || keepsFile ? .busy : .damaged
     }
 
     deinit { close() }

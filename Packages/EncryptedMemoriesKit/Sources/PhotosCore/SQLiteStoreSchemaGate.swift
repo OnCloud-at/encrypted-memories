@@ -15,7 +15,7 @@ public enum SQLiteStoreSchemaCompatibility: Sendable, Equatable {
     case incompatible
     case unavailable
     /// The check could not finish now, and the file may be fine: another connection holds it for longer than the busy
-    /// timeout, or the temporary copy for the inspection could not be made, for example on a full disk.
+    /// timeout, or a full disk stopped the check, at the temporary copy or in SQLite itself (see `SQLiteFailure`).
     case retryLater
 }
 
@@ -104,7 +104,8 @@ public enum SQLiteStoreSchemaGate {
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
-        createDirectory: ((URL) throws -> Void)? = nil
+        createDirectory: ((URL) throws -> Void)? = nil,
+        probe: SQLiteFailureProbe = .live
     ) -> SQLiteRebuildableStoreOutcome {
         func open() -> SQLiteStoreOpenResult {
             openStore(
@@ -115,7 +116,8 @@ public enum SQLiteStoreSchemaGate {
                 verifyVersion: verifyVersion,
                 stampVersion: stampVersion,
                 copyItem: copyItem,
-                createDirectory: createDirectory
+                createDirectory: createDirectory,
+                probe: probe
             )
         }
         switch open() {
@@ -157,7 +159,8 @@ public enum SQLiteStoreSchemaGate {
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
-        createDirectory: ((URL) throws -> Void)? = nil
+        createDirectory: ((URL) throws -> Void)? = nil,
+        probe: SQLiteFailureProbe = .live
     ) -> SQLiteStoreOpenResult {
         let compatibility = compatibility(
             at: url,
@@ -165,7 +168,8 @@ public enum SQLiteStoreSchemaGate {
             busyTimeoutMs: policy.busyTimeoutMs,
             versionIsCurrent: verifyVersion,
             copyItem: copyItem,
-            createDirectory: createDirectory
+            createDirectory: createDirectory,
+            probe: probe
         )
         guard compatibility != .incompatible else { return .incompatible }
         guard compatibility != .unavailable else { return .failed }
@@ -201,8 +205,10 @@ public enum SQLiteStoreSchemaGate {
             guard verifyVersion(handle),
                 matchesCurrentSchema(handle, schemaSQL: schemaSQL)
             else {
-                sqlite3_close(handle)
-                return busy.gaveUp ? .retryLater : .incompatible
+                // A lock that did not clear, or a failure that says nothing about the file, keeps it. The probe reads
+                // the failure and then closes the connection.
+                let keepsFile = probe.keepsFile(closing: handle, step: .verification)
+                return keepsFile || busy.gaveUp ? .retryLater : .incompatible
             }
             configureConnection(handle, policy: policy, includeMemoryTuning: includeMemoryTuning)
         case .incompatible:
@@ -224,7 +230,8 @@ public enum SQLiteStoreSchemaGate {
         busyTimeoutMs: Int = 5_000,
         versionIsCurrent: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
-        createDirectory: ((URL) throws -> Void)? = nil
+        createDirectory: ((URL) throws -> Void)? = nil,
+        probe: SQLiteFailureProbe = .live
     ) -> SQLiteStoreSchemaCompatibility {
         guard FileManager.default.fileExists(atPath: url.path) else { return .empty }
         var inspection: OpaquePointer?
@@ -234,13 +241,17 @@ public enum SQLiteStoreSchemaGate {
         else {
             sqlite3_close(inspection)
             return compatibilityOfWritableCopy(
-                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory)
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory,
+                probe: probe)
         }
         defer { sqlite3_close(inspection) }
         // A statement that meets a lock waits as long as the busy timeout. If the lock stays, no answer of this
         // inspection is reliable: the file may be fine, and the caller must not replace it.
         let busy = SQLiteBusyRecorder(timeoutMs: busyTimeoutMs)
         busy.install(on: inspection)
+        // A failure that says nothing about the file, such as a full disk, ends the inspection the same way. SQLite
+        // keeps the failure only until the next call, so each check below reads it right after the failed read.
+        func keepsFile() -> Bool { busy.gaveUp || probe.keepsFile(after: inspection, step: .inspection) }
         switch state(of: inspection) {
         case .empty:
             guard let version = userVersion(of: inspection) else { return busy.gaveUp ? .retryLater : .unavailable }
@@ -250,12 +261,13 @@ public enum SQLiteStoreSchemaGate {
             let current =
                 versionIsCurrent(inspection)
                 && matchesCurrentSchema(inspection, schemaSQL: schemaSQL)
-            if busy.gaveUp { return .retryLater }
-            return current ? .current : .incompatible
+            if current { return busy.gaveUp ? .retryLater : .current }
+            return keepsFile() ? .retryLater : .incompatible
         case .unavailable:
-            if busy.gaveUp { return .retryLater }
+            if keepsFile() { return .retryLater }
             return compatibilityOfWritableCopy(
-                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory)
+                at: url, busyTimeoutMs: busyTimeoutMs, copyItem: copyItem, createDirectory: createDirectory,
+                probe: probe)
         }
     }
 
@@ -271,7 +283,8 @@ public enum SQLiteStoreSchemaGate {
         at url: URL,
         busyTimeoutMs: Int,
         copyItem: (URL, URL) throws -> Void,
-        createDirectory: ((URL) throws -> Void)?
+        createDirectory: ((URL) throws -> Void)?,
+        probe: SQLiteFailureProbe
     ) -> SQLiteStoreSchemaCompatibility {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteStoreInspection-\(UUID().uuidString)", isDirectory: true)
@@ -280,7 +293,7 @@ public enum SQLiteStoreSchemaGate {
         } catch {
             logger.error("SQLite could not create its temporary recovery inspection.")
             // A full disk says nothing about the file, so it stays. Any other failure keeps its earlier meaning.
-            return isOutOfSpace(error) ? .retryLater : .unavailable
+            return DeviceStorage.isOutOfSpace(error) ? .retryLater : .unavailable
         }
 
         var compatibility = SQLiteStoreSchemaCompatibility.unavailable
@@ -292,11 +305,11 @@ public enum SQLiteStoreSchemaGate {
                     try copyItem(original, URL(fileURLWithPath: copy.path + suffix))
                 }
             }
-            compatibility = emptyCompatibility(at: copy, busyTimeoutMs: busyTimeoutMs)
+            compatibility = emptyCompatibility(at: copy, busyTimeoutMs: busyTimeoutMs, probe: probe)
         } catch {
             logger.error("SQLite could not copy the database and journals for recovery inspection.")
             // A full disk says nothing about the file, so it stays. An unreadable file keeps its earlier meaning.
-            compatibility = isOutOfSpace(error) ? .retryLater : .unavailable
+            compatibility = DeviceStorage.isOutOfSpace(error) ? .retryLater : .unavailable
         }
         do {
             try FileManager.default.removeItem(at: directory)
@@ -307,21 +320,9 @@ public enum SQLiteStoreSchemaGate {
         return compatibility
     }
 
-    /// True when the file system had no room for a write: Cocoa's out-of-space error, or POSIX `ENOSPC` or `EDQUOT`
-    /// underneath it.
-    static func isOutOfSpace(_ error: any Error) -> Bool {
-        var current: NSError? = error as NSError
-        while let nsError = current {
-            if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileWriteOutOfSpaceError { return true }
-            if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOSPC) || nsError.code == Int(EDQUOT) {
-                return true
-            }
-            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
-        }
-        return false
-    }
-
-    private static func emptyCompatibility(at url: URL, busyTimeoutMs: Int) -> SQLiteStoreSchemaCompatibility {
+    private static func emptyCompatibility(
+        at url: URL, busyTimeoutMs: Int, probe: SQLiteFailureProbe
+    ) -> SQLiteStoreSchemaCompatibility {
         var inspection: OpaquePointer?
         guard sqlite3_open_v2(url.path, &inspection, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
             let inspection
@@ -331,15 +332,20 @@ public enum SQLiteStoreSchemaGate {
         }
         defer { sqlite3_close(inspection) }
         sqlite3_busy_timeout(inspection, Int32(clamping: busyTimeoutMs))
+        // A failure that says nothing about the file, such as a full disk, keeps it. Each return below reads the
+        // failure right after the failed call.
+        func unavailable() -> SQLiteStoreSchemaCompatibility {
+            probe.keepsFile(after: inspection, step: .copy) ? .retryLater : .unavailable
+        }
         // Include SQLite's own objects, such as sqlite_sequence. Any remaining object forbids initialization.
-        guard userVersion(of: inspection) == 0 else { return .unavailable }
+        guard userVersion(of: inspection) == 0 else { return unavailable() }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(inspection, "SELECT 1 FROM sqlite_schema LIMIT 1;", -1, &statement, nil) == SQLITE_OK
         else {
-            return .unavailable
+            return unavailable()
         }
         defer { sqlite3_finalize(statement) }
-        return sqlite3_step(statement) == SQLITE_DONE ? .empty : .unavailable
+        return sqlite3_step(statement) == SQLITE_DONE ? .empty : unavailable()
     }
 
     /// Applies connection-local tuning only after the caller accepts the existing schema.
