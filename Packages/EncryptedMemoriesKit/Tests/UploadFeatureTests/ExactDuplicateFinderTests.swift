@@ -6,12 +6,28 @@ import XCTest
 
 final class ExactDuplicateFinderTests: XCTestCase {
     private var directory: URL!
-    private var server: EditScenarioServer!
+    private var servers = ScenarioServers()
+    private var server: EditScenarioServer! {
+        didSet {
+            if let server { servers.append(server) }
+        }
+    }
+
+    private struct ScenarioServers {
+        private var servers: [EditScenarioServer] = []
+
+        mutating func append(_ server: EditScenarioServer) { servers.append(server) }
+
+        var relatedFileTransferCallCount: Int {
+            servers.reduce(0) { $0 + $1.relatedFileTransferCallCount }
+        }
+    }
     private var store: UploadIdentityManifestStore!
     private var journal: EditReplacementJournalFileStore!
     private let epoch = "scenario-epoch"
 
     override func setUpWithError() throws {
+        servers = ScenarioServers()
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("exact-duplicate-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -23,6 +39,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        if let server {
+            XCTAssertEqual(server.relatedFileTransferCallCount, 0, "Existing merge paths must not attempt a transfer")
+            XCTAssertEqual(
+                servers.relatedFileTransferCallCount, 0, "Replaced merge servers must not attempt a transfer")
+        }
         store = nil
         try? FileManager.default.removeItem(at: directory)
     }
@@ -98,6 +119,55 @@ final class ExactDuplicateFinderTests: XCTestCase {
     private var violations: [String] { server.steps.flatMap(\.violations) }
 
     private func count(_ action: String) -> Int { server.steps.filter { $0.action == action }.count }
+
+    func testTransferAccountingIncludesAReplacedScenarioServer() async throws {
+        var servers = ScenarioServers()
+        var remote = EditScenarioServer()
+        servers.append(remote)
+        let uid = PhotoUID(volumeID: "vol", nodeID: "related")
+        let destination = directory.appendingPathComponent("unused.partial")
+        do {
+            _ = try await remote.downloadRelatedFile(uid, to: destination, allowsExpensiveNetwork: false)
+            XCTFail("An unavailable download must fail")
+        } catch {
+            XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .unavailable)
+        }
+        remote = EditScenarioServer()
+        servers.append(remote)
+
+        XCTAssertEqual(remote.relatedFileTransferCallCount, 0)
+        XCTAssertEqual(servers.relatedFileTransferCallCount, 1, "Replacing the server must retain earlier calls")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    func testEveryScenarioRemoteDispatchesBothTransfersThroughTheExistential() async throws {
+        let base = EditScenarioServer()
+        let uid = PhotoUID(volumeID: "vol", nodeID: "related")
+        let file = directory.appendingPathComponent("unused.partial")
+        let remotes: [any ExactDuplicateRemote] = [
+            FavoritesGatedRemote(base: base), TrashStoppingRemote(base: base), RestoreGatedRemote(base: base),
+            TimelineDatesRemote(base: base, unknown: []), BeforeTrashRemote(base: base, before: {}),
+            DateReadCountingRemote(base: base), MemberDroppingRemote(base: base, drop: uid),
+        ]
+        for remote in remotes {
+            do {
+                _ = try await remote.downloadRelatedFile(uid, to: file, allowsExpensiveNetwork: false)
+                XCTFail("An unavailable download must fail")
+            } catch {
+                XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .unavailable)
+            }
+            do {
+                _ = try await remote.uploadRelatedFile(makeDuplicateRelatedFileRequest(fileURL: file))
+                XCTFail("An unavailable upload must fail")
+            } catch {
+                XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .unavailable)
+            }
+        }
+        XCTAssertEqual(base.relatedFileTransferCallCount, remotes.count * 2)
+        XCTAssertEqual(base.uploadRequestCount, 0)
+        XCTAssertEqual(base.steps.count, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
 
     // MARK: - Groups
 
@@ -3050,7 +3120,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
 /// Counts the reads of the manifest rows that name a remote link.
 /// Holds the favorites listing, the first read of the ranking, while its gate is closed.
-private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Sendable {
+private final class FavoritesGatedRemote: EditScenarioDuplicateRemote, @unchecked Sendable {
     let base: EditScenarioServer
     let gate = FinderGate()
 
@@ -3072,7 +3142,7 @@ private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Senda
 }
 
 /// Holds the merge after its trash moved the photos, like a process that ends there.
-private final class TrashStoppingRemote: ExactDuplicateRemote, @unchecked Sendable {
+private final class TrashStoppingRemote: EditScenarioDuplicateRemote, @unchecked Sendable {
     let base: EditScenarioServer
     let gate = FinderGate()
     /// A cancellation while the gate holds the trash fails its answer, as a cancelled request does.
@@ -3100,7 +3170,7 @@ private final class TrashStoppingRemote: ExactDuplicateRemote, @unchecked Sendab
 }
 
 /// Holds every restore before it reaches the server while its gate is closed, and counts the restores that arrived.
-private final class RestoreGatedRemote: ExactDuplicateRemote, @unchecked Sendable {
+private final class RestoreGatedRemote: EditScenarioDuplicateRemote, @unchecked Sendable {
     let base: EditScenarioServer
     let gate = FinderGate()
     private let lock = NSLock()
@@ -3136,7 +3206,7 @@ private final class EndFlag: @unchecked Sendable {
 }
 
 /// The server as one device reads it: its timeline does not know the capture dates of `unknown`.
-private struct TimelineDatesRemote: ExactDuplicateRemote {
+private struct TimelineDatesRemote: EditScenarioDuplicateRemote {
     let base: EditScenarioServer
     let unknown: Set<PhotoUID>
 
@@ -3155,7 +3225,7 @@ private struct TimelineDatesRemote: ExactDuplicateRemote {
 }
 
 /// Runs `before` right before each trash, for example the trash of another device.
-private struct BeforeTrashRemote: ExactDuplicateRemote {
+private struct BeforeTrashRemote: EditScenarioDuplicateRemote {
     let base: EditScenarioServer
     let before: @Sendable () async -> Void
 
@@ -3175,7 +3245,7 @@ private struct BeforeTrashRemote: ExactDuplicateRemote {
 }
 
 /// Records the photos whose dates the device is asked for.
-private final class DateReadCountingRemote: ExactDuplicateRemote, @unchecked Sendable {
+private final class DateReadCountingRemote: EditScenarioDuplicateRemote, @unchecked Sendable {
     let base: EditScenarioServer
     private let lock = NSLock()
     private var _asked: [Set<PhotoUID>] = []
@@ -3238,7 +3308,7 @@ private final class TrashedByDevice {
 }
 
 /// Leaves one photo out of every node read.
-private struct MemberDroppingRemote: ExactDuplicateRemote {
+private struct MemberDroppingRemote: EditScenarioDuplicateRemote {
     let base: EditScenarioServer
     let drop: PhotoUID
 

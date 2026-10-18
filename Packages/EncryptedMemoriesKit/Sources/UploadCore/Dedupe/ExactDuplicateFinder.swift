@@ -1,8 +1,17 @@
 import Foundation
 import PhotosCore
 
-/// Remote reads and the trash write of the duplicate merge. The backend implements it; tests use a fake.
+/// Remote reads, related-file transfers and the trash write of the duplicate merge.
 public protocol ExactDuplicateRemote: PhotoCarryOverRemote {
+    /// Downloads one related file into caller-owned staging and returns its source metadata. The caller owns cleanup.
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource
+    /// Uploads staged bytes as a related file of the kept main, with the supplied integrity digest.
+    /// The conformer reserves the network using `request.allowsExpensiveNetwork`.
+    /// The caller must set `allowsExpensiveNetwork` explicitly. The finder uses the Use Mobile Data setting,
+    /// never the request's default.
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID
     /// Moves the duplicates to the Proton trash on the path of the person's own trash, so Recently Deleted shows them.
     func trashDuplicates(_ uids: [PhotoUID]) async throws
     /// Restores photos that a merge moved to the trash, on the path of the person's own restore.
@@ -11,6 +20,25 @@ public protocol ExactDuplicateRemote: PhotoCarryOverRemote {
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date]
     /// The sharing state and the size of each photo, from one node read for each photo. A trash ends the sharing.
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts]
+}
+
+/// A remote that has no related-file transfer implementation must never report a successful copy.
+public enum ExactDuplicateRelatedFileTransferError: Error, Sendable, Equatable {
+    case unavailable
+}
+
+extension ExactDuplicateRemote {
+    /// Fails before any file or remote operation until the backend implements related-file downloads.
+    public func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
+
+    /// Fails before any file or remote operation until the backend implements related-file uploads.
+    public func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
 }
 
 /// What one node read tells about a photo.
