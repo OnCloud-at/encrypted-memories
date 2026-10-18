@@ -34,6 +34,12 @@ public actor UploadManager: UploadManaging {
         case failed(String)
     }
 
+    private enum DurableSettlementReplayStart {
+        case skipped
+        case storeUnavailable
+        case restored
+    }
+
     // MARK: Injected backends + config
 
     private let uploader: any PhotoUploading
@@ -148,7 +154,7 @@ public actor UploadManager: UploadManaging {
     public func enqueueFiles(_ urls: [URL], destination: UploadDestination) async -> [UploadQueueItemID] {
         guard !isShuttingDown else { return [] }
         let generation = lifecycleGeneration
-        await ensureDurableSettlementReplay()
+        ensureDurableSettlementReplay()
         guard lifecycleIsCurrent(generation) else { return [] }
         let settlementAvailable = settlementStore?.isOperational() ?? !requiresDurableSettlement
         guard settlementAvailable else {
@@ -281,7 +287,7 @@ public actor UploadManager: UploadManaging {
     public func enqueueFolder(_ url: URL, destination: UploadDestination) async throws -> [UploadQueueItemID] {
         guard !isShuttingDown else { return [] }
         let generation = lifecycleGeneration
-        await ensureDurableSettlementReplay()
+        ensureDurableSettlementReplay()
         guard lifecycleIsCurrent(generation) else { return [] }
 
         let settlementAvailable = settlementStore?.isOperational() ?? !requiresDurableSettlement
@@ -394,33 +400,21 @@ public actor UploadManager: UploadManaging {
 
     // MARK: - Durable manual settlement
 
-    /// Loads durable rows once per manager lifetime and schedules only the metadata/album replay
-    /// stages. This path never calls `PhotoUploading.upload`.
-    private func startDurableSettlementReplay() async {
-        guard !isShuttingDown, !settlementReplayStarted else { return }
-        settlementReplayStarted = true
-        guard let settlementStore else { return }
-        let records = settlementStore.allRecords()
-        guard settlementStore.isOperational() else {
+    /// Starts the replay before an enqueue and notifies after the start returned, so the notification
+    /// follows the restore and the scheduling. No `await` can separate them. No handler can receive
+    /// this notification today: both registrations assign their handler and start the replay in one
+    /// actor segment, so the replay has started whenever a handler exists. It advances the sequence number.
+    private func ensureDurableSettlementReplay() {
+        switch startDurableSettlementReplaySynchronouslyIfNeeded() {
+        case .skipped:
+            break
+        case .storeUnavailable:
             if requiresDurableSettlement {
                 notify()
             }
-            return
+        case .restored:
+            notify()
         }
-        for record in records {
-            restoreJobIfNeeded(for: record)
-        }
-        notify()
-        for record in records where record.isPending {
-            scheduleDurableSettlement(record, manifestAlreadyRecorded: false)
-        }
-    }
-
-    private func ensureDurableSettlementReplay() async {
-        if settlementReplayStarted {
-            return
-        }
-        await startDurableSettlementReplay()
     }
 
     private func restoreJobIfNeeded(for record: UploadManualSettlementRecord) {
@@ -1415,22 +1409,29 @@ public actor UploadManager: UploadManaging {
         guard !isShuttingDown else { return [] }
         if !settlementReplayStarted {
             // `snapshot` is async at the protocol boundary, but this actor method cannot await
-            // itself. The init task and enqueue path both start replay before normal UI polling.
+            // itself. The handler registrations, `notify()` and the enqueue functions start the replay
+            // too; a snapshot that comes first starts it here, without a notification.
             startDurableSettlementReplaySynchronouslyIfNeeded()
         }
         return order.compactMap { jobs[$0]?.item }
     }
 
-    private func startDurableSettlementReplaySynchronouslyIfNeeded() {
-        guard !isShuttingDown, !settlementReplayStarted else { return }
+    /// Loads durable rows once per manager lifetime and schedules only the metadata/album replay
+    /// stages. This path never calls `PhotoUploading.upload`. It never notifies and the caller decides
+    /// from the result. Four places start it: `snapshot()`, `notify()`, both handler registrations (they
+    /// notify after the start) and `ensureDurableSettlementReplay()`, the only one that uses the result.
+    @discardableResult
+    private func startDurableSettlementReplaySynchronouslyIfNeeded() -> DurableSettlementReplayStart {
+        guard !isShuttingDown, !settlementReplayStarted else { return .skipped }
         settlementReplayStarted = true
-        guard let settlementStore else { return }
+        guard let settlementStore else { return .skipped }
         let records = settlementStore.allRecords()
-        guard settlementStore.isOperational() else { return }
+        guard settlementStore.isOperational() else { return .storeUnavailable }
         for record in records { restoreJobIfNeeded(for: record) }
         for record in records where record.isPending {
             scheduleDurableSettlement(record, manifestAlreadyRecorded: false)
         }
+        return .restored
     }
 
     private func notify(includingShuttingDown: Bool = false) {
