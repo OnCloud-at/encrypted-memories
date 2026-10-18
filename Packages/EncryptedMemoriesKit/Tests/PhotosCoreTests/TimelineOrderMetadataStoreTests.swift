@@ -268,6 +268,68 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
         XCTAssertEqual(TimelineOrderMetadataStore.check(raw, recorder: recorder), .damaged)
     }
 
+    private func answering(_ failure: SQLiteFailure, volumeIsFull: Bool? = false) -> SQLiteFailureProbe {
+        SQLiteFailureProbe(failure: { _, _ in failure }, volumeIsFull: { _, _ in volumeIsFull })
+    }
+
+    /// A progress handler that stops the check ends it with `SQLITE_INTERRUPT`: an error, not a problem string.
+    func testAQuickCheckThatFailsOnAFullDiskCouldNotVerifyAndIsNoDamage() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        try filledCache(at: url, policy: noWaitPolicy)
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &raw), SQLITE_OK)
+        defer { sqlite3_close(raw) }
+        let recorder = SQLiteBusyRecorder(timeoutMs: 0)
+        recorder.install(on: raw)
+        sqlite3_progress_handler(raw, 1, { _ in 1 }, nil)
+
+        let fullDisk: [(String, SQLiteFailure, Bool?)] = [
+            ("SQLITE_FULL", SQLiteFailure(code: SQLITE_FULL, systemErrno: 0), false),
+            ("CANTOPEN on a full volume", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), true),
+        ]
+        for (name, failure, volumeIsFull) in fullDisk {
+            XCTAssertEqual(
+                TimelineOrderMetadataStore.check(
+                    raw, recorder: recorder, probe: answering(failure, volumeIsFull: volumeIsFull)),
+                .busy, "\(name): could not verify, no damage")
+        }
+        let notFullDisk: [(String, SQLiteFailure, Bool?)] = [
+            ("SQLITE_CORRUPT on a full volume", SQLiteFailure(code: SQLITE_CORRUPT, systemErrno: 0), true),
+            ("bare IOERR", SQLiteFailure(code: SQLITE_IOERR, systemErrno: 0), true),
+            ("CANTOPEN on a volume with room", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), false),
+            ("CANTOPEN on an unknown volume", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), nil),
+        ]
+        for (name, failure, volumeIsFull) in notFullDisk {
+            XCTAssertEqual(
+                TimelineOrderMetadataStore.check(
+                    raw, recorder: recorder, probe: answering(failure, volumeIsFull: volumeIsFull)),
+                .damaged, "\(name): the earlier meaning")
+        }
+        XCTAssertEqual(
+            TimelineOrderMetadataStore.check(raw, recorder: recorder), .damaged,
+            "the real failure (SQLITE_INTERRUPT) names no full disk: the earlier meaning")
+    }
+
+    func testAProblemStringIsDamageWhateverSQLiteSaysAboutTheDisk() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        try filledCache(at: url, policy: noWaitPolicy)
+        let handle = try FileHandle(forUpdating: url)
+        let size = try handle.seekToEnd()
+        try handle.seek(toOffset: 4_096)
+        try handle.write(contentsOf: Data(repeating: 0xFF, count: Int(size) - 4_096))
+        try handle.close()
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &raw), SQLITE_OK)
+        defer { sqlite3_close(raw) }
+        let recorder = SQLiteBusyRecorder(timeoutMs: 0)
+        recorder.install(on: raw)
+
+        XCTAssertEqual(
+            TimelineOrderMetadataStore.check(
+                raw, recorder: recorder, probe: answering(SQLiteFailure(code: SQLITE_FULL, systemErrno: ENOSPC))),
+            .damaged, "the check reads rows, so the answer about the disk does not apply")
+    }
+
     func testAWriteThatMeetsALockKeepsTheCacheAndItsRows() throws {
         let url = try directory().appendingPathComponent("order.sqlite")
         let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))

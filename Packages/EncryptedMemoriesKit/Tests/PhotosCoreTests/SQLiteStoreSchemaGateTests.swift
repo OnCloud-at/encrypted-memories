@@ -124,13 +124,14 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
     private func openMarkerStore(
         at url: URL, verifyVersion: ((OpaquePointer?) -> Bool)? = nil,
         copyItem: @escaping (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
-        createDirectory: ((URL) throws -> Void)? = nil
+        createDirectory: ((URL) throws -> Void)? = nil,
+        probe: SQLiteFailureProbe = .live
     ) -> SQLiteRebuildableStoreOutcome {
         SQLiteStoreSchemaGate.openRebuildableStoreOutcome(
             at: url, schemaSQL: markerSchema, policy: noWaitPolicy,
             verifyVersion: verifyVersion ?? markerVersionIsCurrent,
             stampVersion: { sqlite3_exec($0, "INSERT INTO marker VALUES (1);", nil, nil, nil) == SQLITE_OK },
-            copyItem: copyItem, createDirectory: createDirectory)
+            copyItem: copyItem, createDirectory: createDirectory, probe: probe)
     }
 
     private func marker(at url: URL) throws -> URL {
@@ -381,5 +382,220 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         XCTAssertTrue(
             isFailed(openMarkerStore(at: url, copyItem: { _, _ in throw denied })),
             "an unreadable file is not a full disk: the store may replace it")
+    }
+
+    // MARK: A full disk that SQLite reports itself
+
+    private typealias Answer = (name: String, failure: SQLiteFailure, volumeIsFull: Bool?)
+
+    /// What SQLite and the volume say when the disk is full. Each answer keeps the file. The last two answers are
+    /// what Apple SQLite 3.54.0 reported on an HFS+ volume filled to zero: `errno` was `ENOENT` or `ESRCH`.
+    private let fullDiskAnswers: [Answer] = [
+        ("SQLITE_FULL", SQLiteFailure(code: SQLITE_FULL, systemErrno: 0), false),
+        ("IOERR_WRITE with ENOSPC", SQLiteFailure(code: SQLITE_IOERR | (3 << 8), systemErrno: ENOSPC), false),
+        ("IOERR_SHMSIZE", SQLiteFailure(code: SQLiteFailure.shmSize, systemErrno: 0), false),
+        ("CANTOPEN with ENOSPC", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOSPC), false),
+        ("CANTOPEN on a full volume", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), true),
+        ("IOERR_SHMOPEN on a full volume", SQLiteFailure(code: SQLiteFailure.shmOpen, systemErrno: ESRCH), true),
+    ]
+
+    /// What leaves the earlier meaning of the file. A damaged file stays damaged, also on a full volume.
+    private let otherAnswers: [Answer] = [
+        ("SQLITE_CORRUPT on a full volume", SQLiteFailure(code: SQLITE_CORRUPT, systemErrno: ENOSPC), true),
+        ("SQLITE_NOTADB on a full volume", SQLiteFailure(code: SQLITE_NOTADB, systemErrno: ENOSPC), true),
+        ("IOERR_WRITE alone", SQLiteFailure(code: SQLITE_IOERR | (3 << 8), systemErrno: 0), false),
+        ("bare IOERR on a full volume", SQLiteFailure(code: SQLITE_IOERR, systemErrno: 0), true),
+        ("CANTOPEN on a volume with room", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), false),
+        ("CANTOPEN on an unknown volume", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), nil),
+        ("IOERR_SHMOPEN on a volume with room", SQLiteFailure(code: SQLiteFailure.shmOpen, systemErrno: ESRCH), false),
+    ]
+
+    /// Answers `answer` at `step`. Every other step reads the real connection and the real volume.
+    private func probe(at step: SQLiteCheckStep, _ answer: Answer) -> SQLiteFailureProbe {
+        SQLiteFailureProbe(
+            failure: { db, current in current == step ? answer.failure : SQLiteFailure(of: db) },
+            volumeIsFull: { url, current in
+                current == step ? answer.volumeIsFull : DeviceStorage.volumeHasNoFreeBlocks(at: url)
+            })
+    }
+
+    private func scratchDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
+    /// A marker store with a second row, so a replaced file shows by its row count.
+    private func markedStore(in directory: URL) throws -> URL {
+        let url = try marker(at: directory.appendingPathComponent("\(UUID().uuidString).sqlite"))
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "INSERT INTO marker VALUES (2);", nil, nil, nil), SQLITE_OK)
+        return url
+    }
+
+    private func markerRowCount(at url: URL) -> Int32 {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT count(*) FROM marker;", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        return sqlite3_column_int(statement, 0)
+    }
+
+    /// A version check that fails the way a SQLite call fails, so the probe sees a real failure on the connection.
+    private func failingVersionCheck(_ db: OpaquePointer?) -> Bool {
+        XCTAssertNotEqual(sqlite3_exec(db, "SELECT * FROM no_such_table;", nil, nil, nil), SQLITE_OK)
+        return false
+    }
+
+    private func closeIfOpened(_ outcome: SQLiteRebuildableStoreOutcome) -> Bool {
+        guard case .opened(let handle) = outcome else { return false }
+        sqlite3_close(handle)
+        return true
+    }
+
+    /// A file that SQLite cannot read as a database (`SQLITE_NOTADB`), so the gate falls back to the copy.
+    private func unreadableFile(in directory: URL) throws -> (url: URL, bytes: Data) {
+        let url = directory.appendingPathComponent("\(UUID().uuidString).sqlite")
+        let bytes = Data(repeating: 0xAB, count: 4_096)
+        try bytes.write(to: url)
+        return (url, bytes)
+    }
+
+    func testAFullDiskAnswerInTheInspectionOfAPopulatedFileKeepsIt() throws {
+        let directory = try scratchDirectory()
+        for answer in fullDiskAnswers {
+            let url = try markedStore(in: directory)
+            let outcome = openMarkerStore(
+                at: url, verifyVersion: { self.failingVersionCheck($0) }, probe: probe(at: .inspection, answer))
+            XCTAssertTrue(isRetryLater(outcome), "\(answer.name): retry later")
+            XCTAssertEqual(markerRowCount(at: url), 2, "\(answer.name): the file stays with its rows")
+        }
+        for answer in otherAnswers {
+            let url = try markedStore(in: directory)
+            let outcome = openMarkerStore(
+                at: url, verifyVersion: { self.failingVersionCheck($0) }, probe: probe(at: .inspection, answer))
+            XCTAssertTrue(closeIfOpened(outcome), "\(answer.name): another schema is replaced, as before")
+            XCTAssertEqual(markerRowCount(at: url), 1, "\(answer.name): the file is replaced")
+        }
+    }
+
+    func testAFullDiskAnswerInTheInspectionOfAnUnreadableFileKeepsItAndMakesNoCopy() throws {
+        let directory = try scratchDirectory()
+        for answer in fullDiskAnswers {
+            let file = try unreadableFile(in: directory)
+            var copies = 0
+            let outcome = openMarkerStore(
+                at: file.url,
+                copyItem: {
+                    copies += 1
+                    try FileManager.default.copyItem(at: $0, to: $1)
+                }, probe: probe(at: .inspection, answer))
+            XCTAssertTrue(isRetryLater(outcome), "\(answer.name): retry later")
+            XCTAssertEqual(copies, 0, "\(answer.name): a full disk needs no copy")
+            XCTAssertEqual(try Data(contentsOf: file.url), file.bytes, "\(answer.name): the file stays")
+        }
+        for answer in otherAnswers {
+            let file = try unreadableFile(in: directory)
+            var copies = 0
+            let outcome = openMarkerStore(
+                at: file.url,
+                copyItem: {
+                    copies += 1
+                    try FileManager.default.copyItem(at: $0, to: $1)
+                }, probe: probe(at: .inspection, answer))
+            XCTAssertTrue(isFailed(outcome), "\(answer.name): the earlier meaning")
+            XCTAssertEqual(copies, 1, "\(answer.name): the inspection goes on with the copy")
+        }
+    }
+
+    func testAFullDiskAnswerInTheInspectionOfTheCopyKeepsTheFile() throws {
+        let directory = try scratchDirectory()
+        for answer in fullDiskAnswers {
+            let file = try unreadableFile(in: directory)
+            let outcome = openMarkerStore(at: file.url, probe: probe(at: .copy, answer))
+            XCTAssertTrue(isRetryLater(outcome), "\(answer.name): retry later")
+            XCTAssertEqual(try Data(contentsOf: file.url), file.bytes, "\(answer.name): the file stays")
+        }
+        for answer in otherAnswers {
+            let file = try unreadableFile(in: directory)
+            let outcome = openMarkerStore(at: file.url, probe: probe(at: .copy, answer))
+            XCTAssertTrue(isFailed(outcome), "\(answer.name): the earlier meaning")
+        }
+    }
+
+    func testAFullDiskAnswerInTheVerificationKeepsTheFile() throws {
+        let directory = try scratchDirectory()
+        /// The first call is the read-only inspection, which finds the file current. The second call is the
+        /// read-write verification, which fails with a failed SQLite call.
+        func failingSecondCall(_ calls: inout Int, _ db: OpaquePointer?) -> Bool {
+            calls += 1
+            return calls == 1 ? markerVersionIsCurrent(db) : failingVersionCheck(db)
+        }
+        for answer in fullDiskAnswers {
+            let url = try markedStore(in: directory)
+            var calls = 0
+            let outcome = openMarkerStore(
+                at: url, verifyVersion: { failingSecondCall(&calls, $0) }, probe: probe(at: .verification, answer))
+            XCTAssertTrue(isRetryLater(outcome), "\(answer.name): retry later")
+            XCTAssertEqual(markerRowCount(at: url), 2, "\(answer.name): the file stays with its rows")
+        }
+        for answer in otherAnswers {
+            let url = try markedStore(in: directory)
+            var calls = 0
+            let outcome = openMarkerStore(
+                at: url, verifyVersion: { failingSecondCall(&calls, $0) }, probe: probe(at: .verification, answer))
+            XCTAssertTrue(closeIfOpened(outcome), "\(answer.name): another schema is replaced, as before")
+            XCTAssertEqual(markerRowCount(at: url), 1, "\(answer.name): the file is replaced")
+        }
+    }
+
+    func testAnAnswerAboutTheDiskIsNotAskedWhenNoSQLiteCallFailed() throws {
+        let directory = try scratchDirectory()
+        var calls = 0
+        let full = SQLiteFailure(code: SQLITE_FULL, systemErrno: 0)
+        // Another schema is no failed call: the inspection finds the version wrong and no call fails.
+        let populated = try markedStore(in: directory)
+        let inspected = openMarkerStore(
+            at: populated, verifyVersion: { _ in false }, probe: probe(at: .inspection, ("full", full, true)))
+        XCTAssertTrue(closeIfOpened(inspected), "another schema is replaced")
+        XCTAssertEqual(markerRowCount(at: populated), 1)
+        // The same in the read-write verification.
+        let verified = try markedStore(in: directory)
+        let outcome = openMarkerStore(
+            at: verified,
+            verifyVersion: {
+                calls += 1
+                return calls == 1 && self.markerVersionIsCurrent($0)
+            }, probe: probe(at: .verification, ("full", full, true)))
+        XCTAssertTrue(closeIfOpened(outcome), "another schema is replaced")
+        XCTAssertEqual(markerRowCount(at: verified), 1)
+    }
+
+    func testACantOpenAnswerKeepsTheFileOnlyWhenTheVolumeIsFull() throws {
+        let directory = try scratchDirectory()
+        let cantOpen = SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT)
+        for (volumeIsFull, kept) in [(true, true), (false, false), (nil, false)] as [(Bool?, Bool)] {
+            let url = try markedStore(in: directory)
+            var calls = 0
+            let outcome = openMarkerStore(
+                at: url,
+                verifyVersion: {
+                    calls += 1
+                    return calls == 1 ? self.markerVersionIsCurrent($0) : self.failingVersionCheck($0)
+                }, probe: probe(at: .verification, ("CANTOPEN", cantOpen, volumeIsFull)))
+            if kept {
+                XCTAssertTrue(isRetryLater(outcome), "a full volume keeps the file")
+                XCTAssertEqual(markerRowCount(at: url), 2)
+            } else {
+                XCTAssertTrue(closeIfOpened(outcome), "volume \(String(describing: volumeIsFull)): replaced")
+                XCTAssertEqual(markerRowCount(at: url), 1)
+            }
+        }
     }
 }
