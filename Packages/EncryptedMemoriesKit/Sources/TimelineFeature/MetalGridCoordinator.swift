@@ -2200,14 +2200,12 @@ extension MetalGridCoordinator {
         now: TimeInterval = CACurrentMediaTime()
     ) -> Bool {
         // Streaming policy is shared with the iOS host. This adapter supplies upload sizing, warm requests, and
-        // cache state. Overscan remains evictable while visible items are still missing.
-        let pinOverscan = visibleUIDs.allSatisfy { cache.isResident($0) || !dataSource.canRetryThumbnail(for: $0) }
+        // cache state.
         let uploadPixels = effectiveUploadPixels()
         let result = MetalGridFrameComposer.stream(
             cache: cache,
             visibleIDs: visibleUIDs,
             overscanIDs: overscanUIDs,
-            pinOverscan: pinOverscan,
             effectiveUploadPixels: uploadPixels,
             allowUpgrade: allowUpgrade,
             now: now,
