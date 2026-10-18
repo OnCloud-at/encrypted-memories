@@ -1142,6 +1142,42 @@ private final class ProgressBox: @unchecked Sendable {
 }
 
 @Suite struct AlbumSyncMappingStoreTests {
+    @Test(arguments: [false, true])
+    func openMappingDecodeFailureStaysStickyAfterRepair(readAllMappings: Bool) throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-mapping-failure-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)
+        let store = try #require(AlbumSyncMappingStore(url: url))
+        defer { store.close() }
+        let mapping = AlbumSyncMapping(
+            localAlbumID: "kept", remoteAlbumID: "remote", title: "Mapping",
+            createdAt: Date(timeIntervalSinceReferenceDate: 100))
+        #expect(store.upsert(mapping))
+        #expect(store.isOperational())
+
+        var handle: OpaquePointer?
+        try #require(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        let database = try #require(handle)
+        defer { sqlite3_close(database) }
+        #expect(
+            sqlite3_exec(
+                database, "UPDATE album_sync_mapping SET mode='invalid-mode' WHERE local_album_id='kept';",
+                nil, nil, nil) == SQLITE_OK)
+        if readAllMappings {
+            #expect(store.allMappings().isEmpty)
+        } else {
+            #expect(store.mapping(localAlbumID: "kept") == nil)
+        }
+        #expect(!store.isOperational())
+
+        #expect(store.upsert(mapping), "a later successful SQL predicate keeps its existing result")
+        #expect(store.mapping(localAlbumID: "kept") == mapping)
+        #expect(store.allMappings() == [mapping])
+        #expect(!store.isOperational(), "successful SQL must not reset the recorded failure")
+    }
+
     @Test func closeMakesReadsAndWritesFailClosed() {
         let store = makeStore()
         store.close()
