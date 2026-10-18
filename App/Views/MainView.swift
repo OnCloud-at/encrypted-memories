@@ -1857,26 +1857,21 @@ struct MainView: View {
         isEmptyingTrash = true
         Task {
             defer { isEmptyingTrash = false }
-            // Photos deleted before upload only leave the list; they stay excluded and stay in Apple Photos.
-            if !pending.isEmpty, await model.pendingGrid?.removeFromTrashList(pending) != true {
-                trashActionFailureMessage = L10n.string("trash.empty_failed_message")
-                return
-            }
-            guard !uids.isEmpty else {
-                selectedUIDs = []
-                selectionMode = false
-                return
-            }
             do {
-                try await RecentlyDeletedEmptying.empty(
-                    backend, checkingMergesWith: facade.exactDuplicates,
-                    accountDataDirectory: facade.accountDataDirectory)
-                timelineModel.commitEmptyTrash(uids)
+                // Photos deleted before upload only leave the list; they stay excluded and stay in Apple Photos.
+                try await TrashEmptying.empty(
+                    backend, pendingUIDs: pending,
+                    removePending: { await model.pendingGrid?.removeFromTrashList($0) == true },
+                    includesProtonTrash: !uids.isEmpty, checkingMergesWith: facade.exactDuplicates,
+                    accountDataDirectory: facade.accountDataDirectory,
+                    commit: { timelineModel.commitEmptyTrash(uids) },
+                    recoverFromTrashFailure: { error in
+                        DebugLog.log("empty-trash: FAILED n=\(uids.count) - \(error)")
+                        await timelineModel.retry()
+                    })
                 selectedUIDs = []
                 selectionMode = false
             } catch {
-                DebugLog.log("empty-trash: FAILED n=\(uids.count) - \(error)")
-                await timelineModel.retry()
                 trashActionFailureMessage = L10n.string("trash.empty_failed_message")
             }
         }
