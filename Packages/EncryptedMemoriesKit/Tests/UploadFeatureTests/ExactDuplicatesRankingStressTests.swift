@@ -123,6 +123,16 @@ private struct StressRankingRemote: ExactDuplicateRemote {
     let native: StressNativeNodeReads
     let admission = JoinedShutdownGate()
 
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        XCTFail("Ranking must not download a related file")
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        XCTFail("Ranking must not upload a related file")
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
     func trashDuplicates(_ uids: [PhotoUID]) async throws {}
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {}
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { [:] }

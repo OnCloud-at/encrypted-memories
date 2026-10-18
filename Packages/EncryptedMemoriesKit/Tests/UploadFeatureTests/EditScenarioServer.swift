@@ -66,6 +66,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var history: [Step] = []
     private var nextID = 1
     private var uploadRequests = 0
+    private var relatedFileTransferCalls = 0
     private var contentLookupError: Error?
     private var contentLookupRows: [RemotePhotoDuplicate]?
     private var contentQueries = 0
@@ -101,6 +102,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     var links: [Link] { lock.withLock { orderedLinks() } }
     var uploadRequestCount: Int { lock.withLock { uploadRequests } }
+    var relatedFileTransferCallCount: Int { lock.withLock { relatedFileTransferCalls } }
 
     func setContentLookupError(_ error: Error?) { lock.withLock { contentLookupError = error } }
     func setContentLookupRows(_ rows: [RemotePhotoDuplicate]) { lock.withLock { contentLookupRows = rows } }
@@ -814,7 +816,36 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 }
 
+/// Forwards transfer attempts through the same server that owns the merge's other reads and writes.
+protocol EditScenarioDuplicateRemote: ExactDuplicateRemote {
+    var base: EditScenarioServer { get }
+}
+
+extension EditScenarioDuplicateRemote {
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        try await base.downloadRelatedFile(uid, to: destination, allowsExpensiveNetwork: allowsExpensiveNetwork)
+    }
+
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        try await base.uploadRelatedFile(request)
+    }
+}
+
 extension EditScenarioServer: ExactDuplicateRemote {
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        lock.withLock { relatedFileTransferCalls += 1 }
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
+
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        lock.withLock { relatedFileTransferCalls += 1 }
+        throw ExactDuplicateRelatedFileTransferError.unavailable
+    }
+
     /// The person's trash: only main photos, and a related file never leaves without an active copy elsewhere.
     func trashDuplicates(_ uids: [PhotoUID]) async throws {
         try lock.withLock {
