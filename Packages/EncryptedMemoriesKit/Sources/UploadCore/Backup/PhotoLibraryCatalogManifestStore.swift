@@ -18,9 +18,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private static let reconciledMissingSourceGenerationKey = "reconciled_missing_source_generation"
     private static let missingSourceSweepGenerationKey = "missing_source_sweep_generation"
     private static let missingSourceSweepResumePointKey = "missing_source_sweep_resume_point"
-    private var db: OpaquePointer?
-    private var operationFailed = false
-    private let lock = NSLock()
+    private let connection: SQLiteStoreConnection
+    private var db: OpaquePointer? { connection.database }
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
@@ -28,49 +27,27 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
         SQLiteStoreSchemaGate.enableFullSyncCheckpoints(handle)
-        db = handle
+        connection = SQLiteStoreConnection(database: handle)
     }
 
     deinit { close() }
 
-    public func isOperational() -> Bool {
-        lock.withLock {
-            guard db != nil, !operationFailed else { return false }
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT 1;", -1, &stmt, nil) == SQLITE_OK else {
-                operationFailed = true
-                return false
-            }
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_step(stmt) == SQLITE_ROW else {
-                operationFailed = true
-                return false
-            }
-            return true
-        }
-    }
+    public func isOperational() -> Bool { connection.isOperational() }
 
-    public func close() {
-        lock.withLock {
-            guard db != nil else { return }
-            sqlite3_exec(db, "PRAGMA optimize;", nil, nil, nil)
-            sqlite3_close(db)
-            db = nil
-        }
-    }
+    public func close() { connection.close() }
 
     public func entry(for localIdentifier: String) -> PhotoLibraryCatalogEntry? {
-        lock.withLock { readEntry(localIdentifier) }
+        connection.withLock { readEntry(localIdentifier) }
     }
 
     /// Present (not removed) entries for many identifiers with one prepared statement. Missing or removed
     /// identifiers are absent from the result.
     public func presentEntries(for localIdentifiers: [String]) -> [String: PhotoLibraryCatalogEntry] {
         guard !localIdentifiers.isEmpty else { return [:] }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -91,7 +68,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 bindText(stmt, 1, identifier)
                 let step = sqlite3_step(stmt)
                 if step == SQLITE_DONE { continue }
-                guard requireOperational(step == SQLITE_ROW),
+                guard connection.requireOperational(step == SQLITE_ROW),
                     let entry = decodeEntry(stmt, localIdentifier: identifier, valueOffset: 0)
                 else { return [:] }
                 result[identifier] = entry
@@ -104,10 +81,10 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         let clampedLimit = max(1, limit)
         // The primary-key range keeps pages bounded; the removal index would sort the remaining library per page.
         let frontier = afterLocalIdentifier == nil ? "" : " AND local_id>?"
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -128,13 +105,13 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
                 guard let entry = decodeEntry(stmt, localIdentifierColumn: 0, valueOffset: 1) else {
-                    operationFailed = true
+                    connection.markFailed()
                     return []
                 }
                 entries.append(entry)
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return [] }
             return entries
         }
     }
@@ -145,19 +122,20 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     public func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] {
         guard !entries.isEmpty else { return [] }
-        return lock.withLock { classifyBatchLocked(entries) }
+        return connection.withLock { classifyBatchLocked(entries) }
     }
 
     @discardableResult
     public func upsert(_ entry: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange {
-        lock.withLock {
+        connection.withLock {
             let change = classifyBatchLocked([entry]).first ?? .changed
             var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK)
+            else {
                 return change
             }
             defer { sqlite3_finalize(stmt) }
-            _ = requireOperational(persist(entry, using: stmt))
+            _ = connection.requireOperational(persist(entry, using: stmt))
             return change
         }
     }
@@ -165,26 +143,27 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     @discardableResult
     public func upsertBatch(_ entries: [PhotoLibraryCatalogEntry]) -> Bool {
         guard !entries.isEmpty else { return true }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK)
+            else {
                 return false
             }
             defer { sqlite3_finalize(stmt) }
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             var didPersist = true
             for entry in entries {
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
-                guard requireOperational(persist(entry, using: stmt)) else {
+                guard connection.requireOperational(persist(entry, using: stmt)) else {
                     didPersist = false
                     break
                 }
             }
             guard didPersist,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -202,10 +181,10 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         guard !present.isEmpty else {
             return PhotoLibraryCatalogMutationResult(affectedRows: 0, succeeded: true)
         }
-        return lock.withLock {
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -218,7 +197,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 return PhotoLibraryCatalogMutationResult(affectedRows: 0, succeeded: false)
             }
             defer { sqlite3_finalize(stmt) }
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return PhotoLibraryCatalogMutationResult(affectedRows: 0, succeeded: false)
             }
             var changed = 0
@@ -227,13 +206,13 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 sqlite3_clear_bindings(stmt)
                 sqlite3_bind_double(stmt, 1, removedAt.timeIntervalSince1970)
                 bindText(stmt, 2, id)
-                guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
+                guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                     return PhotoLibraryCatalogMutationResult(affectedRows: 0, succeeded: false)
                 }
                 changed += Int(sqlite3_changes(db))
             }
-            guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return PhotoLibraryCatalogMutationResult(affectedRows: 0, succeeded: false)
             }
@@ -246,10 +225,10 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         notSeenAfter cutoff: Date,
         removedAt: Date
     ) -> PhotoLibraryCatalogMutationResult {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         """
@@ -264,7 +243,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_double(stmt, 1, removedAt.timeIntervalSince1970)
             sqlite3_bind_double(stmt, 2, cutoff.timeIntervalSince1970)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
                 return PhotoLibraryCatalogMutationResult(affectedRows: 0, succeeded: false)
             }
             return PhotoLibraryCatalogMutationResult(
@@ -275,10 +254,10 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     }
 
     public func snapshot() -> PhotoLibraryCatalogSnapshot {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "SELECT is_removed, COUNT(*) FROM photo_catalog GROUP BY is_removed;",
@@ -295,21 +274,21 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 if removed { snapshot.removed += count } else { snapshot.present += count }
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return PhotoLibraryCatalogSnapshot() }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return PhotoLibraryCatalogSnapshot() }
             return snapshot
         }
     }
 
     public func count() -> Int {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM photo_catalog;", -1, &stmt, nil) == SQLITE_OK
                 )
             else { return 0 }
             defer { sqlite3_finalize(stmt) }
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_ROW) else { return 0 }
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_ROW) else { return 0 }
             return Int(sqlite3_column_int(stmt, 0))
         }
     }
@@ -318,40 +297,40 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     /// persistent-change token can exist before our own catalog is complete; this marker prevents
     /// the first real backup pass from mistaking "changed since token" for "entire library known".
     public func hasCompletedFullScan() -> Bool {
-        lock.withLock { readInfoValue(Self.completedFullScanKey) == 1 }
+        connection.withLock { readInfoValue(Self.completedFullScanKey) == 1 }
     }
 
     /// Stores the owed scan in the completion marker itself (value 0). An earlier build that reads the marker then
     /// also runs the full scan, and a store without the key keeps its meaning.
     @discardableResult
     public func markFullScanOwed() -> Bool {
-        lock.withLock { writeInfoValue(Self.completedFullScanKey, 0) }
+        connection.withLock { writeInfoValue(Self.completedFullScanKey, 0) }
     }
 
     /// A full checkpoint moves every committed transaction from the WAL into the database file and syncs that file;
     /// `checkpoint_fullfsync`, set when the store opens, makes the sync an `F_FULLFSYNC`. A busy or partial checkpoint
     /// returns false.
     public func synchronizeToDisk() -> Bool {
-        lock.withLock {
-            SQLiteStoreSchemaGate.synchronizeToDisk(db, operationFailed: operationFailed)
+        connection.withLock {
+            SQLiteStoreSchemaGate.synchronizeToDisk(db, operationFailed: connection.operationFailed)
         }
     }
 
     public func hasReconciledLateRenders() -> Bool {
-        lock.withLock { readInfoValue(Self.reconciledLateRendersKey) == 1 }
+        connection.withLock { readInfoValue(Self.reconciledLateRendersKey) == 1 }
     }
 
     @discardableResult
     public func markLateRendersReconciled() -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             let didWrite =
                 writeInfoValue(Self.reconciledLateRendersKey, 1)
                 && deleteInfoValue(Self.lateRenderSweepResumePointKey)
             guard didWrite,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -361,20 +340,20 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     }
 
     public func lateRenderSweepResumePoint() -> String? {
-        lock.withLock { readInfoText(Self.lateRenderSweepResumePointKey) }
+        connection.withLock { readInfoText(Self.lateRenderSweepResumePointKey) }
     }
 
     @discardableResult
     public func recordLateRenderSweepResumePoint(_ localIdentifier: String) -> Bool {
-        lock.withLock { writeInfoText(Self.lateRenderSweepResumePointKey, localIdentifier) }
+        connection.withLock { writeInfoText(Self.lateRenderSweepResumePointKey, localIdentifier) }
     }
 
     public func reconciledMissingSourceGeneration() -> Int64? {
-        lock.withLock { readInfoValue64(Self.reconciledMissingSourceGenerationKey) }
+        connection.withLock { readInfoValue64(Self.reconciledMissingSourceGenerationKey) }
     }
 
     public func missingSourceSweepProgress() -> PhotoLibraryMissingSourceSweepProgress? {
-        lock.withLock {
+        connection.withLock {
             guard let generation = readInfoValue64(Self.missingSourceSweepGenerationKey) else { return nil }
             return PhotoLibraryMissingSourceSweepProgress(
                 generation: generation, afterLocalIdentifier: readInfoText(Self.missingSourceSweepResumePointKey))
@@ -382,8 +361,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     }
 
     public func recordMissingSourceSweepProgress(_ progress: PhotoLibraryMissingSourceSweepProgress) -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             let cursorSaved: Bool
@@ -393,7 +372,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 cursorSaved = deleteInfoValue(Self.missingSourceSweepResumePointKey)
             }
             guard cursorSaved, writeInfoValue64(Self.missingSourceSweepGenerationKey, progress.generation),
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -403,14 +382,14 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     }
 
     public func completeMissingSourceSweep(generation: Int64) -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             guard writeInfoValue64(Self.reconciledMissingSourceGenerationKey, generation),
                 deleteInfoValue(Self.missingSourceSweepGenerationKey),
                 deleteInfoValue(Self.missingSourceSweepResumePointKey),
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -420,7 +399,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     }
 
     public func fullScanProgress() -> PhotoLibraryFullScanProgress? {
-        lock.withLock {
+        connection.withLock {
             guard readInfoValue(Self.fullScanSnapshotReadyKey) == 1,
                 let bits = readInfoValue64(Self.fullScanEpochStartKey)
             else { return nil }
@@ -432,8 +411,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     @discardableResult
     public func recordFullScanProgress(_ progress: PhotoLibraryFullScanProgress) -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             let didWrite =
@@ -442,7 +421,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                     Int64(bitPattern: progress.epochStart.timeIntervalSince1970.bitPattern)
                 ) && writeInfoValue64(Self.fullScanCursorKey, Int64(progress.cursor))
             guard didWrite,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -455,8 +434,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     /// when a scan actually reaches the end of the library (across however many resumed runs).
     @discardableResult
     public func completeFullScan() -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             let didWrite =
@@ -464,11 +443,11 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 && deleteInfoValue(Self.fullScanEpochStartKey)
                 && deleteInfoValue(Self.fullScanCursorKey)
                 && deleteInfoValue(Self.fullScanSnapshotReadyKey)
-                && requireOperational(
+                && connection.requireOperational(
                     sqlite3_exec(db, "DELETE FROM photo_full_scan_snapshot;", nil, nil, nil) == SQLITE_OK
                 )
             guard didWrite,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -479,19 +458,19 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     @discardableResult
     public func clearFullScanResumePoint() -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             let didWrite =
                 deleteInfoValue(Self.fullScanEpochStartKey)
                 && deleteInfoValue(Self.fullScanCursorKey)
                 && deleteInfoValue(Self.fullScanSnapshotReadyKey)
-                && requireOperational(
+                && connection.requireOperational(
                     sqlite3_exec(db, "DELETE FROM photo_full_scan_snapshot;", nil, nil, nil) == SQLITE_OK
                 )
             guard didWrite,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -502,12 +481,12 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     @discardableResult
     public func beginFullScanSnapshot(epochStart: Date) -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             let didWrite =
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_exec(db, "DELETE FROM photo_full_scan_snapshot;", nil, nil, nil) == SQLITE_OK
                 )
                 && writeInfoValue64(
@@ -517,7 +496,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 && writeInfoValue64(Self.fullScanCursorKey, 0)
                 && writeInfoValue(Self.fullScanSnapshotReadyKey, 0)
             guard didWrite,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -531,12 +510,12 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         let present = identifiers.filter { !$0.isEmpty }
         guard present.count == identifiers.count else { return false }
         guard !present.isEmpty else { return true }
-        return lock.withLock {
+        return connection.withLock {
             var nextPosition = fullScanSnapshotCountLocked()
-            guard !operationFailed else { return false }
+            guard !connection.operationFailed else { return false }
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "INSERT INTO photo_full_scan_snapshot(position, local_id) VALUES(?, ?);",
@@ -544,7 +523,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                     ) == SQLITE_OK)
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             var didWrite = true
@@ -553,14 +532,14 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 sqlite3_clear_bindings(stmt)
                 sqlite3_bind_int64(stmt, 1, Int64(nextPosition))
                 bindText(stmt, 2, identifier)
-                guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
+                guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
                     didWrite = false
                     break
                 }
                 nextPosition += 1
             }
             guard didWrite,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -571,15 +550,15 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     @discardableResult
     public func finishFullScanSnapshot() -> Bool {
-        lock.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+        connection.withLock {
+            guard connection.requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return false
             }
             let didWrite =
                 writeInfoValue64(Self.fullScanCursorKey, 0)
                 && writeInfoValue(Self.fullScanSnapshotReadyKey, 1)
             guard didWrite,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                connection.requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
             else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
@@ -589,10 +568,10 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     }
 
     public func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String] {
-        lock.withLock {
+        connection.withLock {
             var stmt: OpaquePointer?
             guard
-                requireOperational(
+                connection.requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "SELECT local_id FROM photo_full_scan_snapshot WHERE position>=? ORDER BY position LIMIT ?;",
@@ -607,41 +586,41 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
                 guard let identifier = columnText(stmt, 0) else {
-                    operationFailed = true
+                    connection.markFailed()
                     return []
                 }
                 identifiers.append(identifier)
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return [] }
             return identifiers
         }
     }
 
     public func fullScanSnapshotCount() -> Int {
-        lock.withLock { fullScanSnapshotCountLocked() }
+        connection.withLock { fullScanSnapshotCountLocked() }
     }
 
     private func fullScanSnapshotCountLocked() -> Int {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM photo_full_scan_snapshot;", -1, &stmt, nil) == SQLITE_OK
             )
         else {
             return 0
         }
         defer { sqlite3_finalize(stmt) }
-        guard requireOperational(sqlite3_step(stmt) == SQLITE_ROW) else { return 0 }
+        guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_ROW) else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    // MARK: - Read/write helpers (must be called under `lock`)
+    // MARK: - Read/write helpers (must be called inside `connection.withLock`)
 
     private func classifyBatchLocked(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(
                     db,
                     "SELECT content_fingerprint, metadata_revision, is_removed FROM photo_catalog WHERE local_id=?;",
@@ -659,7 +638,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             let result = sqlite3_step(stmt)
             if result == SQLITE_DONE { return .inserted }
             guard result == SQLITE_ROW else {
-                operationFailed = true
+                connection.markFailed()
                 return .changed
             }
             if sqlite3_column_int(stmt, 2) != 0 { return .changed }
@@ -719,7 +698,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func readEntry(_ localIdentifier: String) -> PhotoLibraryCatalogEntry? {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(
                     db,
                     """
@@ -735,7 +714,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         bindText(stmt, 1, localIdentifier)
         let result = sqlite3_step(stmt)
         if result == SQLITE_DONE { return nil }
-        guard requireOperational(result == SQLITE_ROW) else { return nil }
+        guard connection.requireOperational(result == SQLITE_ROW) else { return nil }
 
         return decodeEntry(stmt, localIdentifier: localIdentifier, valueOffset: 0)
     }
@@ -756,7 +735,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             let mediaKindRaw = columnText(stmt, valueOffset + 6),
             let mediaKind = PhotoLibraryCatalogMediaKind(rawValue: mediaKindRaw)
         else {
-            operationFailed = true
+            connection.markFailed()
             return nil
         }
         return PhotoLibraryCatalogEntry(
@@ -783,7 +762,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func readInfoValue(_ key: String) -> Int? {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(db, "SELECT value FROM photo_catalog_info WHERE key=?;", -1, &stmt, nil) == SQLITE_OK
             )
         else {
@@ -793,7 +772,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         bindText(stmt, 1, key)
         let result = sqlite3_step(stmt)
         if result == SQLITE_DONE { return nil }
-        guard requireOperational(result == SQLITE_ROW) else { return nil }
+        guard connection.requireOperational(result == SQLITE_ROW) else { return nil }
         return Int(sqlite3_column_int(stmt, 0))
     }
 
@@ -801,7 +780,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func writeInfoValue(_ key: String, _ value: Int) -> Bool {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(
                     db,
                     "INSERT INTO photo_catalog_info(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
@@ -811,7 +790,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, key)
         sqlite3_bind_int(stmt, 2, Int32(value))
-        return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+        return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
     }
 
     // 64-bit info values (the `value` column is INTEGER = 64-bit in SQLite). Used for the resumable
@@ -819,7 +798,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func readInfoValue64(_ key: String) -> Int64? {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(db, "SELECT value FROM photo_catalog_info WHERE key=?;", -1, &stmt, nil) == SQLITE_OK
             )
         else {
@@ -829,7 +808,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         bindText(stmt, 1, key)
         let result = sqlite3_step(stmt)
         if result == SQLITE_DONE { return nil }
-        guard requireOperational(result == SQLITE_ROW) else { return nil }
+        guard connection.requireOperational(result == SQLITE_ROW) else { return nil }
         return sqlite3_column_int64(stmt, 0)
     }
 
@@ -837,7 +816,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func writeInfoValue64(_ key: String, _ value: Int64) -> Bool {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(
                     db,
                     "INSERT INTO photo_catalog_info(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
@@ -847,7 +826,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, key)
         sqlite3_bind_int64(stmt, 2, value)
-        return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+        return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
     }
 
     // Text info values are bound as a BLOB: the `value` column has INTEGER affinity, which would turn a numeric text
@@ -855,7 +834,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func readInfoText(_ key: String) -> String? {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(db, "SELECT value FROM photo_catalog_info WHERE key=?;", -1, &stmt, nil) == SQLITE_OK
             )
         else {
@@ -865,7 +844,9 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         bindText(stmt, 1, key)
         let result = sqlite3_step(stmt)
         if result == SQLITE_DONE { return nil }
-        guard requireOperational(result == SQLITE_ROW), sqlite3_column_type(stmt, 0) == SQLITE_BLOB else { return nil }
+        guard connection.requireOperational(result == SQLITE_ROW), sqlite3_column_type(stmt, 0) == SQLITE_BLOB else {
+            return nil
+        }
         let count = Int(sqlite3_column_bytes(stmt, 0))
         guard count > 0, let bytes = sqlite3_column_blob(stmt, 0) else { return nil }
         return String(bytes: Data(bytes: bytes, count: count), encoding: .utf8)
@@ -875,7 +856,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func writeInfoText(_ key: String, _ value: String) -> Bool {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(
                     db,
                     "INSERT INTO photo_catalog_info(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
@@ -888,20 +869,20 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         bytes.withUnsafeBytes { buffer in
             _ = sqlite3_bind_blob(stmt, 2, buffer.baseAddress, Int32(buffer.count), transient)
         }
-        return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+        return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
     }
 
     @discardableResult
     private func deleteInfoValue(_ key: String) -> Bool {
         var stmt: OpaquePointer?
         guard
-            requireOperational(
+            connection.requireOperational(
                 sqlite3_prepare_v2(db, "DELETE FROM photo_catalog_info WHERE key=?;", -1, &stmt, nil) == SQLITE_OK
             )
         else { return false }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, key)
-        return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+        return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
     }
 
     // MARK: - Open / schema (mirrors the other backup stores)
@@ -1005,11 +986,5 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private func columnDate(_ stmt: OpaquePointer?, _ index: Int32) -> Date? {
         guard sqlite3_column_type(stmt, index) != SQLITE_NULL else { return nil }
         return Date(timeIntervalSince1970: sqlite3_column_double(stmt, index))
-    }
-
-    @discardableResult
-    private func requireOperational(_ condition: Bool) -> Bool {
-        if !condition { operationFailed = true }
-        return condition
     }
 }

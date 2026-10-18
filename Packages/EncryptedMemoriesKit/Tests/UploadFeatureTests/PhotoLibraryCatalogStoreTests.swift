@@ -450,6 +450,136 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertEqual(store.fullScanProgress()?.cursor, 0, "the stable frontier must not pass unqueued work")
     }
 
+    func testOpenCatalogDecodeFailureStaysStickyAcrossSuccessfulSQLAndRejectsDurabilityAndAppend() throws {
+        let store = try makeStore()
+        defer { store.close() }
+        XCTAssertTrue(store.upsertBatch([entry(from: photoInfo(id: "corrupt"), at: 100)]))
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["kept"]))
+        XCTAssertTrue(store.isOperational())
+        XCTAssertTrue(store.synchronizeToDisk())
+
+        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        do {
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+            let database = try XCTUnwrap(handle)
+            defer { sqlite3_close(database) }
+            XCTAssertEqual(
+                sqlite3_exec(
+                    database, "UPDATE photo_catalog SET resources_json=X'7B' WHERE local_id='corrupt';",
+                    nil, nil, nil), SQLITE_OK)
+        }
+
+        XCTAssertNil(store.entry(for: "corrupt"), "a malformed resource blob must fail decoding on the open store")
+        XCTAssertFalse(store.isOperational())
+        XCTAssertFalse(store.synchronizeToDisk(), "an open handle with a recorded failure cannot prove durability")
+        XCTAssertFalse(store.appendFullScanSnapshotIdentifiers(["rejected"]))
+        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept"])
+
+        let later = entry(from: photoInfo(id: "later"), at: 200)
+        XCTAssertTrue(store.upsertBatch([later]), "successful SQL predicates retain their existing result")
+        XCTAssertEqual(store.entry(for: "later"), later, "the handle remains open and can execute SQL")
+        XCTAssertFalse(store.isOperational(), "successful SQL must not reset the recorded failure")
+        XCTAssertFalse(store.synchronizeToDisk())
+    }
+
+    func testSnapshotAppendRejectsEmptyIdentifiersWithoutAppendingOrRecordingFailure() throws {
+        let store = try makeStore()
+        defer { store.close() }
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["kept"]))
+
+        for identifiers in [[""], ["candidate", ""]] {
+            XCTAssertFalse(store.appendFullScanSnapshotIdentifiers(identifiers))
+            XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept"])
+            XCTAssertTrue(store.isOperational(), "invalid input is rejected before SQL without recording failure")
+            XCTAssertTrue(store.synchronizeToDisk())
+        }
+
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["later"]))
+        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept", "later"])
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testEmptyClassifyBatchReturnsEmptyOnOpenAndClosedStore() throws {
+        try assertEmptyBatchPreservesCallerState { $0.classifyBatch([]).isEmpty }
+    }
+
+    func testEmptyPresentEntriesReturnsEmptyOnOpenAndClosedStore() throws {
+        try assertEmptyBatchPreservesCallerState { $0.presentEntries(for: []).isEmpty }
+    }
+
+    func testEmptyUpsertBatchStillSucceedsAfterCloseWithoutChangingCallerState() throws {
+        try assertEmptyBatchPreservesCallerState { $0.upsertBatch([]) }
+    }
+
+    func testEmptyMarkRemovedStillSucceedsAfterCloseWithoutChangingCallerState() throws {
+        try assertEmptyBatchPreservesCallerState { store in
+            let result = store.markRemoved([], removedAt: Date(timeIntervalSince1970: 100))
+            XCTAssertEqual(result.affectedRows, 0)
+            let filtered = store.markRemoved(["", ""], removedAt: Date(timeIntervalSince1970: 100))
+            XCTAssertTrue(filtered.succeeded)
+            XCTAssertEqual(filtered.affectedRows, 0)
+            return result.succeeded
+        }
+    }
+
+    func testEmptySnapshotAppendStillSucceedsAfterCloseWithoutChangingCallerState() throws {
+        try assertEmptyBatchPreservesCallerState { $0.appendFullScanSnapshotIdentifiers([]) }
+    }
+
+    private func assertEmptyBatchPreservesCallerState(
+        _ operation: (PhotoLibraryCatalogManifestStore) -> Bool
+    ) throws {
+        for closed in [false, true] {
+            let url = tempDir.appendingPathComponent("\(UUID().uuidString).sqlite")
+            let store = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
+            defer { store.close() }
+            let original = entry(from: photoInfo(id: "kept"), at: 100)
+            XCTAssertTrue(store.upsertBatch([original]))
+            if closed { store.close() }
+            let wasOperational = store.isOperational()
+            XCTAssertEqual(wasOperational, !closed)
+
+            XCTAssertTrue(operation(store), "an empty batch still succeeds on a closed store")
+            XCTAssertEqual(store.isOperational(), wasOperational, "a no-op must preserve operational state")
+            XCTAssertTrue(store.classifyBatch([]).isEmpty)
+            XCTAssertTrue(store.presentEntries(for: []).isEmpty)
+            XCTAssertEqual(store.isOperational(), wasOperational)
+            XCTAssertEqual(store.entry(for: "kept"), closed ? nil : original)
+            let later = entry(from: photoInfo(id: "later"), at: 200)
+            XCTAssertEqual(store.upsertBatch([later]), !closed, "a following real write keeps its normal result")
+            XCTAssertEqual(store.isOperational(), wasOperational)
+            store.close()
+
+            let reopened = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
+            defer { reopened.close() }
+            XCTAssertEqual(reopened.entry(for: "kept"), original)
+            XCTAssertEqual(reopened.entry(for: "later"), closed ? nil : later)
+            XCTAssertTrue(reopened.isOperational())
+        }
+    }
+
+    func testCloseRejectsReadsAndWritesAndPreservesPersistedRows() throws {
+        let store = try makeStore()
+        let original = entry(from: photoInfo(id: "kept"), at: 100)
+        XCTAssertEqual(store.upsert(original), .inserted)
+        store.close()
+
+        XCTAssertFalse(store.isOperational())
+        XCTAssertNil(store.entry(for: "kept"))
+        XCTAssertFalse(store.upsertBatch([entry(from: photoInfo(id: "rejected"), at: 200)]))
+        XCTAssertFalse(store.synchronizeToDisk())
+        store.close()
+
+        let reopened = try makeStore()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.entry(for: "kept"), original)
+        XCTAssertNil(reopened.entry(for: "rejected"))
+        XCTAssertTrue(reopened.isOperational())
+    }
+
     func testUnavailableCatalogCannotMasqueradeAsAnEmptyCompletedScan() async throws {
         let store = try makeStore()
         store.close()
