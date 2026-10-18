@@ -165,24 +165,9 @@ public actor UploadManager: UploadManaging {
             notify()
             return ids
         }
-        let resolutionID = UUID()
-        let resolution = Task { [albums] in
-            do {
-                guard destination.usesAlbum else { return AlbumResolutionOutcome.resolved(nil) }
-                guard let albums else {
-                    return .failed(
-                        UploadError.albumStep("no album backend is wired").errorDescription
-                            ?? "Album backend unavailable.")
-                }
-                return .resolved(try await albums.resolveAlbum(for: destination.target))
-            } catch {
-                return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-            }
+        guard let resolutionResult = await resolveAlbum(for: destination, generation: generation) else {
+            return []
         }
-        albumResolutionTasks[resolutionID] = resolution
-        let resolutionResult = await resolution.value
-        albumResolutionTasks[resolutionID] = nil
-        guard lifecycleIsCurrent(generation) else { return [] }
 
         let resolvedAlbumID: String?
         switch resolutionResult {
@@ -223,6 +208,33 @@ public actor UploadManager: UploadManaging {
         pump()
         primeDedupe(for: ids)
         return ids
+    }
+
+    /// Resolves the destination album for one enqueue. The task is registered, so `shutdown` cancels and
+    /// joins it. Returns nil when the lifecycle ended during the await; the caller then adds no work.
+    private func resolveAlbum(
+        for destination: UploadDestination,
+        generation: UInt64
+    ) async -> AlbumResolutionOutcome? {
+        let resolutionID = UUID()
+        let resolution = Task { [albums] in
+            do {
+                guard destination.usesAlbum else { return AlbumResolutionOutcome.resolved(nil) }
+                guard let albums else {
+                    return .failed(
+                        UploadError.albumStep("no album backend is wired").errorDescription
+                            ?? "Album backend unavailable.")
+                }
+                return .resolved(try await albums.resolveAlbum(for: destination.target))
+            } catch {
+                return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            }
+        }
+        albumResolutionTasks[resolutionID] = resolution
+        let outcome = await resolution.value
+        albumResolutionTasks[resolutionID] = nil
+        guard lifecycleIsCurrent(generation) else { return nil }
+        return outcome
     }
 
     /// Kick the pipeline's batched duplicate prefetch for a fresh enqueue (Proton-sized chunks of
@@ -281,24 +293,9 @@ public actor UploadManager: UploadManaging {
         var resolvedAlbumID: String?
         var destinationFailure: String?
         if settlementAvailable {
-            let resolutionID = UUID()
-            let resolution = Task { [albums] in
-                do {
-                    guard destination.usesAlbum else { return AlbumResolutionOutcome.resolved(nil) }
-                    guard let albums else {
-                        return .failed(
-                            UploadError.albumStep("no album backend is wired").errorDescription
-                                ?? "Album backend unavailable.")
-                    }
-                    return .resolved(try await albums.resolveAlbum(for: destination.target))
-                } catch {
-                    return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-                }
+            guard let resolutionResult = await resolveAlbum(for: destination, generation: generation) else {
+                return []
             }
-            albumResolutionTasks[resolutionID] = resolution
-            let resolutionResult = await resolution.value
-            albumResolutionTasks[resolutionID] = nil
-            guard lifecycleIsCurrent(generation) else { return [] }
 
             switch resolutionResult {
             case .resolved(let albumID):
