@@ -695,15 +695,13 @@ final class MobileLibraryModel {
     /// backup and stay in Apple Photos.
     func emptyTrash(includesProtonTrash: Bool = true) async throws {
         guard let backend else { return }
-        if let pendingGrid, !pendingTrash.isEmpty {
-            guard await pendingGrid.removeFromTrashList(pendingTrash.items.map(\.uid)) else {
-                throw CancellationError()
-            }
+        let removePending: (([PhotoUID]) async -> Bool)? = pendingGrid.map { pendingGrid in
+            { await pendingGrid.removeFromTrashList($0) }
         }
-        if includesProtonTrash {
-            try await RecentlyDeletedEmptying.empty(
-                backend, checkingMergesWith: duplicateFinder, accountDataDirectory: facade?.accountDataDirectory)
-        }
+        try await TrashEmptying.empty(
+            backend, pendingUIDs: pendingTrash.items.map(\.uid), removePending: removePending,
+            includesProtonTrash: includesProtonTrash, checkingMergesWith: duplicateFinder,
+            accountDataDirectory: facade?.accountDataDirectory, commit: {})
     }
 
     /// Deletes only the album container through the shared AlbumCore facade. The backend deliberately uses
