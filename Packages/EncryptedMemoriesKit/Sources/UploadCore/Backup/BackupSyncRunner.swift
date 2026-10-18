@@ -2444,7 +2444,11 @@ public actor BackupSyncRunner {
     }
 
     private func sourceWasRemoved(_ entry: UploadBackupSyncQueueEntry) -> Bool {
-        removedSources.contains(Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier))
+        sourceWasRemoved(entry.source)
+    }
+
+    private func sourceWasRemoved(_ source: UploadSourceIdentity) -> Bool {
+        removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier))
     }
 
     private func refreshProgressFromQueue() {
@@ -2647,7 +2651,7 @@ public actor BackupSyncRunner {
         )
         defer { endActiveTransfer(key: progressKey, generation: request.cancellationToken) }
 
-        let uploadTask = Task {
+        let uploadTask = Task { () -> PhotoUID? in
             do {
                 // Coalesce byte callbacks before the actor hop; markProgress stays unconditional
                 // so the watchdog still treats every raw callback as transfer liveness.
@@ -2665,8 +2669,10 @@ public actor BackupSyncRunner {
                     progressGate.publish(progress)
                 }
                 race.resolve(.success(uid))
+                return uid
             } catch {
                 race.resolve(.failure(error))
+                return nil
             }
         }
         let join = BackupUploadJoin(
@@ -2706,14 +2712,16 @@ public actor BackupSyncRunner {
         case .failure(let error):
             await join.settle()
             throw error
+        // The upload can return its uid after a timeout or cancellation decided the race: Proton has the file then, and
+        // the normal settlement records it. A source that a deletion or exclusion removed keeps the cancellation.
         case .timedOut:
-            await join.cancelAndJoin()
+            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
             throw UploadError.transport(
                 code: NSURLErrorTimedOut,
                 message: URLError(.timedOut).localizedDescription
             )
         case .cancelled:
-            await join.cancelAndJoin()
+            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
             throw CancellationError()
         }
     }
@@ -3024,14 +3032,14 @@ final class BackupUploadCancellation: @unchecked Sendable {
 }
 
 private final class BackupUploadJoin: @unchecked Sendable {
-    private let uploadTask: Task<Void, Never>
+    private let uploadTask: Task<PhotoUID?, Never>
     private let race: BackupUploadRace
     private let cancellation = BackupUploadCancellation()
     private let uploader: any PhotoUploading
     private let token: UUID
 
     init(
-        uploadTask: Task<Void, Never>,
+        uploadTask: Task<PhotoUID?, Never>,
         race: BackupUploadRace,
         uploader: any PhotoUploading,
         token: UUID
@@ -3042,16 +3050,19 @@ private final class BackupUploadJoin: @unchecked Sendable {
         self.token = token
     }
 
-    func cancelAndJoin() async {
+    /// Returns the uid when the upload returned one, also after the cancellation: the bridge returns a uid only after
+    /// Proton committed the file.
+    @discardableResult
+    func cancelAndJoin() async -> PhotoUID? {
         uploadTask.cancel()
         if race.requestCancellation() {
             await cancellation.request(uploader: uploader, token: token)
         }
-        await uploadTask.value
+        return await uploadTask.value
     }
 
     func settle() async {
-        await uploadTask.value
+        _ = await uploadTask.value
     }
 }
 

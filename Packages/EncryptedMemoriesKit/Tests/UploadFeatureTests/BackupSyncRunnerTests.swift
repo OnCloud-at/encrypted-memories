@@ -712,10 +712,18 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
     private let inner: UploadDedupePipeline
     private let lock = NSLock()
     private var remainingFailures: Int
+    private var _recordCalls = 0
+    private let failure: any Error
 
-    init(inner: UploadDedupePipeline, failures: Int) {
+    var recordCalls: Int { lock.withLock { _recordCalls } }
+
+    init(
+        inner: UploadDedupePipeline, failures: Int,
+        failure: any Error = UploadError.backend("simulated manifest failure")
+    ) {
         self.inner = inner
         remainingFailures = failures
+        self.failure = failure
     }
 
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
@@ -739,13 +747,14 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
         remoteLinkID: String
     ) async throws {
         let shouldFail = lock.withLock {
+            _recordCalls += 1
             guard remainingFailures > 0 else { return false }
             remainingFailures -= 1
             return true
         }
         if shouldFail {
             await inner.remoteCommitNeedsReconciliation(descriptor)
-            throw UploadError.backend("simulated manifest failure")
+            throw failure
         }
         try await inner.recordUploaded(
             descriptor,
@@ -757,6 +766,10 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
 
     func remoteCommitNeedsReconciliation(_ descriptor: UploadResourceDescriptor) async {
         await inner.remoteCommitNeedsReconciliation(descriptor)
+    }
+
+    func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {
+        await inner.uploadDidFail(descriptor)
     }
 }
 
@@ -1027,6 +1040,43 @@ final class NonCooperativeBackupUploader: PhotoUploading, @unchecked Sendable {
         lock.withLock { _cancellations += 1 }
         await cancelStarted.signal()
         await cancelRelease.wait()
+    }
+}
+
+/// Commits the photo named `gatedName`, then holds the uid at a gate: the uid reaches the runner only after a
+/// cancellation or a timeout decided the upload race. Native cancellation returns at once, as the bridge does for a
+/// finished upload. Other names return at once.
+final class CommitThenGateUploader: PhotoUploading, @unchecked Sendable {
+    let capabilities = UploadBackendCapabilities.sdkUploader
+    let committed = BackupUploadTestLatch()
+    let cancelled = BackupUploadTestLatch()
+    let returnGate = BackupUploadTestLatch()
+    let gatedName: String
+
+    private let lock = NSLock()
+    private var _uploads: [String] = []
+    private var _cancellations = 0
+
+    var uploads: [String] { lock.withLock { _uploads } }
+    var cancellations: Int { lock.withLock { _cancellations } }
+
+    init(gatedName: String) { self.gatedName = gatedName }
+
+    func upload(
+        _ request: PhotoUploadRequest,
+        onProgress: @Sendable @escaping (UploadProgress) -> Void
+    ) async throws -> PhotoUID {
+        lock.withLock { _uploads.append(request.name) }
+        onProgress(UploadProgress(phase: .uploading, fraction: 0))
+        guard request.name == gatedName else { return testUID(request.name) }
+        await committed.signal()
+        await returnGate.wait()
+        return testUID(request.name)
+    }
+
+    func cancel(token: UUID) async {
+        lock.withLock { _cancellations += 1 }
+        await cancelled.signal()
     }
 }
 
@@ -2192,7 +2242,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let returnedAfterSettlement = await drainReturned.isSignaled()
         XCTAssertTrue(returnedAfterSettlement)
         XCTAssertEqual(stalledUploader.cancellations, 1, "timeout must issue one native cancellation")
-        XCTAssertEqual(stalledUploader.uploadAttempts, 2, "the settled timeout may retry once")
+        XCTAssertEqual(stalledUploader.uploadAttempts, 1, "the late uid is a committed upload: no second upload")
         XCTAssertEqual(state(of: entry), .completed)
     }
 
@@ -2260,7 +2310,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let returnedAfterSettlement = await drainReturned.isSignaled()
         XCTAssertTrue(returnedAfterSettlement)
         XCTAssertEqual(stalledUploader.cancellations, 1, "task cancellation must issue one native cancellation")
-        XCTAssertEqual(state(of: entry), .queuedForUpload)
+        XCTAssertEqual(state(of: entry), .completed)
     }
 
     func testStopJoinsNativeCancellationAndUploadBeforeReversion() async throws {
@@ -2310,7 +2360,206 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(stopReturnedAfterSettlement)
         XCTAssertTrue(drainReturnedAfterSettlement)
         XCTAssertEqual(stalledUploader.cancellations, 1, "stop must issue one native cancellation")
+        XCTAssertEqual(state(of: entry), .completed)
+    }
+
+    func testAnUploadThatReturnsItsUidAfterTheCancelWonTheRaceSettlesAsUploaded() async throws {
+        let name = "committed-then-cancelled.jpg"
+        let entry = seedEntry(name)
+        let gated = CommitThenGateUploader(gatedName: name)
+        let identity = RecordFailingIdentityResolver(inner: makePipeline(), failures: 0)
+        let events = SpyBackupItemEvents(queue: queueStore)
+        let runner = makeRunner(
+            uploader: gated, identityResolver: identity, uploadStallTimeout: 60, uploadStallPollInterval: 5,
+            events: events)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await gated.committed.wait()
+        drain.cancel()
+        // The native cancellation runs only after the cancel decided the race, so the uid arrives after the decision.
+        await gated.cancelled.wait()
+        await gated.returnGate.signal()
+        _ = await drain.value
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(queueStore.summary().uploaded, 1)
+        XCTAssertEqual(gated.uploads, [name], "Proton has the photo: no second upload")
+        XCTAssertEqual(gated.cancellations, 1)
+        XCTAssertEqual(identity.recordCalls, 1)
+        XCTAssertEqual(identityStore.record(for: entry.source)?.remoteLinkID, testUID(name).nodeID)
+        let handoffs = events.events.filter {
+            if case .handoff(_, _, .uploaded, _) = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(handoffs.count, 1)
+    }
+
+    func testAnUploadThatReturnsItsUidAfterTheWatchdogTimedOutSettlesWithoutASecondUpload() async throws {
+        let name = "committed-then-stalled.jpg"
+        let entry = seedEntry(name)
+        let gated = CommitThenGateUploader(gatedName: name)
+        let identity = RecordFailingIdentityResolver(inner: makePipeline(), failures: 0)
+        let runner = makeRunner(
+            uploader: gated, identityResolver: identity, uploadStallTimeout: 0.05, uploadStallPollInterval: 0.01)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await gated.committed.wait()
+        await gated.cancelled.wait()
+        await gated.returnGate.signal()
+        let progress = await drain.value
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(gated.uploads, [name], "a timeout must not upload a committed photo again")
+        XCTAssertEqual(gated.cancellations, 1)
+        XCTAssertEqual(identity.recordCalls, 1)
+        XCTAssertEqual(progress.failed, 0)
+    }
+
+    func testAKeptUidWhoseManifestWriteIsCancelledSettlesOnTheNextPassWithoutASecondUpload() async throws {
+        let name = "kept-then-record-cancelled.jpg"
+        let entry = seedEntry(name)
+        let gated = CommitThenGateUploader(gatedName: name)
+        let identity = RecordFailingIdentityResolver(inner: makePipeline(), failures: 1, failure: CancellationError())
+        let runner = makeRunner(
+            uploader: gated, identityResolver: identity, uploadStallTimeout: 60, uploadStallPollInterval: 5)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await gated.committed.wait()
+        drain.cancel()
+        await gated.cancelled.wait()
+        await gated.returnGate.signal()
+        _ = await drain.value
+
+        XCTAssertEqual(state(of: entry), .needsRemoteReconciliation, "the receipt keeps the committed uid")
+        XCTAssertEqual(
+            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation?.receipt
+                .remoteLinkID, testUID(name).nodeID)
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(gated.uploads, [name], "the next pass settles the receipt without a second upload")
+        XCTAssertEqual(identity.recordCalls, 2)
+        XCTAssertEqual(identityStore.record(for: entry.source)?.remoteLinkID, testUID(name).nodeID)
+    }
+
+    func testALivePhotoVideoThatReturnsItsUidAfterTheCancelWonTheRaceSettlesTheCompound() async throws {
+        let entry = seedEntry("kept-live.heic")
+        resolver.setSecondaries(["kept-live.mov"], for: entry.source.identifier)
+        let gated = CommitThenGateUploader(gatedName: "kept-live.mov")
+        let identity = RecordFailingIdentityResolver(inner: makePipeline(), failures: 0)
+        let runner = makeRunner(
+            uploader: gated, identityResolver: identity, uploadStallTimeout: 60, uploadStallPollInterval: 5)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await gated.committed.wait()
+        drain.cancel()
+        await gated.cancelled.wait()
+        await gated.returnGate.signal()
+        _ = await drain.value
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(gated.uploads, ["kept-live.heic", "kept-live.mov"])
+        XCTAssertEqual(gated.cancellations, 1)
+        XCTAssertEqual(identity.recordCalls, 2, "the photo and its video are each recorded once")
+        let video = UploadSourceIdentity(
+            kind: entry.source.kind, identifier: entry.source.identifier, resource: .livePairedVideo)
+        XCTAssertEqual(identityStore.record(for: video)?.remoteLinkID, testUID("kept-live.mov").nodeID)
+        XCTAssertEqual(stateStore.record(for: entry.source, revision: entry.revision)?.isComplete, true)
+    }
+
+    func testAKeptLivePhotoStillWhoseVideoIsCancelledUploadsOnlyTheVideoOnTheNextPass() async throws {
+        let entry = seedEntry("kept-still.heic")
+        resolver.setSecondaries(["kept-still.mov"], for: entry.source.identifier)
+        let gated = CommitThenGateUploader(gatedName: "kept-still.heic")
+        let runner = makeRunner(uploader: gated, uploadStallTimeout: 60, uploadStallPollInterval: 5)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await gated.committed.wait()
+        drain.cancel()
+        await gated.cancelled.wait()
+        await gated.returnGate.signal()
+        _ = await drain.value
+
+        XCTAssertEqual(state(of: entry), .queuedForUpload, "the video still has to upload")
+        XCTAssertEqual(gated.uploads, ["kept-still.heic"])
+        XCTAssertEqual(identityStore.record(for: entry.source)?.remoteLinkID, testUID("kept-still.heic").nodeID)
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(gated.uploads, ["kept-still.heic", "kept-still.mov"], "the photo must not upload again")
+        let backedUp = state(of: entry)
+        XCTAssertTrue(backedUp == .completed || backedUp == .alreadyBackedUp, "got \(String(describing: backedUp))")
+        XCTAssertEqual(stateStore.record(for: entry.source, revision: entry.revision)?.isComplete, true)
+    }
+
+    func testACancelBeforeTheUploadReturnedStillRequeuesTheRow() async throws {
+        let entry = seedEntry("cancelled-before-commit.jpg")
+        let running = RunningUntilCancelledUploader()
+        let identity = RecordFailingIdentityResolver(inner: makePipeline(), failures: 0)
+        let runner = makeRunner(uploader: running, identityResolver: identity)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await running.started.wait()
+        drain.cancel()
+        _ = await drain.value
+
+        XCTAssertEqual(running.cancellations, 1)
         XCTAssertEqual(state(of: entry), .queuedForUpload)
+        XCTAssertEqual(identity.recordCalls, 0)
+        XCTAssertNil(identityStore.record(for: entry.source)?.remoteLinkID)
+    }
+
+    func testALateUidOfARemovedSourceKeepsTheCancellationAndThePassGoesOn() async throws {
+        let removedName = "removed-then-committed.jpg"
+        let removed = seedEntry(removedName, ageSeconds: 600)
+        let next = seedEntry("after-the-removal.jpg")
+        let gated = CommitThenGateUploader(gatedName: removedName)
+        let runner = makeRunner(
+            uploader: gated, throttle: BackupThrottlePolicy(baseConcurrency: 1), uploadStallTimeout: 60,
+            uploadStallPollInterval: 5)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await gated.committed.wait()
+        let removal = Task {
+            await runner.removeSources(kind: removed.source.kind, identifiers: [removed.source.identifier])
+        }
+        await gated.cancelled.wait()
+        await gated.returnGate.signal()
+        _ = await removal.value
+        let progress = await drain.value
+
+        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertNil(identityStore.record(for: removed.source)?.remoteLinkID)
+        XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
+        XCTAssertEqual(progress.failed, 0)
+    }
+
+    func testALateUidOfARemovedSourceAfterATimeoutKeepsTheTimeoutAndThePassGoesOn() async throws {
+        let removedName = "removed-after-stall.jpg"
+        let removed = seedEntry(removedName, ageSeconds: 600)
+        let next = seedEntry("after-the-stall.jpg")
+        let gated = CommitThenGateUploader(gatedName: removedName)
+        let runner = makeRunner(
+            uploader: gated, throttle: BackupThrottlePolicy(baseConcurrency: 1), uploadStallTimeout: 0.05,
+            uploadStallPollInterval: 0.01)
+        let drain = Task { await runner.runUntilDrained() }
+
+        await gated.committed.wait()
+        await gated.cancelled.wait()
+        let removal = Task {
+            await runner.removeSources(kind: removed.source.kind, identifiers: [removed.source.identifier])
+        }
+        let rowRemoved = await waitUntil { queueStore.entry(for: removed.source, revision: removed.revision) == nil }
+        await gated.returnGate.signal()
+        _ = await removal.value
+        let progress = await drain.value
+
+        XCTAssertTrue(rowRemoved)
+        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertNil(identityStore.record(for: removed.source)?.remoteLinkID)
+        XCTAssertEqual(state(of: next), .completed, "the removal must not end the pass")
+        XCTAssertEqual(progress.failed, 0)
     }
 
     func testStopAfterUploadDecisionSettlesClaimBeforeRevertingQueueRow() async throws {
