@@ -64,6 +64,12 @@ final class AppModel {
     /// The pending grid of this account and its lists, shared with iOS. `PendingGridConnection` describes each one.
     @ObservationIgnored private let pendingGridConnection = PendingGridConnection()
     var pendingGrid: PendingGridSession? { pendingGridConnection.session }
+    /// The presentation callback for `session`: it calls `apply` only while the connection shows that session.
+    func pendingPresentationHandler(
+        for session: PendingGridSession, apply: @escaping (PendingTimelinePresentation) -> Void
+    ) -> (PendingTimelinePresentation) -> Void {
+        pendingGridConnection.presentationHandler(for: session, apply: apply)
+    }
     var pendingTrash: PendingTrashPresentation { pendingGridConnection.trash }
     var excludedPendingTiles: [PendingTile] { pendingGridConnection.excludedTiles }
     var pendingFavoriteRevision: UInt64 { pendingGridConnection.favoriteRevision }
@@ -568,6 +574,8 @@ final class AppModel {
                 )
                 let pendingStore = stack.pendingStore
                 let photoBackup = stack.photoBackup
+                let previousPhotoBackup = photoBackupController
+                let previousFolderBackup = backupController
                 photoBackupController = photoBackup
                 photoBackupScheduler.configure(controller: photoBackup)
                 // Watched folders share the pending store and the photo backup's event stream.
@@ -575,7 +583,7 @@ final class AppModel {
                     facade: client, pendingStore: pendingStore, pendingRecorder: photoBackup.pendingRecorder,
                     requiresPendingStore: true)
                 backupController = folderBackup
-                configurePendingGrid(
+                let replacedPendingGrid = configurePendingGrid(
                     store: pendingStore, photoBackup: photoBackup, folderBackup: folderBackup, client: client)
                 let albumSync = stack.albumSync
                 albumSync.setRemoteAlbumsChangedHandler { [weak self] in
@@ -583,6 +591,12 @@ final class AppModel {
                 }
                 albumSyncController = albumSync
                 await client.uploadCoordinator.start()
+                // No current flow is known to hand back a non-empty pair here; a second sign-in is not proven
+                // unreachable. A pair that a replacing start left is closed here, after every assignment of this
+                // block and right before the guard that re-checks the account.
+                await replacedPendingGrid.close(
+                    beforeSession: { await previousFolderBackup?.shutdown() },
+                    whileStoreOpen: { await previousPhotoBackup?.shutdown() })
                 guard !Task.isCancelled, facade === client, authController.currentSession == session else { return }
                 backend = .ready(client.backend)
                 // Register account caches after construction so pressure events can manage their budgets.
@@ -599,14 +613,17 @@ final class AppModel {
 
     // MARK: - Pending grid
 
+    /// Starts the pending grid and returns the session and store that this start replaced. The caller closes them
+    /// (`RetiredPendingGrid.close`). The previous folder backup and photo backup controllers, which also write to
+    /// that store, shut down only in that close; without a replaced pair nothing shuts them down here.
     private func configurePendingGrid(
         store: PendingBackupManifestStore?,
         photoBackup: PhotoLibraryBackupController,
         folderBackup: FolderBackupController,
         client: ProtonClientFacade
-    ) {
+    ) -> RetiredPendingGrid {
         let albums = client.albums
-        pendingGridConnection.start(
+        return pendingGridConnection.start(
             store: store,
             makeSession: { store in
                 PendingGridSession(
@@ -617,7 +634,7 @@ final class AppModel {
                 )
             },
             albumAdds: { await albums.setPendingAlbumAdds($0) }
-        )
+        ).replaced
     }
 
     private func apply(_ state: ProtonAuthState, prepareBackendOnSignedIn: Bool) {
