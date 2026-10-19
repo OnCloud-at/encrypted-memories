@@ -405,6 +405,57 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(store.handoffTime(for: key, revision: UploadBackupRevision(rawValue: 1)), date)
     }
 
+    func testPendingHealthDoesNotProbeDeniedSelect() throws {
+        XCTAssertTrue(store.isOperational())
+        try withDeniedSQLiteSelect(in: store!) {
+            XCTAssertTrue(store.isOperational(), "pending health checks only connection state")
+        }
+        XCTAssertTrue(store.isOperational(), "denied SELECT must not record a new failure")
+    }
+
+    func testPendingCloseRefusesRealWritesAndPreservesEmptyNoOpsAndRows() throws {
+        let revision = UploadBackupRevision(rawValue: 10)
+        XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
+        let states = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+        store.close()
+        XCTAssertFalse(store.isOperational())
+        XCTAssertTrue(store.removeEvidence(for: []))
+        XCTAssertTrue(store.removeEvidence([(PendingSourceKey, UploadBackupRevision)]()))
+        XCTAssertTrue(store.acknowledgeHandoffs([]))
+        XCTAssertTrue(store.unlistFromTrash([], at: date))
+        XCTAssertEqual(store.excludedIdentifiers(kind: .photoLibraryAsset, among: []), [])
+        XCTAssertEqual(store.exclude([], at: date), [])
+        XCTAssertEqual(store.include([], at: date), [])
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: []), [])
+        XCTAssertEqual(store.beginRemoteOperation(.queueSync, for: states), [])
+        XCTAssertTrue(store.latestHandoffs(for: []).isEmpty)
+        XCTAssertTrue(store.handoffs(forRemoteLinkIDs: []).isEmpty)
+        XCTAssertFalse(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 20), at: date))
+        XCTAssertTrue(store.evidenceRevisions().isEmpty)
+        XCTAssertFalse(store.isOperational())
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
+        XCTAssertEqual(store.sourceStates(), states)
+        XCTAssertEqual(store.sourceState(for: key)?.desired, .excluded)
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testPendingActionDecodeFailureStaysStickyWithoutChangingLaterSQLResults() throws {
+        XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(storeURL.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(sqlite3_exec(handle, "UPDATE pending_action SET kind='invalid-kind';", nil, nil, nil), SQLITE_OK)
+        _ = store.actions()
+        XCTAssertFalse(store.isOperational())
+        let revision = UploadBackupRevision(rawValue: 10)
+        XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
+        XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
+        XCTAssertFalse(store.isOperational(), "successful SQL cannot clear recorded failure")
+        XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]))
+    }
+
     func testClosedStoreCannotConfirmExclusions() {
         store.close()
         XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1"]))

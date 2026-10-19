@@ -26,8 +26,8 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
 
     /// Records a predicate under `withLock`. A prior failure does not change a later successful predicate.
     /// The shared type deliberately requires `database != nil`; the old helper returned the condition unchanged.
-    /// Album and catalog conditions derive from SQLite; a nil handle yields MISUSE and fails those conditions.
-    /// Their caller results stay unchanged. Audit non-SQL conditions before migrating another store.
+    /// Album/catalog conditions are SQL-derived; audited queue conditions are SQL-derived or literal false.
+    /// A nil handle fails these conditions, preserving closed-store results; audit other stores before migration.
     /// The old helper could return true after close. The shared type rejects that case.
     /// The operational probe remains false after any recorded failure.
     @discardableResult
@@ -37,9 +37,13 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
         return succeeded
     }
 
-    public func isOperational() -> Bool {
+    public func isOperational() -> Bool { isOperational(probeDatabase: true) }
+
+    /// Set probeDatabase to false only to preserve a store's existing state-only operational check.
+    public func isOperational(probeDatabase: Bool) -> Bool {
         withLock {
             guard database != nil, !operationFailed else { return false }
+            guard probeDatabase else { return true }
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(database, "SELECT 1;", -1, &statement, nil) == SQLITE_OK else {
                 markFailed()

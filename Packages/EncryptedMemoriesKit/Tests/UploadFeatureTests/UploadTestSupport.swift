@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import UploadCore
@@ -34,6 +35,20 @@ actor UploadTestBarrier {
             waiters.append(continuation)
         }
     }
+}
+
+/// Access the owned connection from tests without adding a production observation hook.
+func withDeniedSQLiteSelect(in store: Any, _ body: () throws -> Void) throws {
+    let connection = try XCTUnwrap(
+        Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value as? SQLiteStoreConnection)
+    connection.withLock {
+        XCTAssertEqual(
+            sqlite3_set_authorizer(
+                connection.database,
+                { _, action, _, _, _, _ in action == SQLITE_SELECT ? SQLITE_DENY : SQLITE_OK }, nil), SQLITE_OK)
+    }
+    defer { connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) } }
+    try body()
 }
 
 func testUID(_ name: String) -> PhotoUID { PhotoUID(volumeID: "vol", nodeID: "node-\(name)") }

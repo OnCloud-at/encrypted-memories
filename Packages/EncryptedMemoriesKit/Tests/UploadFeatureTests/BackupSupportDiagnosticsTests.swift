@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import UploadCore
@@ -243,6 +244,36 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
             snapshot.parkedByReason,
             BackupQueueSupportSnapshot.Reason.allCases.map { .init(reason: $0, count: parked[$0, default: 0]) },
             file: file, line: line)
+    }
+
+    func testOpenQueueWithRecordedDecodeFailureReturnsUnavailableSupportSnapshot() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("queue.sqlite")
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        defer { queue.close() }
+        let entry = UploadBackupSyncQueueEntry(
+            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "kept"),
+            revision: UploadBackupRevision(rawValue: 10), originalFilename: "photo.heic",
+            updatedAt: Date(timeIntervalSince1970: 100))
+        XCTAssertTrue(queue.upsert(entry))
+        XCTAssertTrue(queue.isOperational())
+        XCTAssertTrue(queue.backupSupportSnapshot().isAvailable)
+        XCTAssertEqual(queue.backupSupportSnapshot().total, 1)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
+            SQLITE_OK)
+
+        XCTAssertNil(queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertFalse(queue.isOperational())
+        XCTAssertEqual(queue.backupSupportSnapshot(), BackupQueueSupportSnapshot())
+        XCTAssertTrue(queue.upsert(entry), "the handle remains open after the recorded failure")
+        XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+        XCTAssertFalse(queue.isOperational(), "successful SQL cannot clear recorded failure")
+        XCTAssertEqual(queue.backupSupportSnapshot(), BackupQueueSupportSnapshot())
     }
 
     func testClosedQueueIsUnavailableInsteadOfEmpty() throws {
