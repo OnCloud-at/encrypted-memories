@@ -16,6 +16,57 @@ import ProtonDriveBackend
 import TimelineCore
 import UploadCore
 
+@MainActor private struct MacAccountOwners {
+    let backend: Task<Void, Never>?
+    let scopeRecovery: Task<Void, Never>?
+    let facade: ProtonClientFacade?
+    let folderBackup: FolderBackupController?
+    let photoBackup: PhotoLibraryBackupController?
+    let pending: RetiredPendingGrid
+    let albumSync: AlbumSyncController?
+    let smartSearch: AppleSmartSearchSession
+    let sourceAnalysis: LibrarySourceAnalysisSession
+    let assets: MLAssetUniverse
+    var smartSearchShutdown: Task<Void, Never>?
+    var sourceAnalysisShutdown: Task<Void, Never>?
+
+    func makeCoordinator(
+        signingOut: Bool, purge: @escaping AccountOwnerGraphFactory.Shutdown
+    ) throws -> AccountTeardownCoordinator {
+        let location: AccountOwnerGraphFactory.Shutdown? =
+            signingOut
+            ? { @MainActor @Sendable in
+                await OfflineLibraryManager.shared.stopForAccountTeardown()
+            } : nil
+        let closePendingSession: AccountOwnerGraphFactory.Shutdown? = pending.session.map { session in
+            { @MainActor @Sendable in await session.close() }
+        }
+        // The purge deletes the account directory; the pending store must be closed first.
+        let closePendingStore: AccountOwnerGraphFactory.Shutdown? = pending.store.map { store in
+            { @MainActor @Sendable in store.close() }
+        }
+        return try AccountOwnerGraphFactory.makeCoordinator(
+            profile: signingOut ? .macSignOut : .macScopeRecovery,
+            platformTasks: {
+                await backend?.value
+                if signingOut {
+                    await scopeRecovery?.value
+                } else {
+                    await OfflineLibraryManager.shared.stopForAccountTeardown()
+                }
+            },
+            smartSearch: {
+                await smartSearchShutdown?.value
+                await sourceAnalysisShutdown?.value
+            }, locationCrawl: location, folderBackup: { await folderBackup?.shutdown() },
+            closePendingSession: closePendingSession,
+            photoBackup: { await photoBackup?.shutdown() }, closePendingStore: closePendingStore,
+            albumSync: { await albumSync?.shutdown() }, facade: { await facade?.shutdown() },
+            caches: { await OfflineLibraryManager.shared.purgeCachesForAccountTeardown() },
+            logs: { await DebugLog.flush() }, purge: purge)
+    }
+}
+
 /// Root application state + composition. Owns the session lifecycle and builds the SDK-backed
 /// services once the user is signed in.
 @MainActor
@@ -234,22 +285,7 @@ final class AppModel {
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         pendingSignOutPurgeClaim = purgeClaim
         let signedOutState = authController.signOut()
-        let activeScopeRecovery = scopeRecoveryTask
-        activeScopeRecovery?.cancel()
-        scopeRecoveryTask = nil
-        let activeFacade = facade
-        let folderBackup = backupController
-        let photoBackup = photoBackupController
-        let activePendingGrid = pendingGridConnection.retire()
-        let albumSync = albumSyncController
-        auth = .signingOut
-        let backendShutdown = backendTask
-        backendTask?.cancel()
-        backendTask = nil
-        backend = .idle
-        searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
+        let active = captureAndCancelTransientOwners(signingOut: true)
         backupController = nil
         photoBackupScheduler.invalidate()
         photoBackupController = nil
@@ -259,46 +295,12 @@ final class AppModel {
         libraryReady = false
         let teardownCoordinator: AccountTeardownCoordinator
         do {
-            teardownCoordinator = try AccountTeardownCoordinator(owners: [
-                AccountTeardownOwner(id: "mac.platform-build", stage: .platformTasks) {
-                    await backendShutdown?.value
-                    await activeScopeRecovery?.value
-                },
-                AccountTeardownOwner(id: "shared.smart-search", stage: .smartSearch) {
-                    await smartSearchShutdown?.value
-                    await sourceAnalysisShutdown?.value
-                },
-                AccountTeardownOwner(id: "mac.location-crawl", stage: .locationCrawl) {
-                    await OfflineLibraryManager.shared.stopForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "mac.folder-backup", stage: .folderBackup) {
-                    await folderBackup?.shutdown()
-                },
-                AccountTeardownOwner(id: "shared.photo-backup", stage: .photoBackup) {
-                    await activePendingGrid.session?.close()
-                    await photoBackup?.shutdown()
-                    // The purge deletes the account directory; the pending store must be closed first.
-                    activePendingGrid.store?.close()
-                },
-                AccountTeardownOwner(id: "shared.album-sync", stage: .albumSync) {
-                    await albumSync?.shutdown()
-                },
-                AccountTeardownOwner(id: "shared.proton-facade", stage: .facade) {
-                    await activeFacade?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.offline-caches", stage: .caches) {
-                    await OfflineLibraryManager.shared.purgeCachesForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "shared.debug-log", stage: .logs) {
-                    await DebugLog.flush()
-                },
-                AccountTeardownOwner(id: "shared.local-data-claim", stage: .purgeClaims) {
-                    guard let purgeClaim else { throw TeardownFailure.purgeClaimUnavailable }
-                    PendingReplacementLedger.clearForSignOut()
-                    let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
-                    guard succeeded else { throw TeardownFailure.purgeFailed }
-                },
-            ])
+            teardownCoordinator = try active.makeCoordinator(signingOut: true) {
+                guard let purgeClaim else { throw TeardownFailure.purgeClaimUnavailable }
+                PendingReplacementLedger.clearForSignOut()
+                let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
+                guard succeeded else { throw TeardownFailure.purgeFailed }
+            }
         } catch {
             preconditionFailure("Duplicate account teardown owner identifier")
         }
@@ -368,24 +370,11 @@ final class AppModel {
             case .signedIn(let session) = auth
         else { return }
 
-        let activeBackendTask = backendTask
-        let activeFacade = facade
-        let folderBackup = backupController
-        let photoBackup = photoBackupController
-        let activePendingGrid = pendingGridConnection.retire()
-        let albumSync = albumSyncController
-        searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
+        let active = captureAndCancelTransientOwners(signingOut: false)
         let policy = ProtonDriveBackendPolicy.standard(
             libraryDatabasePolicy: ProtonDriveBackendPolicy.desktopLibraryDatabasePolicy
         )
 
-        LibraryRuntimeState.shared.beginNewGeneration()
-        OfflineLibraryManager.shared.prepareForAccountTeardown()
-        activeBackendTask?.cancel()
-        backendTask = nil
-        backend = .preparing(String(localized: "loading.building_library"))
         backupController = nil
         photoBackupScheduler.invalidate()
         photoBackupController = nil
@@ -396,41 +385,11 @@ final class AppModel {
 
         let coordinator: AccountTeardownCoordinator
         do {
-            coordinator = try AccountTeardownCoordinator(owners: [
-                AccountTeardownOwner(id: "mac.scope-recovery.platform", stage: .platformTasks) {
-                    await activeBackendTask?.value
-                    await OfflineLibraryManager.shared.stopForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.smart-search", stage: .smartSearch) {
-                    await smartSearchShutdown?.value
-                    await sourceAnalysisShutdown?.value
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.folder-backup", stage: .folderBackup) {
-                    await folderBackup?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.photo-backup", stage: .photoBackup) {
-                    await activePendingGrid.session?.close()
-                    await photoBackup?.shutdown()
-                    activePendingGrid.store?.close()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.album-sync", stage: .albumSync) {
-                    await albumSync?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.facade", stage: .facade) {
-                    await activeFacade?.shutdown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.caches", stage: .caches) {
-                    await OfflineLibraryManager.shared.purgeCachesForAccountTeardown()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.logs", stage: .logs) {
-                    await DebugLog.flush()
-                },
-                AccountTeardownOwner(id: "mac.scope-recovery.account-data", stage: .purgeClaims) {
-                    await Task.detached(priority: .utility) {
-                        ProtonDriveBackendFactory.purgeLocalAccountData(uid: session.uid, policy: policy)
-                    }.value
-                },
-            ])
+            coordinator = try active.makeCoordinator(signingOut: false) {
+                await Task.detached(priority: .utility) {
+                    ProtonDriveBackendFactory.purgeLocalAccountData(uid: session.uid, policy: policy)
+                }.value
+            }
         } catch {
             preconditionFailure("Duplicate scope recovery owner identifier")
         }
@@ -452,6 +411,38 @@ final class AppModel {
         }
         scopeRecoveryTask = task
         await task.value
+    }
+
+    /// Captures every native owner before cancellation can clear an account slot.
+    private func captureAndCancelTransientOwners(signingOut: Bool) -> MacAccountOwners {
+        AccountOwnerGraphFactory.captureAndCancel(
+            {
+                MacAccountOwners(
+                    backend: backendTask, scopeRecovery: signingOut ? scopeRecoveryTask : nil,
+                    facade: facade, folderBackup: backupController, photoBackup: photoBackupController,
+                    pending: pendingGridConnection.retire(), albumSync: albumSyncController,
+                    smartSearch: smartSearchSession, sourceAnalysis: sourceAnalysis, assets: smartSearchAssets)
+            },
+            cancel: { active in
+                if signingOut {
+                    active.scopeRecovery?.cancel()
+                    scopeRecoveryTask = nil
+                    auth = .signingOut
+                    active.backend?.cancel()
+                    backendTask = nil
+                    backend = .idle
+                }
+                searchSuggestions.reset()
+                active.smartSearchShutdown = active.smartSearch.stop()
+                active.sourceAnalysisShutdown = stopSourceAnalysis()
+                if !signingOut {
+                    LibraryRuntimeState.shared.beginNewGeneration()
+                    OfflineLibraryManager.shared.prepareForAccountTeardown()
+                    active.backend?.cancel()
+                    backendTask = nil
+                    backend = .preparing(String(localized: "loading.building_library"))
+                }
+            })
     }
 
     @discardableResult
