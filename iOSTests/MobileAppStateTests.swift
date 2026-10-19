@@ -1,4 +1,6 @@
 import Foundation
+import MediaLocationCore
+import PhotoLibraryBackupAdapter
 import PhotoViewerCore
 import PhotoViewerUIKitAdapter
 import PhotosCore
@@ -7,6 +9,7 @@ import SwiftUI
 import Testing
 import UIKit
 import UploadCore
+import XCTest
 
 @testable import EncryptedMemoriesMobile
 
@@ -1138,16 +1141,80 @@ private func waitUntil(
         #expect(!fileManager.fileExists(atPath: shareDirectory.path))
     }
 
+    @Test func retryKeepsLocationsAndReturnsFromItsOwnSequence() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        fixture.install(into: model)
+        let pending = try MobilePendingOwnerFixture(model: model)
+        defer { Task { await pending.close() } }
+        #expect(await pending.session.delete([]), "the retained session starts open")
+        let coordinates = [PhotoCoordinate(uid: fixture.items[0].uid, latitude: 0, longitude: 0, date: .distantPast)]
+        let progress = PhotoLocationScanProgress(phase: .completed, scanned: 1, total: 1, found: 1)
+        model.locationIndex.replaceAll(coordinates)
+        model.locationIndex.updateScanProgress(progress)
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("load") } }
+        let replacement = ProtonSession(
+            uid: "replacement-fixture", accessToken: "fixture-access", refreshToken: "fixture-refresh",
+            keyPassword: "fixture-key")
+        model.installIsolatedInitialLoadForTesting {
+            await latch.block("load")
+            await latch.record(Task.isCancelled ? "load-cancelled" : "load-uncancelled")
+            // Change the session through the existing fixture entry. The old retry must not open a backend.
+            model.installIsolatedLibrary(
+                session: replacement, store: SessionKeychainStore(), backend: fixture.backend,
+                sections: fixture.sections, thumbnailFeed: fixture.feed)
+        }
+        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        var returned = false
+        let retry = Task { @MainActor in
+            await model.retry()
+            returned = true
+        }
+        try #require(await waitForMobileOwner { model.backend == nil })
+        await latch.release("load")
+        let finished = await waitForMobileOwner { returned }
+        #expect(finished, "A retry must not await its own BackendRetrySequence task")
+        #expect(await latch.hasEntered("load-cancelled"))
+        #expect(!(await pending.session.delete([])), "retry must close the captured pending session")
+        #expect(!pending.store.isOperational(), "retry must close the captured pending store")
+        #expect(model.locationIndex.coordinates == coordinates)
+        #expect(model.locationIndex.scanProgress == progress)
+        if finished { await retry.value } else { retry.cancel() }
+        model.configure(session: nil, store: SessionKeychainStore())
+    }
+
+    @Test func configureNilWithoutClaimClearsPresentationWithoutArmingPurge() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        fixture.install(into: model)
+        #expect(!model.items.isEmpty)
+        #expect(!BackupLocalDataPurge.isPurgePending())
+
+        model.configure(session: nil, store: SessionKeychainStore())
+
+        #expect(model.items.isEmpty)
+        #expect(model.backend == nil)
+        #expect(!model.isSigningOut)
+        #expect(!model.signOutCleanupFailed)
+        #expect(!BackupLocalDataPurge.isPurgePending())
+        await fixture.feed.stopPrefetch()
+    }
+
     @Test func retryOwnerGraphJoinsEachOwnerBeforeReturning() async throws {
         let latch = MobileRetryLifecycleLatch()
         let completed = MobileRetryCompletionLatch()
-        let coordinator = try MobileRetryOwnerGraph.makeCoordinator(
+        let coordinator = try AccountOwnerGraphFactory.makeCoordinator(
+            profile: .mobileRetry,
             platformTasks: { await latch.record("mobile.retry.platform-tasks") },
             smartSearch: { await latch.record("mobile.retry.smart-search") },
             locationCrawl: { await latch.block("mobile.retry.location-crawl") },
-            photoBackup: { await latch.block("mobile.retry.photo-backup") },
+            folderBackup: nil, closePendingSession: {},
+            photoBackup: { await latch.block("mobile.retry.photo-backup") }, closePendingStore: {},
             albumSync: { await latch.block("mobile.retry.album-sync") },
-            facade: { await latch.block("mobile.retry.facade") }
+            facade: { await latch.block("mobile.retry.facade") }, caches: nil, logs: nil, purge: nil
         )
 
         let first = Task {
@@ -1193,4 +1260,146 @@ private func waitUntil(
                 "mobile.retry.facade",
             ])
     }
+}
+
+// XCTest completes before Swift Testing starts. Keep the shared claimed-purge marker in that serial phase.
+final class MobileAccountOwnerAdapterTests: XCTestCase {
+    @MainActor func testSignOutJoinsRetryBeforePurging() async throws {
+        try await verifySignOut(startRetry: true)
+    }
+
+    @MainActor func testSignOutClosesPendingSessionBeforePurging() async throws {
+        try await verifySignOut(startRetry: false)
+    }
+
+    @MainActor private func verifySignOut(startRetry: Bool) async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        fixture.install(into: model)
+        let pending = try MobilePendingOwnerFixture(model: model)
+        defer { Task { await pending.close() } }
+        let initiallyOpen = await pending.session.delete([])
+        XCTAssertTrue(initiallyOpen)
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("load") } }
+        model.installIsolatedInitialLoadForTesting {
+            await latch.block("load")
+            await latch.record(Task.isCancelled ? "load-cancelled" : "load-uncancelled")
+        }
+        let loadEntered = await waitForMobileOwner { await latch.hasEntered("load") }
+        XCTAssertTrue(loadEntered)
+        guard loadEntered else { return }
+        let retry = startRetry ? Task { @MainActor in await model.retry() } : nil
+        if startRetry {
+            let retirementStarted = await waitForMobileOwner { model.backend == nil }
+            XCTAssertTrue(retirementStarted)
+            guard retirementStarted else {
+                retry?.cancel()
+                return
+            }
+        }
+
+        // The hosted test owns this synthetic account and marker; it never opens a network backend.
+        let root = try XCTUnwrap(BackupLocalDataPurge.localDataRoots().first)
+        let marker = root.appendingPathComponent("owner-join-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data([1]).write(to: marker)
+        defer {
+            BackupLocalDataPurge.markPurgeCompleted()
+            try? FileManager.default.removeItem(at: marker)
+        }
+        let pendingStore = pending.store
+        let onListsChange = pending.session.onListsChange
+        var closedBeforePurge = false
+        // These fixture lists stay empty; close publishes their final callback while the store is still open.
+        pending.session.onListsChange = {
+            onListsChange?()
+            closedBeforePurge = pendingStore.isOperational() && FileManager.default.fileExists(atPath: marker.path)
+        }
+        BackupLocalDataPurge.requestPurgeOnSignOut()
+        model.configure(session: nil, store: SessionKeychainStore())
+        XCTAssertTrue(model.isSigningOut)
+        XCTAssertNil(model.pendingGrid)
+        let openWhileHeld = await pending.session.delete([])
+        XCTAssertTrue(openWhileHeld)
+        XCTAssertTrue(pending.store.isOperational())
+        let completedWhileHeld = await waitForMobileOwner(timeout: .seconds(1)) {
+            !model.isSigningOut || model.signOutCleanupFailed
+        }
+        XCTAssertFalse(completedWhileHeld)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        await latch.release("load")
+        let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
+        XCTAssertTrue(completed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
+        XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
+        let loadWasCancelled = await latch.hasEntered("load-cancelled")
+        XCTAssertTrue(loadWasCancelled)
+        let stillOpen = await pending.session.delete([])
+        XCTAssertFalse(stillOpen, "sign-out must close the captured pending session")
+        XCTAssertTrue(closedBeforePurge, "the session must close before the store and the purge")
+        XCTAssertFalse(pending.store.isOperational())
+        if completed { await retry?.value } else { retry?.cancel() }
+    }
+}
+
+@MainActor private func waitForMobileOwner(
+    timeout: Duration = .seconds(5), _ condition: () async -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while !(await condition()) && ContinuousClock.now < deadline { await Task.yield() }
+    return await condition()
+}
+
+@MainActor private struct MobilePendingOwnerFixture {
+    private let suite = "mobile-pending-owner-" + UUID().uuidString
+    private let directory: URL
+    private let defaults: UserDefaults
+    let store: PendingBackupManifestStore
+    private let controller: PhotoLibraryBackupController
+    let session: PendingGridSession
+
+    init(model: MobileLibraryModel) throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        store = try XCTUnwrap(PendingGridSession.openStore(accountDataDirectory: directory, policy: .conservative))
+        let backend = PendingOwnerBackend()
+        controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: backend, uploader: backend, pendingStore: store, requiresPendingStore: true)
+        model.installIsolatedPendingBackupForTesting(controller, store: store, remote: backend)
+        session = try XCTUnwrap(model.pendingGrid)
+    }
+
+    func close() async {
+        await session.close()
+        await controller.shutdown()
+        store.close()
+        defaults.removePersistentDomain(forName: suite)
+        try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private struct PendingOwnerBackend: PhotoUploading, UploadIdentityResolving, PendingRemoteEffects {
+    let capabilities = UploadBackendCapabilities(
+        canUpload: false, supportsCancel: true, supportsPauseResume: false, supportsResumeAcrossRelaunch: false)
+    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+        throw CancellationError()
+    }
+    func upload(
+        _ request: PhotoUploadRequest, onProgress: @escaping @Sendable (UploadProgress) -> Void
+    ) async throws -> PhotoUID { throw CancellationError() }
+    func cancel(token: UUID) async {}
+    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+        throw CancellationError()
+    }
+    func recordUploaded(
+        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String, remoteLinkID: String
+    ) async throws { throw CancellationError() }
+    func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
+    func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
+    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .done }
+    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
 }

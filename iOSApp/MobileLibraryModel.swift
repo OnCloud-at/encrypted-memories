@@ -23,25 +23,92 @@ import TimelineCore
 import UIKit
 import UploadCore
 
-struct MobileRetryOwnerGraph {
-    typealias Shutdown = @MainActor @Sendable () async -> Void
+@MainActor private struct MobileAccountOwners {
+    let previousTeardown: Task<Void, Never>?
+    let facade: ProtonClientFacade?
+    let load: Task<Void, Never>?
+    let transition: Task<Void, Never>?
+    let prefetch: Task<Void, Never>?
+    let favorites: Task<Void, Never>?
+    let series: Task<Void, Never>?
+    let retry: Task<Void, Never>?
+    let scopeRecovery: Task<Void, Never>?
+    let photoBackup: PhotoLibraryBackupController?
+    let pending: RetiredPendingGrid
+    let albumSync: AlbumSyncController?
+    let feed: UIKitThumbnailFeed?
+    let refresh: LibraryRefreshCoalescer
+    let uploadRefresh: TimelineUploadRefreshCoordinator
+    let changeMonitor: LibraryChangeMonitor
+    let locationSession: LocationCrawlSession
+    let crawl: LocationCrawl
+    let crawlStarter: Task<Void, Never>?
+    let locationIndex: PhotoLocationIndex
+    let originalsCache: ThumbnailCache?
+    let smartSearch: AppleSmartSearchSession
+    let sourceAnalysis: LibrarySourceAnalysisSession
+    let assets: MLAssetUniverse
+    let thumbnailUpdates: LibraryThumbnailUpdateCoordinator
+    var smartSearchShutdown: Task<Void, Never>?
+    var sourceAnalysisShutdown: Task<Void, Never>?
+    var thumbnailShutdown: Task<Void, Never>?
 
-    static func makeCoordinator(
-        platformTasks: @escaping Shutdown,
-        smartSearch: @escaping Shutdown,
-        locationCrawl: @escaping Shutdown,
-        photoBackup: @escaping Shutdown,
-        albumSync: @escaping Shutdown,
-        facade: @escaping Shutdown
+    mutating func stopSearch(stopSourceAnalysis: () -> Task<Void, Never>?) {
+        smartSearchShutdown = smartSearch.stop()
+        sourceAnalysisShutdown = stopSourceAnalysis()
+    }
+
+    func makeCoordinator(
+        signingOut: Bool, purge: AccountOwnerGraphFactory.Shutdown?
     ) throws -> AccountTeardownCoordinator {
-        try AccountTeardownCoordinator(owners: [
-            AccountTeardownOwner(id: "mobile.retry.platform-tasks", stage: .platformTasks, shutdown: platformTasks),
-            AccountTeardownOwner(id: "mobile.retry.smart-search", stage: .smartSearch, shutdown: smartSearch),
-            AccountTeardownOwner(id: "mobile.retry.location-crawl", stage: .locationCrawl, shutdown: locationCrawl),
-            AccountTeardownOwner(id: "mobile.retry.photo-backup", stage: .photoBackup, shutdown: photoBackup),
-            AccountTeardownOwner(id: "mobile.retry.album-sync", stage: .albumSync, shutdown: albumSync),
-            AccountTeardownOwner(id: "mobile.retry.facade", stage: .facade, shutdown: facade),
-        ])
+        let caches: AccountOwnerGraphFactory.Shutdown? =
+            signingOut
+            ? { @MainActor @Sendable in
+                guard let originalsCache else { return }
+                await Task.detached(priority: .utility) { originalsCache.clearForSignOut() }.value
+            } : nil
+        let logs: AccountOwnerGraphFactory.Shutdown? =
+            signingOut ? { @MainActor @Sendable in await DebugLog.flush() } : nil
+        let closePendingSession: AccountOwnerGraphFactory.Shutdown? = pending.session.map { session in
+            { @MainActor @Sendable in await session.close() }
+        }
+        // The purge deletes the account directory; the pending store must be closed first.
+        let closePendingStore: AccountOwnerGraphFactory.Shutdown? = pending.store.map { store in
+            { @MainActor @Sendable in store.close() }
+        }
+        return try AccountOwnerGraphFactory.makeCoordinator(
+            profile: signingOut ? .mobileSignOut : .mobileRetry,
+            platformTasks: {
+                await previousTeardown?.value
+                // Capture is the single retry policy: both owners are nil for a plain retry.
+                await retry?.value
+                await scopeRecovery?.value
+                await transition?.value
+                await load?.value
+                await prefetch?.value
+                await favorites?.value
+                await thumbnailShutdown?.value
+                await refresh.cancel()
+                await uploadRefresh.cancel()
+                await changeMonitor.reset()
+                await feed?.stopPrefetch()
+            },
+            smartSearch: {
+                await smartSearchShutdown?.value
+                await sourceAnalysisShutdown?.value
+            },
+            locationCrawl: {
+                await crawlStarter?.value
+                await crawl.cancel()
+                if signingOut {
+                    locationIndex.replaceAll([])
+                    locationIndex.updateScanProgress(PhotoLocationScanProgress())
+                }
+            }, folderBackup: nil,
+            closePendingSession: closePendingSession,
+            photoBackup: { await photoBackup?.shutdown() }, closePendingStore: closePendingStore,
+            albumSync: { await albumSync?.shutdown() }, facade: { await facade?.shutdown() },
+            caches: caches, logs: logs, purge: purge)
     }
 }
 
@@ -1131,43 +1198,59 @@ final class MobileLibraryModel {
         return sourceAnalysis.stop()
     }
 
+    /// Captures native owners before cancellation can detach their live slots. The core retains this snapshot.
+    private func captureAndCancelTransientOwners(
+        signingOut: Bool, advanceLoadToken: Bool
+    ) -> MobileAccountOwners {
+        AccountOwnerGraphFactory.captureAndCancel(
+            {
+                MobileAccountOwners(
+                    previousTeardown: teardownTask, facade: facade, load: loadTask, transition: transitionTask,
+                    prefetch: prefetchStartTask, favorites: favoriteLoadTask, series: seriesDissolutionTask,
+                    retry: signingOut ? retrySequence.current : nil,
+                    scopeRecovery: signingOut ? scopeRecoveryCoordinator.task : nil,
+                    photoBackup: photoBackup, pending: retirePendingGrid(), albumSync: albumSync, feed: thumbnailFeed,
+                    refresh: libraryRefreshCoalescer, uploadRefresh: uploadRefreshCoordinator,
+                    changeMonitor: libraryChangeMonitor, locationSession: locationCrawl, crawl: locationCrawl.crawl,
+                    crawlStarter: locationCrawl.startingTask, locationIndex: locationIndex,
+                    originalsCache: originalsCache,
+                    smartSearch: smartSearchSession, sourceAnalysis: sourceAnalysis, assets: smartSearchAssets,
+                    thumbnailUpdates: thumbnailUpdateCoordinator)
+            },
+            cancel: { active in
+                if signingOut {
+                    retrySequence.cancel()
+                    _ = scopeRecoveryCoordinator.cancel()
+                } else {
+                    searchSuggestions.reset()
+                    active.stopSearch(stopSourceAnalysis: stopSourceAnalysis)
+                }
+                if advanceLoadToken { loadToken &+= 1 }
+                if signingOut { isRecoveringScope = false }
+                active.load?.cancel()
+                loadTask = nil
+                active.transition?.cancel()
+                transitionTask = nil
+                active.prefetch?.cancel()
+                prefetchStartTask = nil
+                isThumbnailPrefetchLoading = false
+                active.favorites?.cancel()
+                favoriteLoadTask = nil
+                if !signingOut {
+                    active.series?.cancel()
+                    seriesDissolutionTask = nil
+                }
+                favoriteState.reset(keepingFavorites: true)
+                active.thumbnailShutdown = active.thumbnailUpdates.cancel()
+            })
+    }
+
     /// Retires transient retry owners without deleting account data. Every replacement load waits for this
     /// barrier, so a retry never opens a second owner graph while the previous graph still owns SQLite handles.
     private func retireForRetry(advanceLoadToken: Bool = true) async {
-        let previousTeardown = teardownTask
-        let activeFacade = facade
-        let activeLoadTask = loadTask
-        let activeTransitionTask = transitionTask
-        let activePrefetchStartTask = prefetchStartTask
-        let activeFavoriteLoadTask = favoriteLoadTask
-        let activePhotoBackup = photoBackup
-        let activePendingGrid = retirePendingGrid()
-        let activeAlbumSync = albumSync
-        let activeThumbnailFeed = thumbnailFeed
-        let activeRefreshCoalescer = libraryRefreshCoalescer
-        let activeUploadRefreshCoordinator = uploadRefreshCoordinator
-        let activeChangeMonitor = libraryChangeMonitor
-        let activeLocationCrawl = locationCrawl.crawl
-        let activeLocationCrawlStarter = locationCrawl.startingTask
-        searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
-
-        if advanceLoadToken { loadToken &+= 1 }
-        activeLoadTask?.cancel()
-        loadTask = nil
-        transitionTask?.cancel()
-        transitionTask = nil
-        prefetchStartTask?.cancel()
-        prefetchStartTask = nil
-        isThumbnailPrefetchLoading = false
-        favoriteLoadTask?.cancel()
-        favoriteLoadTask = nil
-        seriesDissolutionTask?.cancel()
-        seriesDissolutionTask = nil
-        favoriteState.reset(keepingFavorites: true)
-        let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
-        locationCrawl.retire()
+        let active = captureAndCancelTransientOwners(
+            signingOut: false, advanceLoadToken: advanceLoadToken)
+        active.locationSession.retire()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating
@@ -1182,39 +1265,7 @@ final class MobileLibraryModel {
 
         let coordinator: AccountTeardownCoordinator
         do {
-            coordinator = try MobileRetryOwnerGraph.makeCoordinator(
-                platformTasks: {
-                    await previousTeardown?.value
-                    await activeTransitionTask?.value
-                    await activeLoadTask?.value
-                    await activePrefetchStartTask?.value
-                    await activeFavoriteLoadTask?.value
-                    await activeThumbnailUpdateTask?.value
-                    await activeRefreshCoalescer.cancel()
-                    await activeUploadRefreshCoordinator.cancel()
-                    await activeChangeMonitor.reset()
-                    await activeThumbnailFeed?.stopPrefetch()
-                },
-                smartSearch: {
-                    await smartSearchShutdown?.value
-                    await sourceAnalysisShutdown?.value
-                },
-                locationCrawl: {
-                    await activeLocationCrawlStarter?.value
-                    await activeLocationCrawl.cancel()
-                },
-                photoBackup: {
-                    await activePendingGrid.session?.close()
-                    await activePhotoBackup?.shutdown()
-                    activePendingGrid.store?.close()
-                },
-                albumSync: {
-                    await activeAlbumSync?.shutdown()
-                },
-                facade: {
-                    await activeFacade?.shutdown()
-                }
-            )
+            coordinator = try active.makeCoordinator(signingOut: false, purge: nil)
         } catch {
             preconditionFailure("Duplicate transient retry owner identifier")
         }
@@ -1223,43 +1274,11 @@ final class MobileLibraryModel {
 
     private func teardown() {
         LibraryRuntimeState.shared.beginNewGeneration()
-        let previousTeardown = teardownTask
-        let activeFacade = facade
-        let activeLoadTask = loadTask
-        let activeTransitionTask = transitionTask
-        let activePrefetchStartTask = prefetchStartTask
-        let activeFavoriteLoadTask = favoriteLoadTask
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         isSigningOut = purgeClaim != nil
         pendingSignOutPurgeClaim = purgeClaim
         signOutCleanupFailed = false
-        let activePhotoBackup = photoBackup
-        let activePendingGrid = retirePendingGrid()
-        let activeAlbumSync = albumSync
-        let activeThumbnailFeed = thumbnailFeed
-        let activeOriginalsCache = originalsCache
-        let activeRefreshCoalescer = libraryRefreshCoalescer
-        let activeUploadRefreshCoordinator = uploadRefreshCoordinator
-        let activeChangeMonitor = libraryChangeMonitor
-        let activeLocationCrawl = locationCrawl.crawl
-        let activeLocationCrawlStarter = locationCrawl.startingTask
-        let activeLocationIndex = locationIndex
-        let activeRetry = retrySequence.cancel()
-        let activeScopeRecovery = scopeRecoveryCoordinator.cancel()
-
-        loadToken &+= 1  // supersede any in-flight snapshot sort
-        isRecoveringScope = false
-        activeLoadTask?.cancel()
-        loadTask = nil
-        transitionTask?.cancel()
-        transitionTask = nil
-        prefetchStartTask?.cancel()
-        prefetchStartTask = nil
-        isThumbnailPrefetchLoading = false
-        favoriteLoadTask?.cancel()
-        favoriteLoadTask = nil
-        favoriteState.reset(keepingFavorites: true)
-        let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
+        var active = captureAndCancelTransientOwners(signingOut: true, advanceLoadToken: true)
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating
@@ -1282,79 +1301,32 @@ final class MobileLibraryModel {
         timelineRevision &+= 1
         thumbnailFeed = nil
         searchSuggestions.reset()
-        let smartSearchShutdown = smartSearchSession.stop()
-        let sourceAnalysisShutdown = stopSourceAnalysis()
+        active.stopSearch(stopSourceAnalysis: stopSourceAnalysis)
         thumbnailCache = nil
         originalsCache = nil
         loadState = .initial
-        locationCrawl.resetForTeardown()
-        locationIndex.replaceAll([])
-        locationIndex.updateScanProgress(PhotoLocationScanProgress())
-        var teardownOwners = [
-            AccountTeardownOwner(id: "mobile.platform-tasks", stage: .platformTasks) {
-                await previousTeardown?.value
-                await activeRetry?.value
-                await activeScopeRecovery?.value
-                await activeTransitionTask?.value
-                await activeLoadTask?.value
-                await activePrefetchStartTask?.value
-                await activeFavoriteLoadTask?.value
-                await activeThumbnailUpdateTask?.value
-                await activeRefreshCoalescer.cancel()
-                await activeUploadRefreshCoordinator.cancel()
-                await activeChangeMonitor.reset()
-                await activeThumbnailFeed?.stopPrefetch()
-            },
-            AccountTeardownOwner(id: "shared.smart-search", stage: .smartSearch) {
-                await smartSearchShutdown?.value
-                await sourceAnalysisShutdown?.value
-            },
-            AccountTeardownOwner(id: "mobile.location-crawl", stage: .locationCrawl) {
-                await activeLocationCrawlStarter?.value
-                await activeLocationCrawl.cancel()
-                activeLocationIndex.replaceAll([])
-                activeLocationIndex.updateScanProgress(PhotoLocationScanProgress())
-            },
-            AccountTeardownOwner(id: "shared.photo-backup", stage: .photoBackup) {
-                await activePendingGrid.session?.close()
-                await activePhotoBackup?.shutdown()
-                // The purge deletes the account directory; the pending store must be closed first.
-                activePendingGrid.store?.close()
-            },
-            AccountTeardownOwner(id: "shared.album-sync", stage: .albumSync) {
-                await activeAlbumSync?.shutdown()
-            },
-            AccountTeardownOwner(id: "shared.proton-facade", stage: .facade) {
-                await activeFacade?.shutdown()
-            },
-            AccountTeardownOwner(id: "mobile.originals-cache", stage: .caches) {
-                guard let activeOriginalsCache else { return }
-                await Task.detached(priority: .utility) {
-                    activeOriginalsCache.clearForSignOut()
-                }.value
-            },
-            AccountTeardownOwner(id: "shared.debug-log", stage: .logs) {
-                await DebugLog.flush()
-            },
-        ]
+        active.locationSession.resetForTeardown()
+        active.locationIndex.replaceAll([])
+        active.locationIndex.updateScanProgress(PhotoLocationScanProgress())
+        let purge: AccountOwnerGraphFactory.Shutdown?
         // Transient teardown must not delete account data. Only a claimed sign-out purge may do so.
         if let purgeClaim {
-            teardownOwners.append(
-                AccountTeardownOwner(id: "shared.local-data-claim", stage: .purgeClaims) {
-                    PendingReplacementLedger.clearForSignOut()
-                    let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
-                    guard succeeded else { throw TeardownFailure.purgeFailed }
-                }
-            )
+            purge = {
+                PendingReplacementLedger.clearForSignOut()
+                let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
+                guard succeeded else { throw TeardownFailure.purgeFailed }
+            }
+        } else {
+            purge = nil
         }
 
         let teardownCoordinator: AccountTeardownCoordinator
         do {
-            teardownCoordinator = try AccountTeardownCoordinator(owners: teardownOwners)
+            teardownCoordinator = try active.makeCoordinator(signingOut: true, purge: purge)
         } catch {
             preconditionFailure("Duplicate account teardown owner identifier")
         }
-        teardownTask = Task { @MainActor in
+        teardownTask = Task { @MainActor [purgeClaim] in
             let report = await teardownCoordinator.teardown()
             guard purgeClaim != nil else { return }
             if report.succeeded {
