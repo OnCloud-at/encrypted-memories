@@ -22,8 +22,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let photosClient: EncryptedMemoriesClient
     private let uploadClientUID: String
     private let driveSession: DriveSession
-    private let requestGovernor = ProtonRequestGovernor()
-    private let expensiveUploadAccess = ExpensiveUploadAccess()
+    private let requestGovernor: ProtonRequestGovernor
+    private let expensiveUploadAccess: ExpensiveUploadAccess
+    private let relatedFileOperations: RelatedFileOperations
     /// Keeps uploads that avoid expensive networks apart from uploads that may use them, so `expensiveUploadAccess`
     /// always describes every running upload.
     private nonisolated let uploadNetworkAdmission = UploadNetworkAdmission()
@@ -118,12 +119,119 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         LibraryDatabaseLocation.purgeAccountData(uid: uid, in: policy.libraryDatabaseBaseDirectory)
     }
 
+    /// Dependencies built by sign-in before the bridge starts serving the account.
+    struct PreparedSession: Sendable {
+        let photosClient: EncryptedMemoriesClient
+        let uploadClientUID: String
+        let driveSession: DriveSession
+        let requestGovernor: ProtonRequestGovernor
+        let expensiveUploadAccess: ExpensiveUploadAccess
+        let timelineStore: TimelineMetadataStore?
+        let timelineOrderStore: TimelineOrderMetadataStore?
+        let firstIndexBuildGate: TimelineMetadataStartGate
+        let metadataReconciliation: TimelineMetadataReconciliation
+        let crypto: DriveCrypto
+        let photosVolumeBootstrap: PhotosVolumeBootstrapService
+        let recentlyDeletedStore: RecentlyDeletedListingStore
+        let photoNames: PhotoNameStore?
+        let recentlyDeleted: RecentlyDeletedIdentities
+        let uploadManifestURL: URL
+        let uploadManifestPolicy: LibraryDatabasePolicy
+    }
+
+    /// Existing uploads keep detailed Debug logging. Related-file copies never format private details.
+    struct UploadLogging: Sendable {
+        var logFileDetails = true
+        var log: @Sendable (String) -> Void = DebugLog.log
+
+        func cancellationCleanupFailed(filename: String, error: any Error) {
+            guard logFileDetails else { return }
+            log("[Upload] cancellation cleanup failed file=\(filename) err=\(error)")
+        }
+
+        func completed(nodeID: String, filename: String) {
+            guard logFileDetails else { return }
+            log("[Upload] completed node=\(nodeID.prefix(8))… file=\(filename)")
+        }
+
+        func failed(filename: String, error: any Error) {
+            guard logFileDetails else { return }
+            log("[Upload] FAILED file=\(filename) err=\(error)")
+        }
+    }
+
+    /// SDK operations used by related-file copies. Production and prepared sessions use the same boundary.
+    struct RelatedFileOperations: Sendable {
+        var transfer = ExactDuplicateRelatedFileTransfer()
+        var source: @Sendable (isolated DriveSDKBridge, PhotoUID) async throws -> ExactDuplicateRelatedFileSource = {
+            bridge, uid in
+            try await SDKPhotoMetadataReader.relatedFileSource(for: uid, client: bridge.photosClient)
+        }
+        var stream:
+            @Sendable (
+                isolated DriveSDKBridge, PhotoUID, Bool, @escaping ExactDuplicateRelatedFileTransfer.ByteConsumer
+            ) async throws -> Void = { bridge, uid, allowsExpensiveNetwork, consume in
+                let source = try await bridge.fileSource()
+                try await source.streamOriginalBytes(
+                    uid: uid, allowsExpensiveNetwork: allowsExpensiveNetwork, onChunk: consume, onProgress: { _ in })
+            }
+        var uploadTransport:
+            @Sendable (isolated DriveSDKBridge, PhotoUploadRequest, UploadLogging) async throws -> PhotoUID = {
+                bridge, request, logging in
+                try await bridge.uploadImpl(request, logging: logging, onProgress: { _ in })
+            }
+        var log: @Sendable (String) -> Void = DebugLog.log
+
+        func upload(_ bridge: isolated DriveSDKBridge, _ request: PhotoUploadRequest) async throws -> PhotoUID {
+            do {
+                return try await uploadTransport(bridge, request, UploadLogging(logFileDetails: false, log: log))
+            } catch {
+                var sdkError = error as? ProtonDriveSDKError
+                while let current = sdkError {
+                    if current.domain == .successfulCancellation { throw CancellationError() }
+                    if current.domain == .network, current.type == NSURLErrorDomain, let code = current.primaryCode {
+                        throw URLError(URLError.Code(rawValue: code))
+                    }
+                    sdkError = current.innerError
+                }
+                if DeviceStorage.isOutOfSpace(DriveSDKBridge.originalTransferError(from: error)) {
+                    throw ExactDuplicateRelatedFileTransferError.copyFailed(.capacity)
+                }
+                throw error
+            }
+        }
+
+        static let sdk = Self()
+    }
+
+    init(prepared: PreparedSession, relatedFileOperations: RelatedFileOperations = .sdk) {
+        self.photosClient = prepared.photosClient
+        self.uploadClientUID = prepared.uploadClientUID
+        self.driveSession = prepared.driveSession
+        self.requestGovernor = prepared.requestGovernor
+        self.expensiveUploadAccess = prepared.expensiveUploadAccess
+        self.timelineStore = prepared.timelineStore
+        self.timelineOrderStore = prepared.timelineOrderStore
+        self.firstIndexBuildGate = prepared.firstIndexBuildGate
+        self.metadataReconciliation = prepared.metadataReconciliation
+        self.crypto = prepared.crypto
+        self.photosVolumeBootstrap = prepared.photosVolumeBootstrap
+        self.recentlyDeletedStore = prepared.recentlyDeletedStore
+        self.photoNames = prepared.photoNames
+        self.recentlyDeleted = prepared.recentlyDeleted
+        self.uploadManifestURL = prepared.uploadManifestURL
+        self.uploadManifestPolicy = prepared.uploadManifestPolicy
+        self.relatedFileOperations = relatedFileOperations
+    }
+
     init(
         session: ProtonSession,
         store: SessionKeychainStore,
         policy: ProtonDriveBackendPolicy,
         deviceIdentityStore: DeviceIdentityKeychainStore = DeviceIdentityKeychainStore()
     ) async throws {
+        let requestGovernor = ProtonRequestGovernor()
+        let expensiveUploadAccess = ExpensiveUploadAccess()
         await MainActor.run {
             AccountInfo.shared.beginSession(accountUID: session.uid)
         }
@@ -134,7 +242,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             accountCacheDirectory: policy.sdkCacheDirectory,
             requestGovernor: requestGovernor
         )
-        self.driveSession = driveSession
 
         DebugLog.log("bridge: fetching account data…")
         // Build the account client (fetch + decrypt the user's keys) up front. If the network is unavailable
@@ -156,8 +263,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // Crypto for streaming: the same address keys, kept as (armored, passphrase) so we can
         // derive share/node keys and the per-file content session key on demand.
         let crypto = DriveCrypto(account: account, keyPassword: session.keyPassword)
-        self.crypto = crypto
-        self.photosVolumeBootstrap = PhotosVolumeBootstrapService(session: driveSession, crypto: crypto)
+        let photosVolumeBootstrap = PhotosVolumeBootstrapService(session: driveSession, crypto: crypto)
 
         let caches = policy.sdkCacheDirectory
         try? FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
@@ -167,30 +273,26 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             uid: session.uid,
             in: policy.libraryDatabaseBaseDirectory
         )
-        self.timelineStore = TimelineMetadataStore(
+        let timelineStore = TimelineMetadataStore(
             url: libraryDirectory.appendingPathComponent(LibraryDatabaseLocation.databaseFileName),
             policy: policy.libraryDatabasePolicy
         )
         let firstIndexBuildGate = TimelineMetadataStartGate()
-        self.firstIndexBuildGate = firstIndexBuildGate
-        self.metadataReconciliation = TimelineMetadataReconciliation(startGate: firstIndexBuildGate)
-        self.timelineOrderStore = TimelineOrderMetadataStore(
+        let metadataReconciliation = TimelineMetadataReconciliation(startGate: firstIndexBuildGate)
+        let timelineOrderStore = TimelineOrderMetadataStore(
             url: libraryDirectory.appendingPathComponent(TimelineOrderMetadataStore.databaseFileName),
             policy: policy.libraryDatabasePolicy)
-        self.uploadManifestURL = libraryDirectory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
+        let uploadManifestURL = libraryDirectory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
         let recentlyDeletedStore = RecentlyDeletedListingStore(
             directory: libraryDirectory,
             accountUID: session.uid,
             keyPassword: session.keyPassword
         )
-        self.recentlyDeletedStore = recentlyDeletedStore
         let photoNames = PhotoNameStore(
             directory: libraryDirectory, accountUID: session.uid, keyPassword: session.keyPassword,
             policy: policy.libraryDatabasePolicy)
-        self.photoNames = photoNames
         Task { @MainActor in photoNames?.registerForMemoryPressure(.shared) }
-        self.recentlyDeleted = RecentlyDeletedIdentities(persisted: recentlyDeletedStore.load() ?? .init())
-        self.uploadManifestPolicy = policy.libraryDatabasePolicy
+        let recentlyDeleted = RecentlyDeletedIdentities(persisted: recentlyDeletedStore.load() ?? .init())
         // Keep the optional native SDK cache in memory. SDK 0.31.1 only frees the managed client handle;
         // it does not deterministically dispose its SQLite repository. A persistent native cache can therefore
         // still own WAL files after shutdown and makes the required same-process sign-out purge unsafe.
@@ -199,7 +301,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             accountUID: session.uid,
             deviceIdentifier: deviceIdentityStore.loadOrCreate()
         )
-        self.uploadClientUID = uploadClientUID
         let uploadBufferSize = UploadTransportBufferPolicy.bufferSize()
         let config = ProtonDriveClientConfiguration(
             baseURL: "https://drive-api.proton.me/",  // trailing slash required by the C# core
@@ -209,7 +310,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 try UploadTransportBufferPolicy.makeBoundStreams(bufferSize: uploadBufferSize)
             }
         )
-        self.photosClient = try await EncryptedMemoriesClient(
+        let photosClient = try await EncryptedMemoriesClient(
             configuration: config,
             httpClient: SDKHttpClient(
                 driveSession: driveSession, requestGovernor: requestGovernor,
@@ -219,6 +320,25 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             featureFlagProviderCallback: { _, completion in completion(false) },
             recordMetricEventCallback: { _ in }
         )
+        self.init(
+            prepared: PreparedSession(
+                photosClient: photosClient,
+                uploadClientUID: uploadClientUID,
+                driveSession: driveSession,
+                requestGovernor: requestGovernor,
+                expensiveUploadAccess: expensiveUploadAccess,
+                timelineStore: timelineStore,
+                timelineOrderStore: timelineOrderStore,
+                firstIndexBuildGate: firstIndexBuildGate,
+                metadataReconciliation: metadataReconciliation,
+                crypto: crypto,
+                photosVolumeBootstrap: photosVolumeBootstrap,
+                recentlyDeletedStore: recentlyDeletedStore,
+                photoNames: photoNames,
+                recentlyDeleted: recentlyDeleted,
+                uploadManifestURL: uploadManifestURL,
+                uploadManifestPolicy: policy.libraryDatabasePolicy),
+            relatedFileOperations: .sdk)
         SupportDiagnosticsSources.shared.registerLibrary(self)
         SupportDiagnosticsSources.shared.registerRequests(requestGovernor)
         DebugLog.log("bridge: EncryptedMemoriesClient created ✓")
@@ -2528,6 +2648,7 @@ extension DriveSDKBridge: PhotoUploading {
 
     private func uploadImpl(
         _ request: PhotoUploadRequest,
+        logging: UploadLogging = UploadLogging(),
         onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
         guard !isShutDown else { throw CancellationError() }
@@ -2605,7 +2726,7 @@ extension DriveSDKBridge: PhotoUploading {
                     } catch let cleanupError {
                         // Keep cancellation semantics for the queue. A later same-client preflight
                         // can still replace the draft if Proton could not dispose it right now.
-                        DebugLog.log("[Upload] cancellation cleanup failed file=\(request.name) err=\(cleanupError)")
+                        logging.cancellationCleanupFailed(filename: request.name, error: cleanupError)
                     }
                 }
                 await operation.releaseResources()
@@ -2613,7 +2734,7 @@ extension DriveSDKBridge: PhotoUploading {
             }
             await operation.releaseResources()
             uploadedBytes += max(0, request.fileSize)
-            DebugLog.log("[Upload] completed node=\(ids.nodeUid.nodeID.prefix(8))… file=\(request.name)")
+            logging.completed(nodeID: ids.nodeUid.nodeID, filename: request.name)
             let uid = PhotoUID(volumeID: ids.nodeUid.volumeID, nodeID: ids.nodeUid.nodeID)
             if mainPhotoUid == nil {
                 pendingUploadedNodeIDs.insert(uid.nodeID)
@@ -2624,10 +2745,12 @@ extension DriveSDKBridge: PhotoUploading {
             )
             return uid
         } catch {
-            DebugLog.log("[Upload] FAILED file=\(request.name) err=\(error)")
+            logging.failed(filename: request.name, error: error)
             if error is CancellationError || Self.isSDKCancellation(error) {
                 throw CancellationError()
             }
+            // The related-file boundary maps typed codes; never format an SDK/filesystem message for it.
+            guard logging.logFileDetails else { throw error }
             throw Self.uploadError(from: error, filename: request.name)
         }
     }
@@ -2746,6 +2869,33 @@ extension DriveSDKBridge: PhotoTagAdding {
 extension DriveSDKBridge: EditReplacementRemote {}
 
 extension DriveSDKBridge: ExactDuplicateRemote {
+    func downloadRelatedFile(
+        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
+    ) async throws -> SeriesMemberSource {
+        try await withOpenSession(cause: .duplicatesMerge) { bridge in
+            try await bridge.relatedFileOperations.transfer.download(
+                to: destination, allowsExpensiveNetwork: allowsExpensiveNetwork,
+                source: { try await bridge.relatedFileOperations.source(bridge, uid) },
+                stream: { consume in
+                    try await bridge.relatedFileOperations.stream(bridge, uid, allowsExpensiveNetwork, consume)
+                })
+        }
+    }
+
+    func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
+        // Own staging before session admission, so a closed session also removes its plaintext.
+        try await relatedFileOperations.transfer.upload(request) { checked in
+            try await self.withOpenSession(cause: .duplicatesMerge) { bridge in
+                let reservation = try await bridge.reserveNetwork(
+                    allowsExpensiveNetwork: checked.allowsExpensiveNetwork)
+                defer { reservation.release() }
+                var reserved = checked
+                reserved.networkReservation = reservation
+                return try await bridge.relatedFileOperations.upload(bridge, reserved)
+            }
+        }
+    }
+
     /// The person merges duplicates, so the duplicates take the person's trash path.
     func trashDuplicates(_ uids: [PhotoUID]) async throws {
         try await requestGovernor.causes.run(.duplicatesMerge) { try await trash(uids) }

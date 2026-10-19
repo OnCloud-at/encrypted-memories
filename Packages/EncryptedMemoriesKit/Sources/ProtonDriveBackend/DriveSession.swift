@@ -313,13 +313,15 @@ extension DriveSession {
         url: String,
         token: String?,
         priority: ProtonRequestPriority = ProtonRequestContext.priority,
-        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil
+        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil,
+        allowsExpensiveNetwork: Bool = true
     ) async throws -> Data {
         guard let u = URL(string: url), u.scheme == "https", u.host != nil else {
             throw ProtonAuthError.invalidResponse
         }
         var req = URLRequest(url: u)
         req.httpMethod = "GET"
+        req.allowsExpensiveNetworkAccess = allowsExpensiveNetwork
         if let token {
             req.setValue(token, forHTTPHeaderField: "pm-storage-token")
         } else if isTrustedAPIURL(u) {
