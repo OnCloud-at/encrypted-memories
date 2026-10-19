@@ -305,6 +305,10 @@ struct MobilePhotoViewer: View {
             editedOriginal.pageChanged(to: uid)
             lookUpEditedOriginal()
         }
+        // The library may still load when the viewer opens; the photo on screen then asks as soon as it is ready.
+        .onChange(of: editedOriginalProvider != nil) { _, available in
+            if available, let provider = editedOriginalProvider { editedOriginalLookup.providerAvailable(provider) }
+        }
         // A full-screen cover over the viewer, such as the series selection, ends the access of the shown copy.
         .onAppear { visibleThumbnail?.reopen(currentBaseItem?.uid) }
         .onAppear { lookUpEditedOriginal() }
@@ -942,11 +946,13 @@ struct MobilePhotoViewer: View {
 
     /// Asks for the original of the settled page, once it stayed for the dwell; see `EditedPhotoOriginalLookup`.
     private func lookUpEditedOriginal() {
-        editedOriginalLookup.settled(
-            on: currentBaseItem, provider: libraryModel.backend as? any EditedPhotoOriginalProviding
-        ) { base, original in
+        editedOriginalLookup.settled(on: currentBaseItem, provider: editedOriginalProvider) { base, original in
             editedOriginal.record(original, of: base.uid)
         }
+    }
+
+    private var editedOriginalProvider: (any EditedPhotoOriginalProviding)? {
+        libraryModel.backend as? any EditedPhotoOriginalProviding
     }
 
     @MainActor private func loadBurst(for item: PhotoItem) async {
