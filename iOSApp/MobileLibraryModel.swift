@@ -362,33 +362,42 @@ final class MobileLibraryModel {
 
     // MARK: - Pending grid
 
+    /// Starts the pending grid and returns the session and store that this start replaced. The caller closes them
+    /// (`RetiredPendingGrid.close`). The previous photo backup controller shuts down only in that close; without a
+    /// replaced pair nothing shuts it down here.
     private func configurePendingGrid(
         store: PendingBackupManifestStore?,
         photoBackup: PhotoLibraryBackupController,
         client: ProtonClientFacade,
         feed: UIKitThumbnailFeed
-    ) {
+    ) -> RetiredPendingGrid {
         let albums = client.albums
-        startPendingGrid(
+        return startPendingGrid(
             store: store, photoBackup: photoBackup, remote: ProtonPendingRemoteEffects(facade: client), feed: feed,
-            albumAdds: { await albums.setPendingAlbumAdds($0) })
+            albumAdds: { await albums.setPendingAlbumAdds($0) }
+        ).replaced
     }
 
-    /// Shows the pending photos of `photoBackup` in the grid. Without `feed`, their thumbnails do not load.
-    @discardableResult
+    /// Shows the pending photos of `photoBackup` in the grid. Without `feed`, their thumbnails do not load. A live
+    /// session that this start replaces leaves its presentation and undo notice behind, so they are cleared first,
+    /// as `retirePendingGrid()` does. The caller closes `replaced` of the result.
     private func startPendingGrid(
         store: PendingBackupManifestStore?,
         photoBackup: PhotoLibraryBackupController,
         remote: any PendingRemoteEffects,
         feed: UIKitThumbnailFeed?,
         albumAdds: (@Sendable (@escaping @Sendable ([PhotoUID], String) async -> Bool) async -> Void)? = nil
-    ) -> PendingGridSession? {
-        pendingGridConnection.start(
+    ) -> PendingGridStart {
+        if pendingGridConnection.session != nil { clearPendingPresentation() }
+        return pendingGridConnection.start(
             store: store,
             makeSession: { PendingGridSession(store: $0, photoBackup: photoBackup, remote: remote) },
             albumAdds: albumAdds,
             prepare: { session in
-                session.presenter.onChange = { [weak self] presentation in
+                // A replaced or retired session still publishes when it closes. Only the session that the connection
+                // shows may change the presentation.
+                session.presenter.onChange = pendingGridConnection.presentationHandler(for: session) {
+                    [weak self] presentation in
                     self?.pendingPresentation = presentation
                 }
                 if let feed { session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request) }
@@ -399,11 +408,15 @@ final class MobileLibraryModel {
 
     /// Retires the pending grid (`PendingGridConnection.retire()`) and clears the iOS grid presentation and the
     /// undo notice.
-    private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
+    private func retirePendingGrid() -> RetiredPendingGrid {
         let retired = pendingGridConnection.retire()
+        clearPendingPresentation()
+        return retired
+    }
+
+    private func clearPendingPresentation() {
         pendingPresentation = .empty
         undoNotice = nil
-        return retired
     }
 
     func configure(session: ProtonSession?, store: SessionKeychainStore) {
@@ -1395,8 +1408,11 @@ final class MobileLibraryModel {
         backend = nil
         facade = nil
         albumActions = nil
+        let previousPhotoBackup = photoBackup
         photoBackup = nil
-        _ = retirePendingGrid()
+        // No current flow is known to leave a pair here. A pair that is still there is closed by the load below, in
+        // the teardown order.
+        let retiredPendingGrid = retirePendingGrid()
         albumSync = nil
         timelineRemovals = TimelineRemovalOverlay()
         timelineMutationGeneration &+= 1
@@ -1436,6 +1452,7 @@ final class MobileLibraryModel {
         UIKitMemoryPressureCoordinator.shared.attachByteCache(cache)
 
         loadTask = Task { [weak self] in
+            await retiredPendingGrid.close(whileStoreOpen: { await previousPhotoBackup?.shutdown() })
             guard let self else { return }
             do {
                 // Suggestions validate locations as part of their content identity. Restore the existing
@@ -1512,12 +1529,14 @@ final class MobileLibraryModel {
                     }
                 }
                 self.albumActions = AlbumActionCoordinator(repository: client.albums)
+                let replacedPhotoBackup = self.photoBackup
                 self.photoBackup = photoBackup
                 PhotoBackupBackgroundCoordinator.shared.configure(controller: photoBackup)
                 self.albumSync = albumSync
                 self.backend = backend
                 self.thumbnailFeed = feed
-                self.configurePendingGrid(store: pendingStore, photoBackup: photoBackup, client: client, feed: feed)
+                let replacedPendingGrid = self.configurePendingGrid(
+                    store: pendingStore, photoBackup: photoBackup, client: client, feed: feed)
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }
@@ -1526,6 +1545,11 @@ final class MobileLibraryModel {
                 UIKitMemoryPressureCoordinator.shared.attachFeed(feed)
                 self.configureSourceAnalysis(client: client, feed: feed)
                 self.configureSmartSearch(session: session, client: client, feed: feed)
+                // No current flow is known to hand back a non-empty pair here. A pair that a replacing start left is
+                // closed here, after every assignment of this block. The guard re-checks the load, as the guard after
+                // the earlier await does.
+                await replacedPendingGrid.close(whileStoreOpen: { await replacedPhotoBackup?.shutdown() })
+                guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 try await loadInitialTimeline(
                     backend: backend, feed: feed, session: session, loadGeneration: loadGeneration)
             } catch let error as any LibraryChangeTerminalError {
@@ -1968,7 +1992,8 @@ final class MobileLibraryModel {
             remote: any PendingRemoteEffects
         ) {
             photoBackup = controller
-            startPendingGrid(store: store, photoBackup: controller, remote: remote, feed: nil)
+            let replaced = startPendingGrid(store: store, photoBackup: controller, remote: remote, feed: nil).replaced
+            precondition(replaced.isEmpty, "A test installs the pending grid into a model that has none.")
         }
 
         func installIsolatedAlbumSyncForTesting(_ controller: AlbumSyncController) {

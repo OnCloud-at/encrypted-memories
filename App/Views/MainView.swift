@@ -1107,7 +1107,9 @@ struct MainView: View {
         guard let session = model.pendingGrid else { return }
         session.attachFeed(
             timelineModel.feed, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
-        session.presenter.onChange = { [timelineModel] presentation in
+        // A replaced or retired session publishes an empty presentation when it closes. Only the session that the
+        // connection shows may write into this timeline model.
+        session.presenter.onChange = model.pendingPresentationHandler(for: session) { [timelineModel] presentation in
             timelineModel.setPendingPresentation(presentation)
         }
         timelineModel.setPendingPresentation(session.presenter.current)
