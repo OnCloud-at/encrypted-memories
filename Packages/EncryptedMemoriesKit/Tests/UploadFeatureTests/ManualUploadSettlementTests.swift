@@ -365,6 +365,60 @@ final class ManualUploadSettlementTests: XCTestCase {
         return false
     }
 
+    func testManualHealthDoesNotProbeDeniedSelect() throws {
+        let store = try store()
+        defer { store.close() }
+        XCTAssertTrue(store.isOperational())
+        try withDeniedSQLiteSelect(in: store) {
+            XCTAssertTrue(store.isOperational(), "manual health checks only connection state")
+        }
+        XCTAssertTrue(store.isOperational(), "denied SELECT must not record a new failure")
+    }
+
+    func testManualCloseRefusesReadsAndWritesAndPreservesRows() async throws {
+        let id = try await seedCompletedRow()
+        let durableStore = try store()
+        let record = try XCTUnwrap(durableStore.record(for: id))
+        durableStore.close()
+        XCTAssertFalse(durableStore.isOperational())
+        XCTAssertNil(durableStore.record(for: id))
+        XCTAssertTrue(durableStore.allRecords().isEmpty)
+        XCTAssertFalse(durableStore.upsert(record))
+        XCTAssertFalse(durableStore.remove(queueItemID: id))
+        let reopened = try store()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.record(for: id), record)
+    }
+
+    func testManualDecodeFailureKeepsReadsAndWritesFailClosedAfterRepair() async throws {
+        let id = try await seedCompletedRow()
+        let durableStore = try store()
+        defer { durableStore.close() }
+        let record = try XCTUnwrap(durableStore.record(for: id))
+        var handle: OpaquePointer?
+        let url = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE manual_upload_settlement SET payload='{';", nil, nil, nil), SQLITE_OK)
+        XCTAssertNil(durableStore.record(for: id))
+        XCTAssertFalse(durableStore.isOperational())
+
+        var statement: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(handle, "UPDATE manual_upload_settlement SET payload=?;", -1, &statement, nil), SQLITE_OK
+        )
+        let payload = String(decoding: try JSONEncoder().encode(record), as: UTF8.self)
+        sqlite3_bind_text(statement, 1, payload, -1, SQLiteStoreSchemaGate.transientDestructor)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        sqlite3_finalize(statement)
+        XCTAssertNil(durableStore.record(for: id))
+        XCTAssertTrue(durableStore.allRecords().isEmpty)
+        XCTAssertFalse(durableStore.upsert(record))
+        XCTAssertFalse(durableStore.remove(queueItemID: id))
+        XCTAssertFalse(durableStore.isOperational())
+    }
+
     func testMarkerlessSettlementShapeFailsClosedWithoutRepairingIt() throws {
         let url = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
         var handle: OpaquePointer?

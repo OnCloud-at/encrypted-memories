@@ -19,6 +19,28 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         connection.close()
     }
 
+    func testStateOnlyOperationalCheckSkipsSQLButStillRejectsFailureAndClose() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            sqlite3_set_authorizer(
+                connection.database,
+                { _, action, _, _, _, _ in action == SQLITE_SELECT ? SQLITE_DENY : SQLITE_OK }, nil)
+        }
+        XCTAssertTrue(connection.isOperational(probeDatabase: false))
+        connection.withLock { XCTAssertFalse(connection.operationFailed) }
+        let probe: () -> Bool = connection.isOperational
+        XCTAssertFalse(probe(), "the existing no-argument method still probes SQLite")
+        connection.withLock { XCTAssertTrue(connection.operationFailed) }
+        XCTAssertFalse(connection.isOperational(probeDatabase: false), "state-only checks reject recorded failure")
+        connection.close()
+        XCTAssertFalse(connection.isOperational(probeDatabase: false))
+
+        let healthy = try makeConnection()
+        healthy.close()
+        XCTAssertFalse(healthy.isOperational(probeDatabase: false), "state-only checks reject a closed healthy handle")
+    }
+
     func testFailureStaysStickyAfterASuccessfulPredicate() throws {
         let connection = try makeConnection()
         defer { connection.close() }
