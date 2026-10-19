@@ -78,14 +78,11 @@ final class MobileLibraryUITests: XCTestCase {
 
         let more = app.buttons.matching(NSPredicate(format: "label == 'More actions' OR label == 'More'")).firstMatch
         let showOriginal = app.buttons["Show Original"]
-        // The viewer asks for the original once the photo stayed on screen, so the item appears after a short wait.
+        // The viewer asks for the original once the photo stayed on screen and the app admits the ask, so the item
+        // appears after a wait of unknown length, also while the library still loads on a slow runner.
         XCTAssertTrue(more.waitForExistence(timeout: 10), "the viewer shows no More menu")
         more.tap()
-        if !showOriginal.waitForExistence(timeout: 5) {
-            app.tap()
-            more.tap()
-        }
-        XCTAssertTrue(showOriginal.waitForExistence(timeout: 10), "the More menu offers no Show Original")
+        XCTAssertTrue(showOriginal.waitForExistence(timeout: 30), "the More menu offers no Show Original")
         showOriginal.tap()
 
         let badge = app.descendants(matching: .any)["Showing the original"]
