@@ -157,6 +157,39 @@ struct SDKAlbumCatalogBackendTests {
         #expect(source.additionalMetadata.map(\.name) == ["Camera"], "the copy replaces no earlier upload")
     }
 
+    @Test(arguments: [nil, -1, 1234] as [Int64?])
+    func relatedFileSourceUsesThePhotoRevisionClaimedSizeFromOneRead(size: Int64?) async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(
+            id: "related", albumIDs: [],
+            additionalMetadata: [
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data("camera".utf8)),
+                AdditionalMetadata(name: "iOS.photos", utf8JsonValue: Data("source-asset".utf8)),
+                AdditionalMetadata(name: "EncryptedMemories.lineage", utf8JsonValue: Data("earlier-node".utf8)),
+            ], claimedSize: size)
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: .photo(photo)])
+        let source = try await SDKPhotoMetadataReader.relatedFileSource(
+            for: PhotoUID(volumeID: photo.uid.volumeID, nodeID: photo.uid.nodeID), client: client)
+        #expect(source.claimedSize == size)
+        #expect(source.metadata.filename == "related.jpg")
+        #expect(
+            source.metadata.additionalMetadata == [
+                PhotoUploadAdditionalMetadata(name: "Camera", utf8JsonValue: Data("camera".utf8))
+            ])
+        #expect(await client.getNodeCalls == 1)
+    }
+
+    @Test func relatedFileSourceRejectsAFileNodeInsteadOfGuessingACaptureTime() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let file = fileNode(id: "related-file")
+        await client.configureNodes([file.uid.sdkCompatibleIdentifier: .file(file)])
+        await #expect(throws: CocoaError(.fileReadUnknown)) {
+            try await SDKPhotoMetadataReader.relatedFileSource(
+                for: PhotoUID(volumeID: file.uid.volumeID, nodeID: file.uid.nodeID), client: client)
+        }
+        #expect(await client.getNodeCalls == 1)
+    }
+
     @Test func ownedCatalogMapsSDKMetadataSortsAndKeepsDegradedNodesVisible() async throws {
         let client = FakeSDKPhotoCatalogClient()
         let z = albumNode(id: "z", name: .success("Zoo"), photoCount: 7, coverID: "cover-z")
@@ -869,7 +902,7 @@ private func fileNode(id: String) -> FileNode {
 
 private func photoNode(
     id: String, albumIDs: [SDKNodeUid], volumeID: String = "volume", captureTime: TimeInterval = 1,
-    additionalMetadata: [AdditionalMetadata]? = nil
+    additionalMetadata: [AdditionalMetadata]? = nil, claimedSize: Int64? = 1
 ) -> PhotoNode {
     let uid = SDKNodeUid(volumeID: volumeID, nodeID: id)
     let revision = FileRevision(
@@ -877,7 +910,7 @@ private func photoNode(
         state: .active,
         creationTime: 1,
         storageSize: 1,
-        claimedSize: 1,
+        claimedSize: claimedSize,
         claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
         claimedModificationTime: nil,
         thumbnails: [],

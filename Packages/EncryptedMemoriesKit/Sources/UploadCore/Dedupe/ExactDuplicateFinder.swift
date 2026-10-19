@@ -25,6 +25,18 @@ public protocol ExactDuplicateRemote: PhotoCarryOverRemote {
 /// A remote that has no related-file transfer implementation must never report a successful copy.
 public enum ExactDuplicateRelatedFileTransferError: Error, Sendable, Equatable {
     case unavailable
+    case copyFailed(Failure)
+    case waitingForWiFi
+
+    public enum Failure: Sendable, Equatable {
+        case staging
+        case destination
+        case size
+        case capacity
+        case integrity
+        case transfer
+        case cleanup
+    }
 }
 
 extension ExactDuplicateRemote {
