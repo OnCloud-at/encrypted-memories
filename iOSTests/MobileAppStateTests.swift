@@ -1203,6 +1203,225 @@ private func waitUntil(
         await fixture.feed.stopPrefetch()
     }
 
+    @Test func staleUploadScopeLossKeepsTheReplacementSession() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("terminal-refresh") } }
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: {
+                    await latch.block("terminal-refresh")
+                    throw MobileOwnerScopeLoss()
+                }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        let revision = model.scopePresentationRevision
+        model.refreshAfterLocalUpload()
+        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-refresh") })
+        let replacement = ProtonSession(
+            uid: "replacement-fixture", accessToken: "fixture-access", refreshToken: "fixture-refresh",
+            keyPassword: "fixture-key")
+        model.installIsolatedLibrary(
+            session: replacement, store: SessionKeychainStore(), backend: fixture.backend,
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        await latch.release("terminal-refresh")
+
+        let recoveredReplacement = await waitForMobileOwner(timeout: .seconds(1)) {
+            model.scopePresentationRevision != revision
+        }
+        #expect(!recoveredReplacement)
+        #expect(model.scopePresentationRevision == revision)
+        #expect(!model.isRecoveringScope)
+        #expect(model.backend != nil)
+        #expect(model.items == fixture.items)
+        model.configure(session: nil, store: SessionKeychainStore())
+    }
+
+    @Test func repeatedTerminalSignalsScheduleOneRecovery() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let latch = MobileRetryLifecycleLatch()
+        defer {
+            Task {
+                await latch.release("terminal-refresh")
+                await latch.release("terminal-token")
+                await latch.release("load")
+            }
+        }
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: {
+                    await latch.block("terminal-refresh")
+                    throw MobileOwnerScopeLoss()
+                },
+                changeTokenLoader: {
+                    await latch.block("terminal-token")
+                    throw MobileOwnerScopeLoss()
+                }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        model.installIsolatedInitialLoadForTesting { await latch.block("load") }
+        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        let revision = model.scopePresentationRevision
+        model.settleIsolatedLibraryForTesting()
+        model.setApplicationActive(true)
+        model.refreshAfterLocalUpload()
+        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-refresh") })
+        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-token") })
+        await latch.release("terminal-refresh")
+        await latch.release("terminal-token")
+        try #require(await waitForMobileOwner { model.isRecoveringScope && model.backend == nil })
+        model.refreshAfterLocalUpload()
+        let recoveredTwice = await waitForMobileOwner(timeout: .seconds(1)) {
+            model.scopePresentationRevision != revision &+ 1
+        }
+        #expect(!recoveredTwice)
+        #expect(model.scopePresentationRevision == revision &+ 1)
+        model.configure(session: nil, store: SessionKeychainStore())
+        await latch.release("load")
+    }
+
+    @Test func terminalMonitorDoesNotAdmitAnotherActiveRecovery() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        let latch = MobileRetryLifecycleLatch()
+        defer {
+            Task {
+                await latch.release("terminal-token")
+                await latch.release("load")
+            }
+        }
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: { throw MobileOwnerScopeLoss() },
+                changeTokenLoader: {
+                    await latch.block("terminal-token")
+                    throw MobileOwnerScopeLoss()
+                }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        model.installIsolatedInitialLoadForTesting { await latch.block("load") }
+        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        model.settleIsolatedLibraryForTesting()
+        model.setApplicationActive(true)
+        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-token") })
+        let revision = model.scopePresentationRevision
+        model.refreshAfterLocalUpload()
+        try #require(await waitForMobileOwner { model.isRecoveringScope && model.backend == nil })
+        // Retirement is held before monitor reset. Its terminal callback reaches admission with recovery active.
+        await latch.release("terminal-token")
+        let admittedAgain = await waitForMobileOwner(timeout: .seconds(1)) {
+            model.scopePresentationRevision != revision &+ 1
+        }
+        #expect(!admittedAgain)
+        #expect(model.scopePresentationRevision == revision &+ 1)
+        model.configure(session: nil, store: SessionKeychainStore())
+        await latch.release("load")
+    }
+
+    @Test func terminalUploadDoesNotAdmitAReplacedLoadGeneration() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        let latch = MobileRetryLifecycleLatch()
+        defer {
+            Task {
+                await latch.release("terminal-refresh")
+                await latch.release("load")
+            }
+        }
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: {
+                    await latch.block("terminal-refresh")
+                    throw MobileOwnerScopeLoss()
+                }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        model.installIsolatedInitialLoadForTesting { await latch.block("load") }
+        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        model.refreshAfterLocalUpload()
+        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-refresh") })
+        // Teardown advances the load generation. The held load keeps upload cancellation from running yet.
+        model.configure(session: nil, store: SessionKeychainStore())
+        fixture.install(into: model)
+        let revision = model.scopePresentationRevision
+        // A typed terminal catch reaches the observer without the success path's lease validation.
+        await latch.release("terminal-refresh")
+        let admitted = await waitForMobileOwner(timeout: .seconds(1)) {
+            model.scopePresentationRevision != revision
+        }
+        #expect(!admitted)
+        #expect(!model.isRecoveringScope)
+        #expect(model.backend != nil)
+        #expect(model.items == fixture.items)
+        model.configure(session: nil, store: SessionKeychainStore())
+        await latch.release("load")
+    }
+
+    @Test func nonScopeUploadFailureDoesNotRegisterRecovery() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("load") } }
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: {
+                    await latch.record("refresh")
+                    throw MobileFixtureError.unavailable
+                }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        model.installIsolatedInitialLoadForTesting { await latch.block("load") }
+        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        let revision = model.scopePresentationRevision
+        model.refreshAfterLocalUpload()
+        try #require(await waitForMobileOwner { await latch.hasEntered("refresh") })
+        let recovered = await waitForMobileOwner(timeout: .seconds(1)) {
+            model.scopePresentationRevision != revision
+        }
+        #expect(!recovered)
+        #expect(!model.isRecoveringScope)
+        #expect(model.backend != nil)
+        #expect(model.items == fixture.items)
+        model.configure(session: nil, store: SessionKeychainStore())
+        await latch.release("load")
+    }
+
+    @Test func concurrentAndRepeatedTeardownRunsThePurgeStageOnce() async throws {
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("purge") } }
+        let coordinator = try AccountTeardownCoordinator(owners: [
+            AccountTeardownOwner(id: "purge", stage: .purgeClaims) { await latch.block("purge") }
+        ])
+        let first = Task { await coordinator.teardown() }
+        try #require(await waitForMobileOwner { await latch.hasEntered("purge") })
+        let second = Task { await coordinator.teardown() }
+        let purgedConcurrently = await waitForMobileOwner(timeout: .seconds(1)) {
+            await latch.events().filter { $0 == "purge" }.count > 1
+        }
+        #expect(!purgedConcurrently)
+        await latch.release("purge")
+        let firstReport = await first.value
+        let secondReport = await second.value
+        let repeatedReport = await coordinator.teardown()
+        #expect(firstReport == secondReport)
+        #expect(firstReport == repeatedReport)
+        #expect(firstReport.succeeded)
+        let purgeCount = await latch.events().filter { $0 == "purge" }.count
+        #expect(purgeCount == 1, "purge calls: \(purgeCount)")
+    }
+
     @Test func retryOwnerGraphJoinsEachOwnerBeforeReturning() async throws {
         let latch = MobileRetryLifecycleLatch()
         let completed = MobileRetryCompletionLatch()
@@ -1262,8 +1481,62 @@ private func waitUntil(
     }
 }
 
+private struct MobileOwnerScopeLoss: LibraryChangeTerminalError {}
+
 // XCTest completes before Swift Testing starts. Keep the shared claimed-purge marker in that serial phase.
 final class MobileAccountOwnerAdapterTests: XCTestCase {
+    @MainActor func testSignOutFinishesAfterUploadRefreshLosesScope() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: { throw MobileOwnerScopeLoss() }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("load") } }
+        model.installIsolatedInitialLoadForTesting { await latch.block("load") }
+        let loadEntered = await waitForMobileOwner { await latch.hasEntered("load") }
+        XCTAssertTrue(loadEntered)
+        guard loadEntered else { return }
+        let revision = model.scopePresentationRevision
+        model.refreshAfterLocalUpload()
+        let retirementStarted = await waitForMobileOwner {
+            model.backend == nil && model.isRecoveringScope
+        }
+        XCTAssertTrue(retirementStarted)
+        guard retirementStarted else { return }
+        XCTAssertEqual(model.scopePresentationRevision, revision &+ 1)
+
+        // The hosted test owns this synthetic account and marker; it never opens a network backend.
+        let root = try XCTUnwrap(BackupLocalDataPurge.localDataRoots().first)
+        let marker = root.appendingPathComponent("owner-join-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data([1]).write(to: marker)
+        defer {
+            BackupLocalDataPurge.markPurgeCompleted()
+            try? FileManager.default.removeItem(at: marker)
+        }
+        BackupLocalDataPurge.requestPurgeOnSignOut()
+        model.configure(session: nil, store: SessionKeychainStore())
+        XCTAssertTrue(model.isSigningOut)
+        let completedWhileHeld = await waitForMobileOwner(timeout: .seconds(1)) {
+            !model.isSigningOut || model.signOutCleanupFailed
+        }
+        XCTAssertFalse(completedWhileHeld)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        await latch.release("load")
+        let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
+        XCTAssertTrue(completed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
+        XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
+        XCTAssertEqual(model.scopePresentationRevision, revision &+ 1)
+        XCTAssertNil(model.backend)
+    }
+
     @MainActor func testSignOutJoinsRetryBeforePurging() async throws {
         try await verifySignOut(startRetry: true)
     }

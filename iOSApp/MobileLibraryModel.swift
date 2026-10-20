@@ -950,13 +950,23 @@ final class MobileLibraryModel {
         expectedSession: ProtonSession? = nil,
         expectedLoadGeneration: Int? = nil
     ) async {
-        guard let currentSession = session, let store else { return }
+        let task = scheduleScopeRecovery(
+            expectedSession: expectedSession, expectedLoadGeneration: expectedLoadGeneration)
+        await task?.value
+    }
+
+    /// Attempts synchronous recovery admission and returns the retained task, if any; callers choose whether to join.
+    @discardableResult
+    private func scheduleScopeRecovery(
+        expectedSession: ProtonSession?, expectedLoadGeneration: Int?
+    ) -> Task<Void, Never>? {
+        guard let currentSession = session, let store else { return nil }
         scheduleScopeRecovery(
             failedSession: expectedSession ?? currentSession,
             failedStore: store,
             failedLoadGeneration: expectedLoadGeneration ?? loadToken
         )
-        _ = await scopeRecoveryCoordinator.joinIfActive()
+        return scopeRecoveryCoordinator.task
     }
 
     private func scopeRecoveryIsCurrent(_ identity: MobileScopeRecoveryIdentity) -> Bool {
@@ -1004,7 +1014,8 @@ final class MobileLibraryModel {
                 },
                 observer: { [weak self] attempt in
                     guard attempt.failureReason == .scopeAccessLost else { return }
-                    await self?.recoverAfterScopeAccessLoss(
+                    // Retirement joins this refresh worker, so return after registering recovery.
+                    await self?.scheduleScopeRecovery(
                         expectedSession: recoverySession,
                         expectedLoadGeneration: refreshLease.loadToken
                     )
