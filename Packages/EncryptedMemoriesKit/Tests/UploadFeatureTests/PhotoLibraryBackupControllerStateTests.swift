@@ -2047,6 +2047,69 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        func testAStartAfterACancelledFirstPathTimerStillWaitsForTheUnknownPath() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-cancel-restart", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let firstWait = HeldBackupSleepClock(clock: BackupTestClock())
+            let nextWait = HeldBackupSleepClock(clock: BackupTestClock())
+            defer {
+                firstWait.releaseAll()
+                nextWait.releaseAll()
+            }
+            let timerStarted = expectation(description: "The first timer entered its held sleep")
+            let timerEnded = expectation(description: "The cancelled timer released its task capture")
+            controller.replaceFirstNetworkPathSleepForTesting {
+                [lifetime = FirstPathTimerLifetime(ended: timerEnded)] _ in
+                timerStarted.fulfill()
+                try? await firstWait.sleep(for: 60)
+                withExtendedLifetime(lifetime) {}
+            }
+            let scans = PassCounter()
+            let scanned = expectation(description: "The later pass scanned after the first path arrived")
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                scanned.fulfill()
+            }
+            let windowEnded = expectation(description: "The expired background window ended")
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                windowEnded.fulfill()
+            }
+            await fulfillment(of: [timerStarted], timeout: 5)
+            XCTAssertEqual(controller.deferredStartWaiterCountForTesting, 1)
+            XCTAssertFalse(controller.isSyncing)
+
+            // Drop the controller's copy. The old task alone retains the first sleep's capture.
+            controller.replaceFirstNetworkPathSleepForTesting { _ in try? await nextWait.sleep(for: 60) }
+            window.cancel()
+            await fulfillment(of: [windowEnded], timeout: 5)
+            await window.value
+            firstWait.releaseAll()
+            await fulfillment(of: [timerEnded], timeout: 5)
+
+            controller.syncNow()
+
+            XCTAssertFalse(controller.isSyncing, "A cancelled timer must not end the next start's first-path wait")
+            XCTAssertEqual(scans.count, 0, "The unknown path must still defer the later pass")
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            await fulfillment(of: [scanned], timeout: 5)
+            await controller.waitForSyncRunCompletionForTesting()
+            XCTAssertEqual(scans.count, 1)
+            await controller.shutdown()
+        }
+
+        private final class FirstPathTimerLifetime: Sendable {
+            private let ended: XCTestExpectation
+
+            init(ended: XCTestExpectation) { self.ended = ended }
+
+            deinit { ended.fulfill() }
+        }
+
         func testAnExpiringBackgroundWindowKeepsADeferredForegroundPass() async throws {
             let runtime = LibraryRuntimeState.makeProcessState()
             let fixture = try makeWiFiWaitFixture(
