@@ -738,6 +738,67 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertNotNil(reopened.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
+    func testUnreadablePendingStatePreservesReceiptBeforeIdentitySettlement() async throws {
+        let source = source("pending-failure")
+        let descriptor = descriptor(source: source, filename: "pending-failure.heic", fileExists: false)
+        let entry = seedEntry(reconciliation: reconciliation(descriptor: descriptor))
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL()))
+        defer { queue.close() }
+        XCTAssertTrue(queue.upsert(entry))
+        let pendingURL = tempDirectory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        let key = PendingSourceKey(source)
+        let states = try XCTUnwrap(
+            pending.exclude(
+                [PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: modified))
+        try executeSQL("UPDATE source_state SET desired='invalid';", at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+        recorder.replacementLedger.record(
+            key, revision: entry.revision, replaces: [PhotoUID(volumeID: "remote-volume", nodeID: "earlier")])
+        let identities = RecoveryIdentityRecorder()
+        let resolver = RecoveryResourceResolver(.failure(UploadError.backend("must not resolve")))
+        do {
+            _ = try await UploadRemoteCommitRecovery(
+                queue: queue, resolver: resolver, identityResolver: identities, events: recorder
+            ).settleAll()
+            XCTFail("an unreadable exclusion must retain the remote commit receipt")
+        } catch {
+            XCTAssertEqual(error as? UploadRemoteCommitRecoveryError, .storeUnavailable)
+        }
+        XCTAssertTrue(identities.records.isEmpty)
+        XCTAssertTrue(recorder.replacementLedger.replacementHandoffs().isEmpty)
+        XCTAssertFalse(pending.isOperational())
+        XCTAssertTrue(pending.unacknowledgedHandoffs().isEmpty, "the handoff insert must roll back")
+        XCTAssertEqual(
+            queue.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation,
+            entry.remoteCommitReconciliation)
+        recorder.finish()
+        var events: [PendingRuntimeEvent] = []
+        for await event in recorder.events { events.append(event) }
+        XCTAssertTrue(events.isEmpty, "a failed handoff must not publish success")
+        pending.close()
+        queue.close()
+
+        try executeSQL("UPDATE source_state SET desired='excluded';", at: pendingURL)
+        let reopenedPending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { reopenedPending.close() }
+        XCTAssertEqual(reopenedPending.sourceStates(), states)
+        let reopenedQueue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL()))
+        defer { reopenedQueue.close() }
+        XCTAssertNotNil(reopenedQueue.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        let retryRecorder = PendingBackupEventRecorder(store: reopenedPending)
+        defer { retryRecorder.finish() }
+        let settled = try await UploadRemoteCommitRecovery(
+            queue: reopenedQueue, resolver: resolver, identityResolver: identities, events: retryRecorder
+        ).settleAll()
+        XCTAssertEqual(settled, 1)
+        XCTAssertNil(reopenedQueue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(identities.records.count, 1)
+        XCTAssertTrue(reopenedPending.sourceState(for: key)?.needsRemoteTrash ?? false)
+        XCTAssertEqual(reopenedPending.sourceState(for: key)?.remote?.nodeID, "remote-primary")
+        XCTAssertEqual(resolver.callCount, 0)
+    }
+
     func testMalformedJSONAndSQLReadFailureAreNotDecodedAsNoReceipt() throws {
         let source = source("malformed")
         let descriptor = descriptor(source: source, filename: "malformed.heic", fileExists: false)

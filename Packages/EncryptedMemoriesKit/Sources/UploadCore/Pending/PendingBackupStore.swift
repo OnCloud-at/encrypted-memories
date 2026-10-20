@@ -128,7 +128,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                             sqlite3_bind_double(stmt, 7, handoff.createdAt.timeIntervalSince1970)
                         })
                 else { return false }
-                guard let state = sourceStateLocked(handoff.key), state.desired == .excluded else { return true }
+                guard case .readable(let current) = sourceStateLocked(handoff.key) else { return false }
+                guard let state = current, state.desired == .excluded else { return true }
                 outcome = .excludedRemoteNeedsTrash
                 // The delete of an unfinished edit still owes the trash of the earlier upload. That photo stays the
                 // state's photo; its completed trash moves on to this handoff, see `completeEffect`.
@@ -255,11 +256,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     // MARK: - Desired state
 
     public func sourceStates() -> [PendingSourceState] {
-        connection.withLock { sourceStatesLocked(where: nil) }
+        connection.withLock { sourceStatesLocked(where: nil).states }
     }
 
     public func sourceState(for key: PendingSourceKey) -> PendingSourceState? {
-        connection.withLock { sourceStateLocked(key) }
+        connection.withLock { sourceStateLocked(key).state }
     }
 
     /// Sources with an effect that is due by `date`.
@@ -267,7 +268,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         connection.withLock {
             sourceStatesLocked(
                 where: "(needs_queue_sync=1 OR needs_remote_trash=1 OR needs_remote_restore=1) AND next_attempt_at <= ?"
-            ) { sqlite3_bind_double($0, 1, date.timeIntervalSince1970) }
+            ) { sqlite3_bind_double($0, 1, date.timeIntervalSince1970) }.states
         }
     }
 
@@ -326,7 +327,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             var states: [PendingSourceState] = []
             let committed = transaction {
                 for request in requests {
-                    let previous = sourceStateLocked(request.key)
+                    guard case .readable(let previous) = sourceStateLocked(request.key) else { return false }
                     // A commit of the deleted revision is already durable here, even when its event has not reached
                     // the coordinator yet. The earlier upload that the coordinator sends for an edit goes first: the
                     // completed trash of that photo moves on to the latest handoff, see `completeEffect`.
@@ -372,7 +373,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                                 sqlite3_bind_double(stmt, 15, date.timeIntervalSince1970)
                                 sqlite3_bind_double(stmt, 16, date.timeIntervalSince1970)
                             }),
-                        let state = sourceStateLocked(request.key)
+                        let state = sourceStateLocked(request.key).state
                     else { return false }
                     states.append(state)
                 }
@@ -415,7 +416,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         bindText(stmt, 9, remote.nodeID)
                     })
             else { return nil }
-            return sourceStateLocked(key)
+            return sourceStateLocked(key).state
         }
     }
 
@@ -427,7 +428,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             var states: [PendingSourceState] = []
             let committed = transaction {
                 for key in keys {
-                    guard let previous = sourceStateLocked(key), previous.desired == .excluded else { continue }
+                    guard case .readable(let current) = sourceStateLocked(key) else { return false }
+                    guard let previous = current, previous.desired == .excluded else { continue }
                     guard
                         execute(
                             """
@@ -446,7 +448,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                                 sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
                                 bindKey(stmt, key, from: 3)
                             }),
-                        let state = sourceStateLocked(key)
+                        let state = sourceStateLocked(key).state
                     else { return false }
                     states.append(state)
                 }
@@ -473,7 +475,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     ) -> Bool {
         connection.withLock {
             transaction {
-                guard let state = sourceStateLocked(key) else { return true }
+                guard case .readable(let current) = sourceStateLocked(key) else { return false }
+                guard let state = current else { return true }
                 var sql: String
                 var movesOn = false
                 switch effect {
@@ -575,7 +578,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     @discardableResult
     public func deferEffects(for key: PendingSourceKey, at date: Date) -> Bool {
         connection.withLock {
-            guard let state = sourceStateLocked(key) else { return true }
+            guard case .readable(let current) = sourceStateLocked(key) else { return false }
+            guard let state = current else { return true }
             let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: state.attempts))
             return execute(
                 "UPDATE source_state SET attempts=attempts+1, next_attempt_at=?, updated_at=? WHERE source_kind=? AND source_id=?;"
@@ -722,8 +726,21 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }.first
     }
 
-    private func sourceStateLocked(_ key: PendingSourceKey) -> PendingSourceState? {
-        sourceStatesLocked(where: "source_kind=? AND source_id=?") { self.bindKey($0, key) }.first
+    /// A readable nil is confirmed absence; SQL and decode failures remain distinct for each lookup.
+    private enum SourceStateRead {
+        case unreadable
+        case readable(PendingSourceState?)
+
+        var state: PendingSourceState? {
+            guard case .readable(let state) = self else { return nil }
+            return state
+        }
+    }
+
+    private func sourceStateLocked(_ key: PendingSourceKey) -> SourceStateRead {
+        let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { self.bindKey($0, key) }
+        guard read.succeeded else { return .unreadable }
+        return .readable(read.states.first)
     }
 
     private static let sourceStateColumns = """
@@ -735,16 +752,22 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     private func sourceStatesLocked(
         where condition: String?,
         bind: ((OpaquePointer?) -> Void)? = nil
-    ) -> [PendingSourceState] {
+    ) -> (states: [PendingSourceState], succeeded: Bool) {
         var result: [PendingSourceState] = []
+        var decoded = true
         let sql =
             "SELECT \(Self.sourceStateColumns) FROM source_state"
             + (condition.map { " WHERE \($0)" } ?? "") + " ORDER BY source_kind, source_id;"
-        _ = query(sql, bind: bind) { stmt in
-            guard let key = key(stmt, kindColumn: 0, idColumn: 1),
-                let desired = columnText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:))
+        let queried = query(sql, bind: bind) { stmt in
+            let remoteOperationIsNull = sqlite3_column_type(stmt, 20) == SQLITE_NULL
+            let remoteOperation = sourceStateEnumText(stmt, 20).flatMap(PendingSourceEffect.init(rawValue:))
+            guard let kind = sourceStateEnumText(stmt, 0).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
+                let identifier = columnText(stmt, 1),
+                let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:)),
+                remoteOperationIsNull || remoteOperation != nil
             else {
                 connection.markFailed()
+                decoded = false
                 return
             }
             let remote: PhotoUID? =
@@ -766,7 +789,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             }
             result.append(
                 PendingSourceState(
-                    key: key,
+                    key: PendingSourceKey(kind: kind, identifier: identifier),
                     desired: desired,
                     generation: sqlite3_column_int64(stmt, 3),
                     needsQueueSync: sqlite3_column_int(stmt, 4) != 0,
@@ -774,7 +797,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     needsRemoteRestore: sqlite3_column_int(stmt, 6) != 0,
                     remote: remote,
                     remoteTrashed: sqlite3_column_int(stmt, 9) != 0,
-                    remoteOperation: columnText(stmt, 20).flatMap(PendingSourceEffect.init(rawValue:)),
+                    remoteOperation: remoteOperation,
                     listedInTrash: sqlite3_column_int(stmt, 10) != 0,
                     excludedAt: sqlite3_column_type(stmt, 11) == SQLITE_NULL
                         ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 11)),
@@ -784,7 +807,15 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 19))
                 ))
         }
-        return result
+        return (result, queried && decoded)
+    }
+
+    /// Enum raw values must include every persisted byte, including any embedded NUL.
+    private func sourceStateEnumText(_ stmt: OpaquePointer?, _ column: Int32) -> String? {
+        guard let text = sqlite3_column_text(stmt, column) else { return nil }
+        return String(
+            bytes: UnsafeBufferPointer(start: text, count: Int(sqlite3_column_bytes(stmt, column))),
+            encoding: .utf8)
     }
 
     private func handoffsLocked(where condition: String, bind: ((OpaquePointer?) -> Void)? = nil) -> [PendingHandoff] {
