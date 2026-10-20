@@ -65,6 +65,103 @@ final class PendingBackupStoreTests: XCTestCase {
         }
     }
 
+    func testExcludeRejectsUnknownRemoteOperationAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum("unknown")
+    }
+
+    func testExcludeRejectsEmbeddedNULRemoteOperationAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum("remoteTrash\u{0}unknown")
+    }
+
+    func testExcludeRejectsEmbeddedNULDesiredAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum("included\u{0}unknown", column: "desired", index: 2, repaired: "included")
+    }
+
+    func testReadsRejectEmbeddedNULSourceKindAfterInterruptedRestore() throws {
+        try assertRejectsSourceStateEnum(
+            "photoLibraryAsset\u{0}unknown", column: "source_kind", index: 0, repaired: "photoLibraryAsset")
+    }
+
+    private func assertRejectsSourceStateEnum(
+        _ marker: String, column: String = "remote_op", index: Int = 20, repaired: String = "remoteRestore"
+    ) throws {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date))
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key, generation: 1, at: date))
+        let included = try XCTUnwrap(store.include([key], at: date))
+        XCTAssertEqual(store.beginRemoteOperation(.remoteRestore, for: included), [key])
+        let restoring = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertTrue(restoring.remoteTrashed)
+        XCTAssertTrue(restoring.needsRemoteRestore)
+        XCTAssertEqual(restoring.remoteOperation, .remoteRestore)
+
+        // The restore may have succeeded remotely, but the app ends before recording its completion.
+        store.close()
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        try withRawPendingDatabase { db in
+            var stmt: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(db, "UPDATE source_state SET \(column)=?;", -1, &stmt, nil), SQLITE_OK)
+            defer { sqlite3_finalize(stmt) }
+            marker.withCString {
+                XCTAssertEqual(
+                    sqlite3_bind_text(
+                        stmt, 1, $0, Int32(marker.utf8.count), SQLiteStoreSchemaGate.transientDestructor), SQLITE_OK)
+            }
+            XCTAssertEqual(sqlite3_step(stmt), SQLITE_DONE)
+        }
+        let before = try pendingTables()
+        XCTAssertEqual(try XCTUnwrap(before["source_state"]?.first)[index], Data(marker.utf8))
+        if column == "source_kind" {
+            // A typed-key lookup cannot select the corrupted key; all-row readers must reject its decoded prefix.
+            XCTAssertTrue(store.sourceStates().isEmpty)
+            XCTAssertTrue(store.dueSourceStates(by: date.addingTimeInterval(10)).isEmpty)
+        } else {
+            XCTAssertNil(
+                store.exclude(
+                    [PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date.addingTimeInterval(10)
+                ))
+        }
+        XCTAssertFalse(store.isOperational(), "an unknown non-null enum must record a decode failure")
+        XCTAssertEqual(try pendingTables(), before, "rejection must preserve the interrupted restore row")
+        store.close()
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        XCTAssertEqual(try pendingTables(), before, "the unchanged row must survive reopen")
+
+        // Repair only the enum, then prove the retained restore still makes the next exclusion owe trash.
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE source_state SET \(column)='\(repaired)';", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertEqual(store.sourceState(for: key), restoring)
+        let excluded = try XCTUnwrap(
+            try XCTUnwrap(
+                store.exclude(
+                    [PendingExclusionRequest(key: key, presentation: nil, remote: nil)],
+                    at: date.addingTimeInterval(10))
+            ).first)
+        XCTAssertEqual(excluded.generation, restoring.generation + 1)
+        XCTAssertEqual(excluded.remote, remote)
+        XCTAssertEqual(excluded.presentation, restoring.presentation)
+        XCTAssertTrue(excluded.needsRemoteTrash, "the interrupted restore may have made the remote photo active")
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testExcludeAcceptsSQLNullRemoteOperation() throws {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date))
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key, generation: 1, at: date))
+        XCTAssertNil(store.sourceState(for: key)?.remoteOperation)
+        let excluded = try XCTUnwrap(
+            try XCTUnwrap(
+                store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date)
+            ).first)
+        XCTAssertEqual(excluded.generation, 2)
+        XCTAssertTrue(excluded.remoteTrashed)
+        XCTAssertFalse(excluded.needsRemoteTrash, "SQL NULL means no interrupted restore")
+        XCTAssertTrue(store.isOperational())
+    }
+
     func testAbsentSourceStateKeepsEachWriterResult() throws {
         XCTAssertEqual(store.include([key], at: date), [])
         XCTAssertTrue(store.completeEffect(.remoteTrash, for: key, generation: 1, at: date))
@@ -193,9 +290,9 @@ final class PendingBackupStoreTests: XCTestCase {
         return try body(db)
     }
 
-    private func pendingTables() throws -> [String: [[String?]]] {
+    private func pendingTables() throws -> [String: [[Data?]]] {
         try withRawPendingDatabase { db in
-            var result: [String: [[String?]]] = [:]
+            var result: [String: [[Data?]]] = [:]
             for table in [
                 "pending_info", "source_state", "upload_evidence", "handoff", "pending_action", "saved_from_app",
             ] {
@@ -203,12 +300,16 @@ final class PendingBackupStoreTests: XCTestCase {
                 XCTAssertEqual(
                     sqlite3_prepare_v2(db, "SELECT * FROM \(table) ORDER BY rowid;", -1, &stmt, nil), SQLITE_OK)
                 defer { sqlite3_finalize(stmt) }
-                var rows: [[String?]] = []
+                var rows: [[Data?]] = []
                 var step = sqlite3_step(stmt)
                 while step == SQLITE_ROW {
                     rows.append(
-                        (0..<sqlite3_column_count(stmt)).map { column in
-                            sqlite3_column_text(stmt, column).map { String(cString: $0) }
+                        try (0..<sqlite3_column_count(stmt)).map { column -> Data? in
+                            guard sqlite3_column_type(stmt, column) != SQLITE_NULL else { return nil }
+                            let bytes = sqlite3_column_blob(stmt, column)
+                            let count = Int(sqlite3_column_bytes(stmt, column))
+                            guard count > 0 else { return Data() }
+                            return Data(bytes: try XCTUnwrap(bytes), count: count)
                         })
                     step = sqlite3_step(stmt)
                 }

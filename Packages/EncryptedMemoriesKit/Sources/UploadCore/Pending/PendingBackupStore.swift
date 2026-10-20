@@ -759,8 +759,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             "SELECT \(Self.sourceStateColumns) FROM source_state"
             + (condition.map { " WHERE \($0)" } ?? "") + " ORDER BY source_kind, source_id;"
         let queried = query(sql, bind: bind) { stmt in
-            guard let key = key(stmt, kindColumn: 0, idColumn: 1),
-                let desired = columnText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:))
+            let remoteOperationIsNull = sqlite3_column_type(stmt, 20) == SQLITE_NULL
+            let remoteOperation = sourceStateEnumText(stmt, 20).flatMap(PendingSourceEffect.init(rawValue:))
+            guard let kind = sourceStateEnumText(stmt, 0).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
+                let identifier = columnText(stmt, 1),
+                let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:)),
+                remoteOperationIsNull || remoteOperation != nil
             else {
                 connection.markFailed()
                 decoded = false
@@ -785,7 +789,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             }
             result.append(
                 PendingSourceState(
-                    key: key,
+                    key: PendingSourceKey(kind: kind, identifier: identifier),
                     desired: desired,
                     generation: sqlite3_column_int64(stmt, 3),
                     needsQueueSync: sqlite3_column_int(stmt, 4) != 0,
@@ -793,7 +797,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     needsRemoteRestore: sqlite3_column_int(stmt, 6) != 0,
                     remote: remote,
                     remoteTrashed: sqlite3_column_int(stmt, 9) != 0,
-                    remoteOperation: columnText(stmt, 20).flatMap(PendingSourceEffect.init(rawValue:)),
+                    remoteOperation: remoteOperation,
                     listedInTrash: sqlite3_column_int(stmt, 10) != 0,
                     excludedAt: sqlite3_column_type(stmt, 11) == SQLITE_NULL
                         ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 11)),
@@ -804,6 +808,14 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 ))
         }
         return (result, queried && decoded)
+    }
+
+    /// Enum raw values must include every persisted byte, including any embedded NUL.
+    private func sourceStateEnumText(_ stmt: OpaquePointer?, _ column: Int32) -> String? {
+        guard let text = sqlite3_column_text(stmt, column) else { return nil }
+        return String(
+            bytes: UnsafeBufferPointer(start: text, count: Int(sqlite3_column_bytes(stmt, column))),
+            encoding: .utf8)
     }
 
     private func handoffsLocked(where condition: String, bind: ((OpaquePointer?) -> Void)? = nil) -> [PendingHandoff] {
