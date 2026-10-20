@@ -27,9 +27,12 @@ public struct URLSessionMLModelArtifactTransport: MLModelArtifactTransport {
     #endif
     private let downloadClient: RangeDownloadClient
 
-    public init(session: URLSession = .shared) {
+    public init(session: URLSession = MLModelNetworkSession.shared) {
         self.downloadClient = RangeDownloadClient(configuration: session.configuration)
     }
+
+    /// The configuration of the session that performs the downloads.
+    var downloadConfiguration: URLSessionConfiguration { downloadClient.configuration }
 
     public func download(
         from url: URL,
@@ -231,6 +234,8 @@ private final class RangeDownloadClient: @unchecked Sendable {
         self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
     }
 
+    var configuration: URLSessionConfiguration { session.configuration }
+
     deinit {
         session.invalidateAndCancel()
     }
@@ -363,4 +368,15 @@ private final class RangeDownloadSessionDelegate: NSObject, URLSessionDownloadDe
             }
         }
     }
+}
+
+/// Default catalogs use this session for the process lifetime; production never invalidates it.
+/// Artifact transports copy its configuration into their owned download sessions.
+/// Keep no URL cache; ephemeral cookies and credentials remain in memory only.
+public enum MLModelNetworkSession {
+    public static let shared: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }()
 }

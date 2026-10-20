@@ -103,7 +103,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         trustedCatalog: MLModelCatalog,
         cacheDirectory: URL,
         endpoint: AppleSmartSearchCatalogEndpoint,
-        session: URLSession = .shared,
+        session: URLSession = MLModelNetworkSession.shared,
         legacyCacheDirectory: URL? = nil
     ) {
         self.init(
@@ -120,7 +120,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         trustedCatalog: MLModelCatalog,
         cacheDirectory: URL,
         endpoint: AppleSmartSearchCatalogEndpoint,
-        session: URLSession = .shared,
+        session: URLSession = MLModelNetworkSession.shared,
         legacyCacheDirectory: URL? = nil,
         publicKey: Data
     ) {
@@ -168,7 +168,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         trustedCatalog: MLModelCatalog,
         cacheDirectory: URL,
         version: MLRemoteCatalogVersion,
-        session: URLSession = .shared,
+        session: URLSession = MLModelNetworkSession.shared,
         catalogURL: URL,
         signatureURL: URL,
         legacyCatalogURL: URL? = nil,
@@ -233,6 +233,9 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
             self.pointerCacheURL = nil
         }
     }
+
+    /// The configuration of the session that fetches signed catalogs.
+    var sessionConfiguration: URLSessionConfiguration { session.configuration }
 
     public func catalog() async throws -> MLModelCatalog {
         switch catalogVersion {
