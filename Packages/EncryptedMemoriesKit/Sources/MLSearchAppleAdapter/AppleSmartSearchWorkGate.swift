@@ -21,6 +21,7 @@ public final class AppleSmartSearchWorkGate: @unchecked Sendable {
     private var demandRefreshScheduled = false
     private let indexingWakeLock = NSLock()
     private var indexingWake: (@Sendable () -> Void)?
+    private var runtimeObservation: Task<Void, Never>?
     private var cacheArrivalWakeRegistration: ThumbnailFeedWakeRegistration?
 
     public init(
@@ -53,8 +54,31 @@ public final class AppleSmartSearchWorkGate: @unchecked Sendable {
         self.scheduleDemandRefresh = scheduleDemandRefresh
     }
 
+    /// The callback also runs when a runtime input of the gate changes (thermal state, Low Power Mode, visible demand,
+    /// playback, search, user transfers), so a closed gate opens again without a polling loop.
     public func setIndexingWake(_ callback: @escaping @Sendable () -> Void) {
-        indexingWakeLock.withLock { indexingWake = callback }
+        indexingWakeLock.withLock {
+            indexingWake = callback
+            guard runtimeObservation == nil else { return }
+            // The baseline is the state at registration, so a change before the task runs still wakes.
+            let baseline = GateInputs(runtimeState.snapshot())
+            let updates = runtimeState.updates()
+            runtimeObservation = Task { [weak self] in
+                var last = baseline
+                for await snapshot in updates {
+                    let inputs = GateInputs(snapshot)
+                    guard inputs != last else { continue }
+                    last = inputs
+                    guard let self else { return }
+                    let wake = self.indexingWakeLock.withLock { self.indexingWake }
+                    wake?()
+                }
+            }
+        }
+    }
+
+    deinit {
+        runtimeObservation?.cancel()
     }
 
     public func permitsIndexing() -> Bool {
@@ -90,6 +114,26 @@ public final class AppleSmartSearchWorkGate: @unchecked Sendable {
             guard let self else { return }
             self.refreshLock.withLock { self.demandRefreshScheduled = false }
             _ = self.publishCurrentVisibleDemand()
+        }
+    }
+
+    /// The runtime values that `permitsIndexing` reads. Other runtime changes, such as the network path, never wake the
+    /// indexing loop.
+    private struct GateInputs: Equatable {
+        let thermalLevel: LibraryThermalLevel
+        let isLowPowerMode: Bool
+        let hasVisibleMediaDemand: Bool
+        let isPlayingVideo: Bool
+        let isSearching: Bool
+        let hasUserTransfer: Bool
+
+        init(_ snapshot: LibraryRuntimeSnapshot) {
+            thermalLevel = snapshot.thermalLevel
+            isLowPowerMode = snapshot.isLowPowerMode
+            hasVisibleMediaDemand = snapshot.hasVisibleMediaDemand
+            isPlayingVideo = snapshot.activeVideoPlaybackCount > 0
+            isSearching = snapshot.activeSearchCount > 0
+            hasUserTransfer = snapshot.activeUserTransferCount > 0
         }
     }
 

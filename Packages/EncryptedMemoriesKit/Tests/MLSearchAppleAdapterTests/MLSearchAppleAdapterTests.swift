@@ -3,6 +3,8 @@ import CoreML
 import CryptoKit
 import Foundation
 import MLSearchCore
+import MediaByteCache
+import MediaFeedCore
 import PhotosCore
 import Testing
 
@@ -10,6 +12,41 @@ import Testing
 
 /// Adapter tests that do not require a model artifact. A local opt-in smoke covers the real model.
 @Suite struct MLSearchAppleAdapterTests {
+    private final class WakeCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var value: Int { lock.withLock { count } }
+        func increment() { lock.withLock { count += 1 } }
+
+        func reaches(_ target: Int) async -> Bool {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while value < target, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            return value >= target
+        }
+    }
+
+    private actor EmptyThumbnailLoader: ThumbnailBatchLoader {
+        func loadThumbnails(
+            for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+        ) async -> ThumbnailBatchLoadResult { .delivered }
+    }
+
+    private enum GateSignal: CaseIterable, Sendable {
+        case thermal, lowPower, playback, search, userTransfer
+
+        func setActive(_ active: Bool, in snapshot: inout LibraryRuntimeSnapshot) {
+            switch self {
+            case .thermal: snapshot.thermalLevel = active ? .critical : .nominal
+            case .lowPower: snapshot.isLowPowerMode = active
+            case .playback: snapshot.activeVideoPlaybackCount = active ? 1 : 0
+            case .search: snapshot.activeSearchCount = active ? 1 : 0
+            case .userTransfer: snapshot.activeUserTransferCount = active ? 1 : 0
+            }
+        }
+    }
+
     private final class DemandState: @unchecked Sendable {
         private let lock = NSLock()
         private var active: Bool
@@ -83,7 +120,63 @@ import Testing
         #expect(hostBlocked.permitsIndexing() == false)
     }
 
-    @Test func smartSearchWorkGatePublishesDemandExpiryWithoutAnotherGatePoll() {
+    @Test func smartSearchWorkGateWakesIndexingOnlyWhenOneOfItsInputsChanges() async throws {
+        let runtimeState = LibraryRuntimeState()
+        let gate = AppleSmartSearchWorkGate(visibleMediaDemandActive: { false }, runtimeState: runtimeState)
+        let wakes = WakeCounter()
+        gate.setIndexingWake { wakes.increment() }
+        // The baseline is taken at registration, so this change wakes even if the observation starts later.
+        runtimeState.update { $0.thermalLevel = .serious }
+        #expect(await wakes.reaches(1))
+        // A runtime change that the gate does not read, here the network path, wakes nothing.
+        runtimeState.update { $0.network = LibraryNetworkState(isReachable: false) }
+        runtimeState.update { $0.isLowPowerMode = true }
+        #expect(await wakes.reaches(2))
+        runtimeState.update { $0.thermalLevel = .nominal }
+        #expect(await wakes.reaches(3))
+        runtimeState.update { $0.isLowPowerMode = false }
+        #expect(await wakes.reaches(4))
+        // No extra wake follows; a slow runner can only hide an extra wake here, never invent one.
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(wakes.value == 4)
+        withExtendedLifetime(gate) {}
+    }
+
+    @Test(arguments: GateSignal.allCases)
+    private func publicWorkGateResumesForRuntimeInputsAndReplacesItsCallback(signal: GateSignal) async throws {
+        var initial = LibraryRuntimeSnapshot()
+        signal.setActive(true, in: &initial)
+        let runtimeState = LibraryRuntimeState(initial: initial)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = ThumbnailCache(namespace: "work-gate", rootDirectory: root)
+        cache.configure(accountUID: "fixture", key: SymmetricKey(size: .bits256))
+        let feed = ThumbnailFeedCore(cache: cache, loader: EmptyThumbnailLoader())
+        var gate: AppleSmartSearchWorkGate? = AppleSmartSearchWorkGate(feed: feed, runtimeState: runtimeState)
+        #expect(gate?.permitsIndexing() == false)
+        let first = WakeCounter()
+        gate?.setIndexingWake { first.increment() }
+        runtimeState.update { signal.setActive(false, in: &$0) }
+        try #require(await first.reaches(1))
+        #expect(gate?.permitsIndexing() == true)
+
+        let replacement = WakeCounter()
+        gate?.setIndexingWake { replacement.increment() }
+        runtimeState.update { signal.setActive(true, in: &$0) }
+        try #require(await replacement.reaches(1))
+        #expect(first.value == 1)
+        #expect(replacement.value == 1)
+        #expect(gate?.permitsIndexing() == false)
+
+        weak var releasedGate = gate
+        gate = nil
+        for _ in 0..<100 where releasedGate != nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(releasedGate == nil)
+    }
+
+    @Test func smartSearchWorkGatePublishesDemandExpiryWithoutAnotherGatePoll() async throws {
         let runtimeState = LibraryRuntimeState()
         let demand = DemandState(active: true)
         let gate = AppleSmartSearchWorkGate(
@@ -95,6 +188,8 @@ import Testing
         #expect(gate.permitsIndexing() == false)
         #expect(runtimeState.snapshot().hasVisibleMediaDemand)
         #expect(demand.scheduledRefreshCount == 1)
+        let wakes = WakeCounter()
+        gate.setIndexingWake { wakes.increment() }
         #expect(gate.permitsIndexing() == false)
         #expect(demand.scheduledRefreshCount == 1)
 
@@ -106,6 +201,7 @@ import Testing
         #expect(demand.runNextRefresh())
         #expect(runtimeState.snapshot().hasVisibleMediaDemand == false)
         #expect(demand.scheduledRefreshCount == 0)
+        #expect(await wakes.reaches(1))
     }
 
     @Test func tinyCLIPTokenizerMatchesReferenceVectors() throws {

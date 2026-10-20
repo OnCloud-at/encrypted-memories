@@ -524,7 +524,14 @@ import Testing
     private final class ToggleGovernor: MLIndexingGovernor, @unchecked Sendable {
         private let lock = NSLock()
         private var permitted = true
-        func permitsIndexing() -> Bool { lock.withLock { permitted } }
+        private var checks = 0
+        var checkCount: Int { lock.withLock { checks } }
+        func permitsIndexing() -> Bool {
+            lock.withLock {
+                checks += 1
+                return permitted
+            }
+        }
         func set(_ value: Bool) { lock.withLock { permitted = value } }
     }
 
@@ -3653,6 +3660,71 @@ import Testing
 
         harness.governor.set(true)
         #expect(await waitForCompleteIndex(harness, total: assets.count))
+    }
+
+    @Test func aClosedGateWaitsForAWakeInsteadOfPollingEverySecond() async throws {
+        #expect(MLSmartSearchLifecycle.Configuration().closedGateRecheckDelay == .seconds(30))
+        let payload = Data("model-a-bytes".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payload)
+        let assets = (0..<6).map { uid("asset-\($0)") }
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA]),
+            payloads: [urlA: payload],
+            assets: assets,
+            closedGateRecheckDelay: MLSmartSearchLifecycle.Configuration().closedGateRecheckDelay
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        harness.governor.set(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entryA.id)
+        try #require(
+            await waitUntil {
+                if case .waiting = await harness.lifecycle.currentSnapshot().phase { return true }
+                return false
+            })
+        let checksWhileClosed = harness.governor.checkCount
+        // A 1 s recheck would ask the gate at least twice more in this time.
+        try await Task.sleep(for: .milliseconds(2_500))
+        #expect(harness.governor.checkCount - checksWhileClosed <= 1)
+        #expect(harness.provider.embedder.totalCalls == 0)
+
+        // The host reports the change, and indexing resumes at once instead of after the fallback.
+        harness.governor.set(true)
+        await harness.lifecycle.noteConditionsChanged()
+        #expect(
+            await waitUntil(timeout: .seconds(5)) {
+                let snapshot = await harness.lifecycle.currentSnapshot()
+                if case .ready(let coverage) = snapshot.phase {
+                    return coverage.isComplete && coverage.total == assets.count
+                }
+                return false
+            })
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func shutdownCancelsAClosedGateWaitWithoutWaitingForTheFallback() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")],
+            closedGateRecheckDelay: MLSmartSearchLifecycle.Configuration().closedGateRecheckDelay
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        harness.governor.set(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+        try #require(
+            await waitUntil {
+                if case .waiting = await harness.lifecycle.currentSnapshot().phase { return true }
+                return false
+            })
+        let started = ContinuousClock.now
+        await harness.lifecycle.shutdown()
+        #expect(started.duration(to: .now) < .seconds(5))
+        harness.governor.set(true)
+        await harness.lifecycle.noteConditionsChanged()
+        #expect(harness.provider.embedder.totalCalls == 0)
     }
 
     @Test func disablePurgesEverythingAndIsIdempotent() async throws {
