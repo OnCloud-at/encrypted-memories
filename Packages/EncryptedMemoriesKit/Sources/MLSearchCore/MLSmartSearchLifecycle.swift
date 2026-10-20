@@ -30,7 +30,8 @@ public actor MLSmartSearchLifecycle {
     public struct Configuration: Sendable {
         /// Delay before re-attempting indexing after a pass ends with transient failures.
         public var indexRetryDelay: Duration
-        /// Cadence for rechecking policy suspension independently of failure retries.
+        /// Fallback cadence for rechecking a closed indexing gate. Hosts wake the loop when the gate's inputs change
+        /// (`noteConditionsChanged`), so this only covers an input that reports no change.
         public var closedGateRecheckDelay: Duration
         /// Minimum download-fraction change worth emitting to observers.
         public var downloadProgressStep: Double
@@ -43,7 +44,7 @@ public actor MLSmartSearchLifecycle {
 
         public init(
             indexRetryDelay: Duration = .seconds(120),
-            closedGateRecheckDelay: Duration = .seconds(1),
+            closedGateRecheckDelay: Duration = .seconds(30),
             downloadProgressStep: Double = 0.01,
             nativeAnalysisQuantumAssets: Int = 32,
             semanticQuantumAssets: Int = 128,
