@@ -120,7 +120,7 @@ public enum ProtonAuthLocalDataPurge {
         claim: BackupLocalDataPurge.Claim,
         defaults: UserDefaults = .standard
     ) -> Bool {
-        perform(claim: claim, defaults: defaults) {
+        perform(claim: claim, defaults: defaults, networkStores: .current) {
             try purgeKeychain()
         }
     }
@@ -132,7 +132,7 @@ public enum ProtonAuthLocalDataPurge {
         claim: BackupLocalDataPurge.Claim,
         defaults: UserDefaults = .standard
     ) async -> Bool {
-        await performOffMain(claim: claim, defaults: SendableUserDefaults(defaults)) {
+        await performOffMain(claim: claim, defaults: SendableUserDefaults(defaults), networkStores: .current) {
             try purgeKeychain()
         }
     }
@@ -149,7 +149,8 @@ public enum ProtonAuthLocalDataPurge {
             claim: claim,
             defaults: defaults,
             plaintextPurgeSucceeded: plaintextPurgeSucceeded,
-            networkStores: UnusedNetworkStorePurge.Location.current
+            networkStores: UnusedNetworkStorePurge.Location.current,
+            purgeKeychain: { try purgeKeychain() }
         )
     }
 
@@ -157,7 +158,8 @@ public enum ProtonAuthLocalDataPurge {
         claim: BackupLocalDataPurge.Claim?,
         defaults: UserDefaults,
         plaintextPurgeSucceeded: Bool?,
-        networkStores: UnusedNetworkStorePurge.Location?
+        networkStores: UnusedNetworkStorePurge.Location?,
+        purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
         #if os(iOS)
             if claim != nil {
@@ -173,7 +175,13 @@ public enum ProtonAuthLocalDataPurge {
             claim: claim,
             defaults: sendableDefaults,
             unusedNetworkStorePurge: {
+                if claim != nil {
+                    return UnusedNetworkStorePurge.purgeForSignOut(
+                        defaults: sendableDefaults.value, location: networkStores)?
+                        .succeeded == true
+                }
                 UnusedNetworkStorePurge.purgeOnce(defaults: sendableDefaults.value, location: networkStores)
+                return true
             },
             plaintextPurge: {
                 if let plaintextPurgeSucceeded {
@@ -181,38 +189,39 @@ public enum ProtonAuthLocalDataPurge {
                 }
                 return TransientPlaintextPurge.purgeShareExports().succeeded
             },
-            purgeKeychain: {
-                try purgeKeychain()
-            }
+            purgeKeychain: purgeKeychain
         )
     }
 
     static func performOffMain(
         claim: BackupLocalDataPurge.Claim,
         defaults: SendableUserDefaults,
+        networkStores: UnusedNetworkStorePurge.Location?,
         purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
         return await Task.detached(priority: .utility) {
-            perform(claim: claim, defaults: defaults.value, purgeKeychain: purgeKeychain)
+            perform(claim: claim, defaults: defaults.value, networkStores: networkStores, purgeKeychain: purgeKeychain)
         }.value
     }
 
-    /// The unused network store purge runs once per arming and never fails or aborts sign-in. Sign-out clears
-    /// its completion flag with the preferences, so the next cold launch runs it again; a failed removal also
-    /// retries at the next cold launch. Each run is awaited before an account opens.
+    /// Startup without a sign-out claim keeps network cleanup best effort and once per arming.
+    /// A pending sign-out claim requires verified network cleanup before the transaction can complete.
+    /// Each run is awaited before an account opens.
     static func performStartupOffMain(
         claim: BackupLocalDataPurge.Claim?,
         defaults: SendableUserDefaults,
-        unusedNetworkStorePurge: @escaping @Sendable () -> Void,
+        unusedNetworkStorePurge: @escaping @Sendable () -> Bool,
         plaintextPurge: @escaping @Sendable () -> Bool,
         purgeKeychain: @escaping @Sendable () throws -> Void
     ) async -> Bool {
         await Task.detached(priority: .utility) {
-            unusedNetworkStorePurge()
+            let networkStoresPurged = unusedNetworkStorePurge()
             let plaintextPurgeSucceeded = plaintextPurge()
             let signOutPurgeSucceeded =
                 claim.map {
-                    perform(claim: $0, defaults: defaults.value, purgeKeychain: purgeKeychain)
+                    perform(
+                        claim: $0, defaults: defaults.value,
+                        unusedNetworkStorePurge: { networkStoresPurged }, purgeKeychain: purgeKeychain)
                 } ?? true
             return plaintextPurgeSucceeded && signOutPurgeSucceeded
         }.value
@@ -221,9 +230,25 @@ public enum ProtonAuthLocalDataPurge {
     static func perform(
         claim: BackupLocalDataPurge.Claim,
         defaults: UserDefaults,
+        networkStores: UnusedNetworkStorePurge.Location?,
+        purgeKeychain: () throws -> Void
+    ) -> Bool {
+        perform(
+            claim: claim, defaults: defaults,
+            unusedNetworkStorePurge: {
+                UnusedNetworkStorePurge.purgeForSignOut(defaults: defaults, location: networkStores)?.succeeded == true
+            },
+            purgeKeychain: purgeKeychain)
+    }
+
+    private static func perform(
+        claim: BackupLocalDataPurge.Claim,
+        defaults: UserDefaults,
+        unusedNetworkStorePurge: () -> Bool,
         purgeKeychain: () throws -> Void
     ) -> Bool {
         let fileResult = claim.perform(defaults: defaults, completesRequestOnSuccess: false)
+        let networkStoresPurged = unusedNetworkStorePurge()
         let keychainPurged: Bool
         do {
             try purgeKeychain()
@@ -231,7 +256,7 @@ public enum ProtonAuthLocalDataPurge {
         } catch {
             keychainPurged = false
         }
-        guard fileResult.succeeded, keychainPurged else { return false }
+        guard fileResult.succeeded, networkStoresPurged, keychainPurged else { return false }
         BackupLocalDataPurge.markPurgeCompleted(defaults: defaults)
         return true
     }
@@ -245,9 +270,15 @@ public enum ProtonAuthLocalDataPurge {
             SessionKeychainStore.defaultService,
             DeviceIdentityKeychainStore.defaultService,
         ]
+        var firstError: (any Error)?
         for service in services {
-            try keychain.removeAllData(service: service)
+            do {
+                try keychain.removeAllData(service: service)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
         }
+        if let firstError { throw firstError }
     }
 }
 
