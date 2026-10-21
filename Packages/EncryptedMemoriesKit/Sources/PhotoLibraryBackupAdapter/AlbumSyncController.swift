@@ -23,6 +23,11 @@ public final class AlbumSyncController {
         public var accountDataDirectory: URL
         public var databasePolicy: LibraryDatabasePolicy
 
+        var makeChangeMonitor: (URL) -> PhotoLibraryChangeMonitor = { PhotoLibraryChangeMonitor(tokenURL: $0) }
+        var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
+        var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+        var localSource: any AlbumSyncLocalAlbumSource = PhotoKitAlbumSource()
+
         public init(accountDataDirectory: URL, databasePolicy: LibraryDatabasePolicy) {
             self.accountDataDirectory = accountDataDirectory
             self.databasePolicy = databasePolicy
@@ -130,10 +135,13 @@ public final class AlbumSyncController {
     private let runner: AlbumSyncRunner?
     private let backupExecutor: PhotoAlbumBackupExecutor?
     private let remoteLinkLookup: (any AlbumSyncRemoteLinkLookup)?
-    private let localSource = PhotoKitAlbumSource()
+    private let localSource: any AlbumSyncLocalAlbumSource
     private let mappingStore: AlbumSyncMappingStore?
     private let lastRunStore: AlbumSyncLastRunStore
+    private var changeSubscription: PhotoLibraryChangeMonitor.Subscription?
     private let changeMonitor: PhotoLibraryChangeMonitor
+    private let currentAccessState: () -> PhotoBackupAccessState
+    private let changeSleep: @Sendable (UInt64) async throws -> Void
     private var syncTask: Task<Void, Never>?
     private var changeDebounceTask: Task<Void, Never>?
     private var queuedAlbumIDs: [String] = []
@@ -157,11 +165,13 @@ public final class AlbumSyncController {
         uploader: any PhotoUploading,
         remoteOps: any AlbumSyncRemoteAlbumOps
     ) {
-        accessState = PhotoLibraryAuthorization.currentState()
+        currentAccessState = configuration.currentAccessState
+        changeSleep = configuration.changeSleep
+        localSource = configuration.localSource
+        accessState = currentAccessState()
 
         let directory = configuration.accountDataDirectory
-        changeMonitor = PhotoLibraryChangeMonitor(
-            tokenURL: directory.appendingPathComponent("album-sync-change-token.v1"))
+        changeMonitor = configuration.makeChangeMonitor(directory.appendingPathComponent("album-sync-change-token.v1"))
         let mappingStore = AlbumSyncMappingStore(
             url: directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName),
             policy: configuration.databasePolicy
@@ -237,7 +247,7 @@ public final class AlbumSyncController {
     }
 
     public func refreshAccessState() {
-        accessState = PhotoLibraryAuthorization.currentState()
+        accessState = currentAccessState()
     }
 
     // MARK: - Selection
@@ -356,7 +366,8 @@ public final class AlbumSyncController {
     /// Ordered sign-out boundary for the album mapping database and any per-run backup stores.
     public func shutdown() async {
         isShuttingDown = true
-        changeMonitor.stopObserving()
+        changeSubscription?.cancel()
+        changeSubscription = nil
         isObservingChanges = false
         changeDebounceTask?.cancel()
         changeDebounceTask = nil
@@ -480,7 +491,7 @@ public final class AlbumSyncController {
         guard !isShuttingDown, accessState.allowsBackup, !selectedAlbums.isEmpty else { return }
         if !isObservingChanges {
             isObservingChanges = true
-            changeMonitor.startObserving { [weak self] in
+            changeSubscription = changeMonitor.subscribe { [weak self] in
                 Task { @MainActor in self?.scheduleChangeDrivenSync() }
             }
         }
@@ -496,8 +507,8 @@ public final class AlbumSyncController {
             return
         }
         changeDebounceTask?.cancel()
-        changeDebounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        changeDebounceTask = Task { [weak self, changeSleep] in
+            try? await changeSleep(3_000_000_000)
             guard !Task.isCancelled else { return }
             await self?.refreshLocalAlbumsForAutomaticSync()
             await MainActor.run { [weak self] in

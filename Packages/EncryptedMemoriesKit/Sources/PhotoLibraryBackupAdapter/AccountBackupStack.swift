@@ -23,11 +23,50 @@ public struct AccountBackupStack {
         editReplacement: EditedPhotoReplacement?,
         albumOperations: any AlbumSyncRemoteAlbumOps
     ) {
+        self.init(
+            accountDataDirectory: accountDataDirectory, databasePolicy: databasePolicy,
+            identityResolver: identityResolver, uploader: uploader, tagAdder: tagAdder,
+            editReplacement: editReplacement, albumOperations: albumOperations, dependencies: Dependencies())
+    }
+
+    struct Dependencies {
+        var makeChangeMonitor: (URL) -> PhotoLibraryChangeMonitor = { PhotoLibraryChangeMonitor(tokenURL: $0) }
+        var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
+        var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+        var localAlbumSource: any AlbumSyncLocalAlbumSource = PhotoKitAlbumSource()
+        var defaults: UserDefaults = .standard
+        var runtimeSignals: BackupRuntimeSignalSource = .apple
+    }
+
+    init(
+        accountDataDirectory: URL,
+        databasePolicy: LibraryDatabasePolicy,
+        identityResolver: (any UploadIdentityResolving)?,
+        uploader: any PhotoUploading,
+        tagAdder: (any PhotoTagAdding)?,
+        editReplacement: EditedPhotoReplacement?,
+        albumOperations: any AlbumSyncRemoteAlbumOps,
+        dependencies: Dependencies
+    ) {
+        let changeMonitor = dependencies.makeChangeMonitor(
+            accountDataDirectory.appendingPathComponent("photo-backup-change-token.v1"))
+        var backupConfiguration = PhotoLibraryBackupController.Configuration(
+            accountDataDirectory: accountDataDirectory, databasePolicy: databasePolicy,
+            defaults: dependencies.defaults, runtimeSignals: dependencies.runtimeSignals)
+        backupConfiguration.makeChangeMonitor = { _ in changeMonitor }
+        backupConfiguration.currentAccessState = dependencies.currentAccessState
+        backupConfiguration.changeSleep = dependencies.changeSleep
+        var albumConfiguration = AlbumSyncController.Configuration(
+            accountDataDirectory: accountDataDirectory, databasePolicy: databasePolicy)
+        albumConfiguration.makeChangeMonitor = { _ in changeMonitor }
+        albumConfiguration.currentAccessState = dependencies.currentAccessState
+        albumConfiguration.changeSleep = dependencies.changeSleep
+        albumConfiguration.localSource = dependencies.localAlbumSource
         let pendingStore = PendingGridSession.openStore(
             accountDataDirectory: accountDataDirectory, policy: databasePolicy)
         self.pendingStore = pendingStore
         photoBackup = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: accountDataDirectory, databasePolicy: databasePolicy),
+            configuration: backupConfiguration,
             identityResolver: identityResolver,
             uploader: uploader,
             tagAdder: tagAdder,
@@ -36,7 +75,7 @@ public struct AccountBackupStack {
             requiresPendingStore: true
         )
         albumSync = AlbumSyncController(
-            configuration: .init(accountDataDirectory: accountDataDirectory, databasePolicy: databasePolicy),
+            configuration: albumConfiguration,
             identityResolver: identityResolver,
             uploader: uploader,
             remoteOps: albumOperations

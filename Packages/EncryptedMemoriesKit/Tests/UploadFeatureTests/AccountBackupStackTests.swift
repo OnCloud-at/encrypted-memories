@@ -77,6 +77,193 @@ final class AccountBackupStackTests: XCTestCase {
         await second.shutdownUnused()
     }
 
+    func testAccountCompositionObservesChangesAndStopsConsumersIndependently() async throws {
+        let fixture = try makeChangeFixture()
+        defer { fixture.clock.releaseAll() }
+        let stack = fixture.stack
+        await changeCondition { fixture.probe.registeredCount == fixture.tokenNames.count }
+        XCTAssertEqual(fixture.probe.fetchCount, 1)
+        XCTAssertEqual(fixture.tokenNames, ["photo-backup-change-token.v1"])
+        await changeCondition { fixture.clock.count(.seconds(3)) == 1 }
+        fixture.probe.emit()
+        XCTAssertEqual(fixture.probe.detailCount, 1)
+        await changeCondition { fixture.clock.count(.milliseconds(750)) == 1 }
+        stack.photoBackup.disableBackup()
+        XCTAssertEqual(fixture.probe.registeredCount, 1)
+        fixture.probe.emit()
+        await changeCondition { fixture.clock.count(.seconds(3)) == 1 }
+        XCTAssertEqual(fixture.probe.detailCount, 2)
+        await stack.shutdownUnused()
+        XCTAssertEqual(fixture.probe.registeredCount, 0)
+    }
+
+    func testAlbumCatchUpAndOneRefreshPerChangeWorkWithBackupDisabled() async throws {
+        let fixture = try makeChangeFixture(backupEnabled: false)
+        defer { fixture.clock.releaseAll() }
+        await changeCondition { fixture.probe.registeredCount == 1 && fixture.clock.count(.seconds(3)) == 1 }
+        XCTAssertEqual(fixture.source.listCalls, 0)
+        fixture.clock.release(.seconds(3))
+        await changeCondition {
+            fixture.stack.albumSync.progress.phase == .completed && !fixture.stack.albumSync.isSyncing
+        }
+        XCTAssertEqual(fixture.source.listCalls, 1, "Init catch-up reads albums once")
+        fixture.probe.emit()
+        await changeCondition { fixture.clock.count(.seconds(3)) == 1 }
+        XCTAssertEqual(fixture.source.listCalls, 1, "A change keeps the existing three-second debounce")
+        fixture.clock.release(.seconds(3))
+        await changeCondition { fixture.source.listCalls == 2 }
+        await fixture.stack.shutdownUnused()
+        XCTAssertEqual(fixture.source.listCalls, 2)
+        XCTAssertEqual(fixture.probe.fetchCount, 1)
+        XCTAssertEqual(fixture.probe.detailCount, 1)
+    }
+
+    func testAccountRetirementDoesNotNotifyOrStopAnotherAccount() async throws {
+        let first = try makeChangeFixture(backupEnabled: false)
+        let second = try makeChangeFixture(backupEnabled: false)
+        defer {
+            first.clock.releaseAll()
+            second.clock.releaseAll()
+        }
+        await changeCondition {
+            first.clock.count(.seconds(3)) == 1 && second.clock.count(.seconds(3)) == 1
+                && first.probe.registeredCount == 1 && second.probe.registeredCount == 1
+        }
+        first.probe.emit()
+        await changeCondition { first.clock.requestCount(.seconds(3)) == 2 }
+        XCTAssertEqual(second.clock.requestCount(.seconds(3)), 1)
+        await first.stack.shutdownUnused()
+        first.probe.emitRetired()
+        XCTAssertEqual(second.probe.registeredCount, 1)
+        XCTAssertEqual(second.clock.requestCount(.seconds(3)), 1)
+        second.probe.emit()
+        await changeCondition { second.clock.requestCount(.seconds(3)) == 2 }
+        await second.stack.shutdownUnused()
+    }
+
+    func testAlbumStopCancelsTheHeldCatchUpAndPreservesTheNextChange() async throws {
+        let fixture = try makeChangeFixture(backupEnabled: false)
+        defer { fixture.clock.releaseAll() }
+        await changeCondition { fixture.clock.count(.seconds(3)) == 1 && fixture.probe.registeredCount == 1 }
+        fixture.stack.albumSync.stopSync()
+        await changeCondition { fixture.clock.count(.seconds(3)) == 0 }
+        XCTAssertEqual(fixture.source.listCalls, 0)
+        fixture.probe.emit()
+        await changeCondition { fixture.clock.count(.seconds(3)) == 1 }
+        fixture.clock.release(.seconds(3))
+        await changeCondition { fixture.source.listCalls == 1 }
+        await fixture.stack.shutdownUnused()
+        XCTAssertEqual(fixture.source.listCalls, 1)
+    }
+
+    func testAlbumReadFailureStillReachesTheController() async throws {
+        let fixture = try makeChangeFixture(backupEnabled: false)
+        defer { fixture.clock.releaseAll() }
+        fixture.source.failContents = true
+        await changeCondition { fixture.clock.count(.seconds(3)) == 1 }
+        fixture.clock.release(.seconds(3))
+        await changeCondition { fixture.stack.albumSync.lastMessage == "Album input failed" }
+        XCTAssertEqual(fixture.stack.albumSync.lastMessageStyle, .error)
+        await fixture.stack.shutdownUnused()
+    }
+
+    #if DEBUG
+        func testBackupChangeKeepsItsDebounceAndStartsOneInjectedPass() async throws {
+            let fixture = try makeChangeFixture(backupPaused: false)
+            defer { fixture.clock.releaseAll() }
+            await changeCondition {
+                fixture.passCalls.value("pass") == 1 && !fixture.stack.photoBackup.isSyncing
+                    && fixture.probe.registeredCount == 1 && fixture.clock.count(.seconds(3)) == 1
+            }
+            fixture.probe.emit()
+            await changeCondition { fixture.clock.count(.milliseconds(750)) == 1 }
+            XCTAssertEqual(fixture.passCalls.value("pass"), 1)
+            fixture.clock.release(.milliseconds(750))
+            await changeCondition { fixture.passCalls.value("pass") == 2 && !fixture.stack.photoBackup.isSyncing }
+            await fixture.stack.shutdownUnused()
+            XCTAssertEqual(fixture.passCalls.value("pass"), 2)
+            XCTAssertEqual(fixture.source.listCalls, 0, "Album still waits for its own three-second clock")
+            XCTAssertEqual(fixture.probe.fetchCount, 1)
+            XCTAssertEqual(fixture.probe.detailCount, 1)
+        }
+    #endif
+
+    func testChangesDuringAlbumSyncScheduleOnlyOneFreshFollowUp() async throws {
+        let fixture = try makeChangeFixture(backupEnabled: false)
+        let gate = PhotoAlbumReadGate()
+        fixture.source.gate = gate
+        defer {
+            gate.release()
+            fixture.clock.releaseAll()
+        }
+        await changeCondition { fixture.clock.count(.seconds(3)) == 1 && fixture.probe.registeredCount == 1 }
+        fixture.clock.release(.seconds(3))
+        await changeCondition { fixture.stack.albumSync.isSyncing && gate.isWaiting }
+        fixture.probe.emit()
+        fixture.probe.emit()
+        XCTAssertEqual(fixture.source.listCalls, 1)
+        XCTAssertEqual(fixture.clock.count(.seconds(3)), 0)
+        gate.release()
+        await changeCondition { !fixture.stack.albumSync.isSyncing && fixture.clock.count(.seconds(3)) == 1 }
+        XCTAssertEqual(fixture.source.listCalls, 1)
+        fixture.clock.release(.seconds(3))
+        await changeCondition { fixture.source.listCalls == 2 }
+        await fixture.stack.shutdownUnused()
+        XCTAssertEqual(fixture.source.listCalls, 2)
+        XCTAssertEqual(fixture.probe.detailCount, 2)
+    }
+
+    private struct ChangeFixture {
+        let stack: AccountBackupStack
+        let probe: PhotoChangeOperationsProbe
+        let clock: PhotoChangeSleepGate
+        let tokenNames: [String]
+        let passCalls: ChangeCallCounter
+        let source: ChangeAlbumSource
+    }
+
+    private func makeChangeFixture(backupEnabled: Bool = true, backupPaused: Bool = true) throws -> ChangeFixture {
+        let directory = try makeAccountDirectory()
+        let store = try XCTUnwrap(
+            AlbumSyncMappingStore(
+                url: directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)))
+        XCTAssertTrue(store.addSelection(.init(localAlbumID: "album", title: "Album", addedAt: Date())))
+        store.close()
+        let suite = "account-change-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.set(backupEnabled, forKey: "photoBackup.enabled.v1")
+        defaults.set(backupPaused, forKey: "photoBackup.userPaused.v1")
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let probe = PhotoChangeOperationsProbe()
+        let clock = PhotoChangeSleepGate()
+        var tokens: [String] = []
+        var dependencies = AccountBackupStack.Dependencies()
+        dependencies.makeChangeMonitor = { url in
+            tokens.append(url.lastPathComponent)
+            return PhotoLibraryChangeMonitor(tokenURL: url, operations: probe.operations)
+        }
+        dependencies.currentAccessState = { .full }
+        dependencies.changeSleep = { try await clock.sleep(.nanoseconds(Int64($0))) }
+        let source = ChangeAlbumSource()
+        dependencies.localAlbumSource = source
+        dependencies.defaults = defaults
+        dependencies.runtimeSignals = .wiFiWithMobileDataOff
+        let stack = AccountBackupStack(
+            accountDataDirectory: directory, databasePolicy: .conservative, identityResolver: FakeIdentityResolver(),
+            uploader: MockUploader(), tagAdder: nil, editReplacement: nil, albumOperations: NoRemoteAlbums(),
+            dependencies: dependencies)
+        let passCalls = ChangeCallCounter()
+        #if DEBUG
+            stack.photoBackup.replacePassBodyForTesting { passCalls.increment("pass") }
+        #endif
+        addTeardownBlock {
+            await stack.shutdownUnused()
+            clock.releaseAll()
+        }
+        return ChangeFixture(
+            stack: stack, probe: probe, clock: clock, tokenNames: tokens, passCalls: passCalls, source: source)
+    }
+
     private func makeStack(_ directory: URL) -> AccountBackupStack {
         AccountBackupStack(
             accountDataDirectory: directory, databasePolicy: .conservative, identityResolver: FakeIdentityResolver(),
@@ -98,5 +285,58 @@ private struct NoRemoteAlbums: AlbumSyncRemoteAlbumOps {
     func childMainLinkIDs(albumID: String) async throws -> Set<String> { [] }
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
         AlbumSyncAttachResult()
+    }
+}
+
+private final class ChangeAlbumSource: AlbumSyncLocalAlbumSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var held: PhotoAlbumReadGate?
+    var gate: PhotoAlbumReadGate? {
+        get { lock.withLock { held } }
+        set { lock.withLock { held = newValue } }
+    }
+    private var lists = 0
+    private var failure = false
+    var listCalls: Int { lock.withLock { lists } }
+    var failContents: Bool {
+        get { lock.withLock { failure } }
+        set { lock.withLock { failure = newValue } }
+    }
+    func listAlbums() async throws -> [LocalAlbumSummary] {
+        lock.withLock { lists += 1 }
+        return [.init(id: "album", title: "Album", assetCount: 0)]
+    }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents {
+        if failContents {
+            throw NSError(domain: "album-fixture", code: 1, userInfo: [NSLocalizedDescriptionKey: "Album input failed"])
+        }
+        await gate?.wait()
+        return .present([])
+    }
+}
+
+private final class PhotoAlbumReadGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = false
+    private var waits: [CheckedContinuation<Void, Never>] = []
+    var isWaiting: Bool { lock.withLock { !waits.isEmpty } }
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let immediate = lock.withLock {
+                if open { return true }
+                waits.append(continuation)
+                return false
+            }
+            if immediate { continuation.resume() }
+        }
+    }
+    func release() {
+        let pending = lock.withLock {
+            open = true
+            let pending = waits
+            waits.removeAll()
+            return pending
+        }
+        for waiter in pending { waiter.resume() }
     }
 }
