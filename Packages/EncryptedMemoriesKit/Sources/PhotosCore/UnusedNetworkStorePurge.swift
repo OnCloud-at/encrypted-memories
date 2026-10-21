@@ -5,8 +5,8 @@ import OSLog
 /// wrote before it switched to an ephemeral session (#605). Nothing ever read them.
 ///
 /// The purge never lists either container. It removes only the literal names below, directly inside
-/// `Library/Caches/<bundle id>` and `Library/Cookies`, and never follows a symbolic link. Every other
-/// entry stays, including the Core ML compile cache next to the URL cache and all app caches.
+/// `Library/Caches/<bundle id>` and `Library/Cookies`. It refuses symbolic links at or below the
+/// trusted app-container boundary. Every other entry stays, including the Core ML compile cache and app caches.
 /// On macOS it runs only inside the app's sandbox container, where `Library/Cookies` is the app's own.
 public enum UnusedNetworkStorePurge {
     static let completedKey = "network.unusedStorePurged.v1"
@@ -47,12 +47,27 @@ public enum UnusedNetworkStorePurge {
     /// Any failure leaves the completion flag unset, so the next cold launch tries again.
     @discardableResult
     public static func purgeOnce(defaults: UserDefaults = .standard, location: Location? = .current) -> Result? {
-        guard let location else { return nil }
+        purge(defaults: defaults, location: location, honorCompletedFlag: true)
+    }
+
+    /// Explicit sign-out verifies the named stores even after a completed startup purge.
+    /// A refused location or a failed verification cannot count as successful sign-out.
+    @discardableResult
+    public static func purgeForSignOut(defaults: UserDefaults = .standard, location: Location? = .current) -> Result? {
+        purge(defaults: defaults, location: location, honorCompletedFlag: false)
+    }
+
+    private static func purge(defaults: UserDefaults, location: Location?, honorCompletedFlag: Bool) -> Result? {
+        guard let location else {
+            if !honorCompletedFlag { defaults.removeObject(forKey: completedKey) }
+            return nil
+        }
         return purgeOnce(
             defaults: defaults,
             libraryDirectory: location.libraryDirectory,
             cachesDirectory: location.cachesDirectory,
             bundleIdentifier: location.bundleIdentifier,
+            honorCompletedFlag: honorCompletedFlag,
             removeItem: { try TransientPlaintextPurge.removeWithoutFollowingLinks(at: $0, boundary: $0) }
         )
     }
@@ -63,9 +78,11 @@ public enum UnusedNetworkStorePurge {
         cachesDirectory: URL,
         bundleIdentifier: String,
         requiresSandboxContainer: Bool = Self.requiresSandboxContainer,
+        honorCompletedFlag: Bool = true,
         removeItem: (URL) throws -> Void
     ) -> Result? {
-        guard !defaults.bool(forKey: completedKey) else { return nil }
+        guard !honorCompletedFlag || !defaults.bool(forKey: completedKey) else { return nil }
+        defaults.removeObject(forKey: completedKey)
         // Both containers must sit in the app's own Library.
         guard
             !requiresSandboxContainer
@@ -74,6 +91,10 @@ public enum UnusedNetworkStorePurge {
                 == libraryDirectory.standardizedFileURL.path
         else { return nil }
 
+        let trustedBoundary =
+            requiresSandboxContainer
+            ? libraryDirectory.standardizedFileURL.deletingLastPathComponent().deletingLastPathComponent()
+            : libraryDirectory.standardizedFileURL.deletingLastPathComponent()
         var removed: [URL] = []
         var failed: [URL] = []
         let containers: [(parent: URL, name: String, entries: [String])] = [
@@ -88,16 +109,26 @@ public enum UnusedNetworkStorePurge {
                 failed.append(container)
                 continue
             }
-            // A link in place of the container points outside the app's own files.
-            guard itemType(at: container) == .typeDirectory else { continue }
+            let checkedContainer: URL
+            do {
+                guard let admitted = try checkedDirectory(container, within: trustedBoundary) else { continue }
+                checkedContainer = admitted
+            } catch {
+                failed.append(container)
+                continue
+            }
             for entry in entries {
-                let target = container.appendingPathComponent(entry).standardizedFileURL
-                guard itemType(at: target) != nil else { continue }
-                // An entry that disappeared on its own during removal counts as removed.
-                try? removeItem(target)
-                if itemType(at: target) == nil {
-                    removed.append(target)
-                } else {
+                let target = checkedContainer.appendingPathComponent(entry).standardizedFileURL
+                do {
+                    guard try itemState(at: target) != .missing else { continue }
+                    // The postcondition decides success, including an entry removed before an error.
+                    try? removeItem(target)
+                    if try itemState(at: target) == .missing {
+                        removed.append(target)
+                    } else {
+                        failed.append(target)
+                    }
+                } catch {
                     failed.append(target)
                 }
             }
@@ -105,6 +136,7 @@ public enum UnusedNetworkStorePurge {
         if failed.isEmpty {
             defaults.set(true, forKey: completedKey)
         } else {
+            defaults.removeObject(forKey: completedKey)
             logger.error("Could not remove \(failed.count) unused network store entries; retrying at next launch.")
         }
         return Result(removed: removed, failed: failed)
@@ -123,9 +155,46 @@ public enum UnusedNetworkStorePurge {
             && container.deletingLastPathComponent().lastPathComponent == "Containers"
     }
 
-    /// The type of the item itself, without following a final symbolic link; nil when nothing exists.
-    private static func itemType(at url: URL) -> FileAttributeType? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
-        return attributes[.type] as? FileAttributeType
+    /// Resolve aliases only above the admitted app-container boundary. Every component below it
+    /// must be a directory entry, so a static ancestor link cannot redirect the literal deletion set.
+    /// This check does not prevent concurrent replacement of an admitted filesystem entry.
+    private static func checkedDirectory(_ directory: URL, within boundary: URL) throws -> URL? {
+        guard directory.path.hasPrefix(boundary.path + "/") else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        switch try itemState(at: boundary) {
+        case .missing: return nil
+        case .directory: break
+        case .other: throw CocoaError(.fileReadInvalidFileName)
+        }
+        var current = boundary.resolvingSymlinksInPath()
+        for component in directory.pathComponents.dropFirst(boundary.pathComponents.count) {
+            current.appendPathComponent(component, isDirectory: true)
+            switch try itemState(at: current) {
+            case .missing: return nil
+            case .directory: break
+            case .other: throw CocoaError(.fileReadInvalidFileName)
+            }
+        }
+        return current
+    }
+
+    private static func itemState(at url: URL) throws -> LocalPurgeItemState {
+        try LocalPurgeItemState.read(at: url)
+    }
+}
+
+/// A successful metadata read means present. Only a missing-file error proves absence.
+/// Unknown types remain other; they never become an eligible container directory.
+enum LocalPurgeItemState {
+    case missing, directory, other
+
+    static func read(at url: URL) throws -> Self {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            return attributes[.type] as? FileAttributeType == .typeDirectory ? .directory : .other
+        } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
+            return .missing
+        }
     }
 }

@@ -125,6 +125,166 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         XCTAssertTrue(exists(cookies.appendingPathComponent("Cookies.binarycookies")))
     }
 
+    func testSignOutPurgesTheNamedStoresAfterACompletedStartupAndKeepsOtherEntries() throws {
+        try seedUnusedStores()
+        XCTAssertNotNil(purge())
+        XCTAssertTrue(isDone)
+        try seedUnusedStores()
+        let protected = [
+            urlCache.appendingPathComponent("com.apple.e5rt.e5bundlecache/compiled.bin"),
+            urlCache.appendingPathComponent("Cache.db.keep"),
+            caches.appendingPathComponent("EncryptedMemories/protected.cache"),
+            cookies.appendingPathComponent("Other.binarycookies"),
+        ]
+        for file in protected { try write(file) }
+        let result = try XCTUnwrap(
+            UnusedNetworkStorePurge.purgeForSignOut(
+                defaults: defaults,
+                location: UnusedNetworkStorePurge.Location(
+                    libraryDirectory: library, cachesDirectory: caches, bundleIdentifier: bundleIdentifier)))
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.removed.count, 5)
+        for file in protected { XCTAssertTrue(exists(file)) }
+    }
+
+    func testSignOutRefusesLinkedContainersWithoutFollowingOrDeletingThem() throws {
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        let outsideCache = outside.appendingPathComponent("Cache.db")
+        try write(outsideCache)
+        try FileManager.default.removeItem(at: urlCache)
+        try FileManager.default.createSymbolicLink(at: urlCache, withDestinationURL: outside)
+        let result = try XCTUnwrap(
+            UnusedNetworkStorePurge.purgeForSignOut(
+                defaults: defaults,
+                location: UnusedNetworkStorePurge.Location(
+                    libraryDirectory: library, cachesDirectory: caches, bundleIdentifier: bundleIdentifier)))
+        XCTAssertFalse(result.succeeded)
+        XCTAssertTrue(exists(outsideCache))
+        XCTAssertTrue(exists(urlCache))
+        XCTAssertFalse(isDone)
+    }
+
+    func testSignOutRefusesAStaticLibraryAncestorLink() throws {
+        try assertStaticAncestorLinkIsRefused(at: library)
+    }
+
+    func testSignOutRefusesAStaticCachesAncestorLink() throws {
+        try assertStaticAncestorLinkIsRefused(at: caches)
+    }
+
+    func testSignOutRefusesAStaticDataAncestorLink() throws {
+        try assertStaticAncestorLinkIsRefused(at: library.deletingLastPathComponent())
+    }
+
+    func testSignOutRefusesAStaticTrustedBoundaryLink() throws {
+        let boundary =
+            UnusedNetworkStorePurge.requiresSandboxContainer
+            ? library.deletingLastPathComponent().deletingLastPathComponent()
+            : library.deletingLastPathComponent()
+        try assertStaticAncestorLinkIsRefused(at: boundary)
+    }
+
+    private func assertStaticAncestorLinkIsRefused(at ancestor: URL) throws {
+        try seedUnusedStores()
+        let destination = root.appendingPathComponent("linked-destination", isDirectory: true)
+        let protected = urlCache.appendingPathComponent("com.apple.e5rt.e5bundlecache/compiled.bin")
+        try write(protected)
+        try FileManager.default.moveItem(at: ancestor, to: destination)
+        try FileManager.default.createSymbolicLink(at: ancestor, withDestinationURL: destination)
+        let cacheDestination = destination.appendingPathComponent(
+            String(urlCache.path.dropFirst(ancestor.path.count + 1)))
+        let result = try XCTUnwrap(
+            UnusedNetworkStorePurge.purgeForSignOut(
+                defaults: defaults,
+                location: UnusedNetworkStorePurge.Location(
+                    libraryDirectory: library, cachesDirectory: caches, bundleIdentifier: bundleIdentifier)))
+        XCTAssertFalse(result.succeeded, "a static ancestor link must refuse deletion")
+        for name in ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData/0B1C2D3E"] {
+            XCTAssertTrue(
+                exists(cacheDestination.appendingPathComponent(name)), "linked destination must survive: \(name)")
+        }
+        XCTAssertTrue(exists(cacheDestination.appendingPathComponent("com.apple.e5rt.e5bundlecache/compiled.bin")))
+        if ancestor != caches {
+            let cookieDestination = destination.appendingPathComponent(
+                String(cookies.path.dropFirst(ancestor.path.count + 1)))
+            XCTAssertTrue(exists(cookieDestination.appendingPathComponent("Cookies.binarycookies")))
+        } else {
+            XCTAssertFalse(
+                exists(cookies.appendingPathComponent("Cookies.binarycookies")), "safe independent container runs")
+        }
+        XCTAssertFalse(isDone)
+    }
+
+    func testAnAliasAboveTheTrustedAppContainerDoesNotRefuseCleanup() throws {
+        try seedUnusedStores()
+        let aliasParent = root.appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: aliasParent, withIntermediateDirectories: true)
+        let alias = aliasParent.appendingPathComponent("Containers", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: alias, withDestinationURL: root.appendingPathComponent("Containers", isDirectory: true))
+        let aliasLibrary = alias.appendingPathComponent("\(bundleIdentifier)/Data/Library", isDirectory: true)
+        let result = try XCTUnwrap(
+            UnusedNetworkStorePurge.purgeForSignOut(
+                defaults: defaults,
+                location: UnusedNetworkStorePurge.Location(
+                    libraryDirectory: aliasLibrary,
+                    cachesDirectory: aliasLibrary.appendingPathComponent("Caches", isDirectory: true),
+                    bundleIdentifier: bundleIdentifier)))
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.removed.count, 5)
+        XCTAssertTrue(isDone)
+    }
+
+    func testIOSBoundaryRuleRefusesALinkAtTheLibraryParent() throws {
+        try seedUnusedStores()
+        let data = library.deletingLastPathComponent()
+        let destination = root.appendingPathComponent("ios-boundary-destination", isDirectory: true)
+        try FileManager.default.moveItem(at: data, to: destination)
+        try FileManager.default.createSymbolicLink(at: data, withDestinationURL: destination)
+        let result = try XCTUnwrap(purge(requiresSandboxContainer: false))
+        XCTAssertFalse(result.succeeded)
+        XCTAssertFalse(isDone)
+        XCTAssertTrue(exists(destination.appendingPathComponent("Library/Caches/\(bundleIdentifier)/Cache.db")))
+        XCTAssertTrue(exists(destination.appendingPathComponent("Library/Cookies/Cookies.binarycookies")))
+    }
+
+    func testUnreadableTrustedBoundaryCannotEstablishAbsence() throws {
+        try seedUnusedStores()
+        let boundary =
+            UnusedNetworkStorePurge.requiresSandboxContainer
+            ? library.deletingLastPathComponent().deletingLastPathComponent()
+            : library.deletingLastPathComponent()
+        let parent = boundary.deletingLastPathComponent()
+        let permissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: parent.path)[.posixPermissions] as? NSNumber)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: parent.path)
+        defer {
+            do {
+                try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: parent.path)
+            } catch {
+                XCTFail("Could not restore the owned boundary permission fixture")
+            }
+        }
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: boundary.path)
+            XCTFail("Boundary permission fixture did not cause the required metadata error")
+            return
+        } catch {
+            guard let error = error as? CocoaError, error.code == .fileReadNoPermission else {
+                XCTFail("Boundary permission fixture caused an unexpected error category")
+                return
+            }
+            print("605 boundary metadata probe: verified non-missing CocoaError.fileReadNoPermission")
+        }
+        let result = try XCTUnwrap(purge())
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: parent.path)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.failed.count, 2)
+        XCTAssertFalse(isDone)
+        XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+        XCTAssertTrue(exists(cookies.appendingPathComponent("Cookies.binarycookies")))
+    }
+
     func testMissingEntriesAndContainersAreNotAnError() throws {
         let result = try XCTUnwrap(purge())
         XCTAssertTrue(result.succeeded)
@@ -136,6 +296,18 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         try FileManager.default.removeItem(at: cookies)
         let withoutContainers = try XCTUnwrap(purge())
         XCTAssertTrue(withoutContainers.succeeded)
+        XCTAssertTrue(isDone)
+    }
+
+    func testMissingTrustedBoundaryEstablishesAbsence() throws {
+        let boundary =
+            UnusedNetworkStorePurge.requiresSandboxContainer
+            ? library.deletingLastPathComponent().deletingLastPathComponent()
+            : library.deletingLastPathComponent()
+        try FileManager.default.removeItem(at: boundary)
+        let result = try XCTUnwrap(purge())
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.removed, [])
         XCTAssertTrue(isDone)
     }
 
@@ -160,6 +332,96 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
         let retry = try XCTUnwrap(purge())
         XCTAssertEqual(retry.removed, [wal])
         XCTAssertFalse(exists(wal))
+        XCTAssertTrue(isDone)
+    }
+
+    func testUnreadableNamedEntriesCannotCompleteThePurge() throws {
+        try seedUnusedStores()
+        let permissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: urlCache.path)[.posixPermissions] as? NSNumber)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: urlCache.path)
+        defer {
+            do {
+                try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: urlCache.path)
+            } catch {
+                XCTFail("Could not restore the owned permission fixture")
+            }
+        }
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: urlCache.appendingPathComponent("Cache.db").path)
+            XCTFail("Permission fixture did not cause the required metadata error")
+            return
+        } catch {
+            guard let error = error as? CocoaError, error.code == .fileReadNoPermission else {
+                XCTFail("Permission fixture caused an unexpected error category")
+                return
+            }
+            print("605 metadata probe: verified non-missing CocoaError.fileReadNoPermission")
+        }
+
+        let result = try XCTUnwrap(purge())
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: urlCache.path)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertFalse(isDone)
+        XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+    }
+
+    func testUnreadableContainerCannotCompleteThePurge() throws {
+        try seedUnusedStores()
+        let permissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: caches.path)[.posixPermissions] as? NSNumber)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: caches.path)
+        defer {
+            do {
+                try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: caches.path)
+            } catch {
+                XCTFail("Could not restore the owned container permission fixture")
+            }
+        }
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: urlCache.path)
+            XCTFail("Container permission fixture did not cause the required metadata error")
+            return
+        } catch {
+            guard let error = error as? CocoaError, error.code == .fileReadNoPermission else {
+                XCTFail("Container permission fixture caused an unexpected error category")
+                return
+            }
+            print("605 container metadata probe: verified non-missing CocoaError.fileReadNoPermission")
+        }
+
+        let result = try XCTUnwrap(purge())
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: caches.path)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.failed, [urlCache.standardizedFileURL])
+        XCTAssertFalse(isDone)
+        XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+    }
+
+    func testFailedSignOutClearsAnEarlierStartupCompletionAndCanRetry() throws {
+        try seedUnusedStores()
+        XCTAssertNotNil(purge())
+        XCTAssertTrue(isDone)
+        try seedUnusedStores()
+        let result = try XCTUnwrap(
+            UnusedNetworkStorePurge.purgeOnce(
+                defaults: defaults, libraryDirectory: library, cachesDirectory: caches,
+                bundleIdentifier: bundleIdentifier, honorCompletedFlag: false,
+                removeItem: { _ in throw CocoaError(.fileWriteNoPermission) }))
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.failed.count, 5)
+        XCTAssertEqual(result.removed, [])
+        XCTAssertFalse(isDone)
+        XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+        XCTAssertTrue(exists(cookies.appendingPathComponent("Cookies.binarycookies")))
+
+        let retry = try XCTUnwrap(
+            UnusedNetworkStorePurge.purgeForSignOut(
+                defaults: defaults,
+                location: UnusedNetworkStorePurge.Location(
+                    libraryDirectory: library, cachesDirectory: caches, bundleIdentifier: bundleIdentifier)))
+        XCTAssertTrue(retry.succeeded)
+        XCTAssertEqual(retry.removed.count, 5)
         XCTAssertTrue(isDone)
     }
 
