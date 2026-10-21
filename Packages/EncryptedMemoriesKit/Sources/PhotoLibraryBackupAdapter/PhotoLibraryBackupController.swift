@@ -55,6 +55,11 @@ public final class PhotoLibraryBackupController {
         /// Per-account directory holding the backup stores (sign-out purge covers it wholesale).
         public var accountDataDirectory: URL
         public var databasePolicy: LibraryDatabasePolicy
+
+        var makeChangeMonitor: (URL) -> PhotoLibraryChangeMonitor = { PhotoLibraryChangeMonitor(tokenURL: $0) }
+        var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
+        var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+
         public var defaults: UserDefaults
         public var runtimeSignals: BackupRuntimeSignalSource
         /// How long a pass waits for the first network path before it starts anyway. The Apple path monitor reports
@@ -163,7 +168,10 @@ public final class PhotoLibraryBackupController {
     private var statusProjectionRevision: UInt64 = 0
     private var lastAppliedStatusProjectionRevision: UInt64 = 0
     private let tempStore: BackupTempFileStore
+    private var changeSubscription: PhotoLibraryChangeMonitor.Subscription?
     private let monitor: PhotoLibraryChangeMonitor
+    private let currentAccessState: () -> PhotoBackupAccessState
+    private let changeSleep: @Sendable (UInt64) async throws -> Void
     private let defaults: UserDefaults
     private let runtimeSignals: BackupRuntimeSignalSource
     private let retryPolicy: BackupRetryPolicy
@@ -262,6 +270,8 @@ public final class PhotoLibraryBackupController {
         requiresPendingStore: Bool = false,
         replacementJournal: (any EditReplacementJournaling)? = nil
     ) {
+        currentAccessState = configuration.currentAccessState
+        changeSleep = configuration.changeSleep
         let directory = configuration.accountDataDirectory
         let journal = editReplacement?.journal ?? replacementJournal
         let pendingRecorder = pendingStore.map {
@@ -281,12 +291,12 @@ public final class PhotoLibraryBackupController {
         firstNetworkPathWait = configuration.firstNetworkPathWait
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy
-        accessState = PhotoLibraryAuthorization.currentState()
+        accessState = currentAccessState()
         isEnabled = configuration.defaults.bool(forKey: Self.enabledDefaultsKey)
         isUserPaused = configuration.defaults.bool(forKey: Self.userPausedDefaultsKey)
         tempStore = BackupTempFileStore(
             directory: directory.appendingPathComponent("photo-backup-temp", isDirectory: true))
-        monitor = PhotoLibraryChangeMonitor(tokenURL: directory.appendingPathComponent("photo-backup-change-token.v1"))
+        monitor = configuration.makeChangeMonitor(directory.appendingPathComponent("photo-backup-change-token.v1"))
 
         let queueStore = UploadBackupSyncQueueManifestStore(
             url: directory.appendingPathComponent(Self.queueDatabaseFileName),
@@ -458,7 +468,8 @@ public final class PhotoLibraryBackupController {
         pendingSyncAfterStop = false
         changeDebounceTask?.cancel()
         changeDebounceTask = nil
-        monitor.stopObserving()
+        changeSubscription?.cancel()
+        changeSubscription = nil
         stopSync()
         if !isSyncing {
             refreshFromQueue()
@@ -466,7 +477,7 @@ public final class PhotoLibraryBackupController {
     }
 
     public func refreshAccessState() {
-        accessState = PhotoLibraryAuthorization.currentState()
+        accessState = currentAccessState()
     }
 
     // MARK: - Sync lifecycle
@@ -1360,7 +1371,8 @@ public final class PhotoLibraryBackupController {
         isShuttingDown = true
         manualWiFiRetryPending = false
         pendingSyncAfterStop = false
-        monitor.stopObserving()
+        changeSubscription?.cancel()
+        changeSubscription = nil
         changeDebounceTask?.cancel()
         changeDebounceTask = nil
         statusRefreshTask?.cancel()
@@ -1450,7 +1462,8 @@ public final class PhotoLibraryBackupController {
     }
 
     private func startObservingChanges() {
-        monitor.startObserving { [weak self] in
+        guard changeSubscription == nil else { return }
+        changeSubscription = monitor.subscribe { [weak self] in
             Task { @MainActor in self?.scheduleChangeDrivenSync() }
         }
     }
@@ -1572,8 +1585,8 @@ public final class PhotoLibraryBackupController {
             // Do not commit the change token here; the running pass owns that commit.
             guard !isRetiringInstantWork else { return }
             instantEnqueueTask?.cancel()
-            instantEnqueueTask = Task { [weak self, monitor, engine, catalogStore] in
-                try? await Task.sleep(nanoseconds: Self.liveChangeDebounceNanoseconds)
+            instantEnqueueTask = Task { [weak self, monitor, engine, catalogStore, changeSleep] in
+                try? await changeSleep(Self.liveChangeDebounceNanoseconds)
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
                     guard let self, !self.isShuttingDown, self.isSyncing else { return }
@@ -1584,8 +1597,8 @@ public final class PhotoLibraryBackupController {
             return
         }
         changeDebounceTask?.cancel()
-        changeDebounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.liveChangeDebounceNanoseconds)
+        changeDebounceTask = Task { [weak self, changeSleep] in
+            try? await changeSleep(Self.liveChangeDebounceNanoseconds)
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self, !self.isShuttingDown, self.isEnabled, !self.isSyncing else { return }
