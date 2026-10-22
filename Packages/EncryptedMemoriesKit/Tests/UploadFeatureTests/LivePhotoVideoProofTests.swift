@@ -353,8 +353,8 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .upload)
     }
 
-    func testADeletedCopyKeepsItsMeaningBecauseItsRoleCannotBeRead() async throws {
-        // A copy deleted for good has no role that the server can still name, so it keeps its earlier meaning.
+    func testAMissingStateStaysUnknownWhenItsRoleCannotBeRead() async throws {
+        // Missing State does not prove deletion, even when its role cannot be read.
         checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
             RemotePhotoDuplicate(
                 nameHash: "nh(IMG_1.MOV)", contentHash: videoContentHash, linkState: nil, linkID: "deleted-video")
@@ -362,7 +362,7 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
 
         let result = try await pipeline.resolve(video())
 
-        XCTAssertEqual(result.decision, .skip(.deletedRemotely, remoteLinkID: "deleted-video"))
+        XCTAssertEqual(result.decision, .skip(.inconsistentRemoteState, remoteLinkID: "deleted-video"))
         XCTAssertEqual(checker.linkVisibilityCallCount, 0)
     }
 

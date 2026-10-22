@@ -683,6 +683,43 @@ final class SpyIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
     }
 }
 
+private final class TransportCancellingStageResolver: UploadIdentityResolving, @unchecked Sendable {
+    let inner: UploadDedupePipeline
+    let stage: String
+    let failure: any Error
+    private let lock = NSLock()
+    private var names: [String] = []
+    var resolvedNames: [String] { lock.withLock { names } }
+    init(inner: UploadDedupePipeline, stage: String, failure: any Error) {
+        self.inner = inner
+        self.stage = stage
+        self.failure = failure
+    }
+    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+        lock.withLock { names.append(descriptor.filename) }
+        if stage == "primary", descriptor.source.resource == .primary { throw failure }
+        if stage == "secondary", descriptor.filename == "cancel.mov" { throw failure }
+        let result = try await inner.resolve(descriptor)
+        if stage == "revalidation", descriptor.filename == "cancel.mov" {
+            await inner.uploadDidFail(descriptor)
+            return .init(identity: result.identity, decision: .skip(.draftExists, remoteLinkID: "foreign-draft"))
+        }
+        return result
+    }
+    func revalidateKnownRemote(_ descriptor: UploadResourceDescriptor) async throws -> UploadDuplicateDecision? {
+        throw failure
+    }
+    func recordUploaded(
+        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity,
+        remoteVolumeID: String, remoteLinkID: String
+    ) async throws {
+        try await inner.recordUploaded(
+            descriptor, identity: identity, remoteVolumeID: remoteVolumeID, remoteLinkID: remoteLinkID)
+    }
+    func uploadDidFail(_ descriptor: UploadResourceDescriptor) async { await inner.uploadDidFail(descriptor) }
+    func invalidateCachedRemoteState() async { await inner.invalidateCachedRemoteState() }
+}
+
 final class PreparationFailingIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
     private let inner: any UploadIdentityResolving
     init(inner: any UploadIdentityResolving) { self.inner = inner }
@@ -714,16 +751,18 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
     private var remainingFailures: Int
     private var _recordCalls = 0
     private let failure: any Error
+    private let failureFilename: String?
 
     var recordCalls: Int { lock.withLock { _recordCalls } }
 
     init(
         inner: UploadDedupePipeline, failures: Int,
-        failure: any Error = UploadError.backend("simulated manifest failure")
+        failure: any Error = UploadError.backend("simulated manifest failure"), failureFilename: String? = nil
     ) {
         self.inner = inner
         remainingFailures = failures
         self.failure = failure
+        self.failureFilename = failureFilename
     }
 
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
@@ -748,7 +787,9 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
     ) async throws {
         let shouldFail = lock.withLock {
             _recordCalls += 1
-            guard remainingFailures > 0 else { return false }
+            guard remainingFailures > 0, failureFilename == nil || descriptor.filename == failureFilename else {
+                return false
+            }
             remainingFailures -= 1
             return true
         }
@@ -1140,6 +1181,130 @@ final class BackupSyncRunnerTests: XCTestCase {
     override func tearDownWithError() throws {
         queueStore.close()
         try? FileManager.default.removeItem(at: tempDir)
+    }
+
+    func testTransportCancellationAtPrimarySecondaryAndRevalidationKeepsRetryBudgetAndStopsResources() async throws {
+        let errors: [any Error] = [
+            CancellationError(), URLError(.cancelled), UploadError.cancelled,
+            UploadError.transport(code: -999, message: "cancelled"),
+        ]
+        for stage in ["primary", "secondary", "revalidation"] {
+            for (index, failure) in errors.enumerated() {
+                let queue = try XCTUnwrap(
+                    UploadBackupSyncQueueManifestStore(
+                        url: tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")))
+                defer { queue.close() }
+                let name = "\(stage)-\(index).heic"
+                let entry = UploadBackupSyncQueueEntry(
+                    source: .file(URL(fileURLWithPath: "/backup/\(name)")),
+                    revision: UploadBackupRevision(date: resolver.defaultModified), originalFilename: name,
+                    byteCount: 4, state: .discovered, attempts: 0, updatedAt: clock.now.addingTimeInterval(-60))
+                XCTAssertTrue(queue.upsert(entry))
+                if stage != "primary" {
+                    resolver.setSecondaries(["cancel.mov", "later.mov"], for: entry.source.identifier)
+                    resolver.setSecondaryResource(.photoKit(role: "test", ordinal: 1), forName: "later.mov")
+                }
+                let localUploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
+                let identity = TransportCancellingStageResolver(
+                    inner: UploadDedupePipeline(
+                        store: FakeIdentityStore(), hasher: FakeHasher(), checker: FakeChecker()),
+                    stage: stage, failure: failure)
+                let runner = makeRunner(
+                    uploader: localUploader, identityResolver: identity, queue: queue,
+                    throttle: BackupThrottlePolicy(baseConcurrency: 1))
+                let finished = expectation(description: "transport cancellation ends the pass")
+                let progressBox = BackupProgressBox()
+                let drain = Task {
+                    let result = await runner.runUntilDrained(mode: .eligibleOnly)
+                    progressBox.set(result)
+                    finished.fulfill()
+                    return result
+                }
+                await fulfillment(of: [finished], timeout: 2)
+                if progressBox.value == nil {
+                    drain.cancel()
+                    await runner.stop()  // Cleanup only after failed completion.
+                }
+                let progress = await drain.value
+                let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+                XCTAssertEqual(row.attempts, 0, "\(stage) cancellation must not consume retry budget")
+                XCTAssertNil(row.lastError, "cancellation cannot become an ordinary row failure")
+                XCTAssertEqual(progress.failed, 0)
+                XCTAssertFalse(identity.resolvedNames.contains("later.mov"), "no later resource after cancellation")
+                XCTAssertFalse(localUploader.requests.map(\.name).contains("later.mov"))
+                do {
+                    try await runner.checkCancellation()
+                    XCTFail("the operation owner must receive the transport cancellation")
+                } catch {
+                    XCTAssertTrue(UploadError.isCancellation(error))
+                    XCTAssertFalse(Task.isCancelled)
+                }
+            }
+        }
+    }
+
+    func testExplicitStopRetainsOperationCancellationWithoutPolicyDeferral() async throws {
+        let entry = seedEntry("stop-owner.heic")
+        let running = RunningUntilCancelledUploader()
+        let runner = makeRunner(uploader: running)
+        let drain = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
+        await running.started.wait()
+        await runner.stop()
+        _ = await drain.value
+        do {
+            try await runner.checkCancellation()
+            XCTFail("explicit Stop must retain operation cancellation")
+        } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        XCTAssertEqual(state(of: entry), .queuedForUpload)
+    }
+
+    func testCancelledCommittedReceiptRetainsReconciliationAndOperationSignal() async throws {
+        for secondary in [false, true] {
+            for failure in [
+                CancellationError() as any Error, URLError(.cancelled), UploadError.cancelled,
+                UploadError.transport(code: -999, message: "cancelled"),
+            ] {
+                let queue = try XCTUnwrap(
+                    UploadBackupSyncQueueManifestStore(
+                        url: tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")))
+                defer { queue.close() }
+                let name = UUID().uuidString + ".heic"
+                let entry = UploadBackupSyncQueueEntry(
+                    source: .file(URL(fileURLWithPath: "/backup/\(name)")),
+                    revision: UploadBackupRevision(date: resolver.defaultModified), originalFilename: name,
+                    byteCount: 4, state: .discovered, attempts: 0, updatedAt: clock.now.addingTimeInterval(-60))
+                XCTAssertTrue(queue.upsert(entry))
+                let secondaryName = UUID().uuidString + ".mov"
+                if secondary { resolver.setSecondaries([secondaryName], for: entry.source.identifier) }
+                let inner = UploadDedupePipeline(
+                    store: FakeIdentityStore(), hasher: FakeHasher(), checker: FakeChecker())
+                let identity = RecordFailingIdentityResolver(
+                    inner: inner, failures: 2, failure: failure,
+                    failureFilename: secondary ? secondaryName : name)
+                let runner = makeRunner(
+                    identityResolver: identity, queue: queue,
+                    throttle: BackupThrottlePolicy(baseConcurrency: 1))
+                for pass in 0..<2 {
+                    _ = await runner.runUntilDrained(mode: .eligibleOnly)
+                    do {
+                        try await runner.checkCancellation()
+                        XCTFail("receipt cancellation reaches owner on pass \(pass)")
+                    } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+                    let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+                    XCTAssertEqual(row.state, .needsRemoteReconciliation)
+                    XCTAssertNotNil(row.remoteCommitReconciliation)
+                    XCTAssertEqual(row.attempts, 0)
+                    clock.advance(by: 1000)
+                }
+                _ = await runner.runUntilDrained(mode: .eligibleOnly)
+                let settled = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+                XCTAssertTrue([.completed, .alreadyBackedUp].contains(settled.state))
+                XCTAssertNil(settled.remoteCommitReconciliation)
+                XCTAssertEqual(uploader.requests.filter { $0.name == name }.count, 1)
+                if secondary { XCTAssertEqual(uploader.requests.filter { $0.name == secondaryName }.count, 1) }
+            }
+        }
     }
 
     func testUnavailableQueueStartsNoWorkAndCannotLookDrained() async throws {
@@ -1808,6 +1973,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(progress.isPausedByPolicy)
         XCTAssertTrue(progress.isWaitingForWiFi)
         XCTAssertEqual(progress.failed, 0)
+        try await runner.checkCancellation()
     }
 
     func testBackupUploadsLetTheSystemRefuseCellularDataOnlyWhileMobileDataIsOff() async throws {
@@ -1970,6 +2136,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(row.state, .queuedForUpload)
         XCTAssertEqual(row.attempts, 0)
         XCTAssertTrue(progress.isWaitingForWiFi)
+        try await runner.checkCancellation()
     }
 
     func testATransferThatLeftWiFiDuringItsWaitDoesNotStartWhenTheNetworkIsFree() async throws {
@@ -2392,6 +2559,33 @@ final class BackupSyncRunnerTests: XCTestCase {
             return false
         }
         XCTAssertEqual(handoffs.count, 1)
+    }
+
+    func testExplicitStopRetainsCancellationWhenTheCommittedUploadReturnsSuccessfully() async throws {
+        let name = "committed-before-stop.jpg"
+        let entry = seedEntry(name)
+        let gated = CommitThenGateUploader(gatedName: name)
+        let identity = RecordFailingIdentityResolver(inner: makePipeline(), failures: 0)
+        let runner = makeRunner(
+            uploader: gated, identityResolver: identity, uploadStallTimeout: 60, uploadStallPollInterval: 5)
+        let drain = Task { await runner.runUntilDrained() }
+        await gated.committed.wait()
+        let stopping = Task { await runner.stop() }
+        await gated.cancelled.wait()
+        await gated.returnGate.signal()
+        await stopping.value
+        _ = await drain.value
+
+        do {
+            try await runner.checkCancellation()
+            XCTFail("explicit Stop retains its signal when the committed upload succeeds")
+        } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(queueStore.summary().uploaded, 1)
+        XCTAssertEqual(gated.uploads, [name], "a committed upload must not repeat")
+        XCTAssertEqual(gated.cancellations, 1)
+        XCTAssertEqual(identity.recordCalls, 1)
+        XCTAssertEqual(identityStore.record(for: entry.source)?.remoteLinkID, testUID(name).nodeID)
     }
 
     func testAnUploadThatReturnsItsUidAfterTheWatchdogTimedOutSettlesWithoutASecondUpload() async throws {
@@ -2971,6 +3165,27 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(cancelled.remoteContentIndexHealth, Self.incompleteIndex)
     }
 
+    func testIndexPreparationCancellationReachesTheOperationOwnerWithoutAnAttempt() async throws {
+        let errors: [any Error] = [
+            CancellationError(), URLError(.cancelled), UploadError.cancelled,
+            UploadError.transport(code: NSURLErrorCancelled, message: "cancelled"),
+        ]
+        for error in errors {
+            let runner = makeRunner()
+            let entry = seedEntry("index-cancel-\(UUID().uuidString).jpg")
+            checker.prepareRemoteIndexError = error
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            do {
+                try await runner.checkCancellation()
+                XCTFail("index preparation cancellation must reach the operation owner: \(error)")
+            } catch {
+                XCTAssertTrue(UploadError.isCancellation(error))
+            }
+            XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+            XCTAssertEqual(uploader.requests.count, 0)
+        }
+    }
+
     func testFailedIndexPreparationKeepsTheIncompleteDuplicateIndexWarning() async throws {
         let runner = await runnerThatReportedAnIncompleteIndex()
         checker.prepareRemoteIndexError = URLError(.notConnectedToInternet)
@@ -3255,7 +3470,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.uploaded, 1)
     }
 
-    func testTrashedAndDeletedRemoteDuplicatesAreNotBackedUp() async throws {
+    func testTrashIsRespectedAndMissingRemoteStateStaysUnknown() async throws {
         let trashed = seedEntry("trashed.jpg")
         let deleted = seedEntry("deleted.jpg")
         let trashedHashes = expectedHashes(id: "trashed.jpg")
@@ -3276,13 +3491,13 @@ final class BackupSyncRunnerTests: XCTestCase {
         let progress = await runner.runUntilDrained()
 
         XCTAssertEqual(state(of: trashed), .skippedRemoteDeletion)
-        XCTAssertEqual(state(of: deleted), .skippedRemoteDeletion)
+        XCTAssertNotEqual(state(of: deleted), .skippedRemoteDeletion)
         XCTAssertTrue(uploader.requests.isEmpty)
-        XCTAssertEqual(progress.skippedRemoteDeletions, 2)
+        XCTAssertEqual(progress.skippedRemoteDeletions, 1)
         XCTAssertEqual(progress.backedUp, 0, "respected deletions must never count as backed up")
-        XCTAssertEqual(progress.needsAttention, 0)
+        XCTAssertEqual(progress.needsAttention, 1)
         XCTAssertEqual(state(of: trashed)?.isTerminalSuccess, true)
-        XCTAssertEqual(state(of: deleted)?.isTerminalSuccess, true)
+        XCTAssertEqual(state(of: deleted)?.isTerminalSuccess, false)
         XCTAssertEqual(stateStore.count(), 0, "no preflight completeness record may exist for skipped deletions")
     }
 
@@ -3585,6 +3800,30 @@ final class BackupSyncRunnerTests: XCTestCase {
         let pipeline: UploadDedupePipeline
         let remote: FakeEditReplacementRemote
         let replacement: EditedPhotoReplacement
+    }
+
+    func testReplacementReadCancellationReachesRunnerWithoutRetiringTheJournal() async throws {
+        let harness = try makeReplacementHarness()
+        let entry = seedLibraryEntry("replacement-cancel.heic")
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: entry.source.identifier)
+        let old = PhotoUID(volumeID: "vol", nodeID: "unproven-old")
+        try harness.journal.addSuperseded(old, for: entry.source)
+        // This revision is the original after an undo, so it replaces the earlier uploaded edit.
+        try harness.journal.recordUpload(edited: true, for: entry.source)
+        harness.remote.active = [old]
+        checker.compoundErrorsByMainLinkID[old.nodeID] = [URLError(.cancelled)]
+        let runner = makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        do {
+            try await runner.checkCancellation()
+            XCTFail("replacement cancellation must reach the operation owner")
+        } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+        XCTAssertEqual(harness.journal.entry(for: entry.source).allSuperseded, [old])
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty)
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        XCTAssertEqual(uploader.requests.map(\.name), ["replacement-cancel.heic"])
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(uploader.requests.map(\.name), ["replacement-cancel.heic"], "retry keeps the committed upload")
     }
 
     private func makeReplacementHarness() throws -> ReplacementHarness {
@@ -5374,5 +5613,6 @@ extension BackupSyncRunnerTests {
         let progress = try XCTUnwrap(progressBox.value)
         XCTAssertTrue(progress.isWaitingForWiFi)
         XCTAssertEqual(progress.failed, 0)
+        try await runner.checkCancellation()
     }
 }

@@ -61,6 +61,7 @@ private final class FakeBackupExecutor: AlbumSyncBackupExecuting, @unchecked Sen
         return proofLinks
     }
     var stopped = false
+    var onStop: (@Sendable () async -> Void)?
     /// The unresolved scratch-queue rows and filenames the next run reports.
     var problems: [String: BackupFailedItem] = [:]
     var filenames: [String: String] = [:]
@@ -81,7 +82,10 @@ private final class FakeBackupExecutor: AlbumSyncBackupExecuting, @unchecked Sen
         )
     }
 
-    func stop() async { lock.withLock { stopped = true } }
+    func stop() async {
+        lock.withLock { stopped = true }
+        await onStop?()
+    }
 }
 
 private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable {
@@ -103,6 +107,18 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
     var nextAlbumID = "remote-album-1"
     var sameContent: [String: Set<String>] = [:]
     var sameContentError: (any Error)?
+    var deletionStates: [String: UploadRemoteDeletionState] = [:]
+    var deletionError: (any Error)?
+    var deletionLookup: (@Sendable ([AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState])?
+    private var _deletionRequests: [[String]] = []
+    var deletionRequests: [[String]] { lock.withLock { _deletionRequests } }
+
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState] {
+        lock.withLock { _deletionRequests.append(links.map(\.uid.nodeID).sorted()) }
+        if let deletionError { throw deletionError }
+        if let deletionLookup { return try await deletionLookup(links) }
+        return deletionStates
+    }
     /// The first lookup call (1-based) that throws `sameContentError`; earlier calls answer normally.
     var sameContentFailsFromCall = 1
     private var _sameContentRequests: [Set<String>] = []
@@ -194,6 +210,115 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
     }
 
     private let album = LocalAlbumSummary(id: "local-1", title: "Urlaub", assetCount: 3)
+
+    @Test func freshExplicitTrashIsReportedWithoutAnAttach() async throws {
+        let remote = FakeRemoteOps()
+        remote.deletionStates = ["trash": .trashed]
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["photo"]], links: ["photo": link("trash")], remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(remote.attachedBatches.isEmpty)
+        #expect(report.trashedSkipped == 1)
+        #expect(report.problems.first?.issue == .remoteDeletion)
+        #expect(!report.isFullySynced)
+    }
+
+    @Test func unknownOrFailedDeletionEvidenceKeepsTheExistingAttach() async throws {
+        for fails in [false, true] {
+            let remote = FakeRemoteOps()
+            if fails { remote.deletionError = AlbumSyncError.mappingStoreUnavailable }
+            let (runner, _, _, _) = makeRunner(
+                contents: ["album": ["photo"]], links: ["photo": link("unknown")], remote: remote)
+            let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+            #expect(remote.deletionRequests == [["unknown"]])
+            #expect(remote.attachedBatches.flatMap { $0 } == ["unknown"])
+            #expect(report.problems.isEmpty)
+            #expect(report.isFullySynced)
+        }
+    }
+
+    @Test func transportAndTypedDeletionCancellationPreventAttachment() async throws {
+        let errors: [any Error] = [
+            URLError(.cancelled), UploadError.cancelled,
+            UploadError.transport(code: URLError.cancelled.rawValue, message: "cancelled"),
+        ]
+        for error in errors {
+            let remote = FakeRemoteOps()
+            remote.deletionError = error
+            let (runner, _, _, _) = makeRunner(
+                contents: ["album": ["photo"]], links: ["photo": link("known")], remote: remote)
+            do {
+                _ = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+                Issue.record("cancellation must end sync")
+            } catch {
+                #expect(!Task.isCancelled)
+            }
+            #expect(remote.attachedBatches.isEmpty)
+        }
+    }
+
+    @Test func stopCancelsAndJoinsDeletionLookupBeforeAnotherMetadataBatch() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let stopEntered = Gate()
+        let stopReturned = Gate()
+        let checker = GatedDeletionChecker(entered: entered, release: release)
+        let remote = FakeRemoteOps()
+        remote.deletionLookup = { links in
+            try await UploadRemoteDeletionLookup.states(for: links.map { $0.uid.nodeID }, checker: checker)
+        }
+        let backup = FakeBackupExecutor()
+        backup.onStop = { await stopEntered.open() }
+        let ids = (0..<301).map { "photo-\($0)" }
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ids], links: Dictionary(uniqueKeysWithValues: ids.map { ($0, link($0)) }),
+            remote: remote, backup: backup)
+        let sync = Task { try await runner.sync(album: .init(id: "album", title: "Album", assetCount: ids.count)) }
+        #expect(await waitForDeletionGate(entered))
+        let stop = Task {
+            await runner.stop()
+            await stopReturned.open()
+        }
+        #expect(await waitForDeletionGate(stopEntered))
+        // The metadata operation ignores cancellation until released. Stop must retain and join it.
+        for _ in 0..<20 { await Task.yield() }
+        #expect(await stopReturned.opened == false)
+        await release.open()
+        await stop.value
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(checker.requestCount == 1)
+        #expect(checker.observedCancellation)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func callerCancellationCancelsAndJoinsTheDeletionLookup() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let checker = GatedDeletionChecker(entered: entered, release: release)
+        let remote = FakeRemoteOps()
+        remote.deletionLookup = { links in
+            try await UploadRemoteDeletionLookup.states(for: links.map { $0.uid.nodeID }, checker: checker)
+        }
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["photo"]], links: ["photo": link("known")], remote: remote)
+        let sync = Task { try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1)) }
+        #expect(await waitForDeletionGate(entered))
+        sync.cancel()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
+        #expect(checker.observedCancellation)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func aFullySyncedAlbumDoesNotReadDeletionEvidence() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["member"]
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["photo"]], links: ["photo": link("member")], remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(remote.deletionRequests.isEmpty)
+        #expect(report.isFullySynced)
+    }
 
     @Test func asksProofOnlyForMissingManifestLinksAndKeepsExistingAndTrashedLinks() async throws {
         let backup = FakeBackupExecutor()
@@ -512,6 +637,33 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(remote.attachedBatches.isEmpty)
     }
 
+    @Test func transportCancellationFromProofOrSameContentNeverAttaches() async throws {
+        let errors: [any Error] = [
+            URLError(.cancelled), UploadError.cancelled,
+            UploadError.transport(code: URLError.cancelled.rawValue, message: "cancelled"),
+        ]
+        for route in ["proof", "same-content"] {
+            for failure in errors {
+                let backup = FakeBackupExecutor()
+                let remote = FakeRemoteOps()
+                if route == "proof" {
+                    backup.proofError = failure
+                } else {
+                    remote.children = ["existing-member"]
+                    remote.sameContentError = failure
+                }
+                let (runner, _, _, _) = makeRunner(
+                    contents: ["album": ["known", "missing"]], links: ["known": link("existing")],
+                    remote: remote, backup: backup)
+                await #expect(throws: (any Error).self) {
+                    try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 2))
+                }
+                #expect(remote.attachedBatches.isEmpty)
+                #expect(!Task.isCancelled)
+            }
+        }
+    }
+
     @Test func proofLookupCancellationWithoutStopStillPropagates() async throws {
         let backup = FakeBackupExecutor()
         backup.proofError = CancellationError()
@@ -604,6 +756,32 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         await #expect(throws: AlbumSyncError.stopped) { try await sync.value }
         #expect(backup.proofRuns.isEmpty)
         #expect(remote.attachedBatches.isEmpty)
+    }
+
+    @Test func stopDuringFinalExistenceReadCannotSettleTheRun() async throws {
+        let entered = Gate()
+        let release = Gate()
+        let remote = FakeRemoteOps()
+        let source = FinalExistenceAlbumSource(remote: remote, entered: entered, release: release)
+        let store = makeStore()
+        let lookup = FakeLinkLookup()
+        lookup.links = ["a": link("known")]
+        let runner = AlbumSyncRunner(
+            localSource: source, backup: FakeBackupExecutor(), remoteOps: remote,
+            linkLookup: lookup, mappingStore: store)
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+        let syncing = Task {
+            try await runner.sync(album: LocalAlbumSummary(id: "local-1", title: "Album", assetCount: 1))
+        }
+        await entered.wait()
+        #expect(remote.attachedBatches == [["known"]])
+        let before = store.mapping(localAlbumID: "local-1")
+        await runner.stop()
+        await release.open()
+        await #expect(throws: AlbumSyncError.stopped) { try await syncing.value }
+        #expect(store.mapping(localAlbumID: "local-1") == before, "Stop must preserve only the earlier durable mapping")
+        #expect(!progress.snapshot().contains { $0.phase == .completed })
     }
 
     @Test(arguments: 1...7) func stopDuringAlbumExistenceCheckPreventsNextWork(check: Int) async throws {
@@ -887,14 +1065,21 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
     }
 
     @Test func trashedRemoteCopyIsRespectedNotAttached() async throws {
-        let (runner, remote, _, _) = makeRunner(
+        let (runner, remote, _, store) = makeRunner(
             contents: ["local-1": ["a", "b"]],
             links: ["a": link("l-a"), "b": link("l-b", trashed: true)]
         )
         let report = try await runner.sync(album: album)
         #expect(remote.attachedBatches.flatMap(\.self) == ["l-a"])
         #expect(report.trashedSkipped == 1)
-        #expect(report.isFullySynced)  // intentional user state, not an error
+        #expect(store.mapping(localAlbumID: album.id)?.lastFailedCount == 1)
+        #expect(!report.isFullySynced)
+        #expect(report.problems.count == 1)
+        #expect(report.problems.first?.issue == .remoteDeletion)
+        #expect(report.problems.first?.reason == L10n.string("backup.state_skipped_remote_deletion"))
+        #expect(report.problems.first?.isRetryable == false)
+        #expect(await runner.currentProgress.needsAttentionCount == 1)
+        #expect(await runner.currentProgress.phase == .needsAttention)
     }
 
     @Test func samePhotoInSecondAlbumOnlyAttachesNoNewUpload() async throws {
@@ -1020,6 +1205,7 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
 /// Suspends backup until the test opens the gate - lets tests pin "while a sync is running" states.
 private actor Gate {
     private var isOpen = false
+    var opened: Bool { isOpen }
     private var waiters: [CheckedContinuation<Void, Never>] = []
     func wait() async {
         if isOpen { return }
@@ -1029,6 +1215,21 @@ private actor Gate {
         isOpen = true
         for waiter in waiters { waiter.resume() }
         waiters = []
+    }
+}
+
+private struct FinalExistenceAlbumSource: AlbumSyncLocalAlbumSource {
+    let remote: FakeRemoteOps
+    let entered: Gate
+    let release: Gate
+    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .present(["a"]) }
+    func albumExists(albumID: String) async throws -> Bool {
+        if !remote.attachedBatches.isEmpty {
+            await entered.open()
+            await release.wait()
+        }
+        return true
     }
 }
 
@@ -1320,4 +1521,42 @@ private struct GatedCreateRemoteOps: AlbumSyncRemoteAlbumOps {
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
         try await base.attach(photos, albumID: albumID)
     }
+}
+
+private func waitForDeletionGate(_ gate: Gate) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+    while ContinuousClock.now < deadline {
+        if await gate.opened { return true }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return false
+}
+
+private final class GatedDeletionChecker: UploadDuplicateChecking, @unchecked Sendable {
+    let entered: Gate
+    let release: Gate
+    private let lock = NSLock()
+    private var requests = 0
+    private var cancelled = false
+    var requestCount: Int { lock.withLock { requests } }
+    var observedCancellation: Bool { lock.withLock { cancelled } }
+    init(entered: Gate, release: Gate) {
+        self.entered = entered
+        self.release = release
+    }
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        lock.withLock { requests += 1 }
+        await entered.open()
+        await release.wait()
+        lock.withLock { cancelled = cancelled || Task.isCancelled }
+        try Task.checkCancellation()
+        return .init(states: [:], complete: true)
+    }
+    func nameHash(forCorrectedName name: String) async throws -> String { name }
+    func contentHash(forSHA1Hex sha1Hex: String) async throws -> String { sha1Hex }
+    func hashKeyEpoch() async throws -> String { "epoch" }
+    func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] { [] }
+    func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? { nil }
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> { [] }
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] { [:] }
 }

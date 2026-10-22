@@ -149,7 +149,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
     }
 
-    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {
+    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async throws -> [PhotoUID] {
         do {
             let matches = try await SDKCancellableOperation.run { [photosClient] cancellationToken in
                 try await photosClient.findPhotoDuplicates(
@@ -163,6 +163,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             DebugLog.log("[Dedupe] SDK exact query matches=\(matches.count)")
             return matches.map { PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID) }
         } catch {
+            if UploadError.isCancellation(error) { throw error }
+            var sdkError = error as? ProtonDriveSDKError
+            while let current = sdkError {
+                if current.domain == .successfulCancellation
+                    || (current.domain == .network && current.type == NSURLErrorDomain && current.primaryCode == -999)
+                {
+                    throw CancellationError()
+                }
+                sdkError = current.innerError
+            }
             // Keep the already-proven detailed endpoint as a compatibility fallback if the
             // fresh wrapper/native route fails.
             DebugLog.log("[Dedupe] SDK exact query unavailable; using detailed fallback - \(error)")
@@ -309,6 +319,12 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             // A busy service must not use up the retry budget of a photo.
             throw UploadError.retryableBackend(code: code, message: message)
         }
+    }
+
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        guard !linkIDs.isEmpty else { return .init(states: [:], complete: true) }
+        let context = try await resolveMaterial().context
+        return try await session.fetchLinkStateSnapshot(shareID: context.shareID, linkIDs: linkIDs)
     }
 
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
@@ -667,7 +683,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 crypto: crypto,
                 generation: eventID
             )
-            await repairUnresolvedRows(
+            try await repairUnresolvedRows(
                 &rows,
                 links: fetched.links,
                 material: material,
@@ -800,7 +816,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     rows.lineageRows.unresolvedLinkIDs.insert(event.linkID)
                 }
             }
-            await repairUnresolvedRows(
+            try await repairUnresolvedRows(
                 &rows,
                 links: fetched.links,
                 material: material,
@@ -835,7 +851,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         // After the events: a repair backlog never delays them, and it writes only at the checkpoint they reached.
         if let eventLineageStore, eventLineageStore.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: eventID) {
-            await repairUnresolvedLineage(
+            try await repairUnresolvedLineage(
                 store: eventLineageStore, eventID: eventID, material: material, session: session, crypto: crypto)
         }
     }
@@ -844,19 +860,24 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     /// incomplete until the next full build. A link that reads now gets its rows, a link that is no longer an active
     /// photo leaves the index, and a link that fails again stays for a later sweep. A link that successful responses
     /// leave out in two sweeps is deleted for good and leaves the index; a failed request never settles a link. The
-    /// lineage index stays passive: nothing here throws into the content refresh.
+    /// lineage index stays passive for ordinary failures; request cancellation ends the refresh.
     private static func repairUnresolvedLineage(
         store: UploadRemoteLineageIndexStore,
         eventID: String,
         material: Material,
         session: DriveSession,
         crypto: DriveCrypto
-    ) async {
+    ) async throws {
+        try Task.checkCancellation()
         let ids = store.unresolvedLinkIDsForRepair(
             hashKeyEpoch: material.epoch, limit: lineageRepairLimit, sweepInterval: lineageRepairSweepInterval)
-        guard !ids.isEmpty,
-            let fetched = try? await fetchLinks(ids: ids, shareID: material.context.shareID, session: session),
-            let rows = try? makeIndexRows(
+        guard !ids.isEmpty else { return }
+        let fetched: RemoteMetadataFetch
+        let rows: RemoteContentIndexRows
+        do {
+            fetched = try await fetchLinks(ids: ids, shareID: material.context.shareID, session: session)
+            try Task.checkCancellation()
+            rows = try makeIndexRows(
                 links: fetched.links,
                 expectedActiveFileIDs: Set(ids),
                 endpointFailureIDs: fetched.endpointFailureIDs,
@@ -864,7 +885,11 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 crypto: crypto,
                 generation: eventID
             )
-        else { return }
+        } catch {
+            if UploadError.isCancellation(error) { throw error }
+            try Task.checkCancellation()
+            return
+        }
         let lineage = rows.lineageRows
         let endpointFailures = Set(ids).intersection(fetched.endpointFailureIDs)
         let omitted = Set(ids.filter { fetched.links[$0] == nil }).subtracting(endpointFailures)
@@ -904,12 +929,22 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         links.reserveCapacity(ids.count)
         var endpointFailureIDs: Set<String> = []
 
-        let reads = await BoundedConcurrency.map(chunks, limit: Self.remoteMetadataRequestConcurrency) { chunk in
-            Task.isCancelled ? nil : try? await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: chunk)
+        let reads = try await BoundedConcurrency.throwingMap(chunks, limit: Self.remoteMetadataRequestConcurrency) {
+            chunk -> [AlbumPhotoLinkBody]? in
+            try Task.checkCancellation()
+            do {
+                let links = try await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: chunk)
+                try Task.checkCancellation()
+                return links
+            } catch {
+                if UploadError.isCancellation(error) { throw error }
+                try Task.checkCancellation()
+                return nil
+            }
         }
         // A failed or unstarted chunk becomes endpoint failures; the targeted re-fetch below tries it once more.
         for (chunk, read) in zip(chunks, reads) {
-            guard let batch = read ?? nil else {
+            guard let batch = read else {
                 endpointFailureIDs.formUnion(chunk)
                 continue
             }
@@ -926,7 +961,13 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             try Task.checkCancellation()
             let batch = Array(
                 missing[start..<min(start + UploadDedupePipeline.protonDuplicateBatchSize, missing.count)])
-            guard let retry = try? await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch) else {
+            let retry: [AlbumPhotoLinkBody]
+            do {
+                retry = try await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
+                try Task.checkCancellation()
+            } catch {
+                if UploadError.isCancellation(error) { throw error }
+                try Task.checkCancellation()
                 endpointFailureIDs.formUnion(batch)
                 continue
             }
@@ -1085,7 +1126,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         session: DriveSession,
         crypto: DriveCrypto,
         attemptedAt: Date = Date()
-    ) async {
+    ) async throws {
+        try Task.checkCancellation()
         guard !rows.unresolvedIssues.isEmpty else { return }
         var linkIDsByNameHash: [String: Set<String>] = [:]
         for index in rows.unresolvedIssues.indices {
@@ -1105,12 +1147,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         var repaired: [String: UploadRemoteContentIndexRecord] = [:]
         let hashes = linkIDsByNameHash.keys.sorted()
         for start in stride(from: 0, to: hashes.count, by: UploadDedupePipeline.protonDuplicateBatchSize) {
+            try Task.checkCancellation()
             let batch = Array(hashes[start..<min(start + UploadDedupePipeline.protonDuplicateBatchSize, hashes.count)])
             do {
                 let duplicates = try await session.findPhotoDuplicates(
                     volumeID: material.context.volumeID,
                     nameHashes: batch
                 )
+                try Task.checkCancellation()
                 for duplicate in duplicates {
                     guard let linkID = duplicate.linkID,
                         let expectedLinkIDs = linkIDsByNameHash[duplicate.hash],
@@ -1126,6 +1170,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     )
                 }
             } catch {
+                if UploadError.isCancellation(error) { throw error }
+                try Task.checkCancellation()
                 let failedHashes = Set(batch)
                 for index in rows.unresolvedIssues.indices {
                     let linkID = rows.unresolvedIssues[index].remoteLinkID
@@ -1215,7 +1261,7 @@ private struct DedupeRootLinkResponse: Decodable {
 // MARK: - Duplicates endpoint (DriveSession)
 
 /// One row of `DuplicateHashes` from the find-duplicates endpoint. `linkState`: 0 = draft,
-/// 1 = active, 2 = trashed, absent = deleted.
+/// 1 = active, 2 = trashed. An omitted state is unknown and cannot prove deletion.
 struct PhotoDuplicateEntry: Decodable {
     let hash: String
     let contentHash: String?

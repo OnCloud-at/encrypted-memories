@@ -1285,6 +1285,55 @@ extension DriveSessionStubSuite {
                 ], classifiedNodeIDs: [], libraryID: "vol1")
         }
 
+        @Test(arguments: ["initial", "retry", "repair", "lineage"])
+        func requestCancellationNeverSettlesADegradedIndex(route: String) async throws {
+            let fixture = try RepairFixture(unresolved: route == "lineage" ? ["photo"] : [])
+            defer { fixture.close() }
+            let metadataPath = "POST /drive/shares/share1/links/fetch_metadata"
+            if route == "lineage" {
+                StubURLProtocol.fail(metadataPath)
+                await #expect(throws: (any Error).self) { try await fixture.refresh(to: "two") }
+                #expect(try metadataRequestLinkIDs() == ["photo"], "no retry after cancellation")
+                fixture.clock.advance(10_000)
+                #expect(
+                    fixture.lineage.unresolvedLinkIDsForRepair(
+                        hashKeyEpoch: "epoch", limit: 10, sweepInterval: 0
+                    ).contains("photo"))
+            } else {
+                StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+                StubURLProtocol.route(
+                    "GET /drive/volumes/vol1/photos",
+                    json: #"{"Code":1000,"Photos":[{"LinkID":"photo","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}]}"#)
+                if route == "repair" {
+                    var photo = try fixture.keys.activePhoto("photo", attributes: "{}")
+                    photo["Name"] = try fixture.keys.crypto.encrypt(text: "photo.heic", to: fixture.keys.root)
+                    try routeMetadata([photo])
+                    StubURLProtocol.fail("POST /drive/volumes/vol1/photos/duplicates")
+                } else {
+                    try routeMetadata([])
+                    StubURLProtocol.fail(metadataPath, afterResponses: route == "retry" ? 1 : 0)
+                }
+                let fresh = try #require(
+                    UploadIdentityManifestStore(
+                        url: fixture.directory.appendingPathComponent("fresh.sqlite")))
+                defer { fresh.close() }
+                do {
+                    try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                        material: Self.material(rootKey: fixture.keys.root), session: makeSession(),
+                        crypto: fixture.keys.crypto, store: fresh, lineageStore: nil,
+                        rebuildsMissingLineage: false, progress: { _ in })
+                    Issue.record("request cancellation must propagate from \(route)")
+                } catch { #expect(UploadError.isCancellation(error)) }
+                #expect(fresh.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch") == nil)
+                if route != "repair" {
+                    #expect(try metadataRequestLinkIDs().count == (route == "retry" ? 2 : 1))
+                } else {
+                    #expect(StubURLProtocol.requests().contains { $0.path.contains("/photos/duplicates") })
+                }
+            }
+            #expect(!Task.isCancelled)
+        }
+
         private func makeService(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
             firstBuildGate: TimelineMetadataStartGate? = nil

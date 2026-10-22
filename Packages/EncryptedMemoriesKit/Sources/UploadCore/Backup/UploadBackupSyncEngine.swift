@@ -236,6 +236,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    if UploadError.isCancellation(error) { throw error }
                     proofs = [:]
                 }
                 try Task.checkCancellation()
@@ -385,6 +386,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         } catch {
             // A cancelled index build ends the lookup with a cancellation error even when this pass goes on.
             if Task.isCancelled { throw CancellationError() }
+            if !(error is CancellationError), UploadError.isCancellation(error) { throw error }
             if deferringWithoutProof { throw UploadBackupRemoteProofUnavailable() }
             return []
         }

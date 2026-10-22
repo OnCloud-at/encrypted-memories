@@ -897,19 +897,7 @@ final class EditScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendab
         try device.resetAlbumSyncScratch()
         try await device.enqueue()
         await device.pass()
-        let album = Set(localIdentifiers)
-        var problems: [String: BackupFailedItem] = [:]
-        device.queue.forEachProblemEntry { entry in
-            if entry.source.kind == .photoLibraryAsset, album.contains(entry.source.identifier),
-                problems[entry.source.identifier] == nil
-            {
-                problems[entry.source.identifier] = BackupFailedItem(entry: entry)
-            }
-            return true
-        }
-        return AlbumSyncBackupReport(
-            total: localIdentifiers.count, backedUp: localIdentifiers.count - problems.count,
-            failed: problems.count, sourceMissing: 0, skippedRemoteDeletion: 0, problems: problems)
+        return try AlbumSyncBackupReport.read(from: device.queue, localIdentifiers: localIdentifiers)
     }
 
     func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {

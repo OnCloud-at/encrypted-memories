@@ -20,11 +20,18 @@ final class StubURLProtocol: URLProtocol {
     nonisolated(unsafe) private static var recorded: [Recorded] = []
     nonisolated(unsafe) private static var hanging: Set<String> = []
 
+    nonisolated(unsafe) private static var failures: [String: (code: Int, after: Int)] = [:]
+
+    static func fail(_ route: String, code: Int = NSURLErrorCancelled, afterResponses: Int = 0) {
+        lock.withLock { failures[route] = (code, afterResponses) }
+    }
+
     static func reset() {
         lock.withLock {
             routes = [:]
             recorded = []
             hanging = []
+            failures = [:]
         }
     }
 
@@ -58,6 +65,19 @@ final class StubURLProtocol: URLProtocol {
         let body = Self.drainBody(of: request)
         Self.lock.withLock {
             Self.recorded.append(Recorded(method: method, path: pathAndQuery, body: body))
+        }
+        let failure = Self.lock.withLock { () -> Int? in
+            let key = "\(method) \(url.path)"
+            guard let failure = Self.failures[key] else { return nil }
+            if failure.after > 0 {
+                Self.failures[key] = (failure.code, failure.after - 1)
+                return nil
+            }
+            return failure.code
+        }
+        if let failure {
+            client?.urlProtocol(self, didFailWithError: URLError(URLError.Code(rawValue: failure)))
+            return
         }
         guard !Self.lock.withLock({ Self.hanging.contains("\(method) \(url.path)") }) else { return }
         let match = Self.lock.withLock { () -> (status: Int, body: String)? in
@@ -402,6 +422,24 @@ extension DriveSessionStubSuite {
             #expect(links["trashed-edit"] == .init(isActive: false, mainPhotoLinkID: nil, trashTime: 1_790_000_000))
             #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit"))
             #expect(links["deleted"] == nil, "a link that the server no longer knows is absent")
+        }
+
+        @Test func linkVisibilityWithoutAStateKeepsTheMainPhotoButNoExplicitState() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"""
+                    {"Code":1000,"Links":[
+                        {"LinkID":"unproven","Type":2,
+                         "FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"some-main"}}}}
+                    ]}
+                    """#)
+
+            let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["unproven"])
+
+            #expect(
+                links["unproven"] == .init(isActive: true, mainPhotoLinkID: "some-main", hasExplicitPhotoState: false),
+                "the legacy active default carries the role, yet the answer states nothing")
         }
 
         @Test(arguments: [

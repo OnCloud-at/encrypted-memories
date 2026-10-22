@@ -652,6 +652,44 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertEqual(server.links.first { $0.uid == replacement }?.state, .active)
     }
 
+    func testTransportCancellationInEveryOptionalLineageFallbackPropagates() async throws {
+        let errors: [any Error] = [
+            URLError(.cancelled), UploadError.cancelled,
+            UploadError.transport(code: URLError.cancelled.rawValue, message: "cancelled"),
+        ]
+        for route in ["discovery", "foreign", "ancestry"] {
+            for failure in errors {
+                let localDirectory = directory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+                let localJournal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: localDirectory))
+                let head = try seed("head")
+                if route != "discovery" {
+                    try localJournal.addSuperseded(head, for: source)
+                }
+                server.configureLineageIndex(failing: false)
+                if route == "ancestry" {
+                    server.configureLineageFailureAtAncestry(failure)
+                } else {
+                    server.configureLineageIndex(failing: true, error: failure)
+                }
+                let localPipeline = UploadDedupePipeline(
+                    store: FakeIdentityStore(), checker: server, replacementJournal: localJournal)
+                let before = localJournal.entry(for: source)
+                let next = descriptor("next", edited: route != "foreign")
+                do {
+                    let result = try await localPipeline.resolve(next)
+                    XCTFail("\(route) cancellation must propagate: \(result.decision)")
+                    await localPipeline.uploadDidFail(next)
+                } catch {
+                    XCTAssertTrue(UploadError.isCancellation(error))
+                    XCTAssertFalse(Task.isCancelled)
+                }
+                XCTAssertEqual(localJournal.entry(for: source), before)
+                server.configureLineageFailureAtAncestry(nil)
+            }
+        }
+    }
+
     func testCancellationAtDiscoveryLeavesJournalUnchanged() async throws {
         _ = try seed("head")
         let before = journal.entry(for: source)

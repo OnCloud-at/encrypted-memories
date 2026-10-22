@@ -2,6 +2,7 @@ import Foundation
 import PhotosCore
 import ProtonAuth
 import ProtonCoreDataModel
+import UploadCore
 
 /// Holds the live Proton session and performs authenticated requests against the Drive API,
 /// transparently refreshing the access token on 401. Shared by the SDK HTTP client and the
@@ -461,10 +462,9 @@ extension DriveSession {
         var result: [String: TimelineRemoteVisibilityRequirement.Link] = [:]
         for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
             try Task.checkCancellation()
-            let data = try await send(
-                "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": chunk],
-                retryOnRateLimit: retryOnRateLimit)
-            for link in try JSONDecoder().decode(LinkVisibilityResponse.self, from: data).links {
+            let response = try await linkVisibilityResponse(
+                shareID: shareID, linkIDs: chunk, retryOnRateLimit: retryOnRateLimit)
+            for link in response.links {
                 guard let id = link.linkID else { continue }
                 result[id] = .init(
                     isActive: link.state == nil || link.state == 1,
@@ -474,6 +474,34 @@ extension DriveSession {
             }
         }
         return result
+    }
+
+    private func linkVisibilityResponse(
+        shareID: String, linkIDs: [String], retryOnRateLimit: Bool
+    ) async throws -> LinkVisibilityResponse {
+        let data = try await send(
+            "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": linkIDs],
+            retryOnRateLimit: retryOnRateLimit)
+        return try JSONDecoder().decode(LinkVisibilityResponse.self, from: data)
+    }
+
+    func fetchLinkStateSnapshot(shareID: String, linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        var states: [String: Int] = [:]
+        var complete = true
+        for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
+            try Task.checkCancellation()
+            let response = try await linkVisibilityResponse(shareID: shareID, linkIDs: chunk, retryOnRateLimit: true)
+            complete = complete && response.code == 1000 && response.hasKnownEnvelope
+            let requested = Set(chunk)
+            for link in response.links {
+                guard let id = link.linkID, requested.contains(id), let state = link.state, states[id] == nil else {
+                    complete = false
+                    continue
+                }
+                states[id] = state
+            }
+        }
+        return UploadLinkStateSnapshot(states: states, complete: complete)
     }
 
     func trash(volumeID: String, linkIDs: [String]) async throws {
@@ -681,6 +709,15 @@ private struct VolumeTrashResponse: Decodable {
 /// `POST /drive/shares/{shareID}/links/fetch_metadata` response.
 /// `links/fetch_metadata` fields that decide whether a photos listing can show a link.
 private struct LinkVisibilityResponse: Decodable {
+    let code: Int?
+    let hasKnownEnvelope: Bool
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        code = try container.decodeIfPresent(Int.self, forKey: .code)
+        links = try container.decode([Body].self, forKey: .links)
+        hasKnownEnvelope = try protonResponseContainsOnly(["Code", "Links"], decoder: decoder)
+    }
     /// Required: a response without it is incomplete, not a list of deleted links.
     let links: [Body]
     struct Body: Decodable {
@@ -695,7 +732,10 @@ private struct LinkVisibilityResponse: Decodable {
             case trashed = "Trashed"
         }
     }
-    enum CodingKeys: String, CodingKey { case links = "Links" }
+    enum CodingKeys: String, CodingKey {
+        case code = "Code"
+        case links = "Links"
+    }
 }
 
 private struct LinkMetaBatchResponse: Decodable {

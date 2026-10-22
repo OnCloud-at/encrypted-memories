@@ -210,6 +210,24 @@ final class AlbumRemoteProofLookupTests: XCTestCase {
         }
     }
 
+    func testTransportCancellationDuringProofLookupPropagates() async throws {
+        try await withQueue { queue in
+            let asset = self.candidate("asset")
+            self.seed(asset, in: queue)
+            for failure in [ScriptedAlbumProofResolver.Failure.urlCancelled, .typedCancelled, .transportCancelled] {
+                do {
+                    _ = try await AlbumSyncRemoteProofLookup.remoteLinks(
+                        for: ["asset"], catalog: ProofTestCatalog(assets: [asset]), queue: queue,
+                        resolver: ScriptedAlbumProofResolver(failure: failure))
+                    XCTFail("transport cancellation cannot become an ordinary proof miss")
+                } catch {
+                    XCTAssertTrue(UploadError.isCancellation(error))
+                    XCTAssertFalse(Task.isCancelled)
+                }
+            }
+        }
+    }
+
     func testUnavailableQueueFailsInsteadOfTreatingRowsAsMissing() async throws {
         try await withQueue { queue in
             queue.close()
@@ -234,7 +252,10 @@ private struct ProofTestCatalog: UploadBackupAssetCatalog {
 }
 
 private final class ScriptedAlbumProofResolver: UploadIdentityResolving, @unchecked Sendable {
-    enum Failure { case unavailable, cancelled, cancelAfterProof, cancelWithUnavailable }
+    enum Failure {
+        case unavailable, cancelled, cancelAfterProof, cancelWithUnavailable, urlCancelled, typedCancelled,
+            transportCancelled
+    }
     private let lock = NSLock()
     private var recorded: [[UploadBackupExternalIdentity]] = []
     var requests: [[UploadBackupExternalIdentity]] { lock.withLock { recorded } }
@@ -253,6 +274,9 @@ private final class ScriptedAlbumProofResolver: UploadIdentityResolving, @unchec
         }
         if failure == .cancelWithUnavailable { throw UploadError.backend("Proof unavailable during cancellation") }
         if failure == .cancelled { throw CancellationError() }
+        if failure == .urlCancelled { throw URLError(.cancelled) }
+        if failure == .typedCancelled { throw UploadError.cancelled }
+        if failure == .transportCancelled { throw UploadError.transport(code: -999, message: "cancelled") }
         if failure == .unavailable { throw UploadError.backend("Proof unavailable") }
         if let override { return override }
         return Dictionary(

@@ -605,6 +605,17 @@ public enum UploadError: LocalizedError, Equatable {
     /// and Back Up Now take it up again.
     case accountStorageFull(String, requiredBytes: Int64, availableBytes: Int64)
 
+    /// Cancellation can cross the transport boundary without cancelling the enclosing Swift task.
+    public static func isCancellation(_ error: any Error) -> Bool {
+        if error is CancellationError || (error as? URLError)?.code == .cancelled { return true }
+        guard let uploadError = error as? UploadError else { return false }
+        switch uploadError {
+        case .cancelled: return true
+        case .transport(let code, _): return code == URLError.cancelled.rawValue
+        default: return false
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .unsupportedFile(let name): L10n.string("error.upload_unsupported_file \(name)")

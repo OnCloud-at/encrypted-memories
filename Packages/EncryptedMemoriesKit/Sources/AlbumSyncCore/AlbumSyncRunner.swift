@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import UploadCore
 
 /// How the sync run binds a local album to a Proton album.
@@ -41,6 +42,7 @@ public actor AlbumSyncRunner {
     private var progress = AlbumSyncProgress()
     private var isRunning = false
     private var stopRequested = false
+    private var deletionLookupTask: Task<[String: UploadRemoteDeletionState], any Error>?
 
     public init(
         localSource: any AlbumSyncLocalAlbumSource,
@@ -127,7 +129,10 @@ public actor AlbumSyncRunner {
     /// already done is durable server-side, so the next run resumes/converges.
     public func stop() async {
         stopRequested = true
+        let lookup = deletionLookupTask
+        lookup?.cancel()
         await backup.stop()
+        _ = await lookup?.result
     }
 
     // MARK: - Phases
@@ -183,7 +188,7 @@ public actor AlbumSyncRunner {
                 proven = try await backup.remoteProofLinks(for: missing)
             } catch {
                 try checkStop()
-                if error is CancellationError { throw error }
+                if UploadError.isCancellation(error) { throw error }
                 if (error as? AlbumSyncError) == .stopped { throw error }
                 proven = [:]
             }
@@ -194,6 +199,18 @@ public actor AlbumSyncRunner {
         try checkStop()
         let children = try await remoteOps.childMainLinkIDs(albumID: remoteAlbumID)
         try checkStop()
+        let deletions = try await remoteDeletionStates(links: links, children: children)
+        try checkStop()
+        for identifier in identifiers {
+            guard let link = links[identifier] else { continue }
+            switch deletions[link.uid.nodeID] {
+            case .trashed:
+                links[identifier] = AlbumSyncRemoteLink(
+                    uid: link.uid, sha1Hex: link.sha1Hex, isTrashed: true)
+            case nil:
+                break
+            }
+        }
         let sameContent = try await membersWithSameContent(links: links, children: children)
         try checkStop()
         let plan = AlbumSyncPlanner.plan(
@@ -219,6 +236,7 @@ public actor AlbumSyncRunner {
 
         // Persist the run outcome on the mapping and settle the status.
         try await ensureAlbumPresent(albumID: album.id)
+        try checkStop()
         let attachFailedIdentifiers = Self.localIdentifiers(
             of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links)
         // A photo with a usable link goes into the album even when the backup keeps a part of it open, for
@@ -240,6 +258,7 @@ public actor AlbumSyncRunner {
                 missingIdentifiers: plan.missingRemoteIdentifiers,
                 attachFailedIdentifiers: attachFailedIdentifiers,
                 incompleteIdentifiers: incompleteIdentifiers,
+                trashedIdentifiers: plan.trashedRemoteIdentifiers,
                 backup: backupReport)
         )
         var mapping =
@@ -249,7 +268,7 @@ public actor AlbumSyncRunner {
         mapping.title = album.title
         mapping.lastSyncedAt = now()
         mapping.lastAttachedCount = report.attached
-        mapping.lastFailedCount = report.attachFailed + report.unattachable + report.incomplete
+        mapping.lastFailedCount = report.attachFailed + report.unattachable + report.trashedSkipped + report.incomplete
         guard mappingStore.upsert(mapping) else { throw AlbumSyncError.mappingStoreUnavailable }
 
         progress.phase = report.isFullySynced ? .completed : .needsAttention
@@ -345,6 +364,42 @@ public actor AlbumSyncRunner {
         return result
     }
 
+    private func remoteDeletionStates(
+        links: [String: AlbumSyncRemoteLink], children: Set<String>
+    ) async throws -> [String: UploadRemoteDeletionState] {
+        let candidates = links.values.filter { !children.contains($0.uid.nodeID) }
+            .sorted { $0.uid.nodeID < $1.uid.nodeID }
+        guard !candidates.isEmpty else { return [:] }
+        var result: [String: UploadRemoteDeletionState] = [:]
+        let size = UploadDedupePipeline.protonDuplicateBatchSize
+        for start in stride(from: 0, to: candidates.count, by: size) {
+            try checkStop()
+            let chunk = Array(candidates[start..<min(start + size, candidates.count)])
+            let task = Task { [remoteOps] in
+                try Task.checkCancellation()
+                return try await remoteOps.remoteDeletionStates(for: chunk)
+            }
+            deletionLookupTask = task
+            do {
+                let states = try await withTaskCancellationHandler {
+                    try await task.value
+                } onCancel: {
+                    task.cancel()
+                }
+                deletionLookupTask = nil
+                try checkStop()
+                result.merge(states) { _, fresh in fresh }
+            } catch {
+                deletionLookupTask = nil
+                try checkStop()
+                if UploadError.isCancellation(error) { throw error }
+                if (error as? AlbumSyncError) == .stopped { throw error }
+                PhotoDiagnostics.shared.increment("albumSync.deletionEvidenceUnavailable")
+            }
+        }
+        return result
+    }
+
     /// For each SHA-1 of a link that is not in the album, an album member with the same bytes, for example another
     /// device's copy of a shared photo. Members whose bytes this run already knows count first, also when the lookup
     /// fails. The lookup runs in chunks, so Stop takes effect between them. A failed chunk ends the lookup with the
@@ -372,9 +427,10 @@ public actor AlbumSyncRunner {
             do {
                 copies.merge(try await remoteOps.activeMainLinkIDs(withSameContentAs: chunk)) { $0.union($1) }
             } catch {
-                // Stop and task cancellation end the run; any other failure, also a cancelled index refresh, keeps
-                // today's attach for the rest.
+                // An internally reset content index reports CancellationError without cancelling this caller.
+                // Raw and typed transport cancellation still end the run before attachment.
                 try checkStop()
+                if !(error is CancellationError), UploadError.isCancellation(error) { throw error }
                 break
             }
         }
