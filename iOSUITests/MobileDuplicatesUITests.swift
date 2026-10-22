@@ -433,7 +433,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesFixture",
             extra: ["-EncryptedMemoriesDuplicatesRescanDropsGroup", "-EncryptedMemoriesDuplicatesSlowScan"])
         XCTAssertTrue(group(1).waitForExistence(timeout: 15))
-        let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        let top = app.staticTexts["duplicates.copyCount"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 400)))
 
         let progress = app.activityIndicators["duplicates.loading"].firstMatch
