@@ -44,6 +44,7 @@ public enum AlbumSyncRemoteProofLookup {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            if UploadError.isCancellation(error) { throw error }
             try Task.checkCancellation()
             return [:]
         }

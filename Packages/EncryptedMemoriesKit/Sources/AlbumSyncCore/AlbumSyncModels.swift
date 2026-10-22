@@ -152,7 +152,6 @@ public struct AlbumSyncRemoteLink: Sendable, Equatable {
     /// True when the only known remote copy is in Proton trash - the user deleted it there
     /// intentionally, so album sync must neither attach nor re-upload it.
     public let isTrashed: Bool
-
     public init(uid: PhotoUID, sha1Hex: String?, isTrashed: Bool) {
         self.uid = uid
         self.sha1Hex = sha1Hex
@@ -204,7 +203,7 @@ public struct AlbumSyncProgress: Sendable, Equatable {
 
     public init() {}
 
-    public var needsAttentionCount: Int { attachFailed + unattachable + incomplete }
+    public var needsAttentionCount: Int { attachFailed + unattachable + trashedSkipped + incomplete }
 
     public var localizedTitle: String {
         switch phase {
@@ -237,10 +236,8 @@ public struct AlbumSyncProgress: Sendable, Equatable {
     }
 }
 
-/// Final outcome of one sync run. `isFullySynced` is the honest "everything attachable is in the
-/// Proton album" claim; anything less surfaces counts, never fake success. Photos whose only
-/// remote copy the user trashed on Proton (`trashedSkipped`) are an intentional user state:
-/// additive sync respects the deletion (no re-upload, no attach) and reports the count.
+/// Final outcome of one sync run. A photo skipped because its copy is in the trash remains a gap in the album.
+/// Additive sync respects the deletion and reports the photo for the person's decision.
 public struct AlbumSyncReport: Sendable, Equatable {
     public let remoteAlbumID: String
     public let totalAssets: Int
@@ -276,7 +273,9 @@ public struct AlbumSyncReport: Sendable, Equatable {
         self.problems = problems
     }
 
-    public var isFullySynced: Bool { attachFailed == 0 && unattachable == 0 && incomplete == 0 }
+    public var isFullySynced: Bool {
+        attachFailed == 0 && unattachable == 0 && trashedSkipped == 0 && incomplete == 0
+    }
 }
 
 /// Errors the sync flow surfaces to the UI. All cases are explicit - there is no silent fallback.

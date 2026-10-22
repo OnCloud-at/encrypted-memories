@@ -84,6 +84,8 @@ public protocol AlbumSyncRemoteAlbumOps: Sendable {
     func createAlbum(name: String) async throws -> String
     /// Link ids of the album's current main photos (Live Photo motion parts stay nested).
     func childMainLinkIDs(albumID: String) async throws -> Set<String>
+    /// Fresh deletion evidence only for links that are not current album members. Missing results are unknown.
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState]
     /// Attaches existing remote photos (no media re-upload). Per-item failures are aggregated,
     /// never masked; "already a member" is reported as convergence.
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult
@@ -94,6 +96,9 @@ public protocol AlbumSyncRemoteAlbumOps: Sendable {
 }
 
 public extension AlbumSyncRemoteAlbumOps {
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState] {
+        [:]
+    }
     /// Without a content index no other copy is known, and every photo attaches through its own link.
     func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>] { [:] }
 }

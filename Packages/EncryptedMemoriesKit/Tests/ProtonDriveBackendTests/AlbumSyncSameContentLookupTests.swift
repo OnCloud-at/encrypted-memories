@@ -32,6 +32,15 @@ import UploadCore
         #expect(checker.limits == Array(repeating: ProtonAlbumSyncRemoteOps.sameContentLimit, count: 3))
     }
 
+    @Test func completeMetadataAbsenceDoesNotUseTheActiveIndexToInferDeletion() async throws {
+        let checker = SameContentChecker(rows: [:])
+        let ops = makeOps(checker: checker)
+        let link = AlbumSyncRemoteLink(
+            uid: PhotoUID(volumeID: "vol", nodeID: "unknown"), sha1Hex: "shared", isTrashed: false)
+        #expect(try await ops.remoteDeletionStates(for: [link]).isEmpty)
+        #expect(checker.limits.isEmpty, "an active-only index miss cannot prove permanent deletion")
+    }
+
     @Test func withoutAContentIndexNoCopyIsKnown() async throws {
         let copies = try await makeOps(checker: nil).activeMainLinkIDs(withSameContentAs: ["shared"])
         #expect(copies.isEmpty)
@@ -55,6 +64,9 @@ private final class SameContentChecker: UploadDuplicateChecking, @unchecked Send
     private let rows: [String: [RemotePhotoDuplicate]]
     private let lock = NSLock()
     private var recordedLimits: [Int] = []
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        .init(states: [:], complete: true)
+    }
     var limits: [Int] { lock.withLock { recordedLimits } }
 
     init(rows: [String: [RemotePhotoDuplicate]]) { self.rows = rows }

@@ -207,6 +207,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
     private var lineageReadError: any Error = UploadError.backend("The scenario lineage read failed")
 
+    private var ancestryReadError: (any Error)?
+    func configureLineageFailureAtAncestry(_ error: (any Error)?) {
+        lock.withLock { ancestryReadError = error }
+    }
+
     func configureOptionalReads(
         visibilityFails: Bool = false, compoundFails: Bool = false, compoundCancels: Bool = false
     ) {
@@ -362,6 +367,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         try lock.withLock {
+            if let ancestryReadError { throw ancestryReadError }
             if failLineageRead { throw lineageReadError }
             let link = table[linkID]
             return (
@@ -557,6 +563,27 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                     trashTime: link.state == .trashed || staleTrashTime ? link.trashTime : nil)
             }
             return result
+        }
+    }
+
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        let visible = try await linkVisibility(of: linkIDs)
+        return lock.withLock {
+            var states: [String: Int] = [:]
+            var complete = omittedVisibilityLinks.isDisjoint(with: linkIDs)
+            for (id, evidence) in visible {
+                guard evidence.hasExplicitPhotoState, let link = table[id] else {
+                    complete = false
+                    continue
+                }
+                switch link.state {
+                case .draft: states[id] = 0
+                case .active: states[id] = 1
+                case .trashed: states[id] = 2
+                case .deleted: break
+                }
+            }
+            return .init(states: states, complete: complete)
         }
     }
 
@@ -1118,6 +1145,11 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         try await server.linkVisibility(of: linkIDs)
     }
+
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        try await server.linkStateSnapshot(of: linkIDs)
+    }
+
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
@@ -1222,6 +1254,10 @@ final class EditScenarioDeviceRemote: PhotoUploading, EditReplacementRemote, @un
 }
 
 extension EditScenarioServer: AlbumSyncRemoteAlbumOps {
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState] {
+        try await UploadRemoteDeletionLookup.states(for: links.map { $0.uid.nodeID }, checker: self)
+    }
+
     func listAlbums() async throws -> [AlbumSyncRemoteAlbum] {
         [.init(id: "own-album", title: "Scenario album")]
     }
@@ -1250,11 +1286,12 @@ extension EditScenarioServer: AlbumSyncRemoteAlbumOps {
 
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
         let existing = try await childMainLinkIDs(albumID: albumID)
-        let new = photos.filter { !existing.contains($0.uid.nodeID) }
+        let active = Set(links.filter { $0.state == .active }.map(\.linkID))
+        let unavailable = photos.filter { !active.contains($0.uid.nodeID) }
+        let new = photos.filter { active.contains($0.uid.nodeID) && !existing.contains($0.uid.nodeID) }
         try await addPhotos(new.map(\.uid), toOwnAlbum: albumID)
-        var result = AlbumSyncAttachResult()
-        result.attached = new.count
-        result.alreadyMember = photos.count - new.count
-        return result
+        return AlbumSyncAttachResult(
+            attached: new.count, alreadyMember: photos.count - new.count - unavailable.count,
+            failed: unavailable.count, failedLinkIDs: unavailable.map { $0.uid.nodeID })
     }
 }

@@ -27,6 +27,11 @@ struct ProtonAlbumSyncRemoteOps: AlbumSyncRemoteAlbumOps {
         try await service.childMainLinkIDs(albumID: albumID)
     }
 
+    func remoteDeletionStates(for links: [AlbumSyncRemoteLink]) async throws -> [String: UploadRemoteDeletionState] {
+        guard let duplicateChecker else { return [:] }
+        return try await UploadRemoteDeletionLookup.states(for: links.map { $0.uid.nodeID }, checker: duplicateChecker)
+    }
+
     func activeMainLinkIDs(withSameContentAs sha1Hexes: Set<String>) async throws -> [String: Set<String>] {
         guard let duplicateChecker else { return [:] }
         var result: [String: Set<String>] = [:]

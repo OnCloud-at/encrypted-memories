@@ -28,14 +28,15 @@ final class UploadBackupSyncQueueTests: XCTestCase {
     }
 
     private struct CancellingProofResolver: UploadIdentityResolving {
+        var failure: any Error = CancellationError()
         func remoteAssetProofs(
             for identities: [UploadBackupExternalIdentity]
         ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
-            throw CancellationError()
+            throw failure
         }
 
         func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
-            throw CancellationError()
+            throw failure
         }
 
         func recordUploaded(
@@ -119,6 +120,41 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             originalFilename: "IMG_\(id).HEIC",
             byteCount: 1024
         )
+    }
+
+    func testLateMainReopeningRejectsATrashedManifestMainAsUploadProof() async throws {
+        for isTrashed in [false, true] {
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")))
+            defer { queue.close() }
+            let photo = candidate(id: "photo", revision: 42)
+            let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+            try await index.markBackedUp(photo.snapshot)
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: photo.snapshot.source, revision: photo.snapshot.revision,
+                        originalFilename: photo.originalFilename, state: .completed, updatedAt: Date())))
+            let identities = FakeIdentityStore()
+            let former = source("photo", resource: .photoKit(role: "originalPhoto", ordinal: 0))
+            for identity in [photo.snapshot.source, former] {
+                XCTAssertTrue(
+                    identities.upsert(
+                        .init(
+                            source: identity, filename: "photo", correctedName: "photo", fileSize: 1,
+                            modificationDate: .distantPast, sha1Hex: identity == former ? "original" : "render",
+                            nameHash: "name", contentHash: "content", hashKeyEpoch: "epoch", remoteLinkID: "link",
+                            outcome: identity == photo.snapshot.source && isTrashed ? "duplicateTrashed" : "uploaded",
+                            updatedAt: .distantPast)))
+            }
+            let engine = UploadBackupSyncEngine(
+                preflight: index, queue: queue,
+                remoteProofResolver: UploadDedupePipeline(store: identities, checker: FakeChecker()))
+            let reopened = try await engine.reopenBackedUpRevisions([.init(candidate: photo, formerMain: former)])
+            XCTAssertEqual(reopened, isTrashed ? [photo] : [])
+            XCTAssertEqual(queue.entry(for: photo.snapshot.source, revision: photo.snapshot.revision) == nil, isTrashed)
+        }
     }
 
     func testSQLiteQueueRoundTripsAndOrdersRunnableWork() throws {
@@ -1666,6 +1702,58 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(result.queuedForWork, 1)
         XCTAssertEqual(queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)?.state, .discovered)
         XCTAssertEqual(queue.entry(for: old.source, revision: old.revision), old)
+    }
+
+    func testTransportProofCancellationCannotCreateOrReopenQueueWork() async throws {
+        let errors: [any Error] = [
+            URLError(.cancelled), UploadError.cancelled,
+            UploadError.transport(code: -999, message: "cancelled"),
+        ]
+        for route in ["discovery", "reopen", "defer"] {
+            for failure in errors {
+                let queue = try XCTUnwrap(
+                    UploadBackupSyncQueueManifestStore(
+                        url: tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")))
+                defer { queue.close() }
+                let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+                let asset = candidate(
+                    id: "cancel", revision: 10,
+                    externalIdentity: .init(identifier: "cloud-cancel", revision: revision(10)))
+                if route != "discovery" {
+                    try await index.markBackedUp(asset.snapshot)
+                    XCTAssertTrue(
+                        queue.upsert(
+                            .init(
+                                source: asset.snapshot.source, revision: asset.snapshot.revision,
+                                originalFilename: asset.originalFilename, state: .alreadyBackedUp, updatedAt: Date())))
+                }
+                let engine = UploadBackupSyncEngine(
+                    preflight: index, queue: queue,
+                    remoteProofResolver: CancellingProofResolver(failure: failure))
+                do {
+                    if route == "discovery" {
+                        _ = try await engine.enqueue(asset)
+                    } else {
+                        _ = try await engine.reopenBackedUpRevisions(
+                            [.init(candidate: asset, formerMain: nil)], deferringWithoutRemoteProof: route == "defer")
+                    }
+                    XCTFail("\(route) must propagate transport cancellation")
+                } catch {
+                    XCTAssertTrue(
+                        UploadError.isCancellation(error), "\(route) cannot replace cancellation with proof absence")
+                    XCTAssertFalse(Task.isCancelled)
+                }
+                if route == "discovery" {
+                    XCTAssertEqual(queue.count(), 0)
+                } else {
+                    let complete = try await index.completeStates([asset.snapshot])
+                    XCTAssertEqual(complete, [true], "cancelled proof must not reopen the preflight record")
+                    XCTAssertEqual(
+                        queue.entry(for: asset.snapshot.source, revision: asset.snapshot.revision)?.state,
+                        .alreadyBackedUp)
+                }
+            }
+        }
     }
 
     func testRemoteProofCancellationDoesNotPersistQueueRows() async throws {

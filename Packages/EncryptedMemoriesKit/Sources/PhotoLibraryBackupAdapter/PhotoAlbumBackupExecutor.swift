@@ -195,41 +195,14 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         await runner.setOnProgress { snapshot in onProgress(snapshot) }
         _ = try await engine.scan(PhotoLibraryBackupCatalog(localIdentifiers: localIdentifiers))
         _ = await runner.runUntilDrained(workIntent: .userInitiated)
+        try await runner.checkCancellation()
         try Task.checkCancellation()
         guard await runner.isQueueOperational(), queueStore.isOperational() else {
             throw AlbumSyncError.mappingStoreUnavailable
         }
         tempStore.sweep()
 
-        let summary = queueStore.summary()
-        guard queueStore.isOperational() else {
-            throw AlbumSyncError.mappingStoreUnavailable
-        }
-        // The scratch queue holds only this run, so its unresolved rows are the album's per-photo reasons.
-        // Problem rows arrive newest revision first; the first one per photo wins.
-        var problems: [String: BackupFailedItem] = [:]
-        queueStore.forEachProblemEntry { entry in
-            if entry.source.kind == .photoLibraryAsset, problems[entry.source.identifier] == nil {
-                problems[entry.source.identifier] = BackupFailedItem(entry: entry)
-            }
-            return true
-        }
-        var filenames: [String: String] = [:]
-        for row in queueStore.rows(kind: .photoLibraryAsset, identifiers: Set(localIdentifiers))
-        where !row.originalFilename.isEmpty {
-            if row.source.resource == .primary || filenames[row.source.identifier] == nil {
-                filenames[row.source.identifier] = row.originalFilename
-            }
-        }
-        return AlbumSyncBackupReport(
-            total: summary.total,
-            backedUp: summary.resolved,
-            failed: summary.failed,
-            sourceMissing: summary.sourceMissing,
-            skippedRemoteDeletion: summary.skippedRemoteDeletions,
-            problems: problems,
-            filenames: filenames
-        )
+        return try AlbumSyncBackupReport.read(from: queueStore, localIdentifiers: localIdentifiers)
     }
 
     public func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {

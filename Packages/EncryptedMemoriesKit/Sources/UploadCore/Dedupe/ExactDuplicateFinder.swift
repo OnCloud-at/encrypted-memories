@@ -852,7 +852,7 @@ public struct ExactDuplicateFinder: Sendable {
                 continue
             }
             let isCovered = { [epoch = plan.epoch] (row: UploadSourceIdentity, linkID: String) -> Bool in
-                guard let record = identities.record(for: row), record.remoteLinkID == linkID,
+                guard let record = identities.record(for: row), record.provesUpload, record.remoteLinkID == linkID,
                     record.hashKeyEpoch == epoch
                 else { return false }
                 return candidate.moves.contains { $0.from == linkID && $0.contentHash == record.contentHash }

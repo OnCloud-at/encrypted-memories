@@ -577,11 +577,15 @@ final class UploadDraftContentLookupTests: XCTestCase {
         try await assertScopedContentJournalProof(blocked: true)
     }
 
-    func testNormalContentKeepsJournalUpdatesWithLegacyVisibilityDefaults() async throws {
+    func testNormalContentWithoutExplicitPhotoStateKeepsJournalUnchanged() async throws {
         try await assertScopedContentJournalProof(blocked: false)
     }
 
-    private func assertScopedContentJournalProof(blocked: Bool) async throws {
+    func testNormalContentWithExplicitPhotoStateRestoresJournalLinks() async throws {
+        try await assertScopedContentJournalProof(blocked: false, explicitPhotoState: true)
+    }
+
+    private func assertScopedContentJournalProof(blocked: Bool, explicitPhotoState: Bool = false) async throws {
         let harness = try EditScenarioHarness()
         defer { try? harness.cleanup() }
         let source = try XCTUnwrap(harness.library.snapshot.first).source
@@ -595,9 +599,10 @@ final class UploadDraftContentLookupTests: XCTestCase {
         let before = harness.journal.entry(for: source)
         harness.server.setVisibility(.init(isActive: false, mainPhotoLinkID: nil), for: retired.nodeID)
         let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)
-        let unproven = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
-        harness.server.setVisibilityAfterContentLookup(unproven, for: retired.nodeID)
-        harness.server.setVisibilityAfterContentLookup(unproven, for: active.nodeID)
+        let visibility = RemoteLinkVisibility(
+            isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: explicitPhotoState)
+        harness.server.setVisibilityAfterContentLookup(visibility, for: retired.nodeID)
+        harness.server.setVisibilityAfterContentLookup(visibility, for: active.nodeID)
         let draft =
             blocked
             ? harness.server.seedDraft(
@@ -613,13 +618,12 @@ final class UploadDraftContentLookupTests: XCTestCase {
             result.decision,
             blocked
                 ? .skip(.draftExists, remoteLinkID: draft?.nodeID)
-                : .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+                : .skip(
+                    explicitPhotoState ? .activeDuplicate : .inconsistentRemoteState, remoteLinkID: active.nodeID))
         XCTAssertEqual(harness.server.contentLookupCount, 1)
         let journal = harness.journal.entry(for: source)
-        if blocked {
-            XCTAssertEqual(journal.keptDeleted, before.keptDeleted)
-            XCTAssertEqual(journal.retired, before.retired)
-            XCTAssertEqual(journal.superseded, before.superseded)
+        if blocked || !explicitPhotoState {
+            XCTAssertEqual(journal, before)
             XCTAssertNil(harness.identities.record(for: source)?.remoteLinkID)
             XCTAssertNil(harness.identities.record(for: source)?.outcome)
         } else {

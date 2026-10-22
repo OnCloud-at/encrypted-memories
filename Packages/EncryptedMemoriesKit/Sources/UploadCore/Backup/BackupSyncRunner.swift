@@ -97,6 +97,8 @@ public actor BackupSyncRunner {
     private var drainMode: DrainMode = .waitForScheduledRetries
     private var deletionStateInvalidated = false
     private var stopRequested = false
+    /// Transport cancellation can arrive without cancelling the Swift task. Keep it until the next pass.
+    private var runCancellationError: (any Error)?
     /// Consecutive items that could not even reserve disk space since the last one that did.
     /// Reset to 0 the moment any export succeeds; when it reaches `batchSize` the drain starts no
     /// new item and ends the pass (rows stay runnable) instead of spinning against a genuinely full volume.
@@ -131,6 +133,8 @@ public actor BackupSyncRunner {
     private var inFlightJoins: [UUID: BackupUploadJoin] = [:]
     /// Transfers that wait for their network reservation. `stop()` ends these waits.
     private var networkWaits: [UUID: Task<UploadNetworkReservation, any Error>] = [:]
+    /// Native cancellation requested by Wi-Fi policy defers only these transfers, not the operation.
+    private var policyCancelledTransfers: Set<UUID> = []
     private var inFlightNames: [String: String] = [:]
     /// Sources removed from the local backup set while this actor was suspended in resolver or
     /// upload work. Their callbacks must not recreate a queue row after catalog removal.
@@ -209,6 +213,12 @@ public actor BackupSyncRunner {
         emitProgress()
     }
 
+    /// A caller that awaits a complete operation, such as Album Sync, must not turn cancellation into a report.
+    public func checkCancellation() throws {
+        try Task.checkCancellation()
+        if let runCancellationError { throw runCancellationError }
+    }
+
     public func currentProgress() -> BackupSyncProgress {
         progress
     }
@@ -240,7 +250,7 @@ public actor BackupSyncRunner {
     /// Ask the current pass to wind down: no new work starts, in-flight uploads are cancelled,
     /// and every touched row is reverted to a runnable state for the next pass after settlement.
     public func stop() async {
-        stopRequested = true
+        _ = recordCancellation(CancellationError())
         for wait in networkWaits.values { wait.cancel() }
         let joins = Array(inFlightJoins.values)
         await withTaskGroup(of: Void.self) { group in
@@ -297,6 +307,7 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent = .automatic
     ) async -> BackupSyncProgress {
         guard !isRunning else { return progress }
+        runCancellationError = nil
         guard queue.isOperational() else {
             progress.isRunning = false
             progress.currentItemName = nil
@@ -381,9 +392,11 @@ public actor BackupSyncRunner {
             emitProgress()
         } catch is CancellationError {
             cancelRemoteIndexPreparation(generation: remoteIndexGeneration)
+            _ = recordCancellation(CancellationError())
             return progress
         } catch {
             cancelRemoteIndexPreparation(generation: remoteIndexGeneration)
+            if recordCancellation(error) { return progress }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let issue = automaticRetryIssue(
                 kind: Self.issueKind(for: error),
@@ -574,6 +587,8 @@ public actor BackupSyncRunner {
         guard isRunning, !inFlightJoins.isEmpty || !networkWaits.isEmpty, throttleInputs().waitsForWiFi else {
             return
         }
+        policyCancelledTransfers.formUnion(networkWaits.keys)
+        policyCancelledTransfers.formUnion(inFlightJoins.keys)
         for wait in networkWaits.values { wait.cancel() }
         let joins = Array(inFlightJoins.values)
         await withTaskGroup(of: Void.self) { group in
@@ -859,7 +874,7 @@ public actor BackupSyncRunner {
             let readAdmission: BackupResourceReadAdmission = {
                 try Task.checkCancellation()
                 if isSourceRecheck {
-                    guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw CancellationError() }
+                    guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw BackupWorkDeferredError() }
                 }
             }
             resolved = try await resourceCoordinator.withHeavyPermit(
@@ -873,7 +888,15 @@ public actor BackupSyncRunner {
                 return try await resolver.resolve(
                     resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission)
             }
+        } catch is BackupWorkDeferredError {
+            if isSourceRecheck {
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else {
+                revert(checkingEntry, from: persistedState)
+            }
+            return
         } catch is CancellationError {
+            _ = recordCancellation(CancellationError(), for: checkingEntry)
             if isSourceRecheck {
                 preserveDismissedSourceRecheck(checkingEntry)
                 return
@@ -881,6 +904,14 @@ public actor BackupSyncRunner {
             revert(checkingEntry, from: persistedState)
             return
         } catch {
+            if recordCancellation(error, for: checkingEntry) {
+                if isSourceRecheck {
+                    preserveDismissedSourceRecheck(checkingEntry)
+                } else {
+                    revert(checkingEntry, from: persistedState)
+                }
+                return
+            }
             if isSourceRecheck {
                 let definitiveMissing: Bool
                 switch error as? UploadError {
@@ -1024,11 +1055,17 @@ public actor BackupSyncRunner {
                     }
                 }
             )
+        } catch is BackupWorkDeferredError {
+            let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
+            revert(entry, from: current)
+            return
         } catch is CancellationError {
+            _ = recordCancellation(CancellationError(), for: entry)
             let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
             revert(entry, from: current)
             return
         } catch let settlement as UploadRemoteCommitSettlementError {
+            if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
             if settlement.reconciliationPersisted {
                 adjustProgress(from: .uploading, to: .needsRemoteReconciliation)
                 emitProgress()
@@ -1038,7 +1075,7 @@ public actor BackupSyncRunner {
             return
         } catch {
             let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
-            if stopRequested || failedWhileWaitingForWiFi() {
+            if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
                 revert(entry, from: current)
             } else {
                 retryOrPark(entry, from: current, error: error)
@@ -1194,7 +1231,7 @@ public actor BackupSyncRunner {
     /// not start; its row returns to the queue without spending an attempt, and the pass then waits for Wi-Fi.
     private func transferNetwork() throws -> BackupThrottleInputs {
         let inputs = throttleInputs()
-        guard !inputs.waitsForWiFi else { throw CancellationError() }
+        guard !inputs.waitsForWiFi else { throw BackupWorkDeferredError() }
         return inputs
     }
 
@@ -1261,7 +1298,7 @@ public actor BackupSyncRunner {
         if resolved.hasDeferredMaterialization,
             descriptor.precomputedSHA1Digest != preflightResult.identity.sha1Digest
         {
-            throw CancellationError()
+            throw BackupWorkDeferredError()
         }
         // Materialization can take a while; an exclusion saved meanwhile must still stop the transfer.
         guard await admitsTransfer(for: entry.source) else { throw CancellationError() }
@@ -1369,6 +1406,7 @@ public actor BackupSyncRunner {
                 remoteLinkID: reconciliation.receipt.remoteLinkID
             )
         } catch {
+            _ = recordCancellation(error, for: entry)
             parkRemoteReconciliation(
                 entry,
                 reconciliation: reconciliation,
@@ -1669,6 +1707,7 @@ public actor BackupSyncRunner {
                     retired: Set(editReplacement.journal.entry(for: entry.source).retired)
                 )
             } catch is CancellationError {
+                _ = recordCancellation(CancellationError(), for: entry)
                 revert(entry, from: persistedState)
                 return
             } catch {
@@ -1888,15 +1927,21 @@ public actor BackupSyncRunner {
             } catch is SecondarySourceChangedError {
                 return .sourceChanged
             } catch let settlement as UploadRemoteCommitSettlementError {
+                if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
                 if settlement.reconciliationPersisted {
                     return .reconciliationPending
                 }
                 stopRequested = true
                 return .cancelled
+            } catch is BackupWorkDeferredError {
+                return .cancelled
             } catch is CancellationError {
+                _ = recordCancellation(CancellationError(), for: entry)
                 return .cancelled
             } catch {
-                if stopRequested || failedWhileWaitingForWiFi() { return .cancelled }
+                if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
+                    return .cancelled
+                }
                 lastError = error
             }
         }
@@ -2175,6 +2220,18 @@ public actor BackupSyncRunner {
         return changed
     }
 
+    /// A policy or source snapshot changed during preparation. Requeue without cancelling the operation.
+    private struct BackupWorkDeferredError: Error {}
+
+    /// Cancellation of a removed source belongs only to that source. Other transport cancellation ends the pass.
+    private func recordCancellation(_ error: any Error, for entry: UploadBackupSyncQueueEntry? = nil) -> Bool {
+        guard UploadError.isCancellation(error) else { return false }
+        if let entry, sourceWasRemoved(entry) { return true }
+        if runCancellationError == nil { runCancellationError = error }
+        stopRequested = true
+        return true
+    }
+
     private func retryOrPark(
         _ entry: UploadBackupSyncQueueEntry,
         from oldState: UploadBackupSyncQueueState,
@@ -2182,6 +2239,10 @@ public actor BackupSyncRunner {
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
+        if error is BackupWorkDeferredError || recordCancellation(error, for: entry) {
+            revert(entry, from: oldState)
+            return
+        }
         if case UploadError.fileMissing = error {
             discardMissingSource(entry, from: oldState)
             return
@@ -2632,7 +2693,7 @@ public actor BackupSyncRunner {
         // In each case the row returns to the queue without an attempt and the next claim reserves again.
         guard await admitsTransfer(for: source) else { throw CancellationError() }
         let network = try transferNetwork()
-        guard network.usesMobileData == request.allowsExpensiveNetwork else { throw CancellationError() }
+        guard network.usesMobileData == request.allowsExpensiveNetwork else { throw BackupWorkDeferredError() }
         var reservedRequest = request
         reservedRequest.networkReservation = reservation
         let request = reservedRequest
@@ -2682,7 +2743,10 @@ public actor BackupSyncRunner {
             token: request.cancellationToken
         )
         inFlightJoins[request.cancellationToken] = join
-        defer { inFlightJoins[request.cancellationToken] = nil }
+        defer {
+            inFlightJoins[request.cancellationToken] = nil
+            policyCancelledTransfers.remove(request.cancellationToken)
+        }
 
         let watchdogTask = Task {
             while !Task.isCancelled {
@@ -2711,6 +2775,9 @@ public actor BackupSyncRunner {
             return uid
         case .failure(let error):
             await join.settle()
+            if UploadError.isCancellation(error), policyCancelledTransfers.contains(request.cancellationToken) {
+                throw BackupWorkDeferredError()
+            }
             throw error
         // The upload can return its uid after a timeout or cancellation decided the race: Proton has the file then, and
         // the normal settlement records it. A source that a deletion or exclusion removed keeps the cancellation.
@@ -2722,6 +2789,7 @@ public actor BackupSyncRunner {
             )
         case .cancelled:
             if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
+            if policyCancelledTransfers.contains(request.cancellationToken) { throw BackupWorkDeferredError() }
             throw CancellationError()
         }
     }
@@ -2733,12 +2801,23 @@ public actor BackupSyncRunner {
         let allowsExpensiveNetwork = request.allowsExpensiveNetwork
         let wait = Task { try await uploader.reserveNetwork(allowsExpensiveNetwork: allowsExpensiveNetwork) }
         networkWaits[request.cancellationToken] = wait
-        defer { networkWaits[request.cancellationToken] = nil }
+        defer {
+            networkWaits[request.cancellationToken] = nil
+            policyCancelledTransfers.remove(request.cancellationToken)
+        }
         if stopRequested { wait.cancel() }
-        let reservation = try await withTaskCancellationHandler {
-            try await wait.value
-        } onCancel: {
-            wait.cancel()
+        let reservation: UploadNetworkReservation
+        do {
+            reservation = try await withTaskCancellationHandler {
+                try await wait.value
+            } onCancel: {
+                wait.cancel()
+            }
+        } catch {
+            if UploadError.isCancellation(error), policyCancelledTransfers.contains(request.cancellationToken) {
+                throw BackupWorkDeferredError()
+            }
+            throw error
         }
         guard !stopRequested, !Task.isCancelled else {
             reservation.release()

@@ -199,6 +199,24 @@ final class UploadIdentityManifestTests: XCTestCase {
         )
     }
 
+    func testMergeMovesNeverPromoteADiagnosticTrashLinkToAnActiveCopy() throws {
+        let store = try makeStore()
+        var saved = makeRecord(identifier: "trashed-source")
+        saved.remoteLinkID = "trashed-link"
+        saved.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
+        XCTAssertTrue(store.upsert(saved))
+        XCTAssertTrue(
+            store.rebindRemoteLinks(
+                [.init(from: "trashed-link", to: "kept", contentHash: saved.contentHash)],
+                hashKeyEpoch: saved.hashKeyEpoch))
+        XCTAssertEqual(store.record(for: saved.source), saved)
+        XCTAssertTrue(store.forgetRemoteLinks(["trashed-link"], of: saved.source))
+        let forgotten = try XCTUnwrap(store.record(for: saved.source))
+        XCTAssertNil(forgotten.remoteLinkID)
+        XCTAssertNil(forgotten.outcome)
+        XCTAssertEqual(forgotten.sha1Hex, saved.sha1Hex)
+    }
+
     func testSourcesOfARemoteLinkListOnlyTrustworthyRows() throws {
         let store = try makeStore()
         var uploaded = makeRecord(identifier: "asset-a")

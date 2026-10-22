@@ -126,6 +126,7 @@ public struct EditedPhotoReplacement: Sendable {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                if UploadError.isCancellation(error) { throw error }
                 try Task.checkCancellation()
             }
         }
@@ -191,6 +192,7 @@ public struct EditedPhotoReplacement: Sendable {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    if UploadError.isCancellation(error) { throw error }
                     try Task.checkCancellation()
                     kept.insert(target.nodeID)
                     continue
@@ -297,6 +299,7 @@ public struct EditedPhotoReplacement: Sendable {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            if UploadError.isCancellation(error) { throw error }
             try Task.checkCancellation()
             if case UploadError.retryableBackend = error { throw error }
             if BackupSyncRunner.isTransientNetwork(error) { throw error }

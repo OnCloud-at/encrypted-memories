@@ -2196,7 +2196,10 @@ final class ExactDuplicateFinderTests: XCTestCase {
         if resolved.decision == .upload { await pipeline.uploadDidFail(descriptor) }
 
         XCTAssertNotEqual(resolved.decision, .skip(.activeDuplicate, remoteLinkID: duplicate.nodeID))
-        XCTAssertNotEqual(store.record(for: descriptor.source)?.remoteLinkID, duplicate.nodeID)
+        XCTAssertEqual(resolved.decision, .skip(.trashedDuplicate, remoteLinkID: duplicate.nodeID))
+        let diagnostic = try XCTUnwrap(store.record(for: descriptor.source))
+        XCTAssertEqual(diagnostic.remoteLinkID, duplicate.nodeID)
+        XCTAssertFalse(diagnostic.provesUpload, "a retained trash link must never prove active adoption")
     }
 
     func testMergeKeepsADuplicateWhoseRelatedFileHasNoCopyUnderTheKeptPhoto() async throws {
@@ -2522,6 +2525,28 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(server.links.first { $0.linkID == superseded.nodeID }?.state, .active)
         XCTAssertEqual(server.links.first { $0.linkID == retiring.nodeID }?.state, .active)
         XCTAssertEqual(violations, [])
+    }
+
+    func testMergeDoesNotTreatATrashedOutcomeAsProofAfterTheOwnerSnapshot() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        let identities = CountingIdentityStore(base: store)
+        let manifest = try XCTUnwrap(store)
+        identities.afterOwnerSnapshot = {
+            guard var record = manifest.record(for: source) else { return }
+            record.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
+            _ = manifest.upsert(record)
+        }
+
+        let outcome = try await finder(identities: identities).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: kept, trashed: [], keptDuplicates: [duplicate: .neededByLocalSource]))
+        XCTAssertEqual(state(of: duplicate), .active)
+        XCTAssertEqual(manifest.record(for: source)?.remoteLinkID, duplicate.nodeID)
+        XCTAssertEqual(manifest.record(for: source)?.outcome, "duplicateTrashed")
     }
 
     func testMergeKeepsADuplicateThatALocalSourceNeedsWhenItsRowCannotMove() async throws {
@@ -3395,6 +3420,7 @@ private final class CountingIdentityStore: UploadIdentityStore, @unchecked Senda
     private let base: UploadIdentityManifestStore
     private let lock = NSLock()
     private var counted = Reads()
+    var afterOwnerSnapshot: (@Sendable () -> Void)?
 
     init(base: UploadIdentityManifestStore) { self.base = base }
 
@@ -3411,7 +3437,9 @@ private final class CountingIdentityStore: UploadIdentityStore, @unchecked Senda
     }
     func sources(withRemoteLinkIDs linkIDs: Set<String>) -> [String: [UploadSourceIdentity]]? {
         lock.withLock { counted.batch += 1 }
-        return base.sources(withRemoteLinkIDs: linkIDs)
+        let snapshot = base.sources(withRemoteLinkIDs: linkIDs)
+        afterOwnerSnapshot?()
+        return snapshot
     }
     func forgetRemoteLinks(_ linkIDs: Set<String>, of source: UploadSourceIdentity) -> Bool {
         base.forgetRemoteLinks(linkIDs, of: source)

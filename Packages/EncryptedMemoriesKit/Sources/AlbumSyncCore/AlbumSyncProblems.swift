@@ -20,6 +20,7 @@ public enum AlbumSyncProblemList {
         missingIdentifiers: [String],
         attachFailedIdentifiers: [String],
         incompleteIdentifiers: [String] = [],
+        trashedIdentifiers: [String] = [],
         backup: AlbumSyncBackupReport
     ) -> [BackupFailedItem] {
         var items: [BackupFailedItem] = []
@@ -40,6 +41,9 @@ public enum AlbumSyncProblemList {
                         reason: L10n.string("albumsync.issue_not_backed_up")))
             }
         }
+        for identifier in trashedIdentifiers {
+            items.append(remoteDeletionItem(identifier: identifier, backup: backup))
+        }
         for identifier in attachFailedIdentifiers {
             items.append(
                 albumOnlyItem(
@@ -47,6 +51,18 @@ public enum AlbumSyncProblemList {
                     reason: L10n.string("albumsync.issue_attach_failed")))
         }
         return items
+    }
+
+    static func remoteDeletionItem(identifier: String, backup: AlbumSyncBackupReport) -> BackupFailedItem {
+        if let problem = backup.problems[identifier], problem.issue == .remoteDeletion {
+            return albumItem(from: problem)
+        }
+        return BackupFailedItem(
+            id: "album/\(identifier)",
+            filename: backup.filenames[identifier] ?? L10n.string("albumsync.issue_photo_fallback"),
+            reason: L10n.string("backup.state_skipped_remote_deletion"), isPermanent: false,
+            issue: .remoteDeletion, isRetryable: false,
+            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier))
     }
 
     /// The album scratch queue runs only on Sync now. A backup wait therefore does not continue by
