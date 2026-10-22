@@ -100,6 +100,7 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
         private var completedOnMainThread: Bool?
         private var analysisStarts = 0
         private var beforeAnalysis: (@Sendable () -> Void)?
+        private var beforeWarmingWait: (@Sendable () -> Void)?
     #endif
 
     public init(coordinates: [PhotoCoordinate]) { self.coordinates = coordinates }
@@ -117,6 +118,10 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
     }
 
     public func waitForWarming() async -> Bool {
+        #if DEBUG
+            let beforeWait = statusLock.withLock { beforeWarmingWait }
+            beforeWait?()
+        #endif
         let task = warmingLock.withLock { warmingTask }
         await task?.value
         return !warmingIsRetired
@@ -127,6 +132,9 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
     public func supportSnapshot() -> [PlaceCandidateSupportSnapshot] { analysis().diagnostics }
 
     #if DEBUG
+        public func setBeforeWarmingWaitForTesting(_ hook: @escaping @Sendable () -> Void) {
+            statusLock.withLock { beforeWarmingWait = hook }
+        }
         public func setBeforeAnalysisForTesting(_ hook: @escaping @Sendable () -> Void) {
             statusLock.withLock { beforeAnalysis = hook }
         }
