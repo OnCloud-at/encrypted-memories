@@ -44,6 +44,7 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     #if DEBUG
         public var nowForTesting: (() -> TimeInterval)?
         public var beforePlaceAnalysisForTesting: (@Sendable () -> Void)?
+        public var beforePlaceAnalysisAsyncForTesting: (@Sendable () async -> Void)?
         public func waitForPlaceEvidenceForTesting() async { await placeEvidenceWarmTask?.value }
         /// A test raises the priority of the warming task: a background task starves while many builds run.
         public var warmingPriorityForTesting: TaskPriority = .background
@@ -129,9 +130,17 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
         placeEvidenceTime = time
         placeEvidenceCount = coordinates.count
         let priority = warmingPriority
+        #if DEBUG
+            let beforeAnalysis = beforePlaceAnalysisAsyncForTesting
+        #endif
         let task = Task(priority: priority) { @MainActor [weak self, weak snapshot] in
             guard let snapshot, !Task.isCancelled else { return }
-            let worker = Task.detached(priority: priority) { snapshot.query.evidence.prewarm() }
+            let worker = Task.detached(priority: priority) {
+                #if DEBUG
+                    if let beforeAnalysis { await beforeAnalysis() }
+                #endif
+                snapshot.query.evidence.prewarm()
+            }
             await withTaskCancellationHandler {
                 await worker.value
             } onCancel: {

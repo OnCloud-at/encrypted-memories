@@ -141,7 +141,7 @@ public final class PhotoMapAnnotationLoader {
     }
 
     private var workerPriority: TaskPriority {
-        index.scanProgress.phase == .scanning ? .background : .userInitiated
+        .userInitiated
     }
 
     private func observeScanProgress() {
