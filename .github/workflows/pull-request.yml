@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 env:
-  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
 
 jobs:
   repository-hygiene:
@@ -243,8 +243,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/install-swiftlint
-      - name: Select Xcode 27
-        run: sudo xcode-select --switch /Applications/Xcode.app
+      - name: Select Xcode 27.1
+        run: sudo xcode-select --switch /Applications/Xcode_27.1.app
       - name: Verify Swift style
         id: style
         env:

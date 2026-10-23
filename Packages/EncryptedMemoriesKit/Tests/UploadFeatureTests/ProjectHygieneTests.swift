@@ -141,8 +141,18 @@ final class ProjectHygieneTests: XCTestCase {
         }
         let action = try read(".github/actions/prepare-apple-build/action.yml")
         XCTAssertTrue(action.contains("--force-resolved-versions \\\n          resolve"))
+        XCTAssertTrue(action.contains("EXPECTED_XCODE_VERSION: ${{ inputs.xcode-version }}"))
+        XCTAssertTrue(action.contains("EXPECTED_XCODE_BUILD: ${{ inputs.xcode-build }}"))
+        XCTAssertTrue(action.contains("set -euo pipefail\n        bash .github/scripts/verify_xcode_toolchain.sh"))
+
+        let toolchain = try read(".github/scripts/verify_xcode_toolchain.sh")
+        XCTAssertTrue(toolchain.contains("set -euo pipefail"))
+        XCTAssertTrue(toolchain.contains(#"expected_version="${EXPECTED_XCODE_VERSION:-27.1}""#))
+        XCTAssertTrue(toolchain.contains(#"expected_build="${EXPECTED_XCODE_BUILD:-27A9275}""#))
         XCTAssertTrue(
-            action.contains("[[ \"$xcode_version\" == \"$EXPECTED_XCODE_VERSION\" ]] || release_fail toolchain"))
+            toolchain.contains(
+                #"[[ "$xcode_version" == "$expected_version" && "$xcode_build" == "$expected_build" ]] || release_fail toolchain"#
+            ))
     }
 
     func testProtonAppVersionHeaderInputsReachEveryShippedApp() throws {
