@@ -821,6 +821,18 @@ public struct ExactDuplicateFinder: Sendable {
             } else {
                 read = try await checker.compound(ofMainLink: member.nodeID)
             }
+            if read == nil {
+                let current = try await checker.linkVisibility(batching: group.members.map(\.nodeID))
+                if let currentKept = current[kept.nodeID], currentKept.hasExplicitPhotoState,
+                    currentKept.isActiveMain,
+                    group.members.filter({ $0 != kept }).allSatisfy({ other in
+                        guard let state = current[other.nodeID], state.hasExplicitPhotoState else { return false }
+                        return !state.isActive
+                    })
+                {
+                    return .skipped(.noDuplicateLeft)
+                }
+            }
             guard let compound = read, compound.main.contentHash == group.contentHash else {
                 plan.keptDuplicates[member] = .unreadable
                 continue
