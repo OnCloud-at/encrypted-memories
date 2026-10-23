@@ -1,6 +1,19 @@
 import Foundation
 import PhotosCore
 
+/// Internal monotonic time and suspension dependency. Public owners use the native clock.
+struct TimelineRefreshClock: Sendable {
+    let now: @Sendable () -> ContinuousClock.Instant
+    let sleep: @Sendable (Duration) async throws -> Void
+    let sleepUntil: @Sendable (ContinuousClock.Instant) async throws -> Void
+
+    static let continuous = TimelineRefreshClock(
+        now: { ContinuousClock.now },
+        sleep: { try await Task.sleep(for: $0) },
+        sleepUntil: { try await ContinuousClock().sleep(until: $0) }
+    )
+}
+
 /// Shared foreground polling policy for remote library mutations. The probe is deliberately cheap
 /// (an opaque server event token); a full timeline refresh runs only after that token changes.
 public struct LibraryChangePollingPolicy: Sendable, Equatable {
@@ -9,28 +22,35 @@ public struct LibraryChangePollingPolicy: Sendable, Equatable {
     /// The longest wait between two loads of a library that has not caught up yet.
     public let maxRefreshRetryInterval: Duration
     public let failureInterval: Duration
+    /// Nil preserves immediate change handling for custom polling policies.
+    public let trailingQuietInterval: Duration?
+    public let maxTrailingInterval: Duration
 
     public init(
         interval: Duration, refreshRetryInterval: Duration? = nil, maxRefreshRetryInterval: Duration? = nil,
-        failureInterval: Duration
+        failureInterval: Duration,
+        trailingQuietInterval: Duration? = nil,
+        maxTrailingInterval: Duration = .seconds(60)
     ) {
         self.interval = interval
         self.refreshRetryInterval = refreshRetryInterval ?? interval
         self.maxRefreshRetryInterval = max(
             maxRefreshRetryInterval ?? self.refreshRetryInterval, self.refreshRetryInterval)
         self.failureInterval = failureInterval
+        self.trailingQuietInterval = trailingQuietInterval
+        self.maxTrailingInterval = maxTrailingInterval
     }
 
-    /// Five seconds keeps a second foreground device visibly current without repeatedly enumerating
-    /// a large library. Failures back off so an offline device does not hot-loop the API.
-    ///
-    /// The photos listing shows a change about 90 seconds after the event. A load during that time sees an old
-    /// library, so the wait between loads doubles up to 30 seconds: about six full loads instead of eighteen.
+    /// Probes every five seconds and refreshes the first isolated change immediately after detection.
+    /// Trailing changes wait for twenty-five seconds of quiet or sixty seconds from the first deferred change.
+    /// Inventory convergence retries retain their bounded exponential backoff.
     public static let foreground = LibraryChangePollingPolicy(
         interval: .seconds(5),
         refreshRetryInterval: .seconds(5),
         maxRefreshRetryInterval: .seconds(30),
-        failureInterval: .seconds(30)
+        failureInterval: .seconds(30),
+        trailingQuietInterval: .seconds(25),
+        maxTrailingInterval: .seconds(60)
     )
 
     /// The wait before the next load, after `retries` loads in a row saw a library that had not caught up.
@@ -96,6 +116,7 @@ public actor LibraryChangeMonitor {
         case active
     }
 
+    private let clock: TimelineRefreshClock
     private var task: Task<Void, Never>?
     private var activeTaskID: UInt64?
     private var retiringTaskID: UInt64?
@@ -107,7 +128,13 @@ public actor LibraryChangeMonitor {
     /// Counts host resumes, so a resume during a refresh keeps that refresh's token pending.
     private var resumeGeneration: UInt64 = 0
 
-    public init() {}
+    public init() {
+        clock = .continuous
+    }
+
+    init(clock: TimelineRefreshClock) {
+        self.clock = clock
+    }
 
     #if DEBUG
         func testingBaseline() -> String? { lastToken }
@@ -161,12 +188,15 @@ public actor LibraryChangeMonitor {
             // every later mutation on the normal foreground cadence.
             if delayFirstProbe {
                 do {
-                    try await Task.sleep(for: request.policy.interval)
+                    try await clock.sleep(request.policy.interval)
                 } catch {
                     return
                 }
             }
             var retryCount = LibraryChangeRetryCount()
+            var observedToken = lastToken
+            var lastChangeAt: ContinuousClock.Instant?
+            var firstDeferredAt: ContinuousClock.Instant?
             while !Task.isCancelled {
                 do {
                     let token = try await request.provider.libraryChangeToken()
@@ -174,31 +204,54 @@ public actor LibraryChangeMonitor {
                     if let lastToken, token != lastToken {
                         // A filtered route already refreshed for this token. Wait for a newer token or a resume.
                         if token == deferredToken {
-                            try await Task.sleep(for: request.policy.interval)
+                            try await clock.sleep(request.policy.interval)
                             continue
                         }
+                        if let quiet = request.policy.trailingQuietInterval {
+                            let now = clock.now()
+                            if token != observedToken {
+                                if let previousChange = lastChangeAt, now - previousChange < quiet,
+                                    firstDeferredAt == nil
+                                {
+                                    firstDeferredAt = now
+                                }
+                                observedToken = token
+                                lastChangeAt = now
+                            }
+                            if let firstDeferredAt, let lastChangeAt {
+                                let deadline = min(
+                                    lastChangeAt + quiet, firstDeferredAt + request.policy.maxTrailingInterval)
+                                if now < deadline {
+                                    try await clock.sleepUntil(min(now + request.policy.interval, deadline))
+                                    continue
+                                }
+                            }
+                        }
+                        try Task.checkCancellation()
                         let generation = resumeGeneration
                         switch await request.onChange() {
                         case .refreshedWithoutRevision:
                             try Task.checkCancellation()
+                            firstDeferredAt = nil
                             if generation == resumeGeneration { deferredToken = token }
-                            try await Task.sleep(for: request.policy.interval)
+                            try await clock.sleep(request.policy.interval)
                             continue
                         case .refreshed(let publishedToken):
                             try Task.checkCancellation()
                             deferredToken = nil
                             if let publishedToken { self.lastToken = publishedToken }
                             guard publishedToken == token else {
-                                try? await Task.sleep(for: retryCount.nextDelay(for: token, policy: request.policy))
+                                try? await clock.sleep(retryCount.nextDelay(for: token, policy: request.policy))
                                 continue
                             }
                             retryCount.reset()
-                            try await Task.sleep(for: request.policy.interval)
+                            firstDeferredAt = nil
+                            try await clock.sleep(request.policy.interval)
                             continue
                         case .retry:
                             // A successful token probe with an inventory that has not converged is not a
                             // transport failure. Keep the old token and wait longer after each such load.
-                            try? await Task.sleep(for: retryCount.nextDelay(for: token, policy: request.policy))
+                            try? await clock.sleep(retryCount.nextDelay(for: token, policy: request.policy))
                             continue
                         case .terminal:
                             await handleTerminal(
@@ -211,8 +264,10 @@ public actor LibraryChangeMonitor {
                     }
                     try Task.checkCancellation()
                     retryCount.reset()
+                    firstDeferredAt = nil
+                    observedToken = token
                     lastToken = token
-                    try await Task.sleep(for: request.policy.interval)
+                    try await clock.sleep(request.policy.interval)
                 } catch is CancellationError {
                     break
                 } catch let error as any LibraryChangeTerminalError {
@@ -223,7 +278,7 @@ public actor LibraryChangeMonitor {
                     )
                     return
                 } catch {
-                    try? await Task.sleep(for: request.policy.failureInterval)
+                    try? await clock.sleep(request.policy.failureInterval)
                 }
             }
         }
