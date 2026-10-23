@@ -769,4 +769,110 @@ class PullRequestWorkflowTests < Minitest::Test
     end
   end
 
+
+  def reviewed_xcode_action
+    YAML.load_file(File.join(WORKFLOWS, "../actions/prepare-apple-build/action.yml"))
+  end
+
+  def run_reviewed_xcode_check(output, exit_code: 0, directory_present: true, stderr_output: "")
+    action = reviewed_xcode_action
+    step = action.fetch("runs").fetch("steps").find { |s| s.fetch("name", "").start_with?("Check the pinned Xcode") }
+    Dir.mktmpdir do |directory|
+      bin = File.join(directory, "bin")
+      FileUtils.mkdir_p(bin)
+      developer = File.join(directory, "SelectedXcode.app", "Contents", "Developer")
+      FileUtils.mkdir_p(developer) if directory_present
+      calls = File.join(directory, "xcode-calls")
+      executable = File.join(bin, "xcodebuild")
+      File.write(executable, "#!/bin/bash\nprintf 'call\\n' >> \"$XCODE_CALLS\"\nprintf '%s' \"$FAKE_XCODE_OUTPUT\"\nprintf '%s' \"$FAKE_XCODE_STDERR\" >&2\nexit \"$FAKE_XCODE_EXIT\"\n")
+      FileUtils.chmod(0o755, executable)
+      environment_file = File.join(directory, "environment")
+      environment = {
+        "PATH" => "#{bin}:#{ENV.fetch('PATH')}", "DEVELOPER_DIR" => developer,
+        "EXPECTED_XCODE_VERSION" => action.fetch("inputs").fetch("xcode-version").fetch("default"),
+        "EXPECTED_XCODE_BUILD" => action.fetch("inputs").fetch("xcode-build", {}).fetch("default", ""),
+        "GITHUB_ENV" => environment_file, "GITHUB_STEP_SUMMARY" => File.join(directory, "summary"),
+        "XCODE_CALLS" => calls, "FAKE_XCODE_OUTPUT" => output, "FAKE_XCODE_EXIT" => exit_code.to_s, "FAKE_XCODE_STDERR" => stderr_output
+      }
+      stdout, stderr, status = Open3.capture3(environment, "bash", "-c", step.fetch("run"),
+        chdir: File.expand_path("../..", WORKFLOWS))
+      yield stdout, stderr, status, File.exist?(calls),
+        (File.exist?(environment_file) ? File.read(environment_file) : ""), developer
+    end
+  end
+
+  def test_reviewed_xcode_check_accepts_exact_version_and_build
+    run_reviewed_xcode_check("Xcode 27.1\nBuild version 27A9275\n") do |stdout, stderr, status, called, exports, developer|
+      assert status.success?, stderr
+      assert called
+      assert_includes stdout, "Build version 27A9275"
+      assert_equal "DEVELOPER_DIR=#{developer}\n", exports
+    end
+  end
+
+  def test_reviewed_xcode_check_rejects_wrong_or_missing_version_and_build
+    ["Xcode 27.0\nBuild version 27A9275\n", "Xcode 27.1\nBuild version 27A9269\n",
+     "Xcode 27.2\nBuild version 27B48\n", "Xcode 27.1\n", "Build version 27A9275\n", ""].each do |output|
+      run_reviewed_xcode_check(output) do |_stdout, stderr, status, called, exports, _developer|
+        refute status.success?, output.inspect
+        assert called
+        assert_includes stderr, "expected '27.1' build '27A9275'"
+        assert_empty exports
+      end
+    end
+  end
+
+  def test_reviewed_xcode_check_rejects_a_failed_command_and_missing_directory
+    run_reviewed_xcode_check("Xcode 27.1\nBuild version 27A9275\n", exit_code: 7) do |_out, err, status, called, exports, _dir|
+      refute status.success?
+      assert called
+      assert_includes err, "xcodebuild -version failed"
+      assert_empty exports
+    end
+    run_reviewed_xcode_check("Xcode 27.1\nBuild version 27A9275\n", directory_present: false) do |_out, err, status, called, exports, _dir|
+      refute status.success?
+      refute called
+      assert_includes err, "developer directory is missing"
+      assert_empty exports
+    end
+  end
+
+  def test_hosted_workflows_select_the_reviewed_xcode_and_upgrade_checks_before_cache
+    developer = "/Applications/Xcode_27.1.app/Contents/Developer"
+    %w[pull-request.yml testflight-internal.yml dependency-cache.yml].each do |name|
+      workflow = YAML.load_file(File.join(WORKFLOWS, name))
+      assert_equal developer, workflow.fetch("env").fetch("DEVELOPER_DIR"), name
+    end
+    action = reviewed_xcode_action
+    assert_equal "27.1", action.fetch("inputs").fetch("xcode-version").fetch("default")
+    assert_equal "27A9275", action.fetch("inputs").fetch("xcode-build").fetch("default")
+    check = action.fetch("runs").fetch("steps").find { |step| step.fetch("name", "").start_with?("Check the pinned Xcode") }
+    assert_equal developer, check.fetch("env").fetch("DEVELOPER_DIR")
+    package = @workflow.fetch("jobs").fetch("package-verification").fetch("steps")
+    assert_equal "sudo xcode-select --switch /Applications/Xcode_27.1.app",
+      package.find { |step| step.fetch("name", "").start_with?("Select Xcode") }.fetch("run")
+    upgrade = YAML.load_file(File.join(WORKFLOWS, "testflight-internal.yml")).fetch("jobs").fetch("upgrade").fetch("steps")
+    toolchain = upgrade.find { |step| step["id"] == "toolchain" }
+    assert_includes toolchain.fetch("run"), "bash .github/scripts/verify_xcode_toolchain.sh"
+    assert_operator upgrade.index(toolchain), :<, upgrade.index { |step| step["id"] == "cache" }
+    cache_inputs = action.fetch("runs").fetch("steps").find { |step| step["id"] == "dependency-cache-key" }.fetch("run")
+    assert_includes cache_inputs, ".github/scripts/verify_xcode_toolchain.sh"
+    assert_includes cache_inputs, '$xcode_version-$xcode_build'
+    warm = YAML.load_file(File.join(WORKFLOWS, "dependency-cache.yml"))
+    events = warm["on"] || warm.fetch(true)
+    assert_includes events.fetch("push").fetch("paths"), ".github/scripts/verify_xcode_toolchain.sh"
+  end
+
+  def test_reviewed_xcode_check_retains_stdout_and_stderr_when_command_fails
+    stdout_marker = "xcodebuild stdout diagnostic before failure"
+    stderr_marker = "xcodebuild stderr diagnostic before failure"
+    run_reviewed_xcode_check("#{stdout_marker}\n", exit_code: 7, stderr_output: "#{stderr_marker}\n") do |stdout, stderr, status, called, exports, _developer|
+      refute status.success?
+      assert called
+      assert_includes stderr, stderr_marker
+      assert_includes stderr, "xcodebuild -version failed"
+      assert_empty exports
+      assert_includes stdout, stdout_marker
+    end
+  end
 end

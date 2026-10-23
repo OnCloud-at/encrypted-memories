@@ -9,7 +9,11 @@ inputs:
   xcode-version:
     description: Xcode version that the build expects. A runner with another version fails.
     required: false
-    default: "27.0"
+    default: "27.1"
+  xcode-build:
+    description: Reviewed Xcode build identifier. A runner with another build fails.
+    required: false
+    default: "27A9275"
 
   build-profile:
     description: Dependency graphs to prepare (app, package, or all).
@@ -43,17 +47,16 @@ runs:
         set -euo pipefail
         case "$BUILD_PROFILE" in app|package|all) ;; *) echo "Invalid build profile." >&2; exit 64 ;; esac
 
-    - name: Check the pinned Xcode version
+    - name: Check the pinned Xcode version and build
       shell: bash
       env:
+        DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
         EXPECTED_XCODE_VERSION: ${{ inputs.xcode-version }}
+        EXPECTED_XCODE_BUILD: ${{ inputs.xcode-build }}
       run: |
         set -euo pipefail
-        source .github/scripts/release_failure.sh
-        xcode_version="$(awk '/^Xcode / { print $2; exit }' <<< "$(xcodebuild -version)")"
-        [[ "$xcode_version" == "$EXPECTED_XCODE_VERSION" ]] || release_fail toolchain \
-          "The runner uses Xcode '${xcode_version:-unknown}'; the build expects Xcode '$EXPECTED_XCODE_VERSION'." \
-          "Select the expected Xcode on the runner, or update the xcode-version input in a reviewed change."
+        bash .github/scripts/verify_xcode_toolchain.sh
+        printf 'DEVELOPER_DIR=%s\n' "$DEVELOPER_DIR" >> "$GITHUB_ENV"
 
     - name: Install pinned XcodeGen
       if: ${{ inputs.build-profile != 'package' }}
@@ -85,7 +88,7 @@ runs:
         : > "$key_material"
         while IFS= read -r file; do
           case "$file" in
-            Package.swift|*/Package.swift|Package.resolved|*/Package.resolved|VendorPatches/*|project.yml|scripts/build-paths.sh|scripts/install-xcodegen.sh|scripts/update-proton-sdk.sh|.github/actions/prepare-apple-build/action.yml)
+            Package.swift|*/Package.swift|Package.resolved|*/Package.resolved|VendorPatches/*|project.yml|scripts/build-paths.sh|scripts/install-xcodegen.sh|scripts/update-proton-sdk.sh|.github/scripts/verify_xcode_toolchain.sh|.github/actions/prepare-apple-build/action.yml)
               shasum -a 256 "$file" >> "$key_material"
               ;;
           esac
