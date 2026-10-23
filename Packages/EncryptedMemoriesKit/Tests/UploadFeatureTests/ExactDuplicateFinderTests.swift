@@ -2797,6 +2797,215 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     @MainActor
+    func testMergeAllReconcilesAMemberTrashedAfterItsActiveReadBeforeItsCompoundRead() async throws {
+        let result = try await memberCompoundRace(.concurrentTrash)
+        XCTAssertEqual(activeMains(hash("compound-race")), [result.kept])
+        XCTAssertEqual(result.second.groups.map(\.id), [])
+        XCTAssertEqual(
+            result.first.groups.map(\.id), [], "The joined merge must reconcile the confirmed external trash")
+        XCTAssertEqual(violations, [])
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+        XCTAssertEqual(server.uploadRequestCount, 0)
+    }
+
+    @MainActor
+    func testMergeAllKeepsAGenuinelyUnreadableActiveMemberAfterItsCompoundReadFails() async throws {
+        let result = try await memberCompoundRace(.unreadableActive)
+        let visibility = try await result.checker.linkVisibility(of: [result.source.nodeID])
+        XCTAssertEqual(visibility[result.source.nodeID]?.isActiveMain, true)
+        XCTAssertEqual(visibility[result.source.nodeID]?.hasExplicitPhotoState, true)
+        XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
+        XCTAssertEqual(result.first.groups.first?.keptReason, .unreadable)
+        XCTAssertEqual(state(of: result.source), .active)
+        XCTAssertEqual(state(of: result.kept), .active)
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+        XCTAssertEqual(violations, [])
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+    }
+
+    @MainActor
+    func testMergeAllKeepsUnknownMemberVisibilityAfterItsCompoundReadFails() async throws {
+        for mode in [MemberCompoundRaceChecker.Mode.unknownMissingEntry, .unknownState] {
+            server = EditScenarioServer()
+            let result = try await memberCompoundRace(mode)
+            let visibility = try await result.checker.linkVisibility(of: [result.source.nodeID])
+            if mode == .unknownMissingEntry {
+                XCTAssertNil(visibility[result.source.nodeID])
+            } else {
+                XCTAssertEqual(visibility[result.source.nodeID]?.isActive, false)
+                XCTAssertEqual(
+                    visibility[result.source.nodeID]?.hasExplicitPhotoState, false,
+                    "A false legacy boolean without explicit state must not prove inactivity")
+            }
+            let actual = try await server.linkVisibility(of: [result.source.nodeID])
+            XCTAssertEqual(actual[result.source.nodeID]?.isActiveMain, true)
+            XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
+            XCTAssertEqual(result.first.groups.first?.keptReason, .unreadable)
+            XCTAssertEqual(state(of: result.source), .active)
+            XCTAssertEqual(state(of: result.kept), .active)
+            XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+            XCTAssertEqual(violations, [])
+            XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+        }
+    }
+
+    @MainActor
+    func testUnreadableMemberWithAChangedOrUnknownKeeperDoesNotProveNoDuplicate() async throws {
+        for mode in [MemberCompoundRaceChecker.Mode.keeperTrashed, .keeperUnknown, .keeperMissing, .keeperRelated] {
+            server = EditScenarioServer()
+            let result = try await memberCompoundRace(mode)
+            XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
+            XCTAssertEqual(result.first.groups.first?.keptReason, .unreadable)
+            XCTAssertEqual(state(of: result.source), .trashed)
+            XCTAssertEqual(state(of: result.kept), mode == .keeperTrashed ? .trashed : .active)
+            XCTAssertEqual(
+                server.steps.filter { $0.action.hasPrefix("duplicate trash ") }.count,
+                1, "Only the second model may dispatch a duplicate trash")
+            XCTAssertEqual(result.checker.freshVisibilityReads, 1)
+            if mode == .keeperMissing || mode == .keeperRelated {
+                let visibility = try await result.checker.linkVisibility(of: [result.kept.nodeID, result.source.nodeID])
+                XCTAssertEqual(visibility[result.source.nodeID]?.hasExplicitPhotoState, true)
+                XCTAssertEqual(visibility[result.source.nodeID]?.isActive, false)
+                if mode == .keeperMissing {
+                    XCTAssertNil(visibility[result.kept.nodeID])
+                } else {
+                    XCTAssertEqual(visibility[result.kept.nodeID]?.hasExplicitPhotoState, true)
+                    XCTAssertEqual(visibility[result.kept.nodeID]?.isActive, true)
+                    XCTAssertEqual(visibility[result.kept.nodeID]?.mainPhotoLinkID, result.source.nodeID)
+                    XCTAssertEqual(visibility[result.kept.nodeID]?.isActiveMain, false)
+                }
+            }
+            XCTAssertEqual(violations, [])
+            XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+        }
+    }
+
+    @MainActor
+    func testSoleKeeperProofRequiresEveryOriginalMemberRatherThanOnlyTheInitiallyActiveMembers() async throws {
+        let result = try await memberCompoundRace(.unknownOriginalMember)
+        XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
+        XCTAssertEqual(result.first.groups.first?.members.count, 3)
+        XCTAssertEqual(result.first.groups.first?.keptReason, .unreadable)
+        XCTAssertEqual(activeMains(hash("compound-race")), [result.kept])
+        XCTAssertEqual(server.steps.filter { $0.action.hasPrefix("duplicate trash ") }.count, 1)
+        XCTAssertEqual(result.checker.freshVisibilityReads, 1)
+        XCTAssertEqual(violations, [])
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+    }
+
+    @MainActor
+    func testSoleKeeperVisibilityReadFailureUsesTheExistingFailedResultWithoutClearingTheGroup() async throws {
+        let result = try await memberCompoundRace(.freshReadError)
+        XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
+        XCTAssertEqual(result.first.notice, .failed)
+        XCTAssertEqual(state(of: result.source), .active)
+        XCTAssertEqual(state(of: result.kept), .active)
+        XCTAssertEqual(result.checker.freshVisibilityReads, 1)
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+    }
+
+    @MainActor
+    func testANonnilWrongHashCompoundNeverUsesSoleKeeperReconciliation() async throws {
+        let result = try await memberCompoundRace(.wrongHash)
+        XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
+        XCTAssertEqual(result.first.groups.first?.keptReason, .unreadable)
+        XCTAssertEqual(result.checker.freshVisibilityReads, 0)
+        XCTAssertEqual(state(of: result.source), .active)
+        XCTAssertEqual(state(of: result.kept), .active)
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+    }
+
+    func testSoleKeeperConfirmationPropagatesCancellationInsteadOfDeclaringAbsence() async throws {
+        let kept = server.seedLink(digest: digest("compound-race"))
+        let source = server.seedLink(digest: digest("compound-race"))
+        let gate = MemberCompoundReadGate()
+        let checker = MemberCompoundRaceChecker(
+            base: server, kept: kept, source: source, mode: .freshReadCancellation, gate: gate)
+        let original = try device(0).finder
+        let finder = ExactDuplicateFinder(
+            checker: checker, resolver: original.resolver, index: original.index, identities: original.identities,
+            journal: original.journal, mergeJournal: original.mergeJournal, remote: original.remote,
+            albums: original.albums)
+        let groups = try await finder.duplicateGroups().groups
+        let group = try XCTUnwrap(groups.first)
+        checker.arm()
+        let merging = Task { try await finder.merge(group, keeping: kept) }
+        defer { gate.open() }
+        let arrived = await gate.waitForArrival()
+        guard arrived else {
+            _ = await merging.result
+            return
+        }
+        XCTAssertTrue(checker.sawPositiveActiveRead)
+        gate.open()
+        switch await merging.result {
+        case .failure(let error): XCTAssertTrue(error is CancellationError)
+        case .success: XCTFail("Cancellation must propagate instead of a skipped or merged receipt")
+        }
+        XCTAssertEqual(checker.freshVisibilityReads, 1)
+        XCTAssertEqual(state(of: source), .active)
+        XCTAssertEqual(state(of: kept), .active)
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+    }
+
+    /// Exercise the real models, Finder, manifests and shared server. Only the metadata read boundary is held.
+    @MainActor
+    private func memberCompoundRace(
+        _ mode: MemberCompoundRaceChecker.Mode
+    ) async throws -> (
+        first: ExactDuplicatesModel, second: ExactDuplicatesModel, kept: PhotoUID, source: PhotoUID,
+        checker: MemberCompoundRaceChecker
+    ) {
+        let kept = server.seedLink(digest: digest("compound-race"))
+        let source = server.seedLink(digest: digest("compound-race"))
+        let uncertain = mode == .unknownOriginalMember ? server.seedLink(digest: digest("compound-race")) : nil
+        server.setFavorite(true, of: kept)
+        let gate = MemberCompoundReadGate()
+        let checker = MemberCompoundRaceChecker(
+            base: server, kept: kept, source: source, mode: mode, gate: gate, uncertain: uncertain)
+        let original = try device(0).finder
+        let firstFinder = ExactDuplicateFinder(
+            checker: checker, resolver: original.resolver, index: original.index, identities: original.identities,
+            journal: original.journal, mergeJournal: original.mergeJournal, remote: original.remote,
+            albums: original.albums)
+        let first = ExactDuplicatesModel(finder: firstFinder)
+        let second = ExactDuplicatesModel(finder: try device(1).finder)
+        await first.load()
+        await second.load()
+        XCTAssertEqual(first.groups.first?.kept, kept)
+        XCTAssertEqual(second.groups.first?.kept, kept)
+        checker.arm()
+        let merging = Task { await first.mergeAll() }
+        defer { gate.open() }
+        let arrived = await gate.waitForArrival()
+        guard arrived else {
+            await merging.value
+            return (first, second, kept, source, checker)
+        }
+        XCTAssertTrue(first.isMerging)
+        XCTAssertTrue(checker.sawPositiveActiveRead, "The held compound follows the merge's explicit active visibility")
+        XCTAssertEqual(state(of: source), .active)
+        XCTAssertEqual(state(of: kept), .active)
+        if mode == .concurrentTrash || mode == .keeperUnknown || mode == .keeperTrashed || mode == .keeperMissing
+            || mode == .keeperRelated || mode == .unknownOriginalMember
+        {
+            await second.mergeAll()
+            XCTAssertEqual(state(of: source), .trashed)
+            XCTAssertEqual(state(of: kept), .active)
+            XCTAssertEqual(second.groups.map(\.id), [])
+        }
+        if mode == .keeperTrashed { server.personTrash(kept) }
+        gate.open()
+        await merging.value
+        XCTAssertFalse(first.isMerging, "The test waits for the real merge to finish before reading its UI state")
+        XCTAssertTrue(checker.didReadHeldCompound)
+        return (first, second, kept, source, checker)
+    }
+
+    @MainActor
     func testMergeAllKeepsTheRulesCopyOfGroupsThatNobodyScrolledToOnEveryDeviceInOnePress() async throws {
         // More groups than the screen ranks when it opens, so the last ones show only the order that needs no request.
         let pairs = (0..<60).map { index in
@@ -3515,5 +3724,194 @@ private final class CountingAlbums: SeriesAlbumCarryOver, @unchecked Sendable {
     }
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
         try await base.addPhotos(uids, toOwnAlbum: albumID)
+    }
+}
+
+/// Test-local proxy: preserve server behavior except the explicitly selected unreadable/unknown control.
+private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @unchecked Sendable {
+    enum Mode: Equatable {
+        case concurrentTrash, unreadableActive, unknownMissingEntry, unknownState
+        case keeperTrashed, keeperUnknown, keeperMissing, keeperRelated
+        case unknownOriginalMember, freshReadError, wrongHash, freshReadCancellation
+    }
+    let base: EditScenarioServer
+    let kept: PhotoUID
+    let source: PhotoUID
+    let mode: Mode
+    let gate: MemberCompoundReadGate
+    let uncertain: PhotoUID?
+    private let lock = NSLock()
+    private var armed = false
+    private var held = false
+    private var readHeld = false
+    private var sawActive = false
+    private var freshReads = 0
+
+    init(
+        base: EditScenarioServer, kept: PhotoUID, source: PhotoUID, mode: Mode, gate: MemberCompoundReadGate,
+        uncertain: PhotoUID? = nil
+    ) {
+        self.base = base
+        self.kept = kept
+        self.source = source
+        self.mode = mode
+        self.gate = gate
+        self.uncertain = uncertain
+    }
+    var freshVisibilityReads: Int { lock.withLock { freshReads } }
+    func arm() { lock.withLock { armed = true } }
+    var sawPositiveActiveRead: Bool { lock.withLock { sawActive } }
+    var didReadHeldCompound: Bool { lock.withLock { readHeld } }
+
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        var visibility = try await base.linkVisibility(of: linkIDs)
+        let afterFailure = lock.withLock {
+            if armed, !held, visibility[kept.nodeID]?.isActiveMain == true,
+                visibility[kept.nodeID]?.hasExplicitPhotoState == true,
+                visibility[source.nodeID]?.isActiveMain == true,
+                visibility[source.nodeID]?.hasExplicitPhotoState == true
+            {
+                sawActive = true
+            }
+            let after = armed && readHeld
+            if after { freshReads += 1 }
+            return after
+        }
+        if mode == .unknownOriginalMember, lock.withLock({ armed }), let uncertain {
+            visibility[uncertain.nodeID] = nil
+        }
+        if afterFailure, mode == .freshReadError { throw URLError(.networkConnectionLost) }
+        if afterFailure, mode == .freshReadCancellation { throw CancellationError() }
+        if afterFailure, mode == .keeperUnknown, var keeper = visibility[kept.nodeID] {
+            keeper.hasExplicitPhotoState = false
+            visibility[kept.nodeID] = keeper
+        }
+        if afterFailure, mode == .keeperMissing { visibility[kept.nodeID] = nil }
+        if afterFailure, mode == .keeperRelated {
+            visibility[kept.nodeID] = RemoteLinkVisibility(
+                isActive: true, mainPhotoLinkID: source.nodeID, hasExplicitPhotoState: true)
+        }
+        if afterFailure, linkIDs.contains(source.nodeID) {
+            if mode == .unknownMissingEntry { visibility[source.nodeID] = nil }
+            if mode == .unknownState {
+                visibility[source.nodeID] = RemoteLinkVisibility(
+                    isActive: false, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+            }
+        }
+        return visibility
+    }
+
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        let shouldHold = lock.withLock {
+            guard armed, linkID == source.nodeID, !held else { return false }
+            held = true
+            return true
+        }
+        if shouldHold { await gate.pass() }
+        let actual = try await base.compound(ofMainLink: linkID)
+        let intercept = lock.withLock {
+            guard armed, linkID == source.nodeID else { return false }
+            readHeld = true
+            return true
+        }
+        if intercept, mode == .wrongHash, let actual {
+            return UploadRemoteCompound(
+                main: .init(
+                    linkID: actual.main.linkID, contentHash: "wrong-content-hash",
+                    nameHash: actual.main.nameHash, mimeType: actual.main.mimeType),
+                related: actual.related, tags: actual.tags, externalIdentifier: actual.externalIdentifier,
+                captureDate: actual.captureDate, modificationDate: actual.modificationDate)
+        }
+        if intercept, mode != .concurrentTrash && mode != .keeperUnknown && mode != .unknownOriginalMember {
+            return nil
+        }
+        return actual
+    }
+
+    func nameHash(forCorrectedName name: String) async throws -> String {
+        try await base.nameHash(forCorrectedName: name)
+    }
+    func nameHashes(forCorrectedNames names: [String]) async throws -> [String] {
+        try await base.nameHashes(forCorrectedNames: names)
+    }
+    func contentHash(forSHA1Hex value: String) async throws -> String { try await base.contentHash(forSHA1Hex: value) }
+    func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
+        try await base.findDuplicates(nameHashes: nameHashes)
+    }
+    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async throws -> [PhotoUID] {
+        try await base.findExactActiveDuplicates(correctedName: correctedName, sha1Digest: sha1Digest)
+    }
+    func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
+        try await base.findDuplicate(contentHash: contentHash)
+    }
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
+        try await base.findDuplicates(contentHash: contentHash, limit: limit)
+    }
+    func relatedPhotoLinkIDs(ofMainLinkID linkID: String) async throws -> Set<String> {
+        try await base.relatedPhotoLinkIDs(ofMainLinkID: linkID)
+    }
+    func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
+        try await base.linkStateSnapshot(of: linkIDs)
+    }
+    func activeMainLinkIDs(
+        forExternalIdentifier identifier: String
+    ) async throws -> (links: Set<String>, complete: Bool) {
+        try await base.activeMainLinkIDs(forExternalIdentifier: identifier)
+    }
+    func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        try await base.replacingMainLinkIDs(ofReplacedLink: linkID)
+    }
+    func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
+        try await base.externalIdentifier(ofMainLink: linkID)
+    }
+    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
+        try await base.modificationDate(ofMainLink: linkID)
+    }
+    func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        try await base.replacedLinkIDs(ofReplacingMain: linkID)
+    }
+    func prepareRemoteIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws {
+        try await base.prepareRemoteIndex(progress: progress)
+    }
+    func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
+        try await base.remoteContentIndexHealth()
+    }
+    func findRemoteAssetProofs(
+        for identities: [UploadBackupExternalIdentity]
+    ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
+        try await base.findRemoteAssetProofs(for: identities)
+    }
+    func invalidateCachedRemoteState() async { await base.invalidateCachedRemoteState() }
+    func remoteMainsChangedHere() async { await base.remoteMainsChangedHere() }
+    func recordUploaded(contentHash: String, remoteLinkID: String) async {
+        await base.recordUploaded(contentHash: contentHash, remoteLinkID: remoteLinkID)
+    }
+    func hashKeyEpoch() async throws -> String { try await base.hashKeyEpoch() }
+}
+
+/// The timeout is a setup bound only. It always releases the test's held reader before the caller joins it.
+private actor MemberCompoundReadGate {
+    private let arrival = XCTestExpectation(description: "Member compound read after active visibility")
+    private var openState = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func pass() async {
+        arrival.fulfill()
+        guard !openState else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func waitForArrival() async -> Bool {
+        let result = await XCTWaiter.fulfillment(of: [arrival], timeout: 5)
+        if result != .completed { release() }
+        XCTAssertEqual(result, .completed, "The production merge must reach the held compound boundary")
+        return result == .completed
+    }
+    nonisolated func open() { Task { await self.release() } }
+    private func release() {
+        openState = true
+        let pending = waiters
+        waiters = []
+        pending.forEach { $0.resume() }
     }
 }
