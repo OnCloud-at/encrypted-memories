@@ -541,6 +541,7 @@ import Testing
         private let permanentlyUnavailable: Set<PhotoUID>
         private let suppressionRead: BlockingSuppressionRead?
         private let deferredCount: Int
+        private let afterProgressReport: (@Sendable () async -> Void)?
         private var indexedAssets: [MLPipelineAssetRevision] = []
         private var indexes = 0
         private var shutdowns = 0
@@ -550,10 +551,12 @@ import Testing
             initiallyIndexed: [PhotoUID] = [],
             permanentlyUnavailable: Set<PhotoUID> = [],
             suppressionRead: BlockingSuppressionRead? = nil,
-            deferredCount: Int = 0
+            deferredCount: Int = 0,
+            afterProgressReport: (@Sendable () async -> Void)? = nil
         ) {
             self.results = results
             self.deferredCount = deferredCount
+            self.afterProgressReport = afterProgressReport
             self.permanentlyUnavailable = permanentlyUnavailable
             self.suppressionRead = suppressionRead
             indexedAssets = initiallyIndexed.compactMap {
@@ -663,6 +666,7 @@ import Testing
                 )
             )
             observer.report(outcome.progress)
+            if let afterProgressReport { await afterProgressReport() }
             return outcome
         }
 
@@ -985,25 +989,72 @@ import Testing
         let payload = Data("model".utf8)
         let (entry, url) = downloadableEntry(id: "deferred-native", payload: payload)
         let assets = [uid("a"), uid("b"), uid("c")]
+        let progressDelivery = OneShotEmbeddingBarrier()
+        await progressDelivery.arm()
         let harness = try makeHarness(
             catalog: .init(entries: [entry]), payloads: [url: payload], assets: assets,
-            nativeSearch: RecordingNativeSearch(results: [], deferredCount: 1))
+            nativeSearch: RecordingNativeSearch(
+                results: [], deferredCount: 1,
+                afterProgressReport: { await progressDelivery.waitIfArmed() }))
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        harness.governor.set(false)
         await harness.lifecycle.start()
+        let stream = await harness.lifecycle.snapshots()
         await harness.lifecycle.enable(with: entry.id)
-        #expect(
-            await waitUntil {
-                await harness.lifecycle.currentSnapshot().permitsAutomaticSuggestionGeneration
-            })
-        let snapshot = await harness.lifecycle.currentSnapshot()
-        #expect(snapshot.isVisualIndexComplete)
-        if case .waiting(let progress) = snapshot.indexingState {
-            #expect(progress.deferredWorkUnits == 1)
-            #expect(!progress.isComplete, "a deferred retry is not falsely reported as indexed")
-        } else {
-            Issue.record("deferred native work must remain waiting")
+        let terminal = await withTaskGroup(of: MLSmartSearchSnapshot?.self) { group in
+            group.addTask {
+                var governorOpened = false
+                var nativeProgressDelivered = false
+                for await snapshot in stream {
+                    guard snapshot.isEnabled, snapshot.selectedModelID == entry.id else { continue }
+                    // This fresh fixture publishes waiting after model preparation. Keep the
+                    // native-only startup pass from satisfying the test before semantic indexing.
+                    if !governorOpened, case .waiting = snapshot.phase {
+                        governorOpened = true
+                        harness.governor.set(true)
+                        await harness.lifecycle.noteConditionsChanged()
+                    }
+                    // Keep the native pass alive until its admitted progress has actually arrived.
+                    if !nativeProgressDelivered, case .indexing(let progress) = snapshot.indexingState,
+                        progress.deferredWorkUnits > 0
+                    {
+                        nativeProgressDelivered = true
+                        await progressDelivery.release()
+                    }
+                    guard nativeProgressDelivered else { continue }
+                    switch snapshot.phase {
+                    case .ready(let coverage), .waiting(let coverage):
+                        if coverage.total == assets.count, coverage.isComplete { return snapshot }
+                    default: break
+                    }
+                }
+                return nil
+            }
+            group.addTask {
+                do { try await Task.sleep(for: .seconds(300)) } catch { return nil }
+                await progressDelivery.release()
+                return nil
+            }
+            let snapshot = await group.next() ?? nil
+            group.cancelAll()
+            return snapshot
         }
+        let current = await harness.lifecycle.currentSnapshot()
+        let indexedCount = await harness.lifecycle.semanticIndexedAssetCount()
+        await progressDelivery.release()
         await harness.lifecycle.shutdown()
+        let snapshot = try #require(terminal, "the completed semantic pass must publish its state")
+        #expect(indexedCount == assets.count)
+        for state in [snapshot, current] {
+            #expect(state.permitsAutomaticSuggestionGeneration)
+            #expect(state.isVisualIndexComplete)
+            if case .waiting(let progress) = state.indexingState {
+                #expect(progress.deferredWorkUnits == 1)
+                #expect(!progress.isComplete, "a deferred retry is not falsely reported as indexed")
+            } else {
+                Issue.record("deferred native work must remain waiting")
+            }
+        }
     }
 
     @Test(arguments: ["shutdown", "purge", "modelSwitch", "indexChange"])
