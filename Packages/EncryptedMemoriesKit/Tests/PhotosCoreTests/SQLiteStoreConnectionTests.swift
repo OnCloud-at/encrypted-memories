@@ -74,6 +74,27 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         withExtendedLifetime(trace) {}
     }
 
+    func testCloseWithoutOptimizeOnlyReleasesTheHandleOnce() throws {
+        var opened: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &opened), SQLITE_OK)
+        let handle = try XCTUnwrap(opened)
+        let connection = SQLiteStoreConnection(database: handle, optimizesOnClose: false)
+        let trace = Trace()
+        trace.install(on: handle)
+        defer {
+            if trace.events.last != "close" { sqlite3_close(handle) }
+        }
+
+        XCTAssertTrue(connection.isOperational())
+        connection.close()
+        XCTAssertEqual(trace.events, ["SELECT 1;", "close"], "close runs no SQL before releasing the handle")
+        connection.close()
+        XCTAssertEqual(trace.events, ["SELECT 1;", "close"])
+        XCTAssertFalse(connection.isOperational(probeDatabase: false))
+        connection.withLock { XCTAssertNil(connection.database) }
+        withExtendedLifetime(trace) {}
+    }
+
     func testDeinitializationReleasesTheHandle() throws {
         let trace = Trace()
         var connection: SQLiteStoreConnection? = try makeConnection()
