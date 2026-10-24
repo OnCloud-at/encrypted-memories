@@ -543,6 +543,66 @@ private final class BlockingCoverageStore: ThumbnailCoverageCheckpointStore, @un
     func recordMissing(_ uids: [PhotoUID], for key: String) {}
 }
 
+/// The two conditions that hold the crawl.
+enum CrawlHold: String, CaseIterable, Sendable {
+    case backgroundWindow
+    case storageNearlyFull
+
+    func begin(in state: LibraryRuntimeState) {
+        switch self {
+        case .backgroundWindow: state.update { $0.executionOpportunity = .backgroundPermitted }
+        case .storageNearlyFull: state.update { $0.storagePressure = .critical }
+        }
+    }
+
+    func end(in state: LibraryRuntimeState) {
+        switch self {
+        case .backgroundWindow: state.update { $0.executionOpportunity = .foregroundActive }
+        case .storageNearlyFull: state.update { $0.storagePressure = .normal }
+        }
+    }
+}
+
+/// True for the first call only.
+private final class FirstCall: @unchecked Sendable {
+    private let lock = NSLock()
+    private var called = false
+
+    func take() -> Bool {
+        lock.withLock {
+            defer { called = true }
+            return !called
+        }
+    }
+}
+
+/// Withholds each photo on its first request, as after an authorization change, and calls `onWithheld` before it
+/// answers; delivers the photo afterwards.
+private actor WithheldOnceLoader: ThumbnailBatchLoader {
+    private let payload: Data
+    private let onWithheld: @Sendable () -> Void
+    private var counts: [PhotoUID: Int] = [:]
+
+    init(payload: Data, onWithheld: @escaping @Sendable () -> Void) {
+        self.payload = payload
+        self.onWithheld = onWithheld
+    }
+
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        var withheld = Set<PhotoUID>()
+        for uid in uids {
+            counts[uid, default: 0] += 1
+            if counts[uid] == 1 { withheld.insert(uid) } else { onLoaded(uid, payload) }
+        }
+        if !withheld.isEmpty { onWithheld() }
+        return ThumbnailBatchLoadResult(itemErrors: [:], withheldUIDs: withheld)
+    }
+
+    func requests(for uid: PhotoUID) -> Int { counts[uid] ?? 0 }
+}
+
 private final class BlockingDiskProbeHook: @unchecked Sendable {
     private let lock = NSLock()
     private var entered = false
@@ -929,6 +989,164 @@ struct ThumbnailFeedCoreTests {
         runtimeState.update { $0.storagePressure = .normal }
         try await Self.waitUntil { await loader.recordedPriorities.count == 3 }
         #expect(await loader.recordedPriorities == [.visibleNow, .idleLibraryCrawl, .idleLibraryCrawl])
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func crawlSleepsDuringABackgroundWindowAndResumesInTheForeground() async throws {
+        let crawled = [Self.uid("background-crawl-a"), Self.uid("background-crawl-b")]
+        let visible = Self.uid("background-crawl-visible")
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        // The backup window of iOS runs the app in the background.
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("background-crawl", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1)
+        )
+        await feed.startPrefetch(crawled)
+
+        let stopped = Counter()
+        let waiter = Task {
+            try await feed.waitForPrefetchToFinish()
+            stopped.increment()
+        }
+        try await Self.waitUntil { stopped.value() == 1 }
+        #expect(stopped.value() == 1, "the crawl workers stop instead of polling")
+        waiter.cancel()
+        _ = try? await waiter.value
+        #expect(await feed.hasPendingThumbnailWork())
+        #expect(await loader.recordedPriorities.isEmpty, "the crawl loads nothing in the background")
+
+        _ = await feed.requestPriority(visible)
+        try await Self.waitUntil { await loader.recordedPriorities.count == 1 }
+        #expect(await loader.recordedPriorities == [.visibleNow], "a photo on screen still loads")
+
+        runtimeState.update { $0.executionOpportunity = .foregroundActive }
+        try await Self.waitUntil { await loader.recordedPriorities.count == 3 }
+        #expect(await loader.recordedPriorities == [.visibleNow, .idleLibraryCrawl, .idleLibraryCrawl])
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func crawlSleepsWhileTheAppIsSuspended() async throws {
+        let crawled = [Self.uid("suspended-crawl-a"), Self.uid("suspended-crawl-b")]
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let runtimeState = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .suspended))
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("suspended-crawl", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1)
+        )
+        await feed.startPrefetch(crawled)
+
+        let stopped = Counter()
+        let waiter = Task {
+            try await feed.waitForPrefetchToFinish()
+            stopped.increment()
+        }
+        try await Self.waitUntil { stopped.value() == 1 }
+        waiter.cancel()
+        _ = try? await waiter.value
+        // Nothing on screen asked for a photo, so only the hold keeps the crawl from loading.
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await loader.recordedPriorities.isEmpty, "a suspended app loads nothing")
+
+        runtimeState.update { $0.executionOpportunity = .foregroundActive }
+        try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
+        #expect(await loader.recordedPriorities == [.idleLibraryCrawl, .idleLibraryCrawl])
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func aHeldCrawlStartsNoWorkersUntilTheAppReturnsToTheForeground() async throws {
+        let crawled = [Self.uid("held-crawl-a"), Self.uid("held-crawl-b")]
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("held-crawl", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1)
+        )
+        await feed.startPrefetch(crawled)
+        let stopped = Counter()
+        let waiter = Task {
+            try await feed.waitForPrefetchToFinish()
+            stopped.increment()
+        }
+        try await Self.waitUntil { stopped.value() == 1 }
+        waiter.cancel()
+        _ = try? await waiter.value
+        let starts = await feed.workerStartCountForTesting()
+
+        // Changes that do not end the background window leave the workers stopped instead of waking them.
+        runtimeState.update { $0.thermalLevel = .fair }
+        runtimeState.update { $0.thermalLevel = .nominal }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await feed.workerStartCountForTesting() == starts, "the held crawl does not poll")
+        #expect(await loader.recordedPriorities.isEmpty)
+
+        runtimeState.update { $0.executionOpportunity = .foregroundActive }
+        try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
+        #expect(await loader.recordedPriorities.count == 2)
+        #expect(await feed.workerStartCountForTesting() == starts + 1, "returning to the foreground starts them once")
+        await feed.stopPrefetchAndWait()
+    }
+
+    #if DEBUG
+        /// A withheld photo is the only crawl work left when the hold begins. The hold ends after the last worker
+        /// returned but before the feed records the stop, so the wake finds the workers still marked running.
+        @Test(arguments: CrawlHold.allCases)
+        func aWithheldRetryLoadsWhenTheHoldEndsJustBeforeTheWorkersStop(_ hold: CrawlHold) async throws {
+            let uid = Self.uid("withheld-hold-\(hold.rawValue)")
+            let runtimeState = LibraryRuntimeState(initial: LibraryRuntimeSnapshot())
+            let loader = WithheldOnceLoader(payload: Self.pngData(width: 24, height: 24)) {
+                hold.begin(in: runtimeState)
+            }
+            let feed = ThumbnailFeedCore(
+                cache: Self.cache("withheld-hold-\(hold.rawValue)", runtimeState: runtimeState),
+                loader: loader,
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
+            )
+            let stopGate = BlockingDiskProbeHook()
+            let firstStop = FirstCall()
+            feed.setWorkersStoppedHookForTesting { if firstStop.take() { stopGate.wait() } }
+            defer {
+                stopGate.release.signal()
+                feed.setWorkersStoppedHookForTesting(nil)
+            }
+
+            await feed.startPrefetch([uid])
+            // The first load withholds the photo and begins the hold; the worker installs its wake and returns.
+            try await Self.waitUntil { stopGate.hasEntered }
+            try #require(stopGate.hasEntered)
+            #expect(await feed.crawlWakePendingForTesting())
+
+            hold.end(in: runtimeState)
+            try await Self.waitUntil { await !feed.crawlWakePendingForTesting() }
+            try #require(await !feed.crawlWakePendingForTesting(), "the wake ran while the workers were still marked")
+            stopGate.release.signal()
+
+            try await Self.waitUntil { await loader.requests(for: uid) == 2 }
+            #expect(await loader.requests(for: uid) == 2, "the withheld photo loads again")
+            await feed.stopPrefetchAndWait()
+        }
+    #endif
+
+    @Test func crawlRunsWhileTheAppIsInTheForegroundButInactive() async throws {
+        // A Mac app behind another window, or an iPhone app under Control Center, is not in a background window.
+        let crawled = [Self.uid("inactive-crawl-a"), Self.uid("inactive-crawl-b")]
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .foregroundInactive))
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("inactive-crawl", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1)
+        )
+        await feed.startPrefetch(crawled)
+
+        try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
+        #expect(await loader.recordedPriorities == [.idleLibraryCrawl, .idleLibraryCrawl])
         await feed.stopPrefetchAndWait()
     }
 
