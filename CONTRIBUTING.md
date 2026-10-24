@@ -87,6 +87,7 @@ Run focused tests while you work. Run these gates before requesting review:
 
 `./scripts/verify-ios-app-tests.sh ui` runs the UI tests. They launch the app in the simulator on an offline test
 account and tap through it. They need no Proton account and no network. Add a UI test when you add a user action.
+The iOS app tests and UI tests need a Mac with Apple silicon: the Proton Drive SDK has no x86_64 iOS Simulator build.
 
 Run the platform shell build when your change affects that app:
 
