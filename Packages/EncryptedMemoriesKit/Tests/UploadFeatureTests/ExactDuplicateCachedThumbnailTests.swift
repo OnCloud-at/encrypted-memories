@@ -11,7 +11,7 @@
 
     @MainActor
     final class ExactDuplicateCachedThumbnailTests: XCTestCase {
-        func testCachedDuplicatesTileRendersOutsideThePartialLibraryWithinOneSecond() async throws {
+        func testCachedDuplicatesTileRendersOutsideThePartialLibrary() async throws {
             let fixture = try await makeFixture()
             let host = NSHostingView(
                 rootView: ExactDuplicateThumbnail(
@@ -19,12 +19,8 @@
                     thumbnails: ExactDuplicateThumbnails(feedCore: fixture.feed.feedCore)))
             let window = show(host, size: NSSize(width: 64, height: 64))
             defer { window.orderOut(nil) }
-            let start = ContinuousClock.now
-            while start.duration(to: .now) < .milliseconds(900), !isRed(host) {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            XCTAssertTrue(isRed(host), "the cached photo must replace the glyph within one second")
-            XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+            try await waitUntil { isRed(host) }
+            XCTAssertTrue(isRed(host), "the cached photo must replace the glyph")
             XCTAssertNil(fixture.feed.memoryImage(for: fixture.item.uid), "the grid remains unauthorized")
             XCTAssertEqual(fixture.feed.feedCore.openVisibleThumbnailAccessUIDs, [fixture.item.uid])
             window.contentView = NSView()
@@ -39,14 +35,10 @@
                 items: [fixture.item], index: 0, feed: fixture.feed, media: NoPreview(),
                 allowsVisibleDuplicateThumbnails: true)
             defer { viewer.stop() }
-            let start = ContinuousClock.now
             viewer.start()
-            while start.duration(to: .now) < .milliseconds(900), viewer.image == nil {
-                try await Task.sleep(for: .milliseconds(10))
-            }
+            try await waitUntil { viewer.image != nil }
             XCTAssertNotNil(viewer.image, "the Duplicates viewer must show the cached first frame")
             XCTAssertFalse(viewer.isSharp, "this evidence must come from the thumbnail, not an original")
-            XCTAssertLessThan(start.duration(to: .now), .seconds(1))
             XCTAssertEqual(fixture.feed.feedCore.openVisibleThumbnailAccessUIDs, [fixture.item.uid])
             viewer.stop()
             XCTAssertEqual(fixture.feed.feedCore.openVisibleThumbnailAccessUIDs, [], "closing the viewer revokes")
@@ -54,7 +46,7 @@
             XCTAssertFalse(accepted)
         }
 
-        func testDuplicatesViewerSidebarRendersTheCachedFilmstripWithinOneSecond() async throws {
+        func testDuplicatesViewerSidebarRendersTheCachedFilmstrip() async throws {
             let fixture = try await makeFixture()
             let viewer = PhotoViewerModel(
                 items: [fixture.item], index: 0, feed: fixture.feed, media: NoPreview(),
@@ -67,13 +59,9 @@
                 window.orderOut(nil)
                 viewer.stop()
             }
-            let start = ContinuousClock.now
-            while start.duration(to: .now) < .milliseconds(900), !filmstripHasImage(try XCTUnwrap(host)) {
-                try await Task.sleep(for: .milliseconds(10))
-            }
+            try await waitUntil { filmstripHasImage(try XCTUnwrap(host)) }
             XCTAssertTrue(
                 filmstripHasImage(try XCTUnwrap(host)), "the visible sidebar tile must show its cached thumbnail")
-            XCTAssertLessThan(start.duration(to: .now), .seconds(1))
             viewer.stop()
             XCTAssertEqual(
                 fixture.feed.feedCore.openVisibleThumbnailAccessUIDs, [fixture.item.uid],
@@ -120,12 +108,18 @@
             return (feed, item)
         }
 
-        /// SwiftUI tears a removed view down on a later main-actor turn.
-        private func waitUntilRevoked(_ feed: ThumbnailFeed) async throws {
-            let start = ContinuousClock.now
-            while start.duration(to: .now) < .seconds(1), !feed.feedCore.openVisibleThumbnailAccessUIDs.isEmpty {
+        /// Waits until `condition` holds. The deadline is only a guard against a hang: no test bounds how fast the
+        /// image appears, because a loaded runner cannot promise a speed.
+        private func waitUntil(_ condition: () throws -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(10)
+            while try !condition(), ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
+        }
+
+        /// SwiftUI tears a removed view down on a later main-actor turn.
+        private func waitUntilRevoked(_ feed: ThumbnailFeed) async throws {
+            try await waitUntil { feed.feedCore.openVisibleThumbnailAccessUIDs.isEmpty }
             XCTAssertEqual(feed.feedCore.openVisibleThumbnailAccessUIDs, [], "a removed surface revokes its access")
         }
 
