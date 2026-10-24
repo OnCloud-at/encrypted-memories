@@ -1391,6 +1391,13 @@ public actor BackupSyncRunner {
         resolved: BackupResolvedResource,
         workIntent: LibraryWorkIntent
     ) async {
+        guard Self.receiptBelongs(reconciliation, to: entry, resolvedRevision: resolved.candidate.snapshot.revision)
+        else {
+            // The receipt proves only the revision it was saved for. Recording it now could overwrite a newer backup of
+            // this source, so nothing is recorded and the ordinary path hashes and deduplicates the current revision.
+            requeueWithoutReceipt(entry, from: state)
+            return
+        }
         if reconciliation.source == entry.source,
             events?.recordHandoff(
                 source: entry.source,
@@ -1463,22 +1470,37 @@ public actor BackupSyncRunner {
         } else {
             // The secondary manifest is repaired. Re-run the primary's cheap duplicate decision
             // to recover its UID, then the compound pass will skip this secondary from manifest.
-            guard
-                queue.updateState(
-                    source: entry.source,
-                    revision: entry.revision,
-                    state: .discovered,
-                    attempts: nil,
-                    lastError: nil,
-                    updatedAt: now()
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: state, to: .discovered)
-            emitProgress()
+            requeueWithoutReceipt(entry, from: state)
         }
+    }
+
+    /// A receipt settles only the queue row and revision it was saved for. A receipt with a saved descriptor must pass
+    /// the checks of `UploadRemoteCommitRecovery`; an older receipt without one must at least match the revision.
+    static func receiptBelongs(
+        _ reconciliation: UploadRemoteCommitReconciliation,
+        to entry: UploadBackupSyncQueueEntry,
+        resolvedRevision: UploadBackupRevision
+    ) -> Bool {
+        if reconciliation.descriptor != nil || reconciliation.queueBinding != nil {
+            guard (try? UploadRemoteCommitRecovery.savedDescriptor(of: reconciliation, for: entry)) != nil else {
+                return false
+            }
+        }
+        return resolvedRevision == entry.revision
+    }
+
+    /// Clears the receipt and returns the row to the ordinary path.
+    private func requeueWithoutReceipt(_ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState) {
+        guard
+            queue.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: nil, lastError: nil,
+                updatedAt: now())
+        else {
+            stopRequested = true
+            return
+        }
+        adjustProgress(from: state, to: .discovered)
+        emitProgress()
     }
 
     private func parkRemoteReconciliation(
