@@ -871,6 +871,10 @@ public actor BackupSyncRunner {
             let resolver = self.resolver
             let policy = configuration.throttle
             let inputs = throttleInputs
+            // Only the last check of a row whose file Photos reports missing may leave out the Live Photo video. A
+            // dismissed row keeps its check without an upload.
+            let omitsMissingPairedVideo =
+                !isSourceRecheck && Self.usedReportedMissingChecks(resolvingEntry, now: now())
             let readAdmission: BackupResourceReadAdmission = {
                 try Task.checkCancellation()
                 if isSourceRecheck {
@@ -886,7 +890,8 @@ public actor BackupSyncRunner {
             ) { _ in
                 try readAdmission()
                 return try await resolver.resolve(
-                    resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission)
+                    resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission,
+                    omittingMissingPairedVideo: omitsMissingPairedVideo)
             }
         } catch is BackupWorkDeferredError {
             if isSourceRecheck {
@@ -983,6 +988,16 @@ public actor BackupSyncRunner {
         }
 
         let entry = checkingEntry
+        // An edit, or the undo of one, moves its earlier uploads to the trash once it is backed up, and they can hold
+        // the Live Photo video. Without its video such a photo keeps today's end. This runs before the duplicate
+        // check, which records the earlier uploads that the next upload replaces.
+        if resolved.omitsMissingPairedVideo, let editReplacement,
+            editReplacement.isReplacing(entry.source)
+                || editReplacement.replacesEarlierUploads(of: entry.source, edited: Self.isEdited(resolved))
+        {
+            retryOrPark(entry, from: persistedState, error: UploadError.sourceReportedMissing(entry.originalFilename))
+            return
+        }
         if let reconciliation = entry.remoteCommitReconciliation {
             await reconcileRemoteCommit(
                 reconciliation,
@@ -1097,6 +1112,13 @@ public actor BackupSyncRunner {
             )
 
         case .decision(let preflightResult):
+            // Proton already holds this still, maybe with its Live Photo tag, or the photo waits for a decision.
+            // Without its video it keeps today's end.
+            if resolved.omitsMissingPairedVideo {
+                retryOrPark(
+                    entry, from: persistedState, error: UploadError.sourceReportedMissing(entry.originalFilename))
+                return
+            }
             switch preflightResult.decision {
             case .awaitDeletionCheck:
                 await awaitDeletionCheck(entry, from: persistedState)
@@ -1728,7 +1750,10 @@ public actor BackupSyncRunner {
             retryOrPark(entry, from: persistedState, error: error)
             return
         }
-        finish(entry, from: persistedState, as: terminal, message: nil, resolved: resolved)
+        // For diagnostics, the note keeps why the photo backed up without its Live Photo video.
+        finish(
+            entry, from: persistedState, as: terminal,
+            message: resolved.omitsMissingPairedVideo ? Self.missingPairedVideoNote : nil, resolved: resolved)
     }
 
     private func awaitDeletionCheck(
@@ -2600,6 +2625,22 @@ public actor BackupSyncRunner {
     /// The waits double: one, two, and four hours.
     static let reportedMissingRechecks = 3
     static let reportedMissingRecheckDelay: TimeInterval = 3600
+
+    /// True when the row used its checks of a file that Photos reports missing and its planned last check is due. A
+    /// check that Back Up Now starts earlier does not count.
+    static func usedReportedMissingChecks(_ entry: UploadBackupSyncQueueEntry, now: Date) -> Bool {
+        guard sourceWaits(of: entry, detail: BackupFailedItem.sourceReportedMissingDetail) >= reportedMissingRechecks
+        else { return false }
+        guard let planned = BackupIssueRecord.decode(entry.lastError)?.nextAttemptAt else { return true }
+        return now >= planned
+    }
+
+    /// The note of a photo that backed up without the Live Photo video that Photos still reports missing. It is the
+    /// record of a photo that Photos reports missing after its checks, so diagnostics read it as that reason.
+    static let missingPairedVideoNote = BackupIssueRecord(
+        kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail,
+        automaticRetryAttempt: reportedMissingRechecks
+    ).persistedValue
 
     /// The waits that a row already spent for the reason `detail`; another reason starts again at zero.
     private static func sourceWaits(of entry: UploadBackupSyncQueueEntry, detail: String) -> Int {
