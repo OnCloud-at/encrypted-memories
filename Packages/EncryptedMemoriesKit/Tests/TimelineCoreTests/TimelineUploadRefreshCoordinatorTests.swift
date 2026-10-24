@@ -30,16 +30,8 @@ import Testing
         let scenario = AutomaticUploadScenario()
         await scenario.requestSignal(0)
         #expect(await scenario.timeline.waitForCount(1))
-        let timeout = ContinuousClock.now + .seconds(5)
-        while await scenario.coordinator.testingAutomaticState().workerActive,
-            scenario.clock.pendingSleeps == 0, ContinuousClock.now < timeout
-        {
-            await Task.yield()
-        }
-        if scenario.clock.pendingSleeps > 0 {
-            scenario.clock.advanceToNextSleep()
-            #expect(await scenario.timeline.waitForCount(2))
-        }
+        #expect(await scenario.waitForWorkerRetirement(), "A completed automatic request retires its worker")
+        #expect(scenario.clock.pendingSleeps == 0, "No cycle is scheduled that nobody requested")
         let callCount = await scenario.timeline.times.count
         #expect(callCount == 1)
         await scenario.coordinator.cancel()
@@ -410,6 +402,7 @@ import Testing
             await scenario.coordinator.flushAutomaticUploads()
             await completion.markComplete()
         }
+        #expect(await scenario.waitForFlushRegistration())
         await secondRelease.open()
         #expect(await completion.waitUntilComplete())
         await scenario.coordinator.cancel()
@@ -448,10 +441,9 @@ import Testing
         let beforeCancellation = await scenario.timeline.times
         #expect(beforeCancellation == [.zero])
         await scenario.coordinator.cancel()
-        scenario.clock.advance(by: .seconds(60))
         #expect(await scenario.flush())
-        #expect(await scenario.timeline.times.count == beforeCancellation.count)
 
+        // The old owner's interval ended at 60 seconds. The replacement asks at 6 seconds, long before that.
         let replacement = UploadRefreshTimeline()
         await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
             await replacement.record(scenario.clock.now - scenario.origin)
@@ -459,7 +451,13 @@ import Testing
         })
         #expect(await replacement.waitForCount(1))
         let replacementTimes = await replacement.times
-        #expect(replacementTimes == [.seconds(66)], "A retired owner's interval cannot delay a new owner")
+        #expect(replacementTimes == [.seconds(6)], "A retired owner's interval cannot delay a new owner")
+        #expect(await scenario.waitForWorkerRetirement())
+
+        // The cancelled work never runs, also after the old interval would have ended.
+        scenario.clock.advance(by: .seconds(60))
+        #expect(await scenario.timeline.times.count == beforeCancellation.count)
+        #expect(await replacement.times == [.seconds(6)])
         await scenario.coordinator.cancel()
     }
 
@@ -676,6 +674,205 @@ import Testing
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func aCancelledFlushingTaskStopsWaitingWhileTheAutomaticWorkContinues() async {
+        let release = AsyncGate()
+        let timeline = UploadRefreshTimeline()
+        let completion = AutomaticFlushCompletion()
+        let coordinator = TimelineUploadRefreshCoordinator()
+        await coordinator.requestAutomaticUpload(refresh: { _ in
+            await timeline.record(.zero)
+            await release.wait()
+            return nil
+        })
+        #expect(await timeline.waitForCount(1))
+        let flush = Task {
+            await coordinator.flushAutomaticUploads()
+            await completion.markComplete()
+        }
+        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
+        flush.cancel()
+        // The flushing task stops waiting while the refresh is still held.
+        #expect(
+            await completion.waitUntilComplete(),
+            "A cancelled flushing task must not stay suspended until the automatic work ends")
+        let state = await coordinator.testingAutomaticState()
+        #expect(state.flushCount == 0)
+        #expect(state.workerActive, "The automatic work goes on after the flush was cancelled")
+        await release.open()
+        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 0, workerActive: false))
+        await flush.value
+        await coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aFlushingTaskThatIsCancelledWhileCancelJoinsTheWorkerIsReleased() async {
+        let release = AsyncGate()
+        let admitted = AutomaticFlushCompletion()
+        let flushReturned = AutomaticFlushCompletion()
+        let cancelReturned = AutomaticFlushCompletion()
+        let coordinator = TimelineUploadRefreshCoordinator()
+        let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
+            await release.wait()
+            return nil
+        }
+        await coordinator.requestAutomaticUpload(refresh: { _ in
+            await admitted.markComplete()
+            return await heldRefresh.value
+        })
+        #expect(await admitted.waitUntilComplete())
+        let flush = Task {
+            await coordinator.flushAutomaticUploads()
+            await flushReturned.markComplete()
+        }
+        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
+        // cancel() takes the waiter and joins the worker, which stays held.
+        let cancellation = Task {
+            await coordinator.cancel()
+            await cancelReturned.markComplete()
+        }
+        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 0, workerActive: false))
+        flush.cancel()
+        let flushReturnedWhileHeld = await flushReturned.waitUntilComplete()
+        #expect(
+            flushReturnedWhileHeld,
+            "A cancelled flushing task must be released although cancel() still joins the held refresh")
+        #expect(await cancelReturned.isComplete == false)
+
+        await release.open()
+        _ = await heldRefresh.value
+        await cancellation.value
+        await flush.value
+        #expect(await cancelReturned.isComplete)
+        #expect(await flushReturned.isComplete)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func anExplicitRequestWaitsForTheObserverOfTheAdmittedAutomaticLoad() async {
+        let release = AsyncGate()
+        let order = EventOrder()
+        let coordinator = TimelineUploadRefreshCoordinator()
+        let heldRefresh = Task<TimelineRefreshFailureReason?, Never> {
+            await release.wait()
+            return nil
+        }
+        await coordinator.requestAutomaticUpload(
+            refresh: { _ in
+                await order.add("automatic load")
+                return await heldRefresh.value
+            },
+            observer: { _ in await order.add("automatic observer") }
+        )
+        #expect(await order.waitForCount(1))
+        // The explicit request arrives while the automatic load is held, so it is chosen when the load returns.
+        await coordinator.request(refresh: { _ in
+            await order.add("explicit load")
+            return nil
+        })
+        await release.open()
+        #expect(await order.waitForCount(3))
+        #expect(
+            await order.events == ["automatic load", "automatic observer", "explicit load"],
+            "The explicit load runs after the observer of the admitted automatic load")
+        await coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aFlushDuringAConvergenceRetryWaitKeepsTheRetryDelay() async {
+        let scenario = AutomaticUploadScenario()
+        let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility, nil])
+        await scenario.coordinator.requestAutomaticUpload(
+            refresh: { attempt in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin)
+                return await recorder.failure(at: attempt)
+            },
+            observer: { await recorder.record($0) }
+        )
+        #expect(await scenario.clock.waitForSleepCount(1))
+        #expect(scenario.clock.requestedSleeps == [.milliseconds(350)])
+        let completion = AutomaticFlushCompletion()
+        let flush = Task {
+            await scenario.coordinator.flushAutomaticUploads()
+            await completion.markComplete()
+        }
+        #expect(await scenario.waitForFlushRegistration())
+        // The flush neither retries early nor wakes the delay. A woken delay would register its sleep again at once;
+        // this bounded observation runs while the clock stays where it is.
+        let delayWasRegisteredAgain = await scenario.clock.waitForSleepCount(2)
+        #expect(delayWasRegisteredAgain == false, "The flush must not wake the pending convergence delay")
+        #expect(await scenario.timeline.times == [.zero])
+        #expect(await completion.isComplete == false)
+        scenario.clock.advance(by: .milliseconds(350))
+        #expect(await completion.waitUntilComplete())
+        #expect(await scenario.timeline.times == [.zero, .milliseconds(350)])
+        #expect(
+            scenario.clock.requestedSleeps == [.milliseconds(350)],
+            "The flush keeps the one pending delay: it does not wake it and register it again")
+        await flush.value
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aNewerExplicitRequestReplacesAnOlderOneThatWaitsBehindAnAdmittedAutomaticRefresh() async {
+        let scenario = AutomaticUploadScenario()
+        let release = AsyncGate()
+        await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
+            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+            await release.wait()
+            return nil
+        })
+        #expect(await scenario.timeline.waitForCount(1))
+        await scenario.coordinator.request(refresh: { _ in
+            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+            return nil
+        })
+        await scenario.coordinator.request(refresh: { _ in
+            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 2)
+            return nil
+        })
+        await release.open()
+        #expect(await scenario.timeline.waitForCount(2))
+        #expect(await scenario.waitForWorkerRetirement())
+        #expect(
+            await scenario.timeline.contents == [0, 2],
+            "The explicit request that a newer one replaced never runs; the newer one runs after the admitted load")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aFlushForANewerRequestIsNotReleasedByTheCompletionOfAnOlderOne() async {
+        let scenario = AutomaticUploadScenario()
+        let releaseOlder = AsyncGate()
+        let releaseNewer = AsyncGate()
+        await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
+            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+            await releaseOlder.wait()
+            return nil
+        })
+        #expect(await scenario.timeline.waitForCount(1))
+        scenario.clock.advance(by: .seconds(6))
+        await scenario.coordinator.requestAutomaticUpload(refresh: { _ in
+            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+            await releaseNewer.wait()
+            return nil
+        })
+        let completion = AutomaticFlushCompletion()
+        let flush = Task {
+            await scenario.coordinator.flushAutomaticUploads()
+            await completion.markComplete()
+        }
+        #expect(await scenario.waitForFlushRegistration())
+        // The flush targets the newer request. The older load completes first and must not release it.
+        await releaseOlder.open()
+        #expect(await scenario.timeline.waitForCount(2), "SETUP: the forced newer request runs after the older load")
+        let returnedWhileTheNewerLoadWasHeld = await completion.waitUntilComplete()
+        #expect(returnedWhileTheNewerLoadWasHeld == false, "The older completion must not release the newer target")
+        await releaseNewer.open()
+        #expect(await completion.waitUntilComplete())
+        await flush.value
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func acceptedAutomaticFlushCompletesWithoutAddingARequest() async {
         let release = AsyncGate()
         let timeline = UploadRefreshTimeline()
@@ -691,6 +888,7 @@ import Testing
             await coordinator.flushAutomaticUploads()
             await completion.markComplete()
         }
+        #expect(await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true))
         await release.open()
         await flush.value
         #expect(await completion.isComplete)
@@ -758,7 +956,8 @@ import Testing
         #expect(await recorder.callCount == 2)
     }
 
-    @Test func retriesOnlyPendingVisibilityWithSharedSchedule() async {
+    @Test(.timeLimit(.minutes(1)))
+    func retriesOnlyPendingVisibilityWithSharedSchedule() async {
         let recorder = RefreshAttemptRecorder(failures: [.pendingInventoryVisibility, .pendingInventoryVisibility, nil])
         let coordinator = TimelineUploadRefreshCoordinator(
             policy: .init(schedule: .init(delays: [.zero, .zero, .zero])))
@@ -772,7 +971,8 @@ import Testing
         await coordinator.cancel()
     }
 
-    @Test func repeatedSignalsJoinOneDrainAndCauseOneFollowUp() async {
+    @Test(.timeLimit(.minutes(1)))
+    func repeatedSignalsJoinOneDrainAndCauseOneFollowUp() async {
         let recorder = RefreshAttemptRecorder(failures: [nil, nil])
         let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
         await coordinator.request(refresh: { attempt in
@@ -787,7 +987,8 @@ import Testing
         await coordinator.cancel()
     }
 
-    @Test func supersededCancelledResultRunsLatestRequestAndSkipsStaleObserver() async {
+    @Test(.timeLimit(.minutes(1)))
+    func supersededCancelledResultRunsLatestRequestAndSkipsStaleObserver() async {
         let firstRelease = AsyncGate()
         let recorder = CoordinatorRaceRecorder()
         let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
@@ -817,7 +1018,8 @@ import Testing
         await coordinator.cancel()
     }
 
-    @Test func cancelledWorkerCannotClearReplacementWorker() async {
+    @Test(.timeLimit(.minutes(1)))
+    func cancelledWorkerCannotClearReplacementWorker() async {
         let firstRelease = AsyncGate()
         let secondRelease = AsyncGate()
         let recorder = CoordinatorRaceRecorder()
@@ -1519,5 +1721,17 @@ private struct F1F2Harness: Sendable {
     func end() { log.record("load.exit", time: time) }
     func observe(_ name: String, value: TimelineUploadRefreshAttempt, content: Int = -1) {
         log.record(name, time: time, attempt: value.attempt, content: content, decision: value.decision)
+    }
+}
+
+private actor EventOrder {
+    private(set) var events: [String] = []
+
+    func add(_ event: String) { events.append(event) }
+
+    func waitForCount(_ count: Int) async -> Bool {
+        let timeout = ContinuousClock.now + .seconds(5)
+        while events.count < count, ContinuousClock.now < timeout { await Task.yield() }
+        return events.count >= count
     }
 }
