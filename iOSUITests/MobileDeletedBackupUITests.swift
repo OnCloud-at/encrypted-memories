@@ -15,6 +15,20 @@ final class MobileDeletedBackupUITests: XCTestCase {
 
     override func tearDown() { app.terminate() }
 
+    /// Keeps what the app shows when a wait fails: the whole hierarchy as text (the summary on the Backup screen and
+    /// the rows or the empty, loading or unavailable state of the open sheet) and a screenshot. A failure of the
+    /// list then names its cause.
+    private func attachDiagnostics(named name: String) {
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "\(name): hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "\(name): screenshot"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
     private func openDecision() {
         let settings = app.buttons["Proton Account and Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 60))
@@ -27,7 +41,9 @@ final class MobileDeletedBackupUITests: XCTestCase {
         XCTAssertTrue(attention.label.contains("1"), "One parked photo must need attention")
         attention.tap()
         let row = decisionRow
-        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        let rowAppeared = row.waitForExistence(timeout: 10)
+        if !rowAppeared { attachDiagnostics(named: "Backup list without the decision row") }
+        XCTAssertTrue(rowAppeared)
         row.tap()
         XCTAssertTrue(app.buttons["backup.keepDeleted.dialog"].firstMatch.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)

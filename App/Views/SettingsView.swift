@@ -813,6 +813,8 @@ private struct MacFailedBackupSheet: View {
     let source: Source
     @Environment(\.dismiss) private var dismiss
     @State private var problemList = BackupProblemListModel()
+    @State private var personReadTask: Task<Void, Never>?
+    @State private var readOrder = BackupProblemListReadOrder()
 
     init(controller: PhotoLibraryBackupController) {
         source = .backup(controller)
@@ -832,6 +834,14 @@ private struct MacFailedBackupSheet: View {
         case .album(let albumSync, let albumID):
             albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
         }
+    }
+
+    /// What the sheet shows. The backup list never says that nothing needs attention while the summary counts items.
+    private var presentation: BackupProblemListModel.Presentation {
+        if let controller {
+            return problemList.presentation(expectsItems: controller.status.needsAttentionCount > 0)
+        }
+        return items.isEmpty ? .empty : .list
     }
 
     var body: some View {
@@ -860,30 +870,43 @@ private struct MacFailedBackupSheet: View {
 
             Divider()
 
-            if items.isEmpty {
+            switch presentation {
+            case .loading:
+                ProgressView(L10n.string("loading.content"))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("backup.failedSheet.loading")
+            case .unavailable:
+                ContentUnavailableView {
+                    Label(L10n.string("backup.failed_sheet_unavailable"), systemImage: "exclamationmark.triangle")
+                } actions: {
+                    Button(L10n.string("action.retry")) {
+                        guard let controller else { return }
+                        problemList.beginReading()
+                        readList(of: controller)
+                    }
+                    .accessibilityIdentifier("backup.failedSheet.retry")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .empty:
                 ContentUnavailableView(
                     L10n.string("backup.failed_sheet_empty"),
                     systemImage: "checkmark.shield"
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
+            case .list:
                 List {
                     BackupProblemSections(items: items) { item in
                         BackupProblemRow(item: item) {
                             if let controller, item.issue == .deletedElsewhere {
                                 Button(L10n.string("backup.keep_deleted")) {
                                     controller.keepDeleted(item)
-                                    Task { await problemList.refresh { await controller.problemItems() } }
+                                    readList(of: controller)
                                 }
                                 .buttonStyle(.borderless)
                                 .help(L10n.string("backup.keep_deleted"))
                                 Button(L10n.string("backup.back_up_again")) {
                                     controller.backUpAgain(item)
-                                    Task {
-                                        await problemList.refresh(afterDecision: item) {
-                                            await controller.problemItems()
-                                        }
-                                    }
+                                    readList(of: controller, afterDecision: item)
                                 }
                                 .buttonStyle(.borderless)
                                 .help(L10n.string("backup.back_up_again"))
@@ -914,7 +937,20 @@ private struct MacFailedBackupSheet: View {
         // A photo can need the person while the list is open; Try again then appears.
         .task(id: controller?.status.problemListKey) {
             guard let controller else { return }
-            await controller.followProblemList { problemList.replaceItems($0) }
+            await controller.followProblemList(
+                order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
+        }
+        .onDisappear { personReadTask?.cancel() }
+    }
+
+    /// A person's action reads the list like the automatic follow does. The sheet keeps the task, so closing the
+    /// sheet or a newer action ends it.
+    private func readList(of controller: PhotoLibraryBackupController, afterDecision item: BackupFailedItem? = nil) {
+        personReadTask?.cancel()
+        personReadTask = Task {
+            await controller.readProblemList(
+                order: readOrder, afterDecision: item, { problemList.replaceItems($0) },
+                ifUnavailable: { problemList.markUnavailable() })
         }
     }
 }

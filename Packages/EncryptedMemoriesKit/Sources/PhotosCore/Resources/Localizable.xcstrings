@@ -1273,6 +1273,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Warnung ausblenden" } }
       }
     },
+    "backup.failed_sheet_unavailable": {
+      "extractionState": "manual",
+      "comment": "Shown in the failed-items sheet when the list stayed empty although the summary counts photos.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The list could not be loaded." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Liste konnte nicht geladen werden." } }
+      }
+    },
     "backup.failed_sheet_empty": {
       "extractionState": "manual",
       "comment": "Shown in the failed-items sheet when nothing is failing anymore.",
