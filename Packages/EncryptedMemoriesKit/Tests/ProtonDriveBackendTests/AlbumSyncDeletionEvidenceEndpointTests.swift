@@ -38,6 +38,53 @@ extension DriveSessionStubSuite {
                 ])
         }
 
+        /// A busy service waits like every other request; it must not use up the retry budget of the photo.
+        @Test(arguments: [408, 429, 500, 503])
+        func duplicateLookupTurnsABusyServiceIntoARetryableWait(status: Int) async throws {
+            let failure = try await duplicateLookupFailure(status: status)
+            guard case .retryableBackend(let code, _)? = failure as? UploadCore.UploadError else {
+                Issue.record("expected retryableBackend, got \(failure)")
+                return
+            }
+            #expect(code == status)
+        }
+
+        @Test(arguments: [400, 404, 422])
+        func duplicateLookupKeepsOtherAnswersAsTheyAre(status: Int) async throws {
+            let failure = try await duplicateLookupFailure(status: status)
+            guard case .apiError(let code, _)? = failure as? ProtonAuthError else {
+                Issue.record("expected the unchanged apiError, got \(failure)")
+                return
+            }
+            #expect(code == status)
+        }
+
+        private func duplicateLookupFailure(status: Int) async throws -> any Error {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/volumes/vol/photos/duplicates", status: status,
+                json: #"{"Code":2028,"Error":"Service answer"}"#)
+            let manifest = try #require(
+                UploadIdentityManifestStore(
+                    url: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".sqlite")))
+            defer { manifest.close() }
+            let service = ProtonUploadDedupeService(
+                session: session(), crypto: DriveCrypto(addressKeys: [], signers: []),
+                photosClient: DeletionProbeSDK(), contentIndexStore: manifest,
+                material: .init(
+                    context: .init(volumeID: "vol", shareID: "share", rootLinkID: "root"),
+                    rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
+                contextProvider: { throw UploadError.backend("resolved test material must be reused") })
+            do {
+                _ = try await service.findDuplicates(nameHashes: ["name-hash"])
+            } catch {
+                #expect(StubURLProtocol.requests().allSatisfy { $0.path == "/drive/volumes/vol/photos/duplicates" })
+                return error
+            }
+            Issue.record("the lookup must fail for HTTP \(status)")
+            return CancellationError()
+        }
+
         @Test func sdkExactLookupPreservesCancellationAndOrdinaryFailureFallback() async throws {
             var errors: [(any Error, Bool)] = [
                 (CancellationError(), true), (URLError(.cancelled), true), (UploadError.cancelled, true),

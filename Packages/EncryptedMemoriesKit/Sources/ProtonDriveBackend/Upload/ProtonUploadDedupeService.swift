@@ -136,7 +136,12 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
 
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
         let context = try await resolveMaterial().context
-        let entries = try await session.findPhotoDuplicates(volumeID: context.volumeID, nameHashes: nameHashes)
+        let entries: [PhotoDuplicateEntry]
+        do {
+            entries = try await session.findPhotoDuplicates(volumeID: context.volumeID, nameHashes: nameHashes)
+        } catch ProtonAuthError.apiError(let code, let message) where Self.isBusyService(code) {
+            throw UploadError.retryableBackend(code: code, message: message)
+        }
         DebugLog.log("[Dedupe] duplicates query hashes=\(nameHashes.count) matches=\(entries.count)")
         return entries.map { entry in
             RemotePhotoDuplicate(
@@ -313,12 +318,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let context = try await resolveMaterial().context
         do {
             return try await session.fetchLinkVisibility(shareID: context.shareID, linkIDs: linkIDs)
-        } catch ProtonAuthError.apiError(let code, let message)
-            where code == 408 || code == 429 || (500...599).contains(code)
-        {
-            // A busy service must not use up the retry budget of a photo.
+        } catch ProtonAuthError.apiError(let code, let message) where Self.isBusyService(code) {
             throw UploadError.retryableBackend(code: code, message: message)
         }
+    }
+
+    /// HTTP 408, 429 and 5xx: a busy service must not use up the retry budget of a photo.
+    private static func isBusyService(_ code: Int) -> Bool {
+        code == 408 || code == 429 || (500...599).contains(code)
     }
 
     func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
