@@ -139,6 +139,29 @@ public enum PendingDesiredState: String, Sendable, Equatable {
 
 /// The desired backup state of one source and the effects that are still due. A row is never deleted
 /// before its effects finish, so a crash or a failed request cannot lose a delete or a restore.
+/// One source's desired state as read from the store. A readable nil is confirmed absence; `unreadable` means the query
+/// failed or the row did not decode.
+public enum PendingSourceStateRead: Sendable, Equatable {
+    case unreadable
+    case readable(PendingSourceState?)
+
+    public var state: PendingSourceState? {
+        guard case .readable(let state) = self else { return nil }
+        return state
+    }
+}
+
+/// The source states that decoded, and whether the read was complete. An incomplete read can leave out owed work.
+public struct PendingSourceStatesRead: Sendable, Equatable {
+    public let states: [PendingSourceState]
+    public let complete: Bool
+
+    public init(states: [PendingSourceState], complete: Bool) {
+        self.states = states
+        self.complete = complete
+    }
+}
+
 public struct PendingSourceState: Sendable, Equatable {
     public let key: PendingSourceKey
     public let desired: PendingDesiredState

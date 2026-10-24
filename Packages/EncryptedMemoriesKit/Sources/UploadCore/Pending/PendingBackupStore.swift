@@ -255,20 +255,40 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     // MARK: - Desired state
 
+    /// The rows that decode. Use `sourceStatesRead()` where a missing row must not count as "nothing owed".
     public func sourceStates() -> [PendingSourceState] {
-        connection.withLock { sourceStatesLocked(where: nil).states }
+        sourceStatesRead().states
     }
 
+    /// Every row that decodes, and whether the query succeeded and every row decoded.
+    public func sourceStatesRead() -> PendingSourceStatesRead {
+        connection.withLock {
+            let read = sourceStatesLocked(where: nil)
+            return PendingSourceStatesRead(states: read.states, complete: read.succeeded)
+        }
+    }
+
+    /// nil for an absent and for an unreadable row. Use `sourceStateRead(for:)` to tell them apart.
     public func sourceState(for key: PendingSourceKey) -> PendingSourceState? {
-        connection.withLock { sourceStateLocked(key).state }
+        sourceStateRead(for: key).state
+    }
+
+    public func sourceStateRead(for key: PendingSourceKey) -> PendingSourceStateRead {
+        connection.withLock { sourceStateLocked(key) }
     }
 
     /// Sources with an effect that is due by `date`.
     public func dueSourceStates(by date: Date) -> [PendingSourceState] {
+        dueSourceStatesRead(by: date).states
+    }
+
+    /// Due sources that decode, and whether the query succeeded and every due row decoded.
+    public func dueSourceStatesRead(by date: Date) -> PendingSourceStatesRead {
         connection.withLock {
-            sourceStatesLocked(
+            let read = sourceStatesLocked(
                 where: "(needs_queue_sync=1 OR needs_remote_trash=1 OR needs_remote_restore=1) AND next_attempt_at <= ?"
-            ) { sqlite3_bind_double($0, 1, date.timeIntervalSince1970) }.states
+            ) { sqlite3_bind_double($0, 1, date.timeIntervalSince1970) }
+            return PendingSourceStatesRead(states: read.states, complete: read.succeeded)
         }
     }
 
@@ -726,18 +746,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }.first
     }
 
-    /// A readable nil is confirmed absence; SQL and decode failures remain distinct for each lookup.
-    private enum SourceStateRead {
-        case unreadable
-        case readable(PendingSourceState?)
-
-        var state: PendingSourceState? {
-            guard case .readable(let state) = self else { return nil }
-            return state
-        }
-    }
-
-    private func sourceStateLocked(_ key: PendingSourceKey) -> SourceStateRead {
+    private func sourceStateLocked(_ key: PendingSourceKey) -> PendingSourceStateRead {
         let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { self.bindKey($0, key) }
         guard read.succeeded else { return .unreadable }
         return .readable(read.states.first)
