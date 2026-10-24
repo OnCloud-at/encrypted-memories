@@ -30,8 +30,8 @@ public actor MLSmartSearchLifecycle {
     public struct Configuration: Sendable {
         /// Delay before re-attempting indexing after a pass ends with transient failures.
         public var indexRetryDelay: Duration
-        /// Fallback cadence for rechecking a closed indexing gate. Hosts wake the loop when the gate's inputs change
-        /// (`noteConditionsChanged`), so this only covers an input that reports no change.
+        /// Fallback cadence for rechecking a closed indexing gate. Hosts wake the loop when a change can open the gate
+        /// (`noteConditionsChanged`), so this only covers an opening that no host reports.
         public var closedGateRecheckDelay: Duration
         /// Minimum download-fraction change worth emitting to observers.
         public var downloadProgressStep: Double
