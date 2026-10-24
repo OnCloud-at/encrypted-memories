@@ -257,7 +257,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
         let entry = UploadBackupSyncQueueEntry(
             source: source("claimed"), revision: revision(10), originalFilename: "claimed.heic", state: .uploading,
-            updatedAt: Date(timeIntervalSince1970: 10))
+            attempts: 2, updatedAt: Date(timeIntervalSince1970: 10))
         let reconciliation = UploadRemoteCommitReconciliation(
             source: entry.source,
             identity: UploadIdentity(
@@ -273,17 +273,23 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             store.markNeedsRemoteReconciliation(
                 source: entry.source, revision: entry.revision, reconciliation: reconciliation,
                 lastError: "manifest unavailable", updatedAt: Date(timeIntervalSince1970: 11)))
+        let stored = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertGreaterThan(stored.attempts, 0)
+        XCTAssertEqual(stored.lastError, "manifest unavailable")
 
         XCTAssertTrue(store.upsert(scanned))
-        XCTAssertEqual(
-            store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation, reconciliation,
-            "a reconciliation row keeps its receipt")
+        let reconciling = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(reconciling.remoteCommitReconciliation, reconciliation, "a reconciliation row keeps its receipt")
+        XCTAssertEqual(reconciling.attempts, stored.attempts)
+        XCTAssertEqual(reconciling.lastError, stored.lastError)
         XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 12)).count, 1)
 
         XCTAssertTrue(store.upsert(scanned))
         let claimed = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(claimed.state, .checking)
         XCTAssertEqual(claimed.remoteCommitReconciliation, reconciliation, "the scan keeps the claimed row's receipt")
+        XCTAssertEqual(claimed.attempts, stored.attempts, "the scan keeps the claimed row's attempts")
+        XCTAssertEqual(claimed.lastError, stored.lastError, "the scan keeps the claimed row's error")
 
         XCTAssertTrue(store.upsertBatch([scanned]))
         XCTAssertEqual(
