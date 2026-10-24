@@ -59,6 +59,8 @@ public final class PhotoLibraryBackupController {
         var makeChangeMonitor: (URL) -> PhotoLibraryChangeMonitor = { PhotoLibraryChangeMonitor(tokenURL: $0) }
         var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
         var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+        /// How often a pass renews its execution lock. The lease lets a crashed owner go after 120 s.
+        var heartbeatInterval: TimeInterval = 30
 
         public var defaults: UserDefaults
         public var runtimeSignals: BackupRuntimeSignalSource
@@ -91,7 +93,6 @@ public final class PhotoLibraryBackupController {
     /// Lease used when reaping abandoned locks before a start; matches the lock store default so a
     /// crashed/expired owner is recoverable while a healthy owner (heartbeat every 30s) never is.
     private static let lockLease: TimeInterval = BackupExecutionLockManifestStore.defaultLeaseInterval
-    private static let heartbeatInterval: TimeInterval = 30
     private static let liveChangeDebounceNanoseconds: UInt64 = 750_000_000
     static let instantWorkRetirementTimeout: Duration = .milliseconds(250)
 
@@ -223,6 +224,7 @@ public final class PhotoLibraryBackupController {
     /// The last `startSync` call deferred its pass to the first network path.
     private var lastStartWasDeferred = false
     private let firstNetworkPathWait: Duration
+    private let heartbeatInterval: TimeInterval
     private var firstNetworkPathWaitTask: Task<Void, Never>?
     /// The wait for the first path ended without a path. Passes then run, and uploads still wait for Wi-Fi.
     private var firstNetworkPathWaitEnded = false
@@ -289,6 +291,7 @@ public final class PhotoLibraryBackupController {
         let runtimeSignals = configuration.runtimeSignals
         self.runtimeSignals = runtimeSignals
         firstNetworkPathWait = configuration.firstNetworkPathWait
+        heartbeatInterval = configuration.heartbeatInterval
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy
         accessState = currentAccessState()
@@ -1488,13 +1491,22 @@ public final class PhotoLibraryBackupController {
             heartbeatTask = nil
             return
         }
+        let interval = heartbeatInterval
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(Self.heartbeatInterval * 1_000_000_000))
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 guard !Task.isCancelled else { return }
-                // Stop the pass when another owner acquires the execution lock.
-                if !lockStore.heartbeat(runID: runID, phase: nil) { return }
-                _ = self
+                switch lockStore.heartbeat(runID: runID, phase: nil) {
+                case .renewed, .unavailable:
+                    // A failed read or write leaves ownership unknown; the next interval tries again.
+                    continue
+                case .lost:
+                    // Another owner holds the lock, or nobody does: stop the run. In-flight transfers are cancelled and
+                    // joined; unfinished rows go back to a runnable state, and a transfer that already committed keeps
+                    // its result.
+                    self?.stopSync(runID: runID)
+                    return
+                }
             }
         }
     }
