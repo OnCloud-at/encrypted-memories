@@ -2,8 +2,12 @@
 # Verify the reviewed hosted toolchain before dependencies or upgrade caches are used.
 set -euo pipefail
 source .github/scripts/release_failure.sh
-expected_version="${EXPECTED_XCODE_VERSION:-27.1}"
-expected_build="${EXPECTED_XCODE_BUILD:-27A9275}"
+# The reviewed pins are the defaults of the prepare-apple-build action. The caller passes them; this script has none.
+[[ -n "${EXPECTED_XCODE_VERSION:-}" && -n "${EXPECTED_XCODE_BUILD:-}" ]] || release_fail toolchain \
+  "EXPECTED_XCODE_VERSION or EXPECTED_XCODE_BUILD is missing or empty." \
+  "Pass both reviewed pins from the xcode-version and xcode-build inputs of .github/actions/prepare-apple-build."
+expected_version="$EXPECTED_XCODE_VERSION"
+expected_build="$EXPECTED_XCODE_BUILD"
 [[ -n "${DEVELOPER_DIR:-}" && -d "$DEVELOPER_DIR" ]] || release_fail toolchain \
   "The selected Xcode developer directory is missing." \
   "Select the reviewed Xcode installation from the hosted image inventory."

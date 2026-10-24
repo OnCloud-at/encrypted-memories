@@ -147,8 +147,15 @@ final class ProjectHygieneTests: XCTestCase {
 
         let toolchain = try read(".github/scripts/verify_xcode_toolchain.sh")
         XCTAssertTrue(toolchain.contains("set -euo pipefail"))
-        XCTAssertTrue(toolchain.contains(#"expected_version="${EXPECTED_XCODE_VERSION:-27.1}""#))
-        XCTAssertTrue(toolchain.contains(#"expected_build="${EXPECTED_XCODE_BUILD:-27A9275}""#))
+        // The action inputs hold the only copy of the pins; an empty or missing value fails.
+        XCTAssertTrue(
+            toolchain.contains(
+                #"[[ -n "${EXPECTED_XCODE_VERSION:-}" && -n "${EXPECTED_XCODE_BUILD:-}" ]] || release_fail toolchain"#
+            ))
+        XCTAssertTrue(toolchain.contains(#"expected_version="$EXPECTED_XCODE_VERSION""#))
+        XCTAssertTrue(toolchain.contains(#"expected_build="$EXPECTED_XCODE_BUILD""#))
+        XCTAssertFalse(toolchain.contains("27.1"))
+        XCTAssertFalse(toolchain.contains("27A9275"))
         XCTAssertTrue(
             toolchain.contains(
                 #"[[ "$xcode_version" == "$expected_version" && "$xcode_build" == "$expected_build" ]] || release_fail toolchain"#

@@ -837,6 +837,86 @@ class PullRequestWorkflowTests < Minitest::Test
     end
   end
 
+  # Runs a shell body from the repository root with a fake xcodebuild that reports `output`.
+  def run_with_fake_xcodebuild(body, output, extra_env = {})
+    Dir.mktmpdir do |directory|
+      bin = File.join(directory, "bin")
+      FileUtils.mkdir_p(bin)
+      developer = File.join(directory, "SelectedXcode.app", "Contents", "Developer")
+      FileUtils.mkdir_p(developer)
+      calls = File.join(directory, "xcode-calls")
+      executable = File.join(bin, "xcodebuild")
+      File.write(executable, "#!/bin/bash\nprintf 'call\\n' >> \"$XCODE_CALLS\"\nprintf '%s' \"$FAKE_XCODE_OUTPUT\"\n")
+      FileUtils.chmod(0o755, executable)
+      github_output = File.join(directory, "github-output")
+      environment = {
+        "PATH" => "#{bin}:#{ENV.fetch('PATH')}", "DEVELOPER_DIR" => developer, "GITHUB_OUTPUT" => github_output,
+        "XCODE_CALLS" => calls, "FAKE_XCODE_OUTPUT" => output,
+        # nil removes the variable, so an expectation that a case omits is unset, not inherited from the test run.
+        "EXPECTED_XCODE_VERSION" => nil, "EXPECTED_XCODE_BUILD" => nil
+      }.merge(extra_env)
+      stdout, stderr, status = Open3.capture3(environment, "bash", "-c", body, chdir: File.expand_path("../..", WORKFLOWS))
+      yield stdout, stderr, status, File.exist?(calls), (File.exist?(github_output) ? File.read(github_output) : "")
+    end
+  end
+
+  def test_toolchain_script_rejects_an_empty_or_missing_expectation
+    pins = reviewed_xcode_action.fetch("inputs")
+    version = pins.fetch("xcode-version").fetch("default")
+    build = pins.fetch("xcode-build").fetch("default")
+    output = "Xcode #{version}\nBuild version #{build}\n"
+    [{ "EXPECTED_XCODE_VERSION" => "", "EXPECTED_XCODE_BUILD" => build },
+     { "EXPECTED_XCODE_VERSION" => version, "EXPECTED_XCODE_BUILD" => "" },
+     { "EXPECTED_XCODE_VERSION" => "", "EXPECTED_XCODE_BUILD" => "" },
+     { "EXPECTED_XCODE_BUILD" => build },
+     { "EXPECTED_XCODE_VERSION" => version },
+     {}].each do |expectation|
+      run_with_fake_xcodebuild("bash .github/scripts/verify_xcode_toolchain.sh", output, expectation) do |_out, err, status, called, _key|
+        refute status.success?, expectation.inspect
+        refute called, expectation.inspect
+        assert_includes err, "EXPECTED_XCODE_VERSION or EXPECTED_XCODE_BUILD is missing or empty"
+      end
+    end
+    # A value of only whitespace is no pin either: it never equals the reported version or build.
+    [{ "EXPECTED_XCODE_VERSION" => " ", "EXPECTED_XCODE_BUILD" => build },
+     { "EXPECTED_XCODE_VERSION" => version, "EXPECTED_XCODE_BUILD" => " " },
+     { "EXPECTED_XCODE_VERSION" => "\t", "EXPECTED_XCODE_BUILD" => "\n" }].each do |expectation|
+      run_with_fake_xcodebuild("bash .github/scripts/verify_xcode_toolchain.sh", output, expectation) do |_out, err, status, _called, _key|
+        refute status.success?, expectation.inspect
+        assert_includes err, "expected '"
+      end
+    end
+    run_with_fake_xcodebuild("bash .github/scripts/verify_xcode_toolchain.sh", output,
+      "EXPECTED_XCODE_VERSION" => version, "EXPECTED_XCODE_BUILD" => build) do |_out, err, status, called, _key|
+      assert status.success?, err
+      assert called
+    end
+  end
+
+  def test_the_action_inputs_are_the_only_place_that_writes_the_expected_xcode
+    pins = reviewed_xcode_action.fetch("inputs")
+    version = pins.fetch("xcode-version").fetch("default")
+    build = pins.fetch("xcode-build").fetch("default")
+    script = File.read(File.join(WORKFLOWS, "../scripts/verify_xcode_toolchain.sh"))
+    refute_includes script, build
+    refute_includes script, version
+    upgrade = YAML.load_file(File.join(WORKFLOWS, "testflight-internal.yml")).fetch("jobs").fetch("upgrade").fetch("steps")
+    toolchain = upgrade.find { |step| step["id"] == "toolchain" }
+    refute_includes toolchain.fetch("run"), build
+    refute_includes toolchain.fetch("run"), version
+    # The upgrade job has no copy of the pins: it reads the action's defaults, so a changed pin reaches it.
+    run_with_fake_xcodebuild(toolchain.fetch("run"), "Xcode #{version}\nBuild version #{build}\n") do |_out, err, status, called, key|
+      assert status.success?, err
+      assert called
+      assert_match(/\Akey=\h{64}-\S+\n\z/, key)
+    end
+    run_with_fake_xcodebuild(toolchain.fetch("run"), "Xcode #{version}\nBuild version 27A0000\n") do |_out, err, status, _called, key|
+      refute status.success?
+      assert_includes err, "expected '#{version}' build '#{build}'"
+      assert_empty key
+    end
+  end
+
   def test_hosted_workflows_select_the_reviewed_xcode_and_upgrade_checks_before_cache
     developer = "/Applications/Xcode_27.1.app/Contents/Developer"
     %w[pull-request.yml testflight-internal.yml dependency-cache.yml].each do |name|

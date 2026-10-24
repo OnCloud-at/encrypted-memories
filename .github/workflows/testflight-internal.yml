@@ -916,7 +916,13 @@ jobs:
         if: needs.prepare.outputs.upgrade_overridden != 'true'
         run: |
           set -euo pipefail
-          bash .github/scripts/verify_xcode_toolchain.sh
+          # The reviewed pins are the defaults of the prepare-apple-build action; read them from there.
+          pin() {
+            ruby -ryaml -e 'puts YAML.load_file(ARGV[0]).fetch("inputs").fetch(ARGV[1]).fetch("default")' \
+              .github/actions/prepare-apple-build/action.yml "$1"
+          }
+          EXPECTED_XCODE_VERSION="$(pin xcode-version)" EXPECTED_XCODE_BUILD="$(pin xcode-build)" \
+            bash .github/scripts/verify_xcode_toolchain.sh
           echo "key=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)-$(uname -m)" >> "$GITHUB_OUTPUT"
 
       - name: Report runner disk
