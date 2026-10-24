@@ -8,9 +8,12 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
     private let lock = NSLock()
     public private(set) var database: OpaquePointer?
     public private(set) var operationFailed = false
+    private let optimizesOnClose: Bool
 
-    public init(database: OpaquePointer) {
+    /// Set optimizesOnClose to false only to preserve a store that never ran `PRAGMA optimize` on close.
+    public init(database: OpaquePointer, optimizesOnClose: Bool = true) {
         self.database = database
+        self.optimizesOnClose = optimizesOnClose
     }
 
     deinit { close() }
@@ -61,7 +64,7 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
     public func close() {
         withLock {
             guard database != nil else { return }
-            sqlite3_exec(database, "PRAGMA optimize;", nil, nil, nil)
+            if optimizesOnClose { sqlite3_exec(database, "PRAGMA optimize;", nil, nil, nil) }
             sqlite3_close(database)
             database = nil
         }
