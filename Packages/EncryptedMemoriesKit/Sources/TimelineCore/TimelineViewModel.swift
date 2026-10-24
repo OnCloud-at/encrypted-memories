@@ -257,35 +257,23 @@ public final class TimelineViewModel {
     @ObservationIgnored private var lastCommit: Task<Void, Never>?
     /// Moves with every committed trash or restore, also before a whole-library snapshot exists.
     @ObservationIgnored private var wholeLibraryMutationRevision: UInt64 = 0
-    /// The snapshot comes from a refresh that a trash, restore or other publication overtook. Location work treats
-    /// the library as not known until a listing that nothing overtook replaces it.
-    @ObservationIgnored private var locationListingOvertaken = false
-
-    /// Where a whole-library snapshot comes from. A projection keeps what the listing under it was for locations.
-    private enum WholeLibrarySource {
-        case listing, overtakenListing, projection
-    }
+    /// Moves with every write of the whole-library snapshot or its authority: a load, a refresh, a trash or restore
+    /// projection, a settled result. An equal result counts too, so it overtakes an older reader.
+    @ObservationIgnored private var wholeLibraryWriteCount: UInt64 = 0
 
     /// `change` compares `projection` with the current whole-library snapshot. Without it, the comparison runs here.
     private func updateAllRouteSnapshot(
         _ projection: TimelineContentProjection,
-        change: TimelineProjectionChange? = nil,
-        source: WholeLibrarySource = .listing
+        change: TimelineProjectionChange? = nil
     ) {
         let contentChanged = change?.contentChanged ?? (wholeLibrarySnapshot != projection.snapshot)
+        wholeLibraryWriteCount &+= 1
         allRouteSnapshot = projection.sections
         wholeLibrarySnapshot = projection.snapshot
         if contentChanged { wholeLibraryContentRevision &+= 1 }
-        switch source {
-        case .listing: locationListingOvertaken = false
-        case .overtakenListing: locationListingOvertaken = true
-        case .projection: break
-        }
         // A cached snapshot shows the grid, but only a successful whole-library load makes the library known for
-        // location work: a stale or empty cache must not prune saved pins. An overtaken listing must not either.
-        if locationListingOvertaken {
-            wholeLibraryLocationRevision = nil
-        } else if wholeLibraryInventoryAuthority == .authoritative,
+        // location work: a stale or empty cache must not prune saved pins.
+        if wholeLibraryInventoryAuthority == .authoritative,
             wholeLibraryLocationRevision != .some(wholeLibraryContentRevision)
         {
             wholeLibraryLocationRevision = wholeLibraryContentRevision
@@ -296,10 +284,11 @@ public final class TimelineViewModel {
         wholeLibraryRevision &+= 1
     }
 
-    /// What a whole-library result depends on: its content, its authority and the committed trashes and restores.
-    /// A cache, a full listing or a refresh that was read while any of them changed is overtaken.
+    /// What a whole-library result depends on: every write of the whole-library snapshot and the committed trashes and
+    /// restores. A writer captures it before it reads or projects and compares it before it writes. A cache, a full
+    /// listing or a refresh that was read while it moved is overtaken.
     private var wholeLibraryPublication: [UInt64] {
-        [wholeLibraryContentRevision, wholeLibraryInventoryAuthorityRevision, wholeLibraryMutationRevision]
+        [wholeLibraryWriteCount, wholeLibraryMutationRevision]
     }
 
     /// Revisions of everything that a refresh compares with. Equal values mean equal content.
@@ -339,6 +328,7 @@ public final class TimelineViewModel {
         guard wholeLibraryInventoryAuthority != authority else { return }
         wholeLibraryInventoryAuthority = authority
         wholeLibraryInventoryAuthorityRevision &+= 1
+        wholeLibraryWriteCount &+= 1
     }
 
     /// Whether `sections` flattens to exactly `items` (same `PhotoItem`s, same order) without allocating the
@@ -434,6 +424,8 @@ public final class TimelineViewModel {
 
     #if DEBUG
         func cancelInitialLoadForTesting() { initialLoadTask?.cancel() }
+        /// Runs after a trash or restore projection computed its result and before it writes it.
+        @ObservationIgnored var afterProjectionComputedForTesting: (@MainActor () async -> Void)?
     #endif
 
     public func load() async {
@@ -557,6 +549,19 @@ public final class TimelineViewModel {
     }
 
     private func projectTrash(_ items: [PhotoItem], uids: Set<PhotoUID>) async {
+        // Another write of the whole-library snapshot during the projection leaves it outdated. It never overwrites
+        // that write: it runs again on the newer state.
+        while true {
+            let written = wholeLibraryWriteCount
+            if await projectTrashOnce(items, uids: uids, whileWriteCountIs: written) { return }
+        }
+    }
+
+    private func projectTrashOnce(
+        _ items: [PhotoItem], uids: Set<PhotoUID>, whileWriteCountIs written: UInt64
+    ) async
+        -> Bool
+    {
         let all = allRouteSnapshot
         let caches = filterCache
         let cachedRoutes = caches.routesByRecency
@@ -578,6 +583,10 @@ public final class TimelineViewModel {
                 : nil
             return (all, updatedCaches, transient)
         }.value
+        #if DEBUG
+            await afterProjectionComputedForTesting?()
+        #endif
+        guard written == wholeLibraryWriteCount else { return false }
 
         var updatedCache = TimelineFilterCache(maximumEntries: filterCache.maximumEntries)
         for route in cachedRoutes {
@@ -586,8 +595,9 @@ public final class TimelineViewModel {
             }
         }
         filterCache = updatedCache
-        if let all = result.0 { updateAllRouteSnapshot(all, source: .projection) }
+        if let all = result.0 { updateAllRouteSnapshot(all) }
         publishCurrentRoute(transientMapSections: result.2)
+        return true
     }
 
     /// Commits a successful restore: remove from Trash, insert into All Photos, and invalidate filtered caches
@@ -601,6 +611,17 @@ public final class TimelineViewModel {
     }
 
     private func projectRestore(_ items: [PhotoItem], uids: Set<PhotoUID>) async {
+        while true {
+            let written = wholeLibraryWriteCount
+            if await projectRestoreOnce(items, uids: uids, whileWriteCountIs: written) { return }
+        }
+    }
+
+    private func projectRestoreOnce(
+        _ items: [PhotoItem], uids: Set<PhotoUID>, whileWriteCountIs written: UInt64
+    ) async
+        -> Bool
+    {
         let all = allRouteSnapshot
         let trash = filterCache.snapshot(for: .trash)
         let result = await Task.detached(priority: .userInitiated) {
@@ -608,13 +629,18 @@ public final class TimelineViewModel {
             let trash = trash.map { TimelineContentProjection(sections: $0).removing(uids).sections }
             return (all, trash)
         }.value
+        #if DEBUG
+            await afterProjectionComputedForTesting?()
+        #endif
+        guard written == wholeLibraryWriteCount else { return false }
 
         filterCache.removeAll()
         if let trash = result.1 {
             filterCache.insert(trash, for: .trash, activeRoute: filter)
         }
-        if let all = result.0 { updateAllRouteSnapshot(all, source: .projection) }
+        if let all = result.0 { updateAllRouteSnapshot(all) }
         publishCurrentRoute()
+        return true
     }
 
     /// Runs `projection` after every earlier trash or restore projection. Each projection reads the snapshot that the
@@ -667,6 +693,7 @@ public final class TimelineViewModel {
                 await applyAllContent(projection)
                 if !force {
                     let shownRevisions = shownTimelineRevisions
+                    let publishedAfterCache = wholeLibraryPublication
                     let validation = await TimelineCacheValidationPolicy.validateForPublication(
                         snapshot: cached,
                         repository: repository
@@ -676,7 +703,21 @@ public final class TimelineViewModel {
                         currentProjection = await normalizeOffMain(current.sections, for: .all)
                     }
                     cacheValidation = validation.validation
-                    guard !Task.isCancelled, filter == .all, shownRevisions == shownTimelineRevisions else { return }
+                    guard !Task.isCancelled else { return }
+                    guard filter == .all else {
+                        // A route switch during the check. A saved library that the check proved current is the whole
+                        // library for location work; it does not replace the grid of the route that is shown.
+                        if case .validated = cacheValidation, let currentProjection,
+                            publishedAfterCache == wholeLibraryPublication
+                        {
+                            settleWholeLibrary(currentProjection)
+                        }
+                        return
+                    }
+                    guard shownRevisions == shownTimelineRevisions, publishedAfterCache == wholeLibraryPublication
+                    else {
+                        return
+                    }
                     if case .terminalFailure = cacheValidation {
                         initialLoadFailureReason = .scopeAccessLost
                         return
@@ -704,9 +745,14 @@ public final class TimelineViewModel {
         do {
             let refreshed = try await repository.loadTimelineSnapshot()
             let projection = await normalizeOffMain(refreshed.sections, for: .all)
-            // A route switch, a cancellation, or a newer publication of the whole library during the read supersedes
-            // this older listing. Another route's grid does not: it leaves the whole library unchanged.
-            guard !Task.isCancelled, filter == .all, publishedBeforeLoad == wholeLibraryPublication else { return }
+            // A cancellation or a newer publication of the whole library during the read supersedes this older listing.
+            // Another route's grid does not: it leaves the whole library unchanged.
+            guard !Task.isCancelled, publishedBeforeLoad == wholeLibraryPublication else { return }
+            guard filter == .all else {
+                // A route switch during the read: the listing is the whole library, but the grid keeps its route.
+                settleWholeLibrary(projection)
+                return
+            }
             initialAuthoritativeAddedUIDs =
                 hadInventoryBaseline
                 ? LibraryInventoryDelta.addedUIDs(previous: wholeLibraryUIDs, current: projection.uids)
@@ -743,6 +789,13 @@ public final class TimelineViewModel {
         let gridChanged = projection.uids != wholeLibraryUIDs
         updateAllRouteSnapshot(projection)
         await displayAllContent(projection.sections, restartPrefetch: gridChanged)
+    }
+
+    /// Makes a current whole-library result the whole library for location work, the viewer and the Map while another
+    /// route is shown. The grid keeps that route; returning to All Photos shows the snapshot.
+    private func settleWholeLibrary(_ projection: TimelineContentProjection) {
+        updateWholeLibraryAuthority(.authoritative)
+        updateAllRouteSnapshot(projection)
     }
 
     /// Re-publishes already retained `.all` sections without rebuilding their canonical snapshot/index.
@@ -786,6 +839,15 @@ public final class TimelineViewModel {
         let shownWholeLibrary = f == .all ? wholeLibrarySnapshot : nil
         let shownRevisions = shownTimelineRevisions
         let publishedBeforeRefresh = wholeLibraryPublication
+        let superseded = { (message: String) -> TimelineRefreshResult in
+            TimelineRefreshResult(
+                uploadedUID: uploadedUID, foundItem: nil,
+                timelineCountBefore: before, timelineCountAfter: self.allItems.count,
+                filterDescription: Self.describe(f), elapsedMs: self.elapsedMilliseconds(since: start),
+                errorMessage: message,
+                failureReason: .superseded
+            )
+        }
         do {
             let loaded = try await freshSnapshot(for: f)
             let refresh = await prepareRefreshOffMain(
@@ -795,13 +857,12 @@ public final class TimelineViewModel {
             let projection = refresh.projection
             let sections = projection.sections
             guard filter == f else {  // a sidebar switch landed mid-refresh - don't clobber the new route
-                return TimelineRefreshResult(
-                    uploadedUID: uploadedUID, foundItem: nil,
-                    timelineCountBefore: before, timelineCountAfter: allItems.count,
-                    filterDescription: Self.describe(f), elapsedMs: elapsedMilliseconds(since: start),
-                    errorMessage: "superseded by route switch",
-                    failureReason: .superseded
-                )
+                return superseded("superseded by route switch")
+            }
+            // A trash, restore or other publication of the whole library during the read overtakes this listing. It
+            // replaces neither the grid nor the snapshot. The monitor reads again: this result acknowledges no revision.
+            if f == .all, publishedBeforeRefresh != wholeLibraryPublication {
+                return superseded("superseded by a newer library change")
             }
             // The off-main comparisons hold while nothing else published since this refresh started.
             let comparison = shownRevisions == shownTimelineRevisions ? refresh : nil
@@ -838,11 +899,8 @@ public final class TimelineViewModel {
             allItems = items
             state = items.isEmpty ? .empty : .loaded(sections)
             if f == .all {
-                // The grid shows this refresh (#798). Location work waits for a listing that nothing overtook.
-                let overtaken = publishedBeforeRefresh != wholeLibraryPublication
                 updateWholeLibraryAuthority(.authoritative)
-                updateAllRouteSnapshot(
-                    projection, change: wholeLibraryChange, source: overtaken ? .overtakenListing : .listing)
+                updateAllRouteSnapshot(projection, change: wholeLibraryChange)
             } else {
                 filterCache.insert(sections, for: f, activeRoute: filter)
             }  // keep the route's instant-revisit view fresh

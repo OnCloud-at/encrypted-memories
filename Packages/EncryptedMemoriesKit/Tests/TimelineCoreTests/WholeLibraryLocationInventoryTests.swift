@@ -472,6 +472,9 @@ import Testing
         #expect(
             fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")],
             "M684_ROUTE_SWITCH_GRID: the whole library must not replace the open album")
+        #expect(
+            fixture.timeline.wholeLibraryItemsForLocations == fixture.items,
+            "M799_FULL_LISTING_SETTLES: the listing is the whole library although the album is shown")
         await fixture.close()
     }
 
@@ -545,6 +548,46 @@ import Testing
             outcome == .probeCancelled,
             "M684_EMPTY_STOPS_RUNNING_SCAN: an empty library must stop the crawl of the older library")
         #expect(!fixture.session.isStarted)
+        await fixture.session.stoppingTask?.value
+        #expect(
+            fixture.index.scanProgress.phase == .completed,
+            "M801_EMPTY_NOT_SCANNING: the empty Map must not keep showing that it is scanning")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func anEmptyLibraryKeepsAFailedScanState() async throws {
+        let fixture = try await LocationInventoryFixture.make()
+        fixture.index.updateScanProgress(
+            PhotoLocationScanProgress(phase: .failed, scanned: 2, total: 3, found: 0, noLocation: 0, failed: 2))
+        await fixture.publish([])
+        await fixture.session.stoppingTask?.value
+        #expect(
+            fixture.index.scanProgress.phase == .failed,
+            "M801_EMPTY_KEEPS_FAILED: only a scan that the stop cut short is settled")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aLibraryThatBecomesNonEmptyWhileTheStopIsPendingStartsOneScan() async throws {
+        let fixture = try await LocationInventoryFixture.make()
+        let gate = InventoryGate()
+        defer { gate.open() }
+        fixture.probeGate = gate
+        var events = fixture.events.stream.makeAsyncIterator()
+        await fixture.publish(fixture.items)
+        while await events.next() != .probe {}
+        let startsBefore = fixture.session.crawlStartsForTesting
+
+        await fixture.publish([])
+        await fixture.publish(fixture.items)
+        await fixture.finishAdmittedCrawl()
+
+        #expect(
+            fixture.session.crawlStartsForTesting == startsBefore + 1,
+            "M801_EMPTY_THEN_FULL_ONE_SCAN: exactly one scan starts after the stop")
+        #expect(fixture.index.scanProgress.phase == .completed)
+        #expect(fixture.index.scanProgress.total == fixture.items.count)
         await fixture.close()
     }
 
@@ -590,7 +633,7 @@ import Testing
     }
 
     @Test(.timeLimit(.minutes(1)))
-    func aRefreshOvertakenByARestoreLeavesTheLibraryUnknownForLocations() async throws {
+    func aRefreshOvertakenByARestoreIsRejected() async throws {
         let restored = inventoryItem("b")
         let fixture = try await LocationInventoryFixture.make(
             items: [inventoryItem("a"), inventoryItem("c")], online: true)
@@ -604,28 +647,216 @@ import Testing
         while await events.next() != .fullReadEntered {}
 
         await fixture.timeline.commitRestore([restored])
-        await fixture.reconcile(fixture.timeline.wholeLibraryItemsForLocations)
+        let known = fixture.timeline.wholeLibraryItemsForLocations
         gate.open()
-        await refresh.value
-        #expect(
-            fixture.timeline.wholeLibraryItemsForLocations == nil,
-            "M684_OVERTAKEN_REFRESH_UNKNOWN: a refresh read before the restore must not be the location library")
+        let result = await refresh.value
 
-        // A trash on top of the overtaken refresh keeps the library unknown and its clean-up waiting.
-        await fixture.timeline.commitTrash([inventoryItem("c")])
-        #expect(fixture.timeline.wholeLibraryItemsForLocations == nil)
+        #expect(
+            result.failureReason == .superseded,
+            "M798_OVERTAKEN_REFRESH_REJECTED: the refresh read before the restore must not replace the snapshot")
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == known)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations?.contains(restored) == true)
+        #expect(fixture.timeline.allItems.contains(restored), "The grid keeps the restored photo")
         await fixture.reconcile(fixture.timeline.wholeLibraryItemsForLocations)
         #expect(
             fixture.persistedUIDs().contains(inventoryUID("b")),
-            "M684_OVERTAKEN_REFRESH_PINS: the restored photo's pin must stay")
+            "M798_OVERTAKEN_REFRESH_PINS: the restored photo's pin must stay")
 
-        // A refresh that nothing overtakes makes the library known again and releases the clean-up.
+        // A refresh that nothing overtakes still applies.
         await fixture.repository.setItems([inventoryItem("a"), restored])
-        await fixture.timeline.refreshLibrary()
+        let applied = await fixture.timeline.refreshLibrary()
+        #expect(applied.failureReason == nil)
         #expect(fixture.timeline.wholeLibraryItemsForLocations == [inventoryItem("a"), restored])
-        await fixture.publish(fixture.timeline.wholeLibraryItemsForLocations)
+        await fixture.reconcile(fixture.timeline.wholeLibraryItemsForLocations)
+        #expect(!fixture.persistedUIDs().contains(inventoryUID("c")), "The clean-up of the applied list removes c")
         #expect(fixture.persistedUIDs().contains(inventoryUID("b")))
-        #expect(!fixture.persistedUIDs().contains(inventoryUID("c")), "The waiting clean-up removed c's pin")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRefreshOvertakenByATrashIsRejectedEvenWhenItsListEqualsTheGrid() async throws {
+        let fixture = try await LocationInventoryFixture.make(
+            items: [inventoryItem("a"), inventoryItem("c")], online: true)
+        await fixture.timeline.load()
+        // The server list already lacks c, as the grid will after the trash: the refresh finds nothing to change.
+        await fixture.repository.setItems([inventoryItem("a")])
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let refresh = Task { await fixture.timeline.refreshLibrary() }
+        while await events.next() != .fullReadEntered {}
+
+        await fixture.timeline.commitTrash([inventoryItem("c")])
+        gate.open()
+        let result = await refresh.value
+
+        #expect(
+            result.failureReason == .superseded,
+            "M801_OVERTAKEN_UNCHANGED_REJECTED: an equal list that a trash overtook acknowledges no revision")
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == [inventoryItem("a")])
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aSavedLibraryConfirmedDuringARouteSwitchIsKnown() async throws {
+        let fixture = try await LocationInventoryFixture.make(
+            online: true, cached: [inventoryItem("a"), inventoryItem("b"), inventoryItem("c")], cachedToken: "current")
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextTokenProbe(gate) { fixture.events.send(.tokenProbeEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let loading = Task { await fixture.timeline.load() }
+        while await events.next() != .tokenProbeEntered {}
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        gate.open()
+        await loading.value
+
+        #expect(fixture.timeline.filter == LocationInventoryRepository.album)
+        #expect(
+            fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")],
+            "M799_GRID_KEEPS_ALBUM: the saved library must not replace the open album")
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority == .authoritative)
+        #expect(
+            fixture.timeline.wholeLibraryItemsForLocations == fixture.items,
+            "M799_CONFIRMED_SETTLES: a saved library the check proved current is known for location work")
+        #expect(await fixture.repository.fullReads == 0, "Settling adds no request")
+        // Back to All Photos shows the library.
+        await fixture.timeline.select(.all)
+        #expect(fixture.timeline.allItems == fixture.items)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRouteSwitchBeforeTheSavedLibraryIsReadProvesNothing() async throws {
+        let fixture = try await LocationInventoryFixture.make(
+            online: true, cached: [inventoryItem("a"), inventoryItem("b"), inventoryItem("c")], cachedToken: "current")
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextCacheRead(gate) { fixture.events.send(.cacheReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let loading = Task { await fixture.timeline.load() }
+        while await events.next() != .cacheReadEntered {}
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        gate.open()
+        await loading.value
+
+        #expect(
+            fixture.timeline.wholeLibraryItemsForLocations == nil,
+            "M799_NO_PROOF: nothing was confirmed, so the library stays unknown")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aSavedLibraryThatATrashOvertookStaysUnknownAfterARouteSwitch() async throws {
+        let fixture = try await LocationInventoryFixture.make(
+            online: true, cached: [inventoryItem("a"), inventoryItem("b"), inventoryItem("c")], cachedToken: "current")
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextTokenProbe(gate) { fixture.events.send(.tokenProbeEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let loading = Task { await fixture.timeline.load() }
+        while await events.next() != .tokenProbeEntered {}
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        await fixture.timeline.commitTrash([inventoryItem("c")])
+        gate.open()
+        await loading.value
+
+        #expect(
+            fixture.timeline.wholeLibraryItemsForLocations == nil,
+            "M799_OVERTAKEN_STAYS_UNKNOWN: a trash during the check means the confirmed list is not current")
+        await fixture.close()
+    }
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func aTrashProjectionThatAReloadOvertookRunsAgainOnTheNewerLibrary() async throws {
+            // The saved library [a, c]; the server library is [a, b].
+            let fixture = try await LocationInventoryFixture.make(
+                items: [inventoryItem("a"), inventoryItem("b")], online: true,
+                cached: [inventoryItem("a"), inventoryItem("c")], cachedToken: "saved")
+            fixture.seed(["a", "b", "c"])
+            let probeGate = InventoryGate()
+            let projectionGate = InventoryGate()
+            let fullReadGate = InventoryGate()
+            defer {
+                probeGate.open()
+                projectionGate.open()
+                fullReadGate.open()
+            }
+            var events = fixture.events.stream.makeAsyncIterator()
+            await fixture.repository.holdNextTokenProbe(probeGate) { fixture.events.send(.tokenProbeEntered) }
+            let loading = Task { await fixture.timeline.load() }
+            while await events.next() != .tokenProbeEntered {}
+
+            // The trash of c commits and its projection computed [a] from the saved library; it waits before it writes.
+            var held = true
+            fixture.timeline.afterProjectionComputedForTesting = {
+                guard held else { return }
+                held = false
+                fixture.events.send(.projectionEntered)
+                await projectionGate.wait()
+            }
+            let trash = Task { await fixture.timeline.commitTrash([inventoryItem("c")]) }
+            while await events.next() != .projectionEntered {}
+            // The first load straddled the trash. It is dropped and leaves the saved library as it was.
+            probeGate.open()
+            await loading.value
+            #expect(fixture.timeline.wholeLibraryItemsForLocations == nil)
+
+            // A reload of All Photos starts after the trash was counted and reads [a, b]. The person opens an album
+            // before it finishes, so the result is settled for the whole library without touching the grid.
+            await fixture.timeline.select(LocationInventoryRepository.album)
+            await fixture.repository.holdNextFullRead(fullReadGate) { fixture.events.send(.fullReadEntered) }
+            let reload = Task { await fixture.timeline.select(.all) }
+            while await events.next() != .fullReadEntered {}
+            await fixture.timeline.select(LocationInventoryRepository.album)
+            fullReadGate.open()
+            await reload.value
+            #expect(fixture.timeline.wholeLibraryItemsForLocations == [inventoryItem("a"), inventoryItem("b")])
+
+            projectionGate.open()
+            await trash.value
+            let known = fixture.timeline.wholeLibraryItemsForLocations
+            #expect(
+                known == [inventoryItem("a"), inventoryItem("b")],
+                "M801_OLDER_PROJECTION_RERUNS: the older projection must not overwrite the newer library")
+            await fixture.reconcile(known)
+            #expect(
+                fixture.persistedUIDs().contains(inventoryUID("b")),
+                "M801_OLDER_PROJECTION_PINS: the clean-up must not remove the pin of b")
+            #expect(!fixture.persistedUIDs().contains(inventoryUID("c")))
+            await fixture.close()
+        }
+
+    #endif
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRefreshThatAnEqualNewerListingOvertookIsRejected() async throws {
+        let fixture = try await LocationInventoryFixture.make(
+            items: [inventoryItem("a"), inventoryItem("b")], online: true)
+        await fixture.timeline.load()
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        // The refresh reads an older server state [a] and waits.
+        await fixture.repository.setItems([inventoryItem("a")])
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let refresh = Task { await fixture.timeline.refreshLibrary() }
+        while await events.next() != .fullReadEntered {}
+
+        // A newer load of All Photos publishes [a, b] again: the same content and the same authority as before.
+        await fixture.repository.setItems(fixture.items)
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        await fixture.timeline.select(.all)
+        gate.open()
+        let result = await refresh.value
+
+        #expect(
+            result.failureReason == .superseded,
+            "M801_EQUAL_NEWER_LISTING: a newer listing with equal content still overtakes an older refresh")
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        #expect(fixture.timeline.allItems == fixture.items)
         await fixture.close()
     }
 }
@@ -1349,6 +1580,8 @@ private actor LocationInventoryRepository: PhotosRepository, PhotoLibraryProvide
     private var fullReadEntered: (@Sendable () -> Void)?
     private var cacheReadGate: InventoryGate?
     private var cacheReadEntered: (@Sendable () -> Void)?
+    private var tokenProbeGate: InventoryGate?
+    private var tokenProbeEntered: (@Sendable () -> Void)?
     private var failingFullReads = 0
     private(set) var fullReads = 0
     private(set) var filteredReads = 0
@@ -1371,6 +1604,11 @@ private actor LocationInventoryRepository: PhotosRepository, PhotoLibraryProvide
         cacheReadGate = gate
         cacheReadEntered = entered
     }
+    /// Holds the next validation probe of the saved library, until `gate` opens.
+    func holdNextTokenProbe(_ gate: InventoryGate, entered: @escaping @Sendable () -> Void) {
+        tokenProbeGate = gate
+        tokenProbeEntered = entered
+    }
     /// Holds the next full listing after it read the server list, until `gate` opens.
     func holdNextFullRead(_ gate: InventoryGate, entered: @escaping @Sendable () -> Void) {
         fullReadGate = gate
@@ -1391,6 +1629,11 @@ private actor LocationInventoryRepository: PhotosRepository, PhotoLibraryProvide
     /// The validation probe fails while offline.
     func libraryChangeToken() async throws -> String {
         guard online else { throw InventoryOffline() }
+        if let gate = tokenProbeGate {
+            tokenProbeGate = nil
+            tokenProbeEntered?()
+            await gate.wait()
+        }
         return "current"
     }
     func loadTimeline() async throws -> [TimelineSection] {
@@ -1428,6 +1671,7 @@ private struct InventoryThumbnails: ThumbnailBatchLoader {
 
 private enum InventoryEvent: Sendable, Equatable {
     case projectionEntered, ownerFinished, probe, crawlFinished, factsCaptured, fullReadEntered, cacheReadEntered
+    case tokenProbeEntered
     case probeCancelled, probeReleased
 }
 
