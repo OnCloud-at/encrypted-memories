@@ -131,7 +131,8 @@ final class BackupExecutionLockStoreTests: XCTestCase {
             store.acquire(owner: .manual, runID: "contender"), .unavailable,
             "an unreadable lock must not admit a new owner")
         XCTAssertGreaterThan(duringPrepare ? authorization.deniedSelects : interruption.interruptedSelects, 0)
-        XCTAssertFalse(store.heartbeat(runID: "owner", phase: "changed"))
+        XCTAssertEqual(
+            store.heartbeat(runID: "owner", phase: "changed"), .unavailable, "an unreadable lock is not a lost lock")
         XCTAssertTrue(store.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(1)).isEmpty)
         XCTAssertTrue(
             store.recoverAbandonedProcessLocks(
@@ -149,6 +150,90 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         XCTAssertTrue(store.release(runID: "owner"))
         XCTAssertTrue(
             store.acquire(owner: .manual, runID: "later").didAcquire, "confirmed absence still permits acquisition")
+    }
+
+    func testHeartbeatReportsALockTakenByAnotherRunOrRemovedAsLost() throws {
+        let store = try makeStore()
+        defer { store.close() }
+        let other = try makeStore()
+        defer { other.close() }
+        XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .renewed)
+
+        clock.advance(by: 200)
+        XCTAssertEqual(other.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(-120)).map(\.runID), ["owner"])
+        XCTAssertTrue(other.acquire(owner: .background, runID: "successor").didAcquire)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: "uploading"), .lost)
+        XCTAssertEqual(store.currentLock()?.runID, "successor", "a lost heartbeat never writes the row")
+
+        XCTAssertTrue(other.release(runID: "successor"))
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .lost, "a removed lock is lost too")
+        XCTAssertNil(store.currentLock(), "a lost heartbeat never recreates the row")
+    }
+
+    func testHeartbeatThatCannotReadKeepsTheLockAndRenewsLater() throws {
+        let connection = try makeVerifiedConnection(url: tempDir.appendingPathComponent("unreadable-heartbeat.sqlite"))
+        let store = BackupExecutionLockManifestStore(connection: connection, now: { [clock] in clock!.now })
+        defer { store.close() }
+        XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
+        let acquired = try XCTUnwrap(store.currentLock())
+        let authorization = SelectAuthorization()
+        connection.withLock { authorization.install(on: connection.database) }
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable)
+        XCTAssertGreaterThan(authorization.deniedSelects, 0)
+        connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) }
+        XCTAssertEqual(store.currentLock(), acquired, "a failed read changes nothing")
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .renewed)
+        XCTAssertEqual(store.currentLock()?.heartbeatAt, clock.now)
+    }
+
+    func testHeartbeatThatCannotWriteKeepsTheLockAndRenewsLater() throws {
+        let url = tempDir.appendingPathComponent(BackupExecutionLockManifestStore.databaseFileName)
+        let noWait = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        let store = try XCTUnwrap(
+            BackupExecutionLockManifestStore(url: url, policy: noWait, now: { [clock] in clock!.now }))
+        defer { store.close() }
+        XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
+        let acquired = try XCTUnwrap(store.currentLock())
+        var writer: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &writer), SQLITE_OK)
+        defer { sqlite3_close(writer) }
+        XCTAssertEqual(sqlite3_exec(writer, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable, "a busy writer is not a lost lock")
+        XCTAssertEqual(sqlite3_exec(writer, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(store.currentLock(), acquired)
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .renewed)
+        XCTAssertEqual(store.currentLock()?.heartbeatAt, clock.now)
+    }
+
+    func testHeartbeatThatCannotPrepareItsWriteKeepsTheLockAndRenewsLater() throws {
+        let connection = try makeVerifiedConnection(url: tempDir.appendingPathComponent("unwritable-heartbeat.sqlite"))
+        let store = BackupExecutionLockManifestStore(connection: connection, now: { [clock] in clock!.now })
+        defer { store.close() }
+        XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
+        let acquired = try XCTUnwrap(store.currentLock())
+        connection.withLock {
+            sqlite3_set_authorizer(
+                connection.database, { _, action, _, _, _, _ in action == SQLITE_UPDATE ? SQLITE_DENY : SQLITE_OK },
+                nil)
+        }
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable)
+        connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) }
+        XCTAssertEqual(store.currentLock(), acquired)
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .renewed)
+        XCTAssertEqual(store.currentLock()?.heartbeatAt, clock.now)
     }
 
     func testAcquireAndRelease() throws {
@@ -227,7 +312,7 @@ final class BackupExecutionLockStoreTests: XCTestCase {
 
         XCTAssertNil(store.currentLock())
         XCTAssertEqual(store.acquire(owner: .foreground, runID: "closed"), .unavailable)
-        XCTAssertFalse(store.heartbeat(runID: "closed", phase: "uploading"))
+        XCTAssertEqual(store.heartbeat(runID: "closed", phase: "uploading"), .unavailable)
         XCTAssertFalse(store.release(runID: "closed"))
         XCTAssertTrue(store.recoverStaleLocks(olderThan: clock.now).isEmpty)
     }
@@ -245,7 +330,7 @@ final class BackupExecutionLockStoreTests: XCTestCase {
 
         XCTAssertNil(store.currentLock())
         XCTAssertEqual(store.acquire(owner: .manual, runID: "closed"), .unavailable)
-        XCTAssertFalse(store.heartbeat(runID: "owner", phase: "changed"))
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: "changed"), .unavailable)
         XCTAssertFalse(store.release(runID: "owner"))
         XCTAssertTrue(store.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(1)).isEmpty)
         XCTAssertTrue(
@@ -307,7 +392,7 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         XCTAssertTrue(store.acquire(owner: .foreground, runID: "fg").didAcquire)  // heartbeat @ t0
 
         clock.advance(by: 90)
-        XCTAssertTrue(store.heartbeat(runID: "fg", phase: "uploading"))  // heartbeat @ t0+90
+        XCTAssertEqual(store.heartbeat(runID: "fg", phase: "uploading"), .renewed)  // heartbeat @ t0+90
         XCTAssertEqual(store.currentLock()?.phase, "uploading")
 
         // A cutoff 60s in the past would have reaped the original heartbeat, but the refresh saved it.
@@ -315,7 +400,7 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         XCTAssertTrue(reaped.isEmpty, "a freshly heartbeated lock must survive stale recovery")
         XCTAssertEqual(store.currentLock()?.runID, "fg")
 
-        XCTAssertFalse(store.heartbeat(runID: "other", phase: nil), "only the owner may heartbeat")
+        XCTAssertEqual(store.heartbeat(runID: "other", phase: nil), .lost, "only the owner may heartbeat")
     }
 
     func testStaleLockCanBeRecoveredAndReacquired() throws {

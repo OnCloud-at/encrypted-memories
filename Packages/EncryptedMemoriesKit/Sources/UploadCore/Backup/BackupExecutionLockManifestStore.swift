@@ -107,9 +107,16 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
     }
 
     @discardableResult
-    public func heartbeat(runID: String, phase: String?) -> Bool {
+    public func heartbeat(runID: String, phase: String?) -> BackupLockHeartbeat {
         connection.withLock {
-            guard let existing = readLock(), existing.runID == runID else { return false }
+            let existing: BackupExecutionLock
+            switch readLockResult() {
+            case .failed: return .unavailable
+            case .confirmedAbsent: return .lost
+            case .row(let row):
+                guard row.runID == runID else { return .lost }
+                existing = row
+            }
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -117,13 +124,15 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
                     "UPDATE backup_execution_lock SET heartbeat_at=?, phase=? WHERE lock_name=? AND run_id=?;",
                     -1, &stmt, nil
                 ) == SQLITE_OK
-            else { return false }
+            else { return .unavailable }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_double(stmt, 1, now().timeIntervalSince1970)
             bindNullableText(stmt, 2, phase ?? existing.phase)
             bindText(stmt, 3, lockName)
             bindText(stmt, 4, runID)
-            return sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) > 0
+            guard sqlite3_step(stmt) == SQLITE_DONE else { return .unavailable }
+            // Another connection removed or replaced the row after the read.
+            return sqlite3_changes(db) > 0 ? .renewed : .lost
         }
     }
 
