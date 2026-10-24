@@ -24,7 +24,21 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     @ObservationIgnored private var buckets: [PhotoLocationQuerySnapshot.BucketID: [PhotoCoordinate]] = [:]
     /// Once the library has reconciled its live identities, late results from an older crawl may only merge
     /// coordinates that still belong to that library. `nil` preserves startup loading before identities arrive.
-    @ObservationIgnored private var allowedUIDs: Set<PhotoUID>?
+    @ObservationIgnored private var allowed: AllowList?
+
+    /// The photos that may store results after a clean-up: the library of that clean-up and, on top of it, the
+    /// library that the latest scan runs for.
+    private struct AllowList {
+        var retained: Set<PhotoUID>
+        /// The inventory revision at which the clean-up read its library. A list that was read at this revision or
+        /// earlier is older than the clean-up and never widens the index again.
+        let narrowedAfter: UInt64
+        /// The inventory of the latest scan. It is kept by reference, so a scan start makes no pass over the library.
+        var scanned: [PhotoUID: Date] = [:]
+        var scannedRevision: UInt64 = 0
+
+        func contains(_ uid: PhotoUID) -> Bool { retained.contains(uid) || scanned[uid] != nil }
+    }
 
     @ObservationIgnored public private(set) var coordinateGeneration = 0
     /// Changes when a classified snapshot becomes available, even without another crawl batch.
@@ -192,7 +206,7 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     public func replaceAll(_ snapshot: PhotoLocationSnapshot) {
         invalidatePlaceEvidence()
         resetPlaceEvidenceAdmission()
-        allowedUIDs = nil
+        allowed = nil
         coordinates = snapshot.coordinates
         seen = Set(coordinates.map(\.uid))
         noLocationUIDs = snapshot.noLocationUIDs.subtracting(seen)
@@ -208,7 +222,7 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     public func merge(_ coords: [PhotoCoordinate]) -> [PhotoCoordinate] {
         var accepted: [PhotoCoordinate] = []
         for c in coords
-        where (allowedUIDs?.contains(c.uid) ?? true)
+        where (allowed?.contains(c.uid) ?? true)
             && (!seen.contains(c.uid) || noLocationUIDs.contains(c.uid))
         {
             guard Self.isValid(c) else { continue }
@@ -230,7 +244,7 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     public func markNoLocation(_ uids: some Sequence<PhotoUID>) -> Set<PhotoUID> {
         var accepted = Set<PhotoUID>()
         for uid in uids
-        where (allowedUIDs?.contains(uid) ?? true)
+        where (allowed?.contains(uid) ?? true)
             && !seen.contains(uid)
         {
             noLocationUIDs.insert(uid)
@@ -240,11 +254,16 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
         return accepted
     }
 
-    /// Lets a scan of a known library store results for every photo of that library. Only `retainOnly` narrows
-    /// what the index accepts; without an allow-list every photo is accepted already. The union runs on the main
-    /// actor and costs one pass over `uids`, only while an allow-list exists.
-    public func accept(_ uids: some Sequence<PhotoUID>) {
-        allowedUIDs?.formUnion(uids)
+    /// Lets a scan of a known library store results for every photo of that library, also for photos that a clean-up
+    /// excluded. Only `retainOnly` narrows what the index accepts; without a clean-up every photo is accepted already.
+    /// `revision` is the inventory revision at which the library was read. A library that is not newer than the last
+    /// clean-up, or older than the library of an earlier accept, is ignored: a late list never undoes a clean-up or a
+    /// newer list. The library of the latest scan replaces the one of an earlier scan, so a photo that a newer library
+    /// lacks is not accepted any more. The call keeps the inventory by reference and makes no pass over it.
+    public func accept(_ inventory: LocationCrawlInventory, revision: UInt64) {
+        guard let list = allowed, revision > list.narrowedAfter, revision >= list.scannedRevision else { return }
+        allowed?.scanned = inventory.captureDates
+        allowed?.scannedRevision = revision
     }
 
     /// Reconciles the index with the authoritative whole-library identities and persists the filtered encrypted
@@ -252,12 +271,13 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     public func retainOnly(
         _ uids: Set<PhotoUID>,
         persistTo store: PhotoLocationStore? = nil,
-        sessionLease: PhotoLocationStore.SessionLease? = nil
+        sessionLease: PhotoLocationStore.SessionLease? = nil,
+        afterInventoryRevision inventoryRevision: UInt64 = 0
     ) async {
         if let store, let sessionLease, !store.isCurrentSessionLease(sessionLease) {
             return
         }
-        allowedUIDs = uids
+        allowed = AllowList(retained: uids, narrowedAfter: inventoryRevision)
         let retained = coordinates.filter { uids.contains($0.uid) }
         let retainedNegatives = noLocationUIDs.intersection(uids)
         if retained.count != coordinates.count || retainedNegatives != noLocationUIDs {

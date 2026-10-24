@@ -549,6 +549,122 @@ import Testing
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func aWaitingScanProbesTheNewestLibraryNotTheOneItWasStartedWith() async throws {
+        let fixture = try await LocationInventoryFixture.make()
+        let release = InventoryGate()
+        defer { release.open() }
+        let prerequisite = Task { await release.wait() }
+        await fixture.publish(fixture.items, awaiting: prerequisite)
+        #expect(fixture.session.startingTask != nil)
+        // A newer publication removed b and c while the scan waits for its start.
+        await fixture.publish([inventoryItem("a")])
+        release.open()
+        await prerequisite.value
+        await fixture.finishAdmittedCrawl()
+
+        #expect(
+            Set(fixture.probes.values) == [inventoryUID("a")],
+            "M801_WAITING_SCAN_NEWEST: a photo that a newer publication removed must not be probed")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aCleanUpThatWaitsSurvivesAReconfigurationOfTheSameAccount() async throws {
+        let fixture = try await LocationInventoryFixture.make()
+        fixture.seed(["b", "d"])
+        fixture.mapSwitch.isOn = false
+        await fixture.reconcile(nil)
+        // The same account is configured again: the connection is rebuilt.
+        _ = fixture.session.invalidate()
+        fixture.configurationGeneration += 1
+        await fixture.publish(fixture.items)
+        #expect(
+            fixture.persistedUIDs() == [inventoryUID("b")],
+            "M801_RECONFIGURE_KEEPS_CLEANUP: the waiting clean-up must still remove d's pin")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aCleanUpThatWaitsIsDroppedForAnotherAccountAndForATeardown() async throws {
+        let otherAccount = try await LocationInventoryFixture.make()
+        otherAccount.seed(["b", "d"])
+        otherAccount.mapSwitch.isOn = false
+        await otherAccount.reconcile(nil)
+        _ = otherAccount.session.invalidate()
+        otherAccount.accountUID = "other"
+        await otherAccount.publish(otherAccount.items)
+        #expect(
+            otherAccount.persistedUIDs() == [inventoryUID("b"), inventoryUID("d")],
+            "M801_OTHER_ACCOUNT_DROPS_CLEANUP: a clean-up of another account must not prune this account")
+        // The first account comes back: the clean-up was discarded by the other account's publication, so nothing runs.
+        otherAccount.accountUID = "inventory"
+        await otherAccount.publish(otherAccount.items)
+        #expect(
+            otherAccount.persistedUIDs() == [inventoryUID("b"), inventoryUID("d")],
+            "M801_OTHER_ACCOUNT_DISCARDS_CLEANUP: the discarded clean-up must not run for the first account later")
+        await otherAccount.close()
+
+        let teardown = try await LocationInventoryFixture.make()
+        teardown.seed(["b", "d"])
+        teardown.mapSwitch.isOn = false
+        await teardown.reconcile(nil)
+        _ = teardown.session.retire()
+        await teardown.publish(teardown.items)
+        #expect(
+            teardown.persistedUIDs() == [inventoryUID("b"), inventoryUID("d")],
+            "M801_TEARDOWN_DROPS_CLEANUP: a sign-out drops the waiting clean-up")
+        await teardown.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aDelayedStartCannotUndoACleanUpThatCompletedBeforeIt() async throws {
+        let fixture = try await LocationInventoryFixture.make()
+        let release = InventoryGate()
+        defer { release.open() }
+        let prerequisite = Task { await release.wait() }
+        await fixture.publish(fixture.items, awaiting: prerequisite)
+        #expect(fixture.session.startingTask != nil)
+        // A trash of b completes its clean-up while the scan still waits with the older list [a, b, c].
+        await fixture.reconcile([inventoryItem("a"), inventoryItem("c")])
+        release.open()
+        await prerequisite.value
+        await fixture.finishAdmittedCrawl()
+
+        #expect(
+            fixture.probes.values.contains(inventoryUID("b")),
+            "SETUP: the waiting scan still probes the list it read")
+        #expect(
+            !fixture.persistedUIDs().contains(inventoryUID("b")),
+            "M801_DELAYED_START_KEEPS_CLEANUP: a list that is older than the clean-up must not bring b's pin back")
+        #expect(fixture.persistedUIDs().contains(inventoryUID("a")))
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRunningScanStoresAPhotoThatANewPublicationAddsAfterACleanUp() async throws {
+        let fixture = try await LocationInventoryFixture.make()
+        // A clean-up restricted what the index accepts to a.
+        await fixture.reconcile([inventoryItem("a")])
+        let gate = InventoryGate()
+        defer { gate.open() }
+        fixture.probeGate = gate
+        var events = fixture.events.stream.makeAsyncIterator()
+        await fixture.publish([inventoryItem("a")])
+        while await events.next() != .probe {}
+
+        // Photo b arrives while the scan of [a] runs.
+        await fixture.publish([inventoryItem("a"), inventoryItem("b")])
+        gate.open()
+        await fixture.finishAdmittedCrawl()
+
+        #expect(fixture.probes.values.contains(inventoryUID("b")), "SETUP: the running scan reads the new list")
+        #expect(
+            fixture.persistedUIDs().contains(inventoryUID("b")),
+            "M801_RUNNING_SCAN_ACCEPTS_NEW_PHOTO: the index must accept the photo that the running scan probes")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func aPublicationWithMapAndPlacesOffReconcilesWithoutScanning() async throws {
         let fixture = try await LocationInventoryFixture.make()
         fixture.seed(["b", "d"])
@@ -631,7 +747,33 @@ import Testing
 }
 
 #if DEBUG
+
     @Suite @MainActor struct WholeLibraryLocationGuardTests {
+        @Test(.timeLimit(.minutes(1)))
+        func aPublicationThatLandsDuringTheLastInventoryReadIsTheOneTheScanUses() async throws {
+            let fixture = try await LocationInventoryFixture.make()
+            let release = InventoryGate()
+            defer { release.open() }
+            let prerequisite = Task { await release.wait() }
+            await fixture.publish(fixture.items, awaiting: prerequisite)
+            var replaced = false
+            fixture.session.afterInventoryReadForTesting = {
+                guard !replaced else { return }
+                replaced = true
+                // The newer library arrives while the older inventory is still awaited.
+                fixture.session.updateInventory([inventoryItem("a")])
+            }
+            release.open()
+            await prerequisite.value
+            await fixture.finishAdmittedCrawl()
+
+            #expect(replaced, "SETUP: the hook ran")
+            #expect(
+                Set(fixture.probes.values) == [inventoryUID("a")],
+                "M801_LAST_AWAIT_REVALIDATED: a photo that the newer library lacks must not be probed")
+            await fixture.close()
+        }
+
         @Test(.timeLimit(.minutes(1)))
         func coalescedUnknownMutationsConsumeOneCompletePublication() async throws {
             let fixture = try await LocationInventoryFixture.make()
@@ -1214,6 +1356,8 @@ import Testing
     var configurationGeneration: UInt64 = 0
     /// Holds every GPS probe after it was recorded, so a test can act while a crawl scans.
     var probeGate: InventoryGate?
+    /// The account that the next start facts belong to.
+    var accountUID = "inventory"
 
     private init(items: [PhotoItem], online: Bool, cached: [PhotoItem]?, cachedToken: String) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -1252,7 +1396,7 @@ import Testing
         let probes = probes
         let probeGate = probeGate
         return .init(
-            accountUID: "inventory",
+            accountUID: accountUID,
             location: { uid in
                 probes.record(uid)
                 events.send(.probe)

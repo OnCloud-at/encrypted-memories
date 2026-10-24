@@ -111,6 +111,8 @@ public final class LocationCrawlSession {
 
     #if DEBUG
         public var beforeWholeLibraryUIDProjectionForTesting: (@Sendable () async -> Void)? = nil
+        /// Runs after a read of the inventory returned and before its revision is compared with the newest one.
+        var afterInventoryReadForTesting: (@MainActor () async -> Void)?
     #endif
 
     public init(
@@ -154,11 +156,22 @@ public final class LocationCrawlSession {
         guard !items.isEmpty else { return pause() }
         if restarting { prepareRestart() }
         guard MapAndPlacesPolicy.allowsLocationCrawl(enabled: isEnabled(), itemCount: items.count) else { return }
-        // The scan may store results for every photo it scans; only a clean-up narrows what the index accepts.
-        index.accept(items.lazy.map(\.uid))
         updateInventory(items)
         if finishedWithOutdatedInventory { prepareRestart() }
-        start(items: items, makeStart())
+        // A crawl that runs reads the new list at its next checkpoint; the index must accept its photos by then.
+        if isStarted { acceptPublishedInventory() }
+        start(items: items, makeStart(), acceptingInventory: true)
+    }
+
+    /// Lets the index accept the library that was just published once its inventory is built off the main actor. The
+    /// revision keeps a late result from replacing a newer one or from undoing a clean-up.
+    private func acceptPublishedInventory() {
+        guard let task = inventoryTask else { return }
+        let revision = inventoryRevision
+        Task { [weak self] in
+            let inventory = await task.value
+            self?.index.accept(inventory, revision: revision)
+        }
     }
 
     /// The owner that a publication or reconciliation captures when its work starts, before any suspension.
@@ -243,6 +256,8 @@ public final class LocationCrawlSession {
         start: Start,
         isCurrent: @MainActor () -> Bool
     ) async -> ReconcileOutcome {
+        // The clean-up reads its library now: every list published up to this revision is older than it.
+        let inventoryRevisionAtRead = inventoryRevision
         guard admitsReconciliation(pending, attempt: reconciliationAttempt, start: start, isCurrent: isCurrent) else {
             return rejection(of: pending, attempt: reconciliationAttempt, start: start)
         }
@@ -264,7 +279,8 @@ public final class LocationCrawlSession {
         guard admitsReconciliation(pending, attempt: attempt, start: start, isCurrent: isCurrent),
             store.isCurrentSessionLease(lease)
         else { return rejection(of: pending, attempt: attempt, start: start) }
-        await index.retainOnly(uids, persistTo: store, sessionLease: lease)
+        await index.retainOnly(
+            uids, persistTo: store, sessionLease: lease, afterInventoryRevision: inventoryRevisionAtRead)
         guard admitsReconciliation(pending, attempt: attempt, start: start, isCurrent: isCurrent),
             store.isCurrentSessionLease(lease)
         else { return rejection(of: pending, attempt: attempt, start: start) }
@@ -300,8 +316,9 @@ public final class LocationCrawlSession {
     }
 
     /// Starts the crawl once; repeated calls do nothing until a pause, restart or retirement. `items` builds the
-    /// inventory when none exists yet.
-    public func start(items: [PhotoItem], _ start: Start) {
+    /// inventory when none exists yet. With `acceptingInventory` the scan may store results for every photo of the
+    /// inventory that it reads when it begins, also after a clean-up excluded them.
+    public func start(items: [PhotoItem], _ start: Start, acceptingInventory: Bool = false) {
         guard !isStarted else { return }
         isStarted = true
         generation &+= 1
@@ -333,8 +350,6 @@ public final class LocationCrawlSession {
                 guard let lease = store.captureSessionLease() else { return }
                 sessionLease = lease
             }
-            let inventory = await initialInventory?.value ?? LocationCrawlInventory()
-            guard self.admits(crawlGeneration, start) else { return }
             // Give the thumbnail crawl a head start, then crawl GPS whenever the grid does not wait for visible
             // thumbnails. Do not use `hasPendingThumbnailWork()`: it includes whole-library fill and can starve
             // the Map behind a large thumbnail crawl.
@@ -345,6 +360,19 @@ public final class LocationCrawlSession {
             }
             guard sessionLease.map(store.isCurrentSessionLease) ?? true, self.admits(crawlGeneration, start)
             else { return }
+            // The newest inventory, not the one this start was called with: a publication may have replaced it while
+            // the start waited, and the crawl must not probe a photo that the newer library lacks. A publication can
+            // also land while the inventory is awaited, so the revision is checked again, a bounded number of times,
+            // and nothing is awaited between that check, the acceptance and the start.
+            var newest = await self.newestInventory(startedWith: initialInventory)
+            var rereads = 0
+            while newest.revision != self.inventoryRevision, rereads < 5, self.admits(crawlGeneration, start) {
+                rereads += 1
+                newest = await self.newestInventory(startedWith: initialInventory)
+            }
+            guard self.admits(crawlGeneration, start) else { return }
+            let inventory = newest.inventory
+            if acceptingInventory { index.accept(inventory, revision: newest.revision) }
             self.crawlStartsForTesting += 1
             await crawl.start(
                 uids: inventory.uids,
@@ -393,10 +421,17 @@ public final class LocationCrawlSession {
     }
 
     /// Rejects every admitted start of an earlier account configuration. Returns the cancelled start task, which
-    /// stays the predecessor of the next start.
+    /// stays the predecessor of the next start. The clean-up that waits belongs to the account, not to the
+    /// configuration: it stays for the next publication of the same account. A publication of another account drops it.
     @discardableResult
     public func invalidate() -> Task<Void, Never>? {
+        let waiting = pendingReconciliation
         discardPendingReconciliation()
+        if let waiting {
+            pendingReconciliation = PendingReconciliation(
+                revision: waiting.revision, generation: reconciliationGeneration, accountUID: waiting.accountUID,
+                recrawlRestoredItems: waiting.recrawlRestoredItems)
+        }
         generation &+= 1
         isStarted = false
         startTask?.cancel()
@@ -431,11 +466,29 @@ public final class LocationCrawlSession {
         !Task.isCancelled && crawlGeneration == generation && start.isCurrent() && isEnabled()
     }
 
+    private func newestInventory(
+        startedWith initial: Task<LocationCrawlInventory, Never>?
+    ) async -> (inventory: LocationCrawlInventory, revision: UInt64) {
+        guard inventoryTask != nil else {
+            return (await initial?.value ?? LocationCrawlInventory(), inventoryRevision)
+        }
+        return await readLatestInventory()
+    }
+
     private func latestInventory() async -> LocationCrawlInventory {
-        guard let task = inventoryTask else { return LocationCrawlInventory() }
+        guard inventoryTask != nil else { return LocationCrawlInventory() }
+        return await readLatestInventory().inventory
+    }
+
+    /// The inventory of the revision that was current when the read began, with that revision.
+    private func readLatestInventory() async -> (inventory: LocationCrawlInventory, revision: UInt64) {
+        guard let task = inventoryTask else { return (LocationCrawlInventory(), inventoryRevision) }
         let revision = inventoryRevision
         let inventory = await task.value
+        #if DEBUG
+            await afterInventoryReadForTesting?()
+        #endif
         crawlInventoryRevision = max(crawlInventoryRevision, revision)
-        return inventory
+        return (inventory, revision)
     }
 }
