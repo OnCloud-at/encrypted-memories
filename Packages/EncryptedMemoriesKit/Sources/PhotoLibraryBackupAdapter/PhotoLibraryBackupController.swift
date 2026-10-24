@@ -345,7 +345,7 @@ public final class PhotoLibraryBackupController {
                 uploader: uploader,
                 tagAdder: tagAdder,
                 editReplacement: editReplacement,
-                configuration: .init(retry: retryPolicy),
+                configuration: .init(retry: retryPolicy, leavesOutMissingLivePhotoVideos: true),
                 throttleInputs: runtimeSignals.current,
                 runtimeChanges: runtimeSignals.updates,
                 markSourceUnavailable: { source in

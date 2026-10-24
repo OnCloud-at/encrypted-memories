@@ -47,6 +47,10 @@ public actor BackupSyncRunner {
         /// How often a one-shot drain (`waitForScheduledRetries`, such as an album backup the user waits for) checks
         /// a photo the camera still processes again. Library passes check it once, at the end of the camera window.
         public var oneShotSourceRecheckInterval: TimeInterval
+        /// The photo library backup turns this on: on the last check of a Live Photo whose video Photos still reports
+        /// missing, it backs up the photo without its video. Off, every such photo keeps the end of a missing photo,
+        /// as for an album backup.
+        public var leavesOutMissingLivePhotoVideos: Bool
 
         public init(
             batchSize: Int = 32,
@@ -56,7 +60,8 @@ public actor BackupSyncRunner {
             uploadStallPollInterval: TimeInterval = 5,
             retry: BackupRetryPolicy = BackupRetryPolicy(),
             throttle: BackupThrottlePolicy = BackupThrottlePolicy(),
-            oneShotSourceRecheckInterval: TimeInterval = 30
+            oneShotSourceRecheckInterval: TimeInterval = 30,
+            leavesOutMissingLivePhotoVideos: Bool = false
         ) {
             self.batchSize = max(1, batchSize)
             self.staleActiveGrace = max(0, staleActiveGrace)
@@ -66,6 +71,7 @@ public actor BackupSyncRunner {
             self.retry = retry
             self.throttle = throttle
             self.oneShotSourceRecheckInterval = max(0, oneShotSourceRecheckInterval)
+            self.leavesOutMissingLivePhotoVideos = leavesOutMissingLivePhotoVideos
         }
     }
 
@@ -871,10 +877,11 @@ public actor BackupSyncRunner {
             let resolver = self.resolver
             let policy = configuration.throttle
             let inputs = throttleInputs
-            // Only the last check of a row whose file Photos reports missing may leave out the Live Photo video. A
-            // dismissed row keeps its check without an upload.
+            // Only the photo library backup, on the last check of a row whose file Photos reports missing, may leave
+            // out the Live Photo video. A dismissed row keeps its check without an upload.
             let omitsMissingPairedVideo =
-                !isSourceRecheck && Self.usedReportedMissingChecks(resolvingEntry, now: now())
+                configuration.leavesOutMissingLivePhotoVideos && !isSourceRecheck
+                && Self.usedReportedMissingChecks(resolvingEntry, now: now())
             let readAdmission: BackupResourceReadAdmission = {
                 try Task.checkCancellation()
                 if isSourceRecheck {
@@ -989,11 +996,14 @@ public actor BackupSyncRunner {
 
         let entry = checkingEntry
         // An edit, or the undo of one, moves its earlier uploads to the trash once it is backed up, and they can hold
-        // the Live Photo video. Without its video such a photo keeps today's end. This runs before the duplicate
-        // check, which records the earlier uploads that the next upload replaces.
-        if resolved.omitsMissingPairedVideo, let editReplacement,
-            editReplacement.isReplacing(entry.source)
-                || editReplacement.replacesEarlierUploads(of: entry.source, edited: Self.isEdited(resolved))
+        // the Live Photo video. Without the edit journal the backup cannot tell, so it assumes an edit. Such a photo
+        // keeps today's end before the duplicate check: it uploads nothing, replaces nothing, and moves nothing to the
+        // trash.
+        if resolved.omitsMissingPairedVideo,
+            editReplacement.map({
+                $0.isReplacing(entry.source)
+                    || $0.replacesEarlierUploads(of: entry.source, edited: Self.isEdited(resolved))
+            }) ?? true
         {
             retryOrPark(entry, from: persistedState, error: UploadError.sourceReportedMissing(entry.originalFilename))
             return
