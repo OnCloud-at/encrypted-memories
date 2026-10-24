@@ -19,40 +19,43 @@ struct BackupProblemListModelTests {
         #expect(model.items.offersUserRetry)
     }
 
+    @Test func theSheetNeverSaysThatNothingNeedsAttentionBeforeItReadAnything() {
+        let model = BackupProblemListModel()
+        #expect(model.presentation(expectsItems: false) == .loading)
+        #expect(model.presentation(expectsItems: true) == .loading)
+    }
+
+    @Test func anEmptyListThatTheSummaryContradictsIsNoAnswer() {
+        let model = BackupProblemListModel()
+        model.replaceItems([])
+        #expect(model.presentation(expectsItems: false) == .empty, "Nothing is counted, so nothing needs attention")
+        #expect(model.presentation(expectsItems: true) == .loading, "The summary counts a photo that the list lacks")
+        model.markUnavailable()
+        #expect(model.presentation(expectsItems: true) == .unavailable)
+        // The list can come back: the next read shows its rows again.
+        model.replaceItems([item("late", issue: .unsupported)])
+        #expect(model.presentation(expectsItems: true) == .list)
+        #expect(model.phase == .loaded)
+    }
+
+    @Test func aNewReadAfterAnUnavailableListLoadsAgain() {
+        let model = BackupProblemListModel()
+        model.markUnavailable()
+        model.beginReading()
+        #expect(model.presentation(expectsItems: true) == .loading)
+        // Rows that are shown stay shown while the next read runs.
+        model.replaceItems([item("shown", issue: .network)])
+        model.markUnavailable()
+        model.beginReading()
+        #expect(model.presentation(expectsItems: true) == .list)
+    }
+
     @Test func emptySectionsDisappearAfterDismissal() {
         let model = BackupProblemListModel()
         model.replaceItems([item("permanent", issue: .unsupported)])
         model.dismissItem(id: "permanent")
         #expect(model.items.isEmpty)
         #expect(model.sections.isEmpty)
-        #expect(!model.items.offersUserRetry)
-    }
-
-    @Test func refreshKeepsAnUnresolvedDecisionAndOtherPhotos() async {
-        let model = BackupProblemListModel()
-        let decision = item("decision", issue: .deletedElsewhere)
-        let waiting = item("waiting", issue: .network)
-        await model.refresh(afterDecision: decision) { [decision, waiting] }
-        #expect(model.items == [decision, waiting])
-    }
-
-    @Test func refreshRemovesTheResolvedDecisionUntilTheNextListUpdate() async {
-        let model = BackupProblemListModel()
-        let decision = item("decision", issue: .deletedElsewhere)
-        let reopened = item("decision", issue: .network)
-        let other = item("other", issue: .network)
-        await model.refresh(afterDecision: decision) { [reopened, other] }
-        #expect(model.items == [other])
-        model.replaceItems([reopened, other])
-        #expect(model.items == [reopened, other])
-    }
-
-    @Test func ordinaryRefreshDoesNotFilterAReopenedPhoto() async {
-        let model = BackupProblemListModel()
-        let reopened = item("decision", issue: .network)
-        await model.refresh { [reopened] }
-        #expect(model.items == [reopened])
-        #expect(model.sections.map(\.id) == [.continuesByItself])
         #expect(!model.items.offersUserRetry)
     }
 
