@@ -130,6 +130,9 @@ public final class LocationCrawlSession {
     /// The task that started the crawl last, for hosts that join it.
     public var startingTask: Task<Void, Never>? { startTask }
 
+    /// The task that stops the crawl last (`pause()` or an empty library), for hosts that join it.
+    public var stoppingTask: Task<Void, Never>? { privacyStopTask }
+
     /// Builds the crawl inventory of `items` off the main actor. A running crawl reads it at its next checkpoint.
     public func updateInventory(_ items: [PhotoItem]) {
         inventoryTask?.cancel()
@@ -150,8 +153,9 @@ public final class LocationCrawlSession {
     ) {
         guard let items else { return }
         // A known empty library has nothing to scan. The same stop as for Map and Places off ends a waiting start
-        // and the running crawl of the older library; the waiting clean-up stays.
-        guard !items.isEmpty else { return pause() }
+        // and the running crawl of the older library; the waiting clean-up stays. A scan that this stop cut short
+        // no longer shows as scanning.
+        guard !items.isEmpty else { return stopCrawl(settlingCutShortScan: true) }
         if restarting { prepareRestart() }
         guard MapAndPlacesPolicy.allowsLocationCrawl(enabled: isEnabled(), itemCount: items.count) else { return }
         // The scan may store results for every photo it scans; only a clean-up narrows what the index accepts.
@@ -381,14 +385,23 @@ public final class LocationCrawlSession {
 
     /// Stops the crawl for privacy (Map and Places off). A later start waits until it stopped.
     public func pause() {
+        stopCrawl(settlingCutShortScan: false)
+    }
+
+    private func stopCrawl(settlingCutShortScan: Bool) {
         generation &+= 1
         isStarted = false
         startTask?.cancel()
         let previousStop = privacyStopTask
         let crawl = crawl
+        let index = index
         privacyStopTask = Task {
             await previousStop?.value
             await crawl.cancel()
+            // The crawl has ended and publishes no more progress. A later start waits for this task.
+            if settlingCutShortScan, index.scanProgress.phase == .scanning {
+                index.updateScanProgress(PhotoLocationScanProgress(phase: .completed, found: index.coordinates.count))
+            }
         }
     }
 
