@@ -42,37 +42,147 @@ final class BackupReceiptRevisionTests: XCTestCase {
 
     // MARK: - The comparison that every source kind goes through
 
-    func testAReceiptBelongsOnlyToTheRevisionItWasSavedFor() throws {
+    func testAReceiptBelongsOnlyToTheRevisionWhoseBytesItUploaded() throws {
         for kind in [UploadSourceIdentity.Kind.fileURL, .photoLibraryAsset] {
             let entry = UploadBackupSyncQueueEntry(
                 source: UploadSourceIdentity(kind: kind, identifier: "/backup/photo.jpg"), revision: revision(10),
                 originalFilename: "photo.jpg", byteCount: 4, updatedAt: clock.now)
-            let bound = reconciliation(for: entry, descriptor: descriptor(for: entry), bindTo: entry.revision)
-            let legacy = reconciliation(for: entry, descriptor: nil, bindTo: nil)
+            func belongs(_ receipt: UploadRemoteCommitReconciliation, resolved: TimeInterval) -> Bool {
+                BackupSyncRunner.receiptBelongs(receipt, to: entry, resolvedRevision: revision(resolved))
+            }
+            let saved = descriptor(for: entry)
+            let unchanged = reconciliation(for: entry, descriptor: saved, binding: (10, 10))
+            let drifted = reconciliation(for: entry, descriptor: saved, binding: (10, 20))
+            let withoutUpload = reconciliation(for: entry, descriptor: saved, binding: (10, nil))
+            let legacy = reconciliation(for: entry, descriptor: nil, binding: nil)
+            let descriptorOnly = reconciliation(for: entry, descriptor: saved, binding: nil)
+            let bindingOnly = reconciliation(for: entry, descriptor: nil, binding: (10, 20))
 
-            XCTAssertTrue(
-                BackupSyncRunner.receiptBelongs(bound, to: entry, resolvedRevision: entry.revision), "\(kind)")
-            XCTAssertTrue(
-                BackupSyncRunner.receiptBelongs(legacy, to: entry, resolvedRevision: entry.revision), "\(kind)")
+            XCTAssertTrue(belongs(unchanged, resolved: 10), "\(kind)")
+            XCTAssertFalse(belongs(unchanged, resolved: 20), "a later change must not settle (\(kind))")
+            XCTAssertTrue(belongs(drifted, resolved: 20), "the uploaded revision settles (\(kind))")
             XCTAssertFalse(
-                BackupSyncRunner.receiptBelongs(bound, to: entry, resolvedRevision: revision(20)),
-                "a changed source must not settle with the receipt of its earlier revision (\(kind))")
+                belongs(drifted, resolved: 10), "the row revision is not what was uploaded (\(kind))")
+            XCTAssertTrue(belongs(withoutUpload, resolved: 10), "\(kind)")
+            XCTAssertFalse(belongs(withoutUpload, resolved: 20), "\(kind)")
+            XCTAssertTrue(belongs(legacy, resolved: 10), "\(kind)")
+            XCTAssertFalse(belongs(legacy, resolved: 20), "\(kind)")
+            XCTAssertTrue(belongs(descriptorOnly, resolved: 10), "a receipt without binding uses the row (\(kind))")
+            XCTAssertFalse(belongs(descriptorOnly, resolved: 20), "\(kind)")
+            XCTAssertTrue(belongs(bindingOnly, resolved: 20), "a binding needs no saved descriptor (\(kind))")
+            XCTAssertFalse(belongs(bindingOnly, resolved: 10), "\(kind)")
             XCTAssertFalse(
-                BackupSyncRunner.receiptBelongs(legacy, to: entry, resolvedRevision: revision(20)),
-                "an older receipt without a binding must not settle a changed source either (\(kind))")
-            XCTAssertFalse(
-                BackupSyncRunner.receiptBelongs(
-                    reconciliation(for: entry, descriptor: descriptor(for: entry), bindTo: revision(9)), to: entry,
-                    resolvedRevision: entry.revision),
+                belongs(reconciliation(for: entry, descriptor: saved, binding: (9, 10)), resolved: 10),
                 "a receipt bound to another row settles nothing (\(kind))")
-            XCTAssertFalse(
-                BackupSyncRunner.receiptBelongs(
-                    reconciliation(
-                        for: entry, descriptor: descriptor(for: entry, filename: "other.jpg"), bindTo: entry.revision),
-                    to: entry,
-                    resolvedRevision: entry.revision),
-                "a saved descriptor that does not match its row settles nothing (\(kind))")
         }
+    }
+
+    /// A receipt saved by a released build has no uploaded revision. It still decodes, and the row revision stands in.
+    func testAReceiptOfAReleasedBuildDecodesWithoutTheUploadedRevision() throws {
+        let entry = UploadBackupSyncQueueEntry(
+            source: .file(URL(fileURLWithPath: "/backup/released.jpg")), revision: revision(10),
+            originalFilename: "released.jpg", byteCount: 4, updatedAt: clock.now)
+        let current = reconciliation(for: entry, descriptor: descriptor(for: entry), binding: (10, nil))
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(current)) as? [String: Any])
+        var binding = try XCTUnwrap(json["queueBinding"] as? [String: Any])
+        XCTAssertNil(binding["uploadedRevision"], "a nil uploaded revision is not written")
+        binding.removeValue(forKey: "uploadedRevision")
+        json["queueBinding"] = binding
+        let released = try JSONDecoder().decode(
+            UploadRemoteCommitReconciliation.self, from: JSONSerialization.data(withJSONObject: json))
+
+        XCTAssertEqual(released.queueBinding?.revision, entry.revision)
+        XCTAssertNil(released.queueBinding?.uploadedRevision)
+        XCTAssertTrue(BackupSyncRunner.receiptBelongs(released, to: entry, resolvedRevision: revision(10)))
+        XCTAssertFalse(BackupSyncRunner.receiptBelongs(released, to: entry, resolvedRevision: revision(20)))
+    }
+
+    // MARK: - Route: the source changed after the scan and before the upload
+
+    /// The scan queued revision A, the photo changed, and the pass uploaded revision R. The receipt belongs to R, so
+    /// the next pass that resolves R settles it without hashing or uploading again, and the handoff stays `uploaded`.
+    func testAReceiptOfARevisionThatChangedBeforeTheUploadSettlesThatRevision() async throws {
+        let entry = seedEntry("drifted-before-upload.jpg", kind: .photoLibraryAsset)
+        let uploaded = resolver.defaultModified.addingTimeInterval(120)
+        resolver.setModified(uploaded, for: entry.source.identifier)
+        let events = HandoffLog()
+        let pipeline = makePipeline()
+        _ = await makeRunner(
+            identityResolver: RecordFailingIdentityResolver(inner: pipeline, failures: 2), events: events
+        ).runUntilDrained(mode: .eligibleOnly)
+        let receipt = try XCTUnwrap(
+            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertEqual(receipt.queueBinding?.revision, entry.revision)
+        XCTAssertEqual(receipt.queueBinding?.uploadedRevision, UploadBackupRevision(date: uploaded))
+        XCTAssertEqual(uploader.requests.count, 1)
+        let hashes = hasher.hashCount
+
+        clock.advance(by: 2)
+        _ = await makeRunner(identityResolver: pipeline, events: events).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(uploader.requests.count, 1, "the committed bytes are never uploaded again")
+        XCTAssertEqual(hasher.hashCount, hashes, "settling a receipt needs no hash")
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertEqual(identityStore.record(for: entry.source)?.remoteLinkID, receipt.receipt.remoteLinkID)
+        XCTAssertFalse(events.kinds.contains(.deduplicated), "the source keeps its uploaded handoff")
+        XCTAssertTrue(events.kinds.contains(.uploaded))
+    }
+
+    /// The same drift for the paired video of a Live Photo: its receipt belongs to the uploaded revision as well, so the
+    /// video settles without a second upload.
+    func testAVideoReceiptOfARevisionThatChangedBeforeTheUploadSettlesThatRevision() async throws {
+        let entry = seedEntry("drifted-live.jpg", kind: .photoLibraryAsset)
+        let uploaded = resolver.defaultModified.addingTimeInterval(120)
+        resolver.setModified(uploaded, for: entry.source.identifier)
+        resolver.setSecondaries(["drifted-live.mov"], for: entry.source.identifier)
+        let pipeline = makePipeline()
+        _ = await makeRunner(
+            identityResolver: RecordFailingIdentityResolver(
+                inner: pipeline, failures: 2, failureFilename: "drifted-live.mov")
+        ).runUntilDrained(mode: .eligibleOnly)
+        let receipt = try XCTUnwrap(
+            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertEqual(receipt.source.resource, .livePairedVideo)
+        XCTAssertEqual(receipt.queueBinding?.uploadedRevision, UploadBackupRevision(date: uploaded))
+
+        clock.advance(by: 3600)
+        _ = await makeRunner(identityResolver: pipeline).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(
+            uploader.requests.filter { $0.name == "drifted-live.mov" }.count, 1,
+            "the committed video is never uploaded again")
+        XCTAssertEqual(identityStore.record(for: receipt.source)?.remoteLinkID, receipt.receipt.remoteLinkID)
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+    }
+
+    // MARK: - Route: the source returned to the queued revision after another one was uploaded
+
+    /// The scan queued A, the pass uploaded B, and the source returned to A with the same date and size. The receipt
+    /// belongs to B and must not settle A.
+    func testAReceiptOfAnotherUploadedRevisionDoesNotSettleTheQueuedRevision() async throws {
+        let entry = seedEntry("returned.jpg")
+        let path = URL(fileURLWithPath: entry.source.identifier).path
+        resolver.setModified(resolver.defaultModified.addingTimeInterval(120), for: entry.source.identifier)
+        hasher.contentSeeds[path] = "revision B"
+        let pipeline = makePipeline()
+        _ = await makeRunner(identityResolver: RecordFailingIdentityResolver(inner: pipeline, failures: 2))
+            .runUntilDrained(mode: .eligibleOnly)
+        let receipt = try XCTUnwrap(
+            queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotEqual(receipt.queueBinding?.uploadedRevision, entry.revision)
+
+        resolver.setModified(resolver.defaultModified, for: entry.source.identifier)
+        hasher.contentSeeds[path] = nil
+        clock.advance(by: 2)
+        let recorder = RecordingIdentityResolver(inner: pipeline)
+        _ = await makeRunner(identityResolver: recorder).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertFalse(
+            recorder.linkIDs.contains(receipt.receipt.remoteLinkID), "the receipt of B must not settle A")
+        XCTAssertEqual(uploader.requests.count, 2, "A uploads its own bytes")
+        XCTAssertNotEqual(identityStore.record(for: entry.source)?.sha1Hex, receipt.identity.sha1Hex)
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     // MARK: - Route: the manifest write failed after the remote commit
@@ -187,17 +297,15 @@ final class BackupReceiptRevisionTests: XCTestCase {
         UploadBackupRevision(date: Date(timeIntervalSince1970: seconds))
     }
 
-    private func descriptor(
-        for entry: UploadBackupSyncQueueEntry, filename: String? = nil
-    ) -> UploadResourceDescriptor {
+    private func descriptor(for entry: UploadBackupSyncQueueEntry) -> UploadResourceDescriptor {
         UploadResourceDescriptor(
             source: entry.source, fileURL: URL(fileURLWithPath: entry.source.identifier),
-            filename: filename ?? entry.originalFilename, fileSize: entry.byteCount ?? 1, modificationDate: clock.now)
+            filename: entry.originalFilename, fileSize: entry.byteCount ?? 1, modificationDate: clock.now)
     }
 
     private func reconciliation(
         for entry: UploadBackupSyncQueueEntry, descriptor: UploadResourceDescriptor?,
-        bindTo revision: UploadBackupRevision?
+        binding: (row: TimeInterval, uploaded: TimeInterval?)?
     ) -> UploadRemoteCommitReconciliation {
         UploadRemoteCommitReconciliation(
             source: entry.source,
@@ -207,12 +315,15 @@ final class BackupReceiptRevisionTests: XCTestCase {
                 sha1Digest: Data(repeating: 0xCD, count: 20), contentHash: "content"),
             receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"),
             descriptor: descriptor.map(UploadResourceDescriptorSnapshot.init),
-            queueBinding: revision.map { UploadRemoteCommitQueueBinding(source: entry.source, revision: $0) })
+            queueBinding: binding.map {
+                UploadRemoteCommitQueueBinding(
+                    source: entry.source, revision: revision($0.row), uploadedRevision: $0.uploaded.map(revision))
+            })
     }
 
-    private func seedEntry(_ id: String) -> UploadBackupSyncQueueEntry {
+    private func seedEntry(_ id: String, kind: UploadSourceIdentity.Kind = .fileURL) -> UploadBackupSyncQueueEntry {
         let entry = UploadBackupSyncQueueEntry(
-            source: .file(URL(fileURLWithPath: "/backup/\(id)")),
+            source: UploadSourceIdentity(kind: kind, identifier: URL(fileURLWithPath: "/backup/\(id)").path),
             revision: UploadBackupRevision(date: resolver.defaultModified), originalFilename: id, byteCount: 4,
             updatedAt: clock.now.addingTimeInterval(-60))
         XCTAssertTrue(queueStore.upsert(entry))
@@ -225,7 +336,9 @@ final class BackupReceiptRevisionTests: XCTestCase {
             now: { [clock] in clock!.now })
     }
 
-    private func makeRunner(identityResolver: any UploadIdentityResolving, concurrency: Int = 2) -> BackupSyncRunner {
+    private func makeRunner(
+        identityResolver: any UploadIdentityResolving, concurrency: Int = 2, events: (any BackupItemEventSink)? = nil
+    ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queueStore, preflight: preflight, resolver: resolver, identityResolver: identityResolver,
             uploader: uploader, tagAdder: nil, editReplacement: nil, resourceCoordinator: .shared,
@@ -233,7 +346,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
                 uploadStallTimeout: 180, uploadStallPollInterval: 5,
                 retry: BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 4),
                 throttle: BackupThrottlePolicy(baseConcurrency: concurrency)),
-            throttleInputs: { .unconstrained }, runtimeChanges: nil, clock: clock, events: nil,
+            throttleInputs: { .unconstrained }, runtimeChanges: nil, clock: clock, events: events,
             now: { [clock] in clock!.now })
     }
 
@@ -277,6 +390,28 @@ final class BackupReceiptRevisionTests: XCTestCase {
         func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {
             await inner.uploadDidFail(descriptor)
         }
+    }
+
+    /// Keeps the kind of every handoff; everything else is accepted.
+    private final class HandoffLog: BackupItemEventSink, @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [PendingHandoffKind] = []
+        var kinds: [PendingHandoffKind] { lock.withLock { recorded } }
+
+        func recordUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision, replaces: [PhotoUID]) {}
+
+        func settleUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision, retired: Set<String>) {}
+
+        func recordHandoff(
+            source: UploadSourceIdentity, revision: UploadBackupRevision, remote: PhotoUID, kind: PendingHandoffKind
+        ) -> PendingHandoffOutcome {
+            lock.withLock { recorded.append(kind) }
+            return .recorded
+        }
+
+        func isExcluded(source: UploadSourceIdentity) -> Bool? { false }
+
+        func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {}
     }
 
     private final class MemoryStateStore: UploadBackupStateStore, @unchecked Sendable {

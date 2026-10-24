@@ -60,8 +60,23 @@ public struct UploadRemoteCommitRecovery: Sendable {
             throw UploadRemoteCommitRecoveryError.invalidReceipt(entry.source, entry.revision)
         }
 
-        if reconciliation.descriptor != nil {
-            let descriptor = try Self.savedDescriptor(of: reconciliation, for: entry)
+        if let snapshot = reconciliation.descriptor {
+            guard let queueBinding = reconciliation.queueBinding,
+                queueBinding.source == entry.source,
+                queueBinding.revision == entry.revision
+            else {
+                throw UploadRemoteCommitRecoveryError.invalidReceipt(entry.source, entry.revision)
+            }
+            guard let descriptor = snapshot.descriptor else {
+                throw UploadRemoteCommitRecoveryError.descriptorMismatch(entry.source, entry.revision)
+            }
+            try validateQueueBinding(descriptor, entry: entry)
+            try validate(
+                descriptor,
+                reconciliation: reconciliation,
+                entry: entry,
+                requireDigestMatch: false
+            )
             try await recordAndRemove(descriptor, reconciliation: reconciliation, entry: entry)
             return
         }
@@ -84,7 +99,7 @@ public struct UploadRemoteCommitRecovery: Sendable {
         guard let descriptor else {
             throw UploadRemoteCommitRecoveryError.descriptorUnavailable(entry.source, entry.revision)
         }
-        try Self.validate(
+        try validate(
             descriptor,
             reconciliation: reconciliation,
             entry: entry,
@@ -93,28 +108,7 @@ public struct UploadRemoteCommitRecovery: Sendable {
         try await recordAndRemove(descriptor, reconciliation: reconciliation, entry: entry)
     }
 
-    /// The descriptor that a receipt saved before the upload committed, checked against the queue row it is bound to.
-    /// A receipt without a saved descriptor or queue binding, or one bound to another row, throws.
-    static func savedDescriptor(
-        of reconciliation: UploadRemoteCommitReconciliation,
-        for entry: UploadBackupSyncQueueEntry
-    ) throws -> UploadResourceDescriptor {
-        guard let snapshot = reconciliation.descriptor,
-            let queueBinding = reconciliation.queueBinding,
-            queueBinding.source == entry.source,
-            queueBinding.revision == entry.revision
-        else {
-            throw UploadRemoteCommitRecoveryError.invalidReceipt(entry.source, entry.revision)
-        }
-        guard let descriptor = snapshot.descriptor else {
-            throw UploadRemoteCommitRecoveryError.descriptorMismatch(entry.source, entry.revision)
-        }
-        try validateQueueBinding(descriptor, entry: entry)
-        try validate(descriptor, reconciliation: reconciliation, entry: entry, requireDigestMatch: false)
-        return descriptor
-    }
-
-    private static func validateQueueBinding(
+    private func validateQueueBinding(
         _ descriptor: UploadResourceDescriptor,
         entry: UploadBackupSyncQueueEntry
     ) throws {
@@ -136,7 +130,7 @@ public struct UploadRemoteCommitRecovery: Sendable {
         }
     }
 
-    private static func validate(
+    private func validate(
         _ descriptor: UploadResourceDescriptor,
         reconciliation: UploadRemoteCommitReconciliation,
         entry: UploadBackupSyncQueueEntry,

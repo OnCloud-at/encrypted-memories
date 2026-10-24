@@ -1045,7 +1045,8 @@ public actor BackupSyncRunner {
                         descriptor: UploadResourceDescriptorSnapshot(resolved.descriptor),
                         queueBinding: UploadRemoteCommitQueueBinding(
                             source: entry.source,
-                            revision: entry.revision
+                            revision: entry.revision,
+                            uploadedRevision: resolved.candidate.snapshot.revision
                         )
                     )
                     guard
@@ -1474,19 +1475,16 @@ public actor BackupSyncRunner {
         }
     }
 
-    /// A receipt settles only the queue row and revision it was saved for. A receipt with a saved descriptor must pass
-    /// the checks of `UploadRemoteCommitRecovery`; an older receipt without one must at least match the revision.
+    /// A receipt settles only the revision whose bytes it uploaded, from the queue row it is bound to. A receipt without
+    /// a binding, as written by older builds, and one without the uploaded revision use the row revision instead.
     static func receiptBelongs(
         _ reconciliation: UploadRemoteCommitReconciliation,
         to entry: UploadBackupSyncQueueEntry,
         resolvedRevision: UploadBackupRevision
     ) -> Bool {
-        if reconciliation.descriptor != nil || reconciliation.queueBinding != nil {
-            guard (try? UploadRemoteCommitRecovery.savedDescriptor(of: reconciliation, for: entry)) != nil else {
-                return false
-            }
-        }
-        return resolvedRevision == entry.revision
+        guard let binding = reconciliation.queueBinding else { return resolvedRevision == entry.revision }
+        guard binding.source == entry.source, binding.revision == entry.revision else { return false }
+        return resolvedRevision == (binding.uploadedRevision ?? entry.revision)
     }
 
     /// Clears the receipt and returns the row to the ordinary path.
@@ -1589,6 +1587,7 @@ public actor BackupSyncRunner {
                 requiresRelatedMatch: replacesEarlierUpload,
                 entry: entry,
                 entryKey: Self.key(entry),
+                uploadedRevision: resolved.candidate.snapshot.revision,
                 workIntent: workIntent
             ) {
             case .allSettled:
@@ -1856,6 +1855,7 @@ public actor BackupSyncRunner {
         requiresRelatedMatch: Bool,
         entry: UploadBackupSyncQueueEntry,
         entryKey: String,
+        uploadedRevision: UploadBackupRevision,
         workIntent: LibraryWorkIntent
     ) async -> SecondaryOutcome {
         var remaining = secondaries.count
@@ -1876,7 +1876,8 @@ public actor BackupSyncRunner {
                             descriptor: UploadResourceDescriptorSnapshot(secondary.descriptor),
                             queueBinding: UploadRemoteCommitQueueBinding(
                                 source: entry.source,
-                                revision: entry.revision
+                                revision: entry.revision,
+                                uploadedRevision: uploadedRevision
                             )
                         )
                         guard
