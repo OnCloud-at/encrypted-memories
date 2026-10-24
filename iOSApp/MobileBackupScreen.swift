@@ -506,6 +506,8 @@ struct MobileFailedBackupSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var problemList = BackupProblemListModel()
     @State private var deletionItem: BackupFailedItem?
+    @State private var personReadTask: Task<Void, Never>?
+    @State private var readOrder = BackupProblemListReadOrder()
 
     init(controller: PhotoLibraryBackupController) {
         source = .backup(controller)
@@ -527,14 +529,38 @@ struct MobileFailedBackupSheet: View {
         }
     }
 
+    /// What the sheet shows. The backup list never says that nothing needs attention while the summary counts items.
+    private var presentation: BackupProblemListModel.Presentation {
+        if let controller {
+            return problemList.presentation(expectsItems: controller.status.needsAttentionCount > 0)
+        }
+        return items.isEmpty ? .empty : .list
+    }
+
     var body: some View {
         NavigationStack {
             Group {
-                if items.isEmpty {
+                switch presentation {
+                case .loading:
+                    ProgressView(L10n.string("loading.content"))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("backup.failedSheet.loading")
+                case .unavailable:
+                    ContentUnavailableView {
+                        Label(L10n.string("backup.failed_sheet_unavailable"), systemImage: "exclamationmark.triangle")
+                    } actions: {
+                        Button(L10n.string("action.retry")) {
+                            guard let controller else { return }
+                            problemList.beginReading()
+                            readList(of: controller)
+                        }
+                        .accessibilityIdentifier("backup.failedSheet.retry")
+                    }
+                case .empty:
                     ContentUnavailableView {
                         Label(L10n.string("backup.failed_sheet_empty"), systemImage: "checkmark.shield")
                     }
-                } else {
+                case .list:
                     List {
                         BackupProblemSections(items: items) { item in
                             BackupProblemRow(item: item)
@@ -603,8 +629,10 @@ struct MobileFailedBackupSheet: View {
         // A photo can need the person while the list is open; Try again then appears.
         .task(id: controller?.status.problemListKey) {
             guard let controller else { return }
-            await controller.followProblemList { problemList.replaceItems($0) }
+            await controller.followProblemList(
+                order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
         }
+        .onDisappear { personReadTask?.cancel() }
     }
 
     /// Only the backup list offers the deleted-elsewhere decision; the album list is read-only.
@@ -632,8 +660,17 @@ struct MobileFailedBackupSheet: View {
 
     private func refreshAfterDecision(_ item: BackupFailedItem, controller: PhotoLibraryBackupController) {
         deletionItem = nil
-        Task {
-            await problemList.refresh(afterDecision: item) { await controller.problemItems() }
+        readList(of: controller, afterDecision: item)
+    }
+
+    /// A person's action reads the list like the automatic follow does. The sheet keeps the task, so closing the
+    /// sheet or a newer action ends it.
+    private func readList(of controller: PhotoLibraryBackupController, afterDecision item: BackupFailedItem? = nil) {
+        personReadTask?.cancel()
+        personReadTask = Task {
+            await controller.readProblemList(
+                order: readOrder, afterDecision: item, { problemList.replaceItems($0) },
+                ifUnavailable: { problemList.markUnavailable() })
         }
     }
 }

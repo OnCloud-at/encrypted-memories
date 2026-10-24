@@ -569,11 +569,14 @@ public final class PhotoLibraryBackupController {
     /// Gives `apply` the problem list now and, while a pass runs, again after each committed queue write: a photo
     /// can get another reason during a pass without changing a count. The first write after a quiet moment shows at
     /// once; further writes within `coalescing` seconds are read together after it. The end of the pass reads once
-    /// more and stops.
+    /// more and stops. A read that comes back empty while the summary counts items is read again a bounded number of
+    /// times; when it stays empty, `ifUnavailable` reports it.
     public func followProblemList(
-        limit: Int = 200, coalescing: TimeInterval = 1, clock: any BackupSchedulerClock = BackupContinuousClock(),
-        _ apply: ([BackupFailedItem]) -> Void
+        order: BackupProblemListReadOrder? = nil, limit: Int = 200, coalescing: TimeInterval = 1,
+        clock: any BackupSchedulerClock = BackupContinuousClock(),
+        _ apply: ([BackupFailedItem]) -> Void, ifUnavailable: () -> Void = {}
     ) async {
+        let order = order ?? BackupProblemListReadOrder()
         // Subscribe before the first read, so a write or the end of the pass during that read is not lost.
         let wake = BackupWorkWake()
         let follower = queueStore.map { wake.follow($0.changes()) }
@@ -584,15 +587,71 @@ public final class PhotoLibraryBackupController {
             passStateWakes[id] = nil
         }
         var passEnded = !isSyncing
-        await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
+        await readProblemList(order: order, limit: limit, clock: clock, apply, ifUnavailable: ifUnavailable)
         // A pass that started during the read is followed as well; its start already woke this list.
         while !passEnded || isSyncing {
             await wake.wait(clock: clock)
             guard !Task.isCancelled else { return }
             // A pass that ended before this read, also during the pause or the previous read, gets this last read.
             passEnded = !isSyncing
-            await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
+            await readProblemList(order: order, limit: limit, clock: clock, apply, ifUnavailable: ifUnavailable)
             if !passEnded { try? await clock.sleep(for: coalescing) }
+        }
+    }
+
+    /// The waits before each re-read of a list that came back empty while the summary counts items. A read can miss
+    /// rows for a moment; after these re-reads the list is reported as unavailable instead.
+    static let problemListRereadDelays: [TimeInterval] = [0.25, 0.5, 1, 2, 4]
+
+    /// Reads the list and applies it. While the list is empty and the summary counts items that need attention, it
+    /// reads again after each wait of `problemListRereadDelays`, so one empty read never decides what the sheet
+    /// shows. A cancelled read applies nothing and reports nothing: the task that starts it again reads anew.
+    /// A read that a newer read of the same open list overtakes (`order` is the one of that list) ends without
+    /// applying or reporting: the newer read decides. After a decision on `item`, the first read leaves that photo out until the next read, so the resolved decision
+    /// disappears at once; the re-reads show it again if it failed with another reason.
+    public func readProblemList(
+        order: BackupProblemListReadOrder? = nil, afterDecision item: BackupFailedItem? = nil, limit: Int = 200,
+        clock: any BackupSchedulerClock = BackupContinuousClock(),
+        _ apply: ([BackupFailedItem]) -> Void, ifUnavailable: () -> Void = {}
+    ) async {
+        await readProblemList(
+            using: { await problemItems(limit: limit) }, order: order, afterDecision: item,
+            expectingItems: { summaryCountsProblemItems }, clock: clock, apply, ifUnavailable)
+    }
+
+    /// Whether the summary counts photos that need attention, so the list must show some.
+    private var summaryCountsProblemItems: Bool {
+        #if DEBUG
+            if let override = problemListExpectationForTesting { return override() }
+        #endif
+        return status.needsAttentionCount > 0
+    }
+
+    func readProblemList(
+        using read: () async -> [BackupFailedItem], order: BackupProblemListReadOrder? = nil,
+        afterDecision item: BackupFailedItem? = nil, expectingItems: () -> Bool, clock: any BackupSchedulerClock,
+        _ apply: ([BackupFailedItem]) -> Void, _ ifUnavailable: () -> Void
+    ) async {
+        let order = order ?? BackupProblemListReadOrder()
+        let generation = order.begin()
+        var hiddenDecision = item
+        var rereads = 0
+        while let items = await applyCurrentProblemList(
+            order: order, generation: generation,
+            {
+                let items = await read()
+                defer { hiddenDecision = nil }
+                guard let decided = hiddenDecision else { return items }
+                return items.filter { $0.id != decided.id || $0.issue == .deletedElsewhere }
+            }, apply)
+        {
+            guard items.isEmpty, expectingItems() else { return }
+            guard rereads < Self.problemListRereadDelays.count else {
+                ifUnavailable()
+                return
+            }
+            try? await clock.sleep(for: Self.problemListRereadDelays[rereads])
+            rereads += 1
         }
     }
 
@@ -600,18 +659,23 @@ public final class PhotoLibraryBackupController {
     private(set) var problemListChanges: UInt64 = 0
 
     /// A read that started before the person's action would bring a dismissed row back, so the list reads again.
+    /// Returns the list that it applied, or nil when the read was cancelled, overtaken by a newer read, or the
+    /// controller shut down.
+    @discardableResult
     func applyCurrentProblemList(
-        _ read: () async -> [BackupFailedItem], _ apply: ([BackupFailedItem]) -> Void
-    ) async {
-        while !Task.isCancelled {
+        order: BackupProblemListReadOrder, generation: UInt64, _ read: () async -> [BackupFailedItem],
+        _ apply: ([BackupFailedItem]) -> Void
+    ) async -> [BackupFailedItem]? {
+        while !Task.isCancelled, !isShuttingDown, order.isLatest(generation) {
             let changes = problemListChanges
             let items = await read()
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, !isShuttingDown, order.isLatest(generation) else { return nil }
             if changes == problemListChanges {
                 apply(items)
-                return
+                return items
             }
         }
+        return nil
     }
 
     func noteProblemListChange() {
@@ -1250,6 +1314,9 @@ public final class PhotoLibraryBackupController {
 
         /// The queue store that this controller owns. Only it reports committed writes to the problem list.
         internal var queueStoreForTesting: UploadBackupSyncQueueManifestStore? { queueStore }
+
+        /// Replaces what the summary says about problem items, so a test needs no status projection.
+        @ObservationIgnored internal var problemListExpectationForTesting: (() -> Bool)?
 
         /// Turns the backup on without the launch resume, which reads the real photo library authorization again.
         internal func setEnabledForTesting() {
@@ -2068,4 +2135,22 @@ actor BackupWorkWake {
             }
         }
     }
+}
+
+/// Numbers the reads of one open problem list (the automatic follow, a retry, a decision refresh) in the order in
+/// which they start. Only the newest read of a list applies or reports, so an older result that arrives late never
+/// replaces a newer one, and a list that shows "loading" always has a reader that ends in rows, "empty", or
+/// "unavailable". Each open list has its own order; reads of different lists never overtake each other.
+@MainActor
+public final class BackupProblemListReadOrder {
+    private var latest: UInt64 = 0
+
+    public init() {}
+
+    func begin() -> UInt64 {
+        latest &+= 1
+        return latest
+    }
+
+    func isLatest(_ generation: UInt64) -> Bool { generation == latest }
 }
