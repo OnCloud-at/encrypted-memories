@@ -686,11 +686,21 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await writer.waitUntilBlocked()
 
             var reportedRunID: String?
-            let started = ContinuousClock.now
-            await fixture.controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
-                reportedRunID = runID
+            let returned = CompletionLatch()
+            let catchUp = Task {
+                await fixture.controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
+                    reportedRunID = runID
+                }
+                await returned.markCompleted()
             }
-            XCTAssertLessThan(started.duration(to: ContinuousClock.now), .milliseconds(250))
+            // The call must return while the foreground run is still blocked. The deadline only guards
+            // against a hang; how fast the call returns is not asserted.
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while !(await returned.isCompleted()), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let returnedWhileBlocked = await returned.isCompleted()
+            XCTAssertTrue(returnedWhileBlocked, "The catch-up waited for the foreground run.")
             XCTAssertNil(reportedRunID)
             XCTAssertEqual(fixture.controller.activeExecutionRunID, "foreground")
             let adoptedForegroundRun = await writer.isCompleted()
@@ -698,6 +708,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             await writer.release()
             await task.value
+            await catchUp.value
             await fixture.controller.shutdown()
         }
 
