@@ -73,9 +73,45 @@ public final class LocationCrawlSession {
     private var inventoryTask: Task<LocationCrawlInventory, Never>?
     private var inventoryRevision: UInt64 = 0
     private var crawlInventoryRevision: UInt64 = 0
+    private struct PendingReconciliation {
+        let revision: UInt64
+        let generation: UInt64
+        let accountUID: String
+        let recrawlRestoredItems: Bool
+    }
+
+    /// The account configuration that publications and reconciliations belong to. `invalidate`, `retire` and
+    /// `resetForTeardown` move it, so work that started for an earlier configuration cannot touch the current one.
+    public struct OwnerLease: Equatable, Sendable {
+        fileprivate let generation: UInt64
+    }
+
+    private var reconciliationGeneration: UInt64 = 0
+    private var reconciliationRevision: UInt64 = 0
+    private var reconciliationAttempt: UInt64 = 0
+    private var pendingReconciliation: PendingReconciliation?
+    /// A publication of a known library still has to start the scan. A reconciliation that takes over its
+    /// pending work starts the scan instead, also when that reconciliation stops; a publication that stops leaves
+    /// the start to the next reconciliation or publication.
+    private var publicationStartOwed = false
+
+    /// How one attempt to consume the waiting reconciliation ended.
+    private enum ReconcileOutcome {
+        /// The pins were reconciled; `restarting` says whether an active scan must restart for a restore.
+        case completed(restarting: Bool)
+        /// A newer attempt, a newer request or another configuration took over the waiting work.
+        case superseded
+        /// The attempt is still the latest one but stopped: a cancellation, the host check or the store session.
+        /// The waiting work stays for the next publication.
+        case stopped
+    }
     /// How often an admitted start reached the crawl. A rejected start never touches it: `crawl.start` retires the
     /// crawl that runs, so a stale start must stop before it.
     private(set) var crawlStartsForTesting = 0
+
+    #if DEBUG
+        public var beforeWholeLibraryUIDProjectionForTesting: (@Sendable () async -> Void)? = nil
+    #endif
 
     public init(
         platform: Platform,
@@ -105,6 +141,162 @@ public final class LocationCrawlSession {
     public var finishedWithOutdatedInventory: Bool {
         isStarted && crawlInventoryRevision != inventoryRevision
             && (index.scanProgress.phase == .completed || index.scanProgress.phase == .failed)
+    }
+
+    public func startWholeLibrary(
+        items: [PhotoItem]?,
+        restarting: Bool = false,
+        makeStart: @MainActor () -> Start
+    ) {
+        guard let items else { return }
+        // A known empty library has nothing to scan. The same stop as for Map and Places off ends a waiting start
+        // and the running crawl of the older library; the waiting clean-up stays.
+        guard !items.isEmpty else { return pause() }
+        if restarting { prepareRestart() }
+        guard MapAndPlacesPolicy.allowsLocationCrawl(enabled: isEnabled(), itemCount: items.count) else { return }
+        // The scan may store results for every photo it scans; only a clean-up narrows what the index accepts.
+        index.accept(items.lazy.map(\.uid))
+        updateInventory(items)
+        if finishedWithOutdatedInventory { prepareRestart() }
+        start(items: items, makeStart())
+    }
+
+    /// The owner that a publication or reconciliation captures when its work starts, before any suspension.
+    public func captureOwnerLease() -> OwnerLease { OwnerLease(generation: reconciliationGeneration) }
+
+    /// Publishes a complete inventory, including empty, before deciding whether to start GPS work.
+    public func publishWholeLibrary(
+        items: [PhotoItem]?,
+        owner: OwnerLease,
+        isCurrent: @MainActor () -> Bool = { true },
+        makeStart: @MainActor () -> Start
+    ) async {
+        guard let items, owner.generation == reconciliationGeneration, !Task.isCancelled, isCurrent() else { return }
+        let start = makeStart()
+        let currentGeneration = reconciliationGeneration
+        guard start.isCurrent() else { return }
+        publicationStartOwed = true
+        if let pending = pendingReconciliation {
+            if pending.generation == currentGeneration, pending.accountUID == start.accountUID {
+                let outcome = await reconcilePending(pending, items: items, start: start, isCurrent: isCurrent)
+                guard case .completed = outcome else { return }
+            } else {
+                pendingReconciliation = nil
+            }
+        }
+        guard !Task.isCancelled, reconciliationGeneration == currentGeneration, isCurrent(), start.isCurrent() else {
+            return
+        }
+        publicationStartOwed = false
+        startWholeLibrary(items: items, makeStart: { start })
+    }
+
+    public func reconcileWholeLibrary(
+        items: [PhotoItem]?,
+        recrawlRestoredItems: Bool,
+        owner: OwnerLease,
+        isCurrent: @MainActor () -> Bool = { true },
+        makeStart: @MainActor () -> Start
+    ) async {
+        guard owner.generation == reconciliationGeneration, !Task.isCancelled, isCurrent() else { return }
+        let start = makeStart()
+        guard start.isCurrent() else { return }
+        let previous = pendingReconciliation
+        let sameOwner = previous?.generation == reconciliationGeneration && previous?.accountUID == start.accountUID
+        reconciliationRevision &+= 1
+        let pending = PendingReconciliation(
+            revision: reconciliationRevision,
+            generation: reconciliationGeneration,
+            accountUID: start.accountUID,
+            recrawlRestoredItems: (recrawlRestoredItems && isStarted)
+                || (sameOwner && previous?.recrawlRestoredItems == true)
+        )
+        pendingReconciliation = pending
+        guard let items else { return }
+        switch await reconcilePending(pending, items: items, start: start, isCurrent: isCurrent) {
+        case .completed(restarting: true) where !Task.isCancelled:
+            guard reconciliationGeneration == pending.generation, isCurrent(), start.isCurrent() else { return }
+            publicationStartOwed = false
+            startWholeLibrary(items: items, makeStart: { start })
+        case .completed, .stopped:
+            // The scan that a publication owed is not the cancelled work of this request.
+            startOwedScan(items: items, start: start, generation: pending.generation, isCurrent: isCurrent)
+        case .superseded:
+            return
+        }
+    }
+
+    /// Starts the scan that a publication still owes, with the known library of the request that took it over.
+    private func startOwedScan(
+        items: [PhotoItem], start: Start, generation: UInt64, isCurrent: @MainActor () -> Bool
+    ) {
+        guard publicationStartOwed, reconciliationGeneration == generation, isCurrent(), start.isCurrent() else {
+            return
+        }
+        publicationStartOwed = false
+        startWholeLibrary(items: items, makeStart: { start })
+    }
+
+    private func reconcilePending(
+        _ pending: PendingReconciliation,
+        items: [PhotoItem],
+        start: Start,
+        isCurrent: @MainActor () -> Bool
+    ) async -> ReconcileOutcome {
+        guard admitsReconciliation(pending, attempt: reconciliationAttempt, start: start, isCurrent: isCurrent) else {
+            return rejection(of: pending, attempt: reconciliationAttempt, start: start)
+        }
+        reconciliationAttempt &+= 1
+        let attempt = reconciliationAttempt
+        await start.awaiting?.value
+        guard admitsReconciliation(pending, attempt: attempt, start: start, isCurrent: isCurrent),
+            let lease = store.captureSessionLease()
+        else { return rejection(of: pending, attempt: attempt, start: start) }
+        #if DEBUG
+            let beforeProjection = beforeWholeLibraryUIDProjectionForTesting
+        #endif
+        let uids = await Task.detached(priority: .userInitiated) {
+            #if DEBUG
+                if let beforeProjection { await beforeProjection() }
+            #endif
+            return Set(items.map(\.uid))
+        }.value
+        guard admitsReconciliation(pending, attempt: attempt, start: start, isCurrent: isCurrent),
+            store.isCurrentSessionLease(lease)
+        else { return rejection(of: pending, attempt: attempt, start: start) }
+        await index.retainOnly(uids, persistTo: store, sessionLease: lease)
+        guard admitsReconciliation(pending, attempt: attempt, start: start, isCurrent: isCurrent),
+            store.isCurrentSessionLease(lease)
+        else { return rejection(of: pending, attempt: attempt, start: start) }
+        pendingReconciliation = nil
+        let restarting = pending.recrawlRestoredItems && isStarted
+        if restarting { prepareRestart() }
+        return .completed(restarting: restarting)
+    }
+
+    private func rejection(of pending: PendingReconciliation, attempt: UInt64, start: Start) -> ReconcileOutcome {
+        let latest =
+            reconciliationGeneration == pending.generation && reconciliationAttempt == attempt
+            && pendingReconciliation?.revision == pending.revision && start.accountUID == pending.accountUID
+        return latest ? .stopped : .superseded
+    }
+
+    private func admitsReconciliation(
+        _ pending: PendingReconciliation,
+        attempt: UInt64,
+        start: Start,
+        isCurrent: @MainActor () -> Bool
+    ) -> Bool {
+        !Task.isCancelled && reconciliationGeneration == pending.generation
+            && reconciliationAttempt == attempt && pendingReconciliation?.revision == pending.revision
+            && start.accountUID == pending.accountUID && isCurrent() && start.isCurrent()
+    }
+
+    private func discardPendingReconciliation() {
+        reconciliationGeneration &+= 1
+        reconciliationAttempt &+= 1
+        pendingReconciliation = nil
+        publicationStartOwed = false
     }
 
     /// Starts the crawl once; repeated calls do nothing until a pause, restart or retirement. `items` builds the
@@ -204,6 +396,7 @@ public final class LocationCrawlSession {
     /// stays the predecessor of the next start.
     @discardableResult
     public func invalidate() -> Task<Void, Never>? {
+        discardPendingReconciliation()
         generation &+= 1
         isStarted = false
         startTask?.cancel()
@@ -214,6 +407,7 @@ public final class LocationCrawlSession {
     /// start task, then cancels `crawl`.
     @discardableResult
     public func retire() -> Task<Void, Never>? {
+        discardPendingReconciliation()
         let starter = startTask
         generation &+= 1
         starter?.cancel()
@@ -227,6 +421,7 @@ public final class LocationCrawlSession {
     /// Forgets the inventory and the started state for a sign-out without cancelling the start task: the host's
     /// account check rejects it, and the teardown joins `startingTask` before it cancels `crawl`.
     public func resetForTeardown() {
+        discardPendingReconciliation()
         isStarted = false
         inventoryTask?.cancel()
         inventoryTask = nil

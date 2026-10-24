@@ -286,25 +286,40 @@ final class OfflineLibraryManager {
 
     /// Starts one resumable, throttled GPS crawl for the Map view. It yields to visible thumbnail work and
     /// persists the encrypted index periodically. Repeated calls are safe.
-    func startLocationCrawl(items: [PhotoItem], metadata: any PhotoMetadataProvider) {
-        guard
-            MapAndPlacesPolicy.allowsLocationCrawl(
-                enabled: MapAndPlacesPolicy.isEnabled(), itemCount: items.count)
-        else { return }
-        locationCrawl.updateInventory(items)
-        if locationCrawl.finishedWithOutdatedInventory { locationCrawl.prepareRestart() }
+    func startLocationCrawl(items: [PhotoItem]?, metadata: any PhotoMetadataProvider) {
+        locationCrawl.startWholeLibrary(items: items) { makeLocationCrawlStart(metadata: metadata) }
+    }
+
+    /// The account configuration that location work started for. Capture it before the first suspension of a
+    /// trash, restore or publication; every later account configuration or teardown rejects it.
+    func captureLocationOwner() -> LocationCrawlSession.OwnerLease { locationCrawl.captureOwnerLease() }
+
+    func publishLocationInventory(
+        items: [PhotoItem]?,
+        owner: LocationCrawlSession.OwnerLease,
+        metadata: any PhotoMetadataProvider,
+        isCurrent: @MainActor () -> Bool
+    ) async {
+        await locationCrawl.publishWholeLibrary(
+            items: items, owner: owner, isCurrent: isCurrent,
+            makeStart: { makeLocationCrawlStart(metadata: metadata) }
+        )
+    }
+
+    private func makeLocationCrawlStart(metadata: any PhotoMetadataProvider) -> LocationCrawlSession.Start {
         let accountUID = configuredAccountUID ?? ""
+        let configurationGeneration = locationConfigurationGeneration
         let feed = self.feed
-        locationCrawl.start(
-            items: items,
-            LocationCrawlSession.Start(
-                accountUID: accountUID,
-                location: LocationCrawl.metadataProbe(metadata),
-                visibleDemand: { await feed?.hasVisibleThumbnailPressure() ?? false },
-                log: { DebugLog.log($0) },
-                isCurrent: { [weak self] in self?.configuredAccountUID == accountUID },
-                awaiting: locationConfigurationTask
-            )
+        return LocationCrawlSession.Start(
+            accountUID: accountUID,
+            location: LocationCrawl.metadataProbe(metadata),
+            visibleDemand: { await feed?.hasVisibleThumbnailPressure() ?? false },
+            log: { DebugLog.log($0) },
+            isCurrent: { [weak self] in
+                self?.configuredAccountUID == accountUID
+                    && self?.locationConfigurationGeneration == configurationGeneration
+            },
+            awaiting: locationConfigurationTask
         )
     }
 
@@ -313,33 +328,34 @@ final class OfflineLibraryManager {
         locationCrawl.pause()
     }
 
-    func resumeMapAndPlaces(items: [PhotoItem], metadata: any PhotoMetadataProvider) {
+    func resumeMapAndPlaces(items: [PhotoItem]?, metadata: any PhotoMetadataProvider) {
         guard MapAndPlacesPolicy.isEnabled() else { return }
         mapPrewarmer.prewarm(coordinates: locationIndex.coordinates)
         startLocationCrawl(items: items, metadata: metadata)
     }
 
-    func restartLocationCrawl(items: [PhotoItem], metadata: any PhotoMetadataProvider) {
-        guard !items.isEmpty else { return }
-        locationCrawl.prepareRestart()
-        startLocationCrawl(items: items, metadata: metadata)
+    func restartLocationCrawl(items: [PhotoItem]?, metadata: any PhotoMetadataProvider) {
+        locationCrawl.startWholeLibrary(items: items, restarting: true) {
+            makeLocationCrawlStart(metadata: metadata)
+        }
     }
 
     /// Keeps map pins and the encrypted snapshot aligned with a successful library mutation. A restore only
     /// restarts GPS probing when the user already activated Map work this session.
     func reconcileLocations(
-        items: [PhotoItem],
+        items: [PhotoItem]?,
+        owner: LocationCrawlSession.OwnerLease,
         metadata: any PhotoMetadataProvider,
         recrawlRestoredItems: Bool,
         isCurrent: @MainActor () -> Bool = { true }
     ) async {
-        let lease = locationStore.captureSessionLease()
-        let uids = await Task.detached(priority: .userInitiated) { Set(items.map(\.uid)) }.value
-        guard isCurrent() else { return }
-        await locationIndex.retainOnly(uids, persistTo: locationStore, sessionLease: lease)
-        guard isCurrent(), recrawlRestoredItems, locationCrawl.isStarted else { return }
-        locationCrawl.prepareRestart()
-        startLocationCrawl(items: items, metadata: metadata)
+        await locationCrawl.reconcileWholeLibrary(
+            items: items,
+            recrawlRestoredItems: recrawlRestoredItems,
+            owner: owner,
+            isCurrent: isCurrent,
+            makeStart: { makeLocationCrawlStart(metadata: metadata) }
+        )
     }
 
     /// Persists the Offline Photo Library setting. Enabled mode stores viewed originals in the encrypted

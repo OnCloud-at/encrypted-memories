@@ -240,6 +240,13 @@ public final class PhotoLocationIndex: PhotoPlaceSupportSource {
         return accepted
     }
 
+    /// Lets a scan of a known library store results for every photo of that library. Only `retainOnly` narrows
+    /// what the index accepts; without an allow-list every photo is accepted already. The union runs on the main
+    /// actor and costs one pass over `uids`, only while an allow-list exists.
+    public func accept(_ uids: some Sequence<PhotoUID>) {
+        allowedUIDs?.formUnion(uids)
+    }
+
     /// Reconciles the index with the authoritative whole-library identities and persists the filtered encrypted
     /// snapshot off-main. The allow-list also blocks a late in-flight crawl result from resurrecting a deleted pin.
     public func retainOnly(

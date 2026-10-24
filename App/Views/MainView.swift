@@ -304,9 +304,6 @@ struct MainView: View {
                 model.pendingGrid?.setRemote(timelineModel.wholeLibraryTimeline)
                 let items = timelineModel.wholeLibraryItemsForViewer
                 OfflineLibraryManager.shared.liveAssetCount = items.count
-                // Kick off the low-priority GPS crawl (once) so the Map's location index fills in behind the
-                // thumbnail crawl.
-                OfflineLibraryManager.shared.startLocationCrawl(items: items, metadata: backend)
                 // New/removed assets flow into the Smart Search index on its next background pass.
                 model.updateSmartSearchAssets(
                     items,
@@ -1306,7 +1303,7 @@ struct MainView: View {
         // The whole library, like the automatic start: the route open under the map may be an album, a tag or
         // Recently Deleted.
         OfflineLibraryManager.shared.restartLocationCrawl(
-            items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
+            items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
     }
 
     private var gridFillOrder: GridFillOrder {
@@ -1557,7 +1554,7 @@ struct MainView: View {
                         // left under the map may hold only an album, a tag or Recently Deleted.
                         RetryButton(.prominent) {
                             OfflineLibraryManager.shared.restartLocationCrawl(
-                                items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
+                                items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
                         }
                     }
                 case .completed:
@@ -1756,11 +1753,13 @@ struct MainView: View {
     /// The finder already moved the copies to Recently Deleted; the library and its derived state stop showing them.
     private func commitDuplicateTrash(_ uids: [PhotoUID], account: ExactDuplicatesAccountLifetime.Token) async {
         guard model.isCurrentDuplicatesAccount(account) else { return }
+        let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         let trashed = Set(uids)
         await timelineModel.commitTrash(uids: trashed)
         guard model.isCurrentDuplicatesAccount(account) else { return }
         await OfflineLibraryManager.shared.reconcileLocations(
-            items: timelineModel.wholeLibraryItemsForViewer,
+            items: timelineModel.wholeLibraryItemsForLocations,
+            owner: locationOwner,
             metadata: backend,
             recrawlRestoredItems: false,
             isCurrent: { model.isCurrentDuplicatesAccount(account) }
@@ -1775,6 +1774,8 @@ struct MainView: View {
         let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
         isTrashMutating = true
+        // The account configuration this trash belongs to; a later sign-in rejects its location clean-up.
+        let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         Task {
             defer { isTrashMutating = false }
             if !local.isEmpty {
@@ -1796,7 +1797,8 @@ struct MainView: View {
                 duplicates?.didTrashElsewhere(uids)
                 if mapClusterPresentation != nil { await mapClusterModel.commitTrash(items) }
                 await OfflineLibraryManager.shared.reconcileLocations(
-                    items: timelineModel.wholeLibraryItemsForViewer,
+                    items: timelineModel.wholeLibraryItemsForLocations,
+                    owner: locationOwner,
                     metadata: backend,
                     recrawlRestoredItems: false
                 )
@@ -1817,6 +1819,8 @@ struct MainView: View {
         let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
         isTrashMutating = true
+        // The account configuration this restore belongs to; a later sign-in rejects its location clean-up.
+        let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         Task {
             defer { isTrashMutating = false }
             if !local.isEmpty {
@@ -1837,7 +1841,8 @@ struct MainView: View {
                 model.pendingGrid?.photosRestored(uids)
                 await timelineModel.commitRestore(items)
                 await OfflineLibraryManager.shared.reconcileLocations(
-                    items: timelineModel.wholeLibraryItemsForViewer,
+                    items: timelineModel.wholeLibraryItemsForLocations,
+                    owner: locationOwner,
                     metadata: backend,
                     recrawlRestoredItems: true
                 )
@@ -2030,11 +2035,21 @@ struct MainView: View {
     }
 
     private func mapAndPlacesLifecycle<Content: View>(_ view: Content) -> some View {
-        view.onChange(of: mapAndPlacesEnabled) { _, enabled in
+        view.onChange(of: timelineModel.wholeLibraryLocationRevision) { _, _ in
+            // The configuration this change belongs to. The task reads the newest library when it runs.
+            let owner = OfflineLibraryManager.shared.captureLocationOwner()
+            Task {
+                await OfflineLibraryManager.shared.publishLocationInventory(
+                    items: timelineModel.wholeLibraryItemsForLocations, owner: owner, metadata: backend,
+                    isCurrent: { model.facade === facade }
+                )
+            }
+        }
+        .onChange(of: mapAndPlacesEnabled) { _, enabled in
             if enabled {
                 viewerModel?.refreshPlaceNames()
                 OfflineLibraryManager.shared.resumeMapAndPlaces(
-                    items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
+                    items: timelineModel.wholeLibraryItemsForLocations, metadata: backend)
             } else {
                 if selection == .map { selection = .all }
                 OfflineLibraryManager.shared.pauseMapAndPlaces()
