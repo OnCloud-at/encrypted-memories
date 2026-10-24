@@ -44,6 +44,17 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         onPreparationProgress: @escaping BackupResourcePreparationHandler,
         readAdmission: @escaping BackupResourceReadAdmission
     ) async throws -> BackupResolvedResource? {
+        try await resolve(
+            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission,
+            omittingMissingPairedVideo: false)
+    }
+
+    public func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission,
+        omittingMissingPairedVideo: Bool
+    ) async throws -> BackupResolvedResource? {
         try readAdmission()
         #if ENCRYPTED_MEMORIES_UPGRADE_TEST
             if UpgradeTestProbe.isRequested { return try await UpgradeTestPhotoLibrary.resolve(entry) }
@@ -173,6 +184,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         // from the member's own asset, not from the main photo.
         let burstMembers = PhotoKitAssetMapper.burstPlan(for: asset)?.members ?? []
         var secondaries: [BackupSecondaryResource] = []
+        var omitsMissingPairedVideo = false
         for (secondaryIndex, item) in plan.secondaries.enumerated() {
             let owner: PHAsset
             let role: PhotoBackupAssetInfo.Resource.Role
@@ -192,13 +204,24 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 role = item.role
                 ordinal = item.ordinal
             }
-            guard let resource = PhotoKitAssetMapper.resource(for: role, ordinal: ordinal, of: owner) else {
-                throw UploadError.sourceReportedMissing(item.uploadFilename)
-            }
-            let identity = try await readIdentity(
-                resource, filename: item.uploadFilename, tracking: exportedURLs, readAdmission: readAdmission
-            ) { fraction in
-                identityProgress(secondaryIndex + 1, fraction)
+            let identity: IdentityResult
+            do {
+                guard let resource = PhotoKitAssetMapper.resource(for: role, ordinal: ordinal, of: owner) else {
+                    throw UploadError.sourceReportedMissing(item.uploadFilename)
+                }
+                identity = try await readIdentity(
+                    resource, filename: item.uploadFilename, tracking: exportedURLs, readAdmission: readAdmission
+                ) { fraction in
+                    identityProgress(secondaryIndex + 1, fraction)
+                }
+            } catch let error
+                where Self.omitsSecondary(
+                    item, failingWith: error, omittingMissingPairedVideo: omittingMissingPairedVideo)
+            {
+                // No names or identifiers, for checking on a device that only this video is left out.
+                Self.logger.notice("[Backup] Live Photo video left out: Photos reports it missing after its checks")
+                omitsMissingPairedVideo = true
+                continue
             }
             let source = UploadSourceIdentity(
                 kind: .photoLibraryAsset,
@@ -293,7 +316,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             externalIdentifierIsUnique: info.hasAdjustments
                 && Self.isUniqueCloudIdentifier(cloudIdentifier, localIdentifier: entry.source.identifier),
             materializeWithProgress: primaryMaterializer,
-            cleanup: { for url in exportedURLs.urls { tempStore.discard(url) } }
+            cleanup: { for url in exportedURLs.urls { tempStore.discard(url) } },
+            omitsMissingPairedVideo: omitsMissingPairedVideo
         )
     }
 
@@ -331,6 +355,18 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             throw UploadError.sourceReportedMissing(filename)
         }
         return (plan, candidate)
+    }
+
+    /// True when the compound leaves out `item` after its read failed with `error`: only the Live Photo video, only
+    /// when Photos reports it missing, and only on the last check that the runner allows a missing file. A file that
+    /// waits for iCloud, a denied read, any other error, and every other resource keep their failure.
+    static func omitsSecondary(
+        _ item: PhotoBackupExportPlan.Item, failingWith error: any Error, omittingMissingPairedVideo: Bool
+    ) -> Bool {
+        guard omittingMissingPairedVideo, item.sourceResource == .livePairedVideo,
+            case .sourceReportedMissing? = error as? UploadError
+        else { return false }
+        return true
     }
 
     private static func isUniqueCloudIdentifier(_ identifier: String?, localIdentifier: String) -> Bool {
