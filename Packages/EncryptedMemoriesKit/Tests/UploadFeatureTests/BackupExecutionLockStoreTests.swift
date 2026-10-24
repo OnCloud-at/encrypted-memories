@@ -236,6 +236,65 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         XCTAssertEqual(store.currentLock()?.heartbeatAt, clock.now)
     }
 
+    /// A bind that fails leaves its parameter NULL. The SELECT would then report no row, which is no lost lock.
+    func testHeartbeatWhoseReadCannotBindKeepsTheLock() throws {
+        let connection = try makeVerifiedConnection(url: tempDir.appendingPathComponent("read-bind.sqlite"))
+        let store = BackupExecutionLockManifestStore(connection: connection, now: { [clock] in clock!.now })
+        defer { store.close() }
+        XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
+        let acquired = try XCTUnwrap(store.currentLock())
+        // "photoBackup" no longer fits, so binding the lock name fails with SQLITE_TOOBIG.
+        let limit = connection.withLock { sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 4) }
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable)
+        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, limit) }
+        XCTAssertEqual(store.currentLock(), acquired)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .renewed)
+    }
+
+    /// A bind that fails in the update writes nothing and is no lost lock either.
+    func testHeartbeatWhoseWriteCannotBindWritesNothing() throws {
+        let connection = try makeVerifiedConnection(url: tempDir.appendingPathComponent("write-bind.sqlite"))
+        let store = BackupExecutionLockManifestStore(connection: connection, now: { [clock] in clock!.now })
+        defer { store.close() }
+        XCTAssertTrue(
+            store.acquire(owner: .foreground, runID: "owner", phase: "scanning", processContext: nil).didAcquire)
+        let acquired = try XCTUnwrap(store.currentLock())
+        // The stored row still fits; only the long phase of the update does not.
+        let limit = connection.withLock { sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 128) }
+
+        clock.advance(by: 30)
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: String(repeating: "p", count: 200)), .unavailable)
+        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, limit) }
+        XCTAssertEqual(store.currentLock(), acquired, "a failed bind must not write a NULL phase or a new heartbeat")
+        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .renewed)
+    }
+
+    /// Another connection removes or replaces the row after the heartbeat read it and before it writes.
+    func testHeartbeatWhoseRowChangesBeforeTheWriteIsLost() throws {
+        for replacement in [nil, "successor"] {
+            let url = tempDir.appendingPathComponent("raced-\(replacement ?? "removed").sqlite")
+            let race = RowRace(url: url, replacement: replacement)
+            let connection = try makeVerifiedConnection(url: url)
+            // The heartbeat reads the clock between its read and its write; that is where the other run acts.
+            let store = BackupExecutionLockManifestStore(
+                connection: connection,
+                now: { [clock] in
+                    race.fire()
+                    return clock!.now
+                })
+            defer { store.close() }
+            XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
+
+            race.arm()
+            XCTAssertEqual(store.heartbeat(runID: "owner", phase: "uploading"), .lost, "\(replacement ?? "removed")")
+            XCTAssertTrue(race.fired)
+            XCTAssertEqual(store.currentLock()?.runID, replacement, "the lost heartbeat writes nothing")
+            XCTAssertEqual(store.currentLock()?.phase, nil)
+        }
+    }
+
     func testAcquireAndRelease() throws {
         let store = try makeStore()
         XCTAssertNil(store.currentLock())
@@ -565,6 +624,38 @@ final class BackupExecutionLockStoreTests: XCTestCase {
             throw NSError(domain: "SQLiteTestConnection", code: Int(status))
         }
         return SQLiteStoreConnection(database: handle)
+    }
+
+    /// Changes the lock row through a second connection the first time it fires after `arm()`.
+    private final class RowRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private let url: URL
+        private let replacement: String?
+        private var armed = false
+        private(set) var fired = false
+
+        init(url: URL, replacement: String?) {
+            self.url = url
+            self.replacement = replacement
+        }
+
+        func arm() { lock.withLock { armed = true } }
+
+        func fire() {
+            let shouldFire = lock.withLock { () -> Bool in
+                guard armed, !fired else { return false }
+                fired = true
+                return true
+            }
+            guard shouldFire else { return }
+            var other: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &other), SQLITE_OK)
+            defer { sqlite3_close(other) }
+            let sql =
+                replacement.map { "UPDATE backup_execution_lock SET run_id='\($0)';" }
+                ?? "DELETE FROM backup_execution_lock;"
+            XCTAssertEqual(sqlite3_exec(other, sql, nil, nil, nil), SQLITE_OK)
+        }
     }
 
     private final class SelectInterruption {

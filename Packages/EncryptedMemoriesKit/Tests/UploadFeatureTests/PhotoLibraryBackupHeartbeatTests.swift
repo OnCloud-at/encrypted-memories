@@ -107,7 +107,7 @@ final class PhotoLibraryBackupHeartbeatTests: XCTestCase {
                 // No busy wait: a heartbeat that meets another writer fails at once.
                 databasePolicy: LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0),
                 defaults: defaults, runtimeSignals: .wiFiWithMobileDataOff)
-            configuration.heartbeatInterval = .milliseconds(20)
+            configuration.heartbeatInterval = 0.02
             let controller = PhotoLibraryBackupController(
                 configuration: configuration, identityResolver: FakeIdentityResolver(), uploader: MockUploader())
             controller.setEnabledForTesting()

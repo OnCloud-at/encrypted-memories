@@ -60,7 +60,7 @@ public final class PhotoLibraryBackupController {
         var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
         var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
         /// How often a pass renews its execution lock. The lease lets a crashed owner go after 120 s.
-        var heartbeatInterval: Duration = .seconds(30)
+        var heartbeatInterval: TimeInterval = 30
 
         public var defaults: UserDefaults
         public var runtimeSignals: BackupRuntimeSignalSource
@@ -224,7 +224,7 @@ public final class PhotoLibraryBackupController {
     /// The last `startSync` call deferred its pass to the first network path.
     private var lastStartWasDeferred = false
     private let firstNetworkPathWait: Duration
-    private let heartbeatInterval: Duration
+    private let heartbeatInterval: TimeInterval
     private var firstNetworkPathWaitTask: Task<Void, Never>?
     /// The wait for the first path ended without a path. Passes then run, and uploads still wait for Wi-Fi.
     private var firstNetworkPathWaitEnded = false
@@ -1494,14 +1494,16 @@ public final class PhotoLibraryBackupController {
         let interval = heartbeatInterval
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: interval)
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 guard !Task.isCancelled else { return }
                 switch lockStore.heartbeat(runID: runID, phase: nil) {
                 case .renewed, .unavailable:
                     // A failed read or write leaves ownership unknown; the next interval tries again.
                     continue
                 case .lost:
-                    // Another owner holds the lock, or nobody does: stop this pass at its next safe point.
+                    // Another owner holds the lock, or nobody does: stop the run. In-flight transfers are cancelled and
+                    // joined; unfinished rows go back to a runnable state, and a transfer that already committed keeps
+                    // its result.
                     self?.stopSync(runID: runID)
                     return
                 }
