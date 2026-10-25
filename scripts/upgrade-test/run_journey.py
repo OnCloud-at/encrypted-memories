@@ -502,6 +502,10 @@ def wait_ui_test_start(process, log, label, reached=None, timeout=UI_STARTUP_SEC
 
 
 def main():
+    if sys.argv[1:] == ['--list-points']:
+        # The one list of interruption points. The release workflow builds its job matrix from this output.
+        print(' '.join(POINTS))
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', type=Path, required=True)
     parser.add_argument('--automation', type=Path, required=True)
