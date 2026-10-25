@@ -672,18 +672,33 @@ public struct ExactDuplicateFinder: Sendable {
                     plans.flatMap {
                         $0.plan.candidates.flatMap(\.links) + $0.plan.relatedCopies.flatMap(\.links)
                     }))
+            var copied = [[CopiedRelatedFiles]](repeating: [], count: plans.count)
+            var settled: Set<Int> = []
+            let settle = { (position: Int, error: any Error) in
+                let plan = plans[position].plan
+                settled.insert(position)
+                if error as? ExactDuplicateRelatedFileTransferError == .copyFailed(.cleanup) {
+                    results[plans[position].index] = .success(
+                        .merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
+                } else {
+                    results[plans[position].index] = .failure(error)
+                }
+            }
             for position in plans.indices {
                 do {
-                    try await preserveRelatedFiles(
+                    copied[position] = try await preserveRelatedFiles(
                         in: &plans[position].plan, owners: owners, run: run, stagingClear: stagingClear)
                 } catch {
-                    let plan = plans[position].plan
-                    if error as? ExactDuplicateRelatedFileTransferError == .copyFailed(.cleanup) {
-                        results[plans[position].index] = .success(
-                            .merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
-                    } else {
-                        results[plans[position].index] = .failure(error)
-                    }
+                    settle(position, error)
+                }
+            }
+            // Every upload of the batch has ended. A source can have changed while a later copy ran, so each copied
+            // member proves its twins once more; only a member that passes can reach the trash.
+            for position in plans.indices where !settled.contains(position) {
+                do {
+                    try await proveCopies(copied[position], in: &plans[position].plan, run: run)
+                } catch {
+                    settle(position, error)
                     continue
                 }
                 // Copy work awaited remote changes; re-read local owners for those groups before deciding moves.
@@ -944,11 +959,19 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
-    /// Adds only verified copies. A failed member remains active while already-added twins may remain.
+    /// A member whose copies ended verified, with the twins that its own check found.
+    private struct CopiedRelatedFiles {
+        let copy: RelatedCopy
+        var twins: [String: UploadRemoteCompound.File]
+    }
+
+    /// Returns the verified copies; `proveCopies` adds them as candidates. A failed member remains active while
+    /// already-added twins may remain.
     private func preserveRelatedFiles(
         in plan: inout PlannedMerge, owners: [String: [UploadSourceIdentity]]?, run: ExactDuplicateMergeRun,
         stagingClear: Bool
-    ) async throws {
+    ) async throws -> [CopiedRelatedFiles] {
+        var copied: [CopiedRelatedFiles] = []
         for copy in plan.relatedCopies {
             try Task.checkCancellation()
             if let reason = localKeepReason(links: copy.links, hashes: copy.hashes, epoch: plan.epoch, owners: owners) {
@@ -962,30 +985,57 @@ public struct ExactDuplicateFinder: Sendable {
             do {
                 let snapshot = plan
                 let twins = try await run.copying { try await self.copyRelatedFiles(copy, under: snapshot) }
-                let moves =
-                    [
-                        UploadRemoteLinkMove(
-                            from: copy.member.nodeID, to: plan.kept.nodeID, contentHash: plan.contentHash)
-                    ]
-                    + copy.source.related.compactMap { file in
-                        twins[file.linkID].map {
-                            UploadRemoteLinkMove(from: file.linkID, to: $0.linkID, contentHash: file.contentHash)
-                        }
-                    }
-                plan.candidates.append((copy.member, copy.links, moves))
-                if copy.source.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(copy.member) }
+                copied.append(CopiedRelatedFiles(copy: copy, twins: twins))
             } catch {
-                let transferError = error as? ExactDuplicateRelatedFileTransferError
-                if transferError == .copyFailed(.cleanup) {
-                    plan.keptDuplicates[copy.member] = .copyFailed
-                    if Task.isCancelled { throw error }
-                } else {
-                    if Task.isCancelled || (error is CancellationError && !run.copiesStopped) {
-                        throw CancellationError()
-                    }
-                    plan.keptDuplicates[copy.member] = Self.keepReason(for: transferError)
-                }
+                try keepSource(copy.member, after: error, in: &plan, run: run)
             }
+        }
+        return copied
+    }
+
+    /// Reads every copied member again after all copies of the batch, and adds only the members whose twins still
+    /// cover their source.
+    private func proveCopies(
+        _ copied: [CopiedRelatedFiles], in plan: inout PlannedMerge, run: ExactDuplicateMergeRun
+    ) async throws {
+        var proven = copied
+        var failed: Set<PhotoUID> = []
+        for index in proven.indices {
+            let copy = proven[index].copy
+            do {
+                let snapshot = plan
+                proven[index].twins = try await run.copying { try await self.verifiedTwins(copy, under: snapshot) }
+            } catch {
+                failed.insert(copy.member)
+                try keepSource(copy.member, after: error, in: &plan, run: run)
+            }
+        }
+        for (copy, twins) in proven.map({ ($0.copy, $0.twins) }) where !failed.contains(copy.member) {
+            let moves =
+                [UploadRemoteLinkMove(from: copy.member.nodeID, to: plan.kept.nodeID, contentHash: plan.contentHash)]
+                + copy.source.related.compactMap { file in
+                    twins[file.linkID].map {
+                        UploadRemoteLinkMove(from: file.linkID, to: $0.linkID, contentHash: file.contentHash)
+                    }
+                }
+            plan.candidates.append((copy.member, copy.links, moves))
+            if copy.source.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(copy.member) }
+        }
+    }
+
+    /// A failed or stopped copy keeps its source active; a cancelled task ends the merge.
+    private func keepSource(
+        _ member: PhotoUID, after error: any Error, in plan: inout PlannedMerge, run: ExactDuplicateMergeRun
+    ) throws {
+        let transferError = error as? ExactDuplicateRelatedFileTransferError
+        if transferError == .copyFailed(.cleanup) {
+            plan.keptDuplicates[member] = .copyFailed
+            if Task.isCancelled { throw error }
+        } else {
+            if Task.isCancelled || (error is CancellationError && !run.copiesStopped) {
+                throw CancellationError()
+            }
+            plan.keptDuplicates[member] = Self.keepReason(for: transferError)
         }
     }
 
@@ -1048,6 +1098,13 @@ public struct ExactDuplicateFinder: Sendable {
             }
             try discardOwnedRelatedFile(destination)
         }
+        return try await verifiedTwins(copy, under: plan)
+    }
+
+    /// A fresh read of both compounds; every related file of the source needs its own twin under the kept photo.
+    private func verifiedTwins(
+        _ copy: RelatedCopy, under plan: PlannedMerge
+    ) async throws -> [String: UploadRemoteCompound.File] {
         let verified = try await copyContext(copy, under: plan)
         guard let twins = UploadRemoteReplacementSafety.relatedTwins(of: copy.source, under: verified) else {
             throw ExactDuplicateRelatedFileTransferError.copyFailed(.integrity)

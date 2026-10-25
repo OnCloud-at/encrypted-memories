@@ -385,9 +385,17 @@ final class BackupLocalDataPurgeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outsideFile.path))
     }
 
-    func testSignOutRemovesTheRelatedFileStagingFolder() {
+    func testSignOutRemovesTheRelatedFileStagingFolder() throws {
         let roots = BackupLocalDataPurge.localDataRoots()
         XCTAssertTrue(roots.contains(BackupLocalDataPurge.relatedFileStagingDirectory()))
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-purge-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("left".utf8).write(to: folder.appendingPathComponent("staged"))
+        XCTAssertTrue(BackupLocalDataPurge.purgeAllLocalAccountData(roots: [folder]).succeeded)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
     }
 
     func testEmptyingRelatedFileStagingKeepsTheFolderAndNeverFollowsLinks() throws {
@@ -410,6 +418,19 @@ final class BackupLocalDataPurgeTests: XCTestCase {
 
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [])
         XCTAssertEqual(try Data(contentsOf: outsideFile), Data("private".utf8))
+    }
+
+    func testARemovalOutsideItsBoundaryIsRefused() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("related-staging-boundary-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let folder = BackupLocalDataPurge.relatedFileStagingDirectory(temporaryDirectory: parent)
+        let outside = parent.appendingPathComponent("outside.txt")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("private".utf8).write(to: outside)
+
+        XCTAssertThrowsError(try TransientPlaintextPurge.removeWithoutFollowingLinks(at: outside, boundary: folder))
+        XCTAssertEqual(try Data(contentsOf: outside), Data("private".utf8))
     }
 
     func testALinkInPlaceOfTheRelatedFileStagingFolderIsRemovedWithoutFollowing() throws {

@@ -1129,6 +1129,126 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
     }
 
+    func testARelatedFileAttachedToAnEarlierSourceDuringALaterCopyKeepsThatSource() async throws {
+        let (setup, second, outcome) = try await twoSourceCopyWithHeldSecondUpload { setup in
+            _ = try setup.remote.seed(Data("attached meanwhile".utf8), under: setup.source, in: self.directory)
+        }
+
+        XCTAssertEqual(
+            outcome, .merged(kept: setup.kept, trashed: [second], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertEqual(state(of: second), .trashed)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testTwoSourcesThatStayUnchangedDuringALaterCopyAreBothTrashed() async throws {
+        let (setup, second, outcome) = try await twoSourceCopyWithHeldSecondUpload { _ in }
+
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [setup.source, second], keptDuplicates: [:]))
+        let read = try await server.compound(ofMainLink: setup.kept.nodeID)
+        XCTAssertEqual(read?.related.count, 2)
+        XCTAssertEqual(violations, [])
+    }
+
+    private typealias CopySetup = (kept: PhotoUID, source: PhotoUID, related: PhotoUID, remote: CopyingDuplicateRemote)
+
+    /// Two sources own different related files. The second upload waits until `meanwhile` ran.
+    private func twoSourceCopyWithHeldSecondUpload(
+        meanwhile: (CopySetup) throws -> Void
+    ) async throws -> (setup: CopySetup, second: PhotoUID, outcome: ExactDuplicateMergeOutcome) {
+        let setup = try copyingScenario(downloads: 2, uploads: 2)
+        let second = server.seedLink(digest: digest("main"))
+        let secondBytes = Data("second original".utf8)
+        _ = try setup.remote.seed(secondBytes, under: second, in: directory)
+        indexServer()
+        let secondDigest = try setup.remote.digest(of: secondBytes, in: directory)
+        let gate = FinderGate()
+        defer { gate.open() }
+        setup.remote.beforeUpload = { request in
+            if request.expectedSHA1 == secondDigest { await gate.pass() }
+        }
+        let group = try await onlyGroup()
+        let copying = copyingFinder(setup.remote)
+        let kept = setup.kept
+        let merging = Task { try await copying.merge(group, keeping: kept) }
+        await gate.waitForArrival()
+        try meanwhile(setup)
+        gate.open()
+        return (setup, second, try await merging.value)
+    }
+
+    func testASourceThatLeavesTheLibraryAfterItsUploadStaysUntrashed() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload { server, _, source in
+            server.setVisibility(
+                RemoteLinkVisibility(isActive: false, mainPhotoLinkID: nil, trashTime: 1), for: source.nodeID)
+        }
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+    }
+
+    func testAKeptPhotoThatLeavesTheLibraryAfterTheUploadKeepsTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload { server, kept, _ in
+            server.setVisibility(
+                RemoteLinkVisibility(isActive: false, mainPhotoLinkID: nil, trashTime: 1), for: kept.nodeID)
+        }
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testDetailsThatChangeAfterTheUploadKeepTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload { server, _, source in
+            server.setFingerprint(ExactDuplicateFingerprint(captureTime: Date(timeIntervalSince1970: 5)), of: source)
+        }
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testASourceMainThatChangesAfterTheUploadKeepsTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload(changedMain: \.source)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    func testAKeptMainThatChangesAfterTheUploadKeepsTheSource() async throws {
+        let (setup, outcome) = try await copyWithAContextChangeAfterTheUpload(changedMain: \.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+    }
+
+    /// The copy uploads its file; then one fact that the fresh verification checks changes.
+    private func copyWithAContextChangeAfterTheUpload(
+        changedMain: KeyPath<(kept: PhotoUID, source: PhotoUID), PhotoUID>? = nil,
+        change: @escaping @Sendable (EditScenarioServer, PhotoUID, PhotoUID) -> Void = { _, _, _ in }
+    ) async throws -> (setup: CopySetup, outcome: ExactDuplicateMergeOutcome) {
+        let setup = try copyingScenario()
+        let base = try XCTUnwrap(server)
+        let uploaded = CopyEvidenceSwitch()
+        let (kept, source) = (setup.kept, setup.source)
+        setup.remote.afterUpload = { _ in
+            change(base, kept, source)
+            uploaded.set()
+        }
+        let changedLink = changedMain.map { (kept: kept, source: source)[keyPath: $0].nodeID }
+        var checker = CopyBoundaryChecker(base: base)
+        checker.compoundRewrite = { linkID, read in
+            guard uploaded.isSet, linkID == changedLink, let read else { return read }
+            let main = UploadRemoteCompound.File(
+                linkID: read.main.linkID, contentHash: "changed after the upload", nameHash: read.main.nameHash,
+                mimeType: read.main.mimeType)
+            return UploadRemoteCompound(
+                main: main, related: read.related, tags: read.tags, externalIdentifier: read.externalIdentifier,
+                captureDate: read.captureDate, modificationDate: read.modificationDate)
+        }
+        var real = finder(remote: setup.remote, checker: checker)
+        real.copyNetwork = { BackupThrottleInputs(usesMobileData: false) }
+        return (setup, try await real.merge(try await onlyGroup(), keeping: setup.kept))
+    }
+
     func testTransferAccountingIncludesAReplacedScenarioServer() async throws {
         var servers = ScenarioServers()
         var remote = EditScenarioServer()
@@ -3568,6 +3688,40 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(manifest.record(for: source)?.outcome, "duplicateTrashed")
     }
 
+    func testMergeKeepsADuplicateWhoseRowMovesToAnotherLinkAfterTheOwnerSnapshot() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        let identities = CountingIdentityStore(base: store)
+        let manifest = try XCTUnwrap(store)
+        identities.afterOwnerSnapshot = {
+            guard var record = manifest.record(for: source) else { return }
+            record.remoteLinkID = "link-elsewhere"
+            _ = manifest.upsert(record)
+        }
+
+        let outcome = try await finder(identities: identities).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: kept, trashed: [], keptDuplicates: [duplicate: .neededByLocalSource]))
+        XCTAssertEqual(state(of: duplicate), .active)
+    }
+
+    func testMergeKeepsEveryDuplicateWhenTheStoreCannotTellItsOwners() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let identities = CountingIdentityStore(base: store)
+        identities.ownersUnknown = true
+
+        let outcome = try await finder(identities: identities).merge(try await onlyGroup(), keeping: kept)
+
+        XCTAssertEqual(
+            outcome, .merged(kept: kept, trashed: [], keptDuplicates: [duplicate: .neededByLocalSource]))
+        XCTAssertEqual(state(of: duplicate), .active)
+    }
+
     func testMergeKeepsADuplicateThatALocalSourceNeedsWhenItsRowCannotMove() async throws {
         let kept = server.seedLink(digest: digest("a"))
         let earlierKey = server.seedLink(digest: digest("a"))
@@ -4659,6 +4813,8 @@ private final class CountingIdentityStore: UploadIdentityStore, @unchecked Senda
     private let lock = NSLock()
     private var counted = Reads()
     var afterOwnerSnapshot: (@Sendable () -> Void)?
+    /// The batch owner read cannot tell which sources own the links.
+    var ownersUnknown = false
 
     init(base: UploadIdentityManifestStore) { self.base = base }
 
@@ -4677,7 +4833,7 @@ private final class CountingIdentityStore: UploadIdentityStore, @unchecked Senda
         lock.withLock { counted.batch += 1 }
         let snapshot = base.sources(withRemoteLinkIDs: linkIDs)
         afterOwnerSnapshot?()
-        return snapshot
+        return ownersUnknown ? nil : snapshot
     }
     func forgetRemoteLinks(_ linkIDs: Set<String>, of source: UploadSourceIdentity) -> Bool {
         base.forgetRemoteLinks(linkIDs, of: source)
@@ -4919,6 +5075,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
     let base: EditScenarioServer
     var beforeSuccessors: @Sendable () async -> Void = {}
     var epoch: (@Sendable () async throws -> String)?
+    /// Replaces the answer of a compound read, for example a main file whose content changed on the server.
+    var compoundRewrite: (@Sendable (String, UploadRemoteCompound?) -> UploadRemoteCompound?)?
     func nameHash(forCorrectedName name: String) async throws -> String {
         try await base.nameHash(forCorrectedName: name)
     }
@@ -4935,7 +5093,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
         try await base.linkVisibility(of: linkIDs)
     }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
-        try await base.compound(ofMainLink: linkID)
+        let read = try await base.compound(ofMainLink: linkID)
+        return compoundRewrite.map { $0(linkID, read) } ?? read
     }
     func hashKeyEpoch() async throws -> String {
         if let epoch { return try await epoch() }
