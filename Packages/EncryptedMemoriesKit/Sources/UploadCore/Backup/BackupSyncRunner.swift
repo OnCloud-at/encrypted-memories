@@ -1045,7 +1045,8 @@ public actor BackupSyncRunner {
                         descriptor: UploadResourceDescriptorSnapshot(resolved.descriptor),
                         queueBinding: UploadRemoteCommitQueueBinding(
                             source: entry.source,
-                            revision: entry.revision
+                            revision: entry.revision,
+                            uploadedRevision: resolved.candidate.snapshot.revision
                         )
                     )
                     guard
@@ -1391,6 +1392,13 @@ public actor BackupSyncRunner {
         resolved: BackupResolvedResource,
         workIntent: LibraryWorkIntent
     ) async {
+        guard Self.receiptBelongs(reconciliation, to: entry, resolvedRevision: resolved.candidate.snapshot.revision)
+        else {
+            // The receipt proves only the revision it was saved for. Recording it now could overwrite a newer backup of
+            // this source, so nothing is recorded and the ordinary path hashes and deduplicates the current revision.
+            requeueWithoutReceipt(entry, from: state)
+            return
+        }
         if reconciliation.source == entry.source,
             events?.recordHandoff(
                 source: entry.source,
@@ -1463,22 +1471,34 @@ public actor BackupSyncRunner {
         } else {
             // The secondary manifest is repaired. Re-run the primary's cheap duplicate decision
             // to recover its UID, then the compound pass will skip this secondary from manifest.
-            guard
-                queue.updateState(
-                    source: entry.source,
-                    revision: entry.revision,
-                    state: .discovered,
-                    attempts: nil,
-                    lastError: nil,
-                    updatedAt: now()
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: state, to: .discovered)
-            emitProgress()
+            requeueWithoutReceipt(entry, from: state)
         }
+    }
+
+    /// A receipt settles only the revision whose bytes it uploaded, from the queue row it is bound to. A receipt without
+    /// a binding, as written by older builds, and one without the uploaded revision use the row revision instead.
+    static func receiptBelongs(
+        _ reconciliation: UploadRemoteCommitReconciliation,
+        to entry: UploadBackupSyncQueueEntry,
+        resolvedRevision: UploadBackupRevision
+    ) -> Bool {
+        guard let binding = reconciliation.queueBinding else { return resolvedRevision == entry.revision }
+        guard binding.source == entry.source, binding.revision == entry.revision else { return false }
+        return resolvedRevision == (binding.uploadedRevision ?? entry.revision)
+    }
+
+    /// Clears the receipt and returns the row to the ordinary path.
+    private func requeueWithoutReceipt(_ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState) {
+        guard
+            queue.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: nil, lastError: nil,
+                updatedAt: now())
+        else {
+            stopRequested = true
+            return
+        }
+        adjustProgress(from: state, to: .discovered)
+        emitProgress()
     }
 
     private func parkRemoteReconciliation(
@@ -1567,6 +1587,7 @@ public actor BackupSyncRunner {
                 requiresRelatedMatch: replacesEarlierUpload,
                 entry: entry,
                 entryKey: Self.key(entry),
+                uploadedRevision: resolved.candidate.snapshot.revision,
                 workIntent: workIntent
             ) {
             case .allSettled:
@@ -1834,6 +1855,7 @@ public actor BackupSyncRunner {
         requiresRelatedMatch: Bool,
         entry: UploadBackupSyncQueueEntry,
         entryKey: String,
+        uploadedRevision: UploadBackupRevision,
         workIntent: LibraryWorkIntent
     ) async -> SecondaryOutcome {
         var remaining = secondaries.count
@@ -1854,7 +1876,8 @@ public actor BackupSyncRunner {
                             descriptor: UploadResourceDescriptorSnapshot(secondary.descriptor),
                             queueBinding: UploadRemoteCommitQueueBinding(
                                 source: entry.source,
-                                revision: entry.revision
+                                revision: entry.revision,
+                                uploadedRevision: uploadedRevision
                             )
                         )
                         guard
