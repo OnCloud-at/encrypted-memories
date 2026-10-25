@@ -189,17 +189,15 @@ extension DriveSessionStubSuite {
             routeEmptyEvents(from: "one", to: "two")
             StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
             StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: Self.neverFires)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             func listings() -> Int {
                 StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
             }
             let clock = ContinuousClock()
-            func waitedFor(_ outcome: LockedOutcome) async throws -> Duration {
+            func waitedFor(_ outcome: LockedOutcome) async -> Duration {
                 let start = clock.now
-                while outcome.value == nil, clock.now - start < .seconds(5) {
-                    try await Task.sleep(for: .milliseconds(10))
-                }
+                await outcome.wait()
                 return clock.now - start
             }
             let laterProgress = LockedOutcome()
@@ -217,11 +215,10 @@ extension DriveSessionStubSuite {
             }
 
             let (window, windowCancelled) = preparation()
-            let begin = clock.now
-            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            try await waitUntil { listings() > 0 }
             #expect(listings() == 1, "the build reached its library listing")
             window.cancel()
-            let windowWait = try await waitedFor(windowCancelled)
+            let windowWait = await waitedFor(windowCancelled)
             #expect(windowCancelled.value == true, "the expired window ended with a cancellation")
             #expect(windowWait < .seconds(2), "the expired window stopped waiting at once: \(windowWait)")
 
@@ -232,20 +229,18 @@ extension DriveSessionStubSuite {
             }
             let (later, laterCancelled) = preparation(reporting: laterProgress)
             // The later preparation reports loading just before it joins the running build.
-            while laterProgress.value == nil, clock.now - begin < .seconds(20) {
-                try await Task.sleep(for: .milliseconds(10))
-            }
+            await laterProgress.wait()
             try await Task.sleep(for: .milliseconds(300))
             #expect(listings() == 1, "a later preparation joins the running build")
             #expect(released.value == nil, "the metadata pass stays held while the build runs")
             later.cancel()
-            let laterWait = try await waitedFor(laterCancelled)
+            let laterWait = await waitedFor(laterCancelled)
             #expect(laterCancelled.value == true, "the joined preparation ended with a cancellation")
             #expect(laterWait < .seconds(2), "the joined preparation stopped waiting at once: \(laterWait)")
 
             // The end of the build, here through an invalidation, releases the metadata pass.
             await service.invalidateCachedRemoteState()
-            let passWait = try await waitedFor(released)
+            let passWait = await waitedFor(released)
             #expect(released.value == true, "the end of the build releases the metadata pass: \(passWait)")
             pass.cancel()
         }
@@ -266,7 +261,7 @@ extension DriveSessionStubSuite {
                 content.replaceRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: Self.neverFires)
             let released = LockedOutcome()
             let pass = Task {
                 await gate.wait()
@@ -276,24 +271,26 @@ extension DriveSessionStubSuite {
         }
 
         private func waitUntilReleased(_ released: LockedOutcome) async throws {
+            await released.wait()
+        }
+
+        /// Polls a state that only the stub URL protocol or the gate reports. No time limit decides the result: the
+        /// safety net only ends a wait that nothing else ended, and the next expectation of the caller then fails.
+        private func waitUntil(_ condition: () async -> Bool) async throws {
             let clock = ContinuousClock()
-            let start = clock.now
-            while released.value == nil, clock.now - start < .seconds(10) {
+            let begin = clock.now
+            while await !condition(), clock.now - begin < testSafetyNet {
                 try await Task.sleep(for: .milliseconds(10))
             }
         }
 
-        /// Waits until the timeline pass waits on the gate, bounded: a pass that never waits fails here.
+        /// Waits until the timeline pass waits on the gate: a pass that never waits fails here after the safety net.
         private func waitUntilThePassWaits(on gate: TimelineMetadataStartGate) async throws {
-            let clock = ContinuousClock()
-            let start = clock.now
-            while gate.waiterCount == 0, !gate.isOpen, clock.now - start < .seconds(10) {
-                try await Task.sleep(for: .milliseconds(5))
-            }
+            try await waitUntil { gate.waiterCount > 0 || gate.isOpen }
             try #require(gate.waiterCount == 1, "the timeline pass waits on the gate")
         }
 
-        /// Joins `task`, bounded: a task that never ends fails here and is cancelled instead of hanging the test.
+        /// Joins `task`: a task that never ends fails here after the safety net and is cancelled instead of hanging the test.
         private func join<T: Sendable>(_ task: Task<T, any Error>, _ comment: Comment) async throws {
             let ended = LockedOutcome()
             let joining = Task {
@@ -344,9 +341,7 @@ extension DriveSessionStubSuite {
                 StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
             }
             let preparation = Task { try await service.prepareRemoteIndex { _ in } }
-            let clock = ContinuousClock()
-            let begin = clock.now
-            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            try await waitUntil { listings() > 0 }
             #expect(listings() == 1, "the build reached its library listing")
             try await waitUntilThePassWaits(on: fixture.gate)
             // The backup pass stops waiting; the build keeps running.
@@ -386,9 +381,7 @@ extension DriveSessionStubSuite {
                     UploadBackupExternalIdentity(identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
                 ])
             }
-            let clock = ContinuousClock()
-            let begin = clock.now
-            while eventReads() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            try await waitUntil { eventReads() > 0 }
             #expect(eventReads() == 1, "the lookup's build reads the changes since its checkpoint")
             try await waitUntilThePassWaits(on: fixture.gate)
 
@@ -462,15 +455,13 @@ extension DriveSessionStubSuite {
             routeEmptyEvents(from: "one", to: "two")
             StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
             StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: Self.neverFires)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             func listings() -> Int {
                 StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
             }
-            let clock = ContinuousClock()
             let window = Task { try await service.prepareRemoteIndex { _ in } }
-            let begin = clock.now
-            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            try await waitUntil { listings() > 0 }
             #expect(listings() == 1, "the build reached its library listing")
             window.cancel()
             _ = await window.result
@@ -482,8 +473,7 @@ extension DriveSessionStubSuite {
                 // The shutdown returns only after the build ended, so no build can touch the stores after it.
                 ended.set(!(await service.hasUnfinishedRemoteContentIndexBuild))
             }
-            let stopped = clock.now
-            while ended.value == nil, clock.now - stopped < .seconds(5) { try await Task.sleep(for: .milliseconds(10)) }
+            await ended.wait()
             #expect(ended.value == true, "the shutdown ended the running build")
             shutdown.cancel()
             // The cancelled build ended, so the metadata pass that the cancelled preparation left held is released.
@@ -493,8 +483,7 @@ extension DriveSessionStubSuite {
                 released.set(true)
             }
             defer { pass.cancel() }
-            let shut = clock.now
-            while released.value == nil, clock.now - shut < .seconds(5) { try await Task.sleep(for: .milliseconds(10)) }
+            await released.wait()
             #expect(released.value == true, "the shutdown cancelled the build")
 
             let requestsBefore = StubURLProtocol.requests().count
@@ -507,10 +496,7 @@ extension DriveSessionStubSuite {
                     afterShutdown.set(error is CancellationError)
                 }
             }
-            let asked = clock.now
-            while afterShutdown.value == nil, clock.now - asked < .seconds(5) {
-                try await Task.sleep(for: .milliseconds(10))
-            }
+            await afterShutdown.wait()
             late.cancel()
             #expect(afterShutdown.value == true, "a preparation after the shutdown ends with a cancellation")
             #expect(StubURLProtocol.requests().count == requestsBefore, "no build starts after the shutdown")
@@ -540,10 +526,8 @@ extension DriveSessionStubSuite {
             func listings() -> Int {
                 StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
             }
-            let clock = ContinuousClock()
             let pass = Task { try await service.prepareRemoteIndex { _ in } }
-            let begin = clock.now
-            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            try await waitUntil { listings() > 0 }
             #expect(listings() == 1, "the build reached its library listing")
 
             await service.invalidateCachedRemoteState()
@@ -573,27 +557,23 @@ extension DriveSessionStubSuite {
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
             StubURLProtocol.hang("GET /drive/volumes/vol1/events/one")
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: Self.neverFires)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             func eventReads() -> Int {
                 StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/events/one") }.count
             }
-            let clock = ContinuousClock()
             // An asset proof starts the shorter refresh of the events, which hangs.
             let proof = Task {
                 try await service.findRemoteAssetProofs(for: [
                     UploadBackupExternalIdentity(identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
                 ])
             }
-            let begin = clock.now
-            while eventReads() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            try await waitUntil { eventReads() > 0 }
             #expect(eventReads() == 1, "the shorter refresh reads the events")
             // The preparation needs the lineage rebuild, waits for the running refresh and then stops.
             let loading = LockedOutcome()
             let preparation = Task { try await service.prepareRemoteIndex { _ in loading.set(true) } }
-            while loading.value == nil, clock.now - begin < .seconds(20) {
-                try await Task.sleep(for: .milliseconds(10))
-            }
+            await loading.wait()
             try await Task.sleep(for: .milliseconds(300))
             preparation.cancel()
             _ = await preparation.result
@@ -655,7 +635,6 @@ extension DriveSessionStubSuite {
                 async throws -> Void
         ) async throws {
             try await invalidatedLineageRebuild { service, gate, released, holdsTheBuild in
-                let clock = ContinuousClock()
                 let requestsBeforeN = StubURLProtocol.requests().count
                 let newer = Task {
                     try await service.findRemoteAssetProofs(for: [
@@ -663,17 +642,11 @@ extension DriveSessionStubSuite {
                             identifier: "asset", modificationDate: Date(timeIntervalSince1970: 0))
                     ])
                 }
-                let started = clock.now
-                while StubURLProtocol.requests().count == requestsBeforeN, clock.now - started < .seconds(10) {
-                    try await Task.sleep(for: .milliseconds(10))
-                }
+                try await waitUntil { StubURLProtocol.requests().count != requestsBeforeN }
                 #expect(await service.unfinishedRemoteContentIndexBuildCount == 2, "L and N run")
 
                 await holdsTheBuild.open()
-                let ending = clock.now
-                while await service.unfinishedRemoteContentIndexBuildCount > 1, clock.now - ending < .seconds(10) {
-                    try await Task.sleep(for: .milliseconds(10))
-                }
+                try await waitUntil { await service.unfinishedRemoteContentIndexBuildCount <= 1 }
                 #expect(await service.unfinishedRemoteContentIndexBuildCount == 1, "L ended and N still runs")
                 try await body(service, gate, released)
                 await service.shutdown()
@@ -707,7 +680,7 @@ extension DriveSessionStubSuite {
             StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
             StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
             StubURLProtocol.hang("GET /drive/volumes/vol1/events/one")
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: Self.neverFires)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             let released = LockedOutcome()
             let pass = Task {
@@ -715,7 +688,6 @@ extension DriveSessionStubSuite {
                 released.set(true)
             }
             defer { pass.cancel() }
-            let clock = ContinuousClock()
             let holdsTheBuild = HandlerGate()
             let reachedTheBuild = LockedOutcome()
 
@@ -729,10 +701,7 @@ extension DriveSessionStubSuite {
                     }
                 }
             }
-            let begin = clock.now
-            while reachedTheBuild.value == nil, clock.now - begin < .seconds(10) {
-                try await Task.sleep(for: .milliseconds(10))
-            }
+            await reachedTheBuild.wait()
             #expect(reachedTheBuild.value == true, "L runs and waits in the handler")
             preparation.cancel()
             _ = await preparation.result
@@ -1380,7 +1349,7 @@ extension DriveSessionStubSuite {
             StubURLProtocol.reset()
             routeEmptyEvents(from: "one", to: "two")
             StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: Self.neverFires)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             let released = LockedOutcome()
             let pass = Task {
@@ -1498,7 +1467,7 @@ extension DriveSessionStubSuite {
             _ events: BuildOrderLog, _ reconciliation: TimelineMetadataReconciliation
         ) async -> Bool {
             let safetyNet = Task {
-                do { try await Task.sleep(for: .seconds(180)) } catch { return }
+                do { try await Task.sleep(for: testSafetyNet) } catch { return }
                 await events.giveUp()
             }
             let started = await events.waitFor("metadata pass")
@@ -1732,9 +1701,51 @@ extension DriveSessionStubSuite {
 private final class LockedOutcome: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: Bool?
+    private var gaveUp = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
     var value: Bool? { lock.withLock { stored } }
-    func set(_ value: Bool) { lock.withLock { stored = value } }
+
+    func set(_ value: Bool) {
+        let resumed = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            stored = value
+            defer { waiters = [] }
+            return waiters
+        }
+        resumed.forEach { $0.resume() }
+    }
+
+    /// Returns when the outcome is set, without polling. The safety net only ends a wait that nothing else ended; the
+    /// outcome then stays nil and the next expectation of the test fails.
+    func wait() async {
+        let safetyNet = Task {
+            do { try await Task.sleep(for: testSafetyNet) } catch { return }
+            giveUp()
+        }
+        defer { safetyNet.cancel() }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let ready = lock.withLock { () -> Bool in
+                if stored != nil || gaveUp { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if ready { continuation.resume() }
+        }
+    }
+
+    private func giveUp() {
+        let resumed = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            gaveUp = true
+            defer { waiters = [] }
+            return waiters
+        }
+        resumed.forEach { $0.resume() }
+    }
 }
+
+/// The time that only ends a wait that nothing else ended. A mutation run shortens it with
+/// `EM_TEST_SAFETY_NET_SECONDS`, so a broken production behavior fails in seconds instead of minutes.
+private let testSafetyNet: Duration = .seconds(
+    ProcessInfo.processInfo.environment["EM_TEST_SAFETY_NET_SECONDS"].flatMap { Int($0) } ?? 180)
 
 private final class LockedCount: @unchecked Sendable {
     private let lock = NSLock()
