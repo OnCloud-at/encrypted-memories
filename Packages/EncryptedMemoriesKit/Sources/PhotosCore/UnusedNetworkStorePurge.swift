@@ -7,7 +7,8 @@ import OSLog
 /// The purge never lists either container. It removes only the literal names below, directly inside
 /// `Library/Caches/<bundle id>` and `Library/Cookies`. It refuses symbolic links at or below the
 /// trusted app-container boundary. Every other entry stays, including the Core ML compile cache and app caches.
-/// On macOS it runs only inside the app's sandbox container, where `Library/Cookies` is the app's own.
+/// On macOS it removes entries only inside the app's sandbox container, where `Library/Cookies` is the app's own.
+/// Outside every container it removes nothing and completes; a Library in another container is refused.
 public enum UnusedNetworkStorePurge {
     static let completedKey = "network.unusedStorePurged.v1"
     static let urlCacheEntryNames = ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData"]
@@ -85,11 +86,16 @@ public enum UnusedNetworkStorePurge {
         defaults.removeObject(forKey: completedKey)
         // Both containers must sit in the app's own Library.
         guard
-            !requiresSandboxContainer
-                || isSandboxContainerLibrary(libraryDirectory, bundleIdentifier: bundleIdentifier),
             cachesDirectory.standardizedFileURL.deletingLastPathComponent().path
                 == libraryDirectory.standardizedFileURL.path
         else { return nil }
+        let ownContainer = isSandboxContainerLibrary(libraryDirectory, bundleIdentifier: bundleIdentifier)
+        if requiresSandboxContainer && !ownContainer {
+            // An unsandboxed macOS run shares these stores with other apps. None of them is the app's own.
+            guard isUnsandboxedLibrary(libraryDirectory) else { return nil }
+            defaults.set(true, forKey: completedKey)
+            return Result(removed: [], failed: [])
+        }
 
         let trustedBoundary =
             requiresSandboxContainer
@@ -144,7 +150,7 @@ public enum UnusedNetworkStorePurge {
 
     /// iOS apps always run in their own container. A macOS app outside its own sandbox container
     /// (`Containers/<bundle id>/Data/Library`) shares `Library/Cookies` with other apps,
-    /// so the purge must not run there.
+    /// so the purge must not remove anything there.
     static func isSandboxContainerLibrary(_ library: URL, bundleIdentifier: String) -> Bool {
         let library = library.standardizedFileURL
         let data = library.deletingLastPathComponent()
@@ -153,6 +159,19 @@ public enum UnusedNetworkStorePurge {
             && data.lastPathComponent == "Data"
             && container.lastPathComponent == bundleIdentifier
             && container.deletingLastPathComponent().lastPathComponent == "Containers"
+    }
+
+    /// A macOS Library outside every sandbox container: neither the given path nor its physical location,
+    /// with every link resolved, contains a `Containers/<id>/Data` sequence. An unresolvable Library is refused.
+    static func isUnsandboxedLibrary(_ library: URL) -> Bool {
+        guard let resolved = realpath(library.path, nil) else { return false }
+        defer { free(resolved) }
+        return !containsContainerData(library.standardizedFileURL.pathComponents)
+            && !containsContainerData(URL(fileURLWithPath: String(cString: resolved)).pathComponents)
+    }
+
+    private static func containsContainerData(_ components: [String]) -> Bool {
+        components.indices.dropLast(2).contains { components[$0] == "Containers" && components[$0 + 2] == "Data" }
     }
 
     /// Resolve aliases only above the admitted app-container boundary. Every component below it

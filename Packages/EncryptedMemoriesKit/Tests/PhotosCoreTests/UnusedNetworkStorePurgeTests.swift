@@ -518,20 +518,110 @@ final class UnusedNetworkStorePurgeTests: XCTestCase {
     }
 
     #if os(macOS)
-        func testDoesNothingOutsideAMacSandboxContainer() throws {
+        /// An unsandboxed run shares `Library/Cookies` with other apps. It removes nothing and still completes (#792).
+        func testOutsideAMacSandboxContainerRemovesNothingAndCompletes() throws {
             let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
             let sharedCookies = sharedLibrary.appendingPathComponent("Cookies/Cookies.binarycookies")
             let sharedCache = sharedLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
             try write(sharedCookies)
             try write(sharedCache)
 
-            XCTAssertNil(purge(library: sharedLibrary))
+            let result = try XCTUnwrap(purge(library: sharedLibrary))
 
+            XCTAssertEqual(result.removed, [])
+            XCTAssertEqual(result.failed, [])
             XCTAssertTrue(exists(sharedCookies))
+            XCTAssertTrue(exists(sharedCache))
+            XCTAssertTrue(isDone)
+        }
+
+        /// A Library that leads into a container through a link is not an unsandboxed Library.
+        func testALibraryLinkIntoAContainerIsRefused() throws {
+            try seedUnusedStores()
+            let otherLibrary = root.appendingPathComponent("Containers/other.id/Data/Library", isDirectory: true)
+            let otherCache = otherLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+            try write(otherCache)
+            for destination in [library!, otherLibrary] {
+                let link = root.appendingPathComponent("Users/\(UUID().uuidString)/Library", isDirectory: true)
+                try FileManager.default.createDirectory(
+                    at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+
+                XCTAssertNil(purge(library: link), destination.path)
+            }
+
+            XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+            XCTAssertTrue(exists(cookies.appendingPathComponent("Cookies.binarycookies")))
+            XCTAssertTrue(exists(otherCache))
+            XCTAssertFalse(isDone)
+        }
+
+        func testAnAncestorLinkIntoAContainerIsRefused() throws {
+            try seedUnusedStores()
+            let data = library.deletingLastPathComponent()
+            let link = root.appendingPathComponent("Users/someone", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: data)
+
+            XCTAssertNil(purge(library: link.appendingPathComponent("Library", isDirectory: true)))
+
+            XCTAssertTrue(exists(urlCache.appendingPathComponent("Cache.db")))
+            XCTAssertFalse(isDone)
+        }
+
+        /// The written path counts as well: a container path that links to a plain Library is still refused.
+        func testAContainerPathLinkedToAPlainLibraryIsRefused() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            let sharedCache = sharedLibrary.appendingPathComponent("Caches/\(bundleIdentifier)/Cache.db")
+            try write(sharedCache)
+            let otherLibrary = root.appendingPathComponent("Containers/other.id/Data/Library", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: otherLibrary.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: otherLibrary, withDestinationURL: sharedLibrary)
+
+            XCTAssertNil(purge(library: otherLibrary))
+
             XCTAssertTrue(exists(sharedCache))
             XCTAssertFalse(isDone)
         }
+
+        func testAMissingLibraryOutsideAContainerIsRefused() throws {
+            XCTAssertNil(purge(library: root.appendingPathComponent("Users/nobody/Library", isDirectory: true)))
+            XCTAssertFalse(isDone)
+        }
+
+        func testCachesOutsideAnUnsandboxedLibraryAreRefused() throws {
+            let sharedLibrary = root.appendingPathComponent("Users/someone/Library", isDirectory: true)
+            try FileManager.default.createDirectory(at: sharedLibrary, withIntermediateDirectories: true)
+            let foreignCaches = root.appendingPathComponent("elsewhere/Caches", isDirectory: true)
+            let foreignCache = foreignCaches.appendingPathComponent("\(bundleIdentifier)/Cache.db")
+            try write(foreignCache)
+
+            XCTAssertNil(purge(library: sharedLibrary, caches: foreignCaches))
+
+            XCTAssertTrue(exists(foreignCache))
+            XCTAssertFalse(isDone)
+        }
     #endif
+
+    /// iOS has no container layout rule. Its Library keeps the full removal of the five names.
+    func testIOSRuleRemovesTheNamedEntriesOutsideAContainerLayout() throws {
+        let iOSLibrary = root.appendingPathComponent("\(UUID().uuidString)/Library", isDirectory: true)
+        let iOSCache = iOSLibrary.appendingPathComponent("Caches/\(bundleIdentifier)", isDirectory: true)
+        for name in ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData/0B1C2D3E"] {
+            try write(iOSCache.appendingPathComponent(name))
+        }
+        try write(iOSLibrary.appendingPathComponent("Cookies/Cookies.binarycookies"))
+
+        let result = try XCTUnwrap(purge(library: iOSLibrary, requiresSandboxContainer: false))
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(
+            Set(result.removed.map(\.lastPathComponent)),
+            ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData", "Cookies.binarycookies"])
+        XCTAssertTrue(isDone)
+    }
 
     /// Sign-out clears the app's preferences, so the next cold launch removes any URL cache or
     /// cookie file that appeared since the last purge.
