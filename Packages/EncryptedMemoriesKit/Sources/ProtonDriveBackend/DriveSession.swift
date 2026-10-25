@@ -491,7 +491,10 @@ extension DriveSession {
         for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let response = try await linkVisibilityResponse(shareID: shareID, linkIDs: chunk, retryOnRateLimit: true)
-            complete = complete && response.code == 1000 && response.hasKnownEnvelope
+            complete = complete && response.code == 1000 && response.envelope.isComplete
+            if response.envelope.isUnsupported {
+                PhotoDiagnostics.shared.increment("albumSync.deletionMetadataUnsupportedEnvelope")
+            }
             let requested = Set(chunk)
             for link in response.links {
                 guard let id = link.linkID, requested.contains(id), let state = link.state, states[id] == nil else {
@@ -710,13 +713,14 @@ private struct VolumeTrashResponse: Decodable {
 /// `links/fetch_metadata` fields that decide whether a photos listing can show a link.
 private struct LinkVisibilityResponse: Decodable {
     let code: Int?
-    let hasKnownEnvelope: Bool
+    /// What the shape of the answer says about its completeness; see `protonMetadataEnvelope`.
+    let envelope: ProtonMetadataEnvelope
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         code = try container.decodeIfPresent(Int.self, forKey: .code)
         links = try container.decode([Body].self, forKey: .links)
-        hasKnownEnvelope = try protonResponseContainsOnly(["Code", "Links"], decoder: decoder)
+        envelope = try protonMetadataEnvelope(decoder: decoder)
     }
     /// Required: a response without it is incomplete, not a list of deleted links.
     let links: [Body]
