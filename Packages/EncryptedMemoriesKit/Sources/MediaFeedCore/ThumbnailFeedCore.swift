@@ -394,6 +394,8 @@ public actor ThumbnailFeedCore {
     /// Wakes the crawl after storage leaves the critical level. It exists only while the crawl sleeps for storage.
     /// Wakes the crawl when the condition that held it ends: storage recovers, or the app is in the foreground.
     private var crawlWakeTask: Task<Void, Never>?
+    /// The workers' waits for the coordinator's permit in a background window.
+    private var windowPermitWaits: [UUID: Task<LibraryBackgroundWindowPermit?, Never>] = [:]
     private var sourceEpoch: LibrarySourceEpoch?
     private var lastSelectedScope: SelectedDerivedDataScope?
     private var lastAnalysisScope: AnalysisDerivedDataScope?
@@ -921,6 +923,7 @@ public actor ThumbnailFeedCore {
         priority.append(uid)
         priorityByUID[uid] = requestedPriority
         trimPriorityQueueIfNeeded()
+        endWindowPermitWaits()
         startWorkers()
         return true
     }
@@ -2153,10 +2156,34 @@ public actor ThumbnailFeedCore {
     /// In a background window every batch waits for the coordinator's single heavy permit, so a waiting backup item
     /// goes first and batches run one at a time. Nil in the foreground, where the crawl runs as before, and when the
     /// window ends during the wait.
-    private nonisolated func backgroundWindowPermit() async -> LibraryBackgroundWindowPermit? {
-        await LibraryBackgroundWindowPermit.acquire(
-            LibraryBackgroundWorkTuning.crawlBatch, coordinator: resourceCoordinator, runtimeState: cache.runtimeState)
+    private func backgroundWindowPermit() async -> LibraryBackgroundWindowPermit? {
+        let id = UUID()
+        let wait = Task { [resourceCoordinator, cache] in
+            await LibraryBackgroundWindowPermit.acquire(
+                LibraryBackgroundWorkTuning.crawlBatch, coordinator: resourceCoordinator,
+                runtimeState: cache.runtimeState)
+        }
+        windowPermitWaits[id] = wait
+        defer { windowPermitWaits[id] = nil }
+        return await withTaskCancellationHandler {
+            await wait.value
+        } onCancel: {
+            wait.cancel()
+        }
     }
+
+    /// A photo on screen does not wait behind the crawl's permit: the waiting workers stop waiting and take it.
+    private func endWindowPermitWaits() {
+        for wait in windowPermitWaits.values { wait.cancel() }
+    }
+
+    private nonisolated func isInBackgroundWindow() -> Bool {
+        cache.runtimeState.snapshot().executionOpportunity == .backgroundPermitted
+    }
+
+    /// The pause after a permit wait that ended while the app is still, or again, in a background window: a new
+    /// window began or the account changed. It keeps that rare case from spinning.
+    private static let windowPermitRetryDelay: Duration = .milliseconds(50)
 
     private nonisolated func crawlIsHeld() -> Bool {
         Self.holdsCrawl(cache.runtimeState.snapshot())
@@ -2192,11 +2219,21 @@ public actor ThumbnailFeedCore {
     private func worker(generation: UInt64) async {
         while !Task.isCancelled, generation == prefetchGeneration {
             guard ownerLeaseIsCurrent() else { return }
-            // The permit is the quantum: it ends with this batch, and the next batch asks again.
-            let windowPermit = await backgroundWindowPermit()
+            // In a background window a crawl batch runs only under the coordinator's single heavy permit, so a
+            // waiting backup item goes first; the permit ends with this batch. A photo on screen loads as before.
+            let windowPermit = priority.isEmpty && isInBackgroundWindow() ? await backgroundWindowPermit() : nil
             defer { windowPermit?.release() }
             guard !Task.isCancelled, generation == prefetchGeneration else { return }
-            let work = await takeBatch()
+            #if DEBUG
+                testingHooks.afterWindowPermitWait()
+            #endif
+            // A wait that ended without a permit decides again from the state now: a new window waits again.
+            let crawlAllowed = windowPermit != nil || !isInBackgroundWindow()
+            if !crawlAllowed, priority.isEmpty {
+                try? await Task.sleep(for: Self.windowPermitRetryDelay)
+                continue
+            }
+            let work = await takeBatch(crawlAllowed: crawlAllowed)
             // Every exit of this iteration gives the returned reservations back; the download path below also
             // releases them as soon as the load ends.
             defer { releasePriorityReservations(for: work.uids, generation: generation) }
@@ -2215,6 +2252,7 @@ public actor ThumbnailFeedCore {
                     && (withheldRetry.isEmpty || !prefetchEnabled)
                 {
                     if diskProbeBatchesInFlight > 0 {
+                        windowPermit?.release()
                         try? await Task.sleep(for: .milliseconds(10))
                         continue
                     }
@@ -2224,6 +2262,7 @@ public actor ThumbnailFeedCore {
                     // compete for the serial actor with the visible decode that demand represents. Idle; the
                     // scan resumes once demand quiets.
                     if recentVisibleDemand() {
+                        windowPermit?.release()
                         try? await Task.sleep(for: .milliseconds(150))
                         continue
                     }
@@ -2232,18 +2271,22 @@ public actor ThumbnailFeedCore {
                     // chunked, demand-aborting `runCoverageRefresh`, this means one bounded refresh per drain,
                     // never a stampede of N full-library scans on the serial actor.
                     guard !coverageRefreshInFlight else {
+                        windowPermit?.release()
                         try? await Task.sleep(for: .milliseconds(150))
                         continue
                     }
                     coverageRefreshInFlight = true
-                    let outcome = await runCoverageRefresh()
+                    // Under a permit the refresh also stops when the coordinator asks for the permit back or the
+                    // window ends; the release below then lets a waiting backup item go first.
+                    let outcome = await runCoverageRefresh(shouldStop: { windowPermit?.mustStop ?? false })
                     coverageRefreshInFlight = false
                     switch outcome {
                     case .aborted:
-                        continue  // A live viewport takes priority; retry coverage when quiet.
+                        continue  // A live viewport, a stop or a changed session; the loop decides again.
                     case .recrawl:
                         sequentialIndex = 0
                         coverageScanCursor = 0
+                        windowPermit?.release()
                         try? await Task.sleep(for: .seconds(2))
                         continue
                     case .settled:
@@ -2261,6 +2304,7 @@ public actor ThumbnailFeedCore {
                     sleepUntilCrawlMayRun()
                     return
                 }
+                windowPermit?.release()
                 try? await Task.sleep(for: .milliseconds(150))
                 continue
             }
@@ -2529,7 +2573,7 @@ public actor ThumbnailFeedCore {
     /// Reserves queue candidates on the actor, then yields it while the dedicated executor performs the actual
     /// file reads and AES-GCM validation. The old implementation called `hasUsableDiskData` inline here; one
     /// pathological APFS read could therefore stop every viewport replacement for multiple seconds.
-    private func takeBatch() async -> BatchWork {
+    private func takeBatch(crawlAllowed: Bool = true) async -> BatchWork {
         let probeGeneration = cache.captureWriterGeneration()
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(probeGeneration) else {
             return BatchWork()
@@ -2585,7 +2629,8 @@ public actor ThumbnailFeedCore {
         let now = clock()
         let backingOff = crawlBackoffUntil.map { now < $0 } ?? false
         // A nearly full device or a background window holds the crawl; visible photos still load.
-        guard !prefetchPaused, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff, !crawlIsHeld()
+        guard crawlAllowed, !prefetchPaused, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff,
+            !crawlIsHeld()
         else {
             let batch = await finishDiskProbeBatch(
                 candidates,
@@ -2869,11 +2914,22 @@ public actor ThumbnailFeedCore {
     /// live, so it can never starve a visible warm decode. Workers share `coverageScanCursor`, so together they
     /// complete one pass in bounded steps; no single worker runs a full scan. All filesystem probes run on the
     /// decode executor, never on this actor.
-    private func advanceDiskCoverageScan() async -> (present: Int, total: Int, percent: Double)? {
+    /// One step of the end-of-crawl coverage scan.
+    private enum CoverageScanStep {
+        case finished((present: Int, total: Int, percent: Double))
+        case unfinished
+        /// The session or the cache writer changed: this feed's scan can never finish.
+        case stale
+    }
+
+    private func advanceDiskCoverageScan() async -> CoverageScanStep {
+        #if DEBUG
+            testingHooks.beforeCoverageScanStep()
+        #endif
         let cache = self.cache
         let probeGeneration = cache.captureWriterGeneration()
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(probeGeneration) else {
-            return nil
+            return .stale
         }
         var scanned = 0
         var present: [PhotoUID] = []
@@ -2881,13 +2937,13 @@ public actor ThumbnailFeedCore {
         var needsProbe: [PhotoUID] = []
         while coverageScanCursor < sequential.count, scanned < Self.coverageScanChunk {
             guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(probeGeneration) else {
-                return nil
+                return .stale
             }
-            if recentVisibleDemand() { return nil }
+            if recentVisibleDemand() { return .unfinished }
             let uid = sequential[coverageScanCursor]
             if checkpointPresent.contains(uid) {
                 guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(probeGeneration) else {
-                    return nil
+                    return .stale
                 }
                 diskPresence.set(uid, present: true)
                 present.append(uid)
@@ -2918,11 +2974,11 @@ public actor ThumbnailFeedCore {
                 cache.isCurrentSessionLease(ownerSessionLease),
                 cache.isCurrentWriterGeneration(probeGeneration)
             else {
-                return nil
+                return .stale
             }
             for probe in probes {
                 guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(probeGeneration) else {
-                    return nil
+                    return .stale
                 }
                 diskPresence.set(probe.uid, present: probe.usable)
                 if probe.usable {
@@ -2933,13 +2989,13 @@ public actor ThumbnailFeedCore {
             }
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(probeGeneration) else {
-            return nil
+            return .stale
         }
         recordCheckpointPresent(present, writerGeneration: probeGeneration)
         recordCheckpointMissing(missing, writerGeneration: probeGeneration)
-        guard coverageScanCursor >= sequential.count else { return nil }  // pass not finished yet
+        guard coverageScanCursor >= sequential.count else { return .unfinished }  // pass not finished yet
         coverageScanCursor = 0
-        return diskPresence.coverage()
+        return .finished(diskPresence.coverage())
     }
 
     private func recordCheckpointPresent(
@@ -3022,7 +3078,7 @@ public actor ThumbnailFeedCore {
     /// (guarded by `coverageRefreshInFlight`), so exactly one runs per drain regardless of worker count - it can
     /// never hold the actor for an O(library) scan, be multiplied by the worker count, or starve a visible warm
     /// decode. Emits one `[ThumbCoverage]` line at start and one at finish (never per item).
-    private func runCoverageRefresh() async -> CoverageRefreshOutcome {
+    private func runCoverageRefresh(shouldStop: () -> Bool = { false }) async -> CoverageRefreshOutcome {
         defer { flushCheckpointUpdates() }
         let startedAt = clock()
         coverageRefreshStarts += 1
@@ -3040,15 +3096,30 @@ public actor ThumbnailFeedCore {
         coverageFullScans += 1
         coverageScanCursor = 0
         while true {
+            if Task.isCancelled || shouldStop() {
+                emitCoverage(
+                    "refreshAbortStopped", scanned: coverageScanCursor,
+                    coverage: diskPresence.coverage(), startedAt: startedAt, reason: "stopped")
+                return .aborted
+            }
             if recentVisibleDemand() {
                 emitCoverage(
                     "refreshAbortVisibleDemand", scanned: coverageScanCursor,
                     coverage: diskPresence.coverage(), startedAt: startedAt, reason: "visibleDemand")
                 return .aborted
             }
-            guard let coverage = await advanceDiskCoverageScan() else {
+            let coverage: (present: Int, total: Int, percent: Double)
+            switch await advanceDiskCoverageScan() {
+            case .finished(let finished):
+                coverage = finished
+            case .unfinished:
                 try? await Task.sleep(for: .milliseconds(1))  // Yield after each chunk.
                 continue
+            case .stale:
+                emitCoverage(
+                    "refreshAbortStale", scanned: coverageScanCursor,
+                    coverage: diskPresence.coverage(), startedAt: startedAt, reason: "staleSession")
+                return .aborted
             }
             let recrawl = coverage.percent < 0.995 && coverage.percent > lastRepassPercent + 0.01
             if recrawl { lastRepassPercent = coverage.percent }
@@ -3501,6 +3572,26 @@ public actor ThumbnailFeedCore {
         private let lock = NSLock()
         private var diskProbeHook: (@Sendable () -> Void)?
         private var workersStoppedHook: (@Sendable () -> Void)?
+        private var permitWaitHook: (@Sendable () -> Void)?
+        private var coverageStepHook: (@Sendable () -> Void)?
+
+        func setAfterWindowPermitWait(_ hook: (@Sendable () -> Void)?) {
+            lock.withLock { permitWaitHook = hook }
+        }
+
+        func afterWindowPermitWait() {
+            let hook = lock.withLock { permitWaitHook }
+            hook?()
+        }
+
+        func setBeforeCoverageScanStep(_ hook: (@Sendable () -> Void)?) {
+            lock.withLock { coverageStepHook = hook }
+        }
+
+        func beforeCoverageScanStep() {
+            let hook = lock.withLock { coverageStepHook }
+            hook?()
+        }
 
         func setBeforeDiskProbe(_ hook: (@Sendable () -> Void)?) {
             lock.withLock { diskProbeHook = hook }
@@ -3534,6 +3625,28 @@ public actor ThumbnailFeedCore {
             _ = await advanceDiskCoverageScan()
             // The cursor advances by one bounded chunk per call and reports that step's probe count.
             return coverageScanCursor
+        }
+
+        /// Debug-only seam for a synchronous gate after a worker's wait for the window permit ended.
+        nonisolated func setWindowPermitWaitHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            testingHooks.setAfterWindowPermitWait(hook)
+        }
+
+        /// Debug-only seam for a synchronous gate before each coverage scan step.
+        nonisolated func setCoverageScanStepHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            testingHooks.setBeforeCoverageScanStep(hook)
+        }
+
+        /// Debug-only seam that runs the end-of-crawl coverage refresh over `uids` and names its outcome.
+        func runCoverageRefreshForTesting(seeding uids: [PhotoUID], shouldStop: @escaping () -> Bool) async -> String {
+            sequential = uids
+            coverageScanCursor = 0
+            diskPresence.beginTracking(uids, reporting: Set(uids), knownPresent: [])
+            return switch await runCoverageRefresh(shouldStop: shouldStop) {
+            case .settled: "settled"
+            case .recrawl: "recrawl"
+            case .aborted: "aborted"
+            }
         }
 
         /// Debug-only seam that reports end-of-crawl coverage refreshes started during this crawl.

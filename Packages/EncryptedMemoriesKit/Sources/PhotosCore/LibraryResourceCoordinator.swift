@@ -143,8 +143,10 @@ public struct LibraryWorkLease: Sendable {
     public let budget: LibraryWorkBudget
     private let decision: @Sendable () -> LibraryWorkContinuationDecision
     private let waitForYield: @Sendable () async -> LibraryWorkYieldReason?
-    private let yieldWaitEvaluationCount: @Sendable () -> Int
     private let runtimeSnapshot: @Sendable () -> LibraryRuntimeSnapshot
+    #if DEBUG
+        private let yieldWaitEvaluationCount: @Sendable () -> Int
+    #endif
 
     fileprivate init(
         budget: LibraryWorkBudget,
@@ -156,12 +158,16 @@ public struct LibraryWorkLease: Sendable {
         self.budget = budget
         self.decision = decision
         self.waitForYield = waitForYield
-        self.yieldWaitEvaluationCount = yieldWaitEvaluationCount
         self.runtimeSnapshot = runtimeSnapshot
+        #if DEBUG
+            self.yieldWaitEvaluationCount = yieldWaitEvaluationCount
+        #endif
     }
 
-    /// How often `nextYield` evaluated the decision, so a test can tell that the wait is in place.
-    var yieldWaitEvaluations: Int { yieldWaitEvaluationCount() }
+    #if DEBUG
+        /// Debug-only seam: how often `nextYield` evaluated the decision, so a test can tell that the wait is in place.
+        var yieldWaitEvaluations: Int { yieldWaitEvaluationCount() }
+    #endif
 
     /// Feature code consults this only at an asset/chunk/file boundary. It never interrupts a
     /// remote commit or an already-running framework inference.

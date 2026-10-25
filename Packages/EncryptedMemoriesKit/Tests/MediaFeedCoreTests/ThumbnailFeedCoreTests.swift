@@ -563,22 +563,28 @@ enum CrawlHold: String, CaseIterable, Sendable {
     }
 }
 
-/// Records how many batches load at the same time.
+/// Records how many batches load at the same time; `beforeLoad` can hold a batch.
 private actor ConcurrencyRecordingLoader: ThumbnailBatchLoader {
     private let payload: Data
+    private let beforeLoad: @Sendable (Int) async -> Void
     private var active = 0
     private(set) var peakConcurrentLoads = 0
     private(set) var loadedCount = 0
+    private(set) var startedCount = 0
 
-    init(payload: Data) { self.payload = payload }
+    init(payload: Data, beforeLoad: @escaping @Sendable (Int) async -> Void = { _ in }) {
+        self.payload = payload
+        self.beforeLoad = beforeLoad
+    }
 
     func loadThumbnails(
         for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult {
+        let index = startedCount
+        startedCount += 1
         active += 1
         peakConcurrentLoads = max(peakConcurrentLoads, active)
-        // Long enough for a second batch to start if nothing kept it out.
-        try? await Task.sleep(for: .milliseconds(100))
+        await beforeLoad(index)
         active -= 1
         for uid in uids { onLoaded(uid, payload) }
         loadedCount += uids.count
@@ -613,21 +619,49 @@ private actor EventOrder {
     func append(_ entry: String) { entries.append(entry) }
 }
 
-/// Opens once; waiters before and after the opening return.
+/// Opens once; waiters before and after the opening return. A wait that reaches its limit records an issue and
+/// returns false, so a test never hangs on it.
 private actor OneShotGate {
     private var isOpen = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
 
-    func wait() async {
-        guard !isOpen else { return }
-        await withCheckedContinuation { waiters.append($0) }
+    @discardableResult
+    func wait(limit: Duration = .seconds(20), sourceLocation: SourceLocation = #_sourceLocation) async -> Bool {
+        guard !isOpen else { return true }
+        let id = UUID()
+        let timer = Task { [weak self] in
+            try? await Task.sleep(for: limit)
+            await self?.expire(id)
+        }
+        let opened = await withCheckedContinuation { waiters[id] = $0 }
+        timer.cancel()
+        if !opened { Issue.record("the gate did not open within \(limit)", sourceLocation: sourceLocation) }
+        return opened
+    }
+
+    private func expire(_ id: UUID) {
+        waiters.removeValue(forKey: id)?.resume(returning: false)
     }
 
     func open() {
         isOpen = true
-        waiters.forEach { $0.resume() }
+        waiters.values.forEach { $0.resume(returning: true) }
         waiters.removeAll()
     }
+}
+
+private final class ValueBox<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: T?
+    var value: T? { lock.withLock { stored } }
+    func set(_ value: T) { lock.withLock { stored = value } }
+}
+
+private final class FlagBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    var isSet: Bool { lock.withLock { flag } }
+    func set() { lock.withLock { flag = true } }
 }
 
 /// Records each batch as "crawl <index>" before it loads; `beforeLoad` can hold a batch.
@@ -1093,24 +1127,34 @@ struct ThumbnailFeedCoreTests {
 
     @Test func crawlLoadsInABackgroundWindowOneBatchAtATimeUnderThePermit() async throws {
         let crawled = (0..<3).map { Self.uid("window-crawl-\($0)") }
-        let loader = ConcurrencyRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let firstBatch = OneShotGate()
+        let loader = ConcurrencyRecordingLoader(payload: Self.pngData(width: 24, height: 24)) { index in
+            if index == 0 { await firstBatch.wait() }
+        }
         // The backup window of iOS runs the app in the background.
         let runtimeState = LibraryRuntimeState(
             initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
         let coordinator = await Self.coordinator(runtimeState)
+        // Two downloaders from the start: only the permit can keep the second batch out.
         let feed = ThumbnailFeedCore(
             cache: Self.cache("window-crawl", runtimeState: runtimeState),
             loader: loader,
-            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1),
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, initialDownloadConcurrency: 2, batchSize: 1),
             resourceCoordinator: coordinator
         )
         await feed.startPrefetch(crawled)
+
+        try await Self.waitUntil { await loader.startedCount == 1 }
+        try await Self.waitUntil { await coordinator.waitingPermitCount == 1 }
+        #expect(await coordinator.waitingPermitCount == 1, "the second worker waits for the permit, not for a slot")
+        #expect(await loader.startedCount == 1)
+        await firstBatch.open()
 
         try await Self.waitUntil { await loader.loadedCount == 3 }
         #expect(await loader.loadedCount == 3, "the crawl loads in the background window")
         #expect(await loader.peakConcurrentLoads == 1, "one batch at a time under the single permit")
         #expect(await coordinator.metrics().permitsAcquired >= 3, "every batch took the permit")
-        await feed.stopPrefetchAndWait()
+        await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
     }
 
     @Test func crawlSleepsWhileTheAppIsSuspended() async throws {
@@ -1160,10 +1204,40 @@ struct ThumbnailFeedCoreTests {
         #expect(await coordinator.waitingPermitCount == 2)
         #expect(await loader.recordedPriorities.isEmpty, "Low Power Mode refuses the crawl in the background")
 
+        // A photo on screen still loads, without the crawl's permit.
+        let visible = Self.uid("low-power-crawl-visible")
+        _ = await feed.requestPriority(visible)
+        try await Self.waitUntil { await loader.recordedPriorities.count == 1 }
+        #expect(await loader.recordedPriorities == [.visibleNow], "a photo on screen still loads")
+        #expect(await coordinator.metrics().permitsAcquired == 0, "it took no permit")
+
         runtimeState.update { $0.isLowPowerMode = false }
+        try await Self.waitUntil { await loader.recordedPriorities.count == 3 }
+        #expect(await loader.recordedPriorities == [.visibleNow, .idleLibraryCrawl, .idleLibraryCrawl])
+        await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
+    }
+
+    @Test func photosOnScreenLoadInALowPowerWindowWithoutAPermit() async throws {
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(isLowPowerMode: true, executionOpportunity: .backgroundPermitted))
+        let coordinator = await Self.coordinator(runtimeState)
+        // One worker: after the first photo, the second one is already queued when the worker asks again.
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("low-power-visible", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+            resourceCoordinator: coordinator
+        )
+        await feed.startPrefetch([Self.uid("low-power-visible-crawl")])
+        try await Self.waitUntil { await coordinator.waitingPermitCount == 1 }
+
+        _ = await feed.requestPriority(Self.uid("low-power-visible-a"))
+        _ = await feed.requestPriority(Self.uid("low-power-visible-b"))
         try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
-        #expect(await loader.recordedPriorities == [.idleLibraryCrawl, .idleLibraryCrawl])
-        await feed.stopPrefetchAndWait()
+        #expect(await loader.recordedPriorities == [.visibleNow, .visibleNow], "both photos on screen load")
+        #expect(await coordinator.metrics().permitsAcquired == 0, "without the crawl's permit")
+        await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
     }
 
     @Test func aBackupItemTakesThePermitBeforeTheNextCrawlBatch() async throws {
@@ -1195,8 +1269,8 @@ struct ThumbnailFeedCoreTests {
         await firstBatch.open()
         try await Self.waitUntil { await events.entries.count == 3 }
         #expect(await events.entries == ["crawl 0", "backup", "crawl 1"])
-        await backup.value
-        await feed.stopPrefetchAndWait()
+        await Self.join(backup, "the backup item ends")
+        await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
     }
 
     @Test func theEndOfTheWindowEndsTheCrawlsWaitForThePermit() async throws {
@@ -1233,9 +1307,162 @@ struct ThumbnailFeedCoreTests {
         try await Self.waitUntil { await coordinator.waitingPermitCount == 0 }
         #expect(await coordinator.waitingPermitCount == 0, "the coordinator keeps no waiter behind")
         await backupRelease.open()
-        await backup.value
-        await feed.stopPrefetchAndWait()
+        await Self.join(backup, "the backup item ends")
+        await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
     }
+
+    #if DEBUG
+        @Test func aNewWindowAfterAnEndedWaitStillWaitsForThePermit() async throws {
+            let crawled = [Self.uid("new-window-a"), Self.uid("new-window-b")]
+            let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+            let runtimeState = LibraryRuntimeState(
+                initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+            let coordinator = await Self.coordinator(runtimeState)
+            let backupEntered = OneShotGate()
+            let backupRelease = OneShotGate()
+            let backup = Task {
+                _ = try? await coordinator.withHeavyPermit(
+                    LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+                ) { _ in
+                    await backupEntered.open()
+                    await backupRelease.wait()
+                }
+            }
+            await backupEntered.wait()
+            let feed = ThumbnailFeedCore(
+                cache: Self.cache("new-window", runtimeState: runtimeState),
+                loader: loader,
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+                resourceCoordinator: coordinator
+            )
+            await feed.startPrefetch(crawled)
+            try await Self.waitUntil { await coordinator.waitingPermitCount == 1 }
+
+            // The foreground ends the wait; before the worker goes on, a new background window begins.
+            let afterWait = BlockingDiskProbeHook()
+            let first = FirstCall()
+            feed.setWindowPermitWaitHookForTesting { if first.take() { afterWait.wait() } }
+            defer {
+                afterWait.release.signal()
+                feed.setWindowPermitWaitHookForTesting(nil)
+            }
+            runtimeState.update { $0.executionOpportunity = .foregroundActive }
+            try await Self.waitUntil { afterWait.hasEntered }
+            runtimeState.update { $0.executionOpportunity = .backgroundPermitted }
+            afterWait.release.signal()
+
+            try await Self.waitUntil { await coordinator.waitingPermitCount == 1 }
+            #expect(await coordinator.waitingPermitCount == 1, "the worker waits for the permit of the new window")
+            #expect(await loader.recordedPriorities.isEmpty, "no batch beside the backup item")
+
+            await backupRelease.open()
+            try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
+            #expect(await loader.recordedPriorities.count == 2)
+            await Self.join(backup, "the backup item ends")
+            await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
+        }
+
+        @Test func aSessionChangeDuringTheCoverageRefreshReleasesThePermitAndEndsTheWorker() async throws {
+            let uid = Self.uid("refresh-session-change")
+            let runtimeState = LibraryRuntimeState(
+                initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+            let coordinator = await Self.coordinator(runtimeState)
+            let cache = Self.cache("refresh-session-change", runtimeState: runtimeState)
+            // Nothing arrives, so the coverage stays incomplete and the end-of-crawl refresh scans the disk.
+            let feed = ThumbnailFeedCore(
+                cache: cache, loader: RecordingLoader(failAll: true),
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+                resourceCoordinator: coordinator
+            )
+            let step = BlockingDiskProbeHook()
+            let first = FirstCall()
+            feed.setCoverageScanStepHookForTesting { if first.take() { step.wait() } }
+            defer {
+                step.release.signal()
+                feed.setCoverageScanStepHookForTesting(nil)
+            }
+            await feed.startPrefetch([uid])
+            try await Self.waitUntil { step.hasEntered }
+
+            // The account changes while the refresh holds the permit, and a backup item waits for it.
+            cache.configure(accountUID: "acct-B", key: feedCacheTestKey)
+            let backupEntered = OneShotGate()
+            let backup = Task {
+                _ = try? await coordinator.withHeavyPermit(
+                    LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+                ) { _ in await backupEntered.open() }
+            }
+            try await Self.waitUntil { await coordinator.waitingPermitCount == 1 }
+            step.release.signal()
+
+            #expect(await backupEntered.wait(), "the backup item gets the permit")
+            try await Self.waitUntil { await !feed.downloadCountersForTesting().workersRunning }
+            #expect(await !feed.downloadCountersForTesting().workersRunning, "the worker ends")
+            await Self.join(backup, "the backup item ends")
+            await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
+        }
+
+        @Test func aSessionChangeDuringTheCoverageRefreshEndsTheWorkerInTheForeground() async throws {
+            // No permit and no waiting backup item: only the changed session can end the refresh.
+            let uid = Self.uid("refresh-session-change-foreground")
+            let cache = Self.cache("refresh-session-change-foreground")
+            let feed = ThumbnailFeedCore(
+                cache: cache, loader: RecordingLoader(failAll: true),
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
+            )
+            let step = BlockingDiskProbeHook()
+            let first = FirstCall()
+            feed.setCoverageScanStepHookForTesting { if first.take() { step.wait() } }
+            defer {
+                step.release.signal()
+                feed.setCoverageScanStepHookForTesting(nil)
+            }
+            await feed.startPrefetch([uid])
+            try await Self.waitUntil { step.hasEntered }
+
+            cache.configure(accountUID: "acct-B", key: feedCacheTestKey)
+            step.release.signal()
+            try await Self.waitUntil { await !feed.downloadCountersForTesting().workersRunning }
+            #expect(await !feed.downloadCountersForTesting().workersRunning, "the refresh of the old session ends")
+            await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
+        }
+
+        @Test func theCoverageRefreshStopsWhenItsTaskIsCancelled() async throws {
+            let (feed, uids) = Self.refreshFeed("refresh-cancel")
+            let steps = Counter()
+            let gate = BlockingDiskProbeHook()
+            feed.setCoverageScanStepHookForTesting {
+                steps.increment()
+                if steps.value() == 2 { gate.wait() }
+            }
+            defer {
+                gate.release.signal()
+                feed.setCoverageScanStepHookForTesting(nil)
+            }
+            let refresh = Task { await feed.runCoverageRefreshForTesting(seeding: uids, shouldStop: { false }) }
+            try await Self.waitUntil { gate.hasEntered }
+            refresh.cancel()
+            gate.release.signal()
+            let outcome = await Self.value(of: refresh)
+            #expect(outcome == "aborted")
+            #expect(steps.value() == 2, "no further scan step after the cancellation")
+        }
+
+        @Test func theCoverageRefreshStopsWhenThePermitMustBeGivenBack() async throws {
+            let (feed, uids) = Self.refreshFeed("refresh-stop")
+            let steps = Counter()
+            let stop = FlagBox()
+            feed.setCoverageScanStepHookForTesting {
+                steps.increment()
+                if steps.value() == 2 { stop.set() }
+            }
+            defer { feed.setCoverageScanStepHookForTesting(nil) }
+            let outcome = await Self.value(
+                of: Task { await feed.runCoverageRefreshForTesting(seeding: uids, shouldStop: { stop.isSet }) })
+            #expect(outcome == "aborted")
+            #expect(steps.value() == 2, "the refresh stops at the next step")
+        }
+    #endif
 
     @Test func aCrawlStoppedDuringABatchKeepsItsSavedPhotosAndLoadsOnlyTheRest() async throws {
         let saved = Self.uid("killed-crawl-saved")
@@ -4079,6 +4306,7 @@ struct ThumbnailFeedCoreTests {
     private static func configuration(
         targetPixels: CGFloat = 16,
         downloadConcurrencyLimit: Int = 2,
+        initialDownloadConcurrency: Int = 1,
         batchSize: Int = 2,
         maxConcurrentDecodes: Int = 1,
         visibleQuietWindow: TimeInterval = 0.25,
@@ -4088,7 +4316,7 @@ struct ThumbnailFeedCoreTests {
         ThumbnailFeedCoreConfiguration(
             targetPixels: targetPixels,
             downloadConcurrencyLimit: downloadConcurrencyLimit,
-            initialDownloadConcurrency: 1,
+            initialDownloadConcurrency: initialDownloadConcurrency,
             minimumDownloadConcurrency: 1,
             batchSize: batchSize,
             decodedMemoryBudgetBytes: 16 * 1024 * 1024,
@@ -4147,11 +4375,56 @@ struct ThumbnailFeedCoreTests {
         DecodedThumbnail(image: makeCGImage(width: width, height: height))
     }
 
-    private static func waitUntil(_ condition: @Sendable () async -> Bool) async throws {
+    /// Waits up to three seconds and records an issue when the condition never holds.
+    private static func waitUntil(
+        _ condition: @Sendable () async -> Bool, sourceLocation: SourceLocation = #_sourceLocation
+    ) async throws {
         for _ in 0..<60 {
             if await condition() { return }
             try await Task.sleep(for: .milliseconds(50))
         }
+        if await condition() { return }
+        Issue.record("the condition did not hold within 3 s", sourceLocation: sourceLocation)
+    }
+
+    /// Joins `task` within 20 s; a task that does not end records an issue and is cancelled.
+    private static func join(
+        _ task: Task<Void, Never>, _ comment: Comment, sourceLocation: SourceLocation = #_sourceLocation
+    ) async {
+        let ended = OneShotGate()
+        Task {
+            await task.value
+            await ended.open()
+        }
+        if !(await ended.wait(limit: .seconds(20), sourceLocation: sourceLocation)) {
+            Issue.record(comment, sourceLocation: sourceLocation)
+            task.cancel()
+        }
+    }
+
+    /// The value of `task` within 20 s, or nil with an issue recorded.
+    private static func value<T: Sendable>(
+        of task: Task<T, Never>, sourceLocation: SourceLocation = #_sourceLocation
+    ) async -> T? {
+        let box = ValueBox<T>()
+        let ended = OneShotGate()
+        Task {
+            box.set(await task.value)
+            await ended.open()
+        }
+        guard await ended.wait(limit: .seconds(20), sourceLocation: sourceLocation) else {
+            task.cancel()
+            return nil
+        }
+        return box.value
+    }
+
+    /// A feed over photos that are not on disk, so every coverage scan step probes them.
+    private static func refreshFeed(_ prefix: String) -> (ThumbnailFeedCore, [PhotoUID]) {
+        let uids = (0..<2_000).map { Self.uid("\(prefix)-\($0)") }
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache(prefix), loader: RecordingLoader(), configuration: Self.configuration())
+        return (feed, uids)
     }
 }
 

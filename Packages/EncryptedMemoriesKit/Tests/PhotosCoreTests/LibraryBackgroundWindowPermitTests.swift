@@ -74,6 +74,28 @@ final class LibraryBackgroundWindowPermitTests: XCTestCase {
         XCTAssertEqual(reason, .some(.windowEnded))
     }
 
+    func testAStepCheckSeesTheEndOfTheWindow() async throws {
+        let state = window()
+        let coordinator = LibraryResourceCoordinator(runtimeState: state)
+        let acquired = await boundedValue(of: acquire(state, coordinator))
+        let permit = try XCTUnwrap(acquired ?? nil)
+        defer { permit.release() }
+        XCTAssertFalse(permit.mustStop)
+        state.update { $0.executionOpportunity = .foregroundActive }
+        XCTAssertTrue(permit.mustStop, "a step loop stops when the window ends")
+    }
+
+    func testAStepCheckSeesTheLeaseYield() async throws {
+        let state = window()
+        let coordinator = LibraryResourceCoordinator(runtimeState: state)
+        let acquired = await boundedValue(of: acquire(state, coordinator))
+        let permit = try XCTUnwrap(acquired ?? nil)
+        defer { permit.release() }
+        XCTAssertFalse(permit.mustStop)
+        state.update { $0.isLowPowerMode = true }
+        XCTAssertTrue(permit.mustStop, "a step loop stops when the coordinator wants the permit back")
+    }
+
     func testAPermitStopsWhenItsLeaseYields() async throws {
         let state = window()
         let coordinator = LibraryResourceCoordinator(runtimeState: state)

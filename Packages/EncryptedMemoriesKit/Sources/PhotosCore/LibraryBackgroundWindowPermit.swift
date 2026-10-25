@@ -95,6 +95,12 @@ public final class LibraryBackgroundWindowPermit: Sendable {
         }
     }
 
+    /// True when the work must stop now: the lease yields, or the app left its background window. For a loop that
+    /// checks at each step instead of waiting.
+    public var mustStop: Bool {
+        !lease.shouldContinue() || runtimeState.snapshot().executionOpportunity != .backgroundPermitted
+    }
+
     /// Gives the permit back to the coordinator. Repeated calls are harmless.
     public func release() { released.fire() }
 }
