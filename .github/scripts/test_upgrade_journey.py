@@ -1056,6 +1056,19 @@ else:
                         request.close()
             self.assertEqual(results, [200] * 40)
 
+    def test_fixture_server_binds_without_a_name_lookup(self):
+        # The loopback server needs no host name. A reverse lookup of its address can reach mDNS on macOS and show the
+        # local network prompt over the journey.
+        def refuse(*arguments, **keywords):
+            raise AssertionError('the fixture server looked up a host name')
+
+        with tempfile.TemporaryDirectory() as root:
+            with patch('socket.getfqdn', side_effect=refuse), patch('socket.gethostbyaddr', side_effect=refuse):
+                server = FixtureServer(Path(root), 'backup.claimed')
+            self.assertEqual(server.http.server_name, '127.0.0.1')
+            with server:
+                self.assertEqual(json.load(urlopen(server.url + '/links')), [])
+
     def test_upload_ledger_survives_app_replacement_and_exposes_duplicates(self):
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'backup.claimed') as server:
             def upload():
