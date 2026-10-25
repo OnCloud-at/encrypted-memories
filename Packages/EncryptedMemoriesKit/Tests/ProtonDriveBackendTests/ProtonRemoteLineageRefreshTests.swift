@@ -194,12 +194,6 @@ extension DriveSessionStubSuite {
             func listings() -> Int {
                 StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
             }
-            let clock = ContinuousClock()
-            func waitedFor(_ outcome: LockedOutcome) async -> Duration {
-                let start = clock.now
-                await outcome.wait()
-                return clock.now - start
-            }
             let laterProgress = LockedOutcome()
             func preparation(reporting reported: LockedOutcome? = nil) -> (Task<Void, Never>, LockedOutcome) {
                 let cancelled = LockedOutcome()
@@ -218,9 +212,11 @@ extension DriveSessionStubSuite {
             try await waitUntil { listings() > 0 }
             #expect(listings() == 1, "the build reached its library listing")
             window.cancel()
-            let windowWait = await waitedFor(windowCancelled)
+            // The listing hangs until the build is invalidated, so the build cannot end before the window does: the
+            // window stopped waiting for it instead of waiting until the build ended.
+            await windowCancelled.wait()
             #expect(windowCancelled.value == true, "the expired window ended with a cancellation")
-            #expect(windowWait < .seconds(2), "the expired window stopped waiting at once: \(windowWait)")
+            #expect(await service.hasUnfinishedRemoteContentIndexBuild, "the build keeps running after the window")
 
             let released = LockedOutcome()
             let pass = Task {
@@ -234,14 +230,15 @@ extension DriveSessionStubSuite {
             #expect(listings() == 1, "a later preparation joins the running build")
             #expect(released.value == nil, "the metadata pass stays held while the build runs")
             later.cancel()
-            let laterWait = await waitedFor(laterCancelled)
+            await laterCancelled.wait()
             #expect(laterCancelled.value == true, "the joined preparation ended with a cancellation")
-            #expect(laterWait < .seconds(2), "the joined preparation stopped waiting at once: \(laterWait)")
+            #expect(await service.hasUnfinishedRemoteContentIndexBuild, "the build keeps running after the joiner")
+            #expect(released.value == nil, "the joined preparation stopped waiting before the build ended")
 
             // The end of the build, here through an invalidation, releases the metadata pass.
             await service.invalidateCachedRemoteState()
-            let passWait = await waitedFor(released)
-            #expect(released.value == true, "the end of the build releases the metadata pass: \(passWait)")
+            await released.wait()
+            #expect(released.value == true, "the end of the build releases the metadata pass")
             pass.cancel()
         }
 
