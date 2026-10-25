@@ -596,8 +596,8 @@ import Testing
         #expect(cancellationWasAdmitted)
 
         // These bounded observations run while the held refresh's release stays closed.
-        async let cancellationObservation = cancellationCompletion.waitUntilComplete()
-        async let flushObservation = flushCompletion.waitUntilComplete()
+        async let cancellationObservation = cancellationCompletion.completesWithinTheObservationWindow()
+        async let flushObservation = flushCompletion.completesWithinTheObservationWindow()
         let (cancelReturnedWhileHeld, flushReturnedWhileHeld) = await (
             cancellationObservation, flushObservation
         )
@@ -797,7 +797,7 @@ import Testing
         #expect(await scenario.waitForFlushRegistration())
         // The flush neither retries early nor wakes the delay. A woken delay would register its sleep again at once;
         // this bounded observation runs while the clock stays where it is.
-        let delayWasRegisteredAgain = await scenario.clock.waitForSleepCount(2)
+        let delayWasRegisteredAgain = await clockRegistersSleeps(scenario.clock, count: 2)
         #expect(delayWasRegisteredAgain == false, "The flush must not wake the pending convergence delay")
         #expect(await scenario.timeline.times == [.zero])
         #expect(await completion.isComplete == false)
@@ -864,8 +864,11 @@ import Testing
         // The flush targets the newer request. The older load completes first and must not release it.
         await releaseOlder.open()
         #expect(await scenario.timeline.waitForCount(2), "SETUP: the forced newer request runs after the older load")
-        let returnedWhileTheNewerLoadWasHeld = await completion.waitUntilComplete()
-        #expect(returnedWhileTheNewerLoadWasHeld == false, "The older completion must not release the newer target")
+        // The older load completed before the newer one entered, so a wrong release has happened by now: it would
+        // have removed the flush waiter from the coordinator.
+        let flushStillRegistered = await scenario.coordinator.testingAutomaticState().flushCount == 1
+        #expect(flushStillRegistered, "The older completion must not release the newer target")
+        #expect(await completion.isComplete == false, "The older completion must not release the newer target")
         await releaseNewer.open()
         #expect(await completion.waitUntilComplete())
         await flush.value
@@ -1161,16 +1164,36 @@ private actor UploadRefreshTimeline {
     }
 }
 
+/// How long a check observes that something does NOT happen while the work stays held. A positive wait ends as soon as
+/// its event comes, so it keeps its five second deadline; a check that expects no event would wait the whole deadline.
+/// This window can miss a regression whose event comes later than the window on a loaded machine. It never fails a
+/// correct run, because the check passes when nothing happens.
+private let negativeObservationWindow: Duration = .milliseconds(250)
+
 private actor AutomaticFlushCompletion {
     private(set) var isComplete = false
 
     func markComplete() { isComplete = true }
+
+    /// True when the completion arrives within the negative observation window.
+    func completesWithinTheObservationWindow() async -> Bool {
+        let end = ContinuousClock.now + negativeObservationWindow
+        while !isComplete, ContinuousClock.now < end { await Task.yield() }
+        return isComplete
+    }
 
     func waitUntilComplete() async -> Bool {
         let timeout = ContinuousClock.now + .seconds(5)
         while !isComplete, ContinuousClock.now < timeout { await Task.yield() }
         return isComplete
     }
+}
+
+/// True when the clock registers `count` sleeps within the negative observation window.
+private func clockRegistersSleeps(_ clock: TimelineRefreshTestClock, count: Int) async -> Bool {
+    let end = ContinuousClock.now + negativeObservationWindow
+    while clock.requestedSleeps.count < count, ContinuousClock.now < end { await Task.yield() }
+    return clock.requestedSleeps.count >= count
 }
 
 private func waitForAutomaticCoordinatorState(
@@ -1345,7 +1368,8 @@ extension TimelineUploadRefreshCoordinatorTests {
             return nil
         })
         // The cancelled wait itself stays noncooperatively held. No manual load may overlap it.
-        let explicitEnteredWhileWaitWasHeld = await h.log.waitFor("manual.enter")
+        #expect(await h.log.waitFor("cancelled.wait.held"), "SETUP: the explicit request cancelled the retry wait")
+        let explicitEnteredWhileWaitWasHeld = await h.log.appearsWithinTheObservationWindow("manual.enter")
         #expect(explicitEnteredWhileWaitWasHeld == false)
         await releaseWaitReturn.open()
         // Virtual time still stays below350ms. This finite entry observation is the F1 behavior.
@@ -1546,8 +1570,11 @@ extension TimelineUploadRefreshCoordinatorTests {
             await waitForAutomaticCoordinatorState(coordinator, flushCount: 1, workerActive: true),
             "SETUP: target B waiter registered")
         // The held B load cannot be acknowledged by A's completed success.
-        let flushReturnedWhileBWasHeld = await completion.waitUntilComplete()
+        // A's completion came before B entered, so a wrong release of the flush has happened by now: it would have
+        // removed the waiter, and the registration check above would have failed.
+        let flushReturnedWhileBWasHeld = await completion.isComplete
         #expect(flushReturnedWhileBWasHeld == false)
+        #expect(await coordinator.testingAutomaticState().flushCount == 1, "A's success must not release target B")
         await releaseB.open()
         #expect(await completion.waitUntilComplete(), "SETUP: B completion released its own waiter")
         await releaseA.open()
@@ -1584,7 +1611,7 @@ extension TimelineUploadRefreshCoordinatorTests {
             h.end()
             return nil
         })
-        let explicitEnteredWhileObserverHeld = await h.log.waitFor("manual.enter")
+        let explicitEnteredWhileObserverHeld = await h.log.appearsWithinTheObservationWindow("manual.enter")
         #expect(explicitEnteredWhileObserverHeld == false)
         await release.open()
         #expect(await h.log.waitFor("manual.enter"), "SETUP: joined observer permits manual work")
@@ -1661,6 +1688,13 @@ private final class F1F2Log: @unchecked Sendable {
         let deadline = ContinuousClock.now + .seconds(5)
         while events.filter({ $0.name == name }).count < count, ContinuousClock.now < deadline { await Task.yield() }
         return events.filter { $0.name == name }.count >= count
+    }
+
+    /// True when the event appears within the negative observation window.
+    func appearsWithinTheObservationWindow(_ name: String) async -> Bool {
+        let end = ContinuousClock.now + negativeObservationWindow
+        while !events.contains(where: { $0.name == name }), ContinuousClock.now < end { await Task.yield() }
+        return events.contains { $0.name == name }
     }
 
     func waitForScheduling(after boundary: Int) async -> F1F2Event? {
