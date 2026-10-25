@@ -1777,6 +1777,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             Self.setColumns("remote_link_id='b', next_attempt_at=\(date.timeIntervalSince1970)", of: "s", at: url))
         let failure = KeyedReadFailure()
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         gate.open()
 
@@ -1926,6 +1927,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
         let failure = SourceListFailure()
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         gate.open()
 
@@ -2430,10 +2432,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
     }
 
-    /// A timer records its wait when its task starts, after the call that scheduled it returned. Exact checks of the
-    /// recorded waits first give such a task a moment to record.
+    /// How long exact and negative checks of the recorded waits give a timer task to record. A timer records its wait
+    /// when its task starts, after the call that scheduled it returned. A negative check observes only this bounded
+    /// window: a wrong timer that registers later is missed (a false pass, never a false failure).
+    private static let settleWindow = Duration.milliseconds(300)
+
     private func settle() async throws {
-        try await Task.sleep(for: .milliseconds(300))
+        try await Task.sleep(for: Self.settleWindow)
     }
 
     /// The handoff of a pending photo is stored, but its read fails. The favorite neither waits for a handoff event
@@ -2447,6 +2452,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartWithBackoffLog(delays, firstRetry: retry)
         let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
         let uid = PhotoUID(localPending: .photoLibrary, identifier: "k")
 
         _ = await coordinator.setFavorite([uid], favorite: true)
@@ -2523,6 +2529,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(store.setFavoriteIntent(key("k"), favorite: true, at: date))
         let failure = SourceListFailure(table: "pending_action", untilRemoved: true)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
         let delays = DelayLog()
         let retry = OpenGate()
 
@@ -2582,6 +2589,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try await startPendingEditWithoutHandoff(identities: identities)
         let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         await coordinator.exclude([key("p").localUID])
 
@@ -2603,6 +2611,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartIdle()
         let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         _ = await coordinator.addToAlbum([PhotoUID(localPending: .photoLibrary, identifier: "k")], albumID: "album")
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
@@ -2629,6 +2638,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartWithBackoffLog(delays, firstRetry: retry)
         let failure = KeyedReadFailure(matching: Self.dueActionRead)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
@@ -2654,6 +2664,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartWithBackoffLog(delays, firstRetry: retry)
         let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
@@ -2681,6 +2692,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartWithBackoffLog(delays, firstRetry: retry)
         let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
         try await waitUntil { !Self.backoffs(delays.values).isEmpty }
         failure.remove(from: store)
@@ -2689,6 +2701,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(effects.favorites.count, 2, "the clean pass runs both favorites")
         let again = KeyedReadFailure(matching: Self.latestHandoffRead)
         try again.install(on: store)
+        defer { again.remove(from: store) }
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k3")], favorite: true)
         try await waitUntil { Self.backoffs(delays.values).count >= 2 }
         try await settle()
@@ -2716,6 +2729,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try await startPendingEditWithoutHandoff(identities: identities)
         let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         await coordinator.exclude([key("p").localUID])
 
@@ -2769,6 +2783,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartIdle()
         let failure = KeyedReadFailure(matching: Self.dueActionRead, skip: 1, limit: 1)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
@@ -2786,6 +2801,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartWithBackoffLog(delays, firstRetry: retry)
         let failure = SourceListFailure(table: "handoff", untilRemoved: true)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
@@ -2815,6 +2831,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await restartWithBackoffLog(delays, firstRetry: retry)
         let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
         try failure.install(on: store)
+        defer { failure.remove(from: store) }
 
         // A pass with no due action: only the read that schedules the timer reads the handoff.
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
@@ -2868,6 +2885,95 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(effects.favorites.isEmpty, "the incomplete due read still holds the action (#770 part 1)")
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the wait of the unreadable state stays")
         assertNoShortWait(delays)
+        retry.open()
+    }
+
+    // MARK: - Unreadable handoffs and actions, round 2 (#770 part 2)
+
+    /// Runs a call of `runDueActions` with two passes: the first pass sends the favorite of "b" and waits at the gate;
+    /// `between` runs while it waits, then a second request makes the call read again.
+    private func runTwoPassCall(between: () throws -> Void) async throws {
+        let gate = LookupGate()
+        effects.favoriteGate = gate
+        let running = try XCTUnwrap(coordinator)
+        let first = PhotoUID(localPending: .photoLibrary, identifier: "b")
+        let call = Task { await running.setFavorite([first], favorite: true) }
+        guard await gate.entered(within: .seconds(5)) else {
+            XCTFail("the first pass never sent its favorite")
+            _ = await call.value
+            return
+        }
+        try between()
+        _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "a")], favorite: true)
+        gate.open()
+        _ = await call.value
+    }
+
+    /// The first pass of one call cannot read the handoff of "a"; the second pass of the same call reads it and runs
+    /// the favorite. The failure of the first pass still counts for this call, so the reads are tried again later.
+    func testAFailedHandoffReadOfAnEarlierPassInTheSameCallStillCounts() async throws {
+        for id in ["a", "b"] {
+            includedLater(id)
+            _ = favoriteFixture(id)
+        }
+        let delays = DelayLog()
+        let retry = OpenGate()
+        await restartWithBackoffLog(delays, firstRetry: retry)
+        XCTAssertTrue(change("UPDATE handoff SET kind='broken' WHERE source_id='a';"))
+        XCTAssertTrue(store.setFavoriteIntent(key("a"), favorite: true, at: date))
+
+        try await runTwoPassCall {
+            XCTAssertTrue(self.change("UPDATE handoff SET kind='uploaded' WHERE source_id='a';"))
+        }
+
+        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await settle()
+        XCTAssertEqual(Set(effects.favorites.map(\.nodeID)), ["link-a", "link-b"], "the second pass runs the favorite")
+        XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the failed read of the first pass counts")
+        assertNoShortWait(delays)
+        retry.open()
+    }
+
+    /// The first pass of one call cannot decode a due action; the second pass decodes it. The incomplete read of the
+    /// first pass still counts for this call.
+    func testAnIncompleteDueReadOfAnEarlierPassInTheSameCallStillCounts() async throws {
+        for id in ["a", "b"] {
+            includedLater(id)
+            _ = favoriteFixture(id)
+        }
+        let delays = DelayLog()
+        let retry = OpenGate()
+        await restartWithBackoffLog(delays, firstRetry: retry)
+        XCTAssertTrue(store.setFavoriteIntent(key("a"), favorite: true, at: date))
+        XCTAssertTrue(change("UPDATE pending_action SET kind='broken' WHERE source_id='a';"))
+
+        try await runTwoPassCall {
+            XCTAssertTrue(self.change("UPDATE pending_action SET kind='favorite' WHERE source_id='a';"))
+        }
+
+        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await settle()
+        XCTAssertEqual(Set(effects.favorites.map(\.nodeID)), ["link-a", "link-b"])
+        XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the incomplete read of the first pass counts")
+        assertNoShortWait(delays)
+        retry.open()
+    }
+
+    /// Outside an episode, a clean action read leaves a healthy reconcile timer as it is.
+    func testACleanActionReadDoesNotRescheduleAHealthyTimer() async throws {
+        includedLater("k")
+        let remote = favoriteFixture("k")
+        let delays = DelayLog()
+        let retry = OpenGate()
+        await restartWithBackoffLog(delays, firstRetry: retry)
+        try await waitUntil { delays.values.contains(.seconds(5000)) }
+
+        _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
+        try await settle()
+
+        XCTAssertEqual(effects.favorites, [remote])
+        XCTAssertEqual(delays.values.filter { $0 == .seconds(5000) }.count, 1, "the healthy timer is not set again")
+        XCTAssertTrue(Self.backoffs(delays.values).isEmpty)
         retry.open()
     }
 
@@ -3191,7 +3297,15 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
         return .done
     }
 
+    /// Holds the next favorite request until the gate opens.
+    var favoriteGate: LookupGate? {
+        get { lock.withLock { _favoriteGate } }
+        set { lock.withLock { _favoriteGate = newValue } }
+    }
+    private var _favoriteGate: LookupGate?
+
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult {
+        await favoriteGate?.pass()
         lock.withLock { _favorites.append(uid) }
         return .done
     }
