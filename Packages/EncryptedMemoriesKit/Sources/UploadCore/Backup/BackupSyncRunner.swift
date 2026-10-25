@@ -368,10 +368,10 @@ public actor BackupSyncRunner {
 
         if mode == .eligibleOnly {
             guard let nextRunnableDate = queue.nextRunnableDate() else {
-                // Nothing waits for an upload until the library changes, so no index build follows from this pass.
-                // A photo that is due later or a wait for Wi-Fi can still start one soon.
+                // Nothing is due now or later. A parked draft whose re-check is due later can still start an index
+                // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
                 progress.isRunning = false
-                await identityResolver.remoteIndexPreparationNotNeeded()
+                progress.leavesNoUploadWork = !queue.containsAny(in: [.blockedByDraft]) && queue.isOperational()
                 return progress
             }
             guard nextRunnableDate <= now() else {

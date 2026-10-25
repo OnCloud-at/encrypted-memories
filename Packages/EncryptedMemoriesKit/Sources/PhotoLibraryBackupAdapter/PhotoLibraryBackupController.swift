@@ -954,13 +954,17 @@ public final class PhotoLibraryBackupController {
             }
         #endif
         let task = Task {
-            [weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody] in
+            [
+                weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody,
+                identityResolver
+            ] in
             await statusSetupTask?.value
             self?.refreshFromQueue()
             // Scan and reconcile run concurrently. Reconcile drains existing work and newly enqueued
             // items, and it is the only runner caller. A slow scan cannot block uploads.
             self?.beginScanPhase()
             let scanDone = BackupScanSignal()
+            var scanFinished = false
             let workIntent: LibraryWorkIntent = owner == .manual ? .userInitiated : .automatic
             async let reconcile: BackupSyncProgress = Self.reconcileWhileScanning(
                 runner: runner,
@@ -986,6 +990,7 @@ public final class PhotoLibraryBackupController {
                         commitChanges: { monitor.commit(preparedChanges) }
                     )
                 }
+                scanFinished = true
             } catch is CancellationError {
                 // The one-shot completion signal below releases the reconcile loop cleanly.
             } catch {
@@ -995,6 +1000,11 @@ public final class PhotoLibraryBackupController {
 
             await scanDone.markDone()
             let finalProgress = await reconcile  // drains the tail enqueued during the scan, then returns
+            // The last drain ran after the scan. Only a finished scan shows that no photo waits; then no index build
+            // follows from this pass.
+            if scanFinished, finalProgress.leavesNoUploadWork {
+                await identityResolver?.remoteIndexPreparationNotNeeded()
+            }
             do {
                 // Requeue drops after the runner stops. The next pass retries them without looping in this pass.
                 try await Self.reconcileMissingSources(

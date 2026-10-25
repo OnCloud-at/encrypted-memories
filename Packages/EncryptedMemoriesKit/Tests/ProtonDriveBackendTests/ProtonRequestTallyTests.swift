@@ -435,6 +435,15 @@ struct ProtonRequestTallyTests {
         #expect(base.count == 1)
     }
 
+    @Test func aReportAfterTheShutdownGateClosedReachesNoResolver() async {
+        let base = NotNeededRecordingResolver()
+        let admission = JoinedShutdownGate()
+        let resolver = ShutdownGatedUploadIdentityResolver(base: base, admission: admission)
+        admission.closeAdmission()
+        await resolver.remoteIndexPreparationNotNeeded()
+        #expect(base.count == 0, "the account's stores may already be closed")
+    }
+
     private static func configuration(initial: Int) -> ProtonRequestGovernor.Configuration {
         let scope = ProtonRequestGovernor.Configuration.Scope(initialConcurrency: initial, maximumConcurrency: initial)
         return .init(
