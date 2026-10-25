@@ -1,5 +1,3 @@
-import CoreGraphics
-import SwiftUI
 import Testing
 
 @testable import DesignSystemCore
@@ -20,30 +18,7 @@ import Testing
         #expect(long > short)
     }
 
-    /// Renders the view on white in the light scheme and counts the pixels that are not white.
-    @MainActor private static func inkPixels<V: View>(_ view: V) throws -> Int {
-        let framed =
-            view
-            .frame(width: 320, height: 200)
-            .background(Color.white)
-            .environment(\.colorScheme, .light)
-        let renderer = ImageRenderer(content: framed)
-        renderer.scale = 1
-        let image = try #require(renderer.cgImage)
-        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
-        let drawn = bytes.withUnsafeMutableBytes { buffer -> Bool in
-            guard
-                let context = CGContext(
-                    data: buffer.baseAddress, width: image.width, height: image.height, bitsPerComponent: 8,
-                    bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-            else { return false }
-            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
-            return true
-        }
-        try #require(drawn)
-        return stride(from: 0, to: bytes.count, by: 4).reduce(0) { count, offset in
-            count + (bytes[offset] < 200 || bytes[offset + 1] < 200 || bytes[offset + 2] < 200 ? 1 : 0)
-        }
+    @MainActor private static func inkPixels(_ view: ProtonLoadingView) throws -> Int {
+        try RenderedInk.pixels(view, width: 320, height: 200)
     }
 }
