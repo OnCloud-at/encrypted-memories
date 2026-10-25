@@ -39,6 +39,46 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         await reconciliation.waitForCurrentPass()
     }
 
+    func testAnOpenGateStillWaitsForTheForeground() async {
+        let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: HeldWaits().sleep)
+        gate.open()
+        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let reconciliation = TimelineMetadataReconciliation(startGate: gate, runtimeState: state)
+        let started = AsyncTestSignal()
+        reconciliation.schedule(inventory) { _ in started.fire() }
+        await awaitHeldSnapshots(1, in: reconciliation)
+        XCTAssertFalse(started.hasFired, "an open gate does not start the pass in a background window")
+
+        state.update { $0.executionOpportunity = .foregroundActive }
+        await awaitEvent(started, "the pass after the foreground return")
+        reconciliation.retire()
+        await reconciliation.waitForCurrentPass()
+    }
+
+    func testThePassNeedsTheGateAndTheForegroundInEitherOrder() async {
+        let waits = HeldWaits()
+        let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: waits.sleep)
+        gate.buildStarted()
+        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .foregroundActive))
+        let reconciliation = TimelineMetadataReconciliation(startGate: gate, runtimeState: state)
+        let started = AsyncTestSignal()
+        reconciliation.schedule(inventory) { _ in started.fire() }
+        let waiting = await waits.waitUntilRequested(1)
+        XCTAssertTrue(waiting, "the gate never started its limit timer")
+        XCTAssertFalse(started.hasFired, "a closed gate holds the pass in the foreground")
+
+        // The app enters the background before the build ends; the gate opens there.
+        state.update { $0.executionOpportunity = .backgroundPermitted }
+        gate.open()
+        await awaitHeldSnapshots(1, in: reconciliation)
+        XCTAssertFalse(started.hasFired, "the open gate does not start the pass in the background")
+
+        state.update { $0.executionOpportunity = .foregroundActive }
+        await awaitEvent(started, "the pass after the foreground return")
+        reconciliation.retire()
+        await reconciliation.waitForCurrentPass()
+    }
+
     func testABuildThatDoesNotStartReleasesThePassAfterTheStartLimit() async {
         let waits = HeldWaits()
         let started = await passStarts(

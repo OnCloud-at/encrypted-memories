@@ -20,6 +20,127 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
             }, classifiedNodeIDs: [], libraryID: library)
     }
 
+    // MARK: - Background window
+
+    private func runtimeState(_ opportunity: LibraryExecutionOpportunity) -> LibraryRuntimeState {
+        LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: opportunity))
+    }
+
+    func testAPassWaitsDuringABackgroundWindowAndStartsOnceInTheForeground() async {
+        await assertThePassWaits(in: .backgroundPermitted)
+    }
+
+    func testAPassWaitsWhileTheAppIsSuspended() async {
+        await assertThePassWaits(in: .suspended)
+    }
+
+    private func assertThePassWaits(
+        in opportunity: LibraryExecutionOpportunity, file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        let state = runtimeState(opportunity)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let log = PassLog()
+        reconciliation.schedule(inventory(2)) { await log.start($0) }
+        await awaitHeldSnapshots(1, in: reconciliation, file: file, line: line)
+        let held = await log.count
+        XCTAssertEqual(held, 0, "no pass starts while the app is held", file: file, line: line)
+
+        state.update { $0.executionOpportunity = .foregroundActive }
+        await awaitEvent(log.started, "the pass after the foreground return", file: file, line: line)
+        await reconciliation.waitForCurrentPass()
+        let started = await log.count
+        XCTAssertEqual(started, 1, "the foreground return starts exactly one pass", file: file, line: line)
+        XCTAssertEqual(reconciliation.heldSnapshotCount, 1, "one check per runtime change", file: file, line: line)
+    }
+
+    func testAPassRunsAtOnceWhileTheAppIsInTheForegroundButInactive() async {
+        // A Mac app behind another window, or an iPhone app under Control Center, is not in a background window.
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: runtimeState(.foregroundInactive))
+        let log = PassLog()
+        reconciliation.schedule(inventory(2)) { await log.start($0) }
+        let ran = await log.started.wait(limit: .seconds(20))
+        XCTAssertTrue(ran, "the pass starts at once")
+        // A pass that waits would keep the task alive; retiring it lets the test end.
+        if !ran { reconciliation.retire() }
+        await reconciliation.waitForCurrentPass()
+        XCTAssertEqual(reconciliation.heldSnapshotCount, 0)
+    }
+
+    func testARuntimeChangeThatKeepsTheBackgroundWindowStartsNoPass() async {
+        let state = runtimeState(.backgroundPermitted)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let log = PassLog()
+        reconciliation.schedule(inventory(2)) { await log.start($0) }
+        await awaitHeldSnapshots(1, in: reconciliation)
+
+        state.update { $0.thermalLevel = .fair }
+        await awaitHeldSnapshots(2, in: reconciliation)
+        let held = await log.count
+        XCTAssertEqual(held, 0, "the wake checks the window again")
+
+        state.update { $0.executionOpportunity = .foregroundActive }
+        await awaitEvent(log.started, "the pass after the foreground return")
+        await reconciliation.waitForCurrentPass()
+        let started = await log.count
+        XCTAssertEqual(started, 1)
+        XCTAssertEqual(reconciliation.heldSnapshotCount, 2, "no check without a runtime change")
+    }
+
+    func testAPendingPassWaitsWhenTheAppEnteredTheBackgroundDuringTheFirstPass() async {
+        let state = runtimeState(.foregroundActive)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let log = PassLog()
+        let firstRunning = AsyncTestSignal()
+        let releaseFirst = AsyncTestSignal()
+        let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = { pass in
+            await log.start(pass)
+            if pass.inventory.items.count == 2 {
+                firstRunning.fire()
+                _ = await releaseFirst.wait(limit: Self.hangLimit)
+            }
+        }
+        reconciliation.schedule(inventory(2), operation: operation)
+        await awaitEvent(firstRunning, "the first pass")
+        state.update { $0.executionOpportunity = .backgroundPermitted }
+        reconciliation.schedule(inventory(3), operation: operation)
+        releaseFirst.fire()
+        await awaitHeldSnapshots(1, in: reconciliation)
+        let held = await log.count
+        XCTAssertEqual(held, 1, "the pending pass waits for the foreground")
+
+        state.update { $0.executionOpportunity = .foregroundActive }
+        await reconciliation.waitForCurrentPass()
+        let started = await log.count
+        XCTAssertEqual(started, 2)
+    }
+
+    func testRetiringAWaitingPassEndsItWithoutAStart() async {
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: runtimeState(.backgroundPermitted))
+        let log = PassLog()
+        reconciliation.schedule(inventory(2)) { await log.start($0) }
+        await awaitHeldSnapshots(1, in: reconciliation)
+        reconciliation.retire()
+        await reconciliation.waitForCurrentPass()
+        let started = await log.count
+        XCTAssertEqual(started, 0)
+    }
+
+    func testALibraryReplacementWhileAPassWaitsStartsOnlyTheNewLibrary() async {
+        let state = runtimeState(.backgroundPermitted)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let log = PassLog()
+        reconciliation.schedule(inventory(2, library: "first")) { await log.start($0) }
+        await awaitHeldSnapshots(1, in: reconciliation)
+        reconciliation.schedule(inventory(2, library: "second")) { await log.start($0) }
+        await awaitHeldSnapshots(2, in: reconciliation)
+
+        state.update { $0.executionOpportunity = .foregroundActive }
+        await awaitEvent(log.started, "the pass of the new library")
+        await reconciliation.waitForCurrentPass()
+        let libraries = await log.libraries
+        XCTAssertEqual(libraries, ["second"])
+    }
+
     func testFrequentChangesPublishTheActiveSnapshotAndOnlyOneLatestFollowUp() async throws {
         let fixture = try fixture()
         let reconciliation = TimelineMetadataReconciliation()
@@ -370,5 +491,36 @@ private actor MIMEReconciliationFixture {
     func close() {
         order?.close()
         timeline.close()
+    }
+}
+
+/// The passes that started, by library.
+private actor PassLog {
+    nonisolated let started = AsyncTestSignal()
+    private(set) var libraries: [String?] = []
+
+    var count: Int { libraries.count }
+
+    func start(_ pass: TimelineMetadataReconciliation.Pass) {
+        libraries.append(pass.inventory.libraryID)
+        started.fire()
+    }
+}
+
+extension XCTestCase {
+    /// A pass that is held evaluates each runtime snapshot once; this waits for the expected number. It is bounded,
+    /// so a pass that never waits fails here instead of hanging.
+    func awaitHeldSnapshots(
+        _ count: Int, in reconciliation: TimelineMetadataReconciliation, file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(20))
+        while reconciliation.heldSnapshotCount < count, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(
+            reconciliation.heldSnapshotCount, count, "the pass did not wait for the runtime state", file: file,
+            line: line)
     }
 }

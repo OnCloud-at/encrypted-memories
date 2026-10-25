@@ -31,10 +31,16 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
     private var task: Task<Void, Never>?
     private var retired = false
     private let startGate: TimelineMetadataStartGate?
+    private let runtimeState: LibraryRuntimeState
+    /// The runtime snapshots that held a pass back, so a test can tell that the task waits.
+    private var heldSnapshots = 0
 
-    public init(startGate: TimelineMetadataStartGate? = nil) {
+    public init(startGate: TimelineMetadataStartGate? = nil, runtimeState: LibraryRuntimeState = .shared) {
         self.startGate = startGate
+        self.runtimeState = runtimeState
     }
+
+    var heldSnapshotCount: Int { lock.withLock { heldSnapshots } }
 
     /// Repeated offers for the active inventory do not repeat its metadata requests.
     public func schedule(
@@ -58,7 +64,7 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
             let runGeneration = generation
             task = Task(priority: .background) { [self] in
                 await startGate?.wait()
-                while let pass = takeInput(generation: runGeneration) {
+                while await waitUntilAPassMayRun(), let pass = takeInput(generation: runGeneration) {
                     await operation(pass)
                     finish(pass)
                 }
@@ -88,6 +94,21 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
     public func waitForCurrentPass() async {
         let current = lock.withLock { task }
         await current?.value
+    }
+
+    /// A pass reads the whole library, so it waits while the app is in a background window of iOS or suspended: that
+    /// time belongs to the backup. A foreground app runs it, also when inactive. The runtime state yields its current
+    /// snapshot first, so a change between the check and the subscription cannot be missed. False after cancellation.
+    private func waitUntilAPassMayRun() async -> Bool {
+        for await snapshot in runtimeState.updates() {
+            if Self.passMayRun(snapshot) { return true }
+            lock.withLock { heldSnapshots += 1 }
+        }
+        return false
+    }
+
+    private static func passMayRun(_ snapshot: LibraryRuntimeSnapshot) -> Bool {
+        snapshot.executionOpportunity < .backgroundPermitted
     }
 
     private func takeInput(generation: UInt64) -> Pass? {
