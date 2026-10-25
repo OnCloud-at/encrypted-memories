@@ -1336,8 +1336,10 @@ extension DriveSessionStubSuite {
             routeEmptyEvents(from: "one", to: "two")
             StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
             StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
-            // The build outlasts the start limit, which applies only until a build starts.
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(1), limit: .seconds(60))
+            // The build outlasts the start limit, which applies only until a build starts. The test ends the start-limit
+            // wait of the gate while the build runs; the limit that follows never ends on its own.
+            let startLimit = StartLimitHold(then: Self.neverFires)
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(1), limit: .seconds(60), sleep: startLimit.sleep)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             let reconciliation = TimelineMetadataReconciliation(startGate: gate)
             let events = BuildOrderLog()
@@ -1347,9 +1349,12 @@ extension DriveSessionStubSuite {
                 // The last progress comes a moment after the build ends; the pass still starts only after it.
                 if step.phase == .ready { try? await Task.sleep(for: .milliseconds(500)) }
                 await events.append("build \(step.phase)")
-                if step.phase == .indexing { try? await Task.sleep(for: .milliseconds(1_500)) }
+                if step.phase == .indexing {
+                    startLimit.end()
+                    try? await Task.sleep(for: .milliseconds(1_500))
+                }
             }
-            #expect(await passStart(events, reconciliation) != nil)
+            #expect(await passStart(events, reconciliation))
 
             let log = await events.entries
             #expect(log.contains("build indexing"), "\(log)")
@@ -1416,7 +1421,8 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             StubURLProtocol.reset()
-            let gate = TimelineMetadataStartGate(startLimit: .seconds(20), limit: .seconds(20))
+            let gate = TimelineMetadataStartGate(
+                startLimit: .seconds(20), limit: .seconds(20), sleep: Self.neverFires)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
             let reconciliation = TimelineMetadataReconciliation(startGate: gate)
             let events = BuildOrderLog()
@@ -1429,7 +1435,7 @@ extension DriveSessionStubSuite {
                 }
             }
 
-            #expect(await passStart(events, reconciliation) != nil, "the failed build must release the pass")
+            #expect(await passStart(events, reconciliation), "the failed build must release the pass")
             let log = await events.entries
             #expect(log.first == "build loading", "\(log)")
             #expect(log.last == "metadata pass", "the pass waits for the failure: \(log)")
@@ -1466,35 +1472,47 @@ extension DriveSessionStubSuite {
                     }
                 }
                 defer { lineage?.close() }
-                let gate = TimelineMetadataStartGate(startLimit: .seconds(20), limit: .seconds(20))
+                let events = BuildOrderLog()
+                // A later launch opens the gate at once. A pass that reaches the gate wait anyway is held, and the wait
+                // starts the sleeper of the gate, so the sleeper ends the wait for the start instead of any time limit.
+                let gate = TimelineMetadataStartGate(
+                    startLimit: .seconds(20), limit: .seconds(20),
+                    sleep: { duration in
+                        await events.giveUp()
+                        try await Self.neverFires(duration)
+                    })
                 _ = makeService(content: content, lineage: lineage, firstBuildGate: gate)
                 let reconciliation = TimelineMetadataReconciliation(startGate: gate)
-                let events = BuildOrderLog()
 
                 reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
 
-                let waited = await passStart(events, reconciliation)
-                #expect(waited.map { $0 < .seconds(5) } == true, "\(mode): a later launch must not hold the pass")
+                #expect(await passStart(events, reconciliation), "\(mode): a later launch must not hold the pass")
+                gate.open()
             }
         }
 
-        /// Waits at most ten seconds for the pass, then retires the scheduler so a held pass cannot outlive the test.
+        /// Waits until the pass logs its start, then retires the scheduler so a held pass cannot outlive the test.
+        /// No time limit decides the result: the wait ends when the pass starts, or when the log gives up. The safety
+        /// net gives up only after a wait that nothing else ended, so a hung pass fails the test and cannot hang it.
         private func passStart(
             _ events: BuildOrderLog, _ reconciliation: TimelineMetadataReconciliation
-        ) async -> Duration? {
-            let clock = ContinuousClock()
-            let begin = clock.now
-            var started: Duration?
-            while started == nil, clock.now - begin < .seconds(10) {
-                if await events.entries.contains("metadata pass") {
-                    started = clock.now - begin
-                } else {
-                    try? await Task.sleep(for: .milliseconds(20))
-                }
+        ) async -> Bool {
+            let safetyNet = Task {
+                do { try await Task.sleep(for: .seconds(180)) } catch { return }
+                await events.giveUp()
             }
+            let started = await events.waitFor("metadata pass")
+            safetyNet.cancel()
             reconciliation.retire()
             await reconciliation.waitForCurrentPass()
             return started
+        }
+
+        /// A gate sleeper that ends only when its task is cancelled, which `open()` does to the timer of the gate. A
+        /// gate with this sleeper releases a waiting pass only through `open()`, never through its time limits. With a
+        /// real limit, a pass that production code wrongly holds would start when the limit ends and pass the test.
+        private static func neverFires(_ duration: Duration) async throws {
+            try await Task.sleep(for: .seconds(24 * 60 * 60))
         }
 
         private var timelineInventory: TimelineMetadataReconciliation.Inventory {
@@ -1755,7 +1773,72 @@ private struct NoPhotoDuplicates: SDKPhotoDuplicatesClient {
 
 private actor BuildOrderLog {
     private(set) var entries: [String] = []
-    func append(_ entry: String) { entries.append(entry) }
+    private var gaveUp = false
+    private var waiters: [(entry: String, continuation: CheckedContinuation<Bool, Never>)] = []
+
+    func append(_ entry: String) {
+        entries.append(entry)
+        let (ready, rest) = (waiters.filter { $0.entry == entry }, waiters.filter { $0.entry != entry })
+        waiters = rest
+        ready.forEach { $0.continuation.resume(returning: true) }
+    }
+
+    /// Returns true when `entry` is in the log, without polling; false once `giveUp()` ended the wait first.
+    func waitFor(_ entry: String) async -> Bool {
+        if entries.contains(entry) { return true }
+        if gaveUp { return false }
+        return await withCheckedContinuation { waiters.append((entry, $0)) }
+    }
+
+    /// Ends every wait for an entry that did not come, and every later one.
+    func giveUp() {
+        gaveUp = true
+        let ended = waiters
+        waiters = []
+        ended.forEach { $0.continuation.resume(returning: false) }
+    }
+}
+
+/// The sleeper of a gate whose first wait, the start limit, ends when the test calls `end()` and whose later waits
+/// run `then`. The test can end the start limit while a build runs, whatever the speed of the machine.
+private final class StartLimitHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private let then: @Sendable (Duration) async throws -> Void
+    private var firstWaitTaken = false
+    private var ended = false
+    private var waiting: CheckedContinuation<Void, Never>?
+
+    init(then: @escaping @Sendable (Duration) async throws -> Void) {
+        self.then = then
+    }
+
+    func sleep(_ duration: Duration) async throws {
+        let isFirst = lock.withLock { () -> Bool in
+            defer { firstWaitTaken = true }
+            return !firstWaitTaken
+        }
+        guard isFirst else { return try await then(duration) }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let endedAlready = lock.withLock { () -> Bool in
+                    if !ended { waiting = continuation }
+                    return ended
+                }
+                if endedAlready { continuation.resume() }
+            }
+        } onCancel: {
+            end()
+        }
+    }
+
+    func end() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            ended = true
+            defer { waiting = nil }
+            return waiting
+        }
+        continuation?.resume()
+    }
 }
 
 private actor PreparationLog {
