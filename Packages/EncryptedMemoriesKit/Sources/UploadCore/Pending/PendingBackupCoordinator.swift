@@ -89,9 +89,11 @@ public actor PendingBackupCoordinator {
     private var unreadableSourceStates = Set<PendingSourceKey>()
     /// The last load of every source state was incomplete, so a source without a cached state is unknown.
     private var sourceStatesIncomplete = false
-    /// The last reconcile could not read every due source state.
+    /// The sources that incomplete load decoded. Only they may run actions until a complete load.
+    private var loadDecodedKeys = Set<PendingSourceKey>()
+    /// The current reconcile pass could not read every due source state. Set before the pass awaits any effect.
     private var dueStatesIncomplete = false
-    /// The sources whose state that incomplete due read decoded. Only they may run actions until a complete read.
+    /// The sources whose state the due reads of that pass decoded. Only they may run actions until a complete read.
     private var dueDecodedKeys = Set<PendingSourceKey>()
     /// The current retry delay while a source state cannot be read; nil when every read succeeded.
     private var unreadableRetry: Duration?
@@ -712,9 +714,12 @@ public actor PendingBackupCoordinator {
         let decoded = Dictionary(uniqueKeysWithValues: read.states.map { ($0.key, $0) })
         if read.complete {
             sourceStates = decoded
+            loadDecodedKeys = []
         } else {
-            // A source missing from an incomplete list keeps its last known state.
+            // A source missing from an incomplete list keeps its last known state for timing and restores, but that
+            // state may be stale, so only the sources this load decoded may run actions.
             sourceStates.merge(decoded) { _, current in current }
+            loadDecodedKeys = Set(decoded.keys)
         }
         sourceStatesIncomplete = !read.complete
     }
@@ -1145,6 +1150,10 @@ public actor PendingBackupCoordinator {
                 let read = store.dueSourceStatesRead(by: now())
                 if !read.complete { incomplete = true }
                 decoded.formUnion(read.states.map(\.key))
+                // Published before the effects of this pass await, so an action that runs meanwhile never uses the
+                // permission of an earlier pass.
+                dueStatesIncomplete = incomplete
+                dueDecodedKeys = decoded
                 return read.states
             }
             await performRemote(
@@ -1163,8 +1172,6 @@ public actor PendingBackupCoordinator {
                 due().filter {
                     $0.needsRemoteTrash && $0.desired == .excluded && $0.remote != nil
                 })
-            dueStatesIncomplete = incomplete
-            dueDecodedKeys = decoded
             guard !closed else { return }
             // A restore can make deferred actions eligible again. Inside the loop, so a request that arrives
             // while an action awaits the network still runs another pass.
@@ -1264,8 +1271,10 @@ public actor PendingBackupCoordinator {
         let delay: Duration
         if dueStatesIncomplete || sourceStatesIncomplete || !unreadableSourceStates.isEmpty {
             // An unreadable row stays due in the store, so the next effect date would retry it every second.
-            let next = unreadableRetry.map { $0 * 2 } ?? configuration.unreadableRetryDelay
-            let backoff = min(next, configuration.unreadableRetryLimit)
+            let limit = configuration.unreadableRetryLimit
+            let next = unreadableRetry.map { $0 > limit / 2 ? limit : $0 * 2 } ?? configuration.unreadableRetryDelay
+            // At least one second, whatever the configuration says, so a zero or negative limit never spins.
+            let backoff = max(.seconds(1), min(next, limit))
             unreadableRetry = backoff
             // Readable sources keep their own retry time; only the unreadable part waits for the backoff.
             if let readable = readableNextEffectDate() {
@@ -1359,7 +1368,10 @@ public actor PendingBackupCoordinator {
         guard !unreadableSourceStates.contains(key) else { return false }
         // An incomplete due read may have left out this source's current state.
         guard !dueStatesIncomplete || dueDecodedKeys.contains(key) else { return false }
-        guard let state = sourceStates[key] else { return !sourceStatesIncomplete }
+        // After an incomplete load, a last known state of a source that this load did not decode may be stale.
+        guard !sourceStatesIncomplete || loadDecodedKeys.contains(key) else { return false }
+        // A source without a state here was decoded as absent: by a complete load, or by a fresh read since.
+        guard let state = sourceStates[key] else { return true }
         return state.desired == .included && !state.needsRemoteRestore
     }
 
