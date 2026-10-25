@@ -54,9 +54,9 @@ public enum UnusedNetworkStorePurge {
     }
 
     /// Explicit sign-out verifies the named stores even after a completed startup purge.
-    /// An unsandboxed macOS Library outside every container has no stores of the app's own; it completes
-    /// without removing or verifying anything. A refused location or a failed verification cannot count
-    /// as successful sign-out.
+    /// An unsandboxed macOS Library outside every container has no stores of the app's own. It completes without
+    /// removing or verifying the named stores; it still checks the Library and Caches metadata and physical paths.
+    /// A refused location or a failed verification cannot count as successful sign-out.
     @discardableResult
     public static func purgeForSignOut(defaults: UserDefaults = .standard, location: Location? = .current) -> Result? {
         purge(defaults: defaults, location: location, honorCompletedFlag: false)
@@ -165,12 +165,16 @@ public enum UnusedNetworkStorePurge {
             && container.deletingLastPathComponent().lastPathComponent == "Containers"
     }
 
-    /// A macOS Library outside every sandbox container. Neither its written path nor its physical path,
-    /// with every link resolved, contains a `Containers/<id>/Data` sequence or a `Group Containers` component,
-    /// in any letter case. The physical Library must be a directory. Caches must be a directory, not a link,
-    /// directly inside it. Nothing below Caches or Cookies is examined, because this case removes nothing.
+    /// A macOS Library outside every sandbox container. Neither its lexically standardized written path nor its
+    /// physical path, with every link resolved, contains a `Containers/<id>/Data` sequence or a `Group Containers`
+    /// component, in any letter case. The physical Library must be a directory. Caches must be a directory, not a
+    /// link, directly inside it. Nothing below Caches or Cookies is examined, because this case removes nothing.
     /// A missing or unresolvable Library or Caches is refused.
     static func isUnsandboxedLibrary(_ library: URL, caches: URL) -> Bool {
+        // One lexical form for every check: `.` and `..` go without following a link, so lstat sees the literal
+        // Caches entry. `standardizedFileURL` would resolve `..` through a link and hide it.
+        let library = library.standardized
+        let caches = caches.standardized
         guard let physicalLibrary = physicalPath(of: library),
             // Stated explicitly, so the rule does not depend on the lstat error below a file.
             (try? LocalPurgeItemState.read(at: physicalLibrary)) == .directory,
@@ -178,7 +182,8 @@ public enum UnusedNetworkStorePurge {
             // Stated explicitly, so the rule does not depend on how a Caches entry that is no link resolves.
             physicalPath(of: caches)?.deletingLastPathComponent().path == physicalLibrary.path
         else { return false }
-        return !isInsideAnyContainer(library.standardizedFileURL.pathComponents)
+        // The written path is this lexical form; components that `..` cancels do not count.
+        return !isInsideAnyContainer(library.pathComponents)
             && !isInsideAnyContainer(physicalLibrary.pathComponents)
     }
 
