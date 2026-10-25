@@ -70,6 +70,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private var unfinishedRemoteContentIndexBuilds: [Int: Task<Void, any Error>] = [:]
     /// A preparation stopped waiting while a build ran; the timeline metadata pass then waits for that build to end.
     private var metadataPassWaitsForBuild = false
+    /// The backup reported that it prepares no index while a build had not ended. The end of the last build releases
+    /// the metadata pass, whether or not that build rebuilt the lineage.
+    private var metadataPassWaitsOnlyForRunningBuilds = false
     /// Set when the account's work ends. No build starts after it.
     private var isShutDown = false
     private var remoteIndexProgressHandlers: [UUID: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void] =
@@ -429,6 +432,20 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         await progress(.init(phase: .ready))
     }
 
+    /// The backup ended its pass without preparing the index, for a reason that lasts until the person acts. The
+    /// timeline metadata pass then need not wait for a first full build. A preparation that is about to start a build
+    /// releases the pass itself when it ends. A build that has not ended, also one that an invalidation cancelled,
+    /// still reads the library, so the end of the last such build releases the pass.
+    func remoteIndexPreparationNotNeeded() async {
+        guard remoteIndexProgressHandlers.isEmpty else { return }
+        guard unfinishedRemoteContentIndexBuilds.isEmpty else {
+            metadataPassWaitsOnlyForRunningBuilds = true
+            return
+        }
+        metadataPassWaitsForBuild = false
+        firstBuildGate?.open()
+    }
+
     func findRemoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
@@ -600,6 +617,13 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         // when no build runs and that build ended: this one rebuilt the lineage, or no lineage rebuild is still due.
         let firstFullBuildEnded = rebuiltLineage || !rebuildsMissingLineage(material: material)
         if metadataPassWaitsForBuild, remoteContentIndexTask == nil, firstFullBuildEnded {
+            metadataPassWaitsForBuild = false
+            firstBuildGate?.open()
+        }
+        if metadataPassWaitsOnlyForRunningBuilds, unfinishedRemoteContentIndexBuilds.isEmpty,
+            remoteIndexProgressHandlers.isEmpty
+        {
+            metadataPassWaitsOnlyForRunningBuilds = false
             metadataPassWaitsForBuild = false
             firstBuildGate?.open()
         }

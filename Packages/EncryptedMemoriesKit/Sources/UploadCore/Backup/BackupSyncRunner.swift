@@ -367,7 +367,14 @@ public actor BackupSyncRunner {
         emitProgress()
 
         if mode == .eligibleOnly {
-            guard let nextRunnableDate = queue.nextRunnableDate(), nextRunnableDate <= now() else {
+            guard let nextRunnableDate = queue.nextRunnableDate() else {
+                // Nothing is due now or later. A parked draft whose re-check is due later can still start an index
+                // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
+                progress.isRunning = false
+                progress.leavesNoUploadWork = !queue.containsAny(in: [.blockedByDraft]) && queue.isOperational()
+                return progress
+            }
+            guard nextRunnableDate <= now() else {
                 progress.isRunning = false
                 return progress
             }

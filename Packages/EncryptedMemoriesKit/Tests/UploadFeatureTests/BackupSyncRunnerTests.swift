@@ -506,11 +506,19 @@ final class BackupProgressRecorder: @unchecked Sendable {
 final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private let inner: UploadBackupSyncQueueManifestStore
     private let log: BackupEventLog
+    private let failsRunnableDateRead: Bool
+    private let lock = NSLock()
+    private var readFailed = false
 
-    init(inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog) {
+    /// With `failsRunnableDateRead`, the read of the next due date fails as a broken SQLite read does: it returns nil
+    /// and leaves the store not operational.
+    init(inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog, failsRunnableDateRead: Bool = false) {
         self.inner = inner
         self.log = log
+        self.failsRunnableDateRead = failsRunnableDateRead
     }
+
+    func isOperational() -> Bool { lock.withLock { !readFailed } }
 
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
 
@@ -527,7 +535,11 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
 
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
-        inner.nextRunnableDate(excludingSourcesOf: excludedSources)
+        if failsRunnableDateRead {
+            lock.withLock { readFailed = true }
+            return nil
+        }
+        return inner.nextRunnableDate(excludingSourcesOf: excludedSources)
     }
 
     func claimRunnable(
@@ -731,6 +743,11 @@ final class SpyIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
         log.append("manifest.uploadDidFail")
         await inner.uploadDidFail(descriptor)
     }
+
+    func remoteIndexPreparationNotNeeded() async {
+        log.append("manifest.remoteIndexPreparationNotNeeded")
+        await inner.remoteIndexPreparationNotNeeded()
+    }
 }
 
 private final class TransportCancellingStageResolver: UploadIdentityResolving, @unchecked Sendable {
@@ -768,6 +785,7 @@ private final class TransportCancellingStageResolver: UploadIdentityResolving, @
     }
     func uploadDidFail(_ descriptor: UploadResourceDescriptor) async { await inner.uploadDidFail(descriptor) }
     func invalidateCachedRemoteState() async { await inner.invalidateCachedRemoteState() }
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
 }
 
 final class PreparationFailingIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
@@ -780,6 +798,7 @@ final class PreparationFailingIdentityResolver: UploadIdentityResolving, @unchec
         await progress(.init(phase: .indexing, completed: 10, total: 100))
         throw UploadError.backend("index unavailable")
     }
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try await inner.resolve(descriptor)
     }
@@ -814,6 +833,8 @@ final class RecordFailingIdentityResolver: UploadIdentityResolving, @unchecked S
         self.failure = failure
         self.failureFilename = failureFilename
     }
+
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
 
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try await inner.resolve(descriptor)
@@ -1951,6 +1972,75 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(omitted?.omitsMissingPairedVideo, true)
         XCTAssertEqual(omitted?.secondaries.isEmpty, true)
         XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [true])
+    }
+
+    // MARK: - The first index build and the timeline order pass
+
+    /// A runner whose resolver logs every call, and the number of reports of a pass without an index build. The runner
+    /// itself never reports; it tells the controller whether any upload work is left.
+    private func signalRunner(
+        throttleInputs: BackupThrottleInputs = .unconstrained, queue: (any UploadBackupSyncQueueStore)? = nil
+    ) -> (BackupSyncRunner, () -> Int) {
+        let log = BackupEventLog()
+        let resolver = SpyIdentityResolver(inner: makePipeline(), log: log)
+        let runner = makeRunner(identityResolver: resolver, queue: queue, throttleInputs: { throttleInputs })
+        return (runner, { log.events.filter { $0 == "manifest.remoteIndexPreparationNotNeeded" }.count })
+    }
+
+    func testAPassWithNothingQueuedLeavesNoUploadWork() async {
+        let (runner, signals) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(progress.leavesNoUploadWork, "a backed-up library needs no index build")
+        XCTAssertEqual(signals(), 0, "the controller reports once it knows that the scan finished")
+    }
+
+    func testAPassThatWaitsForWiFiLeavesUploadWork() async {
+        _ = seedEntry("waiting.jpg")
+        let (runner, _) = signalRunner(
+            throttleInputs: BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false))
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertFalse(progress.leavesNoUploadWork, "the index build can start as soon as Wi-Fi comes")
+    }
+
+    func testAPassWhoseNextPhotoIsDueLaterLeavesUploadWork() async {
+        let entry = seedEntry("later.jpg")
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(3_600)))
+        let (runner, _) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertFalse(progress.leavesNoUploadWork, "the index build can start when the photo is due")
+    }
+
+    func testAPassThatPreparesTheIndexLeavesNoClaimOfNoUploadWork() async {
+        let entry = seedEntry("ready.jpg")
+        let (runner, _) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertFalse(progress.leavesNoUploadWork, "this pass prepared the index")
+    }
+
+    func testAParkedDraftWithALaterRecheckLeavesUploadWork() async {
+        let issue = BackupIssueRecord(
+            kind: .remoteService, detail: "draft", nextAttemptAt: clock.now.addingTimeInterval(3_600))
+        let entry = seedEntry("draft.jpg", state: .blockedByDraft)
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .blockedByDraft, attempts: 0,
+                lastError: issue.persistedValue, updatedAt: clock.now.addingTimeInterval(3_600)))
+        let (runner, _) = signalRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .blockedByDraft, "the re-check is not due yet")
+        XCTAssertFalse(progress.leavesNoUploadWork, "the re-check of the draft can start an index build")
+    }
+
+    func testAFailedQueueReadLeavesNoClaimOfNoUploadWork() async {
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog(), failsRunnableDateRead: true)
+        let (runner, _) = signalRunner(queue: queue)
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertFalse(progress.leavesNoUploadWork, "an unreadable queue proves nothing")
     }
 
     func testAFileThatPhotosCannotFindForAListedPhotoIsCheckedAgainLater() async throws {
@@ -5474,6 +5564,7 @@ final class RecordHoldingIdentityResolver: UploadIdentityResolving, @unchecked S
     /// True while a held record waits.
     var holds: Bool { lock.withLock { holding > 0 } }
     func releaseAll() { lock.withLock { held.removeAll() } }
+    func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
 
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try await inner.resolve(descriptor)

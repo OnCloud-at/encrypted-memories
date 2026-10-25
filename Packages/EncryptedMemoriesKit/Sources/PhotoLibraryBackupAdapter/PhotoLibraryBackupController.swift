@@ -240,6 +240,7 @@ public final class PhotoLibraryBackupController {
     private var didAutoRetryFailedThisLaunch = false
     private var lastProjectedProgress = BackupSyncProgress()
     private var executionOpportunityIssue: BackupExecutionOpportunityIssue?
+    private let identityResolver: (any UploadIdentityResolving)?
 
     #if DEBUG
         private var runnerStopOperationForTesting: (@Sendable () async -> Void)?
@@ -272,6 +273,7 @@ public final class PhotoLibraryBackupController {
         requiresPendingStore: Bool = false,
         replacementJournal: (any EditReplacementJournaling)? = nil
     ) {
+        self.identityResolver = identityResolver
         currentAccessState = configuration.currentAccessState
         changeSleep = configuration.changeSleep
         let directory = configuration.accountDataDirectory
@@ -387,6 +389,8 @@ public final class PhotoLibraryBackupController {
                 await self?.statusSetupTask?.value
                 self?.resumeEnabledBackupAfterLaunch()
             }
+        } else {
+            reportNoIndexBuild()
         }
         startObservingNetwork()
     }
@@ -477,6 +481,13 @@ public final class PhotoLibraryBackupController {
         if !isSyncing {
             refreshFromQueue()
         }
+        reportNoIndexBuild()
+    }
+
+    /// Backup is off, so no backup pass prepares the remote index until the person turns it on again.
+    private func reportNoIndexBuild() {
+        guard let identityResolver else { return }
+        Task { await identityResolver.remoteIndexPreparationNotNeeded() }
     }
 
     public func refreshAccessState() {
@@ -943,13 +954,17 @@ public final class PhotoLibraryBackupController {
             }
         #endif
         let task = Task {
-            [weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody] in
+            [
+                weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody,
+                identityResolver
+            ] in
             await statusSetupTask?.value
             self?.refreshFromQueue()
             // Scan and reconcile run concurrently. Reconcile drains existing work and newly enqueued
             // items, and it is the only runner caller. A slow scan cannot block uploads.
             self?.beginScanPhase()
             let scanDone = BackupScanSignal()
+            var scanFinished = false
             let workIntent: LibraryWorkIntent = owner == .manual ? .userInitiated : .automatic
             async let reconcile: BackupSyncProgress = Self.reconcileWhileScanning(
                 runner: runner,
@@ -975,6 +990,7 @@ public final class PhotoLibraryBackupController {
                         commitChanges: { monitor.commit(preparedChanges) }
                     )
                 }
+                scanFinished = true
             } catch is CancellationError {
                 // The one-shot completion signal below releases the reconcile loop cleanly.
             } catch {
@@ -984,6 +1000,11 @@ public final class PhotoLibraryBackupController {
 
             await scanDone.markDone()
             let finalProgress = await reconcile  // drains the tail enqueued during the scan, then returns
+            // The last drain ran after the scan. Only a finished scan shows that no photo waits; then no index build
+            // follows from this pass.
+            if scanFinished, finalProgress.leavesNoUploadWork {
+                await identityResolver?.remoteIndexPreparationNotNeeded()
+            }
             do {
                 // Requeue drops after the runner stops. The next pass retries them without looping in this pass.
                 try await Self.reconcileMissingSources(

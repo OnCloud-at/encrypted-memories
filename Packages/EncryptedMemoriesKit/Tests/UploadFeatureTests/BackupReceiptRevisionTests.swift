@@ -360,6 +360,8 @@ final class BackupReceiptRevisionTests: XCTestCase {
 
         init(inner: UploadDedupePipeline) { self.inner = inner }
 
+        func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
+
         func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
             try await inner.resolve(descriptor)
         }
