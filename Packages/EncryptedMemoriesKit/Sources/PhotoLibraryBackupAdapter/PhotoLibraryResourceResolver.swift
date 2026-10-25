@@ -134,51 +134,27 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             stableDate: captureDate,
             tempStore: tempStore
         )
-        let primaryRole = plan.primary.role
-        let primaryByteCount = primaryIdentity.byteCount
-        let primaryStaged = StagedExport(primaryIdentity.staged)
-        let modifiedAtResolve = asset.modificationDate
-        let localIdentifier = entry.source.identifier
         let tempStore = self.tempStore
-        let primaryMaterializer:
-            @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor = {
-                progress in
-                guard
-                    let currentAsset = PHAsset.fetchAssets(
-                        withLocalIdentifiers: [localIdentifier], options: nil
-                    ).firstObject
-                else {
-                    throw UploadError.fileMissing(plan.primary.uploadFilename)
-                }
-                guard let resource = PhotoKitAssetMapper.resource(for: primaryRole, of: currentAsset) else {
-                    throw UploadError.sourceReportedMissing(plan.primary.uploadFilename)
-                }
-                let export = try await Self.export(
-                    resource,
-                    uploadFilename: plan.primary.uploadFilename,
-                    expectedBytes: primaryByteCount,
-                    staged: primaryStaged,
-                    sourceUnchanged: currentAsset.modificationDate == modifiedAtResolve,
-                    tempStore: tempStore,
-                    tracking: exportedURLs,
-                    readAdmission: readAdmission,
-                    onProgress: {
-                        progress(
-                            .init(
-                                phase: .materializing,
-                                fraction: $0,
-                                resourceIndex: 0,
-                                resourceCount: resourceCount
-                            ))
-                    }
-                )
-                return Self.materializedDescriptor(
-                    source: candidate.snapshot.source,
-                    export: export,
-                    filename: plan.primary.uploadFilename,
-                    stableDate: captureDate
-                )
-            }
+        let primaryMaterializer = Self.makeMaterializer(
+            ResourceMaterialization(
+                kind: .primary,
+                ownerIdentifier: entry.source.identifier,
+                role: plan.primary.role,
+                ordinal: 0,
+                filename: plan.primary.uploadFilename,
+                expectedByteCount: primaryIdentity.byteCount,
+                source: candidate.snapshot.source,
+                stableDate: captureDate,
+                modifiedAtResolve: asset.modificationDate,
+                resourceIndex: 0,
+                resourceCount: resourceCount
+            ),
+            refetch: .photos,
+            staged: StagedExport(primaryIdentity.staged),
+            tempStore: tempStore,
+            tracking: exportedURLs,
+            readAdmission: readAdmission
+        )
 
         // A series main photo carries its members as secondaries. Each member's bytes and capture date come
         // from the member's own asset, not from the main photo.
@@ -229,52 +205,27 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 resource: item.sourceResource
             )
             let isBurstMember = item.role == .burstMember
-            let ownerIdentifier = owner.localIdentifier
             let stableDate = isBurstMember ? owner.creationDate ?? captureDate : captureDate
-            let filename = item.uploadFilename
-            let expectedByteCount = identity.byteCount
-            let staged = StagedExport(identity.staged)
-            let ownerModifiedAtResolve = owner.modificationDate
-            let materializer: @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor = {
-                progress in
-                guard let currentAsset = PhotoKitAssetMapper.asset(withLocalIdentifier: ownerIdentifier) else {
-                    // A series member is an asset of its own; the main photo is still listed.
-                    throw isBurstMember
-                        ? UploadError.sourceReportedMissing(filename) : UploadError.fileMissing(filename)
-                }
-                guard
-                    let currentResource = PhotoKitAssetMapper.resource(
-                        for: role, ordinal: ordinal, of: currentAsset
-                    )
-                else {
-                    throw UploadError.sourceReportedMissing(filename)
-                }
-                let export = try await Self.export(
-                    currentResource,
-                    uploadFilename: filename,
-                    expectedBytes: expectedByteCount,
-                    staged: staged,
-                    sourceUnchanged: currentAsset.modificationDate == ownerModifiedAtResolve,
-                    tempStore: tempStore,
-                    tracking: exportedURLs,
-                    readAdmission: readAdmission,
-                    onProgress: {
-                        progress(
-                            .init(
-                                phase: .materializing,
-                                fraction: $0,
-                                resourceIndex: secondaryIndex + 1,
-                                resourceCount: resourceCount
-                            ))
-                    }
-                )
-                return Self.materializedDescriptor(
+            let materializer = Self.makeMaterializer(
+                ResourceMaterialization(
+                    kind: .secondary(isBurstMember: isBurstMember),
+                    ownerIdentifier: owner.localIdentifier,
+                    role: role,
+                    ordinal: ordinal,
+                    filename: item.uploadFilename,
+                    expectedByteCount: identity.byteCount,
                     source: source,
-                    export: export,
-                    filename: filename,
-                    stableDate: stableDate
-                )
-            }
+                    stableDate: stableDate,
+                    modifiedAtResolve: owner.modificationDate,
+                    resourceIndex: secondaryIndex + 1,
+                    resourceCount: resourceCount
+                ),
+                refetch: .photos,
+                staged: StagedExport(identity.staged),
+                tempStore: tempStore,
+                tracking: exportedURLs,
+                readAdmission: readAdmission
+            )
             secondaries.append(
                 BackupSecondaryResource(
                     descriptor: Self.identityDescriptor(
@@ -381,7 +332,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
     /// Collects committed export URLs so the whole compound can be discarded in one cleanup call.
     /// A reference box (not an inout array) so it survives the async export hops and is captured
     /// by the `cleanup` closure.
-    private final class ExportedURLBox: @unchecked Sendable {
+    final class ExportedURLBox: @unchecked Sendable {
         private let lock = NSLock()
         private var stored: [URL] = []
         func append(_ url: URL) { lock.withLock { stored.append(url) } }
@@ -397,7 +348,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
 
     /// Gives the file that the identity pass staged to the first export of the resource, once. A later export of the
     /// same resource reads the original again.
-    private final class StagedExport: @unchecked Sendable {
+    final class StagedExport: @unchecked Sendable {
         private let lock = NSLock()
         private var export: ExportResult?
 
@@ -444,10 +395,103 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         )
     }
 
-    private struct ExportResult {
+    struct ExportResult {
         let url: URL
         let byteCount: Int64
         let sha1Digest: Data
+    }
+
+    /// How a deferred materialization reads its asset again. The two roles differ on purpose: the primary resource
+    /// belongs to the asset that the queue entry names, which the default fetch of Photos lists. A secondary resource
+    /// can belong to a series member, which the default fetch hides, so its lookup includes all series assets.
+    struct MaterializationRefetch: Sendable {
+        let primary: @Sendable (String) -> PHAsset?
+        let secondary: @Sendable (String) -> PHAsset?
+
+        static let photos = MaterializationRefetch(
+            primary: { PHAsset.fetchAssets(withLocalIdentifiers: [$0], options: nil).firstObject },
+            secondary: { PhotoKitAssetMapper.asset(withLocalIdentifier: $0) }
+        )
+    }
+
+    /// One resource that is exported after Core selected it for upload.
+    struct ResourceMaterialization: Sendable {
+        enum Kind: Sendable, Equatable {
+            case primary
+            case secondary(isBurstMember: Bool)
+        }
+
+        let kind: Kind
+        /// The asset that owns the resource: the queue entry's asset, or the series member of a burst resource.
+        let ownerIdentifier: String
+        let role: PhotoBackupAssetInfo.Resource.Role
+        let ordinal: Int
+        let filename: String
+        let expectedByteCount: Int64
+        let source: UploadSourceIdentity
+        let stableDate: Date
+        /// The modification date of the owner when the identity pass read the resource.
+        let modifiedAtResolve: Date?
+        let resourceIndex: Int
+        let resourceCount: Int
+    }
+
+    /// The deferred export of one resource, for the primary and every secondary resource alike. It reads the owner
+    /// again at export time. A missing owner is a missing file, except for a series member: that is an asset of its
+    /// own, and the main photo is still listed, so Photos reports the source missing.
+    static func makeMaterializer(
+        _ resource: ResourceMaterialization,
+        refetch: MaterializationRefetch,
+        staged: StagedExport,
+        tempStore: BackupTempFileStore,
+        tracking exportedURLs: ExportedURLBox,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) -> @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor {
+        { progress in
+            let currentAsset: PHAsset?
+            switch resource.kind {
+            case .primary: currentAsset = refetch.primary(resource.ownerIdentifier)
+            case .secondary: currentAsset = refetch.secondary(resource.ownerIdentifier)
+            }
+            guard let currentAsset else {
+                if resource.kind == .secondary(isBurstMember: true) {
+                    throw UploadError.sourceReportedMissing(resource.filename)
+                }
+                throw UploadError.fileMissing(resource.filename)
+            }
+            guard
+                let currentResource = PhotoKitAssetMapper.resource(
+                    for: resource.role, ordinal: resource.ordinal, of: currentAsset
+                )
+            else {
+                throw UploadError.sourceReportedMissing(resource.filename)
+            }
+            let export = try await Self.export(
+                currentResource,
+                uploadFilename: resource.filename,
+                expectedBytes: resource.expectedByteCount,
+                staged: staged,
+                sourceUnchanged: currentAsset.modificationDate == resource.modifiedAtResolve,
+                tempStore: tempStore,
+                tracking: exportedURLs,
+                readAdmission: readAdmission,
+                onProgress: {
+                    progress(
+                        .init(
+                            phase: .materializing,
+                            fraction: $0,
+                            resourceIndex: resource.resourceIndex,
+                            resourceCount: resource.resourceCount
+                        ))
+                }
+            )
+            return Self.materializedDescriptor(
+                source: resource.source,
+                export: export,
+                filename: resource.filename,
+                stableDate: resource.stableDate
+            )
+        }
     }
 
     /// PhotoKit may report very fine-grained iCloud progress. One-percent buckets cap cross-actor/UI churn
