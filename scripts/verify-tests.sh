@@ -13,6 +13,24 @@ else
 fi
 export DEVELOPER_DIR
 
+# ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=1 skips the vendored sdk-swift pass for quick local iterations. It is opt-in and
+# local only: CI refuses it, and the gate before review runs without it. Any other non-empty value is an error.
+skip_sdk_tests=0
+case "${ENCRYPTED_MEMORIES_SKIP_SDK_TESTS:-}" in
+  "") ;;
+  1)
+    if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+      echo "[tests] ENCRYPTED_MEMORIES_SKIP_SDK_TESTS is for local runs only; CI always runs the vendored sdk-swift tests." >&2
+      exit 64
+    fi
+    skip_sdk_tests=1
+    ;;
+  *)
+    echo "[tests] ENCRYPTED_MEMORIES_SKIP_SDK_TESTS must be unset, empty or 1." >&2
+    exit 64
+    ;;
+esac
+
 encryptedmemories_acquire_build_lock "verify-tests"
 
 # Runs one phase between a start and an end line that carry the elapsed seconds, so a log shows where the time goes.
@@ -44,12 +62,20 @@ run_phase "EncryptedMemoriesKit" xcrun swift test \
 
 # sdk-swift is a local path dependency, so SwiftPM does not execute its own test target while
 # testing EncryptedMemoriesKit. Keep a separate invocation in the canonical gate or those tests vanish.
-run_phase "vendored sdk-swift" xcrun swift test \
-  --package-path "$ROOT/Vendor/sdk-swift" \
-  --scratch-path "$SDK_SCRATCH" \
-  --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
-  --force-resolved-versions \
-  --no-parallel
+if [[ "$skip_sdk_tests" == 1 ]]; then
+  echo "[tests] skipped: vendored sdk-swift (ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=1, local run only)"
+else
+  run_phase "vendored sdk-swift" xcrun swift test \
+    --package-path "$ROOT/Vendor/sdk-swift" \
+    --scratch-path "$SDK_SCRATCH" \
+    --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+    --force-resolved-versions \
+    --no-parallel
+fi
 
-echo "[tests] all package suites passed"
+if [[ "$skip_sdk_tests" == 1 ]]; then
+  echo "[tests] package suites passed; vendored sdk-swift NOT run"
+else
+  echo "[tests] all package suites passed"
+fi
 echo "[tests] total: $SECONDS s"

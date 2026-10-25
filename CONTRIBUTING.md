@@ -85,6 +85,9 @@ Run focused tests while you work. Run these gates before requesting review:
 ./scripts/verify-universal-core.sh fast
 ```
 
+`ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=1 ./scripts/verify-tests.sh` skips the vendored SDK tests for a quick local run.
+CI refuses this switch, and the gate before review runs without it.
+
 `./scripts/verify-ios-app-tests.sh ui` runs the UI tests. They launch the app in the simulator on an offline test
 account and tap through it. They need no Proton account and no network. Add a UI test when you add a user action.
 The iOS app tests and UI tests need a Mac with Apple silicon: the Proton Drive SDK has no x86_64 iOS Simulator build.

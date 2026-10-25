@@ -104,6 +104,70 @@ class VerifyTestsScriptTests(unittest.TestCase):
         expected = [(kind, name, 0 if kind == "end" else None) for name in PHASES for kind in ("start", "end")]
         self.assertEqual(self.markers(result.stdout), expected)
         self.assertRegex(result.stdout, r"\[tests\] all package suites passed\n\[tests\] total: \d+ s\n")
+        self.assertNotIn("skipped", result.stdout)
+
+    def test_the_switch_skips_only_the_sdk_pass_and_says_so(self) -> None:
+        result = self.run_script(ENCRYPTED_MEMORIES_SKIP_SDK_TESTS="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([line.split(" --")[0] for line in self.invocations()], [
+            "python3 <root>/scripts/verify-apple-vision-sdk-surface.py",
+            "python3 <root>/scripts/tests/test_upgrade_fixture_corpus.py",
+            "xcrun swift test",
+        ])
+        self.assertIn("Packages/EncryptedMemoriesKit", self.invocations()[2])
+        self.assertEqual(self.markers(result.stdout), [(kind, name, 0 if kind == "end" else None)
+                                                       for name in PHASES[:3] for kind in ("start", "end")])
+        self.assertIn("[tests] skipped: vendored sdk-swift", result.stdout)
+        self.assertIn("[tests] package suites passed; vendored sdk-swift NOT run\n", result.stdout)
+        self.assertNotIn("all package suites passed", result.stdout)
+
+    def test_an_empty_switch_runs_every_phase(self) -> None:
+        result = self.run_script(ENCRYPTED_MEMORIES_SKIP_SDK_TESTS="")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.invocations()), 4)
+        self.assertIn("all package suites passed", result.stdout)
+
+    def test_ci_runs_every_phase_and_refuses_the_switch(self) -> None:
+        for ci in ({"CI": "true"}, {"GITHUB_ACTIONS": "true"}, {"CI": "true", "GITHUB_ACTIONS": "true"}):
+            with self.subTest(ci=ci, switch=False):
+                self.log.unlink(missing_ok=True)
+                result = self.run_script(**ci)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.invocations()), 4)
+                self.assertIn("all package suites passed", result.stdout)
+            with self.subTest(ci=ci, switch=True):
+                self.log.unlink(missing_ok=True)
+                shutil.rmtree(self.tmp / "build", ignore_errors=True)
+                result = self.run_script(ENCRYPTED_MEMORIES_SKIP_SDK_TESTS="1", **ci)
+
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn("local runs only", result.stderr)
+                self.assertEqual(self.invocations(), [])
+                self.assertEqual(self.markers(result.stdout), [])
+                self.assertFalse((self.tmp / "build").exists(), "the refusal comes before the build lock")
+
+    def test_any_other_switch_value_is_an_error_before_any_phase(self) -> None:
+        for value in ("0", "true", "yes", "1 ", "11"):
+            with self.subTest(value=value):
+                self.log.unlink(missing_ok=True)
+                result = self.run_script(ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=value)
+
+                self.assertEqual(result.returncode, 64, result.stdout)
+                self.assertIn("must be unset, empty or 1", result.stderr)
+                self.assertEqual(self.invocations(), [])
+                self.assertEqual(self.markers(result.stdout), [])
+
+    def test_a_failing_phase_still_ends_a_skipping_run_with_its_exit_status(self) -> None:
+        result = self.run_script(
+            ENCRYPTED_MEMORIES_SKIP_SDK_TESTS="1", STUB_FAIL_MATCH="Packages/EncryptedMemoriesKit", STUB_FAIL_CODE="7")
+
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assertEqual(self.markers(result.stdout)[-1], ("end", "EncryptedMemoriesKit", 7))
+        self.assertNotIn("package suites passed", result.stdout)
+        self.assertNotIn("skipped", result.stdout)
 
     def test_a_failing_phase_ends_the_script_with_its_exit_status(self) -> None:
         failing = {
@@ -127,11 +191,13 @@ class VerifyTestsScriptTests(unittest.TestCase):
     def test_a_missing_sdk_checkout_stops_before_any_phase(self) -> None:
         (self.root / "Vendor" / "sdk-swift" / "Package.swift").unlink()
 
-        result = self.run_script()
+        for switch in ("", "1"):
+            with self.subTest(switch=switch):
+                result = self.run_script(ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=switch)
 
-        self.assertEqual(result.returncode, 66)
-        self.assertEqual(self.invocations(), [])
-        self.assertEqual(self.markers(result.stdout), [])
+                self.assertEqual(result.returncode, 66)
+                self.assertEqual(self.invocations(), [])
+                self.assertEqual(self.markers(result.stdout), [])
 
 
 if __name__ == "__main__":
