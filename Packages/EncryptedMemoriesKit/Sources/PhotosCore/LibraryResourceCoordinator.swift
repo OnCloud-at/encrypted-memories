@@ -145,23 +145,20 @@ public struct LibraryWorkLease: Sendable {
     private let waitForYield: @Sendable () async -> LibraryWorkYieldReason?
     private let runtimeSnapshot: @Sendable () -> LibraryRuntimeSnapshot
     #if DEBUG
-        private let yieldWaitEvaluationCount: @Sendable () -> Int
+        /// Debug-only seam, set where the coordinator creates the lease.
+        fileprivate var yieldWaitEvaluationCount: @Sendable () -> Int = { 0 }
     #endif
 
     fileprivate init(
         budget: LibraryWorkBudget,
         decision: @escaping @Sendable () -> LibraryWorkContinuationDecision,
         waitForYield: @escaping @Sendable () async -> LibraryWorkYieldReason?,
-        yieldWaitEvaluationCount: @escaping @Sendable () -> Int,
         runtimeSnapshot: @escaping @Sendable () -> LibraryRuntimeSnapshot
     ) {
         self.budget = budget
         self.decision = decision
         self.waitForYield = waitForYield
         self.runtimeSnapshot = runtimeSnapshot
-        #if DEBUG
-            self.yieldWaitEvaluationCount = yieldWaitEvaluationCount
-        #endif
     }
 
     #if DEBUG
@@ -387,7 +384,9 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
     private let monotonicNow: @Sendable () -> UInt64
     private let lock = NSLock()
     private var recordedYieldReason: LibraryWorkYieldReason?
-    private var yieldWaitEvaluations = 0
+    #if DEBUG
+        private var yieldWaitEvaluations = 0
+    #endif
 
     init(
         budget: LibraryWorkBudget,
@@ -432,9 +431,11 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
         lock.withLock { recordedYieldReason }
     }
 
-    func yieldWaitEvaluationCount() -> Int {
-        lock.withLock { yieldWaitEvaluations }
-    }
+    #if DEBUG
+        func yieldWaitEvaluationCount() -> Int {
+            lock.withLock { yieldWaitEvaluations }
+        }
+    #endif
 
     /// Evaluates the decision on each wake: a runtime change (the first is the current snapshot), a preemption, or the
     /// end of the time slice.
@@ -467,7 +468,9 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
         for await _ in wakes {
             guard !Task.isCancelled else { return nil }
             let current = decision()
-            lock.withLock { yieldWaitEvaluations += 1 }
+            #if DEBUG
+                lock.withLock { yieldWaitEvaluations += 1 }
+            #endif
             if case .yield(let reason) = current { return reason }
         }
         return nil
@@ -763,14 +766,16 @@ public actor LibraryResourceCoordinator {
                     "workload": candidate.request.workload.rawValue,
                 ])
             let runtimeState = self.runtimeState
-            candidate.continuation.resume(
-                returning: LibraryWorkLease(
-                    budget: budget,
-                    decision: { leaseState.decision() },
-                    waitForYield: { await leaseState.nextYield() },
-                    yieldWaitEvaluationCount: { leaseState.yieldWaitEvaluationCount() },
-                    runtimeSnapshot: { runtimeState.snapshot() }
-                ))
+            var lease = LibraryWorkLease(
+                budget: budget,
+                decision: { leaseState.decision() },
+                waitForYield: { await leaseState.nextYield() },
+                runtimeSnapshot: { runtimeState.snapshot() }
+            )
+            #if DEBUG
+                lease.yieldWaitEvaluationCount = { leaseState.yieldWaitEvaluationCount() }
+            #endif
+            candidate.continuation.resume(returning: lease)
             return
         }
     }
