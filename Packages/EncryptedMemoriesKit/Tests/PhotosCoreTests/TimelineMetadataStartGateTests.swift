@@ -52,7 +52,7 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         state.update { $0.executionOpportunity = .foregroundActive }
         await awaitEvent(started, "the pass after the foreground return")
         reconciliation.retire()
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
     }
 
     func testThePassNeedsTheGateAndTheForegroundInEitherOrder() async {
@@ -76,7 +76,7 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         state.update { $0.executionOpportunity = .foregroundActive }
         await awaitEvent(started, "the pass after the foreground return")
         reconciliation.retire()
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
     }
 
     func testABuildThatDoesNotStartReleasesThePassAfterTheStartLimit() async {

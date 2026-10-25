@@ -47,7 +47,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
         state.update { $0.executionOpportunity = .foregroundActive }
         await awaitEvent(log.started, "the pass after the foreground return", file: file, line: line)
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
         let started = await log.count
         XCTAssertEqual(started, 1, "the foreground return starts exactly one pass", file: file, line: line)
         XCTAssertEqual(reconciliation.heldSnapshotCount, 1, "one check per runtime change", file: file, line: line)
@@ -62,7 +62,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         XCTAssertTrue(ran, "the pass starts at once")
         // A pass that waits would keep the task alive; retiring it lets the test end.
         if !ran { reconciliation.retire() }
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
         XCTAssertEqual(reconciliation.heldSnapshotCount, 0)
     }
 
@@ -80,7 +80,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
         state.update { $0.executionOpportunity = .foregroundActive }
         await awaitEvent(log.started, "the pass after the foreground return")
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
         let started = await log.count
         XCTAssertEqual(started, 1)
         XCTAssertEqual(reconciliation.heldSnapshotCount, 2, "no check without a runtime change")
@@ -109,7 +109,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         XCTAssertEqual(held, 1, "the pending pass waits for the foreground")
 
         state.update { $0.executionOpportunity = .foregroundActive }
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
         let started = await log.count
         XCTAssertEqual(started, 2)
     }
@@ -120,7 +120,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         await awaitHeldSnapshots(1, in: reconciliation)
         reconciliation.retire()
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
         let started = await log.count
         XCTAssertEqual(started, 0)
     }
@@ -136,9 +136,56 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
 
         state.update { $0.executionOpportunity = .foregroundActive }
         await awaitEvent(log.started, "the pass of the new library")
-        await reconciliation.waitForCurrentPass()
+        await joinCurrentPass(reconciliation)
         let libraries = await log.libraries
         XCTAssertEqual(libraries, ["second"])
+    }
+
+    func testAHeldPassResumesWhenTheAppReturnsToAnInactiveForeground() async {
+        let state = runtimeState(.backgroundPermitted)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let log = PassLog()
+        reconciliation.schedule(inventory(2)) { await log.start($0) }
+        await awaitHeldSnapshots(1, in: reconciliation)
+
+        // The app comes back under Control Center: in the foreground, but not active.
+        state.update { $0.executionOpportunity = .foregroundInactive }
+        let ran = await log.started.wait(limit: .seconds(20))
+        XCTAssertTrue(ran, "an inactive foreground runs the held pass")
+        if !ran { reconciliation.retire() }
+        await joinCurrentPass(reconciliation)
+    }
+
+    func testAPassThatEndsInTheBackgroundLeavesNoWaiterBehind() async {
+        let state = runtimeState(.foregroundActive)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let running = AsyncTestSignal()
+        let release = AsyncTestSignal()
+        reconciliation.schedule(inventory(2)) { _ in
+            running.fire()
+            _ = await release.wait(limit: Self.hangLimit)
+        }
+        await awaitEvent(running, "the pass")
+        // The join holds the running task; the app leaves the foreground before the pass ends without a follow-up.
+        let joined = AsyncTestSignal()
+        let entered = AsyncTestSignal()
+        let join = Task {
+            entered.fire()
+            await reconciliation.waitForCurrentPass()
+            joined.fire()
+        }
+        await awaitEvent(entered, "the join")
+        for _ in 0..<20 { await Task.yield() }
+        state.update { $0.executionOpportunity = .backgroundPermitted }
+        release.fire()
+
+        let ended = await joined.wait(limit: .seconds(20))
+        XCTAssertTrue(ended, "the task ends when no pass is owed")
+        XCTAssertEqual(reconciliation.heldSnapshotCount, 0, "no waiter holds the background")
+        if !ended {
+            reconciliation.retire()
+            join.cancel()
+        }
     }
 
     func testFrequentChangesPublishTheActiveSnapshotAndOnlyOneLatestFollowUp() async throws {
@@ -508,6 +555,23 @@ private actor PassLog {
 }
 
 extension XCTestCase {
+    /// Joins the current pass, bounded: a pass that never ends fails here and is retired instead of hanging the test.
+    func joinCurrentPass(
+        _ reconciliation: TimelineMetadataReconciliation, file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        let joined = AsyncTestSignal()
+        let join = Task {
+            await reconciliation.waitForCurrentPass()
+            joined.fire()
+        }
+        let ended = await joined.wait(limit: .seconds(20))
+        XCTAssertTrue(ended, "the pass did not end", file: file, line: line)
+        if !ended {
+            reconciliation.retire()
+            join.cancel()
+        }
+    }
+
     /// A pass that is held evaluates each runtime snapshot once; this waits for the expected number. It is bounded,
     /// so a pass that never waits fails here instead of hanging.
     func awaitHeldSnapshots(

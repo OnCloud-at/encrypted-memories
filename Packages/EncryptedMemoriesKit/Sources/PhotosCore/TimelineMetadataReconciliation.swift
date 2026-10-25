@@ -64,7 +64,10 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
             let runGeneration = generation
             task = Task(priority: .background) { [self] in
                 await startGate?.wait()
-                while await waitUntilAPassMayRun(), let pass = takeInput(generation: runGeneration) {
+                // Only an owed pass waits: after the last pass, the task ends instead of waiting untracked.
+                while hasOwedInput(generation: runGeneration), await waitUntilAPassMayRun(),
+                    let pass = takeInput(generation: runGeneration)
+                {
                     await operation(pass)
                     finish(pass)
                 }
@@ -109,6 +112,10 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
 
     private static func passMayRun(_ snapshot: LibraryRuntimeSnapshot) -> Bool {
         snapshot.executionOpportunity < .backgroundPermitted
+    }
+
+    private func hasOwedInput(generation: UInt64) -> Bool {
+        lock.withLock { !retired && self.generation == generation && !Task.isCancelled && input != nil }
     }
 
     private func takeInput(generation: UInt64) -> Pass? {
