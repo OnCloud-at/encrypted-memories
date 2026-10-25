@@ -549,7 +549,7 @@ struct MobileFailedBackupSheet: View {
                     ContentUnavailableView {
                         Label(L10n.string("backup.failed_sheet_unavailable"), systemImage: "exclamationmark.triangle")
                     } actions: {
-                        Button(L10n.string("action.retry")) {
+                        RetryButton(.prominent) {
                             guard let controller else { return }
                             problemList.beginReading()
                             readList(of: controller)
