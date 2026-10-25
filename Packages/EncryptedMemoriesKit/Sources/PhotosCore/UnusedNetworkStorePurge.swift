@@ -5,10 +5,12 @@ import OSLog
 /// wrote before it switched to an ephemeral session (#605). Nothing ever read them.
 ///
 /// The purge never lists either container. It removes only the literal names below, directly inside
-/// `Library/Caches/<bundle id>` and `Library/Cookies`. It refuses symbolic links at or below the
-/// trusted app-container boundary. Every other entry stays, including the Core ML compile cache and app caches.
+/// `Library/Caches/<bundle id>` and `Library/Cookies`. It refuses a symbolic link at the trusted app-container
+/// boundary or at a container or ancestor below it; a named entry that is a link is removed as a link.
+/// Every other entry stays, including the Core ML compile cache and app caches.
 /// On macOS it removes entries only inside the app's sandbox container, where `Library/Cookies` is the app's own.
-/// Outside every container it removes nothing and completes; a Library in another container is refused.
+/// An unsandboxed Library outside every container removes nothing and completes; a Library in another container,
+/// and a missing unsandboxed Library, are refused.
 public enum UnusedNetworkStorePurge {
     static let completedKey = "network.unusedStorePurged.v1"
     static let urlCacheEntryNames = ["Cache.db", "Cache.db-wal", "Cache.db-shm", "fsCachedData"]
@@ -52,7 +54,9 @@ public enum UnusedNetworkStorePurge {
     }
 
     /// Explicit sign-out verifies the named stores even after a completed startup purge.
-    /// A refused location or a failed verification cannot count as successful sign-out.
+    /// An unsandboxed macOS Library outside every container has no stores of the app's own; it completes
+    /// without removing or verifying anything. A refused location or a failed verification cannot count
+    /// as successful sign-out.
     @discardableResult
     public static func purgeForSignOut(defaults: UserDefaults = .standard, location: Location? = .current) -> Result? {
         purge(defaults: defaults, location: location, honorCompletedFlag: false)
@@ -92,7 +96,7 @@ public enum UnusedNetworkStorePurge {
         let ownContainer = isSandboxContainerLibrary(libraryDirectory, bundleIdentifier: bundleIdentifier)
         if requiresSandboxContainer && !ownContainer {
             // An unsandboxed macOS run shares these stores with other apps. None of them is the app's own.
-            guard isUnsandboxedLibrary(libraryDirectory) else { return nil }
+            guard isUnsandboxedLibrary(libraryDirectory, caches: cachesDirectory) else { return nil }
             defaults.set(true, forKey: completedKey)
             return Result(removed: [], failed: [])
         }
@@ -161,17 +165,37 @@ public enum UnusedNetworkStorePurge {
             && container.deletingLastPathComponent().lastPathComponent == "Containers"
     }
 
-    /// A macOS Library outside every sandbox container: neither the given path nor its physical location,
-    /// with every link resolved, contains a `Containers/<id>/Data` sequence. An unresolvable Library is refused.
-    static func isUnsandboxedLibrary(_ library: URL) -> Bool {
-        guard let resolved = realpath(library.path, nil) else { return false }
-        defer { free(resolved) }
-        return !containsContainerData(library.standardizedFileURL.pathComponents)
-            && !containsContainerData(URL(fileURLWithPath: String(cString: resolved)).pathComponents)
+    /// A macOS Library outside every sandbox container. Neither its written path nor its physical path,
+    /// with every link resolved, contains a `Containers/<id>/Data` sequence or a `Group Containers` component,
+    /// in any letter case. The physical Library must be a directory. Caches must be a directory, not a link,
+    /// directly inside it. Nothing below Caches or Cookies is examined, because this case removes nothing.
+    /// A missing or unresolvable Library or Caches is refused.
+    static func isUnsandboxedLibrary(_ library: URL, caches: URL) -> Bool {
+        guard let physicalLibrary = physicalPath(of: library),
+            // Stated explicitly, so the rule does not depend on the lstat error below a file.
+            (try? LocalPurgeItemState.read(at: physicalLibrary)) == .directory,
+            (try? LocalPurgeItemState.read(at: caches)) == .directory,
+            // Stated explicitly, so the rule does not depend on how a Caches entry that is no link resolves.
+            physicalPath(of: caches)?.deletingLastPathComponent().path == physicalLibrary.path
+        else { return false }
+        return !isInsideAnyContainer(library.standardizedFileURL.pathComponents)
+            && !isInsideAnyContainer(physicalLibrary.pathComponents)
     }
 
-    private static func containsContainerData(_ components: [String]) -> Bool {
-        components.indices.dropLast(2).contains { components[$0] == "Containers" && components[$0 + 2] == "Data" }
+    private static func physicalPath(of url: URL) -> URL? {
+        guard let resolved = realpath(url.path, nil) else { return nil }
+        defer { free(resolved) }
+        return URL(fileURLWithPath: String(cString: resolved))
+    }
+
+    private static func isInsideAnyContainer(_ components: [String]) -> Bool {
+        func named(_ component: String, _ name: String) -> Bool {
+            component.caseInsensitiveCompare(name) == .orderedSame
+        }
+        return components.contains { named($0, "Group Containers") }
+            || components.indices.dropLast(2).contains {
+                named(components[$0], "Containers") && named(components[$0 + 2], "Data")
+            }
     }
 
     /// Resolve aliases only above the admitted app-container boundary. Every component below it
