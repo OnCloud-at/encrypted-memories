@@ -160,6 +160,29 @@ public struct PendingSourceStatesRead: Sendable, Equatable {
     }
 }
 
+/// One source's latest handoff as read from the store. A readable nil is confirmed absence; `unreadable` means the
+/// query failed or the row did not decode.
+public enum PendingHandoffRead: Sendable, Equatable {
+    case unreadable
+    case readable(PendingHandoff?)
+
+    public var handoff: PendingHandoff? {
+        guard case .readable(let handoff) = self else { return nil }
+        return handoff
+    }
+}
+
+/// The actions that decoded, and whether the read was complete. An incomplete read can leave out owed actions.
+public struct PendingActionsRead: Sendable, Equatable {
+    public let actions: [PendingAction]
+    public let complete: Bool
+
+    public init(actions: [PendingAction], complete: Bool) {
+        self.actions = actions
+        self.complete = complete
+    }
+}
+
 /// The desired backup state of one source and the effects that are still due. A row is never deleted
 /// before its effects finish, so a crash or a failed request cannot lose a delete or a restore.
 public struct PendingSourceState: Sendable, Equatable {

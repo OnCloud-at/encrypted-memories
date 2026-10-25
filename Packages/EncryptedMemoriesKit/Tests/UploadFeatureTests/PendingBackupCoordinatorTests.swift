@@ -2378,6 +2378,210 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(effects.favorites, [remote], "after a complete read the action runs")
     }
 
+    // MARK: - Unreadable handoffs and actions (#770 part 2)
+
+    /// The read of the latest handoff of one source, as `runDueActions`, `scheduleActionTimer` and the delete of an
+    /// edit run it.
+    private static let latestHandoffRead = "ORDER BY created_at DESC, revision_us DESC LIMIT 1"
+
+    /// Runs one statement through a second SQLite connection and reports whether it changed exactly one row.
+    private func change(_ sql: String) -> Bool {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let db = handle else {
+            sqlite3_close(handle)
+            return false
+        }
+        defer { sqlite3_close(db) }
+        return sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK && sqlite3_changes(db) == 1
+    }
+
+    /// A coordinator whose first backoff waits for `retry`. It records only backoff waits (60 s to 30 min); every other
+    /// wait sleeps for an hour.
+    private func restartWithBackoffLog(_ delays: DelayLog, firstRetry retry: OpenGate) async {
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                guard duration >= .seconds(60), duration <= .seconds(1800) else {
+                    return try await Task.sleep(for: .seconds(3600))
+                }
+                delays.append(duration)
+                if delays.values.count == 1 { await retry.wait() } else { try await Task.sleep(for: .seconds(3600)) }
+            })
+        await coordinator.start()
+    }
+
+    private func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    /// The handoff of a pending photo is stored, but its read fails. The favorite neither waits for a handoff event
+    /// that never comes nor runs: it stays owed, unchanged, and the reconcile backoff tries again. A second request
+    /// meanwhile keeps the wait. Once the read succeeds, the favorite runs and the backoff ends.
+    func testAnActionRunsAfterItsHandoffCouldNotBeRead() async throws {
+        includedLater("k")
+        let remote = favoriteFixture("k")
+        let delays = DelayLog()
+        let retry = OpenGate()
+        await restartWithBackoffLog(delays, firstRetry: retry)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
+        try failure.install(on: store)
+        let uid = PhotoUID(localPending: .photoLibrary, identifier: "k")
+
+        _ = await coordinator.setFavorite([uid], favorite: true)
+        _ = await coordinator.setFavorite([uid], favorite: true)
+
+        try await waitUntil { !delays.values.isEmpty }
+        XCTAssertGreaterThan(failure.count, 0)
+        XCTAssertTrue(effects.favorites.isEmpty, "an unreadable handoff is no Proton photo to act on")
+        XCTAssertEqual(delays.values, [.seconds(60)], "one degraded wait; a second request does not double it")
+        let owed = store.actions().filter { $0.key == key("k") }
+        XCTAssertEqual(owed.count, 1, "the action is neither completed nor removed")
+        XCTAssertEqual(owed.first?.attempts, 0)
+        XCTAssertEqual(owed.first?.failed, false, "the action is not failed")
+        failure.remove(from: store)
+        retry.open()
+        try await waitUntil { !effects.favorites.isEmpty }
+        XCTAssertEqual(effects.favorites, [remote], "the retry reads the handoff and runs the owed action")
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+        XCTAssertEqual(delays.values, [.seconds(60)], "after every read succeeds, the backoff ends")
+    }
+
+    /// The handoff row does not decode. Its favorite is retried by the backoff, not left to an event.
+    func testAnActionWhoseHandoffDoesNotDecodeIsRetried() async throws {
+        includedLater("k")
+        let remote = favoriteFixture("k")
+        XCTAssertTrue(change("UPDATE handoff SET kind='broken' WHERE source_id='k';"))
+        let delays = DelayLog()
+        let retry = OpenGate()
+        await restartWithBackoffLog(delays, firstRetry: retry)
+
+        _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
+
+        try await waitUntil { !delays.values.isEmpty }
+        XCTAssertTrue(effects.favorites.isEmpty)
+        XCTAssertEqual(delays.values, [.seconds(60)], "an undecodable handoff is retried after a minute")
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='k';"))
+        retry.open()
+        try await waitUntil { !effects.favorites.isEmpty }
+        XCTAssertEqual(effects.favorites, [remote])
+    }
+
+    /// Counter-test: a source without any handoff still waits for its handoff event, without a timer or a backoff.
+    func testAnActionWithoutAHandoffStillWaitsForItsEvent() async throws {
+        includedLater("k")
+        let delays = DelayLog()
+        let retry = OpenGate()
+        await restartWithBackoffLog(delays, firstRetry: retry)
+
+        _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        XCTAssertTrue(delays.values.isEmpty, "a confirmed absent handoff starts no backoff")
+        XCTAssertTrue(effects.favorites.isEmpty)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-k")
+        recorder.recordHandoff(source: source("k"), revision: revision, remote: remote, kind: .uploaded)
+        try await waitUntil { !effects.favorites.isEmpty }
+        XCTAssertEqual(effects.favorites, [remote], "the handoff event starts the action")
+        retry.open()
+    }
+
+    /// Every read of the pending actions fails at start. The owed favorite is retried by the backoff; once the reads
+    /// succeed it runs, and the backoff ends.
+    func testAnActionRunsAfterTheActionListCouldNotBeRead() async throws {
+        includedLater("k")
+        let remote = favoriteFixture("k")
+        XCTAssertTrue(store.setFavoriteIntent(key("k"), favorite: true, at: date))
+        let failure = SourceListFailure(table: "pending_action", untilRemoved: true)
+        try failure.install(on: store)
+        let delays = DelayLog()
+        let retry = OpenGate()
+
+        await restartWithBackoffLog(delays, firstRetry: retry)
+
+        try await waitUntil { !delays.values.isEmpty }
+        XCTAssertTrue(failure.denied)
+        XCTAssertTrue(effects.favorites.isEmpty)
+        XCTAssertEqual(delays.values, [.seconds(60)], "an action list that cannot be read is retried after a minute")
+        failure.remove(from: store)
+        retry.open()
+        try await waitUntil { !effects.favorites.isEmpty }
+        XCTAssertEqual(effects.favorites, [remote])
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+        XCTAssertEqual(delays.values, [.seconds(60)], "after every read succeeds, the backoff ends")
+    }
+
+    /// One action row does not decode. A healthy action runs in the same pass, and the retries stay bounded.
+    func testAnUndecodableActionRowDoesNotHoldTheOthers() async throws {
+        includedLater("good")
+        includedLater("bad")
+        let remote = favoriteFixture("good")
+        _ = favoriteFixture("bad")
+        XCTAssertTrue(store.setFavoriteIntent(key("good"), favorite: true, at: date))
+        XCTAssertTrue(store.setFavoriteIntent(key("bad"), favorite: true, at: date))
+        XCTAssertTrue(change("UPDATE pending_action SET kind='broken' WHERE source_id='bad';"))
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                guard duration >= .seconds(1), duration <= .seconds(1800) else {
+                    return try await Task.sleep(for: .seconds(3600))
+                }
+                delays.append(duration)
+                if delays.values.count < 2 { return }
+                try await Task.sleep(for: .seconds(3600))
+            })
+
+        await coordinator.start()
+
+        try await waitUntil { delays.values.count >= 2 }
+        XCTAssertEqual(effects.favorites, [remote], "the healthy action runs in the same pass")
+        XCTAssertEqual(delays.values.prefix(2), [.seconds(60), .seconds(120)], "the retries back off")
+        XCTAssertFalse(delays.values.contains(.seconds(1)), "an undecodable action row never retries every second")
+    }
+
+    /// The delete of an edit cannot read the handoff that names its earlier upload. The journal could name another
+    /// photo, so nothing goes to the trash: the delete is stored, and the manifest keeps the earlier upload.
+    func testADeleteOfAnEditTrashesNothingWhenItsHandoffCannotBeRead() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        try await startPendingEditWithoutHandoff(identities: identities)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
+        try failure.install(on: store)
+
+        await coordinator.exclude([key("p").localUID])
+
+        failure.remove(from: store)
+        XCTAssertGreaterThan(failure.count, 0)
+        XCTAssertTrue(effects.trashed.isEmpty, "a photo chosen on an unreadable handoff is never trashed")
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.desired, .excluded, "the delete is stored")
+        XCTAssertNil(state.remote)
+        XCTAssertEqual(identities.record(for: source("p"))?.remoteLinkID, earlier.nodeID)
+    }
+
+    /// An album action whose handoff cannot be read is not sent, so a permanent failure of the album write can never
+    /// mark it failed.
+    func testAnActionWithAnUnreadableHandoffIsNeverFailed() async throws {
+        includedLater("k")
+        _ = favoriteFixture("k")
+        effects.albumResult = .permanentFailure
+        await restartIdle()
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead)
+        try failure.install(on: store)
+
+        _ = await coordinator.addToAlbum([PhotoUID(localPending: .photoLibrary, identifier: "k")], albumID: "album")
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        failure.remove(from: store)
+        let owed = store.actions().filter { $0.key == key("k") && $0.kind == .addToAlbum }
+        XCTAssertEqual(owed.count, 1)
+        XCTAssertEqual(owed.first?.failed, false, "an action with an unreadable handoff is not failed")
+        XCTAssertEqual(owed.first?.attempts, 0)
+    }
+
     private func setDesired(_ value: String, of id: String) throws {
         let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
         try Self.setDesired(value, of: id, at: url)
@@ -2444,11 +2648,17 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
     }
 
-    /// Interrupts every keyed read of a source state on the store's own connection, as a failing disk read would.
+    /// Interrupts every read whose SQL contains `fragment` on the store's own connection, as a failing disk read would.
+    /// The default is the keyed read of a source state.
     private final class KeyedReadFailure: @unchecked Sendable {
         private let lock = NSLock()
         private var interrupted = 0
+        private let fragment: String
         var count: Int { lock.withLock { interrupted } }
+
+        init(matching fragment: String = "FROM source_state WHERE source_kind=? AND source_id=?") {
+            self.fragment = fragment
+        }
 
         func install(on store: PendingBackupManifestStore) throws {
             let connection = try Self.connection(of: store)
@@ -2458,10 +2668,10 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                     { _, context, pointer, _ in
                         guard let context, let pointer else { return 0 }
                         let statement = OpaquePointer(pointer)
-                        guard let sql = sqlite3_sql(statement).map({ String(cString: $0) }),
-                            sql.contains("FROM source_state WHERE source_kind=? AND source_id=?")
-                        else { return 0 }
                         let failure = Unmanaged<KeyedReadFailure>.fromOpaque(context).takeUnretainedValue()
+                        guard let sql = sqlite3_sql(statement).map({ String(cString: $0) }),
+                            sql.contains(failure.fragment)
+                        else { return 0 }
                         failure.lock.withLock { failure.interrupted += 1 }
                         sqlite3_interrupt(sqlite3_db_handle(statement))
                         return 0
@@ -2481,11 +2691,19 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
     }
 
-    /// Denies the next full read of the source states on the store's own connection.
+    /// Denies the next read of `table` on the store's own connection, or every read until `remove` when `untilRemoved`.
+    /// The default is the next full read of the source states.
     private final class SourceListFailure: @unchecked Sendable {
         private let lock = NSLock()
         private var done = false
+        private let table: String
+        private let untilRemoved: Bool
         var denied: Bool { lock.withLock { done } }
+
+        init(table: String = "source_state", untilRemoved: Bool = false) {
+            self.table = table
+            self.untilRemoved = untilRemoved
+        }
 
         func install(on store: PendingBackupManifestStore) throws {
             let connection = try KeyedReadFailure.connection(of: store)
@@ -2493,11 +2711,11 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 _ = sqlite3_set_authorizer(
                     connection.database,
                     { context, action, table, _, _, _ in
-                        guard let context, action == SQLITE_READ, let table, String(cString: table) == "source_state"
-                        else { return SQLITE_OK }
+                        guard let context, action == SQLITE_READ, let table else { return SQLITE_OK }
                         let failure = Unmanaged<SourceListFailure>.fromOpaque(context).takeUnretainedValue()
+                        guard String(cString: table) == failure.table else { return SQLITE_OK }
                         return failure.lock.withLock {
-                            guard !failure.done else { return SQLITE_OK }
+                            guard !failure.done || failure.untilRemoved else { return SQLITE_OK }
                             failure.done = true
                             return SQLITE_DENY
                         }
