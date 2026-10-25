@@ -1123,12 +1123,6 @@ private struct AlbumPickerSheet: View {
     @State private var searchText = ""
     @State private var didLoad = false
 
-    private var filteredAlbums: [LocalAlbumSummary] {
-        let query = searchText.trimmingCharacters(in: .whitespaces)
-        guard !query.isEmpty else { return controller.availableAlbums }
-        return controller.availableAlbums.filter { $0.title.localizedCaseInsensitiveContains(query) }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
@@ -1141,26 +1135,27 @@ private struct AlbumPickerSheet: View {
 
             Divider()
 
-            if controller.isLoadingAlbums && !didLoad {
+            switch controller.pickerContent(matching: searchText, didLoad: didLoad) {
+            case .loading:
                 Spacer()
                 ProgressView()
                 Spacer()
-            } else if controller.accessState == .denied || controller.accessState == .restricted {
+            case .accessDenied:
                 Spacer()
                 Text("settings.photos_backup_denied_macos")
                     .font(.footnote)
                     .foregroundStyle(.orange)
                     .padding()
                 Spacer()
-            } else if filteredAlbums.isEmpty {
+            case .empty:
                 Spacer()
                 Text(L10n.string("settings.albumsync_picker_empty"))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .padding()
                 Spacer()
-            } else {
-                List(filteredAlbums) { album in
+            case .list(let albums):
+                List(albums) { album in
                     Toggle(isOn: draftBinding(album.id)) {
                         HStack {
                             Text(album.title)
