@@ -303,6 +303,7 @@ public actor ThumbnailFeedCore {
     }
 
     private nonisolated let cache: ThumbnailCache
+    private nonisolated let resourceCoordinator: LibraryResourceCoordinator
     private nonisolated let visibleAccessOwner = UUID()
     private nonisolated let visibleAccessLifetime = VisibleThumbnailLifetime()
     private nonisolated let loader: ThumbnailBatchLoader
@@ -538,9 +539,11 @@ public actor ThumbnailFeedCore {
         coverageStore: (any ThumbnailCoverageCheckpointStore)? = nil,
         diagnostics: PhotoDiagnostics = .shared,
         clock: @escaping @Sendable () -> Date = { Date() },
+        resourceCoordinator: LibraryResourceCoordinator = .shared,
         onDecoded: @escaping @Sendable (PhotoUID, DecodedThumbnail) -> Void = { _, _ in }
     ) {
         self.cache = cache
+        self.resourceCoordinator = resourceCoordinator
         self.loader = loader
         self.configuration = configuration
         self.coverageStore = coverageStore
@@ -2140,11 +2143,19 @@ public actor ThumbnailFeedCore {
         if !priority.isEmpty || (crawlRemains && crawlWakeTask == nil) { startWorkers() }
     }
 
-    /// The crawl waits while the device is nearly full, because the cache cannot keep what it downloads, and during
-    /// a background window of the app, which leaves the battery and the network to the backup. Visible photos still
-    /// load. Only iOS reports a background window.
+    /// The crawl waits while the device is nearly full, because the cache cannot keep what it downloads, and while the
+    /// app is suspended. Visible photos still load. In a background window of iOS it runs under the coordinator's
+    /// permit instead (`backgroundWindowPermit`).
     private nonisolated static func holdsCrawl(_ snapshot: LibraryRuntimeSnapshot) -> Bool {
-        snapshot.storagePressure == .critical || snapshot.executionOpportunity >= .backgroundPermitted
+        snapshot.storagePressure == .critical || snapshot.executionOpportunity == .suspended
+    }
+
+    /// In a background window every batch waits for the coordinator's single heavy permit, so a waiting backup item
+    /// goes first and batches run one at a time. Nil in the foreground, where the crawl runs as before, and when the
+    /// window ends during the wait.
+    private nonisolated func backgroundWindowPermit() async -> LibraryBackgroundWindowPermit? {
+        await LibraryBackgroundWindowPermit.acquire(
+            LibraryBackgroundWorkTuning.crawlBatch, coordinator: resourceCoordinator, runtimeState: cache.runtimeState)
     }
 
     private nonisolated func crawlIsHeld() -> Bool {
@@ -2181,6 +2192,10 @@ public actor ThumbnailFeedCore {
     private func worker(generation: UInt64) async {
         while !Task.isCancelled, generation == prefetchGeneration {
             guard ownerLeaseIsCurrent() else { return }
+            // The permit is the quantum: it ends with this batch, and the next batch asks again.
+            let windowPermit = await backgroundWindowPermit()
+            defer { windowPermit?.release() }
+            guard !Task.isCancelled, generation == prefetchGeneration else { return }
             let work = await takeBatch()
             // Every exit of this iteration gives the returned reservations back; the download path below also
             // releases them as soon as the load ends.

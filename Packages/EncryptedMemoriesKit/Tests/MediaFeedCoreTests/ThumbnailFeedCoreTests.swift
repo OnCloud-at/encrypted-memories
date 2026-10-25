@@ -3,11 +3,11 @@ import CryptoKit
 import Foundation
 import ImageIO
 import MediaDecodingCore
-import PhotosCore
 import Testing
 
 @testable import MediaByteCache
 @testable import MediaFeedCore
+@testable import PhotosCore
 
 private let feedCacheTestKey = SymmetricKey(size: .bits256)
 
@@ -545,21 +545,113 @@ private final class BlockingCoverageStore: ThumbnailCoverageCheckpointStore, @un
 
 /// The two conditions that hold the crawl.
 enum CrawlHold: String, CaseIterable, Sendable {
-    case backgroundWindow
+    case appSuspended
     case storageNearlyFull
 
     func begin(in state: LibraryRuntimeState) {
         switch self {
-        case .backgroundWindow: state.update { $0.executionOpportunity = .backgroundPermitted }
+        case .appSuspended: state.update { $0.executionOpportunity = .suspended }
         case .storageNearlyFull: state.update { $0.storagePressure = .critical }
         }
     }
 
     func end(in state: LibraryRuntimeState) {
         switch self {
-        case .backgroundWindow: state.update { $0.executionOpportunity = .foregroundActive }
+        case .appSuspended: state.update { $0.executionOpportunity = .foregroundActive }
         case .storageNearlyFull: state.update { $0.storagePressure = .normal }
         }
+    }
+}
+
+/// Records how many batches load at the same time.
+private actor ConcurrencyRecordingLoader: ThumbnailBatchLoader {
+    private let payload: Data
+    private var active = 0
+    private(set) var peakConcurrentLoads = 0
+    private(set) var loadedCount = 0
+
+    init(payload: Data) { self.payload = payload }
+
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        active += 1
+        peakConcurrentLoads = max(peakConcurrentLoads, active)
+        // Long enough for a second batch to start if nothing kept it out.
+        try? await Task.sleep(for: .milliseconds(100))
+        active -= 1
+        for uid in uids { onLoaded(uid, payload) }
+        loadedCount += uids.count
+        return .delivered
+    }
+}
+
+/// Delivers the first batch and downloads every later batch until it is cancelled.
+private actor FirstBatchThenHangingLoader: ThumbnailBatchLoader {
+    private let payload: Data
+    private(set) var requests: [PhotoUID] = []
+
+    init(payload: Data) { self.payload = payload }
+
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        let first = requests.isEmpty
+        requests.append(contentsOf: uids)
+        guard first else {
+            try? await Task.sleep(for: .seconds(300))
+            return .delivered
+        }
+        for uid in uids { onLoaded(uid, payload) }
+        return .delivered
+    }
+}
+
+/// The order of crawl batches and other work.
+private actor EventOrder {
+    private(set) var entries: [String] = []
+    func append(_ entry: String) { entries.append(entry) }
+}
+
+/// Opens once; waiters before and after the opening return.
+private actor OneShotGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+}
+
+/// Records each batch as "crawl <index>" before it loads; `beforeLoad` can hold a batch.
+private actor OrderRecordingLoader: ThumbnailBatchLoader {
+    private let payload: Data
+    private let events: EventOrder
+    private let beforeLoad: @Sendable (Int) async -> Void
+    private var batches = 0
+
+    init(payload: Data, events: EventOrder, beforeLoad: @escaping @Sendable (Int) async -> Void) {
+        self.payload = payload
+        self.events = events
+        self.beforeLoad = beforeLoad
+    }
+
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        let index = batches
+        batches += 1
+        await events.append("crawl \(index)")
+        await beforeLoad(index)
+        for uid in uids { onLoaded(uid, payload) }
+        return .delivered
     }
 }
 
@@ -992,39 +1084,32 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    @Test func crawlSleepsDuringABackgroundWindowAndResumesInTheForeground() async throws {
-        let crawled = [Self.uid("background-crawl-a"), Self.uid("background-crawl-b")]
-        let visible = Self.uid("background-crawl-visible")
-        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+    /// A coordinator of its own per test, which follows the runtime state as the app's shared one does.
+    private static func coordinator(_ state: LibraryRuntimeState) async -> LibraryResourceCoordinator {
+        let coordinator = LibraryResourceCoordinator(runtimeState: state)
+        await coordinator.startObserving()
+        return coordinator
+    }
+
+    @Test func crawlLoadsInABackgroundWindowOneBatchAtATimeUnderThePermit() async throws {
+        let crawled = (0..<3).map { Self.uid("window-crawl-\($0)") }
+        let loader = ConcurrencyRecordingLoader(payload: Self.pngData(width: 24, height: 24))
         // The backup window of iOS runs the app in the background.
         let runtimeState = LibraryRuntimeState(
             initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let coordinator = await Self.coordinator(runtimeState)
         let feed = ThumbnailFeedCore(
-            cache: Self.cache("background-crawl", runtimeState: runtimeState),
+            cache: Self.cache("window-crawl", runtimeState: runtimeState),
             loader: loader,
-            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1)
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1),
+            resourceCoordinator: coordinator
         )
         await feed.startPrefetch(crawled)
 
-        let stopped = Counter()
-        let waiter = Task {
-            try await feed.waitForPrefetchToFinish()
-            stopped.increment()
-        }
-        try await Self.waitUntil { stopped.value() == 1 }
-        #expect(stopped.value() == 1, "the crawl workers stop instead of polling")
-        waiter.cancel()
-        _ = try? await waiter.value
-        #expect(await feed.hasPendingThumbnailWork())
-        #expect(await loader.recordedPriorities.isEmpty, "the crawl loads nothing in the background")
-
-        _ = await feed.requestPriority(visible)
-        try await Self.waitUntil { await loader.recordedPriorities.count == 1 }
-        #expect(await loader.recordedPriorities == [.visibleNow], "a photo on screen still loads")
-
-        runtimeState.update { $0.executionOpportunity = .foregroundActive }
-        try await Self.waitUntil { await loader.recordedPriorities.count == 3 }
-        #expect(await loader.recordedPriorities == [.visibleNow, .idleLibraryCrawl, .idleLibraryCrawl])
+        try await Self.waitUntil { await loader.loadedCount == 3 }
+        #expect(await loader.loadedCount == 3, "the crawl loads in the background window")
+        #expect(await loader.peakConcurrentLoads == 1, "one batch at a time under the single permit")
+        #expect(await coordinator.metrics().permitsAcquired >= 3, "every batch took the permit")
         await feed.stopPrefetchAndWait()
     }
 
@@ -1057,39 +1142,142 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    @Test func aHeldCrawlStartsNoWorkersUntilTheAppReturnsToTheForeground() async throws {
-        let crawled = [Self.uid("held-crawl-a"), Self.uid("held-crawl-b")]
+    @Test func lowPowerModeInABackgroundWindowKeepsTheCrawlWaitingWithoutPolling() async throws {
+        let crawled = [Self.uid("low-power-crawl-a"), Self.uid("low-power-crawl-b")]
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(isLowPowerMode: true, executionOpportunity: .backgroundPermitted))
+        let coordinator = await Self.coordinator(runtimeState)
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("low-power-crawl", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1),
+            resourceCoordinator: coordinator
+        )
+        await feed.startPrefetch(crawled)
+        // The workers wait in the coordinator's queue instead of polling.
+        try await Self.waitUntil { await coordinator.waitingPermitCount == 2 }
+        #expect(await coordinator.waitingPermitCount == 2)
+        #expect(await loader.recordedPriorities.isEmpty, "Low Power Mode refuses the crawl in the background")
+
+        runtimeState.update { $0.isLowPowerMode = false }
+        try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
+        #expect(await loader.recordedPriorities == [.idleLibraryCrawl, .idleLibraryCrawl])
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func aBackupItemTakesThePermitBeforeTheNextCrawlBatch() async throws {
+        let crawled = [Self.uid("backup-first-a"), Self.uid("backup-first-b")]
+        let events = EventOrder()
+        let firstBatch = OneShotGate()
+        let loader = OrderRecordingLoader(payload: Self.pngData(width: 24, height: 24), events: events) { index in
+            if index == 0 { await firstBatch.wait() }
+        }
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let coordinator = await Self.coordinator(runtimeState)
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("backup-first", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1),
+            resourceCoordinator: coordinator
+        )
+        await feed.startPrefetch(crawled)
+        try await Self.waitUntil { await events.entries.count == 1 }
+        // The second worker already waits for the permit; the backup item arrives after it but outranks it.
+        try await Self.waitUntil { await coordinator.waitingPermitCount == 1 }
+        let backup = Task {
+            _ = try? await coordinator.withHeavyPermit(
+                LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+            ) { _ in await events.append("backup") }
+        }
+        try await Self.waitUntil { await coordinator.waitingPermitCount == 2 }
+        await firstBatch.open()
+        try await Self.waitUntil { await events.entries.count == 3 }
+        #expect(await events.entries == ["crawl 0", "backup", "crawl 1"])
+        await backup.value
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func theEndOfTheWindowEndsTheCrawlsWaitForThePermit() async throws {
+        let crawled = [Self.uid("window-end-a"), Self.uid("window-end-b")]
         let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
         let runtimeState = LibraryRuntimeState(
             initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let coordinator = await Self.coordinator(runtimeState)
+        let backupEntered = OneShotGate()
+        let backupRelease = OneShotGate()
+        let backup = Task {
+            _ = try? await coordinator.withHeavyPermit(
+                LibraryWorkRequest(workload: .backupHashing, intent: .automatic)
+            ) { _ in
+                await backupEntered.open()
+                await backupRelease.wait()
+            }
+        }
+        await backupEntered.wait()
         let feed = ThumbnailFeedCore(
-            cache: Self.cache("held-crawl", runtimeState: runtimeState),
+            cache: Self.cache("window-end", runtimeState: runtimeState),
             loader: loader,
-            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1)
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1),
+            resourceCoordinator: coordinator
         )
         await feed.startPrefetch(crawled)
-        let stopped = Counter()
-        let waiter = Task {
-            try await feed.waitForPrefetchToFinish()
-            stopped.increment()
-        }
-        try await Self.waitUntil { stopped.value() == 1 }
-        waiter.cancel()
-        _ = try? await waiter.value
-        let starts = await feed.workerStartCountForTesting()
+        try await Self.waitUntil { await coordinator.waitingPermitCount == 2 }
+        #expect(await coordinator.waitingPermitCount == 2, "both workers wait behind the backup item")
 
-        // Changes that do not end the background window leave the workers stopped instead of waking them.
-        runtimeState.update { $0.thermalLevel = .fair }
-        runtimeState.update { $0.thermalLevel = .nominal }
-        try await Task.sleep(for: .milliseconds(200))
-        #expect(await feed.workerStartCountForTesting() == starts, "the held crawl does not poll")
-        #expect(await loader.recordedPriorities.isEmpty)
-
+        // Back in the foreground the crawl runs as before, while the backup item still holds the permit.
         runtimeState.update { $0.executionOpportunity = .foregroundActive }
         try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
         #expect(await loader.recordedPriorities.count == 2)
-        #expect(await feed.workerStartCountForTesting() == starts + 1, "returning to the foreground starts them once")
+        try await Self.waitUntil { await coordinator.waitingPermitCount == 0 }
+        #expect(await coordinator.waitingPermitCount == 0, "the coordinator keeps no waiter behind")
+        await backupRelease.open()
+        await backup.value
         await feed.stopPrefetchAndWait()
+    }
+
+    @Test func aCrawlStoppedDuringABatchKeepsItsSavedPhotosAndLoadsOnlyTheRest() async throws {
+        let saved = Self.uid("killed-crawl-saved")
+        let unsaved = Self.uid("killed-crawl-unsaved")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EncryptedMemoriesKit-killed-crawl-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let namespace = "killed-crawl-\(UUID().uuidString)"
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        func cache() -> ThumbnailCache {
+            let cache = ThumbnailCache(namespace: namespace, rootDirectory: root, runtimeState: runtimeState)
+            cache.configure(accountUID: "acct-A", key: feedCacheTestKey)
+            return cache
+        }
+
+        // The first process saves one photo and is ended while the next batch still downloads.
+        let first = FirstBatchThenHangingLoader(payload: Self.pngData(width: 24, height: 24))
+        let firstFeed = ThumbnailFeedCore(
+            cache: cache(), loader: first,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+            resourceCoordinator: await Self.coordinator(runtimeState)
+        )
+        await firstFeed.startPrefetch([saved, unsaved])
+        try await Self.waitUntil { await first.requests == [saved, unsaved] }
+        #expect(await first.requests == [saved, unsaved], "the second batch was downloading")
+        await firstFeed.stopPrefetchAndWait()
+
+        // The next process opens the same cache: the saved photo is whole, only the other photo loads.
+        let next = RecordingLoader(payloads: [unsaved: Self.pngData(width: 24, height: 24)])
+        let nextFeed = ThumbnailFeedCore(
+            cache: cache(), loader: next,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+            resourceCoordinator: await Self.coordinator(runtimeState)
+        )
+        await nextFeed.startPrefetch([saved, unsaved])
+        try await Self.waitUntil { await next.requestCount() == 1 }
+        try await Self.waitUntil { await nextFeed.prefetchStatus().currentQueueLength == 0 }
+        #expect(await next.requestOrder() == [unsaved], "the saved photo is not downloaded again")
+        #expect(await nextFeed.prefetchStatus().diskHit >= 1, "the saved photo is read from the cache")
+        await nextFeed.stopPrefetchAndWait()
     }
 
     #if DEBUG
@@ -1131,6 +1319,26 @@ struct ThumbnailFeedCoreTests {
             await feed.stopPrefetchAndWait()
         }
     #endif
+
+    @Test(arguments: [LibraryExecutionOpportunity.foregroundActive, .foregroundInactive])
+    func aForegroundCrawlTakesNoPermit(_ opportunity: LibraryExecutionOpportunity) async throws {
+        let crawled = [Self.uid("foreground-crawl-a"), Self.uid("foreground-crawl-b")]
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let runtimeState = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: opportunity))
+        let coordinator = await Self.coordinator(runtimeState)
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("foreground-crawl", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1),
+            resourceCoordinator: coordinator
+        )
+        await feed.startPrefetch(crawled)
+
+        try await Self.waitUntil { await loader.recordedPriorities.count == 2 }
+        #expect(await loader.recordedPriorities == [.idleLibraryCrawl, .idleLibraryCrawl])
+        #expect(await coordinator.metrics().permitsAcquired == 0, "the foreground crawl runs as before")
+        await feed.stopPrefetchAndWait()
+    }
 
     @Test func crawlRunsWhileTheAppIsInTheForegroundButInactive() async throws {
         // A Mac app behind another window, or an iPhone app under Control Center, is not in a background window.
