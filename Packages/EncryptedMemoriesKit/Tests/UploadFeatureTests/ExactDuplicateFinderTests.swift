@@ -1151,6 +1151,61 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(violations, [])
     }
 
+    func testAnAttachmentToAnEarlierGroupDuringALaterGroupsCopyKeepsThatSource() async throws {
+        let (earlier, later, results) = try await twoGroupCopyWithHeldLaterUpload { earlier in
+            _ = try earlier.remote.seed(Data("attached meanwhile".utf8), under: earlier.source, in: self.directory)
+        }
+
+        XCTAssertEqual(
+            try results[0].get(),
+            .merged(kept: earlier.kept, trashed: [], keptDuplicates: [earlier.source: .copyFailed]))
+        XCTAssertEqual(state(of: earlier.source), .active)
+        XCTAssertEqual(state(of: earlier.related), .active)
+        XCTAssertEqual(try results[1].get(), .merged(kept: later.kept, trashed: [later.source], keptDuplicates: [:]))
+        XCTAssertEqual(violations, [])
+    }
+
+    func testTwoGroupsThatStayUnchangedDuringALaterGroupsCopyAreBothTrashed() async throws {
+        let (earlier, later, results) = try await twoGroupCopyWithHeldLaterUpload { _ in }
+
+        XCTAssertEqual(
+            try results[0].get(), .merged(kept: earlier.kept, trashed: [earlier.source], keptDuplicates: [:]))
+        XCTAssertEqual(try results[1].get(), .merged(kept: later.kept, trashed: [later.source], keptDuplicates: [:]))
+        XCTAssertEqual(violations, [])
+    }
+
+    /// Two groups in one batch, each with a source whose related file the kept photo lacks. The upload of the later
+    /// group waits until `meanwhile` ran.
+    private func twoGroupCopyWithHeldLaterUpload(
+        meanwhile: (CopySetup) throws -> Void
+    ) async throws -> (
+        earlier: CopySetup, later: CopySetup, results: [Result<ExactDuplicateMergeOutcome, any Error>]
+    ) {
+        let earlier = try copyingScenario(downloads: 2, uploads: 2)
+        let laterKept = server.seedLink(digest: digest("other main"))
+        let laterSource = server.seedLink(digest: digest("other main"))
+        let laterBytes = Data("later original".utf8)
+        let laterRelated = try earlier.remote.seed(laterBytes, under: laterSource, in: directory)
+        let later: CopySetup = (laterKept, laterSource, laterRelated, earlier.remote)
+        indexServer()
+        let laterDigest = try earlier.remote.digest(of: laterBytes, in: directory)
+        let gate = FinderGate()
+        defer { gate.open() }
+        earlier.remote.beforeUpload = { request in
+            if request.expectedSHA1 == laterDigest { await gate.pass() }
+        }
+        let groups = try await finder.duplicateGroups().groups
+        let earlierGroup = try XCTUnwrap(groups.first { $0.members.contains(earlier.kept) })
+        let laterGroup = try XCTUnwrap(groups.first { $0.members.contains(laterKept) })
+        let requests = chosen([(earlierGroup, earlier.kept), (laterGroup, laterKept)])
+        let copying = copyingFinder(earlier.remote)
+        let merging = Task { await copying.merge(requests) }
+        await gate.waitForArrival()
+        try meanwhile(earlier)
+        gate.open()
+        return (earlier, later, await merging.value)
+    }
+
     private typealias CopySetup = (kept: PhotoUID, source: PhotoUID, related: PhotoUID, remote: CopyingDuplicateRemote)
 
     /// Two sources own different related files. The second upload waits until `meanwhile` ran.
