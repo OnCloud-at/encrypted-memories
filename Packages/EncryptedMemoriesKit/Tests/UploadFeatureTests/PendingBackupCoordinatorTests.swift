@@ -49,6 +49,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         sourceKind: UploadSourceIdentity.Kind = .photoLibraryAsset,
         membershipInterval: Duration = .zero,
         libraryChangeDelay: Duration = .zero,
+        unreadableRetryDelay: Duration = .seconds(60),
         unreadableRetryLimit: Duration = .seconds(30 * 60),
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) -> PendingBackupCoordinator {
@@ -68,6 +69,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 checkmarkDuration: checkmarkDuration,
                 uncheckedAdmissionLimit: uncheckedAdmissionLimit,
                 libraryChangeDelay: libraryChangeDelay,
+                unreadableRetryDelay: unreadableRetryDelay,
                 unreadableRetryLimit: unreadableRetryLimit
             ),
             now: { [date] in date },
@@ -2150,6 +2152,31 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let deadline = ContinuousClock.now + .seconds(5)
         while delays.values.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertEqual(delays.values.first, .seconds(30))
+    }
+
+    /// The doubling stops at the limit. Near the largest Duration, a doubled wait would overflow; the wait stays at the
+    /// limit instead.
+    func testABackoffNearTheLargestDurationStaysAtTheLimit() async throws {
+        excludedLater("bad")
+        XCTAssertTrue(
+            Self.setColumns("desired='invalid', next_attempt_at=\(date.timeIntervalSince1970)", of: "bad", at: storeURL)
+        )
+        // Above half of the largest Duration, so that twice this limit overflows.
+        let limit = Duration.seconds(Int64.max) * 10
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5), unreadableRetryDelay: limit, unreadableRetryLimit: limit,
+            sleep: { duration in
+                guard duration >= .seconds(60) else { return try await Task.sleep(for: .seconds(3600)) }
+                delays.append(duration)
+                if delays.values.count < 3 { return }
+                try await Task.sleep(for: .seconds(3600))
+            })
+        await coordinator.start()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.count < 3, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(delays.values.prefix(3), [limit, limit, limit])
     }
 
     /// A readable row whose retry date already passed does not shorten the wait to a second.
