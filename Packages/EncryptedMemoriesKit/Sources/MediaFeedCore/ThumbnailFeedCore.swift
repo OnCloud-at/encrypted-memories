@@ -2143,6 +2143,8 @@ public actor ThumbnailFeedCore {
         // A wake that ran before this stop found the workers still running, so the remaining crawl restarts here: the
         // rest of the library, or photos withheld for a retry.
         let crawlRemains = sequentialIndex < sequential.count || (prefetchEnabled && !withheldRetry.isEmpty)
+        // Workers of a session that ended would stop at once again; the new session's feed starts its own.
+        guard ownerLeaseIsCurrent() else { return }
         if !priority.isEmpty || (crawlRemains && crawlWakeTask == nil) { startWorkers() }
     }
 
@@ -2221,7 +2223,7 @@ public actor ThumbnailFeedCore {
             guard ownerLeaseIsCurrent() else { return }
             // In a background window a crawl batch runs only under the coordinator's single heavy permit, so a
             // waiting backup item goes first; the permit ends with this batch. A photo on screen loads as before.
-            let windowPermit = priority.isEmpty && isInBackgroundWindow() ? await backgroundWindowPermit() : nil
+            var windowPermit = priority.isEmpty && isInBackgroundWindow() ? await backgroundWindowPermit() : nil
             defer { windowPermit?.release() }
             guard !Task.isCancelled, generation == prefetchGeneration else { return }
             #if DEBUG
@@ -2251,6 +2253,8 @@ public actor ThumbnailFeedCore {
                 if priority.isEmpty && sequentialIndex >= sequential.count
                     && (withheldRetry.isEmpty || !prefetchEnabled)
                 {
+                    // Coverage work is crawl work: in a window it runs only under a permit. The next round asks for one.
+                    guard crawlAllowed else { continue }
                     if diskProbeBatchesInFlight > 0 {
                         windowPermit?.release()
                         try? await Task.sleep(for: .milliseconds(10))
@@ -2308,6 +2312,10 @@ public actor ThumbnailFeedCore {
                 try? await Task.sleep(for: .milliseconds(150))
                 continue
             }
+            // A batch that waits for a download slot gives the permit back meanwhile, so a backup item never waits
+            // behind a slot that a timed-out loader may hold for long; the batch asks for the permit again first.
+            let heldPermitForSlot = windowPermit != nil && activeDownloaders + timedOutLoaders >= targetConcurrency
+            if heldPermitForSlot { windowPermit?.release() }
             while activeDownloaders + timedOutLoaders >= targetConcurrency, !Task.isCancelled {
                 #if DEBUG
                     downloadSlotWaitHookForTesting?()
@@ -2315,6 +2323,12 @@ public actor ThumbnailFeedCore {
                 try? await Task.sleep(for: .milliseconds(60))
             }
             if Task.isCancelled { return }
+            if heldPermitForSlot {
+                windowPermit = await backgroundWindowPermit()
+                // The window ended during the wait: a foreground app goes on as before; otherwise this batch's photos
+                // wait for the next round of the crawl, and the end-of-crawl check finds them.
+                if windowPermit == nil, isInBackgroundWindow() || crawlIsHeld() { continue }
+            }
             // Nothing is counted before the lease check: a worker that stops here has no other way to give the
             // download slot and the in-flight items back.
             guard ownerLeaseIsCurrent() else { return }
