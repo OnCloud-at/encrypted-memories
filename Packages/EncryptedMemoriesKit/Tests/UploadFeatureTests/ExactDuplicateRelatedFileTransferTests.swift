@@ -253,7 +253,11 @@ final class ExactDuplicateRelatedFileTransferTests: XCTestCase {
                     to: destination, allowsExpensiveNetwork: false, source: { source },
                     stream: { _ in await probe.hit() })
                 XCTFail("A download without enough known capacity must fail")
-            } catch { XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .copyFailed(.capacity)) }
+            } catch {
+                XCTAssertEqual(
+                    error as? ExactDuplicateRelatedFileTransferError,
+                    .copyFailed(free == nil ? .capacityUnknown : .capacity))
+            }
             let calls = await probe.count
             XCTAssertEqual(calls, 0)
             XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
