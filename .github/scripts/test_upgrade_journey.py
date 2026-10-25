@@ -1056,6 +1056,51 @@ else:
                         request.close()
             self.assertEqual(results, [200] * 40)
 
+    def test_runner_sampler_line_reports_swap_every_minute_and_the_trees_every_fifth(self):
+        with patch.object(run_journey, 'free_gib', return_value=20.0), \
+                patch.object(run_journey, 'swap_used_mib', return_value=12.0), \
+                patch.object(run_journey, 'tree_gib', side_effect=lambda tree: 1.5):
+            trees = run_journey.runner_trees(Path('/evidence/runner-load.log'), Path('/root'))
+            first = run_journey.runner_sample_line(0, trees)
+            second = run_journey.runner_sample_line(1, trees)
+            fifth = run_journey.runner_sample_line(5, trees)
+        self.assertIn('free 20.0 GiB swap used 12 MiB', first)
+        for name in ('evidence', 'scratch', 'products', 'simulators', 'derived-data',
+                     'tmp', 'caches', 'logs', 'diagnostics'):
+            self.assertIn(f' {name} 1.5', first)
+        self.assertNotIn('|', second)
+        self.assertIn('swap used 12 MiB', second)
+        self.assertIn(' tmp 1.5', fifth)
+        self.assertEqual(trees['tmp'], Path(tempfile.gettempdir()))
+
+    def test_swap_usage_reads_megabytes_and_gigabytes_and_fails_open(self):
+        def result(text):
+            return subprocess.CompletedProcess(['sysctl'], 0, stdout=text)
+        with patch.object(run_journey.subprocess, 'run',
+                          return_value=result('vm.swapusage: total = 2048.00M  used = 1.25M  free = 2046.75M  (encrypted)')):
+            self.assertEqual(run_journey.swap_used_mib(), 1.25)
+        with patch.object(run_journey.subprocess, 'run',
+                          return_value=result('vm.swapusage: total = 8.00G  used = 2.00G  free = 6.00G  (encrypted)')):
+            self.assertEqual(run_journey.swap_used_mib(), 2048.0)
+        with patch.object(run_journey.subprocess, 'run', return_value=result('')):
+            self.assertTrue(run_journey.swap_used_mib() != run_journey.swap_used_mib())  # NaN
+        with patch.object(run_journey.subprocess, 'run', side_effect=FileNotFoundError()):
+            self.assertTrue(run_journey.swap_used_mib() != run_journey.swap_used_mib())
+
+    @unittest.skipIf(os.geteuid() == 0, 'root can read every directory')
+    def test_a_tree_that_the_user_cannot_read_is_reported_as_unknown_not_empty(self):
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root) / 'diagnostics'
+            tree.mkdir()
+            (tree / 'file').write_bytes(b'x' * 4096)
+            tree.chmod(0)
+            try:
+                size = run_journey.tree_gib(tree)
+            finally:
+                tree.chmod(0o700)
+            self.assertTrue(size != size)  # NaN
+            self.assertGreater(run_journey.tree_gib(tree), 0.0)
+
     def test_fixture_server_binds_without_a_name_lookup(self):
         # The loopback server needs no host name. A reverse lookup of its address can reach mDNS on macOS and show the
         # local network prompt over the journey.
@@ -1065,9 +1110,10 @@ else:
         with tempfile.TemporaryDirectory() as root:
             with patch('socket.getfqdn', side_effect=refuse), patch('socket.gethostbyaddr', side_effect=refuse):
                 server = FixtureServer(Path(root), 'backup.claimed')
-            self.assertEqual(server.http.server_name, '127.0.0.1')
             with server:
-                self.assertEqual(json.load(urlopen(server.url + '/links')), [])
+                self.assertEqual(server.http.server_name, '127.0.0.1')
+                with urlopen(server.url + '/links', timeout=10) as response:
+                    self.assertEqual(json.load(response), [])
 
     def test_upload_ledger_survives_app_replacement_and_exposes_duplicates(self):
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'backup.claimed') as server:

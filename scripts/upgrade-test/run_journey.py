@@ -139,20 +139,42 @@ def tree_gib(path):
         return float('nan')
 
 
-def sample_runner(path, root, interval=60):
-    # Load and free disk every minute, and the large trees every fifth minute, show what a slow or failed case met.
-    # A hosted iOS shard ran out of disk (rehearsal 38181793360) without any record of what filled it.
+def swap_used_mib():
+    # `sysctl vm.swapusage` prints "vm.swapusage: total = 2048.00M  used = 1.25M  free = 2046.75M  (encrypted)".
+    try:
+        result = subprocess.run(['sysctl', 'vm.swapusage'], capture_output=True, text=True, timeout=10)
+        used, unit = re.search(r'used = ([0-9.]+)([MG])', result.stdout).groups()
+        return float(used) * (1024 if unit == 'G' else 1)
+    except (subprocess.TimeoutExpired, OSError, AttributeError, ValueError):
+        return float('nan')
+
+
+def runner_trees(path, root):
     home = Path.home()
-    trees = {'evidence': path.parent, 'scratch': root / 'scratch', 'products': root / 'products',
-             'simulators': home / 'Library/Developer/CoreSimulator/Devices',
-             'simulator-logs': home / 'Library/Logs/CoreSimulator',
-             'derived-data': home / 'Library/Developer/Xcode/DerivedData'}
+    return {'evidence': path.parent, 'scratch': root / 'scratch', 'products': root / 'products',
+            'simulators': home / 'Library/Developer/CoreSimulator/Devices',
+            'simulator-logs': home / 'Library/Logs/CoreSimulator',
+            'derived-data': home / 'Library/Developer/Xcode/DerivedData',
+            # The free disk of a hosted iOS shard fell by about 0.9 GiB per case outside the trees above (#498).
+            'tmp': Path(tempfile.gettempdir()), 'caches': home / 'Library/Caches', 'logs': home / 'Library/Logs',
+            'diagnostics': Path('/var/db/diagnostics')}
+
+
+def runner_sample_line(count, trees):
+    line = (time.strftime('%H:%M:%S') + ' load ' + ' '.join(f'{value:.2f}' for value in os.getloadavg())
+            + f' free {free_gib():.1f} GiB swap used {swap_used_mib():.0f} MiB')
+    if count % 5 == 0:
+        line += ' |' + ''.join(f' {name} {tree_gib(tree):.1f}' for name, tree in trees.items()) + ' GiB'
+    return line
+
+
+def sample_runner(path, root, interval=60):
+    # Load, free disk and swap every minute, and the large trees every fifth minute, show what a slow or failed case
+    # met. A hosted iOS shard ran out of disk (rehearsal 38181793360) without any record of what filled it.
+    trees = runner_trees(path, root)
     def sample():
         for count in range(sys.maxsize):
-            line = (time.strftime('%H:%M:%S') + ' load ' + ' '.join(f'{value:.2f}' for value in os.getloadavg())
-                    + f' free {free_gib():.1f} GiB')
-            if count % 5 == 0:
-                line += ' |' + ''.join(f' {name} {tree_gib(tree):.1f}' for name, tree in trees.items()) + ' GiB'
+            line = runner_sample_line(count, trees)
             try:
                 with open(path, 'a') as log:
                     log.write(line + '\n')
