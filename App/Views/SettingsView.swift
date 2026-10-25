@@ -871,27 +871,12 @@ private struct MacFailedBackupSheet: View {
             Divider()
 
             switch presentation {
-            case .loading:
-                ProgressView(L10n.string("loading.content"))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .accessibilityIdentifier("backup.failedSheet.loading")
-            case .unavailable:
-                ContentUnavailableView {
-                    Label(L10n.string("backup.failed_sheet_unavailable"), systemImage: "exclamationmark.triangle")
-                } actions: {
-                    RetryButton(.prominent) {
-                        guard let controller else { return }
-                        problemList.beginReading()
-                        readList(of: controller)
-                    }
-                    .accessibilityIdentifier("backup.failedSheet.retry")
+            case .loading, .unavailable, .empty:
+                BackupProblemListStateView(presentation) {
+                    guard let controller else { return }
+                    problemList.beginReading()
+                    readList(of: controller)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .empty:
-                ContentUnavailableView(
-                    L10n.string("backup.failed_sheet_empty"),
-                    systemImage: "checkmark.shield"
-                )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .list:
                 List {
