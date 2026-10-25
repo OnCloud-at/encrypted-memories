@@ -1370,8 +1370,9 @@ public actor PendingBackupCoordinator {
         guard !dueStatesIncomplete || dueDecodedKeys.contains(key) else { return false }
         // After an incomplete load, a last known state of a source that this load did not decode may be stale.
         guard !sourceStatesIncomplete || loadDecodedKeys.contains(key) else { return false }
-        // A source without a state here was decoded as absent: by a complete load, or by a fresh read since.
-        guard let state = sourceStates[key] else { return true }
+        // A source without a state here was read as absent. A keyed read cannot find a row whose key no longer
+        // decodes, so absence counts only while no load and no due read of the current states is incomplete.
+        guard let state = sourceStates[key] else { return !sourceStatesIncomplete && !dueStatesIncomplete }
         return state.desired == .included && !state.needsRemoteRestore
     }
 
