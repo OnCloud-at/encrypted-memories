@@ -364,7 +364,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     // the coordinator yet. The earlier upload that the coordinator sends for an edit goes first: the
                     // completed trash of that photo moves on to the latest handoff, see `completeEffect`.
                     let durable = request.revision.flatMap { handoffLocked(request.key, revision: $0)?.remote }
-                    let remote = request.remote ?? durable ?? previous?.remote
+                    // A delete that could not tell its photo names none: the photo that the state still knows can be
+                    // another one, and it never goes to the trash on an unknown.
+                    let remote = request.remote ?? durable ?? (request.remoteUnknown ? nil : previous?.remote)
                     // A photo that this path trashed stays trashed, unless a restore of it may already have
                     // happened. Otherwise a known remote photo must go to the Proton trash.
                     let alreadyTrashed =

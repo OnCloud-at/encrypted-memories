@@ -255,17 +255,22 @@ public struct PendingExclusionRequest: Sendable, Equatable {
     /// The revision the person deleted. The store also looks up a durable handoff of this revision, so a
     /// commit whose event has not reached the coordinator yet still goes to the trash.
     public let revision: UploadBackupRevision?
+    /// The coordinator could not tell which Proton photo the delete covers. The store then keeps no photo that the
+    /// stored state still names; only a durable commit of the deleted revision goes to the trash.
+    public let remoteUnknown: Bool
 
     public init(
         key: PendingSourceKey,
         presentation: PendingPresentationMetadata?,
         remote: PhotoUID?,
-        revision: UploadBackupRevision? = nil
+        revision: UploadBackupRevision? = nil,
+        remoteUnknown: Bool = false
     ) {
         self.key = key
         self.presentation = presentation
         self.remote = remote
         self.revision = revision
+        self.remoteUnknown = remoteUnknown
     }
 }
 
