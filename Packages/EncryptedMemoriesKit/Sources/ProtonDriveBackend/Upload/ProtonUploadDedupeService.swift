@@ -429,6 +429,15 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         await progress(.init(phase: .ready))
     }
 
+    /// The backup ended its pass without preparing the index, for a reason that lasts until the person acts. The
+    /// timeline metadata pass then need not wait for a first full build, unless a build runs or a preparation is about
+    /// to start one.
+    func remoteIndexPreparationNotNeeded() async {
+        guard remoteIndexProgressHandlers.isEmpty, remoteContentIndexTask == nil else { return }
+        metadataPassWaitsForBuild = false
+        firstBuildGate?.open()
+    }
+
     func findRemoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {

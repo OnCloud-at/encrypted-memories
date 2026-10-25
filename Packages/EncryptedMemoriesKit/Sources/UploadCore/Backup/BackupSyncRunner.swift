@@ -367,7 +367,14 @@ public actor BackupSyncRunner {
         emitProgress()
 
         if mode == .eligibleOnly {
-            guard let nextRunnableDate = queue.nextRunnableDate(), nextRunnableDate <= now() else {
+            guard let nextRunnableDate = queue.nextRunnableDate() else {
+                // Nothing waits for an upload until the library changes, so no index build follows from this pass.
+                // A photo that is due later or a wait for Wi-Fi can still start one soon.
+                progress.isRunning = false
+                await identityResolver.remoteIndexPreparationNotNeeded()
+                return progress
+            }
+            guard nextRunnableDate <= now() else {
                 progress.isRunning = false
                 return progress
             }

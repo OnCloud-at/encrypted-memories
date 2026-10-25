@@ -250,6 +250,130 @@ extension DriveSessionStubSuite {
             pass.cancel()
         }
 
+        /// The first launch after the update holds the timeline order pass for the first full index build. A backup
+        /// that ends its pass without preparing the index releases it, but only while no build runs or prepares.
+        private func gateFixture() throws -> (
+            directory: URL, content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore,
+            gate: TimelineMetadataStartGate, released: LockedOutcome, pass: Task<Void, Never>
+        ) {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60))
+            let released = LockedOutcome()
+            let pass = Task {
+                await gate.wait()
+                released.set(true)
+            }
+            return (directory, content, lineage, gate, released, pass)
+        }
+
+        private func waitUntilReleased(_ released: LockedOutcome) async throws {
+            let clock = ContinuousClock()
+            let start = clock.now
+            while released.value == nil, clock.now - start < .seconds(10) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        @Test func aPassWithoutAnIndexBuildReleasesTheHeldTimelinePass() async throws {
+            let fixture = try gateFixture()
+            defer {
+                fixture.pass.cancel()
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            StubURLProtocol.reset()
+            let service = makeService(content: fixture.content, lineage: fixture.lineage, firstBuildGate: fixture.gate)
+            try await Task.sleep(for: .milliseconds(100))
+            #expect(fixture.released.value == nil, "the launch that created the lineage index holds the pass")
+
+            await service.remoteIndexPreparationNotNeeded()
+            try await waitUntilReleased(fixture.released)
+            #expect(fixture.released.value == true, "no build comes, so the pass starts")
+        }
+
+        @Test func aRunningBuildKeepsTheTimelinePassHeldAfterAPassWithoutABuild() async throws {
+            let fixture = try gateFixture()
+            defer {
+                fixture.pass.cancel()
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let service = makeService(content: fixture.content, lineage: fixture.lineage, firstBuildGate: fixture.gate)
+            func listings() -> Int {
+                StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count
+            }
+            let preparation = Task { try await service.prepareRemoteIndex { _ in } }
+            let clock = ContinuousClock()
+            let begin = clock.now
+            while listings() == 0, clock.now - begin < .seconds(10) { try await Task.sleep(for: .milliseconds(10)) }
+            #expect(listings() == 1, "the build reached its library listing")
+            // The backup pass stops waiting; the build keeps running.
+            preparation.cancel()
+            _ = await preparation.result
+
+            await service.remoteIndexPreparationNotNeeded()
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(fixture.released.value == nil, "a running build keeps the pass held")
+
+            await service.invalidateCachedRemoteState()
+            try await waitUntilReleased(fixture.released)
+            #expect(fixture.released.value == true, "the end of the build releases the pass")
+            await service.shutdown()
+        }
+
+        @Test func aPreparationThatHasNotStartedItsBuildKeepsTheTimelinePassHeld() async throws {
+            let fixture = try gateFixture()
+            defer {
+                fixture.pass.cancel()
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.hang("GET /drive/volumes/vol1/photos")
+            let service = makeService(content: fixture.content, lineage: fixture.lineage, firstBuildGate: fixture.gate)
+            let holds = HandlerGate()
+            let reached = LockedOutcome()
+            let calls = LockedCount()
+            // The preparation waits in its first progress report, before it starts the build.
+            let preparation = Task {
+                try await service.prepareRemoteIndex { _ in
+                    if calls.next() == 1 {
+                        reached.set(true)
+                        await holds.wait()
+                    }
+                }
+            }
+            try await waitUntilReleased(reached)
+            #expect(reached.value == true, "the preparation waits before its build")
+
+            await service.remoteIndexPreparationNotNeeded()
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(fixture.released.value == nil, "a preparation that is about to build keeps the pass held")
+
+            preparation.cancel()
+            await holds.open()
+            _ = await preparation.result
+            await service.shutdown()
+        }
+
         /// Sign-out closes the account's stores after the shutdown of its work. A build that a cancelled waiter left
         /// running must end first, and no build starts after the shutdown.
         @Test func theShutdownEndsTheRunningBuildAndStartsNoOther() async throws {

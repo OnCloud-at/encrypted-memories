@@ -2683,6 +2683,30 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     }
 
+    func testBackupThatIsOffAtLaunchOrTurnedOffReportsThatNoIndexBuildIsNeeded() async throws {
+        let resolver = FakeIdentityResolver()
+        let fixture = try makeControllerFixture(prefix: "backup-off-index", enabled: false, identityResolver: resolver)
+        defer { fixture.cleanup() }
+        try await waitForReports(1, from: resolver, "a launch with backup off")
+
+        fixture.controller.disableBackup()
+        try await waitForReports(2, from: resolver, "turning backup off")
+    }
+
+    private func waitForReports(
+        _ count: Int, from resolver: FakeIdentityResolver, _ description: String, file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
+        while resolver.remoteIndexPreparationNotNeededCount < count, clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            resolver.remoteIndexPreparationNotNeededCount, count, "\(description) reports no index build", file: file,
+            line: line)
+    }
+
     private func makeControllerFixture(
         prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil,
         runtimeSignals: BackupRuntimeSignalSource = .apple, firstNetworkPathWait: Duration = .seconds(10)

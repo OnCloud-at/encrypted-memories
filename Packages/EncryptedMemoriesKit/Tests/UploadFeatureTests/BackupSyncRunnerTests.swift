@@ -731,6 +731,11 @@ final class SpyIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
         log.append("manifest.uploadDidFail")
         await inner.uploadDidFail(descriptor)
     }
+
+    func remoteIndexPreparationNotNeeded() async {
+        log.append("manifest.remoteIndexPreparationNotNeeded")
+        await inner.remoteIndexPreparationNotNeeded()
+    }
 }
 
 private final class TransportCancellingStageResolver: UploadIdentityResolving, @unchecked Sendable {
@@ -1951,6 +1956,56 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(omitted?.omitsMissingPairedVideo, true)
         XCTAssertEqual(omitted?.secondaries.isEmpty, true)
         XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [true])
+    }
+
+    // MARK: - The first index build and the timeline order pass
+
+    /// A runner whose resolver logs the end of a pass without an index build, and the number of such reports.
+    private func signalRunner(
+        throttleInputs: BackupThrottleInputs = .unconstrained
+    ) -> (BackupSyncRunner, () -> Int, () -> Int) {
+        let log = BackupEventLog()
+        let resolver = SpyIdentityResolver(inner: makePipeline(), log: log)
+        let runner = makeRunner(identityResolver: resolver, throttleInputs: { throttleInputs })
+        return (
+            runner, { log.events.filter { $0 == "manifest.remoteIndexPreparationNotNeeded" }.count },
+            { self.checker.remoteIndexPreparationNotNeededCount }
+        )
+    }
+
+    func testAPassWithNothingQueuedReportsThatNoIndexBuildIsNeeded() async {
+        let (runner, signals, delivered) = signalRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(signals(), 1, "a backed-up library needs no index build")
+        XCTAssertEqual(delivered(), 1, "the pipeline hands the report to its checker")
+    }
+
+    func testAPassThatWaitsForWiFiReportsNothing() async {
+        _ = seedEntry("waiting.jpg")
+        let (runner, signals, _) = signalRunner(
+            throttleInputs: BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false))
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertEqual(signals(), 0, "the index build can start as soon as Wi-Fi comes")
+    }
+
+    func testAPassWhoseNextPhotoIsDueLaterReportsNothing() async {
+        let entry = seedEntry("later.jpg")
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(3_600)))
+        let (runner, signals, _) = signalRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(signals(), 0, "the index build can start when the photo is due")
+    }
+
+    func testAPassThatPreparesTheIndexReportsNothing() async {
+        let entry = seedEntry("ready.jpg")
+        let (runner, signals, _) = signalRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(signals(), 0, "this pass prepared the index")
     }
 
     func testAFileThatPhotosCannotFindForAListedPhotoIsCheckedAgainLater() async throws {
