@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import UploadCore
@@ -48,6 +49,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         sourceKind: UploadSourceIdentity.Kind = .photoLibraryAsset,
         membershipInterval: Duration = .zero,
         libraryChangeDelay: Duration = .zero,
+        unreadableRetryDelay: Duration = .seconds(60),
+        unreadableRetryLimit: Duration = .seconds(30 * 60),
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) -> PendingBackupCoordinator {
         PendingBackupCoordinator(
@@ -65,7 +68,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 doneLinger: .milliseconds(20),
                 checkmarkDuration: checkmarkDuration,
                 uncheckedAdmissionLimit: uncheckedAdmissionLimit,
-                libraryChangeDelay: libraryChangeDelay
+                libraryChangeDelay: libraryChangeDelay,
+                unreadableRetryDelay: unreadableRetryDelay,
+                unreadableRetryLimit: unreadableRetryLimit
             ),
             now: { [date] in date },
             sleep: sleep
@@ -1566,6 +1571,952 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertFalse(action.failed)
         XCTAssertEqual(action.attempts, 1)
     }
+
+    // MARK: - Unreadable source states (#770)
+
+    /// An undecodable due row next to healthy rows. The coordinator retries with backoff instead of every second, and
+    /// after a repair and a reopen the owed trash of both sources still runs.
+    func testAnUndecodableDueStateRetriesWithBackoffAndItsTrashSurvivesARepair() async throws {
+        let requests = ["good", "bad"].map {
+            PendingExclusionRequest(
+                key: key($0), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: "link-\($0)"))
+        }
+        XCTAssertNotNil(store.exclude(requests, at: date))
+        try setDesired("invalid", of: "bad")
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5), unreadableRetryLimit: .seconds(120),
+            sleep: { duration in
+                delays.append(duration)
+                // The first two retries return at once, so the test sees the next delays; the third one waits.
+                if duration >= .seconds(60), delays.values.filter({ $0 >= .seconds(60) }).count <= 2 { return }
+                try await Task.sleep(for: .seconds(3600))
+            })
+
+        await coordinator.start()
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.filter({ $0 >= .seconds(60) }).count < 3, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(
+            delays.values.filter { $0 >= .seconds(60) }, [.seconds(60), .seconds(120), .seconds(120)],
+            "an unreadable row retries after a minute, doubling up to the limit")
+        XCTAssertFalse(delays.values.contains(.seconds(1)), "an unreadable row must not retry every second")
+        XCTAssertFalse(effects.trashed.joined().contains { $0.nodeID == "link-bad" })
+        XCTAssertTrue(
+            effects.trashed.joined().contains { $0.nodeID == "link-good" },
+            "the healthy row is trashed in the same session")
+
+        await coordinator.close()
+        try setDesired("excluded", of: "bad")
+        try reopenStore()
+        coordinator = makeCoordinator()
+        await coordinator.start()
+
+        let trashed = Set(effects.trashed.joined().map(\.nodeID))
+        XCTAssertTrue(trashed.contains("link-bad"), "the owed trash survives the repair")
+        XCTAssertTrue(trashed.contains("link-good"))
+    }
+
+    /// The state of an excluded source cannot be read. Its favorite action must wait, not run as if nothing were owed.
+    func testAnActionWaitsWhileItsSourceStateCannotBeRead() async throws {
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-fav")
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key("fav"), presentation: nil, remote: remote)], at: date))
+        XCTAssertNotEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("fav"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .failed)
+        XCTAssertTrue(store.setFavoriteIntent(key("fav"), favorite: true, at: date))
+        try setDesired("invalid", of: "fav")
+        await coordinator.close()
+        coordinator = makeCoordinator()
+
+        await coordinator.start()
+
+        XCTAssertTrue(effects.favorites.isEmpty, "an unreadable state is no permission to act")
+        XCTAssertEqual(store.actions().filter { $0.key == key("fav") && !$0.failed }.count, 1, "the action stays owed")
+
+        await coordinator.close()
+        try setDesired("included", of: "fav")
+        try reopenStore()
+        coordinator = makeCoordinator()
+        await coordinator.start()
+        XCTAssertEqual(effects.favorites, [remote], "after the repair the owed action runs")
+    }
+
+    /// The load at start cannot read one state, so a source without any state is unknown, too: its favorite waits.
+    /// After a repair in the same session, the next retry reads every state again and the favorite runs.
+    func testARepairedStateIsReadAgainByTheNextRetry() async throws {
+        XCTAssertNotNil(
+            store.exclude(
+                [PendingExclusionRequest(key: key("bad"), presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(
+            Self.setColumns(
+                "desired='invalid', needs_queue_sync=0", of: "bad",
+                at: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-free")
+        XCTAssertNotEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("free"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .failed)
+        XCTAssertTrue(store.setFavoriteIntent(key("free"), favorite: true, at: date))
+        let retry = OpenGate()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                if duration >= .seconds(60) { await retry.wait() } else { try await Task.sleep(for: duration) }
+            })
+        await coordinator.start()
+        XCTAssertTrue(effects.favorites.isEmpty, "while one state is unreadable, a source without state is unknown")
+
+        try setDesired("excluded", of: "bad")
+        retry.open()
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while effects.favorites.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(effects.favorites, [remote], "the retry reads every state again and runs the owed action")
+    }
+
+    /// The source returns to the backup, and its state becomes unreadable while the return runs. Its last known state
+    /// would allow the favorite, but the current one is unknown, so the favorite waits until a read succeeds.
+    func testAnActionWaitsWhenItsStateBecomesUnreadableAfterAnEffect() async throws {
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-back")
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key("back"), presentation: nil, remote: nil)], at: date))
+        XCTAssertNotNil(store.include([key("back")], at: date))
+        XCTAssertNotEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("back"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .failed)
+        XCTAssertTrue(store.setFavoriteIntent(key("back"), favorite: true, at: date))
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        effects.onReturn = { try? Self.setDesired("invalid", of: "back", at: url) }
+        let retry = OpenGate()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                if duration >= .seconds(60) { await retry.wait() } else { try await Task.sleep(for: duration) }
+            })
+
+        await coordinator.start()
+
+        XCTAssertEqual(effects.returned, [[key("back")]])
+        XCTAssertTrue(
+            effects.favorites.isEmpty, "the last known state is no permission while the current one is unknown")
+
+        // The repaired state owes no further effect, so only the retry of the unreadable source reads it again.
+        XCTAssertTrue(
+            Self.setColumns(
+                "desired='included', needs_queue_sync=0", of: "back",
+                at: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
+        retry.open()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while effects.favorites.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(effects.favorites, [remote], "once the state reads again, the owed action runs")
+    }
+
+    /// Every state read at start. A due row becomes undecodable later; the next reconcile also backs off.
+    func testADueRowThatBecomesUnreadableLaterRetriesWithBackoff() async throws {
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                delays.append(duration)
+                try await Task.sleep(for: .seconds(3600))
+            })
+        await coordinator.start()
+        let request = PendingExclusionRequest(
+            key: key("late"), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: "link-late"))
+        XCTAssertNotNil(store.exclude([request], at: date))
+        try setDesired("invalid", of: "late")
+
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !delays.values.contains(.seconds(60)), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(delays.values.contains(.seconds(60)), "a due row that cannot be read retries after a minute")
+        XCTAssertFalse(delays.values.contains(.seconds(1)))
+    }
+
+    /// A trash finished, the store now owes the trash of a later commit, and the source's keyed read fails. The pass
+    /// must not trust the last known state and dispatch the new trash again and again; it waits for the backoff.
+    func testATrashWhoseStateCannotBeReadAfterwardsIsNotDispatchedAgainInTheSamePass() async throws {
+        XCTAssertNotNil(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key("s"), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: "a"))
+                ],
+                at: date))
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 500)", of: "s", at: url))
+        let gate = OpenGate()
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                delays.append(duration)
+                if duration == .seconds(500) { await gate.wait() } else { try await Task.sleep(for: .seconds(3600)) }
+            })
+        await coordinator.start()
+        let started = ContinuousClock.now + .seconds(5)
+        while !delays.values.contains(.seconds(500)), ContinuousClock.now < started {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        // The store now owes the trash of photo B, while the coordinator still knows photo A.
+        XCTAssertTrue(
+            Self.setColumns("remote_link_id='b', next_attempt_at=\(date.timeIntervalSince1970)", of: "s", at: url))
+        let failure = KeyedReadFailure()
+        try failure.install(on: store)
+
+        gate.open()
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !delays.values.contains(.seconds(60)), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertGreaterThan(failure.count, 0)
+        XCTAssertEqual(effects.trashed.joined().filter { $0.nodeID == "b" }.count, 1, "photo B is sent once per pass")
+        XCTAssertTrue(delays.values.contains(.seconds(60)), "the source waits for the backoff")
+        await coordinator.close()
+        failure.remove(from: store)
+    }
+
+    /// The load at start was complete. A later due read cannot read another source's row, so it may have left out
+    /// this source's current state too: its favorite waits until a complete read, then runs once.
+    func testAnActionWaitsWhileALaterDueReadIsIncomplete() async throws {
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        XCTAssertNotNil(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key("bad"), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: "x"))
+                ],
+                at: date))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 5000)", of: "bad", at: url))
+        // A known included state, so only the incomplete due read can hold the favorite.
+        includedLater("fav")
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-fav")
+        XCTAssertNotEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("fav"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .failed)
+        let retry = OpenGate()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                if duration == .seconds(60) { await retry.wait() } else { try await Task.sleep(for: .seconds(3600)) }
+            })
+        await coordinator.start()
+        XCTAssertTrue(
+            Self.setColumns("desired='invalid', next_attempt_at=\(date.timeIntervalSince1970)", of: "bad", at: url))
+        XCTAssertTrue(store.setFavoriteIntent(key("fav"), favorite: true, at: date))
+
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        XCTAssertTrue(effects.favorites.isEmpty, "an incomplete due read is no permission to act")
+        XCTAssertTrue(Self.setColumns("desired='excluded'", of: "bad", at: url))
+        retry.open()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while effects.favorites.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(effects.favorites, [remote], "after a complete read the action runs once")
+    }
+
+    /// The same incomplete due read decoded this source's own row, so its favorite may still run.
+    func testAnIncompleteDueReadStillLetsTheSourcesItDecodedAct() async throws {
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        let later = date.timeIntervalSince1970 + 5000
+        XCTAssertNotNil(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key("bad"), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: "x"))
+                ],
+                at: date))
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key("fav"), presentation: nil, remote: nil)], at: date))
+        XCTAssertNotNil(store.include([key("fav")], at: date))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(later)", of: "bad", at: url))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(later)", of: "fav", at: url))
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-fav")
+        XCTAssertNotEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("fav"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .failed)
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5), sleep: { _ in try await Task.sleep(for: .seconds(3600)) })
+        await coordinator.start()
+        let now = date.timeIntervalSince1970
+        XCTAssertTrue(Self.setColumns("desired='invalid', next_attempt_at=\(now)", of: "bad", at: url))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(now)", of: "fav", at: url))
+        XCTAssertTrue(store.setFavoriteIntent(key("fav"), favorite: true, at: date))
+        keepStateAfterReturn("fav")
+
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        XCTAssertEqual(effects.returned, [[key("fav")]], "the due read decoded the source")
+        XCTAssertEqual(effects.favorites, [remote], "a source that the incomplete read decoded may act")
+    }
+
+    /// While one row cannot be read, a readable row keeps its own retry time instead of waiting for the backoff.
+    func testAReadableRetryKeepsItsTimeWhileAnotherRowIsUnreadable() async throws {
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        let requests = ["healthy", "bad"].map {
+            PendingExclusionRequest(key: key($0), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: $0))
+        }
+        XCTAssertNotNil(store.exclude(requests, at: date))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 90)", of: "healthy", at: url))
+        try setDesired("invalid", of: "bad")
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                delays.append(duration)
+                if delays.values.count == 1 { return }
+                try await Task.sleep(for: .seconds(3600))
+            })
+
+        await coordinator.start()
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(
+            delays.values, [.seconds(60), .seconds(90)], "the backoff is 120 s, the readable row is due at 90 s")
+    }
+
+    /// A second incomplete load keeps the last known state of a source that it could not list, so a restore from the
+    /// Proton trash still finds the deleted source.
+    func testASecondIncompleteLoadKeepsTheLastKnownStates() async throws {
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        let requests = ["kept", "bad"].map {
+            PendingExclusionRequest(
+                key: key($0), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: "link-\($0)"))
+        }
+        XCTAssertNotNil(store.exclude(requests, at: date))
+        try setDesired("invalid", of: "bad")
+        let gate = OpenGate()
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                delays.append(duration)
+                if delays.values.filter({ $0 >= .seconds(60) }).count == 1 {
+                    await gate.wait()
+                } else {
+                    try await Task.sleep(for: .seconds(3600))
+                }
+            })
+        await coordinator.start()
+        var deadline = ContinuousClock.now + .seconds(5)
+        while !effects.trashed.joined().contains(where: { $0.nodeID == "link-kept" }), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let failure = SourceListFailure()
+        try failure.install(on: store)
+
+        gate.open()
+
+        deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.filter({ $0 >= .seconds(60) }).count < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(failure.denied, "the second load must fail")
+        failure.remove(from: store)
+        await coordinator.restoreSources(ofRemote: [PhotoUID(volumeID: "vol", nodeID: "link-kept")])
+        XCTAssertEqual(
+            effects.restored.joined().map(\.nodeID), ["link-kept"], "the last known state finds the deleted source")
+    }
+
+    func testAZeroRetryDelayStillWaitsASecond() {
+        XCTAssertEqual(
+            PendingBackupCoordinator.Configuration(unreadableRetryDelay: .zero).unreadableRetryDelay, .seconds(1))
+    }
+
+    /// Once every read succeeds again, the next unreadable episode in the same session starts at the base delay.
+    func testABackoffStartsAgainAfterTheStatesReadAgain() async throws {
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        let requests = ["first", "second"].map {
+            PendingExclusionRequest(key: key($0), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: $0))
+        }
+        XCTAssertNotNil(store.exclude(requests, at: date))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 100_000)", of: "second", at: url))
+        try setDesired("invalid", of: "first")
+        let gate = OpenGate()
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                let backoff = duration >= .seconds(60) && duration <= .seconds(1800)
+                if backoff { delays.append(duration) }
+                if backoff, delays.values.count == 1 { return }
+                if backoff, delays.values.count == 2 {
+                    await gate.wait()
+                } else {
+                    try await Task.sleep(for: .seconds(3600))
+                }
+            })
+        await coordinator.start()
+        var deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+
+        try setDesired("excluded", of: "first")
+        gate.open()
+        deadline = ContinuousClock.now + .seconds(5)
+        while !effects.trashed.joined().contains(where: { $0.nodeID == "first" }), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(
+            Self.setColumns("desired='invalid', next_attempt_at=\(date.timeIntervalSince1970)", of: "second", at: url))
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.count < 3, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(
+            delays.values, [.seconds(60), .seconds(120), .seconds(60)], "a new episode starts at one minute")
+    }
+
+    // MARK: - Unreadable source states, round 2 (#770)
+
+    private func favoriteFixture(_ id: String) -> PhotoUID {
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-\(id)")
+        XCTAssertNotEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key(id), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .failed)
+        return remote
+    }
+
+    private var storeURL: URL { directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName) }
+
+    /// An included source with a queue sync that is due only later.
+    private func includedLater(_ id: String) {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: nil)], at: date))
+        XCTAssertNotNil(store.include([key(id)], at: date))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 5000)", of: id, at: storeURL))
+    }
+
+    /// An excluded source with a Proton photo whose trash is due only later.
+    private func excludedLater(_ id: String) {
+        XCTAssertNotNil(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key(id), presentation: nil, remote: PhotoUID(volumeID: "vol", nodeID: id))
+                ],
+                at: date))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 5000)", of: id, at: storeURL))
+    }
+
+    /// A newer decision lands while the source returns to the backup, so the store keeps its included state with a
+    /// queue sync that is due only later: the source keeps a known state after the pass.
+    private func keepStateAfterReturn(_ id: String) {
+        let later = date.timeIntervalSince1970 + 5000
+        effects.onReturn = { [storeURL] in
+            XCTAssertTrue(
+                PendingBackupCoordinatorTests.setColumns(
+                    "generation=generation+1, next_attempt_at=\(later)", of: id, at: storeURL))
+        }
+    }
+
+    private func restartIdle() async {
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5), sleep: { _ in try await Task.sleep(for: .seconds(3600)) })
+        await coordinator.start()
+    }
+
+    /// The start load could not read one row. A later incomplete load no longer decodes a source either; its last
+    /// known "included" state is kept for timing, but it must not let an owed favorite run.
+    func testAStaleStateFromAnIncompleteLoadDoesNotAuthorizeAnAction() async throws {
+        excludedLater("bad")
+        includedLater("k")
+        let remote = favoriteFixture("k")
+        try setDesired("invalid", of: "bad")
+        await restartIdle()
+        XCTAssertTrue(Self.setColumns("desired='invalid'", of: "k", at: storeURL))
+        XCTAssertTrue(store.setFavoriteIntent(key("k"), favorite: true, at: date))
+
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        XCTAssertTrue(effects.favorites.isEmpty, "a stale state from an incomplete load is no permission to act")
+        XCTAssertEqual(store.actions().filter { $0.key == key("k") && !$0.failed }.count, 1, "the action stays owed")
+        try setDesired("excluded", of: "bad")
+        XCTAssertTrue(Self.setColumns("desired='included'", of: "k", at: storeURL))
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "again")])
+        XCTAssertEqual(effects.favorites, [remote], "after a complete load the action runs")
+    }
+
+    /// A source that the incomplete load decoded may still act.
+    func testASourceThatAnIncompleteLoadDecodedStillActs() async throws {
+        excludedLater("bad")
+        includedLater("k")
+        try setDesired("invalid", of: "bad")
+        await restartIdle()
+        let remote = favoriteFixture("k")
+        XCTAssertTrue(store.setFavoriteIntent(key("k"), favorite: true, at: date))
+
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        XCTAssertEqual(effects.favorites, [remote])
+    }
+
+    /// While a pass waits for a remote effect, an action request must already see that this pass's due read was
+    /// incomplete; the permission of the earlier, complete pass no longer applies.
+    func testAnActionDuringAPassUsesThatPassesDueRead() async throws {
+        excludedLater("x")
+        excludedLater("bad")
+        // A known included state, so only the due read of the running pass can hold the favorite.
+        includedLater("y")
+        let remote = favoriteFixture("y")
+        await restartIdle()
+        let gate = LookupGate()
+        effects.trashGate = gate
+        let now = date.timeIntervalSince1970
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(now)", of: "x", at: storeURL))
+        XCTAssertTrue(Self.setColumns("desired='invalid', next_attempt_at=\(now)", of: "bad", at: storeURL))
+        let running = try XCTUnwrap(coordinator)
+        let pass = Task { await running.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")]) }
+        guard await gate.entered(within: .seconds(5)) else {
+            XCTFail("the trash of the running pass never reached the gate")
+            _ = await pass.value
+            return
+        }
+
+        _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "y")], favorite: true)
+
+        XCTAssertTrue(effects.favorites.isEmpty, "the running pass's incomplete due read already holds the action")
+        try setDesired("excluded", of: "bad")
+        gate.open()
+        _ = await pass.value
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "again")])
+        XCTAssertEqual(effects.favorites, [remote], "after a complete read the action runs")
+    }
+
+    func testAZeroOrNegativeRetryLimitStillWaitsASecond() async throws {
+        excludedLater("bad")
+        XCTAssertTrue(
+            Self.setColumns("desired='invalid', next_attempt_at=\(date.timeIntervalSince1970)", of: "bad", at: storeURL)
+        )
+        for limit in [Duration.zero, .seconds(-5)] {
+            let delays = DelayLog()
+            await coordinator.close()
+            // A decode failure stays recorded on the open store; each coordinator starts on a fresh connection.
+            try reopenStore()
+            coordinator = makeCoordinator(
+                checkmarkDuration: .seconds(5), unreadableRetryLimit: limit,
+                sleep: { duration in
+                    delays.append(duration)
+                    if delays.values.count < 3 { return }
+                    try await Task.sleep(for: .seconds(3600))
+                })
+            await coordinator.start()
+            let deadline = ContinuousClock.now + .seconds(5)
+            while delays.values.count < 3, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertEqual(delays.values.prefix(3).count, 3, "\(limit)")
+            XCTAssertTrue(delays.values.prefix(3).allSatisfy { $0 >= .seconds(1) }, "limit \(limit): \(delays.values)")
+        }
+    }
+
+    /// A limit below the first retry delay caps the first wait as well.
+    func testARetryLimitBelowTheFirstDelayCapsTheFirstWait() async throws {
+        excludedLater("bad")
+        XCTAssertTrue(
+            Self.setColumns("desired='invalid', next_attempt_at=\(date.timeIntervalSince1970)", of: "bad", at: storeURL)
+        )
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5), unreadableRetryLimit: .seconds(30),
+            sleep: { duration in
+                delays.append(duration)
+                try await Task.sleep(for: .seconds(3600))
+            })
+        await coordinator.start()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(delays.values.first, .seconds(30))
+    }
+
+    /// The doubling stops at the limit. Near the largest Duration, a doubled wait would overflow; the wait stays at the
+    /// limit instead.
+    func testABackoffNearTheLargestDurationStaysAtTheLimit() async throws {
+        excludedLater("bad")
+        XCTAssertTrue(
+            Self.setColumns("desired='invalid', next_attempt_at=\(date.timeIntervalSince1970)", of: "bad", at: storeURL)
+        )
+        // Above half of the largest Duration, so that twice this limit overflows.
+        let limit = Duration.seconds(Int64.max) * 10
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5), unreadableRetryDelay: limit, unreadableRetryLimit: limit,
+            sleep: { duration in
+                guard duration >= .seconds(60) else { return try await Task.sleep(for: .seconds(3600)) }
+                delays.append(duration)
+                if delays.values.count < 3 { return }
+                try await Task.sleep(for: .seconds(3600))
+            })
+        await coordinator.start()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.count < 3, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(delays.values.prefix(3), [limit, limit, limit])
+    }
+
+    /// A readable row whose retry date already passed does not shorten the wait to a second.
+    func testAReadableStateWithAPastRetryDateKeepsTheBackoff() async throws {
+        excludedLater("bad")
+        includedLater("stuck")
+        let now = date.timeIntervalSince1970
+        XCTAssertTrue(Self.setColumns("desired='invalid', next_attempt_at=\(now)", of: "bad", at: storeURL))
+        // A restore without a Proton photo is never sent, so this readable row stays due with a past date.
+        XCTAssertTrue(
+            Self.setColumns(
+                "needs_queue_sync=0, needs_remote_restore=1, remote_volume_id=NULL, remote_link_id=NULL, "
+                    + "next_attempt_at=\(now - 10)", of: "stuck", at: storeURL))
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(
+            checkmarkDuration: .seconds(5),
+            sleep: { duration in
+                delays.append(duration)
+                try await Task.sleep(for: .seconds(3600))
+            })
+        await coordinator.start()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while delays.values.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(delays.values.first, .seconds(60))
+    }
+
+    /// A complete load forgets the state of a source that left the store, so its action may run again.
+    func testACompleteLoadForgetsStatesThatLeftTheStore() async throws {
+        excludedLater("bad")
+        excludedLater("k")
+        try setDesired("invalid", of: "bad")
+        await restartIdle()
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(handle, "DELETE FROM source_state WHERE source_id='k';", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(handle)
+        try setDesired("excluded", of: "bad")
+        let remote = favoriteFixture("k")
+        XCTAssertTrue(store.setFavoriteIntent(key("k"), favorite: true, at: date))
+
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
+
+        XCTAssertEqual(effects.favorites, [remote], "the complete load no longer knows the old exclusion")
+    }
+
+    /// The permission of an incomplete due read belongs to its own pass. A source decoded one pass earlier but no
+    /// longer due is not decoded in the next incomplete pass, so its action waits.
+    func testTheDecodedSourcesOfAnEarlierPassDoNotCarryOver() async throws {
+        excludedLater("bad")
+        includedLater("y")
+        await restartIdle()
+        let now = date.timeIntervalSince1970
+        XCTAssertTrue(Self.setColumns("desired='invalid', next_attempt_at=\(now)", of: "bad", at: storeURL))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(now)", of: "y", at: storeURL))
+        keepStateAfterReturn("y")
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "first")])
+        XCTAssertEqual(effects.returned, [[key("y")]], "the first incomplete pass decoded the source")
+        _ = favoriteFixture("y")
+        XCTAssertTrue(store.setFavoriteIntent(key("y"), favorite: true, at: date))
+
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "second")])
+
+        XCTAssertTrue(effects.favorites.isEmpty, "the next incomplete pass did not decode the source")
+    }
+
+    // MARK: - Unreadable source states, round 3 (#770)
+
+    /// An excluded source whose queue sync is due now, with a favorite that waits for it.
+    private func excludedWithFavorite(_ id: String) -> PhotoUID {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: nil)], at: date))
+        let remote = favoriteFixture(id)
+        XCTAssertTrue(store.setFavoriteIntent(key(id), favorite: true, at: date))
+        return remote
+    }
+
+    /// Breaks the key of a source row, so a keyed read finds nothing while the full reads fail to decode it.
+    private func breakKeyWhileItLeavesTheBackup(_ id: String) {
+        effects.onRemove = { [storeURL] in
+            XCTAssertTrue(PendingBackupCoordinatorTests.setColumns("source_kind='broken'", of: id, at: storeURL))
+        }
+    }
+
+    private func sourceRows(_ id: String) -> Int {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = handle else {
+            sqlite3_close(handle)
+            return -1
+        }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "SELECT COUNT(*) FROM source_state WHERE source_id='\(id)';"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return -1 }
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : -1
+    }
+
+    /// The incomplete load and the first due reads decoded the excluded source. While its queue sync runs, its key
+    /// stops decoding: the keyed reread finds no row, and the next due read is incomplete. The absent answer is no
+    /// permission: the favorite waits, stays owed, and the damaged row stays.
+    func testAnAbsentRereadOfADamagedRowAfterAnIncompleteLoadIsNoPermission() async throws {
+        excludedLater("bad")
+        try setDesired("invalid", of: "bad")
+        _ = excludedWithFavorite("k")
+        breakKeyWhileItLeavesTheBackup("k")
+
+        await restartIdle()
+
+        XCTAssertEqual(effects.removed, [["k"]], "the queue sync ran while the key broke")
+        XCTAssertTrue(effects.favorites.isEmpty, "an absent reread is no permission while a read is incomplete")
+        XCTAssertEqual(store.actions().filter { $0.key == key("k") && !$0.failed }.count, 1, "the action stays owed")
+        XCTAssertEqual(sourceRows("k"), 1, "the damaged row is still stored")
+    }
+
+    /// The same damage after a complete load: the incomplete due read alone already makes the absent answer
+    /// unreliable.
+    func testAnAbsentRereadOfADamagedRowWhileADueReadIsIncompleteIsNoPermission() async throws {
+        _ = excludedWithFavorite("k")
+        breakKeyWhileItLeavesTheBackup("k")
+
+        await restartIdle()
+
+        XCTAssertEqual(effects.removed, [["k"]], "the queue sync ran while the key broke")
+        XCTAssertTrue(effects.favorites.isEmpty, "an absent reread is no permission while a due read is incomplete")
+        XCTAssertEqual(store.actions().filter { $0.key == key("k") && !$0.failed }.count, 1, "the action stays owed")
+    }
+
+    /// After an incomplete load that decoded the source, its key stops decoding and a keyed reread finds no row.
+    /// The due reads stay complete, because the source owes nothing yet; the incomplete load alone holds the favorite.
+    func testAnAbsentRereadAfterAnIncompleteLoadIsNoPermission() async throws {
+        excludedLater("bad")
+        try setDesired("invalid", of: "bad")
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key("k"), presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 5000)", of: "k", at: storeURL))
+        await restartIdle()
+        XCTAssertTrue(Self.setColumns("source_kind='broken'", of: "k", at: storeURL))
+        let uid = PhotoUID(localPending: .photoLibrary, identifier: "k")
+        let unlisted = await coordinator.removeFromTrashList([uid])
+        XCTAssertTrue(unlisted, "the keyed reread answers absent")
+        _ = favoriteFixture("k")
+
+        _ = await coordinator.setFavorite([uid], favorite: true)
+
+        XCTAssertTrue(effects.favorites.isEmpty, "an absent reread is no permission after an incomplete load")
+        XCTAssertEqual(store.actions().filter { $0.key == key("k") && !$0.failed }.count, 1, "the action stays owed")
+    }
+
+    /// Counter-test: after complete reads, a source whose row really left the store reads as absent and acts.
+    func testAnAbsentRereadAfterCompleteReadsStillActs() async throws {
+        let remote = excludedWithFavorite("k")
+        effects.onRemove = { [storeURL] in
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+            XCTAssertEqual(
+                sqlite3_exec(handle, "DELETE FROM source_state WHERE source_id='k';", nil, nil, nil), SQLITE_OK)
+            sqlite3_close(handle)
+        }
+
+        await restartIdle()
+
+        XCTAssertEqual(effects.removed, [["k"]])
+        XCTAssertEqual(effects.favorites, [remote], "a healthy absent source after complete reads acts")
+    }
+
+    /// An action that arrives while a pass waits for a remote effect sees the sources that this pass decoded, not
+    /// those of the earlier incomplete pass.
+    func testAReentrantActionDoesNotUseTheDecodedSourcesOfAnEarlierPass() async throws {
+        excludedLater("bad")
+        excludedLater("x")
+        includedLater("y")
+        await restartIdle()
+        let now = date.timeIntervalSince1970
+        XCTAssertTrue(Self.setColumns("desired='invalid', next_attempt_at=\(now)", of: "bad", at: storeURL))
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(now)", of: "y", at: storeURL))
+        keepStateAfterReturn("y")
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "first")])
+        XCTAssertEqual(effects.returned, [[key("y")]], "the first incomplete pass decoded the source")
+        let remote = favoriteFixture("y")
+        let gate = LookupGate()
+        effects.trashGate = gate
+        XCTAssertTrue(Self.setColumns("next_attempt_at=\(now)", of: "x", at: storeURL))
+        let running = try XCTUnwrap(coordinator)
+        let pass = Task { await running.restore([PhotoUID(localPending: .photoLibrary, identifier: "second")]) }
+        guard await gate.entered(within: .seconds(5)) else {
+            XCTFail("the trash of the second pass never reached the gate")
+            _ = await pass.value
+            return
+        }
+
+        _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "y")], favorite: true)
+
+        XCTAssertTrue(effects.favorites.isEmpty, "the earlier pass's decoded sources are no permission")
+        try setDesired("excluded", of: "bad")
+        gate.open()
+        _ = await pass.value
+        _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "again")])
+        XCTAssertEqual(effects.favorites, [remote], "after a complete read the action runs")
+    }
+
+    private func setDesired(_ value: String, of id: String) throws {
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        try Self.setDesired(value, of: id, at: url)
+    }
+
+    @discardableResult
+    private static func setColumns(_ assignments: String, of id: String, at url: URL) -> Bool {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let db = handle else {
+            sqlite3_close(handle)
+            return false
+        }
+        defer { sqlite3_close(db) }
+        return sqlite3_exec(db, "UPDATE source_state SET \(assignments) WHERE source_id='\(id)';", nil, nil, nil)
+            == SQLITE_OK && sqlite3_changes(db) == 1
+    }
+
+    /// Writes through a second SQLite connection, so the store's own connection sees an unreadable row.
+    private static func setDesired(_ value: String, of id: String, at url: URL) throws {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(
+            sqlite3_exec(db, "UPDATE source_state SET desired='\(value)' WHERE source_id='\(id)';", nil, nil, nil),
+            SQLITE_OK)
+        XCTAssertEqual(sqlite3_changes(db), 1)
+    }
+
+    /// A decode failure stays recorded for the open connection; a repair is seen after a reopen.
+    private func reopenStore() throws {
+        recorder.finish()
+        store.close()
+        let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        store = try XCTUnwrap(PendingBackupManifestStore(url: url))
+        recorder = PendingBackupEventRecorder(
+            store: store, replacementLedger: .shared(accountDataDirectory: directory), now: { [date] in date })
+    }
+
+    /// Holds every waiter until `open()`; afterwards `wait()` returns at once.
+    private final class OpenGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async {
+            await withCheckedContinuation { continuation in
+                let resume = lock.withLock { () -> Bool in
+                    if isOpen { return true }
+                    waiters.append(continuation)
+                    return false
+                }
+                if resume { continuation.resume() }
+            }
+        }
+
+        func open() {
+            let waiting = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+                isOpen = true
+                defer { waiters.removeAll() }
+                return waiters
+            }
+            waiting.forEach { $0.resume() }
+        }
+    }
+
+    /// Interrupts every keyed read of a source state on the store's own connection, as a failing disk read would.
+    private final class KeyedReadFailure: @unchecked Sendable {
+        private let lock = NSLock()
+        private var interrupted = 0
+        var count: Int { lock.withLock { interrupted } }
+
+        func install(on store: PendingBackupManifestStore) throws {
+            let connection = try Self.connection(of: store)
+            connection.withLock {
+                _ = sqlite3_trace_v2(
+                    connection.database, UInt32(SQLITE_TRACE_STMT),
+                    { _, context, pointer, _ in
+                        guard let context, let pointer else { return 0 }
+                        let statement = OpaquePointer(pointer)
+                        guard let sql = sqlite3_sql(statement).map({ String(cString: $0) }),
+                            sql.contains("FROM source_state WHERE source_kind=? AND source_id=?")
+                        else { return 0 }
+                        let failure = Unmanaged<KeyedReadFailure>.fromOpaque(context).takeUnretainedValue()
+                        failure.lock.withLock { failure.interrupted += 1 }
+                        sqlite3_interrupt(sqlite3_db_handle(statement))
+                        return 0
+                    }, Unmanaged.passUnretained(self).toOpaque())
+            }
+        }
+
+        func remove(from store: PendingBackupManifestStore) {
+            guard let connection = try? Self.connection(of: store) else { return }
+            connection.withLock { _ = sqlite3_trace_v2(connection.database, 0, nil, nil) }
+        }
+
+        static func connection(of store: PendingBackupManifestStore) throws -> SQLiteStoreConnection {
+            try XCTUnwrap(
+                Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value
+                    as? SQLiteStoreConnection)
+        }
+    }
+
+    /// Denies the next full read of the source states on the store's own connection.
+    private final class SourceListFailure: @unchecked Sendable {
+        private let lock = NSLock()
+        private var done = false
+        var denied: Bool { lock.withLock { done } }
+
+        func install(on store: PendingBackupManifestStore) throws {
+            let connection = try KeyedReadFailure.connection(of: store)
+            connection.withLock {
+                _ = sqlite3_set_authorizer(
+                    connection.database,
+                    { context, action, table, _, _, _ in
+                        guard let context, action == SQLITE_READ, let table, String(cString: table) == "source_state"
+                        else { return SQLITE_OK }
+                        let failure = Unmanaged<SourceListFailure>.fromOpaque(context).takeUnretainedValue()
+                        return failure.lock.withLock {
+                            guard !failure.done else { return SQLITE_OK }
+                            failure.done = true
+                            return SQLITE_DENY
+                        }
+                    }, Unmanaged.passUnretained(self).toOpaque())
+            }
+        }
+
+        func remove(from store: PendingBackupManifestStore) {
+            guard let connection = try? KeyedReadFailure.connection(of: store) else { return }
+            connection.withLock { _ = sqlite3_set_authorizer(connection.database, nil, nil) }
+        }
+    }
+
+    private final class DelayLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [Duration] = []
+        var values: [Duration] { lock.withLock { recorded } }
+        func append(_ duration: Duration) { lock.withLock { recorded.append(duration) } }
+    }
 }
 
 private final class FakePendingMetadata: PendingSourceMetadataProviding, @unchecked Sendable {
@@ -1641,18 +2592,38 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
         set { lock.withLock { _trashRetry = newValue } }
     }
 
+    /// Runs once during the next removal from the backup, before the coordinator records its result.
+    var onRemove: (@Sendable () -> Void)? {
+        get { lock.withLock { _onRemove } }
+        set { lock.withLock { _onRemove = newValue } }
+    }
+    private var _onRemove: (@Sendable () -> Void)?
+
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool {
-        lock.withLock {
+        let (hook, succeeds) = lock.withLock {
             _removed.append(identifiers.sorted())
-            return _removeSucceeds
+            defer { _onRemove = nil }
+            return (_onRemove, _removeSucceeds)
         }
+        hook?()
+        return succeeds
     }
 
+    /// Runs once during the next return to the backup, before the coordinator records its result.
+    var onReturn: (@Sendable () -> Void)? {
+        get { lock.withLock { _onReturn } }
+        set { lock.withLock { _onReturn = newValue } }
+    }
+    private var _onReturn: (@Sendable () -> Void)?
+
     func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
-        lock.withLock {
+        let hook = lock.withLock {
             _returned.append(keys.sorted())
             _order.append("return")
+            defer { _onReturn = nil }
+            return _onReturn
         }
+        hook?()
         return true
     }
 
@@ -1672,8 +2643,16 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
         return "photos-volume"
     }
 
+    /// Holds the next trash request until the gate opens.
+    var trashGate: LookupGate? {
+        get { lock.withLock { _trashGate } }
+        set { lock.withLock { _trashGate = newValue } }
+    }
+    private var _trashGate: LookupGate?
+
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
-        lock.withLock {
+        await trashGate?.pass()
+        return lock.withLock {
             _trashed.append(uids)
             _order.append("trash")
             return PendingBatchEffectResult(retry: _trashRetry.intersection(uids))
@@ -1772,6 +2751,7 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
 private final class LookupGate: @unchecked Sendable {
     private let lock = NSLock()
     private var holds = 1
+    private var reached = false
     private let enteredStream: AsyncStream<Void>
     private let enteredContinuation: AsyncStream<Void>.Continuation
     private let openStream: AsyncStream<Void>
@@ -1785,6 +2765,7 @@ private final class LookupGate: @unchecked Sendable {
     func pass() async {
         let held = lock.withLock { () -> Bool in
             defer { holds -= 1 }
+            if holds > 0 { reached = true }
             return holds > 0
         }
         guard held else { return }
@@ -1795,6 +2776,20 @@ private final class LookupGate: @unchecked Sendable {
     /// Returns once the held lookup waits at the gate.
     func entered() async {
         for await _ in enteredStream { return }
+    }
+
+    /// Returns whether the held lookup reached the gate within `limit`. On a timeout the gate opens, so the held
+    /// work and the test can finish.
+    func entered(within limit: Duration) async -> Bool {
+        let deadline = ContinuousClock.now + limit
+        while !lock.withLock({ reached }), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard lock.withLock({ reached }) else {
+            open()
+            return false
+        }
+        return true
     }
 
     func open() {
