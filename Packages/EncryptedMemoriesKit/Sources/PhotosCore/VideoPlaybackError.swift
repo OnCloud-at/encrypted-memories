@@ -24,6 +24,9 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
     case rangeNotSupported
     /// A typed crypto failure of the backend: a key ring, a message or a key packet that does not decrypt.
     case decryptionFailed
+    /// The stored description of the video contradicts itself in a way that no new attempt changes, for example a
+    /// negative block size.
+    case malformedContent
     /// No network / transport error while fetching bytes.
     case networkUnavailable
     /// Auth expired and could not be refreshed.
@@ -48,6 +51,7 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
         case .streamURLUnavailable: return L10n.string("error.video.stream_unavailable")
         case .rangeNotSupported: return L10n.string("error.video.range_not_supported")
         case .decryptionFailed: return L10n.string("error.video.decryption_failed")
+        case .malformedContent: return L10n.string("error.video.malformed_content")
         case .networkUnavailable: return L10n.string("error.video.network_unavailable")
         case .authExpired: return L10n.string("error.video.auth_expired")
         case .quotaOrRateLimited: return L10n.string("error.video.quota_rate_limited")
@@ -67,6 +71,7 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
         case .streamURLUnavailable: return "streamURLUnavailable"
         case .rangeNotSupported: return "rangeNotSupported"
         case .decryptionFailed: return "decryptionFailed"
+        case .malformedContent: return "malformedContent"
         case .networkUnavailable: return "networkUnavailable"
         case .authExpired: return "authExpired"
         case .quotaOrRateLimited: return "quotaOrRateLimited"
@@ -78,11 +83,12 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
     }
 
     /// Whether a "Retry" can work. Only a cause that is confirmed permanent hides it: a codec the player cannot decode,
-    /// a file that is not a video, a host without a stream provider, and a typed crypto failure. An HTTP answer such as
+    /// a file that is not a video, a host without a stream provider, a typed crypto failure and a self-contradicting
+    /// description of the video. An HTTP answer such as
     /// 404, 410 or 416 does not prove that a new attempt fails (an expired stream reference is renewed), so it keeps Retry.
     public var isRetryable: Bool {
         switch self {
-        case .unsupportedCodec, .notVideo, .streamURLUnavailable, .decryptionFailed: return false
+        case .unsupportedCodec, .notVideo, .streamURLUnavailable, .decryptionFailed, .malformedContent: return false
         default: return true
         }
     }
@@ -121,8 +127,10 @@ public extension VideoPlaybackError {
 
         // AVFoundation media errors.
         if ns.domain == "AVFoundationErrorDomain" {
-            // -11828 mediaFormatNotRecognized, -11833 unsupported, -11839 cannotDecode, etc.
-            let unsupported: Set<Int> = [-11828, -11829, -11833, -11839, -11850]
+            // -11828 fileFormatNotRecognized, -11829 fileFailedToParse, -11833 decoderNotFound,
+            // -11850 serverIncorrectlyConfigured. -11839 decoderTemporarilyUnavailable is a state of the moment: it
+            // stays a player failure, which keeps Retry.
+            let unsupported: Set<Int> = [-11828, -11829, -11833, -11850]
             if unsupported.contains(ns.code) { return .unsupportedCodec }
             return .playerItemFailed(detail: "AV\(ns.code)")
         }

@@ -25,6 +25,18 @@ enum StreamingError: Error, Equatable {
     case incompleteStream(streamed: Int, expected: Int)
 }
 
+/// Only a block layout that contradicts itself no matter which page of the answer arrived is permanent. A count
+/// mismatch, a missing revision or a size that disagrees with the blocks can come from an incomplete answer, so a
+/// new attempt can change it and keeps Retry.
+extension StreamingError: VideoPlaybackClassifiable {
+    var videoPlaybackError: VideoPlaybackError? {
+        switch self {
+        case .negativeBlockSize, .blockSizeSumOverflow: return .malformedContent
+        default: return nil
+        }
+    }
+}
+
 /// One block's fetch info + its position in the *cleartext* file (from XAttr block sizes), so the
 /// resource loader can map a requested byte range to the blocks it needs.
 struct VideoBlock: Sendable {

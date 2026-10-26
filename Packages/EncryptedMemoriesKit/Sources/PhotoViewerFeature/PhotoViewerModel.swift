@@ -106,6 +106,10 @@ public final class PhotoViewerModel {
     private let sessionCache: ThumbnailCache?
     private let sessionLease: CacheWriterGeneration.SessionToken?
     private var loadTask: Task<Void, Never>?
+    /// The number of page loads that started and that ended, so a test joins every load, also one that a newer load
+    /// replaced.
+    package private(set) var startedLoadCount = 0
+    package private(set) var finishedLoadCount = 0
     private var metadataTask: Task<Void, Never>?
     private var albumMembershipTask: Task<Void, Never>?
     private var placeTask: Task<Void, Never>?
@@ -588,7 +592,9 @@ public final class PhotoViewerModel {
         }
         isSharp = false
 
+        startedLoadCount += 1
         loadTask = Task {
+            defer { self.finishedLoadCount += 1 }
             try? await Task.sleep(for: .milliseconds(160))  // debounce: skip work for photos flicked past
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
 
@@ -849,7 +855,8 @@ public final class PhotoViewerModel {
             } else {
                 requestedSharpPixelSize = loadedSharpPixelSize
                 originalLoadFailed = expecting != .video
-                video.fail(.streamURLUnavailable, uid: item.uid)
+                // A host with a streamer got here, so a later fetch or decode can still succeed: keep Retry.
+                video.fail(.unknown(detail: "originalDecodeFailed"), uid: item.uid)
                 logViewer(item, strategy: "streamRequired", kind: .video)
             }
         } catch is CancellationError {

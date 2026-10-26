@@ -2430,6 +2430,24 @@
         }
       }
     },
+    "error.video.malformed_content": {
+      "extractionState": "manual",
+      "comment": "The stored description of the video contradicts itself; a new attempt does not change it.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This video’s data is damaged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Daten dieses Videos sind beschädigt."
+          }
+        }
+      }
+    },
     "error.video.network_unavailable": {
       "extractionState": "manual",
       "comment": "Network/transport error.",

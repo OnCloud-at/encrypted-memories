@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import PhotosCore
 import Testing
@@ -126,6 +127,19 @@ struct VideoPlaybackTests {
         let codec = NSError(domain: "AVFoundationErrorDomain", code: -11828)
         #expect(VideoPlaybackError.classify(codec) == .unsupportedCodec)
         #expect(VideoPlaybackError.unsupportedCodec.isRetryable == false)
+    }
+
+    @Test func aDecoderThatIsTemporarilyUnavailableKeepsRetry() {
+        // The numeric codes come from AVFoundation, so a change of the SDK shows here.
+        let temporary = NSError(
+            domain: AVFoundationErrorDomain, code: AVError.Code.decoderTemporarilyUnavailable.rawValue)
+        let classified = VideoPlaybackError.classify(temporary)
+        #expect(classified != .unsupportedCodec)
+        #expect(classified.isRetryable)
+        for code in [AVError.Code.fileFormatNotRecognized, .fileFailedToParse, .decoderNotFound] {
+            let permanent = NSError(domain: AVFoundationErrorDomain, code: code.rawValue)
+            #expect(VideoPlaybackError.classify(permanent) == .unsupportedCodec)
+        }
     }
 
     @Test func mapsHTTPStatusErrors() {
