@@ -1,4 +1,5 @@
 import DesignSystemCore
+import PhotosCore
 import SwiftUI
 import UploadCore
 
@@ -28,14 +29,21 @@ public struct BackupProblemSections<Row: View>: View {
 public struct BackupProblemRow<Actions: View>: View {
     private let item: BackupFailedItem
     private let actions: Actions
+    private let previews: BackupProblemPreviewModel?
 
-    public init(item: BackupFailedItem, @ViewBuilder actions: () -> Actions) {
+    public init(
+        item: BackupFailedItem, previews: BackupProblemPreviewModel? = nil, @ViewBuilder actions: () -> Actions
+    ) {
         self.item = item
         self.actions = actions()
+        self.previews = previews
     }
 
     public var body: some View {
         HStack(alignment: .top, spacing: rowSpacing) {
+            if let previews, let uid = BackupProblemPreviewModel.uid(for: item.source) {
+                LocalPhotoThumbnail(uid: uid) { await previews.thumbnail(for: $0) }
+            }
             Image(systemName: item.category.symbolName)
                 .foregroundStyle(item.isPermanent ? detailColor : .orange)
                 #if os(iOS)
@@ -84,7 +92,15 @@ public struct BackupProblemRow<Actions: View>: View {
 }
 
 extension BackupProblemRow where Actions == EmptyView {
-    public init(item: BackupFailedItem) {
-        self.init(item: item) { EmptyView() }
+    public init(item: BackupFailedItem, previews: BackupProblemPreviewModel? = nil) {
+        self.init(item: item, previews: previews) { EmptyView() }
+    }
+}
+
+public extension View {
+    /// The list owns preview registrations and admitted loads only while it is visible.
+    func backupProblemPreviews(_ previews: BackupProblemPreviewModel) -> some View {
+        onAppear { previews.open() }
+            .onDisappear { previews.close() }
     }
 }

@@ -505,6 +505,7 @@ struct MobileFailedBackupSheet: View {
     let source: Source
     @Environment(\.dismiss) private var dismiss
     @State private var problemList = BackupProblemListModel()
+    @State private var previews = Self.makePreviews()
     @State private var deletionItem: BackupFailedItem?
     @State private var personReadTask: Task<Void, Never>?
     @State private var readOrder = BackupProblemListReadOrder()
@@ -515,6 +516,20 @@ struct MobileFailedBackupSheet: View {
 
     init(albumSync: AlbumSyncController, albumID: String) {
         source = .album(albumSync, albumID: albumID)
+    }
+
+    private static func makePreviews() -> BackupProblemPreviewModel {
+        #if DEBUG
+            if MobileUITestLaunch.isRequested {
+                return BackupProblemPreviewModel { uid in
+                    await MobileSignedInFixture.backupProblemThumbnail(for: uid)
+                }
+            }
+        #endif
+        return BackupProblemPreviewModel(
+            load: PhotoKitLocalThumbnailLoader.problemListPreviews(
+                request: PhotoKitPlatformImages.request
+            ).listThumbnail(for:))
     }
 
     private var controller: PhotoLibraryBackupController? {
@@ -550,7 +565,7 @@ struct MobileFailedBackupSheet: View {
                 case .list:
                     List {
                         BackupProblemSections(items: items) { item in
-                            BackupProblemRow(item: item)
+                            BackupProblemRow(item: item, previews: previews)
                                 .contentShape(Rectangle())
                                 .onTapGesture {
                                     if offersDecision(item) { deletionItem = item }
@@ -619,6 +634,7 @@ struct MobileFailedBackupSheet: View {
             await controller.followProblemList(
                 order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
         }
+        .backupProblemPreviews(previews)
         .onDisappear { personReadTask?.cancel() }
     }
 

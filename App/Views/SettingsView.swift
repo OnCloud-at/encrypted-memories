@@ -813,6 +813,10 @@ private struct MacFailedBackupSheet: View {
     let source: Source
     @Environment(\.dismiss) private var dismiss
     @State private var problemList = BackupProblemListModel()
+    @State private var previews = BackupProblemPreviewModel(
+        load: PhotoKitLocalThumbnailLoader.problemListPreviews(
+            request: PhotoKitPlatformImages.request
+        ).listThumbnail(for:))
     @State private var personReadTask: Task<Void, Never>?
     @State private var readOrder = BackupProblemListReadOrder()
 
@@ -881,7 +885,7 @@ private struct MacFailedBackupSheet: View {
             case .list:
                 List {
                     BackupProblemSections(items: items) { item in
-                        BackupProblemRow(item: item) {
+                        BackupProblemRow(item: item, previews: previews) {
                             if let controller, item.issue == .deletedElsewhere {
                                 Button(L10n.string("backup.keep_deleted")) {
                                     controller.keepDeleted(item)
@@ -925,6 +929,7 @@ private struct MacFailedBackupSheet: View {
             await controller.followProblemList(
                 order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
         }
+        .backupProblemPreviews(previews)
         .onDisappear { personReadTask?.cancel() }
     }
 
