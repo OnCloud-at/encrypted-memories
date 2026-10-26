@@ -71,11 +71,21 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
         }
     }
 
-    /// Whether it's worth offering a "Retry" affordance (transient failures) vs. a hard "no" (codec).
+    /// Whether a "Retry" can work. A fixed answer of the file or the backend (codec, no stream, no byte ranges, a block
+    /// that does not decrypt) does not change when the person asks again, so it offers none.
     public var isRetryable: Bool {
         switch self {
-        case .unsupportedCodec, .notVideo: return false
+        case .unsupportedCodec, .notVideo, .streamURLUnavailable, .rangeNotSupported, .decryptionFailed: return false
         default: return true
+        }
+    }
+
+    /// The waits before the silent retries of a failure that goes away by itself. The viewer keeps its loading
+    /// indicator during these waits and shows the failure only when the last retry fails too.
+    public var silentRetryDelays: [Duration] {
+        switch self {
+        case .quotaOrRateLimited: return [.seconds(3), .seconds(8), .seconds(20)]
+        default: return []
         }
     }
 }

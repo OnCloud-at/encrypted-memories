@@ -2473,13 +2473,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Too many requests. Please try again later."
+            "value": "Proton is busy right now."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Zu viele Anfragen. Bitte später erneut versuchen."
+            "value": "Proton ist gerade ausgelastet."
           }
         }
       }
