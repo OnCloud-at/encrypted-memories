@@ -321,7 +321,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     private func applyAuthAndHeaders(_ req: inout URLRequest, headers: [(String, [String])]) -> UInt64 {
         let auth = driveSession.authorization()
         for (k, v) in auth.headers { req.setValue(v, forHTTPHeaderField: k) }
-        applyHeaders(&req, headers: headers)
+        // Supplied headers cannot replace the session credentials that the returned generation describes.
+        applyHeaders(&req, headers: headers.filter { !["authorization", "x-pm-uid"].contains($0.0.lowercased()) })
         return auth.generation
     }
 

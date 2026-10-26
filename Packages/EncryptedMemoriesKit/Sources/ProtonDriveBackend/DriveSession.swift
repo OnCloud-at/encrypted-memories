@@ -157,11 +157,11 @@ final class DriveSession: @unchecked Sendable {
 
     // MARK: - Token refresh
 
-    /// True when credentials newer than `generation` exist: at once if another request already replaced them,
-    /// otherwise after joining or starting the one refresh in flight.
+    /// True when credentials newer than `generation` exist. Current credentials join the one refresh in flight
+    /// or start it. Replaced credentials never start a refresh: they wait for a running one, else retry at once.
     func refreshToken(after generation: UInt64) async -> Bool {
         let flight: (id: UInt64, task: Task<Bool, Never>)? = lock.withLock {
-            guard generation == credentialGeneration else { return nil }
+            guard generation == credentialGeneration else { return refreshFlight.running }
             return refreshFlight.join { Task<Bool, Never> { await self.performRefresh() } }
         }
         guard let flight else { return true }
@@ -219,6 +219,7 @@ struct RefreshFlight {
     private var current: (id: UInt64, task: Task<Bool, Never>)?
     private var lastID: UInt64 = 0
 
+    var running: (id: UInt64, task: Task<Bool, Never>)? { current }
     var id: UInt64? { current?.id }
 
     mutating func join(starting start: () -> Task<Bool, Never>) -> (id: UInt64, task: Task<Bool, Never>) {
