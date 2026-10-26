@@ -106,6 +106,10 @@ public final class PhotoViewerModel {
     private let sessionCache: ThumbnailCache?
     private let sessionLease: CacheWriterGeneration.SessionToken?
     private var loadTask: Task<Void, Never>?
+    /// The number of page loads that started and that ended, so a test joins every load, also one that a newer load
+    /// replaced.
+    package private(set) var startedLoadCount = 0
+    package private(set) var finishedLoadCount = 0
     private var metadataTask: Task<Void, Never>?
     private var albumMembershipTask: Task<Void, Never>?
     private var placeTask: Task<Void, Never>?
@@ -115,6 +119,10 @@ public final class PhotoViewerModel {
     private var originalLoadGeneration: UInt64 = 0
     private var burstSelection = BurstSelectionModel()
     private let editedOriginalProvider: (any EditedPhotoOriginalProviding)?
+    /// The waits before the silent retries of a video failure; the failure shows only after the last retry fails too.
+    private let silentRetryDelays: (VideoPlaybackError) -> [Duration]
+    /// Waits out one silent retry delay; a cancelled viewer ends the wait early.
+    private let silentRetryWait: (Duration) async -> Void
     private let editedOriginalLookup = EditedPhotoOriginalLookup()
     /// The originals of edited photos that this viewer found, and whether the page shows one.
     public private(set) var editedOriginal = EditedPhotoOriginalState()
@@ -133,8 +141,12 @@ public final class PhotoViewerModel {
         previewCache: ThumbnailCache? = nil, originalsCache: ThumbnailCache? = nil,
         cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
         allowsVisibleDuplicateThumbnails: Bool = false,
-        editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil
+        editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil,
+        silentRetryDelays: @escaping (VideoPlaybackError) -> [Duration] = { $0.silentRetryDelays },
+        silentRetryWait: @escaping (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
+        self.silentRetryDelays = silentRetryDelays
+        self.silentRetryWait = silentRetryWait
         self.items = items
         self.index = index
         self.pageIndex = ViewerPageIndex(orderedUIDs: items.map(\.uid))
@@ -580,7 +592,9 @@ public final class PhotoViewerModel {
         }
         isSharp = false
 
+        startedLoadCount += 1
         loadTask = Task {
+            defer { self.finishedLoadCount += 1 }
             try? await Task.sleep(for: .milliseconds(160))  // debounce: skip work for photos flicked past
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
 
@@ -667,7 +681,25 @@ public final class PhotoViewerModel {
     /// MIME type, so the streaming probe performs a lightweight metadata check and rejects images before key
     /// setup. Videos then use byte-range streaming while images continue through the original-data path.
     private func resolveMedia(for item: PhotoItem, needsDisplayFallback: Bool) async {
-        guard sessionIsCurrent() else { return }
+        var silentRetries = 0
+        while let delay = await resolveMediaOnce(
+            for: item, needsDisplayFallback: needsDisplayFallback, silentRetries: silentRetries)
+        {
+            // The failure goes away by itself, for example a rate limit: wait behind the loading indicator and ask
+            // again. A new load of the viewer cancels this task, and so does the next item.
+            video.setResolving()
+            await silentRetryWait(delay)
+            guard !Task.isCancelled, isDisplaying(item), sessionIsCurrent() else { return }
+            silentRetries += 1
+        }
+    }
+
+    /// One attempt to resolve the media. Returns the wait before another attempt when the video failure should be
+    /// retried silently, otherwise nil.
+    private func resolveMediaOnce(
+        for item: PhotoItem, needsDisplayFallback: Bool, silentRetries: Int
+    ) async -> Duration? {
+        guard sessionIsCurrent() else { return nil }
         let shouldLoadBoundedStill = item.isLivePhoto || needsDisplayFallback
         guard let streamer else {
             if item.isVideo {
@@ -680,7 +712,7 @@ public final class PhotoViewerModel {
                     useOfflineOriginalCache: needsDisplayFallback
                 )
             }
-            return
+            return nil
         }
         video.setResolving()
         logViewer(item, strategy: "resolving", kind: nil)
@@ -690,14 +722,14 @@ public final class PhotoViewerModel {
             let stream = try await streamer.makeStreamingAsset(for: item.uid)
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else {
                 stream.close()
-                return
+                return nil
             }
             isLoadingOriginal = false
             logViewer(item, strategy: "range", kind: .video)
             video.playStreaming(asset: stream.asset, retaining: stream, uid: item.uid)
         } catch is VideoStreamError {
             // A non-video server MIME uses the image path.
-            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
+            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return nil }
             video.reset()
             logViewer(item, strategy: "image", kind: .image)
             if shouldLoadBoundedStill {
@@ -711,10 +743,12 @@ public final class PhotoViewerModel {
         } catch {
             // A real video (or unknown) whose stream setup failed stays failed rather than writing a
             // decrypted full-video temp file.
-            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
+            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return nil }
             video.reset()
             if item.isVideo {
-                video.fail(VideoPlaybackError.classify(error), uid: item.uid)
+                let failure = VideoPlaybackError.classify(error)
+                if let delay = silentRetryDelays(failure).dropFirst(silentRetries).first { return delay }
+                video.fail(failure, uid: item.uid)
             } else if shouldLoadBoundedStill {
                 await loadOriginalBytes(
                     for: item,
@@ -724,6 +758,7 @@ public final class PhotoViewerModel {
                 )
             }
         }
+        return nil
     }
 
     private enum Expecting: Equatable { case unknown, image, video }
@@ -820,7 +855,8 @@ public final class PhotoViewerModel {
             } else {
                 requestedSharpPixelSize = loadedSharpPixelSize
                 originalLoadFailed = expecting != .video
-                video.fail(.streamURLUnavailable, uid: item.uid)
+                // A host with a streamer got here, so a later fetch or decode can still succeed: keep Retry.
+                video.fail(.unknown(detail: "originalDecodeFailed"), uid: item.uid)
                 logViewer(item, strategy: "streamRequired", kind: .video)
             }
         } catch is CancellationError {
@@ -901,7 +937,6 @@ public final class PhotoViewerModel {
         PhotoDiagnostics.shared.emit(
             "VideoViewer",
             videoViewerLogFields(
-                uid: item.uid,
                 mime: item.mediaType,
                 detectedKind: kind,
                 state: videoState,

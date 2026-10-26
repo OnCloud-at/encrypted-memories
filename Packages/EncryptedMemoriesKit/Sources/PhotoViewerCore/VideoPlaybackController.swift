@@ -42,6 +42,9 @@ public final class VideoPlaybackController {
     private var isStreaming = false
     private var hasStartedPlayback = false
     private var attachmentGeneration: UInt64 = 0
+    /// The number of players that were ever attached. It only grows, so a test sees an attachment that a later
+    /// teardown removed again.
+    package private(set) var attachedPlayerCount = 0
     private var attachmentIdentity: VideoPlaybackAttachmentIdentity?
     private var playbackActivity: LibraryRuntimeActivityRegistration?
     private let runtimeState: LibraryRuntimeState
@@ -98,6 +101,7 @@ public final class VideoPlaybackController {
 
     private func attach(_ item: AVPlayerItem, uid: PhotoUID, initial: VideoViewerState) {
         hasStartedPlayback = false
+        attachedPlayerCount += 1
         let player = AVPlayer(playerItem: item)
         VideoPlaybackTuning.configure(player: player, item: item, isStreaming: isStreaming)
         attachmentGeneration &+= 1

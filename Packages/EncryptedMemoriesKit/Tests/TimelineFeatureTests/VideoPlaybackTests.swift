@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import PhotosCore
 import Testing
@@ -128,17 +129,34 @@ struct VideoPlaybackTests {
         #expect(VideoPlaybackError.unsupportedCodec.isRetryable == false)
     }
 
+    @Test func aDecoderThatIsTemporarilyUnavailableKeepsRetry() {
+        // The numeric codes come from AVFoundation, so a change of the SDK shows here.
+        let temporary = NSError(
+            domain: AVFoundationErrorDomain, code: AVError.Code.decoderTemporarilyUnavailable.rawValue)
+        let classified = VideoPlaybackError.classify(temporary)
+        #expect(classified != .unsupportedCodec)
+        #expect(classified.isRetryable)
+        for code in [AVError.Code.fileFormatNotRecognized, .fileFailedToParse, .decoderNotFound] {
+            let permanent = NSError(domain: AVFoundationErrorDomain, code: code.rawValue)
+            #expect(VideoPlaybackError.classify(permanent) == .unsupportedCodec)
+        }
+    }
+
     @Test func mapsHTTPStatusErrors() {
         #expect(VideoPlaybackError.classify(apiError(401)) == .authExpired)
         #expect(VideoPlaybackError.classify(apiError(429)) == .quotaOrRateLimited)
         #expect(VideoPlaybackError.classify(apiError(416)) == .rangeNotSupported)
     }
 
-    @Test func mapsDecryptionErrors() {
-        let decrypt = NSError(
+    @Test func decryptionFailureComesFromTheTypeOfTheErrorNotFromItsText() {
+        struct Typed: VideoPlaybackClassifiable {
+            var videoPlaybackError: VideoPlaybackError? { .decryptionFailed }
+        }
+        let text = NSError(
             domain: "Custom", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "block decrypt failed"])
-        #expect(VideoPlaybackError.classify(decrypt) == .decryptionFailed)
+        #expect(VideoPlaybackError.classify(Typed()) == .decryptionFailed)
+        #expect(VideoPlaybackError.classify(text) != .decryptionFailed)
     }
 
     @Test func everyTerminalStatusLeavesLoading() {
