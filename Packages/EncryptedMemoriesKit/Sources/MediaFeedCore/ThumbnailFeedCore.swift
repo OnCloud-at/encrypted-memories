@@ -2142,8 +2142,10 @@ public actor ThumbnailFeedCore {
         workerTask = nil
         workersRunning = false
         // A wake that ran before this stop found the workers still running, so the remaining crawl restarts here: the
-        // rest of the library, or photos withheld for a retry.
-        let crawlRemains = sequentialIndex < sequential.count || (prefetchEnabled && !withheldRetry.isEmpty)
+        // rest of the library, photos withheld for a retry, or an end-of-crawl coverage check that a hold stopped.
+        let crawlRemains =
+            sequentialIndex < sequential.count || (prefetchEnabled && !withheldRetry.isEmpty)
+            || (prefetchEnabled && !sequential.isEmpty && !coverageSettled)
         // Workers of a session that ended would stop at once again; the new session's feed starts its own.
         guard ownerLeaseIsCurrent() else { return }
         if !priority.isEmpty || (crawlRemains && crawlWakeTask == nil) { startWorkers() }
@@ -2245,7 +2247,8 @@ public actor ThumbnailFeedCore {
                     try? await Task.sleep(for: .milliseconds(60))
                 }
                 guard !Task.isCancelled, generation == prefetchGeneration, ownerLeaseIsCurrent() else { return }
-                windowPermit = await backgroundWindowPermit()
+                // A photo on screen that arrived during the slot wait loads without the crawl's permit, as at the top.
+                windowPermit = priority.isEmpty ? await backgroundWindowPermit() : nil
                 #if DEBUG
                     await windowPermitReturnHookForTesting?()
                 #endif
