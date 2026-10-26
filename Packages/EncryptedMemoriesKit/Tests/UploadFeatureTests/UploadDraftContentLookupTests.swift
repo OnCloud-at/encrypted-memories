@@ -533,11 +533,36 @@ final class UploadDraftContentLookupTests: XCTestCase {
         XCTAssertEqual(retried.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
     }
 
+    func testReplacementContentProofIsReusedBeforeAdoption() async throws {
+        let harness = try EditScenarioHarness()
+        defer { try? harness.cleanup() }
+        let source = try XCTUnwrap(harness.library.snapshot.first).source
+        let descriptor = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/fixture/current.heic"), filename: "current.heic",
+            fileSize: 20, modificationDate: harness.clock.now, precomputedSHA1Digest: Data(repeating: 1, count: 20))
+        let retired = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
+        try harness.journal.addSuperseded(retired, for: source)
+        try harness.journal.settle([retired.nodeID], related: [], trashed: true, for: source)
+        harness.server.setVisibility(.init(isActive: false, mainPhotoLinkID: nil), for: retired.nodeID)
+        let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let pipeline = UploadDedupePipeline(
+            store: harness.identities, checker: harness.server, currentClientUID: "this-uploader",
+            replacementJournal: harness.journal)
+        let before = harness.server.readCounts.visibility
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: active.nodeID))
+        XCTAssertEqual(harness.identities.record(for: source)?.remoteLinkID, active.nodeID)
+        // One name-pass read of the retired target, then one content-pass proof. Adoption reuses that proof.
+        XCTAssertEqual(harness.server.readCounts.visibility, before + 2)
+    }
+
     func testFirstBatchVisibilityFailureKeepsTheDraftInsteadOfAdoptingTheSecondBatch() async throws {
         try await assertBatchedVisibilityFailure(blocked: true)
     }
 
-    func testNormalContentPassKeepsItsFailOpenVisibilityBehaviorAcrossBatches() async throws {
+    func testNormalContentPassFailsClosedOnAFailedCandidateRead() async throws {
         try await assertBatchedVisibilityFailure(blocked: false)
     }
 

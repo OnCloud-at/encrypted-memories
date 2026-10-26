@@ -492,14 +492,21 @@ extension DriveSession {
     /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
     /// The state and the main photo of each link. A link that the server no longer knows is absent from the result.
     /// `retryOnRateLimit` false answers a rate limit with an error at once, for a read that has a cheaper fallback.
+    /// `requiresCompleteResponse` true throws on an answer that is not complete: there, an omitted link and a
+    /// deleted link look the same.
     func fetchLinkVisibility(
-        shareID: String, linkIDs: [String], retryOnRateLimit: Bool = true
+        shareID: String, linkIDs: [String], retryOnRateLimit: Bool = true, requiresCompleteResponse: Bool = false
     ) async throws -> [String: TimelineRemoteVisibilityRequirement.Link] {
         var result: [String: TimelineRemoteVisibilityRequirement.Link] = [:]
         for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let response = try await linkVisibilityResponse(
                 shareID: shareID, linkIDs: chunk, retryOnRateLimit: retryOnRateLimit)
+            if requiresCompleteResponse {
+                guard response.code == 1000, response.envelope.isComplete else {
+                    throw UploadError.backend("The link visibility response is incomplete")
+                }
+            }
             for link in response.links {
                 guard let id = link.linkID else { continue }
                 result[id] = .init(

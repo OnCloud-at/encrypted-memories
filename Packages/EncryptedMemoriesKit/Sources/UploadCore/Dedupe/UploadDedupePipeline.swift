@@ -396,6 +396,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                             // a state read of this check says that the copy is active.
                             if item.linkState == .active, let linkID = item.linkID, !linkID.isEmpty {
                                 guard try await isActiveInThisCheck(linkID, reads: &relatedReads) else { continue }
+                                // A root photo is backed up only by a main photo, not by another photo's related file.
+                                if isRoot && replacement.isEmpty && !blockedByDraft {
+                                    guard relatedReads.visibility[linkID]?.isActiveMain == true else { continue }
+                                }
                             }
                             adopted = item
                             break
@@ -760,6 +764,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             visibility = optional
         } else {
             visibility = try await checker.linkVisibility(of: asked.sorted())
+            relatedReads.askedLinks.formUnion(asked)
+            relatedReads.visibility.merge(visibility) { _, new in new }
         }
         try Task.checkCancellation()
         func isLiveMain(_ linkID: String) -> Bool {

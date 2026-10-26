@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import ProtonAuth
+import ProtonDriveSDK
 import Testing
 import UploadCore
 
@@ -129,9 +130,23 @@ private func makeSession() -> DriveSession {
     )
 }
 
+private struct VisibilityOnlySDK: SDKPhotoDuplicatesClient {
+    func findPhotoDuplicates(name: String, sha1: Data, cancellationToken: UUID) async throws -> [SDKNodeUid] {
+        throw UploadCore.UploadError.backend("A visibility read must not query SDK duplicates")
+    }
+    func cancelFindPhotoDuplicates(cancellationToken: UUID) async throws {}
+}
+
 private struct DecodedVisibilityChecker: UploadDuplicateChecking {
     let session: DriveSession
     let blocked: Bool
+    let visibilityService: ProtonUploadDedupeService?
+
+    init(session: DriveSession, blocked: Bool, visibilityService: ProtonUploadDedupeService? = nil) {
+        self.session = session
+        self.blocked = blocked
+        self.visibilityService = visibilityService
+    }
 
     func hashKeyEpoch() async throws -> String { "epoch" }
     func nameHash(forCorrectedName name: String) async throws -> String { "name" }
@@ -150,7 +165,8 @@ private struct DecodedVisibilityChecker: UploadDuplicateChecking {
     }
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> { [] }
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
-        try await session.fetchLinkVisibility(shareID: "share1", linkIDs: linkIDs)
+        if let visibilityService { return try await visibilityService.linkVisibility(of: linkIDs) }
+        return try await session.fetchLinkVisibility(shareID: "share1", linkIDs: linkIDs)
     }
 }
 
@@ -401,6 +417,62 @@ extension DriveSessionStubSuite {
             let paths = StubURLProtocol.requests().map(\.path)
             #expect(paths.first?.hasPrefix("/drive/volumes/vol1/trash?Page=0") == true)
             #expect(paths.contains("/drive/shares/share1/links/fetch_metadata"))
+        }
+
+        @Test func defaultVisibilityKeepsItsPartialEnvelopeBehavior() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"{"Code":2000,"Links":[{"LinkID":"photo","State":1}],"Partial":true}"#)
+
+            let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["photo"])
+
+            #expect(links["photo"]?.isActive == true)
+            #expect(links["photo"]?.hasExplicitPhotoState == false)
+        }
+
+        @Test(arguments: [
+            #"{"Code":1000,"Links":[],"Partial":true}"#,
+            #"{"Code":2000,"Links":[]}"#,
+        ])
+        func dedupeRejectsIncompleteVisibilityBeforeReturningAnUpload(response: String) async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: response)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let store = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("manifest.sqlite")))
+            defer { store.close() }
+            let session = makeSession()
+            let service = ProtonUploadDedupeService(
+                session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
+                photosClient: VisibilityOnlySDK(), contentIndexStore: store,
+                material: .init(
+                    context: .init(volumeID: "vol", shareID: "share1", rootLinkID: "root"),
+                    rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
+                contextProvider: { throw UploadCore.UploadError.backend("The test material must be reused") })
+            let pipeline = UploadDedupePipeline(
+                store: store,
+                checker: DecodedVisibilityChecker(session: session, blocked: false, visibilityService: service))
+            let file = directory.appendingPathComponent("current.heic")
+            let descriptor = UploadResourceDescriptor(
+                source: .file(file), fileURL: file, filename: "current.heic", fileSize: 20,
+                modificationDate: Date(timeIntervalSince1970: 1_720_000_000),
+                precomputedSHA1Digest: Data(repeating: 1, count: 20))
+
+            do {
+                let result = try await pipeline.resolve(descriptor)
+                Issue.record(
+                    "An incomplete visibility response must throw before returning an upload: \(result.decision)")
+                await pipeline.uploadDidFail(descriptor)
+            } catch {
+                #expect(error as? UploadCore.UploadError == .backend("The link visibility response is incomplete"))
+            }
+
+            #expect(store.record(for: descriptor.source)?.remoteLinkID == nil)
+            #expect(store.record(for: descriptor.source)?.outcome == nil)
+            #expect(StubURLProtocol.requests().allSatisfy { $0.path == "/drive/shares/share1/links/fetch_metadata" })
         }
 
         @Test func linkVisibilityReadsTheStateAndTheMainPhoto() async throws {

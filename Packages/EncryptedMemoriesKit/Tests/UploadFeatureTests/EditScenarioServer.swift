@@ -74,6 +74,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var visibilityOverrides: [String: RemoteLinkVisibility] = [:]
     private var visibilityAfterContentLookup: [String: RemoteLinkVisibility] = [:]
     private var cancelContentCaller = false
+    private var cancelVisibilityCaller = false
     private var includeInactiveContent = false
     private var failTrash = false
     enum LineageRead: Sendable, Equatable { case identity, successors, ancestry, external }
@@ -113,6 +114,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         lock.withLock { visibilityAfterContentLookup[linkID] = visibility }
     }
     func cancelCallerAtContentLookup(_ enabled: Bool) { lock.withLock { cancelContentCaller = enabled } }
+    func cancelCallerAtVisibility(_ enabled: Bool) { lock.withLock { cancelVisibilityCaller = enabled } }
     var contentLookupCount: Int { lock.withLock { contentQueries } }
     func setVisibilityError(_ error: (any Error)?, whenAskingFor linkID: String) {
         lock.withLock { visibilityErrors[linkID] = error }
@@ -539,6 +541,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         guard !linkIDs.isEmpty else { return [:] }
+        if lock.withLock({ cancelVisibilityCaller }) { withUnsafeCurrentTask { $0?.cancel() } }
         return try lock.withLock {
             counted.visibility += 1
             for linkID in linkIDs {
