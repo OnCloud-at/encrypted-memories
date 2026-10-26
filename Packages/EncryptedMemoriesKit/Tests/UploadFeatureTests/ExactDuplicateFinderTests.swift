@@ -3843,19 +3843,81 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(store.record(for: otherBytes)?.remoteLinkID, "link-dup")
     }
 
-    /// The plan reads the group's link states once, at the first unreadable member, and reuses the answer (#794).
-    func testThreeUnreadableDuplicatesReadTheGroupStatesOnce() async throws {
-        let kept = server.seedLink(digest: digest("unreadable"))
+    /// Three duplicates whose details cannot be read, under a kept photo and a counting checker (#794).
+    private func unreadableGroup(
+        _ tag: String
+    ) async throws -> (group: ExactDuplicateGroup, kept: PhotoUID, unreadable: [PhotoUID], reads: VisibilityReadLog) {
+        let kept = server.seedLink(digest: digest(tag))
         server.setFavorite(true, of: kept)
-        let unreadable = (0..<3).map { _ in server.seedLink(digest: digest("unreadable")) }
+        let unreadable = (0..<3).map { _ in server.seedLink(digest: digest(tag)) }
         indexServer()
-        let group = try await onlyGroup()
-        let groupLinks = Set(group.members.map(\.nodeID))
+        return (try await onlyGroup(), kept, unreadable, VisibilityReadLog())
+    }
+
+    private func unreadableChecker(_ unreadable: [PhotoUID], reads: VisibilityReadLog) -> CopyBoundaryChecker {
         let unreadableLinks = Set(unreadable.map(\.nodeID))
-        let reads = VisibilityReadLog()
         var checker = CopyBoundaryChecker(base: server)
         checker.compoundRewrite = { linkID, read in unreadableLinks.contains(linkID) ? nil : read }
         checker.visibilityRead = { reads.record($0) }
+        return checker
+    }
+
+    private func groupReads(_ reads: VisibilityReadLog, of group: ExactDuplicateGroup) -> Int {
+        reads.calls.filter { Set($0) == Set(group.members.map(\.nodeID)) }.count
+    }
+
+    /// The plan reads the group's link states once before its members and once more at the first unreadable member.
+    /// A complete answer stands for the later unreadable members.
+    func testThreeUnreadableDuplicatesReadTheGroupStatesOnce() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("unreadable")
+
+        let outcome = try await finder(checker: unreadableChecker(unreadable, reads: reads))
+            .merge(group, keeping: kept)
+
+        XCTAssertEqual(
+            outcome,
+            ExactDuplicateMergeOutcome.merged(
+                kept: kept, trashed: [],
+                keptDuplicates: Dictionary(uniqueKeysWithValues: unreadable.map { ($0, .unreadable) })))
+        XCTAssertEqual(groupReads(reads, of: group), 2, "one read before the members and one at the first unreadable")
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+    }
+
+    /// An answer that omits a member cannot stand for the later unreadable members: the next one reads again.
+    func testAnIncompleteAnswerLetsTheNextUnreadableDuplicateReadAgain() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("incomplete")
+        let base = try XCTUnwrap(server)
+        var checker = unreadableChecker(unreadable, reads: reads)
+        let groupLinks = Set(group.members.map(\.nodeID))
+        let omitted = unreadable[2].nodeID
+        checker.visibilityRewrite = { linkIDs, answer in
+            guard Set(linkIDs) == groupLinks, reads.calls.filter({ Set($0) == groupLinks }).count == 2 else {
+                return answer
+            }
+            // The first reconciliation answer omits one member; then the person removes every other copy.
+            for link in unreadable { base.personTrash(link) }
+            return answer.filter { $0.key != omitted }
+        }
+
+        let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, ExactDuplicateMergeOutcome.skipped(.noDuplicateLeft))
+        XCTAssertEqual(groupReads(reads, of: group), 3)
+    }
+
+    /// Documented limit: a removal after a complete reconciliation answer is not seen by the same plan. The merge
+    /// keeps the three copies as unreadable and trashes nothing; the next load shows the removal.
+    func testARemovalAfterACompleteAnswerIsSeenOnlyByTheNextPlan() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("late-removal")
+        let base = try XCTUnwrap(server)
+        var checker = unreadableChecker(unreadable, reads: reads)
+        let groupLinks = Set(group.members.map(\.nodeID))
+        checker.visibilityRewrite = { linkIDs, answer in
+            if Set(linkIDs) == groupLinks, reads.calls.filter({ Set($0) == groupLinks }).count == 2 {
+                for link in unreadable { base.personTrash(link) }
+            }
+            return answer
+        }
 
         let outcome = try await finder(checker: checker).merge(group, keeping: kept)
 
@@ -3864,34 +3926,57 @@ final class ExactDuplicateFinderTests: XCTestCase {
             ExactDuplicateMergeOutcome.merged(
                 kept: kept, trashed: [],
                 keptDuplicates: Dictionary(uniqueKeysWithValues: unreadable.map { ($0, .unreadable) })))
-        XCTAssertEqual(
-            reads.calls.filter { Set($0) == groupLinks }.count, 2,
-            "one read before the plan and one at the first unreadable member")
+        XCTAssertEqual(groupReads(reads, of: group), 2)
         XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
     }
 
-    /// The same single read still ends the plan when the person removed every other copy meanwhile.
-    func testAnUnreadableDuplicateThatLeftTheLibraryMeanwhileEndsThePlan() async throws {
-        let kept = server.seedLink(digest: digest("left"))
-        server.setFavorite(true, of: kept)
-        let unreadable = (0..<3).map { _ in server.seedLink(digest: digest("left")) }
-        indexServer()
-        let group = try await onlyGroup()
-        let unreadableLinks = Set(unreadable.map(\.nodeID))
+    /// A removal before the first reconciliation read still ends the plan.
+    func testARemovalBeforeTheFirstReconciliationReadEndsThePlan() async throws {
+        let (group, kept, unreadable, reads) = try await unreadableGroup("left")
         let base = try XCTUnwrap(server)
-        let reads = VisibilityReadLog()
-        var checker = CopyBoundaryChecker(base: base)
+        let unreadableLinks = Set(unreadable.map(\.nodeID))
+        var checker = unreadableChecker(unreadable, reads: reads)
         checker.compoundRewrite = { linkID, read in
             guard unreadableLinks.contains(linkID) else { return read }
             for link in unreadable { base.personTrash(link) }
             return nil
         }
-        checker.visibilityRead = { reads.record($0) }
 
         let outcome = try await finder(checker: checker).merge(group, keeping: kept)
 
         XCTAssertEqual(outcome, ExactDuplicateMergeOutcome.skipped(.noDuplicateLeft))
-        XCTAssertEqual(reads.calls.filter { Set($0) == Set(group.members.map(\.nodeID)) }.count, 2)
+        XCTAssertEqual(groupReads(reads, of: group), 2)
+    }
+
+    /// Every group of one merge batch reads its own link states at its own first unreadable member.
+    func testEachGroupOfABatchReadsItsOwnLinkStates() async throws {
+        var groups: [(kept: PhotoUID, unreadable: [PhotoUID])] = []
+        for tag in ["first", "second"] {
+            let kept = server.seedLink(digest: digest(tag))
+            server.setFavorite(true, of: kept)
+            groups.append((kept, (0..<3).map { _ in server.seedLink(digest: digest(tag)) }))
+        }
+        indexServer()
+        let scanned = try await finder.duplicateGroups().groups
+        XCTAssertEqual(scanned.count, 2)
+        let reads = VisibilityReadLog()
+        let checker = unreadableChecker(groups.flatMap(\.unreadable), reads: reads)
+        let requests = try groups.map { entry in
+            let group = try XCTUnwrap(scanned.first { $0.members.contains(entry.kept) })
+            return ExactDuplicateMergeRequest(group: group, kept: entry.kept, isKeptChosen: true)
+        }
+
+        let outcomes = await finder(checker: checker).merge(requests)
+
+        XCTAssertEqual(outcomes.count, groups.count)
+        for (index, entry) in groups.enumerated() {
+            XCTAssertEqual(groupReads(reads, of: requests[index].group), 2)
+            XCTAssertEqual(
+                try outcomes[index].get(),
+                ExactDuplicateMergeOutcome.merged(
+                    kept: entry.kept, trashed: [],
+                    keptDuplicates: Dictionary(uniqueKeysWithValues: entry.unreadable.map { ($0, .unreadable) })))
+        }
     }
 
     func testARetryAfterAFailedTrashRepeatsNoWriteAndLosesNothing() async throws {
@@ -5185,6 +5270,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
     var compoundRewrite: (@Sendable (String, UploadRemoteCompound?) -> UploadRemoteCompound?)?
     /// Observes every link-state read, for example to count them.
     var visibilityRead: (@Sendable ([String]) -> Void)?
+    /// Replaces the answer of a link-state read, for example an answer that omits a link.
+    var visibilityRewrite: (@Sendable ([String], [String: RemoteLinkVisibility]) -> [String: RemoteLinkVisibility])?
     func nameHash(forCorrectedName name: String) async throws -> String {
         try await base.nameHash(forCorrectedName: name)
     }
@@ -5199,7 +5286,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
     }
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         visibilityRead?(linkIDs)
-        return try await base.linkVisibility(of: linkIDs)
+        let answer = try await base.linkVisibility(of: linkIDs)
+        return visibilityRewrite.map { $0(linkIDs, answer) } ?? answer
     }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
         let read = try await base.compound(ofMainLink: linkID)

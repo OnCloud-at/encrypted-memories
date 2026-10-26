@@ -879,7 +879,8 @@ public struct ExactDuplicateFinder: Sendable {
         if keptCompound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(kept) }
         // A trash ends the sharing of a photo, so a shared duplicate stays.
         let shared = Set(facts.filter(\.value.isShared).keys)
-        // The group's link states are read once, at the first unreadable member; later unreadable members reuse it.
+        // The group's link states are read at the first unreadable member. A complete answer stands for the later
+        // unreadable members; an answer that omits a member does not, so the next one reads again.
         var checkedLinkStates = false
         for member in active where member != kept {
             try Task.checkCancellation()
@@ -899,8 +900,8 @@ public struct ExactDuplicateFinder: Sendable {
                 read = try await checker.compound(ofMainLink: member.nodeID)
             }
             if read == nil, !checkedLinkStates {
-                checkedLinkStates = true
                 let current = try await checker.linkVisibility(batching: group.members.map(\.nodeID))
+                checkedLinkStates = group.members.allSatisfy { current[$0.nodeID] != nil }
                 if let currentKept = current[kept.nodeID], currentKept.hasExplicitPhotoState,
                     currentKept.isActiveMain,
                     group.members.filter({ $0 != kept }).allSatisfy({ other in
