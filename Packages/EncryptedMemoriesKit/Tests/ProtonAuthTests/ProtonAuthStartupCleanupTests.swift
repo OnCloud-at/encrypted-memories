@@ -194,6 +194,84 @@ import Testing
         await fixture.gate.finishAll()
     }
 
+    @Test func aLockBeforeTheFirstTaskJobIsRememberedUntilItsResult() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.begin { finished.results.append($0) }
+        // The will-lock notification arrives before the task starts and before availability changes.
+        fixture.cleanup.noteProtectedDataUnavailable()
+        await fixture.gate.waitUntilEntered(1)
+        fixture.protectedData.value = 0
+        fixture.protectedData.value = 1
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.release(succeeded: true)
+        await finished.wait()
+        #expect(finished.results == [true], "the early lock cannot publish a sign-in failure")
+        #expect(await fixture.gate.plaintextPurgeArguments.count == 2)
+        await fixture.gate.finishAll()
+    }
+
+    @Test func aLockDuringASuccessDoesNotReachTheNextBegin() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.begin { finished.results.append($0) }
+        await fixture.gate.waitUntilEntered(1)
+        fixture.cleanup.noteProtectedDataUnavailable()
+        await fixture.gate.release(succeeded: true)
+        await finished.wait()
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.release(succeeded: true)
+        fixture.cleanup.begin { finished.results.append($0) }
+        await finished.wait(count: 2)
+        #expect(finished.results == [true, false], "the next chain has no lock event")
+        #expect(await fixture.gate.plaintextPurgeArguments.count == 2)
+        await fixture.gate.finishAll()
+    }
+
+    @Test func aRetryAndALockInOneRunDoNotGrantAThirdRun() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.begin { finished.results.append($0) }
+        await fixture.gate.waitUntilEntered(1)
+        fixture.cleanup.requestRetryIfRunning()
+        fixture.cleanup.noteProtectedDataUnavailable()
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.release(succeeded: true)
+        await finished.wait()
+        #expect(finished.results == [false], "the consumed request and lock grant only one retry")
+        #expect(await fixture.gate.plaintextPurgeArguments.count == 2)
+        await fixture.gate.finishAll()
+    }
+
+    @Test func aLockNotificationWithoutARunningCleanupDoesNotGrantARepeat() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.noteProtectedDataUnavailable()
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.release(succeeded: true)
+        fixture.cleanup.begin { finished.results.append($0) }
+        await finished.wait()
+        #expect(finished.results == [false], "an idle lock event does not reach the next chain")
+        #expect(await fixture.gate.plaintextPurgeArguments.count == 1)
+        await fixture.gate.finishAll()
+    }
+
+    @Test func aLockDuringARunGrantsOnlyOneAutomaticRepeat() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.begin { finished.results.append($0) }
+        await fixture.gate.waitUntilEntered(1)
+        fixture.cleanup.noteProtectedDataUnavailable()
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.release(succeeded: true)
+        await finished.wait()
+        #expect(finished.results == [false], "the automatic repeat is used only once")
+        #expect(await fixture.gate.plaintextPurgeArguments.count == 2)
+        await fixture.gate.finishAll()
+    }
+
     @Test func aLockedDeviceRunsTheCleanupAndKeepsChecking() async {
         let fixture = Fixture(protectedDataAvailable: false)
         let finished = Finished()

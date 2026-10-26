@@ -1,5 +1,7 @@
+import AppleSecurityCore
 import PhotosCore
 import ProtonAuth
+import Security
 import SwiftUI
 import Testing
 import UIKit
@@ -41,6 +43,14 @@ import UIKit
         #expect(factory.protectedDataSource == \UIApplication.isProtectedDataAvailable)
         #expect(
             UIApplication.shared[keyPath: factory.protectedDataSource] == UIApplication.shared.isProtectedDataAvailable)
+    }
+
+    @Test func authenticationFactoryKeepsALockedSessionReadChecking() {
+        let store = SessionKeychainStore(
+            service: "factory-locked-read-tests", account: "default", keychain: LockedReadKeychain(),
+            accessibility: .afterFirstUnlockThisDeviceOnly)
+        let authentication = MobileSessionModel.AuthenticationFactory().make(store: store)
+        #expect(authentication.controller.bootstrap() == .checking, "the factory passes the locked-read policy")
     }
 
     /// A runtime without scenes whose Smart Search state changes are recorded, so a test reaches no shared coordinator.
@@ -238,4 +248,21 @@ import UIKit
 @MainActor private final class ValueRecorder<Value> {
     private(set) var values: [Value] = []
     func append(_ value: Value) { values.append(value) }
+}
+
+/// Supplies a locked read without accessing the system Keychain.
+private struct LockedReadKeychain: AppleKeychainStoring {
+    private enum UnexpectedOperation: Error { case called }
+
+    func data(for item: AppleKeychainItem) throws -> Data? {
+        throw AppleSecurityError(operation: .read, status: errSecInteractionNotAllowed)
+    }
+
+    func setData(_ data: Data, for item: AppleKeychainItem) throws { throw UnexpectedOperation.called }
+    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data { throw UnexpectedOperation.called }
+    func removeData(for item: AppleKeychainItem) throws { throw UnexpectedOperation.called }
+    func removeAllData(service: String) throws { throw UnexpectedOperation.called }
+    func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility? {
+        throw UnexpectedOperation.called
+    }
 }

@@ -64,11 +64,11 @@ public final class ProtonAuthStartupCleanup {
         let claim = claimPurge()
         succeeded = false
         retryRequested = false
+        lockedDuringRun = false
         let run = run
         task = Task { @MainActor [weak self] in
             var startedLocked = self?.isProtectedDataAvailable() == false
             var repeatedAfterUnlock = false
-            self?.lockedDuringRun = false
             var succeeded = await run(claim, plaintextPurgeSucceeded)
             // A cleanup that failed while the device was locked can succeed after the unlock that came meanwhile; its
             // failure must not reach the sign-in state first. Each retry request repeats a failed run once, and without
