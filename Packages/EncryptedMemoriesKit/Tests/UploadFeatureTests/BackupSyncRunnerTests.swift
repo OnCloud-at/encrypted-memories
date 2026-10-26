@@ -1759,6 +1759,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: first.source.identifier)
         _ = await omittingRunner(harness).runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(state(of: first), .completed)
+        // The still that this device uploaded is in the library; a state read says so.
+        harness.remote.active = [testUID("live.heic")]
         let changed = resolver.defaultModified.addingTimeInterval(60)
         resolver.setModified(changed, for: first.source.identifier)
         var later = first

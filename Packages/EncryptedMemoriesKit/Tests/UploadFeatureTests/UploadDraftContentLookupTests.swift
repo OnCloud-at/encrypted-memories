@@ -559,15 +559,20 @@ final class UploadDraftContentLookupTests: XCTestCase {
         server.setVisibilityError(
             UploadError.backend("First batch visibility failed"), whenAskingFor: related[0].nodeID)
 
-        let result = try await pipeline.resolve(descriptor)
-
-        XCTAssertEqual(
-            result.decision,
-            blocked
-                ? .skip(.draftExists, remoteLinkID: draft?.nodeID)
-                : .skip(.activeDuplicate, remoteLinkID: related[0].nodeID))
-        XCTAssertEqual(store.record(for: descriptor.source)?.remoteLinkID, blocked ? nil : related[0].nodeID)
-        XCTAssertEqual(store.record(for: descriptor.source)?.outcome, blocked ? nil : "duplicateActive")
+        if blocked {
+            let result = try await pipeline.resolve(descriptor)
+            XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft?.nodeID))
+        } else {
+            // #553 reverses fail-open adoption: a failed read cannot prove this candidate is still active.
+            do {
+                _ = try await pipeline.resolve(descriptor)
+                XCTFail("A failed visibility read must not adopt the candidate")
+            } catch {
+                XCTAssertEqual(error as? UploadError, .backend("First batch visibility failed"))
+            }
+        }
+        XCTAssertNil(store.record(for: descriptor.source)?.remoteLinkID)
+        XCTAssertNil(store.record(for: descriptor.source)?.outcome)
         XCTAssertEqual(server.contentLookupCount, 1)
         XCTAssertEqual(server.uploadRequestCount, 0)
         if let draft { XCTAssertEqual(server.links.first { $0.uid == draft }?.state, .draft) }
