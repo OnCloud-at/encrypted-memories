@@ -1198,6 +1198,12 @@ else:
                 with urlopen(server.url + '/links', timeout=10) as response:
                     self.assertEqual(json.load(response), [])
 
+    def test_the_journey_lists_its_points_without_any_other_argument(self):
+        result = subprocess.run([sys.executable, str(Path(run_journey.__file__)), '--list-points'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), run_journey.POINTS)
+
     def test_upload_ledger_survives_app_replacement_and_exposes_duplicates(self):
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'backup.claimed') as server:
             def upload():
