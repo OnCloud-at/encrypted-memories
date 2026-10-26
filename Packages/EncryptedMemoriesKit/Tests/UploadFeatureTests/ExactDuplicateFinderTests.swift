@@ -3843,6 +3843,57 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(store.record(for: otherBytes)?.remoteLinkID, "link-dup")
     }
 
+    /// The plan reads the group's link states once, at the first unreadable member, and reuses the answer (#794).
+    func testThreeUnreadableDuplicatesReadTheGroupStatesOnce() async throws {
+        let kept = server.seedLink(digest: digest("unreadable"))
+        server.setFavorite(true, of: kept)
+        let unreadable = (0..<3).map { _ in server.seedLink(digest: digest("unreadable")) }
+        indexServer()
+        let group = try await onlyGroup()
+        let groupLinks = Set(group.members.map(\.nodeID))
+        let unreadableLinks = Set(unreadable.map(\.nodeID))
+        let reads = VisibilityReadLog()
+        var checker = CopyBoundaryChecker(base: server)
+        checker.compoundRewrite = { linkID, read in unreadableLinks.contains(linkID) ? nil : read }
+        checker.visibilityRead = { reads.record($0) }
+
+        let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+
+        XCTAssertEqual(
+            outcome,
+            ExactDuplicateMergeOutcome.merged(
+                kept: kept, trashed: [],
+                keptDuplicates: Dictionary(uniqueKeysWithValues: unreadable.map { ($0, .unreadable) })))
+        XCTAssertEqual(
+            reads.calls.filter { Set($0) == groupLinks }.count, 2,
+            "one read before the plan and one at the first unreadable member")
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+    }
+
+    /// The same single read still ends the plan when the person removed every other copy meanwhile.
+    func testAnUnreadableDuplicateThatLeftTheLibraryMeanwhileEndsThePlan() async throws {
+        let kept = server.seedLink(digest: digest("left"))
+        server.setFavorite(true, of: kept)
+        let unreadable = (0..<3).map { _ in server.seedLink(digest: digest("left")) }
+        indexServer()
+        let group = try await onlyGroup()
+        let unreadableLinks = Set(unreadable.map(\.nodeID))
+        let base = try XCTUnwrap(server)
+        let reads = VisibilityReadLog()
+        var checker = CopyBoundaryChecker(base: base)
+        checker.compoundRewrite = { linkID, read in
+            guard unreadableLinks.contains(linkID) else { return read }
+            for link in unreadable { base.personTrash(link) }
+            return nil
+        }
+        checker.visibilityRead = { reads.record($0) }
+
+        let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, ExactDuplicateMergeOutcome.skipped(.noDuplicateLeft))
+        XCTAssertEqual(reads.calls.filter { Set($0) == Set(group.members.map(\.nodeID)) }.count, 2)
+    }
+
     func testARetryAfterAFailedTrashRepeatsNoWriteAndLosesNothing() async throws {
         let kept = server.seedLink(digest: digest("a"))
         let duplicate = server.seedLink(digest: digest("a"))
@@ -5132,6 +5183,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
     var epoch: (@Sendable () async throws -> String)?
     /// Replaces the answer of a compound read, for example a main file whose content changed on the server.
     var compoundRewrite: (@Sendable (String, UploadRemoteCompound?) -> UploadRemoteCompound?)?
+    /// Observes every link-state read, for example to count them.
+    var visibilityRead: (@Sendable ([String]) -> Void)?
     func nameHash(forCorrectedName name: String) async throws -> String {
         try await base.nameHash(forCorrectedName: name)
     }
@@ -5145,7 +5198,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
         try await base.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
     }
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
-        try await base.linkVisibility(of: linkIDs)
+        visibilityRead?(linkIDs)
+        return try await base.linkVisibility(of: linkIDs)
     }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
         let read = try await base.compound(ofMainLink: linkID)
@@ -5192,6 +5246,13 @@ private actor CopyRendezvous {
         gate.open()
         XCTAssertEqual(result, .completed, "Always release both held device operations, including on failure")
     }
+}
+
+private final class VisibilityReadLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [[String]] = []
+    var calls: [[String]] { lock.withLock { recorded } }
+    func record(_ linkIDs: [String]) { lock.withLock { recorded.append(linkIDs) } }
 }
 
 private final class CopyEvidenceSwitch: @unchecked Sendable {

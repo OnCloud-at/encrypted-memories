@@ -879,6 +879,8 @@ public struct ExactDuplicateFinder: Sendable {
         if keptCompound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(kept) }
         // A trash ends the sharing of a photo, so a shared duplicate stays.
         let shared = Set(facts.filter(\.value.isShared).keys)
+        // The group's link states are read once, at the first unreadable member; later unreadable members reuse it.
+        var checkedLinkStates = false
         for member in active where member != kept {
             try Task.checkCancellation()
             // A copy with other metadata, such as another date or place, is no duplicate: its trash would lose them.
@@ -896,7 +898,8 @@ public struct ExactDuplicateFinder: Sendable {
             } else {
                 read = try await checker.compound(ofMainLink: member.nodeID)
             }
-            if read == nil {
+            if read == nil, !checkedLinkStates {
+                checkedLinkStates = true
                 let current = try await checker.linkVisibility(batching: group.members.map(\.nodeID))
                 if let currentKept = current[kept.nodeID], currentKept.hasExplicitPhotoState,
                     currentKept.isActiveMain,
