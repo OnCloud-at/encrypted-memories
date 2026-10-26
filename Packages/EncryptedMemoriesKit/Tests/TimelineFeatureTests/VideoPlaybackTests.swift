@@ -134,11 +134,15 @@ struct VideoPlaybackTests {
         #expect(VideoPlaybackError.classify(apiError(416)) == .rangeNotSupported)
     }
 
-    @Test func mapsDecryptionErrors() {
-        let decrypt = NSError(
+    @Test func decryptionFailureComesFromTheTypeOfTheErrorNotFromItsText() {
+        struct Typed: VideoPlaybackClassifiable {
+            var videoPlaybackError: VideoPlaybackError? { .decryptionFailed }
+        }
+        let text = NSError(
             domain: "Custom", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "block decrypt failed"])
-        #expect(VideoPlaybackError.classify(decrypt) == .decryptionFailed)
+        #expect(VideoPlaybackError.classify(Typed()) == .decryptionFailed)
+        #expect(VideoPlaybackError.classify(text) != .decryptionFailed)
     }
 
     @Test func everyTerminalStatusLeavesLoading() {

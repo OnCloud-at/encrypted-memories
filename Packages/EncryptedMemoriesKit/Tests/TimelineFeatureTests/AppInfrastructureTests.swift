@@ -135,14 +135,13 @@ struct AppInfrastructureTests {
 
     @Test func videoLogFieldsContract() {
         let fields = videoViewerLogFields(
-            uid: PhotoUID(volumeID: "v", nodeID: "n"),
             state: .downloading(0.5),
             localURLExists: true,
             assetPlayable: false,
             playerItemStatus: 0,
             error: nil
         )
-        #expect(fields["uid"] == "v~n")
+        #expect(fields["uid"] == nil, "the diagnostic never carries the identifier of a photo")
         #expect(fields["state"] == "downloading")
         #expect(fields["progress"] == "0.50")
         #expect(fields["localURLExists"] == "true")

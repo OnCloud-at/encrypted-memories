@@ -117,6 +117,8 @@ public final class PhotoViewerModel {
     private let editedOriginalProvider: (any EditedPhotoOriginalProviding)?
     /// The waits before the silent retries of a video failure; the failure shows only after the last retry fails too.
     private let silentRetryDelays: (VideoPlaybackError) -> [Duration]
+    /// Waits out one silent retry delay; a cancelled viewer ends the wait early.
+    private let silentRetryWait: (Duration) async -> Void
     private let editedOriginalLookup = EditedPhotoOriginalLookup()
     /// The originals of edited photos that this viewer found, and whether the page shows one.
     public private(set) var editedOriginal = EditedPhotoOriginalState()
@@ -136,9 +138,11 @@ public final class PhotoViewerModel {
         cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
         allowsVisibleDuplicateThumbnails: Bool = false,
         editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil,
-        silentRetryDelays: @escaping (VideoPlaybackError) -> [Duration] = { $0.silentRetryDelays }
+        silentRetryDelays: @escaping (VideoPlaybackError) -> [Duration] = { $0.silentRetryDelays },
+        silentRetryWait: @escaping (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
         self.silentRetryDelays = silentRetryDelays
+        self.silentRetryWait = silentRetryWait
         self.items = items
         self.index = index
         self.pageIndex = ViewerPageIndex(orderedUIDs: items.map(\.uid))
@@ -678,7 +682,7 @@ public final class PhotoViewerModel {
             // The failure goes away by itself, for example a rate limit: wait behind the loading indicator and ask
             // again. A new load of the viewer cancels this task, and so does the next item.
             video.setResolving()
-            try? await Task.sleep(for: delay)
+            await silentRetryWait(delay)
             guard !Task.isCancelled, isDisplaying(item), sessionIsCurrent() else { return }
             silentRetries += 1
         }
@@ -737,8 +741,7 @@ public final class PhotoViewerModel {
             video.reset()
             if item.isVideo {
                 let failure = VideoPlaybackError.classify(error)
-                let delays = silentRetryDelays(failure)
-                if silentRetries < delays.count { return delays[silentRetries] }
+                if let delay = silentRetryDelays(failure).dropFirst(silentRetries).first { return delay }
                 video.fail(failure, uid: item.uid)
             } else if shouldLoadBoundedStill {
                 await loadOriginalBytes(
@@ -927,7 +930,6 @@ public final class PhotoViewerModel {
         PhotoDiagnostics.shared.emit(
             "VideoViewer",
             videoViewerLogFields(
-                uid: item.uid,
                 mime: item.mediaType,
                 detectedKind: kind,
                 state: videoState,
