@@ -397,8 +397,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                             if item.linkState == .active, let linkID = item.linkID, !linkID.isEmpty {
                                 guard try await isActiveInThisCheck(linkID, reads: &relatedReads) else { continue }
                                 // A root photo is backed up only by a main photo, not by another photo's related file.
-                                if isRoot && replacement.isEmpty && !blockedByDraft {
-                                    guard relatedReads.visibility[linkID]?.isActiveMain == true else { continue }
+                                // The read that shows the copy active also decides its role. A draft block and a
+                                // replacement trust only a stated photo state, like their role filters.
+                                if isRoot {
+                                    guard let state = relatedReads.visibility[linkID], state.isActiveMain,
+                                        state.hasExplicitPhotoState || (replacement.isEmpty && !blockedByDraft)
+                                    else { continue }
                                 }
                             }
                             adopted = item

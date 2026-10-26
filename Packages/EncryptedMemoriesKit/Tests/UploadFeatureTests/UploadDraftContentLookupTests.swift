@@ -668,6 +668,42 @@ final class UploadDraftContentLookupTests: XCTestCase {
         XCTAssertEqual(harness.journal.entry(for: source), journal)
     }
 
+    func testARelatedStateInThisCheckKeepsTheDraftDespiteAnEarlierMainState() async throws {
+        try await assertEarlierMainStateKeepsTheDraft(
+            now: RemoteLinkVisibility(isActive: true, mainPhotoLinkID: "link-other"))
+    }
+
+    func testAStateWithoutAPhotoRoleInThisCheckKeepsTheDraftDespiteAnEarlierMainState() async throws {
+        try await assertEarlierMainStateKeepsTheDraft(
+            now: RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil, hasExplicitPhotoState: false))
+    }
+
+    /// An earlier read of this view named the copy an active main photo; the read of this check does not.
+    private func assertEarlierMainStateKeepsTheDraft(
+        now: RemoteLinkVisibility, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let server = EditScenarioServer()
+        let store = FakeIdentityStore()
+        let (_, descriptor, draft) = fixture(server: server)
+        let pipeline = UploadDedupePipeline(store: store, checker: server, currentClientUID: "this-uploader")
+        let copy = server.seedLink(digest: descriptor.precomputedSHA1Digest!)
+        let url = URL(fileURLWithPath: "/fixture/\(copy.nodeID)")
+        await pipeline.prime([
+            UploadResourceDescriptor(
+                source: .file(url), fileURL: url, filename: copy.nodeID, fileSize: 20,
+                modificationDate: descriptor.modificationDate,
+                precomputedSHA1Digest: descriptor.precomputedSHA1Digest)
+        ])
+        server.setVisibility(now, for: copy.nodeID)
+        let before = server.readCounts.visibility
+
+        let result = try await pipeline.resolve(descriptor)
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: draft.nodeID), file: file, line: line)
+        XCTAssertNil(store.record(for: descriptor.source)?.remoteLinkID, file: file, line: line)
+        XCTAssertEqual(server.readCounts.visibility, before + 1, file: file, line: line)
+    }
+
     private func resolveBeforeTimeout(
         _ pipeline: UploadDedupePipeline, descriptor: UploadResourceDescriptor
     ) async throws -> UploadPreflightResult {
