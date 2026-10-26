@@ -341,7 +341,7 @@ public final class VideoPlaybackController {
                 self.player?.timeControlStatus != .paused
             else { return }
             self.emitDiagnostics([
-                "uid": self.key(uid), "event": "watchdogTimeout", "deadline": "\(Int(deadline))s",
+                "event": "watchdogTimeout", "deadline": "\(Int(deadline))s",
             ])
             self.handleFailure(.timedOut, uid: uid, identity: identity)
         }
@@ -391,8 +391,6 @@ public final class VideoPlaybackController {
         state = next
     }
 
-    private func key(_ uid: PhotoUID) -> String { "\(uid.volumeID)~\(uid.nodeID)" }
-
     private func emitDiagnostics(_ fields: [String: String], throttleSeconds: TimeInterval = 0) {
         diagnostics?(
             VideoPlaybackDiagnosticEvent(
@@ -413,7 +411,6 @@ public final class VideoPlaybackController {
         let duration = item.duration.isNumeric ? String(format: "%.1f", item.duration.seconds) : "?"
         emitDiagnostics(
             [
-                "uid": currentUID.map(key) ?? "-",
                 "status": "\(item.status.rawValue)",
                 "timeControl": "\(player.timeControlStatus.rawValue)",
                 "bufferEmpty": "\(item.isPlaybackBufferEmpty)",
