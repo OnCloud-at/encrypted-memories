@@ -255,6 +255,17 @@ import UploadCore
             }
         }
 
+        /// A visible local preview without reading the person's Photos library in UI tests.
+        static func backupProblemThumbnail(for uid: PhotoUID) -> CGImage? {
+            guard !ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesMissingProblemPreview"),
+                uid.localPendingNamespace == .photoLibrary, uid.nodeID.hasPrefix("fixture-")
+            else { return nil }
+            return UIGraphicsImageRenderer(size: CGSize(width: 120, height: 120)).image { context in
+                UIColor.magenta.setFill()
+                context.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+            }.cgImage
+        }
+
         private func installDeletedBackupFixture(failedItems: Bool = false) {
             let directory = cacheDirectory.appendingPathComponent("backup", isDirectory: true)
             do {
