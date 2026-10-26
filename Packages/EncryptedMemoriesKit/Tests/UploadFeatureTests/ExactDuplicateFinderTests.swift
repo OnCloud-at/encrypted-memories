@@ -3905,6 +3905,42 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(groupReads(reads, of: group), 3)
     }
 
+    /// The scan accepts an incomplete state answer and shows the copies that it names, as before #553. Only the
+    /// duplicate check of the backup requires a complete answer.
+    func testAnIncompleteStateAnswerShowsTheCopiesThatItNames() async throws {
+        let copies = (0..<3).map { _ in server.seedLink(digest: digest("incomplete-scan")) }
+        indexServer()
+        var checker = CopyBoundaryChecker(base: server)
+        checker.answersIncompletely = true
+        checker.visibilityRewrite = { _, answer in answer.filter { $0.key != copies[2].nodeID } }
+
+        do {
+            let groups = try await finder(checker: checker).duplicateGroups().groups
+            XCTAssertEqual(groups.map { Set($0.members) }, [Set(copies.prefix(2))])
+        } catch {
+            XCTFail("An incomplete state answer must not fail the scan: \(error)")
+        }
+    }
+
+    /// The merge plan reads the group like the scan: a copy that an incomplete answer omits is not merged.
+    func testAnIncompleteStateAnswerLetsTheMergePlanSkipTheOmittedCopy() async throws {
+        let kept = server.seedLink(digest: digest("incomplete-plan"))
+        let copy = server.seedLink(digest: digest("incomplete-plan"))
+        indexServer()
+        let group = try await onlyGroup()
+        var checker = CopyBoundaryChecker(base: server)
+        checker.answersIncompletely = true
+        checker.visibilityRewrite = { _, answer in answer.filter { $0.key != copy.nodeID } }
+
+        do {
+            let outcome = try await finder(checker: checker).merge(group, keeping: kept)
+            XCTAssertEqual(outcome, ExactDuplicateMergeOutcome.skipped(.noDuplicateLeft))
+        } catch {
+            XCTFail("An incomplete state answer must not fail the merge plan: \(error)")
+        }
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
+    }
+
     /// Documented limit: a removal after a complete reconciliation answer is not seen by the same plan. The merge
     /// keeps the three copies as unreadable and trashes nothing; the next load shows the removal.
     func testARemovalAfterACompleteAnswerIsSeenOnlyByTheNextPlan() async throws {
@@ -5272,6 +5308,8 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
     var visibilityRead: (@Sendable ([String]) -> Void)?
     /// Replaces the answer of a link-state read, for example an answer that omits a link.
     var visibilityRewrite: (@Sendable ([String], [String: RemoteLinkVisibility]) -> [String: RemoteLinkVisibility])?
+    /// The server answers incompletely: like the Proton backend, a read that requires a complete answer throws.
+    var answersIncompletely = false
     func nameHash(forCorrectedName name: String) async throws -> String {
         try await base.nameHash(forCorrectedName: name)
     }
@@ -5285,7 +5323,15 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
         try await base.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
     }
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        try await linkVisibility(of: linkIDs, requiresCompleteResponse: true)
+    }
+    func linkVisibility(
+        of linkIDs: [String], requiresCompleteResponse: Bool
+    ) async throws -> [String: RemoteLinkVisibility] {
         visibilityRead?(linkIDs)
+        if answersIncompletely && requiresCompleteResponse {
+            throw UploadError.backend("The link visibility response is incomplete")
+        }
         let answer = try await base.linkVisibility(of: linkIDs)
         return visibilityRewrite.map { $0(linkIDs, answer) } ?? answer
     }

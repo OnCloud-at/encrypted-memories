@@ -170,6 +170,19 @@ private struct DecodedVisibilityChecker: UploadDuplicateChecking {
     }
 }
 
+/// The dedupe service over fixed key material, so a read never resolves the photos root.
+private func makeDedupeService(
+    session: DriveSession, store: UploadIdentityManifestStore
+) -> ProtonUploadDedupeService {
+    ProtonUploadDedupeService(
+        session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
+        photosClient: VisibilityOnlySDK(), contentIndexStore: store,
+        material: .init(
+            context: .init(volumeID: "vol", shareID: "share1", rootLinkID: "root"),
+            rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
+        contextProvider: { throw UploadCore.UploadError.backend("The test material must be reused") })
+}
+
 private func linkIDs(inBodyOf request: StubURLProtocol.Recorded) throws -> [String] {
     let body = try #require(request.body)
     let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
@@ -445,13 +458,7 @@ extension DriveSessionStubSuite {
                 UploadIdentityManifestStore(url: directory.appendingPathComponent("manifest.sqlite")))
             defer { store.close() }
             let session = makeSession()
-            let service = ProtonUploadDedupeService(
-                session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
-                photosClient: VisibilityOnlySDK(), contentIndexStore: store,
-                material: .init(
-                    context: .init(volumeID: "vol", shareID: "share1", rootLinkID: "root"),
-                    rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
-                contextProvider: { throw UploadCore.UploadError.backend("The test material must be reused") })
+            let service = makeDedupeService(session: session, store: store)
             let pipeline = UploadDedupePipeline(
                 store: store,
                 checker: DecodedVisibilityChecker(session: session, blocked: false, visibilityService: service))
@@ -473,6 +480,26 @@ extension DriveSessionStubSuite {
             #expect(store.record(for: descriptor.source)?.remoteLinkID == nil)
             #expect(store.record(for: descriptor.source)?.outcome == nil)
             #expect(StubURLProtocol.requests().allSatisfy { $0.path == "/drive/shares/share1/links/fetch_metadata" })
+        }
+
+        /// Exact Duplicates asks for the lenient read: an incomplete answer gives the links that it names.
+        @Test func duplicatesReadAcceptsAnIncompleteVisibilityAnswer() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"{"Code":1000,"Links":[{"LinkID":"photo","State":1}],"Partial":true}"#)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let store = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("manifest.sqlite")))
+            defer { store.close() }
+            let service = makeDedupeService(session: makeSession(), store: store)
+
+            let links = try? await service.linkVisibility(of: ["photo"], requiresCompleteResponse: false)
+
+            #expect(links?.keys.sorted() == ["photo"])
+            #expect(links?["photo"]?.isActive == true)
         }
 
         @Test func linkVisibilityReadsTheStateAndTheMainPhoto() async throws {
