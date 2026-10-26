@@ -35,6 +35,14 @@ import UIKit
         #expect(MobileAccountRuntime.shared.sessionModel.sessionStore.accessibility == .afterFirstUnlockThisDeviceOnly)
     }
 
+    @Test func authenticationFactoryUsesTheProductionProtectedDataPolicy() {
+        let factory = MobileSessionModel.AuthenticationFactory()
+        #expect(factory.lockedReadIsChecking)
+        #expect(factory.protectedDataSource == \UIApplication.isProtectedDataAvailable)
+        #expect(
+            UIApplication.shared[keyPath: factory.protectedDataSource] == UIApplication.shared.isProtectedDataAvailable)
+    }
+
     /// A runtime without scenes whose Smart Search state changes are recorded, so a test reaches no shared coordinator.
     private static func isolatedRuntime(recording states: ValueRecorder<Bool>) -> MobileAccountRuntime {
         MobileAccountRuntime(

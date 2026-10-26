@@ -22,10 +22,9 @@ final class MobileSessionModel: ObservableObject {
     let sessionStore: SessionKeychainStore
     private let authController: ProtonAuthController
     /// The startup and sign-in guard shared with macOS: no session starts before the sign-out purge and cleanup ended.
-    private let startupCleanup = ProtonAuthStartupCleanup(isProtectedDataAvailable: {
-        UIApplication.shared.isProtectedDataAvailable
-    })
+    private let startupCleanup: ProtonAuthStartupCleanup
     private var protectedDataObserver: NSObjectProtocol?
+    private var protectedDataUnavailableObserver: NSObjectProtocol?
     private let webAuthenticationSession = ManagedWebAuthenticationSession()
     /// The window of the scene that started sign-in. The managed browser must appear in that window, not in
     /// whichever window happens to be key when Proton returns the authentication URL.
@@ -49,11 +48,9 @@ final class MobileSessionModel: ObservableObject {
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
         injectDefaultCryptoImplementation()
         sessionStore = SessionKeychainStore(accessibility: .afterFirstUnlockThisDeviceOnly)
-        self.authController = ProtonAuthController(
-            store: sessionStore,
-            authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories),
-            lockedReadIsChecking: true
-        )
+        let authentication = AuthenticationFactory().make(store: sessionStore)
+        authController = authentication.controller
+        startupCleanup = authentication.cleanup
         isCheckingSession = true
         statusText = L10n.string("auth.checking_session")
         protectedDataObserver = NotificationCenter.default.addObserver(
@@ -73,6 +70,15 @@ final class MobileSessionModel: ObservableObject {
                 }
             }
         }
+        protectedDataUnavailableObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.startupCleanup.noteProtectedDataUnavailable()
+            }
+        }
         beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
     }
 
@@ -81,11 +87,29 @@ final class MobileSessionModel: ObservableObject {
         /// cleanup and observes no unlock, so a test never touches the process's saved session.
         init(isolatedStore: SessionKeychainStore) {
             sessionStore = isolatedStore
-            authController = ProtonAuthController(
-                store: isolatedStore, authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories),
-                lockedReadIsChecking: true)
+            let authentication = AuthenticationFactory().make(store: isolatedStore)
+            authController = authentication.controller
+            startupCleanup = authentication.cleanup
         }
     #endif
+
+    /// Both initializers use the same platform policy. The key path names the UIKit source without a second
+    /// test configuration; reading it does not start cleanup, read the Keychain or install an observer.
+    @MainActor struct AuthenticationFactory {
+        let lockedReadIsChecking = true
+        let protectedDataSource = \UIApplication.isProtectedDataAvailable
+
+        func make(store: SessionKeychainStore) -> (controller: ProtonAuthController, cleanup: ProtonAuthStartupCleanup)
+        {
+            let source = protectedDataSource
+            return (
+                ProtonAuthController(
+                    store: store, authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories),
+                    lockedReadIsChecking: lockedReadIsChecking),
+                ProtonAuthStartupCleanup(isProtectedDataAvailable: { UIApplication.shared[keyPath: source] })
+            )
+        }
+    }
 
     private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
         guard !startupCleanup.isRunning else { return }
@@ -112,6 +136,9 @@ final class MobileSessionModel: ObservableObject {
     deinit {
         if let protectedDataObserver {
             NotificationCenter.default.removeObserver(protectedDataObserver)
+        }
+        if let protectedDataUnavailableObserver {
+            NotificationCenter.default.removeObserver(protectedDataUnavailableObserver)
         }
     }
 

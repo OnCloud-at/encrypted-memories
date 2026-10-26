@@ -63,6 +63,13 @@ import Testing
         #expect(keychain.storedData == data, "the old item stays readable")
     }
 
+    @Test func changedDataAtTheRightClassIsStillAFailedMigration() throws {
+        let keychain = ClassRecordingKeychain(updateChangesData: true)
+        keychain.seed(try JSONEncoder().encode(session), class: .whenUnlockedThisDeviceOnly)
+        #expect(store(keychain, .afterFirstUnlockThisDeviceOnly).migrateAccessibilityIfNeeded() == .failed)
+        #expect(keychain.storedClass == .afterFirstUnlockThisDeviceOnly)
+    }
+
     @Test func anItemThatCannotBeReadYetIsNotWritten() throws {
         let keychain = ClassRecordingKeychain(readStatus: errSecInteractionNotAllowed)
         keychain.seed(try JSONEncoder().encode(session), class: .whenUnlockedThisDeviceOnly)
@@ -120,6 +127,18 @@ import Testing
         #expect(error != nil)
     }
 
+    @MainActor @Test func anotherReadFailureStillReportsItselfWithLockedReadChecking() {
+        let storage = StubSessionStorage(
+            load: .failure(AppleSecurityError(operation: .read, status: errSecNotAvailable)))
+        let controller = ProtonAuthController(
+            store: storage, authenticator: NeverAuthenticator(), lockedReadIsChecking: true)
+        guard case .signedOut(let error) = controller.bootstrap() else {
+            Issue.record("only interaction-not-allowed keeps checking")
+            return
+        }
+        #expect(error != nil)
+    }
+
     @MainActor @Test func aFailedMigrationKeepsThePersonSignedIn() {
         let storage = StubSessionStorage(load: .success(session), migration: .failed)
         let controller = ProtonAuthController(store: storage, authenticator: NeverAuthenticator())
@@ -136,10 +155,12 @@ private final class ClassRecordingKeychain: AppleKeychainStoring, @unchecked Sen
     private var recorded: [String] = []
     private let readStatus: OSStatus?
     private let updateKeepsClass: Bool
+    private let updateChangesData: Bool
 
-    init(readStatus: OSStatus? = nil, updateKeepsClass: Bool = false) {
+    init(readStatus: OSStatus? = nil, updateKeepsClass: Bool = false, updateChangesData: Bool = false) {
         self.readStatus = readStatus
         self.updateKeepsClass = updateKeepsClass
+        self.updateChangesData = updateChangesData
     }
 
     var storedData: Data? { lock.withLock { data } }
@@ -165,7 +186,7 @@ private final class ClassRecordingKeychain: AppleKeychainStoring, @unchecked Sen
         lock.withLock {
             recorded.append("write")
             if self.data == nil || !updateKeepsClass { itemClass = item.accessibility }
-            self.data = data
+            self.data = updateChangesData ? Data("different session".utf8) : data
         }
     }
 

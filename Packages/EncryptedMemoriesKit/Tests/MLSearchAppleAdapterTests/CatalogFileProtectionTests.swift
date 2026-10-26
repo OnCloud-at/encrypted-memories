@@ -130,20 +130,50 @@ import Testing
         #expect(failures == 1)
     }
 
+    @Test func aLinkedCacheDirectoryIsNeverFollowed() throws {
+        let root = Self.makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("private")
+        try Self.write([target.appendingPathComponent("catalog-v1.json")])
+        let link = root.appendingPathComponent("cache")
+        try Self.link(link, to: target)
+        var visited: [URL] = []
+        let failures = SignedRemoteMLModelCatalogProvider.applyFileProtection(
+            cacheDirectory: link, legacyDirectory: root.appendingPathComponent("missing")
+        ) { visited.append($0) }
+        #expect(visited.isEmpty)
+        #expect(failures == 1)
+    }
+
+    @Test func aLinkedLegacyDirectoryIsNeverFollowed() throws {
+        let root = Self.makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("private")
+        try Self.write([target.appendingPathComponent("catalog-v1.json")])
+        let link = root.appendingPathComponent("legacy")
+        try Self.link(link, to: target)
+        var visited: [URL] = []
+        let failures = SignedRemoteMLModelCatalogProvider.applyFileProtection(
+            cacheDirectory: root.appendingPathComponent("missing"), legacyDirectory: link
+        ) { visited.append($0) }
+        #expect(visited.isEmpty)
+        #expect(failures == 1)
+    }
+
     @Test func aDirectoryThatCannotBeReadIsAFailure() throws {
         let root = Self.makeRoot()
         let pair = root.appendingPathComponent("active-pair", isDirectory: true)
-        try Self.write([pair.appendingPathComponent("active-pair.json")])
+        try FileManager.default.createDirectory(at: pair, withIntermediateDirectories: true)
         defer {
             try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: pair.path)
             try? FileManager.default.removeItem(at: root)
         }
-        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: pair.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o111], ofItemAtPath: pair.path)
 
         let failures = SignedRemoteMLModelCatalogProvider.applyFileProtection(
             cacheDirectory: root, legacyDirectory: root
         ) { _ in }
-        #expect(failures > 0, "a walk that could not look is not complete")
+        #expect(failures == 1, "only the directory enumeration fails; no active-pair file exists")
     }
 
     @Test func aMissingTreeIsSkipped() {
@@ -186,6 +216,9 @@ import Testing
 
         upgrade()
         #expect(classes.count == 2 * firstWalk, "a walk with a failure stays open, so the next call walks again")
+        #expect(
+            PhotoDiagnostics.shared.supportSnapshot().counters[counter] == before + 1,
+            "a successful walk adds no failure")
         upgrade()
         #expect(classes.count == 2 * firstWalk, "a complete walk is done for this process")
 

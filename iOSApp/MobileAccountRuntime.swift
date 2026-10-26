@@ -41,7 +41,7 @@ final class MobileAccountRuntime {
         }
     }
 
-    /// Test seam: an isolated runtime around injected models. It never touches UIKit scene notifications.
+    /// An isolated runtime around injected models. `start()` installs scene observers just as the shared runtime does.
     init(
         sessionModel: MobileSessionModel, libraryModel: MobileLibraryModel,
         connectedScenes: @escaping @MainActor () -> Set<UIScene> = { UIApplication.shared.connectedScenes },

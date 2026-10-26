@@ -21,6 +21,7 @@ public final class ProtonAuthStartupCleanup {
     private var task: Task<Void, Never>?
     /// An unlock arrived while a cleanup ran; a failed run is repeated once before its result counts.
     private var retryRequested = false
+    private var lockedDuringRun = false
     private let claimPurge: () -> BackupLocalDataPurge.Claim?
     private let isPurgePending: () -> Bool
     private let run: @Sendable (BackupLocalDataPurge.Claim?, Bool?) async -> Bool
@@ -67,19 +68,21 @@ public final class ProtonAuthStartupCleanup {
         task = Task { @MainActor [weak self] in
             var startedLocked = self?.isProtectedDataAvailable() == false
             var repeatedAfterUnlock = false
+            self?.lockedDuringRun = false
             var succeeded = await run(claim, plaintextPurgeSucceeded)
             // A cleanup that failed while the device was locked can succeed after the unlock that came meanwhile; its
             // failure must not reach the sign-in state first. Each retry request repeats a failed run once, and without
-            // any notification a run that started locked repeats once when protected data is available after it.
+            // any unlock notification, a run that encountered a lock repeats once when protected data is available after it.
             while !succeeded, let self {
                 if self.retryRequested {
                     self.retryRequested = false
-                } else if startedLocked, !repeatedAfterUnlock, self.isProtectedDataAvailable() {
+                } else if startedLocked || self.lockedDuringRun, !repeatedAfterUnlock, self.isProtectedDataAvailable() {
                     repeatedAfterUnlock = true
                 } else {
                     break
                 }
                 startedLocked = !self.isProtectedDataAvailable()
+                self.lockedDuringRun = false
                 succeeded = await run(self.claimPurge(), plaintextPurgeSucceeded)
             }
             guard let self else { return }
@@ -94,6 +97,11 @@ public final class ProtonAuthStartupCleanup {
     /// Does nothing when no cleanup runs.
     public func requestRetryIfRunning() {
         if task != nil { retryRequested = true }
+    }
+
+    /// Remembers a lock during this run even if protected data becomes available before its result returns.
+    public func noteProtectedDataUnavailable() {
+        if task != nil { lockedDuringRun = true }
     }
 
     /// What the host shows once no cleanup runs. After a successful cleanup the saved session decides, also on a

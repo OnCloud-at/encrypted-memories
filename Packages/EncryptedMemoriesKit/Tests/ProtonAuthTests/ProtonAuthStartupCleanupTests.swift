@@ -139,6 +139,59 @@ import Testing
         await finished.wait()
         #expect(finished.results == [false], "a run that started unlocked and fails counts")
         #expect(await fixture.gate.plaintextPurgeArguments.count == 2)
+        await fixture.gate.finishAll()
+        await finished.wait()
+    }
+
+    @Test func aRetryIsConsumedEvenWhenTheSecondRunFails() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.begin { finished.results.append($0) }
+        await fixture.gate.waitUntilEntered(1)
+        fixture.cleanup.requestRetryIfRunning()
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.waitUntilEntered(2)
+        await fixture.gate.release(succeeded: false)
+        await finished.wait()
+        #expect(finished.results == [false], "one request permits exactly one retry")
+        #expect(await fixture.gate.plaintextPurgeArguments.count == 2)
+        await fixture.gate.finishAll()
+        await finished.wait()
+    }
+
+    @Test func aRetryDuringASuccessDoesNotReachTheNextBegin() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.begin { finished.results.append($0) }
+        await fixture.gate.waitUntilEntered(1)
+        fixture.cleanup.requestRetryIfRunning()
+        await fixture.gate.release(succeeded: true)
+        await finished.wait()
+        fixture.cleanup.begin { finished.results.append($0) }
+        await fixture.gate.waitUntilEntered(2)
+        await fixture.gate.release(succeeded: false)
+        await finished.wait(count: 2)
+        #expect(finished.results == [true, false], "the new chain runs exactly once")
+        #expect(await fixture.gate.plaintextPurgeArguments.count == 2)
+        await fixture.gate.finishAll()
+        await finished.wait(count: 2)
+    }
+
+    @Test func aLockDuringAnUnlockedRunIsRememberedUntilItsResult() async {
+        let fixture = Fixture()
+        let finished = Finished()
+        fixture.cleanup.begin { finished.results.append($0) }
+        await fixture.gate.waitUntilEntered(1)
+        fixture.protectedData.value = 0
+        fixture.cleanup.noteProtectedDataUnavailable()
+        fixture.protectedData.value = 1
+        await fixture.gate.release(succeeded: false)
+        await fixture.gate.waitUntilEntered(2)
+        #expect(finished.results.isEmpty, "the locked run cannot publish a sign-in failure")
+        await fixture.gate.release(succeeded: true)
+        await finished.wait()
+        #expect(finished.results == [true])
+        await fixture.gate.finishAll()
     }
 
     @Test func aLockedDeviceRunsTheCleanupAndKeepsChecking() async {
@@ -233,6 +286,7 @@ private struct Fixture {
 private actor CleanupGate {
     private var waiters: [CheckedContinuation<Bool, Never>] = []
     private var results: [Bool] = []
+    private var finished = false
     private(set) var plaintextPurgeArguments: [Bool?] = []
 
     /// Waits up to 10 s until `count` runs have entered the cleanup.
@@ -246,8 +300,16 @@ private actor CleanupGate {
 
     func run(_ plaintextPurgeSucceeded: Bool?) async -> Bool {
         plaintextPurgeArguments.append(plaintextPurgeSucceeded)
+        if finished { return true }
         if !results.isEmpty { return results.removeFirst() }
         return await withCheckedContinuation { waiters.append($0) }
+    }
+
+    /// Ends unexpected extra runs after the bounded assertions, so a repeat mutant cannot retain a continuation.
+    func finishAll() {
+        finished = true
+        for waiter in waiters { waiter.resume(returning: true) }
+        waiters.removeAll()
     }
 
     func release(succeeded: Bool) {
