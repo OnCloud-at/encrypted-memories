@@ -1114,8 +1114,13 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let (model, _) = makeModel(finder)
         let first = Task { await model.load() }
         await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+        // The gate opens only when the second load has joined the running build; its scan says nothing about that, and
+        // a build that ends before the join leaves nothing to wait for.
+        let joinedBefore = PhotoDiagnostics.shared.counter("duplicates.indexBuildJoined")
         let second = Task { await model.load() }
-        await waitUntil({ finder.scanCalls == 2 }, "the second load scans")
+        await waitUntil(
+            { PhotoDiagnostics.shared.counter("duplicates.indexBuildJoined") > joinedBefore },
+            "the second load waits for the running build")
         finder.buildGate.open()
         await first.value
         await second.value
