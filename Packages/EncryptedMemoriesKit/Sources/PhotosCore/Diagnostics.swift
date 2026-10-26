@@ -297,6 +297,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         "ml.suggestions.snapshotWriteSuperseded",
         "perf.videoPrefetchDeduped",
         "perf.videoPrefetchScheduled",
+        "smartSearch.catalogProtectionFailed",
         "thumb.decodedUpgrade",
         "thumb.directLoadOverlapsBatch",
         "thumb.diskCacheHit",

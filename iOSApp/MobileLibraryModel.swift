@@ -410,7 +410,7 @@ final class MobileLibraryModel {
     private let libraryChangeMonitor = LibraryChangeMonitor()
     private let libraryRefreshCoalescer = LibraryRefreshCoalescer()
     private let uploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
-    private var applicationIsActive = true
+    private(set) var applicationIsActive = true
     private(set) var isRefreshingLibrary = false
     /// Wakes analysis-only presentation after a source inventory becomes readable.
     private(set) var sourceAnalysisRevision: UInt64 = 0

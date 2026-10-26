@@ -29,16 +29,30 @@ final class MobileAccountRuntime {
     private var uploadedLibraryMutationRevision: UInt64?
     private var completedUploadRevision: Int?
     private var wasSigningOut = false
+    private let connectedScenes: @MainActor () -> Set<UIScene>
+    private let smartSearchForegroundChanged: @MainActor (Bool) -> Void
 
     private init() {
         sessionModel = MobileSessionModel()
         libraryModel = MobileLibraryModel()
+        connectedScenes = { UIApplication.shared.connectedScenes }
+        smartSearchForegroundChanged = {
+            AppleSmartSearchBackgroundCoordinator.shared.applicationStateChanged(isForeground: $0)
+        }
     }
 
-    /// Test seam: an isolated runtime around injected models. It never touches UIKit scene notifications.
-    init(sessionModel: MobileSessionModel, libraryModel: MobileLibraryModel) {
+    /// An isolated runtime around injected models. `start()` installs scene observers just as the shared runtime does.
+    init(
+        sessionModel: MobileSessionModel, libraryModel: MobileLibraryModel,
+        connectedScenes: @escaping @MainActor () -> Set<UIScene> = { UIApplication.shared.connectedScenes },
+        smartSearchForegroundChanged: @escaping @MainActor (Bool) -> Void = {
+            AppleSmartSearchBackgroundCoordinator.shared.applicationStateChanged(isForeground: $0)
+        }
+    ) {
         self.sessionModel = sessionModel
         self.libraryModel = libraryModel
+        self.connectedScenes = connectedScenes
+        self.smartSearchForegroundChanged = smartSearchForegroundChanged
     }
 
     /// Idempotent. The first scene root starts the account; later scenes (including simultaneous state
@@ -99,12 +113,22 @@ final class MobileAccountRuntime {
         libraryModel.setApplicationActive(opportunity == .foregroundActive)
     }
 
+    /// The scene observers that `start()` installed, so a test can tell that a second start installs none.
+    var sceneObserverCount: Int { sceneObservers.count }
+
     private func installSceneObservers() {
         let center = NotificationCenter.default
-        for scene in UIApplication.shared.connectedScenes {
+        for scene in connectedScenes() {
             sceneLedger.update(sceneID: Self.sceneID(scene), phase: Self.phase(of: scene.activationState))
         }
-        if !sceneLedger.isEmpty { apply(sceneLedger.opportunity) }
+        if !sceneLedger.isEmpty {
+            apply(sceneLedger.opportunity)
+        } else {
+            // A start without a scene, from a background window, is not foreground activity: no source refresh or
+            // library polling as if the app were open. The first scene that connects applies its phase.
+            libraryModel.setApplicationActive(false)
+            smartSearchForegroundChanged(false)
+        }
 
         let phaseEvents: [(Notification.Name, LibrarySceneActivityLedger.ScenePhase)] = [
             (UIScene.didActivateNotification, .active),
