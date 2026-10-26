@@ -1948,6 +1948,8 @@ struct ThumbnailFeedCoreTests {
             try await Self.waitUntil { await loader.recordedPriorities.count == 1 }
             #expect(await loader.recordedPriorities.count == 1, "the next photo loads after the empty batch")
             await Self.join(Task { await feed.stopPrefetchAndWait() }, "the feed stops")
+            // Every worker has ended, so every batch has given its slot back.
+            #expect(await feed.downloadCountersForTesting().activeDownloaders == 0, "no slot stays counted")
         }
 
         @Test func aSessionChangeWithAQueuedPhotoStartsNoWorkersAgain() async throws {
