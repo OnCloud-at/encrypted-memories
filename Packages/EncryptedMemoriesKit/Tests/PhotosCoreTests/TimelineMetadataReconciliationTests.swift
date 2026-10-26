@@ -26,31 +26,60 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: opportunity))
     }
 
-    func testAPassWaitsDuringABackgroundWindowAndStartsOnceInTheForeground() async {
-        await assertThePassWaits(in: .backgroundPermitted)
+    /// A coordinator of its own per test, which follows the runtime state as the app's shared one does.
+    private func coordinator(_ state: LibraryRuntimeState) async -> LibraryResourceCoordinator {
+        let coordinator = LibraryResourceCoordinator(runtimeState: state)
+        await coordinator.startObserving()
+        return coordinator
+    }
+
+    func testAPassRunsInABackgroundWindowUnderTheHeavyPermit() async {
+        let state = runtimeState(.backgroundPermitted)
+        let coordinator = await coordinator(state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let log = PassLog()
+        reconciliation.schedule(inventory(2)) { await log.start($0) }
+        await awaitWindowEvent(log.started, "the pass in the background window")
+        await joinCurrentPass(reconciliation)
+        let acquired = await coordinator.metrics().permitsAcquired
+        XCTAssertEqual(acquired, 1, "the pass ran under the coordinator's permit")
+        // The coordinator records the release when the permit's holder returns, just after the pass.
+        let released = await waitFor { await coordinator.metrics().permitsReleased == 1 }
+        XCTAssertTrue(released, "the pass gave the permit back")
+        let started = await log.count
+        XCTAssertEqual(started, 1)
     }
 
     func testAPassWaitsWhileTheAppIsSuspended() async {
-        await assertThePassWaits(in: .suspended)
-    }
-
-    private func assertThePassWaits(
-        in opportunity: LibraryExecutionOpportunity, file: StaticString = #filePath, line: UInt = #line
-    ) async {
-        let state = runtimeState(opportunity)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let state = runtimeState(.suspended)
+        let coordinator = await coordinator(state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
-        await awaitHeldSnapshots(1, in: reconciliation, file: file, line: line)
+        await awaitHeldSnapshots(1, in: reconciliation)
         let held = await log.count
-        XCTAssertEqual(held, 0, "no pass starts while the app is held", file: file, line: line)
+        XCTAssertEqual(held, 0, "no pass starts while the app is suspended")
 
         state.update { $0.executionOpportunity = .foregroundActive }
-        await awaitEvent(log.started, "the pass after the foreground return", file: file, line: line)
+        await awaitWindowEvent(log.started, "the pass after the foreground return")
         await joinCurrentPass(reconciliation)
         let started = await log.count
-        XCTAssertEqual(started, 1, "the foreground return starts exactly one pass", file: file, line: line)
-        XCTAssertEqual(reconciliation.heldSnapshotCount, 1, "one check per runtime change", file: file, line: line)
+        XCTAssertEqual(started, 1, "the foreground return starts exactly one pass")
+        XCTAssertEqual(reconciliation.heldSnapshotCount, 1, "one check per runtime change")
+    }
+
+    func testAForegroundPassTakesNoPermit() async {
+        for opportunity in [LibraryExecutionOpportunity.foregroundActive, .foregroundInactive] {
+            let state = runtimeState(opportunity)
+            let coordinator = await coordinator(state)
+            let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+            let log = PassLog()
+            reconciliation.schedule(inventory(2)) { await log.start($0) }
+            await awaitWindowEvent(log.started, "the pass in the foreground")
+            await joinCurrentPass(reconciliation)
+            let acquired = await coordinator.metrics().permitsAcquired
+            XCTAssertEqual(acquired, 0, "the foreground pass runs as before, without the coordinator")
+        }
     }
 
     func testAPassRunsAtOnceWhileTheAppIsInTheForegroundButInactive() async {
@@ -66,29 +95,29 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         XCTAssertEqual(reconciliation.heldSnapshotCount, 0)
     }
 
-    func testARuntimeChangeThatKeepsTheBackgroundWindowStartsNoPass() async {
-        let state = runtimeState(.backgroundPermitted)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+    func testLowPowerModeInABackgroundWindowKeepsThePassWaitingWithoutPolling() async {
+        let state = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(isLowPowerMode: true, executionOpportunity: .backgroundPermitted))
+        let coordinator = await coordinator(state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
-        await awaitHeldSnapshots(1, in: reconciliation)
-
-        state.update { $0.thermalLevel = .fair }
-        await awaitHeldSnapshots(2, in: reconciliation)
+        let queued = await waitFor { await coordinator.waitingPermitCount == 1 }
+        XCTAssertTrue(queued, "the pass waits in the coordinator's queue")
         let held = await log.count
-        XCTAssertEqual(held, 0, "the wake checks the window again")
+        XCTAssertEqual(held, 0, "Low Power Mode refuses background work")
 
-        state.update { $0.executionOpportunity = .foregroundActive }
-        await awaitEvent(log.started, "the pass after the foreground return")
+        state.update { $0.isLowPowerMode = false }
+        await awaitWindowEvent(log.started, "the pass after Low Power Mode ends")
         await joinCurrentPass(reconciliation)
         let started = await log.count
         XCTAssertEqual(started, 1)
-        XCTAssertEqual(reconciliation.heldSnapshotCount, 2, "no check without a runtime change")
     }
 
-    func testAPendingPassWaitsWhenTheAppEnteredTheBackgroundDuringTheFirstPass() async {
+    func testAPendingPassRunsUnderThePermitWhenTheAppEnteredTheBackgroundDuringTheFirstPass() async {
         let state = runtimeState(.foregroundActive)
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
+        let coordinator = await coordinator(state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
         let log = PassLog()
         let firstRunning = AsyncTestSignal()
         let releaseFirst = AsyncTestSignal()
@@ -100,22 +129,67 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
             }
         }
         reconciliation.schedule(inventory(2), operation: operation)
-        await awaitEvent(firstRunning, "the first pass")
+        await awaitWindowEvent(firstRunning, "the first pass")
         state.update { $0.executionOpportunity = .backgroundPermitted }
         reconciliation.schedule(inventory(3), operation: operation)
         releaseFirst.fire()
-        await awaitHeldSnapshots(1, in: reconciliation)
-        let held = await log.count
-        XCTAssertEqual(held, 1, "the pending pass waits for the foreground")
-
-        state.update { $0.executionOpportunity = .foregroundActive }
         await joinCurrentPass(reconciliation)
         let started = await log.count
         XCTAssertEqual(started, 2)
+        let acquired = await coordinator.metrics().permitsAcquired
+        XCTAssertEqual(acquired, 1, "only the pass in the background window took the permit")
+    }
+
+    func testABackupItemStopsTheBackgroundPassWhichRunsAgainWithTheSameInventory() async {
+        let state = runtimeState(.backgroundPermitted)
+        let coordinator = await coordinator(state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        let order = OrderLog()
+        let firstRunning = AsyncTestSignal()
+        reconciliation.schedule(inventory(2)) { pass in
+            let run = await order.append("pass \(pass.inventory.items.count)")
+            guard run == 1 else { return }
+            firstRunning.fire()
+            // The first run waits until the stop cancels it, as the bridge's page loop does.
+            await waitUntilCancelled()
+            await order.append(Task.isCancelled ? "pass stopped" : "pass not stopped")
+        }
+        await awaitWindowEvent(firstRunning, "the background pass")
+        let backup = HeldPermit(coordinator)
+        await awaitWindowEvent(backup.entered, "the backup item")
+        await order.append("backup")
+        await backup.release()
+        await joinCurrentPass(reconciliation)
+        let entries = await order.entries
+        XCTAssertEqual(entries, ["pass 2", "pass stopped", "backup", "pass 2"])
+    }
+
+    func testTheEndOfTheWindowStopsThePassAndTheForegroundRepeatsNoSavedPage() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try MIMEReconciliationFixture(
+            directory: directory, useOrderCache: true, holdsTheSecondPageOfTheFirstPass: true)
+        let state = runtimeState(.backgroundPermitted)
+        let coordinator = await coordinator(state)
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: state, coordinator: coordinator)
+        reconciliation.schedule(inventory(302)) { await fixture.run($0, reconciliation: reconciliation) }
+        await awaitWindowEvent(fixture.requested, "the second page of the background pass")
+
+        state.update { $0.executionOpportunity = .foregroundActive }
+        await joinCurrentPass(reconciliation)
+        let result = try await fixture.result()
+        XCTAssertEqual(result.requests.count, 2, "the stopped pass ran again in the foreground")
+        let firstPage = Set(try XCTUnwrap(result.requests.first?.first))
+        let repeated = result.requests.last?.flatMap { $0 }.filter { firstPage.contains($0) } ?? []
+        XCTAssertTrue(repeated.isEmpty, "the saved first page is not requested again")
+        XCTAssertEqual(result.classified, 302, "the foreground pass completes the library")
+        XCTAssertTrue(result.pending.isEmpty)
+        await fixture.close()
     }
 
     func testRetiringAWaitingPassEndsItWithoutAStart() async {
-        let reconciliation = TimelineMetadataReconciliation(runtimeState: runtimeState(.backgroundPermitted))
+        let reconciliation = TimelineMetadataReconciliation(runtimeState: runtimeState(.suspended))
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
         await awaitHeldSnapshots(1, in: reconciliation)
@@ -126,7 +200,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     }
 
     func testALibraryReplacementWhileAPassWaitsStartsOnlyTheNewLibrary() async {
-        let state = runtimeState(.backgroundPermitted)
+        let state = runtimeState(.suspended)
         let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
         let log = PassLog()
         reconciliation.schedule(inventory(2, library: "first")) { await log.start($0) }
@@ -142,7 +216,7 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
     }
 
     func testAHeldPassResumesWhenTheAppReturnsToAnInactiveForeground() async {
-        let state = runtimeState(.backgroundPermitted)
+        let state = runtimeState(.suspended)
         let reconciliation = TimelineMetadataReconciliation(runtimeState: state)
         let log = PassLog()
         reconciliation.schedule(inventory(2)) { await log.start($0) }
@@ -480,8 +554,11 @@ private actor MIMEReconciliationFixture {
     private var requests: [[[PhotoUID]]] = []
     private var response: CheckedContinuation<Void, Never>?
     private var released = false
+    /// The first pass waits at its second page until it is cancelled, after it saved its first page.
+    private let holdsTheSecondPageOfTheFirstPass: Bool
 
-    init(directory: URL, useOrderCache: Bool) throws {
+    init(directory: URL, useOrderCache: Bool, holdsTheSecondPageOfTheFirstPass: Bool = false) throws {
+        self.holdsTheSecondPageOfTheFirstPass = holdsTheSecondPageOfTheFirstPass
         timeline = try XCTUnwrap(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
         order =
             useOrderCache
@@ -498,7 +575,13 @@ private actor MIMEReconciliationFixture {
                 let page = try await reader.nextPage(isCurrent: { reconciliation.isCurrent(pass) })
                 if page.isEmpty { break }
                 requests[index].append(page.map(\.uid))
-                if index == 0, requests[index].count == 1, !released {
+                if holdsTheSecondPageOfTheFirstPass {
+                    if index == 0, requests[index].count == 2 {
+                        requested.fire()
+                        await waitUntilCancelled()
+                        return
+                    }
+                } else if index == 0, requests[index].count == 1, !released {
                     await withCheckedContinuation {
                         response = $0
                         requested.fire()
@@ -539,6 +622,22 @@ private actor MIMEReconciliationFixture {
         order?.close()
         timeline.close()
     }
+}
+
+/// The order of events across a pass and other work. `append` returns how often the entry occurred so far.
+private actor OrderLog {
+    private(set) var entries: [String] = []
+
+    @discardableResult
+    func append(_ entry: String) -> Int {
+        entries.append(entry)
+        return entries.filter { $0 == entry }.count
+    }
+}
+
+/// Returns when the awaiting task is cancelled.
+private func waitUntilCancelled() async {
+    await AsyncTestSignal().wait()
 }
 
 /// The passes that started, by library.

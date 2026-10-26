@@ -39,15 +39,15 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         await reconciliation.waitForCurrentPass()
     }
 
-    func testAnOpenGateStillWaitsForTheForeground() async {
+    func testAnOpenGateStillWaitsWhileTheAppIsSuspended() async {
         let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: HeldWaits().sleep)
         gate.open()
-        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .suspended))
         let reconciliation = TimelineMetadataReconciliation(startGate: gate, runtimeState: state)
         let started = AsyncTestSignal()
         reconciliation.schedule(inventory) { _ in started.fire() }
         await awaitHeldSnapshots(1, in: reconciliation)
-        XCTAssertFalse(started.hasFired, "an open gate does not start the pass in a background window")
+        XCTAssertFalse(started.hasFired, "an open gate does not start the pass while the app is suspended")
 
         state.update { $0.executionOpportunity = .foregroundActive }
         await awaitEvent(started, "the pass after the foreground return")
@@ -55,7 +55,7 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         await joinCurrentPass(reconciliation)
     }
 
-    func testThePassNeedsTheGateAndTheForegroundInEitherOrder() async {
+    func testThePassNeedsTheGateAndAnAppThatIsNotSuspendedInEitherOrder() async {
         let waits = HeldWaits()
         let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: waits.sleep)
         gate.buildStarted()
@@ -67,11 +67,11 @@ final class TimelineMetadataStartGateTests: XCTestCase {
         XCTAssertTrue(waiting, "the gate never started its limit timer")
         XCTAssertFalse(started.hasFired, "a closed gate holds the pass in the foreground")
 
-        // The app enters the background before the build ends; the gate opens there.
-        state.update { $0.executionOpportunity = .backgroundPermitted }
+        // The app is suspended before the build ends; the gate opens then.
+        state.update { $0.executionOpportunity = .suspended }
         gate.open()
         await awaitHeldSnapshots(1, in: reconciliation)
-        XCTAssertFalse(started.hasFired, "the open gate does not start the pass in the background")
+        XCTAssertFalse(started.hasFired, "the open gate does not start the pass while the app is suspended")
 
         state.update { $0.executionOpportunity = .foregroundActive }
         await awaitEvent(started, "the pass after the foreground return")
