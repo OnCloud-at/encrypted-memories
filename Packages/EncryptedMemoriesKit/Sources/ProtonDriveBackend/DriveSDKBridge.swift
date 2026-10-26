@@ -1545,6 +1545,24 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         return result
     }
 
+    /// Runs a viewer or export read: it promotes API and download requests and holds new uploads. The scope ends on
+    /// every exit, also after an error. The thumbnail batch loader keeps its own scope, because it never throws.
+    private func withViewerPriorityScope<T: Sendable>(_ operation: () async throws -> T) async throws -> T {
+        let priorityScope = await requestGovernor.beginPriorityScope(
+            .immediate,
+            promoting: [.api, .storageDownload],
+            suspending: [.storageUpload]
+        )
+        do {
+            let result = try await operation()
+            await requestGovernor.endPriorityScope(priorityScope)
+            return result
+        } catch {
+            await requestGovernor.endPriorityScope(priorityScope)
+            throw error
+        }
+    }
+
     // MARK: - FullMediaProvider
 
     func preview(for uid: PhotoUID) async throws -> Data {
@@ -1574,20 +1592,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         onChunk: @escaping @Sendable (Data) async throws -> Void,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        do {
+        try await withViewerPriorityScope {
             try await ProtonRequestContext.$priority.withValue(.immediate) {
                 let source = try await fileSource()
                 try await source.streamOriginalBytes(uid: uid, onChunk: onChunk, onProgress: onProgress)
             }
-            await requestGovernor.endPriorityScope(priorityScope)
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
         }
     }
 
@@ -1595,21 +1604,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         for uid: PhotoUID,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> Data {
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        do {
-            let result = try await ProtonRequestContext.$priority.withValue(.immediate) {
+        try await withViewerPriorityScope {
+            try await ProtonRequestContext.$priority.withValue(.immediate) {
                 let source = try await fileSource()
                 return try await source.originalData(uid: uid, onProgress: onProgress)
             }
-            await requestGovernor.endPriorityScope(priorityScope)
-            return result
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
         }
     }
 
@@ -1637,49 +1636,52 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
         let token = UUID()
         let sdkUID = SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID)
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
         do {
-            let operation = try await ProtonRequestContext.$priority.withValue(.immediate) {
-                try await photosClient.downloadOperation(
-                    photoUid: sdkUID,
-                    destinationUrl: partial,
-                    cancellationToken: token,
-                    progressCallback: { onProgress($0.fractionCompleted) }
-                )
-            }
-            // Keep the export's partial file and open-session lease alive until native cancel
-            // has settled, even when the download's terminal callback arrives first.
-            let verificationIssue = try await SDKCancellableOperation.run(token: token) { _ in
-                try await operation.awaitDownloadWithResilience(
-                    operationalResilience: BasicOperationalResilience.default,
-                    onRetriableErrorReceived: { error in
-                        DebugLog.log("original file transfer retry: \(error.localizedDescription)")
-                    }
-                )
-            } cancel: { _ in
-                try? await operation.cancel()
-            }
-            try Task.checkCancellation()
-            if fileManager.fileExists(atPath: destination.path) {
-                _ = try fileManager.replaceItemAt(destination, withItemAt: partial)
-            } else {
-                try fileManager.moveItem(at: partial, to: destination)
-            }
-            onProgress(1)
-            if let verificationIssue {
-                DebugLog.log(
-                    "original file completed with verification warning: \(verificationIssue.localizedDescription)")
+            try await withViewerPriorityScope {
+                try await writeOriginalFile(token: token, sdkUID: sdkUID, partial: partial, to: destination, onProgress)
             }
         } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
             if Task.isCancelled { throw CancellationError() }
             throw Self.originalTransferError(from: error)
         }
-        await requestGovernor.endPriorityScope(priorityScope)
+    }
+
+    private func writeOriginalFile(
+        token: UUID, sdkUID: SDKNodeUid, partial: URL, to destination: URL,
+        _ onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let fileManager = FileManager.default
+        let operation = try await ProtonRequestContext.$priority.withValue(.immediate) {
+            try await photosClient.downloadOperation(
+                photoUid: sdkUID,
+                destinationUrl: partial,
+                cancellationToken: token,
+                progressCallback: { onProgress($0.fractionCompleted) }
+            )
+        }
+        // Keep the export's partial file and open-session lease alive until native cancel
+        // has settled, even when the download's terminal callback arrives first.
+        let verificationIssue = try await SDKCancellableOperation.run(token: token) { _ in
+            try await operation.awaitDownloadWithResilience(
+                operationalResilience: BasicOperationalResilience.default,
+                onRetriableErrorReceived: { error in
+                    DebugLog.log("original file transfer retry: \(error.localizedDescription)")
+                }
+            )
+        } cancel: { _ in
+            try? await operation.cancel()
+        }
+        try Task.checkCancellation()
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: partial)
+        } else {
+            try fileManager.moveItem(at: partial, to: destination)
+        }
+        onProgress(1)
+        if let verificationIssue {
+            DebugLog.log(
+                "original file completed with verification warning: \(verificationIssue.localizedDescription)")
+        }
     }
 
     /// Exports stop on a full device through `DeviceStorage.isOutOfSpace`, which cannot read the SDK's own
@@ -1700,12 +1702,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private func singleThumbnail(_ uid: PhotoUID, type: ThumbnailData.ThumbnailType) async throws -> Data {
         let sdkUid = SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID)
         let box = DataBox()
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        do {
+        try await withViewerPriorityScope {
             try await ProtonRequestContext.$priority.withValue(.immediate) {
                 try await photosClient.downloadThumbnails(
                     photoUids: [sdkUid],
@@ -1718,11 +1715,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     }
                 )
             }
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
         }
-        await requestGovernor.endPriorityScope(priorityScope)
         guard let data = box.value else { throw CocoaError(.fileReadUnknown) }
         return data
     }
@@ -2289,30 +2282,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func makeStreamingAssetImpl(for uid: PhotoUID) async throws -> StreamingVideoAsset {
-        let priorityScope = await requestGovernor.beginPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        let source: PhotoVideoStreamSource
-        do {
-            source = try await ProtonRequestContext.$priority.withValue(.immediate) {
-                try await fileSource()
-            }
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
-        }
+        try await withViewerPriorityScope { try await prepareStreamingAsset(for: uid) }
+    }
 
+    private func prepareStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
+        let source = try await ProtonRequestContext.$priority.withValue(.immediate) {
+            try await fileSource()
+        }
         // Throws `.notAVideo` cheaply for images, so the viewer falls back to its image path.
-        let prepared: PreparedVideo
-        do {
-            prepared = try await ProtonRequestContext.$priority.withValue(.immediate) {
-                try await source.prepare(uid: uid)
-            }
-        } catch {
-            await requestGovernor.endPriorityScope(priorityScope)
-            throw error
+        let prepared = try await ProtonRequestContext.$priority.withValue(.immediate) {
+            try await source.prepare(uid: uid)
         }
         let loader = ProtonVideoResourceLoader(
             prepared: prepared,
@@ -2329,26 +2308,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // Fetch and decrypt the first blocks while AVFoundation still inspects the asset, so its own
         // start-of-playback decision can already count on served bytes.
         loader.primePlaybackStart()
-        await requestGovernor.endPriorityScope(priorityScope)
         return StreamingVideoAsset(asset: asset, retaining: loader)
     }
 
     func prefetchEncrypted(for uid: PhotoUID) async throws {
         try await withOpenSession(cause: .viewer) { bridge in
-            let priorityScope = await bridge.requestGovernor.beginPriorityScope(
-                .immediate,
-                promoting: [.api, .storageDownload],
-                suspending: [.storageUpload]
-            )
-            do {
+            try await bridge.withViewerPriorityScope {
                 try await ProtonRequestContext.$priority.withValue(.immediate) {
                     let source = try await bridge.fileSource()
                     try await source.prefetchEncrypted(uid: uid)
                 }
-                await bridge.requestGovernor.endPriorityScope(priorityScope)
-            } catch {
-                await bridge.requestGovernor.endPriorityScope(priorityScope)
-                throw error
             }
         }
     }
