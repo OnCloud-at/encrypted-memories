@@ -1185,7 +1185,10 @@ public final class ExactDuplicatesModel {
 
     /// Runs the build of the content index, or waits for the build that already runs.
     private func buildIndex() async throws -> Bool {
-        if let indexBuild { return try await indexBuild.value }
+        if let indexBuild {
+            PhotoDiagnostics.shared.increment("duplicates.indexBuildJoined")
+            return try await indexBuild.value
+        }
         let finder = finder
         let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] progress in
             await self?.show(progress)
