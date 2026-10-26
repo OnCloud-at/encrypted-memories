@@ -184,6 +184,8 @@ final class PhotoBackupBackgroundCoordinator {
                 completion.finish(success: false)
                 return
             }
+            // A launch without a scene has not started the account yet.
+            BackgroundLaunchAccountStart.shared.ensureStarted()
             guard let self, let controller = await self.waitForController() else {
                 completion.finish(success: false)
                 return

@@ -199,6 +199,9 @@ public final class AppleSmartSearchBackgroundCoordinator {
                     task.setTaskCompleted(success: false)
                     return
                 }
+                // A launch without a scene has not started the account yet; an operation that the window's end
+                // cancelled before it ran starts nothing and ends below.
+                BackgroundLaunchAccountStart.shared.ensureStarted(unlessCancelled: Task.isCancelled)
                 guard let lifecycle = await self.reference.whenReady(timeout: .seconds(30)),
                     !Task.isCancelled, self.reference.value === lifecycle
                 else {

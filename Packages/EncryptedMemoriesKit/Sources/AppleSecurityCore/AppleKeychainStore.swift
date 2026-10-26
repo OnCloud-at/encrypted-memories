@@ -14,6 +14,13 @@ public enum AppleKeychainAccessibility: Sendable, Hashable {
             kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         }
     }
+
+    /// The class of a stored item, or nil for a class this app never writes.
+    fileprivate init?(securityValue: String) {
+        let known: [Self] = [.whenUnlockedThisDeviceOnly, .afterFirstUnlockThisDeviceOnly]
+        guard let match = known.first(where: { $0.securityValue as String == securityValue }) else { return nil }
+        self = match
+    }
 }
 
 /// Complete identity and protection policy for one generic-password item.
@@ -64,11 +71,20 @@ public protocol AppleKeychainStoring: Sendable {
     func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data
     func removeData(for item: AppleKeychainItem) throws
     func removeAllData(service: String) throws
+    /// The class of the stored item, or nil when no item exists or the store cannot tell.
+    func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility?
+}
+
+extension AppleKeychainStoring {
+    /// A store that cannot report the class returns nil, so no migration ever writes through it.
+    public func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility? { nil }
 }
 
 struct SecurityItemCopyResult: Sendable {
     let status: OSStatus
     let data: Data?
+    /// The `kSecAttrAccessible` value of an attribute query.
+    var accessible: String? = nil
 }
 
 protocol SecurityItemCalling: Sendable {
@@ -82,7 +98,9 @@ private struct SystemSecurityItemClient: SecurityItemCalling {
     func copyMatching(_ query: [String: Any]) -> SecurityItemCopyResult {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        return SecurityItemCopyResult(status: status, data: result as? Data)
+        let attributes = result as? [String: Any]
+        return SecurityItemCopyResult(
+            status: status, data: result as? Data, accessible: attributes?[kSecAttrAccessible as String] as? String)
     }
 
     func add(_ attributes: [String: Any]) -> OSStatus {
@@ -162,6 +180,22 @@ public struct SystemAppleKeychainStore: AppleKeychainStoring {
     /// uses this to sweep keys left by older accounts as well as the currently authenticated one.
     public func removeAllData(service: String) throws {
         try deleteService(service)
+    }
+
+    /// Reads only the attributes of the item, never its data.
+    public func accessibility(for item: AppleKeychainItem) throws -> AppleKeychainAccessibility? {
+        var query = baseQuery(item)
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        let result = security.copyMatching(query)
+        switch result.status {
+        case errSecSuccess:
+            return result.accessible.flatMap(AppleKeychainAccessibility.init(securityValue:))
+        case errSecItemNotFound:
+            return nil
+        default:
+            throw AppleSecurityError(operation: .read, status: result.status)
+        }
     }
 
     private func read(_ item: AppleKeychainItem) throws -> Data? {

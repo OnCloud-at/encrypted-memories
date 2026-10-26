@@ -36,6 +36,8 @@ struct EncryptedMemoriesMobileApp: App {
 
         AppleLibraryRuntimeAdapter.shared.install()
         MobileMetricKitCollector.shared.install()
+        // A background launch may connect no scene; its windows start the account through this one start.
+        BackgroundLaunchAccountStart.shared.install { MobileAccountRuntime.shared.start() }
         PhotoBackupBackgroundCoordinator.shared.register()
         AppleSmartSearchBackgroundCoordinator.shared.register()
     }
