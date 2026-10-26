@@ -221,6 +221,8 @@ public final class PhotoLibraryBackupController {
     private var deferredBackgroundOwner: BackupExecutionOwner?
     /// Background windows that wait for their deferred pass, so that the OS task ends only when that pass ends.
     private var deferredStartWaiters: [UUID: CheckedContinuation<StartedBackupRun?, Never>] = [:]
+    /// Background windows that hold a run they took over. Each wait ends with that run or with its window.
+    private var adoptedRunWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     /// The last `startSync` call deferred its pass to the first network path.
     private var lastStartWasDeferred = false
     private let firstNetworkPathWait: Duration
@@ -232,6 +234,8 @@ public final class PhotoLibraryBackupController {
     private var backedUpAtRunStart = 0
     private var lastObservedUploadedCount: Int?
     private var activeRunID: String?
+    /// The owner that started the active run. A background window may take over only an automatic foreground pass.
+    private var activeRunOwner: BackupExecutionOwner?
     private var pendingSyncAfterStop = false
     private var isShuttingDown = false
     private var isScanning = false
@@ -251,6 +255,10 @@ public final class PhotoLibraryBackupController {
         private var scanBodyForTesting: (@Sendable () async throws -> Void)?
         /// Replaces the real sleep of the wait for the first network path, so a test decides when the wait ends.
         private var firstNetworkPathSleepForTesting: (@Sendable (Duration) async -> Void)?
+        /// Holds the resume at launch until the test releases it, so a test decides whether it comes before a window.
+        private var launchResumeGateForTesting: (@Sendable () async -> Void)?
+        /// The resume at launch returned.
+        internal private(set) var launchResumeEndedForTesting = false
         /// Ended passes whose completion (status projection and the next wake) still runs.
         private var completingSyncRuns = 0
         private var syncRunCompletionWaiters: [CheckedContinuation<Void, Never>] = []
@@ -387,7 +395,13 @@ public final class PhotoLibraryBackupController {
             startObservingChanges()
             Task { @MainActor [weak self] in
                 await self?.statusSetupTask?.value
+                #if DEBUG
+                    if let gate = self?.launchResumeGateForTesting { await gate() }
+                #endif
                 self?.resumeEnabledBackupAfterLaunch()
+                #if DEBUG
+                    self?.launchResumeEndedForTesting = true
+                #endif
             }
         } else {
             reportNoIndexBuild()
@@ -831,6 +845,11 @@ public final class PhotoLibraryBackupController {
         if started == nil, lastStartWasDeferred {
             // The pass waits for the first network path. The window stays open until that pass ends.
             started = await waitForDeferredStart()
+        } else if started == nil, let run = automaticRunInTheBackground() {
+            // Nobody watches this automatic pass, so it runs on the window's time until it ends or the window ends.
+            onRunStarted?(run.runID)
+            await waitForAdoptedRun(run)
+            return
         }
         guard let run = started else { return }
         onRunStarted?(run.runID)
@@ -862,11 +881,27 @@ public final class PhotoLibraryBackupController {
             startFirstNetworkPathWait()
             return nil
         }
-        if deferredStartOwner != nil {
+        var tookAutomaticDeferral = false
+        if deferredStartOwner == .foreground, owner != .foreground, owner != .manual,
+            runtimeSignals.current().isAppInBackground
+        {
+            // The snapshot arrived before its observer, and no scene is in the foreground: this window runs the
+            // automatic pass that waited for the path.
+            deferredStartOwner = nil
+            tookAutomaticDeferral = true
+            if deferredBackgroundOwner == nil {
+                firstNetworkPathWaitTask?.cancel()
+                firstNetworkPathWaitTask = nil
+            }
+        } else if deferredStartOwner != nil {
             // The snapshot can arrive before its observer. A window must still yield to the deferred session pass.
             if owner == .manual { deferredStartOwner = .manual }
             let run = startAfterFirstNetworkPath()
             return owner == .foreground || owner == .manual ? run : nil
+        }
+        defer {
+            // A window that took the automatic pass but started no run gives it back, so the path observer starts it.
+            if tookAutomaticDeferral, activeRunID == nil, deferredStartOwner == nil { deferredStartOwner = .foreground }
         }
         if manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait, owner != .manual {
             let run = startSync(owner: .manual)
@@ -909,6 +944,7 @@ public final class PhotoLibraryBackupController {
             return nil
         }
         activeRunID = runID
+        activeRunOwner = owner
 
         // Retry previously failed items once per launch.
         if !didAutoRetryFailedThisLaunch {
@@ -1219,6 +1255,14 @@ public final class PhotoLibraryBackupController {
         stopCurrentSync()
     }
 
+    /// Stops the run of an expired OS background window. A run that the window took over from an automatic pass keeps
+    /// going when a scene is in the foreground again, because the person now watches it.
+    public func stopBackgroundWindowRun(runID: String) {
+        guard activeRunID == runID else { return }
+        if activeRunOwner == .foreground, !runtimeSignals.current().isAppInBackground { return }
+        stopCurrentSync()
+    }
+
     /// Explicit user actions may stop whichever run is currently active.
     public func stopSync() {
         stopCurrentSync()
@@ -1362,6 +1406,13 @@ public final class PhotoLibraryBackupController {
         internal func replaceFirstNetworkPathSleepForTesting(_ sleep: @escaping @Sendable (Duration) async -> Void) {
             firstNetworkPathSleepForTesting = sleep
         }
+
+        /// Set this right after the controller is created, before the test awaits anything.
+        internal func holdLaunchResumeForTesting(_ gate: @escaping @Sendable () async -> Void) {
+            launchResumeGateForTesting = gate
+        }
+
+        internal var deferredStartOwnerForTesting: BackupExecutionOwner? { deferredStartOwner }
 
         /// Returns when every ended pass has finished its completion, including the decision about its next wake.
         internal func waitForSyncRunCompletionForTesting() async {
@@ -1613,7 +1664,14 @@ public final class PhotoLibraryBackupController {
         deferredBackgroundOwner = nil
         firstNetworkPathWaitTask?.cancel()
         firstNetworkPathWaitTask = nil
-        if let sessionOwner {
+        if sessionOwner == .foreground, let backgroundOwner, !deferredStartWaiters.isEmpty,
+            runtimeSignals.current().isAppInBackground
+        {
+            // No scene is in the foreground, so nobody watches the automatic pass: the waiting window runs it.
+            let run = startSync(owner: backgroundOwner)
+            if run == nil { deferredStartOwner = sessionOwner }
+            resumeDeferredStartWaiters(with: run)
+        } else if let sessionOwner {
             // The foreground or explicit pass runs on its own; a waiting window ends without owning it.
             let run = startSync(owner: sessionOwner)
             if run == nil { deferredStartOwner = sessionOwner }
@@ -1641,6 +1699,39 @@ public final class PhotoLibraryBackupController {
         } onCancel: {
             Task { @MainActor [weak self] in self?.cancelDeferredStartWait(id) }
         }
+    }
+
+    /// The running automatic pass, while no scene is in the foreground. An explicit pass is never returned: a window
+    /// must not own or stop it.
+    private func automaticRunInTheBackground() -> StartedBackupRun? {
+        guard activeRunOwner == .foreground, let activeRunID, let syncTask, runtimeSignals.current().isAppInBackground
+        else { return nil }
+        return StartedBackupRun(runID: activeRunID, task: syncTask)
+    }
+
+    /// Waits for a run that a background window took over. The cancellation of the window ends the wait at once; the
+    /// run then belongs to the app again, and the window's expiration decides whether it stops.
+    private func waitForAdoptedRun(_ run: StartedBackupRun) async {
+        let id = UUID()
+        Task { @MainActor [weak self] in
+            await run.task.value
+            self?.endAdoptedRunWait(id)
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume()
+                    return
+                }
+                adoptedRunWaiters[id] = continuation
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.endAdoptedRunWait(id) }
+        }
+    }
+
+    private func endAdoptedRunWait(_ id: UUID) {
+        adoptedRunWaiters.removeValue(forKey: id)?.resume()
     }
 
     private func cancelDeferredStartWait(_ id: UUID) {
@@ -1914,6 +2005,7 @@ public final class PhotoLibraryBackupController {
         heartbeatTask = nil
         lockStore?.release(runID: runID)
         activeRunID = nil
+        activeRunOwner = nil
         isSyncing = false
         #if DEBUG
             completingSyncRuns += 1

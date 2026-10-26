@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import UploadCore
 import UploadFeature
 import XCTest
@@ -2607,6 +2608,480 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(scans.count, 0)
         }
 
+        // MARK: Resume at launch against a background window (#472)
+
+        // A background window can launch the app without a scene. The account start then creates the controller, whose
+        // resume at launch starts an automatic foreground pass. The window and the resume reach the controller in
+        // either order. While no scene is in the foreground, the window must run that pass inside its own time.
+
+        func testAResumeAtLaunchThatWaitsForTheFirstPathHandsItsPassToALaterWindow() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-launch-resume-then-window", source: .mobileDataOff(runtime))
+            defer { launch.cleanup() }
+            let controller = launch.controller
+            let scan = launch.scan
+            scan.open.value = true
+
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground, "the resume waits for the first path")
+            let window = startWindow(controller, scan: scan)
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            try await assertWindowRanTheOnlyPass(window, scan: scan, controller: controller)
+            await controller.shutdown()
+        }
+
+        func testAWindowThatWaitsForTheFirstPathTakesThePassOfALaterResumeAtLaunch() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-window-then-launch-resume", source: .mobileDataOff(runtime))
+            defer { launch.cleanup() }
+            let controller = launch.controller
+            let scan = launch.scan
+            scan.open.value = true
+
+            let window = startWindow(controller, scan: scan)
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground, "the resume waits for the first path")
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            try await assertWindowRanTheOnlyPass(window, scan: scan, controller: controller)
+            await controller.shutdown()
+        }
+
+        func testAWindowRunsTheResumeAtLaunchWhenThePathArrivedBeforeItsObserver() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            signals.setAppInBackground(true)
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-launch-resume-observer-gap", source: signals.source)
+            defer { launch.cleanup() }
+            let controller = launch.controller
+            let scan = launch.scan
+            scan.open.value = true
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground, "the resume waits for the first path")
+
+            // Publish the snapshot without notifying the observer, as the real main-actor hop can lag the path.
+            signals.setNetworkDetermined(true)
+            signals.setWaitsForWiFi(false)
+            let window = startWindow(controller, scan: scan)
+            try await assertWindowRanTheOnlyPass(window, scan: scan, controller: controller)
+            signals.announceChange()
+            await controller.waitForSyncRunCompletionForTesting()
+            XCTAssertEqual(scan.starts.count, 1, "the observer starts no second pass")
+            await controller.shutdown()
+        }
+
+        func testAWindowTakesOverAResumeAtLaunchThatIsAlreadyRunning() async throws {
+            let launch = try await makeRunningLaunchResume(prefix: "backup-launch-resume-running-window")
+            defer { launch.fixture.cleanup() }
+            let controller = launch.fixture.controller
+            let scan = launch.fixture.scan
+
+            let window = startWindow(controller, scan: scan)
+            let adopted = await waitUntil(timeout: .seconds(2)) { window.record.runIDs.count == 1 }
+            XCTAssertTrue(adopted, "the window takes over the running automatic pass")
+            XCTAssertEqual(window.record.runIDs, [launch.runID], "the window holds the run of the resume")
+            XCTAssertFalse(window.record.hasEnded, "the window stays open while the pass runs")
+
+            scan.open.value = true
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(window.record.completedScansAtEnd, 1, "the window ends only after the pass")
+            XCTAssertEqual(scan.starts.count, 1, "no second pass starts")
+            XCTAssertEqual(scan.owners.values, [.foreground], "the run keeps the owner that started it")
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testAnExpiredWindowStopsTheResumeAtLaunchItTookOverWhileTheAppStaysInTheBackground() async throws {
+            let launch = try await makeRunningLaunchResume(prefix: "backup-launch-resume-window-expired")
+            defer { launch.fixture.cleanup() }
+            let controller = launch.fixture.controller
+            let scan = launch.fixture.scan
+            let window = startWindow(controller, scan: scan)
+            _ = await waitUntil(timeout: .seconds(2)) { window.record.runIDs.count == 1 }
+            let runID = try XCTUnwrap(window.record.runIDs.first, "the window takes over the running pass")
+
+            // An expiry that names another run stops nothing.
+            controller.stopBackgroundWindowRun(runID: "an-earlier-run")
+            XCTAssertFalse(controller.isRunnerStopPendingForTesting, "only the window's own run can be stopped")
+
+            // The expiration handler cancels the window's work, then stops the run it holds.
+            window.task.cancel()
+            controller.stopBackgroundWindowRun(runID: runID)
+            XCTAssertTrue(controller.isRunnerStopPendingForTesting, "the expiry stops the pass in the background")
+            XCTAssertEqual(controller.runnerStopRunIDForTesting, runID)
+
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded && !controller.isSyncing }
+            XCTAssertTrue(ended, "the window and the stopped pass end")
+            scan.open.value = true
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testAnExpiredWindowKeepsTheResumeAtLaunchItTookOverOnceTheAppIsInTheForeground() async throws {
+            let launch = try await makeRunningLaunchResume(prefix: "backup-launch-resume-window-foreground")
+            defer { launch.fixture.cleanup() }
+            let controller = launch.fixture.controller
+            let scan = launch.fixture.scan
+            let window = startWindow(controller, scan: scan)
+            _ = await waitUntil(timeout: .seconds(2)) { window.record.runIDs.count == 1 }
+            let runID = try XCTUnwrap(window.record.runIDs.first, "the window takes over the running pass")
+
+            // The person opens the app before the window expires; they now watch this pass.
+            launch.runtime.update { $0.executionOpportunity = .foregroundActive }
+            window.task.cancel()
+            controller.stopBackgroundWindowRun(runID: runID)
+            XCTAssertFalse(controller.isRunnerStopPendingForTesting, "the expiry does not stop a pass the person sees")
+            XCTAssertEqual(controller.activeExecutionRunID, runID)
+
+            // The pass stays held until the window processed its cancellation; then the pass may finish.
+            _ = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded }
+            scan.open.value = true
+            await window.task.value
+            XCTAssertEqual(
+                window.record.completedScansAtEnd, 0, "the window ended before the pass it gave back finished")
+            let finished = await waitUntil(timeout: .seconds(5)) { !controller.isSyncing }
+            XCTAssertTrue(finished)
+            XCTAssertEqual(scan.completions.count, 1, "the pass the person sees runs to its end")
+            XCTAssertFalse(controller.isRunnerStopPendingForTesting)
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testAWindowNeverTakesOverARunningManualPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .backgroundPermitted
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-manual-running-window", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scan = HeldScan()
+            scan.install(on: controller)
+            await controller.retryUserResolvableWork()
+            _ = await waitUntil { scan.starts.count == 1 }
+            XCTAssertEqual(scan.owners.values, [.manual])
+
+            let window = startWindow(controller, scan: scan)
+            let ended = await waitUntil(timeout: .seconds(2)) { window.record.hasEnded }
+            XCTAssertTrue(ended, "the window ends at once next to the explicit pass")
+            XCTAssertEqual(window.record.runIDs, [], "the window can never stop the explicit pass at its expiration")
+            scan.open.value = true
+            await controller.shutdown()
+        }
+
+        func testAWindowOwnsItsPassWhenTheResumeAtLaunchComesLater() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .backgroundPermitted
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-window-then-running-resume", source: .mobileDataOff(runtime))
+            defer { launch.cleanup() }
+            let controller = launch.controller
+            let scan = launch.scan
+
+            let window = startWindow(controller, scan: scan)
+            _ = await waitUntil { scan.starts.count == 1 }
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+            scan.open.value = true
+
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(window.record.runIDs.count, 1)
+            XCTAssertEqual(scan.starts.count, 1, "the resume finds the running pass and starts none")
+            XCTAssertEqual(scan.owners.values, [.iOSBackgroundTask])
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testAWindowThatCannotTakeTheLockGivesTheResumeAtLaunchBack() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            signals.setAppInBackground(true)
+            let launch = try makeLaunchResumeFixture(prefix: "backup-takeover-busy-lock", source: signals.source)
+            defer { launch.cleanup() }
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: launch.fixture.directory.appendingPathComponent(
+                        PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
+            await assertAFailedTakeoverGivesTheResumeBack(launch: launch, signals: signals) {
+                XCTAssertTrue(lock.release(runID: "other-live-run"))
+            }
+        }
+
+        func testAWindowThatFindsTheLockUnreadableGivesTheResumeAtLaunchBack() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            signals.setAppInBackground(true)
+            // No busy wait, so the held write transaction below makes the lock unreadable at once.
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-takeover-unavailable-lock", source: signals.source,
+                databasePolicy: LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0))
+            defer { launch.cleanup() }
+            let url = launch.fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)
+            var writer: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &writer), SQLITE_OK)
+            defer { sqlite3_close(writer) }
+            XCTAssertEqual(sqlite3_exec(writer, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            await assertAFailedTakeoverGivesTheResumeBack(launch: launch, signals: signals) {
+                XCTAssertEqual(sqlite3_exec(writer, "COMMIT;", nil, nil, nil), SQLITE_OK)
+            }
+        }
+
+        /// The resume at launch waits for the path, the path arrives before its observer, and a window cannot start the
+        /// pass it takes. The window ends without a run, the automatic pass stays pending, and the observer starts it.
+        private func assertAFailedTakeoverGivesTheResumeBack(
+            launch: LaunchResumeFixture, signals: FakeBackupRuntimeSignals, freeTheLock: () -> Void,
+            file: StaticString = #filePath, line: UInt = #line
+        ) async {
+            let controller = launch.controller
+            let scan = launch.scan
+            scan.open.value = true
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground, file: file, line: line)
+            signals.setNetworkDetermined(true)
+            signals.setWaitsForWiFi(false)
+
+            let window = startWindow(controller, scan: scan)
+            await window.task.value
+            XCTAssertEqual(window.record.runIDs, [], "the window could not start a pass", file: file, line: line)
+            XCTAssertEqual(
+                controller.deferredStartOwnerForTesting, .foreground, "the automatic pass stays pending",
+                file: file, line: line)
+
+            freeTheLock()
+            signals.announceChange()
+            let ran = await waitUntil(timeout: .seconds(5)) { scan.completions.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(ran, "the observer starts the automatic pass", file: file, line: line)
+            XCTAssertEqual(scan.owners.values, [.foreground], file: file, line: line)
+            await controller.shutdown()
+        }
+
+        func testInTheForegroundAResumeAtLaunchThatWaitsForThePathKeepsItsPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-foreground-resume-window", source: .mobileDataOff(runtime))
+            defer { launch.cleanup() }
+            let controller = launch.controller
+            let scan = launch.scan
+            scan.open.value = true
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+            let window = startWindow(controller, scan: scan)
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded && scan.completions.count == 1 }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(window.record.runIDs, [], "a window never owns the pass of an open app")
+            XCTAssertEqual(scan.owners.values, [.foreground])
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testInTheForegroundAWindowYieldsToAResumeAtLaunchThatWaitedBeforeItsObserver() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-foreground-resume-observer-gap", source: signals.source)
+            defer { launch.cleanup() }
+            let controller = launch.controller
+            let scan = launch.scan
+            scan.open.value = true
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+
+            signals.setNetworkDetermined(true)
+            signals.setWaitsForWiFi(false)
+            let window = startWindow(controller, scan: scan)
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded && scan.completions.count == 1 }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(window.record.runIDs, [], "a window never owns the pass of an open app")
+            XCTAssertEqual(scan.owners.values, [.foreground])
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testInTheBackgroundAWindowNeverOwnsADeferredManualPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-background-deferred-manual-window", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scan = HeldScan()
+            scan.open.value = true
+            scan.install(on: controller)
+            await controller.retryUserResolvableWork()
+            let window = startWindow(controller, scan: scan)
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded && scan.completions.count == 1 }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(window.record.runIDs, [], "the window cannot stop the explicit pass at its expiration")
+            XCTAssertEqual(scan.owners.values, [.manual])
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testInTheBackgroundAWindowNeverTakesADeferredManualPassBeforeItsObserver() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            signals.setAppInBackground(true)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-background-manual-observer-gap", source: signals.source,
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scan = HeldScan()
+            scan.open.value = true
+            scan.install(on: controller)
+            await controller.retryUserResolvableWork()
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .manual)
+
+            signals.setNetworkDetermined(true)
+            signals.setWaitsForWiFi(false)
+            let window = startWindow(controller, scan: scan)
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded && scan.completions.count == 1 }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(window.record.runIDs, [], "the window never owns or expires the deferred manual pass")
+            XCTAssertEqual(scan.owners.values, [.manual])
+            await window.task.value
+            await controller.shutdown()
+        }
+
+        func testInTheForegroundAWindowDoesNotTakeOverARunningResumeAtLaunch() async throws {
+            let launch = try await makeRunningLaunchResume(
+                prefix: "backup-foreground-running-resume-window", opportunity: .foregroundActive)
+            defer { launch.fixture.cleanup() }
+            let controller = launch.fixture.controller
+            let scan = launch.fixture.scan
+
+            let window = startWindow(controller, scan: scan)
+            let ended = await waitUntil(timeout: .seconds(2)) { window.record.hasEnded }
+            XCTAssertTrue(ended, "the window ends at once next to the pass of an open app")
+            XCTAssertEqual(window.record.runIDs, [])
+            scan.open.value = true
+            await controller.shutdown()
+        }
+
+        /// The window ended once, after the one pass of the launch ran inside it with the window's own owner.
+        private func assertWindowRanTheOnlyPass(
+            _ window: BackgroundWindowProbe, scan: HeldScan, controller: PhotoLibraryBackupController,
+            file: StaticString = #filePath, line: UInt = #line
+        ) async throws {
+            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded }
+            XCTAssertTrue(ended, "the window ends", file: file, line: line)
+            XCTAssertEqual(window.record.runIDs.count, 1, "the window received the pass", file: file, line: line)
+            XCTAssertEqual(
+                window.record.completedScansAtEnd, 1, "the pass ran inside the window", file: file, line: line)
+            XCTAssertEqual(
+                scan.owners.values, [.iOSBackgroundTask], "the pass has the window's owner", file: file, line: line)
+            XCTAssertNil(controller.deferredStartOwnerForTesting, "no resume is left waiting", file: file, line: line)
+            await window.task.value
+        }
+
+        /// A backup that is on at launch with a determined path, whose resume at launch already runs and holds its scan.
+        private func makeRunningLaunchResume(
+            prefix: String, opportunity: LibraryExecutionOpportunity = .backgroundPermitted
+        ) async throws -> (fixture: LaunchResumeFixture, runtime: LibraryRuntimeState, runID: String) {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = opportunity
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeLaunchResumeFixture(prefix: prefix, source: .mobileDataOff(runtime))
+            fixture.releaseResume()
+            _ = await waitUntil { fixture.scan.starts.count == 1 }
+            XCTAssertEqual(fixture.scan.owners.values, [.foreground], "the resume at launch runs an automatic pass")
+            let runID = try XCTUnwrap(fixture.controller.activeExecutionRunID)
+            return (fixture, runtime, runID)
+        }
+
+        /// A backup that is on at launch, so the real resume at launch runs; the test decides when it may start.
+        private func makeLaunchResumeFixture(
+            prefix: String, source: BackupRuntimeSignalSource, databasePolicy: LibraryDatabasePolicy = .conservative
+        ) throws -> LaunchResumeFixture {
+            let suite = "\(prefix)-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defaults.set(true, forKey: "photoBackup.enabled.v1")
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+            var configuration = PhotoLibraryBackupController.Configuration(
+                accountDataDirectory: directory, databasePolicy: databasePolicy, defaults: defaults,
+                runtimeSignals: source, firstNetworkPathWait: .seconds(60))
+            configuration.currentAccessState = { .full }
+            let controller = PhotoLibraryBackupController(
+                configuration: configuration, identityResolver: FakeIdentityResolver(), uploader: MockUploader())
+            // Installed before the first await, so the resume at launch cannot pass the gate unseen.
+            let gate = HeldBackupSleepClock(clock: BackupTestClock())
+            controller.holdLaunchResumeForTesting { try? await gate.sleep(for: 0) }
+            let scan = HeldScan()
+            scan.install(on: controller)
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: .init(kind: .fileURL, identifier: "waiting-photo"), revision: .init(rawValue: 1),
+                        originalFilename: "waiting-photo.jpg", state: .discovered, lastError: nil,
+                        updatedAt: Date().addingTimeInterval(-60))))
+            queue.close()
+            return LaunchResumeFixture(
+                fixture: ControllerFixture(
+                    controller: controller, defaults: defaults, suite: suite, directory: directory),
+                gate: gate, scan: scan)
+        }
+
+        private struct LaunchResumeFixture {
+            let fixture: ControllerFixture
+            let gate: HeldBackupSleepClock
+            let scan: HeldScan
+
+            var controller: PhotoLibraryBackupController { fixture.controller }
+
+            func releaseResume() { gate.releaseAll() }
+
+            func cleanup() {
+                gate.releaseAll()
+                scan.open.value = true
+                fixture.cleanup()
+            }
+        }
+
+        private struct BackgroundWindowProbe {
+            let task: Task<Void, Never>
+            let record: BackgroundWindowRecord
+        }
+
+        private func startWindow(_ controller: PhotoLibraryBackupController, scan: HeldScan) -> BackgroundWindowProbe {
+            let record = BackgroundWindowRecord()
+            let task = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { record.received($0) }
+                record.end(completedScans: scan.completions.count)
+            }
+            return BackgroundWindowProbe(task: task, record: record)
+        }
+
         /// Holds the wait for the first network path until the test releases it, so the bounded wait ends on cue.
         private func holdFirstNetworkPathWait(of controller: PhotoLibraryBackupController) -> HeldBackupSleepClock {
             let clock = HeldBackupSleepClock(clock: BackupTestClock())
@@ -2934,6 +3409,7 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
     private var networkDetermined: Bool
     private var networkAvailable = true
     private var usesMobileData = false
+    private var appInBackground = false
     private var reads = 0
     private var continuations: [AsyncStream<LibraryRuntimeSnapshot>.Continuation] = []
 
@@ -2954,6 +3430,8 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
     func setNetworkAvailable(_ value: Bool) { lock.withLock { networkAvailable = value } }
 
     func setUsesMobileData(_ value: Bool) { lock.withLock { usesMobileData = value } }
+
+    func setAppInBackground(_ value: Bool) { lock.withLock { appInBackground = value } }
 
     var hasBeenRead: Bool { lock.withLock { reads > 0 } }
 
@@ -2978,9 +3456,44 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
             reads += 1
             return BackupThrottleInputs(
                 isNetworkAvailable: networkAvailable, isNetworkExpensive: waitsForWiFi, usesMobileData: usesMobileData,
-                isNetworkDetermined: networkDetermined)
+                isNetworkDetermined: networkDetermined, isAppInBackground: appInBackground)
         }
     }
+}
+
+#if DEBUG
+    /// A scan that records its owner and runs until the test opens it. A stop cancels it before it completes.
+    private final class HeldScan: @unchecked Sendable {
+        let starts = PassCounter()
+        let completions = PassCounter()
+        let owners = OwnerRecorder()
+        let open = LockedFlag(false)
+
+        @MainActor
+        func install(on controller: PhotoLibraryBackupController) {
+            controller.replaceScanForTesting { [self] in
+                // The owner is recorded before the count rises, so a wait for the count also sees the owner.
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                _ = starts.increment()
+                while !open.value { try await Task.sleep(for: .milliseconds(5)) }
+                _ = completions.increment()
+            }
+        }
+    }
+#endif
+
+/// What one background window received from `backgroundCatchUp`, and how many scans had completed when it ended.
+private final class BackgroundWindowRecord: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ids: [String] = []
+    private var scansAtEnd: Int?
+
+    var runIDs: [String] { lock.withLock { ids } }
+    var hasEnded: Bool { lock.withLock { scansAtEnd != nil } }
+    var completedScansAtEnd: Int? { lock.withLock { scansAtEnd } }
+
+    func received(_ runID: String) { lock.withLock { ids.append(runID) } }
+    func end(completedScans: Int) { lock.withLock { scansAtEnd = completedScans } }
 }
 
 private final class OwnerRecorder: @unchecked Sendable {

@@ -209,7 +209,7 @@ final class PhotoBackupBackgroundCoordinator {
             await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
                 attempt.runID = runID
                 if attempt.didExpire {
-                    controller.stopSync(runID: runID)
+                    controller.stopBackgroundWindowRun(runID: runID)
                 }
             }
             self.scheduleProcessingCatchUp(controller: controller)
@@ -222,7 +222,7 @@ final class PhotoBackupBackgroundCoordinator {
                 attempt.work?.cancel()
                 let controller = PhotoLibraryBackupSharedRef.shared.controller
                 if let runID = attempt.runID {
-                    controller?.stopSync(runID: runID)
+                    controller?.stopBackgroundWindowRun(runID: runID)
                 }
                 _ = self?.scheduleProcessingCatchUp(controller: controller)
             }

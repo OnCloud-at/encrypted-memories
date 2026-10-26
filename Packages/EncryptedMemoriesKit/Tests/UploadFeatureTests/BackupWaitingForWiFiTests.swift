@@ -57,6 +57,19 @@ final class BackupWaitingForWiFiTests: XCTestCase {
         XCTAssertFalse(BackupThrottleInputs(runtime: snapshot, usesMobileData: true).waitsForWiFi)
     }
 
+    func testRuntimeSnapshotMapsWhetherTheAppRunsOnlyInTheBackground() {
+        let expected: [(LibraryExecutionOpportunity, Bool)] = [
+            (.foregroundActive, false), (.foregroundInactive, false), (.backgroundPermitted, true), (.suspended, true),
+        ]
+        for (opportunity, inBackground) in expected {
+            let snapshot = LibraryRuntimeSnapshot(executionOpportunity: opportunity)
+            XCTAssertEqual(
+                BackupThrottleInputs(runtime: snapshot, usesMobileData: false).isAppInBackground, inBackground,
+                "\(opportunity)")
+        }
+        XCTAssertFalse(BackupThrottleInputs().isAppInBackground, "platforms without the signal stay in the foreground")
+    }
+
     func testUnknownNetworkWaitsOnlyWhileMobileDataIsOff() {
         let snapshot = LibraryRuntimeSnapshot(network: .undetermined)
 
