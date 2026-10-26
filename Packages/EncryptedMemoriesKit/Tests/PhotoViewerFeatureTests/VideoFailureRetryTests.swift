@@ -235,13 +235,14 @@ final class VideoFailureRetryTests: XCTestCase {
         let late = LateStream()
         let streamer = ScriptedStreamProvider(steps: [.fail(Self.rateLimit), .lateSuccess(late)])
         let model = try makeModel(
-            streamer: streamer, wait: ControlledWait(), delays: [.milliseconds(1)])
+            streamer: streamer, wait: ControlledWait(), delays: [.milliseconds(1)], late: late)
         model.start()
         try await waitUntil { late.waiting == 1 }  // the second attempt waits for its stream
 
         model.stop()
         late.open()
         try await waitUntil { model.finishedLoadCount == 1 }
+        XCTAssertEqual(model.video.attachedPlayerCount, 0, "a stale stream never reaches a player")
         XCTAssertEqual(late.closed, 1, "the viewer disposes a stream that it no longer wants")
         XCTAssertNil(model.player, "a stale stream is not published")
     }
@@ -252,13 +253,15 @@ final class VideoFailureRetryTests: XCTestCase {
         let streamer = ScriptedStreamProvider(steps: [.fail(Self.rateLimit), .lateSuccess(late)])
         let previewCache = ThumbnailCache(namespace: "video-retry-late-session", rootDirectory: temporaryRoot())
         let model = try makeModel(
-            streamer: streamer, wait: ControlledWait(), delays: [.milliseconds(1)], previewCache: previewCache)
+            streamer: streamer, wait: ControlledWait(), delays: [.milliseconds(1)], previewCache: previewCache,
+            late: late)
         model.start()
         try await waitUntil { late.waiting == 1 }
 
         previewCache.configure(accountUID: "another-account", key: nil)
         late.open()
         try await waitUntil { model.finishedLoadCount == 1 }
+        XCTAssertEqual(model.video.attachedPlayerCount, 0, "a stale stream never reaches a player")
         XCTAssertEqual(late.closed, 1)
         XCTAssertNil(model.player)
     }
@@ -294,7 +297,7 @@ final class VideoFailureRetryTests: XCTestCase {
     private func makeModel(
         items: [PhotoItem] = [VideoFailureRetryTests.video(0)], streamer: ScriptedStreamProvider?,
         wait: ControlledWait, delays: [Duration]? = nil, previewCache: ThumbnailCache? = nil,
-        original: Data? = nil
+        original: Data? = nil, late: LateStream? = nil
     ) throws -> PhotoViewerModel {
         let provider = FailingPreviewProvider(original: original)
         let feed = ThumbnailFeed(
@@ -317,8 +320,12 @@ final class VideoFailureRetryTests: XCTestCase {
             let deadline = ContinuousClock.now + .seconds(5)
             while model.finishedLoadCount < model.startedLoadCount, ContinuousClock.now < deadline {
                 wait.release()  // also a load that waits again after an earlier release
+                late?.open()  // and an attempt that still waits for its stream
                 try? await Task.sleep(for: .milliseconds(5))
             }
+            XCTAssertEqual(
+                model.finishedLoadCount, model.startedLoadCount, "a load of the viewer did not end in the teardown")
+            late?.dropDelivered()  // the asset and the stream retain each other until here
         }
         return model
     }
@@ -411,6 +418,16 @@ private final class LateStream: @unchecked Sendable, VideoStreamLifetime {
     }
 
     func close() { lock.withLock { closeCount += 1 } }
+
+    /// Lets go of the delivered assets. Each one retains this stream and this stream retains it. The assets end
+    /// outside the lock, because the last reference of an asset that is still open closes it, and a close takes the lock.
+    func dropDelivered() {
+        let assets = lock.withLock { () -> [StreamingVideoAsset] in
+            defer { delivered = [] }
+            return delivered
+        }
+        withExtendedLifetime(assets) {}
+    }
 }
 
 /// The wait between two silent retries, which a test holds and releases. `holds: false` returns at once. A held wait

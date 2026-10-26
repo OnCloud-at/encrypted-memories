@@ -46,6 +46,7 @@ final class VideoFailureClassificationTests: XCTestCase {
             Self.thrown(blockInfos: [block], blockSizes: [3], declaredSize: 5),  // blockSumSizeMismatch
             StreamingError.noRevision, StreamingError.noXAttr, StreamingError.revisionPaginationNoProgress,
             StreamingError.missingBlockForSlice(2), StreamingError.incompleteStream(streamed: 1, expected: 2),
+            StreamingError.decryptedBlockLengthMismatch(blockIndex: 1, expected: 2, actual: 1),
         ]
         for error in thrown {
             let classified = VideoPlaybackError.classify(error)
