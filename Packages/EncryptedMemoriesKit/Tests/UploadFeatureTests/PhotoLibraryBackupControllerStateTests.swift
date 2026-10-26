@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import UploadCore
 import UploadFeature
 import XCTest
@@ -2710,6 +2711,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             _ = await waitUntil(timeout: .seconds(2)) { window.record.runIDs.count == 1 }
             let runID = try XCTUnwrap(window.record.runIDs.first, "the window takes over the running pass")
 
+            // An expiry that names another run stops nothing.
+            controller.stopBackgroundWindowRun(runID: "an-earlier-run")
+            XCTAssertFalse(controller.isRunnerStopPendingForTesting, "only the window's own run can be stopped")
+
             // The expiration handler cancels the window's work, then stops the run it holds.
             window.task.cancel()
             controller.stopBackgroundWindowRun(runID: runID)
@@ -2739,10 +2744,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertFalse(controller.isRunnerStopPendingForTesting, "the expiry does not stop a pass the person sees")
             XCTAssertEqual(controller.activeExecutionRunID, runID)
 
-            let ended = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded }
-            XCTAssertTrue(ended, "the window ends at its expiry")
-            XCTAssertEqual(window.record.completedScansAtEnd, 0, "the window does not wait for the pass it gave back")
+            // The pass stays held until the window processed its cancellation; then the pass may finish.
+            _ = await waitUntil(timeout: .seconds(5)) { window.record.hasEnded }
             scan.open.value = true
+            await window.task.value
+            XCTAssertEqual(
+                window.record.completedScansAtEnd, 0, "the window ended before the pass it gave back finished")
             let finished = await waitUntil(timeout: .seconds(5)) { !controller.isSyncing }
             XCTAssertTrue(finished)
             XCTAssertEqual(scan.completions.count, 1, "the pass the person sees runs to its end")
@@ -2800,6 +2807,70 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(scan.starts.count, 1, "the resume finds the running pass and starts none")
             XCTAssertEqual(scan.owners.values, [.iOSBackgroundTask])
             await window.task.value
+            await controller.shutdown()
+        }
+
+        func testAWindowThatCannotTakeTheLockGivesTheResumeAtLaunchBack() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            signals.setAppInBackground(true)
+            let launch = try makeLaunchResumeFixture(prefix: "backup-takeover-busy-lock", source: signals.source)
+            defer { launch.cleanup() }
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: launch.fixture.directory.appendingPathComponent(
+                        PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
+            await assertAFailedTakeoverGivesTheResumeBack(launch: launch, signals: signals) {
+                XCTAssertTrue(lock.release(runID: "other-live-run"))
+            }
+        }
+
+        func testAWindowThatFindsTheLockUnreadableGivesTheResumeAtLaunchBack() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: false)
+            signals.setAppInBackground(true)
+            // No busy wait, so the held write transaction below makes the lock unreadable at once.
+            let launch = try makeLaunchResumeFixture(
+                prefix: "backup-takeover-unavailable-lock", source: signals.source,
+                databasePolicy: LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0))
+            defer { launch.cleanup() }
+            let url = launch.fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)
+            var writer: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &writer), SQLITE_OK)
+            defer { sqlite3_close(writer) }
+            XCTAssertEqual(sqlite3_exec(writer, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            await assertAFailedTakeoverGivesTheResumeBack(launch: launch, signals: signals) {
+                XCTAssertEqual(sqlite3_exec(writer, "COMMIT;", nil, nil, nil), SQLITE_OK)
+            }
+        }
+
+        /// The resume at launch waits for the path, the path arrives before its observer, and a window cannot start the
+        /// pass it takes. The window ends without a run, the automatic pass stays pending, and the observer starts it.
+        private func assertAFailedTakeoverGivesTheResumeBack(
+            launch: LaunchResumeFixture, signals: FakeBackupRuntimeSignals, freeTheLock: () -> Void,
+            file: StaticString = #filePath, line: UInt = #line
+        ) async {
+            let controller = launch.controller
+            let scan = launch.scan
+            scan.open.value = true
+            launch.releaseResume()
+            _ = await waitUntil { controller.launchResumeEndedForTesting }
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground, file: file, line: line)
+            signals.setNetworkDetermined(true)
+            signals.setWaitsForWiFi(false)
+
+            let window = startWindow(controller, scan: scan)
+            await window.task.value
+            XCTAssertEqual(window.record.runIDs, [], "the window could not start a pass", file: file, line: line)
+            XCTAssertEqual(
+                controller.deferredStartOwnerForTesting, .foreground, "the automatic pass stays pending",
+                file: file, line: line)
+
+            freeTheLock()
+            signals.announceChange()
+            let ran = await waitUntil(timeout: .seconds(5)) { scan.completions.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(ran, "the observer starts the automatic pass", file: file, line: line)
+            XCTAssertEqual(scan.owners.values, [.foreground], file: file, line: line)
             await controller.shutdown()
         }
 
@@ -2948,14 +3019,14 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
         /// A backup that is on at launch, so the real resume at launch runs; the test decides when it may start.
         private func makeLaunchResumeFixture(
-            prefix: String, source: BackupRuntimeSignalSource
+            prefix: String, source: BackupRuntimeSignalSource, databasePolicy: LibraryDatabasePolicy = .conservative
         ) throws -> LaunchResumeFixture {
             let suite = "\(prefix)-\(UUID().uuidString)"
             let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             defaults.set(true, forKey: "photoBackup.enabled.v1")
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
             var configuration = PhotoLibraryBackupController.Configuration(
-                accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
+                accountDataDirectory: directory, databasePolicy: databasePolicy, defaults: defaults,
                 runtimeSignals: source, firstNetworkPathWait: .seconds(60))
             configuration.currentAccessState = { .full }
             let controller = PhotoLibraryBackupController(

@@ -881,12 +881,14 @@ public final class PhotoLibraryBackupController {
             startFirstNetworkPathWait()
             return nil
         }
+        var tookAutomaticDeferral = false
         if deferredStartOwner == .foreground, owner != .foreground, owner != .manual,
             runtimeSignals.current().isAppInBackground
         {
             // The snapshot arrived before its observer, and no scene is in the foreground: this window runs the
             // automatic pass that waited for the path.
             deferredStartOwner = nil
+            tookAutomaticDeferral = true
             if deferredBackgroundOwner == nil {
                 firstNetworkPathWaitTask?.cancel()
                 firstNetworkPathWaitTask = nil
@@ -896,6 +898,10 @@ public final class PhotoLibraryBackupController {
             if owner == .manual { deferredStartOwner = .manual }
             let run = startAfterFirstNetworkPath()
             return owner == .foreground || owner == .manual ? run : nil
+        }
+        defer {
+            // A window that took the automatic pass but started no run gives it back, so the path observer starts it.
+            if tookAutomaticDeferral, activeRunID == nil, deferredStartOwner == nil { deferredStartOwner = .foreground }
         }
         if manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait, owner != .manual {
             let run = startSync(owner: .manual)
