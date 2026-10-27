@@ -385,7 +385,7 @@ public struct ExactDuplicateFinder: Sendable {
         let reads = try await BoundedConcurrency.throwingMap(
             batches, limit: Self.visibilityConcurrency, progress: report
         ) {
-            try await checker.linkVisibility(of: $0)
+            try await checker.linkVisibility(of: $0, requiresCompleteResponse: false)
         }
         let visibility = reads.reduce(into: [String: RemoteLinkVisibility]()) { $0.merge($1) { _, new in new } }
         return (visibility, batches.count)

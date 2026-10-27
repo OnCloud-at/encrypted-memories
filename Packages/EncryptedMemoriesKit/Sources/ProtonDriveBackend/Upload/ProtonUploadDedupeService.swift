@@ -317,10 +317,17 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     }
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        try await linkVisibility(of: linkIDs, requiresCompleteResponse: true)
+    }
+
+    func linkVisibility(
+        of linkIDs: [String], requiresCompleteResponse: Bool
+    ) async throws -> [String: RemoteLinkVisibility] {
         guard !linkIDs.isEmpty else { return [:] }
         let context = try await resolveMaterial().context
         do {
-            return try await session.fetchLinkVisibility(shareID: context.shareID, linkIDs: linkIDs)
+            return try await session.fetchLinkVisibility(
+                shareID: context.shareID, linkIDs: linkIDs, requiresCompleteResponse: requiresCompleteResponse)
         } catch ProtonAuthError.apiError(let code, let message) where Self.isBusyService(code) {
             throw UploadError.retryableBackend(code: code, message: message)
         }

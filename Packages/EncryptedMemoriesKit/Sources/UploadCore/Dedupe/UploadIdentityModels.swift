@@ -862,7 +862,15 @@ public protocol UploadDuplicateChecking: Sendable {
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String>
     /// The current state and main photo of each link. A link that the server no longer knows is absent. The edit
     /// replacement reads it, because only the state of a photo proves that the person deleted it.
+    /// On the Proton backend this read fails closed: an answer that is not complete throws, because an omitted link
+    /// and a deleted link look the same there. The Exact Duplicates reads ask for the lenient read below.
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility]
+    /// `linkVisibility(of:)` that accepts an incomplete answer when `requiresCompleteResponse` is false: a link that
+    /// the answer omits is absent. The Exact Duplicates reads use it and keep their behavior on such an answer.
+    /// The default ignores the flag, for backends without a completeness signal.
+    func linkVisibility(
+        of linkIDs: [String], requiresCompleteResponse: Bool
+    ) async throws -> [String: RemoteLinkVisibility]
     /// Fresh raw states and response completeness, without the legacy visibility defaults.
     func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot
     /// Active main photos carrying this iCloud identifier. Incomplete results cannot prove absence.
@@ -917,8 +925,14 @@ extension RemoteLinkVisibility {
 }
 
 public extension UploadDuplicateChecking {
-    /// `linkVisibility(of:)` in requests of at most `batchSize` links, the limit of Proton's metadata endpoint. A
-    /// failed request fails the whole read.
+    func linkVisibility(
+        of linkIDs: [String], requiresCompleteResponse: Bool
+    ) async throws -> [String: RemoteLinkVisibility] {
+        try await linkVisibility(of: linkIDs)
+    }
+
+    /// `linkVisibility(of:requiresCompleteResponse: false)` in requests of at most `batchSize` links, the limit of
+    /// Proton's metadata endpoint. A failed request fails the whole read. The Exact Duplicates reads use it.
     func linkVisibility(
         batching linkIDs: [String], batchSize: Int = UploadDedupePipeline.protonDuplicateBatchSize
     ) async throws -> [String: RemoteLinkVisibility] {
@@ -927,7 +941,7 @@ public extension UploadDuplicateChecking {
         for start in stride(from: 0, to: linkIDs.count, by: size) {
             try Task.checkCancellation()
             let chunk = Array(linkIDs[start..<min(start + size, linkIDs.count)])
-            visibility.merge(try await linkVisibility(of: chunk)) { _, new in new }
+            visibility.merge(try await linkVisibility(of: chunk, requiresCompleteResponse: false)) { _, new in new }
         }
         return visibility
     }

@@ -382,15 +382,33 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                         let excluded =
                             blockedByDraft
                             ? try await relatedLinks(
-                                among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true)
+                                among: Set(contentCandidates.items.compactMap(\.linkID)), requiresActiveMain: true,
+                                reads: &relatedReads)
                             : []
-                        if let remoteContent = contentCandidates.items.first(where: {
-                            guard blockedByDraft else { return true }
-                            guard $0.linkState == .active, $0.contentHash == contentHash,
-                                let linkID = $0.linkID, !linkID.isEmpty
-                            else { return false }
-                            return !excluded.contains(linkID)
-                        }) {
+                        var adopted: RemotePhotoDuplicate?
+                        for item in contentCandidates.items {
+                            if blockedByDraft {
+                                guard item.linkState == .active, item.contentHash == contentHash,
+                                    let linkID = item.linkID, !linkID.isEmpty, !excluded.contains(linkID)
+                                else { continue }
+                            }
+                            // An index row can outlive its photo for a short time, so an active row counts only when
+                            // a state read of this check says that the copy is active.
+                            if item.linkState == .active, let linkID = item.linkID, !linkID.isEmpty {
+                                guard try await isActiveInThisCheck(linkID, reads: &relatedReads) else { continue }
+                                // A root photo is backed up only by a main photo, not by another photo's related file.
+                                // The read that shows the copy active also decides its role. A draft block and a
+                                // replacement trust only a stated photo state, like their role filters.
+                                if isRoot {
+                                    guard let state = relatedReads.visibility[linkID], state.isActiveMain,
+                                        state.hasExplicitPhotoState || (replacement.isEmpty && !blockedByDraft)
+                                    else { continue }
+                                }
+                            }
+                            adopted = item
+                            break
+                        }
+                        if let remoteContent = adopted {
                             decision = decisionForRemoteContent(
                                 remoteContent,
                                 replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
@@ -733,7 +751,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 return (remoteItems, false)
             }
             return (
-                try await rootEligible(remoteItems, contentHash: contentHash, requiresActiveMain: requiresActiveMain),
+                try await rootEligible(
+                    remoteItems, contentHash: contentHash, requiresActiveMain: requiresActiveMain,
+                    reads: &relatedReads),
                 false
             )
         }
@@ -748,6 +768,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             visibility = optional
         } else {
             visibility = try await checker.linkVisibility(of: asked.sorted())
+            relatedReads.askedLinks.formUnion(asked)
+            relatedReads.visibility.merge(visibility) { _, new in new }
         }
         try Task.checkCancellation()
         func isLiveMain(_ linkID: String) -> Bool {
@@ -830,12 +852,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// under an edited photo, or a paired video. Those bytes do not make a photo of their own, so the primary
     /// uploads as its own photo. With a replacement, `candidates` already counts only live main photos.
     private func rootEligible(
-        _ remoteItems: [RemotePhotoDuplicate], contentHash: String, requiresActiveMain: Bool
+        _ remoteItems: [RemotePhotoDuplicate], contentHash: String, requiresActiveMain: Bool,
+        reads: inout RelatedProofReads
     ) async throws -> [RemotePhotoDuplicate] {
         let matches = Set(
             remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }.compactMap(\.linkID))
         guard !matches.isEmpty else { return remoteItems }
-        let related = try await relatedLinks(among: matches, requiresActiveMain: requiresActiveMain)
+        let related = try await relatedLinks(among: matches, requiresActiveMain: requiresActiveMain, reads: &reads)
         guard !related.isEmpty else { return remoteItems }
         return remoteItems.filter { item in item.linkID.map { !related.contains($0) } ?? true }
     }
@@ -885,6 +908,14 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     private func relatedLinks(
         among linkIDs: Set<String>, requiresActiveMain: Bool = false
     ) async throws -> Set<String> {
+        var reads = RelatedProofReads()
+        return try await relatedLinks(among: linkIDs, requiresActiveMain: requiresActiveMain, reads: &reads)
+    }
+
+    /// Like `relatedLinks(among:requiresActiveMain:)`, and records the states that answered in `reads`.
+    private func relatedLinks(
+        among linkIDs: Set<String>, requiresActiveMain: Bool, reads: inout RelatedProofReads
+    ) async throws -> Set<String> {
         var known = rootVisibility
         let unasked = linkIDs.subtracting(rootVisibilityAsked)
         if !unasked.isEmpty {
@@ -893,6 +924,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             do {
                 read = try await checker.linkVisibility(of: unasked.sorted())
                 try Task.checkCancellation()
+                reads.askedLinks.formUnion(unasked)
+                reads.visibility.merge(read) { _, new in new }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -925,7 +958,19 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         try replacementJournal?.unretire([linkID], for: source)
     }
 
-    /// What one resolve learned about the copies that could prove a secondary.
+    /// The state of a matching copy from a read of this check. A copy that an earlier check read, or whose read
+    /// failed, is read again. A copy that the answer leaves out is no active copy, and a failed read fails the check.
+    private func isActiveInThisCheck(_ linkID: String, reads: inout RelatedProofReads) async throws -> Bool {
+        if !reads.askedLinks.contains(linkID) {
+            let read = try await checker.linkVisibility(of: [linkID])
+            try Task.checkCancellation()
+            reads.askedLinks.insert(linkID)
+            reads.visibility.merge(read) { _, new in new }
+        }
+        return reads.visibility[linkID]?.isActive == true
+    }
+
+    /// What one resolve learned about the copies that could prove a secondary or a matching copy.
     private struct RelatedProofReads {
         var relatedByMain: [String: Set<String>] = [:]
         var visibility: [String: RemoteLinkVisibility] = [:]
