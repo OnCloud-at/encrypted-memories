@@ -11,6 +11,8 @@ public enum SQLiteCheckStep: Sendable, Equatable {
     case verification
     /// SQLite's own integrity check of a cache.
     case quickCheck
+    /// A read or write of a rebuildable cache after the store has opened.
+    case cacheOperation
 }
 
 /// SQLite's answer to a failed call on a connection: the extended result code and the operating-system error under

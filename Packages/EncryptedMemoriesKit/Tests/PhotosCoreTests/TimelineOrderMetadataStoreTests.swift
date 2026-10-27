@@ -567,4 +567,383 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
             );
             CREATE TABLE IF NOT EXISTS store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """
+
+    // MARK: - Issue 751: a full disk that makes a read or write fail keeps the cache
+
+    private let fullDisk = SQLiteFailure(code: SQLITE_FULL, systemErrno: 0)
+
+    /// A probe that gives `failure` for every failed call of an open store. The volume answers `volumeIsFull`.
+    private func probe(_ failure: SQLiteFailure, volumeIsFull: Bool? = false) -> SQLiteFailureProbe {
+        SQLiteFailureProbe(failure: { _, _ in failure }, volumeIsFull: { _, _ in volumeIsFull })
+    }
+
+    /// Fails one prepare, step or exec call of the store's connection with a real SQLite error: the `target`-th
+    /// statement that starts is interrupted (`SQLITE_INTERRUPT`), the `target`-th row that a statement returns is
+    /// followed by an interrupt (the next step of that statement fails), or the `target`-th question to the authorizer
+    /// is denied (`SQLITE_AUTH`), which fails the statement that SQLite prepares. A sweep over `target` reaches every
+    /// prepare, step and exec site of an operation. It does not fail `sqlite3_reset`, `sqlite3_bind_*` and
+    /// `sqlite3_clear_bindings`, which the store does not check.
+    private final class CallFault {
+        enum Kind { case statement, row, preparation }
+        let kind: Kind
+        let target: Int
+        var seen = 0
+        var fired = false
+
+        init(_ kind: Kind, target: Int) {
+            self.kind = kind
+            self.target = target
+        }
+
+        func count(_ db: OpaquePointer?) -> Bool {
+            seen += 1
+            guard seen == target else { return false }
+            fired = true
+            return true
+        }
+
+        func arm(on db: OpaquePointer?) {
+            let context = Unmanaged.passUnretained(self).toOpaque()
+            switch kind {
+            case .statement:
+                sqlite3_trace_v2(
+                    db, UInt32(SQLITE_TRACE_STMT),
+                    { _, context, statement, _ in
+                        guard let context, let statement else { return 0 }
+                        let fault = Unmanaged<CallFault>.fromOpaque(context).takeUnretainedValue()
+                        let handle = sqlite3_db_handle(OpaquePointer(statement))
+                        if fault.count(handle) { sqlite3_interrupt(handle) }
+                        return 0
+                    }, context)
+            case .row:
+                sqlite3_trace_v2(
+                    db, UInt32(SQLITE_TRACE_ROW),
+                    { _, context, statement, _ in
+                        guard let context, let statement else { return 0 }
+                        let fault = Unmanaged<CallFault>.fromOpaque(context).takeUnretainedValue()
+                        let handle = sqlite3_db_handle(OpaquePointer(statement))
+                        if fault.count(handle) { sqlite3_interrupt(handle) }
+                        return 0
+                    }, context)
+            case .preparation:
+                sqlite3_set_authorizer(
+                    db,
+                    { context, _, _, _, _, _ in
+                        guard let context else { return SQLITE_OK }
+                        let fault = Unmanaged<CallFault>.fromOpaque(context).takeUnretainedValue()
+                        return fault.count(nil) ? SQLITE_DENY : SQLITE_OK
+                    }, context)
+            }
+        }
+
+        func disarm(on db: OpaquePointer?) {
+            sqlite3_trace_v2(db, 0, nil, nil)
+            sqlite3_set_authorizer(db, nil, nil)
+        }
+    }
+
+    private enum Operation: CaseIterable {
+        case synchronize, nextPage, record, publish
+        /// `enrich` judges its own failure: it keeps or rebuilds the cache itself, with no call of `rebuildUnlessBusy()`.
+        case enrichBeforePublication, enrichPublished
+
+        var judgesItsOwnFailure: Bool { self == .enrichBeforePublication || self == .enrichPublished }
+    }
+
+    /// A store in a state where `operation` has work to do, and the operation. It reports whether it succeeded. The
+    /// caller closes the store.
+    private func store(
+        for operation: Operation, probe: SQLiteFailureProbe
+    ) throws -> (store: TimelineOrderMetadataStore, run: () -> Bool) {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy, probe: probe))
+        let items = [photo("a"), photo("b"), photo("c")]
+        let ids = Set(items.map(\.uid))
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: ids))
+        let exact = TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: 500.2))
+        switch operation {
+        case .synchronize:
+            return (store, { store.synchronize([items[0], items[1], self.photo("d")], classifiedUIDs: ids) })
+        case .nextPage:
+            return (store, { (try? store.nextPage()) != nil })
+        case .record:
+            return (store, { store.record([items[0].uid: exact], classifiedUIDs: ids) })
+        case .publish:
+            XCTAssertTrue(store.record(Dictionary(uniqueKeysWithValues: items.map { ($0.uid, exact) })))
+            return (store, { (try? store.publishCompletedSeconds()) != nil })
+        case .enrichBeforePublication:
+            return (store, { self.enrichWithoutAFailure(store, items) })
+        case .enrichPublished:
+            XCTAssertTrue(store.record(Dictionary(uniqueKeysWithValues: items.map { ($0.uid, exact) })))
+            XCTAssertTrue(try store.publishCompletedSeconds())
+            return (store, { self.enrichWithoutAFailure(store, items) })
+        }
+    }
+
+    /// Runs `enrich`. True when it neither rebuilt nor kept the cache because of a failure.
+    private func enrichWithoutAFailure(_ store: TimelineOrderMetadataStore, _ items: [PhotoItem]) -> Bool {
+        let revision = store.rebuildRevision
+        let kept = PhotoDiagnostics.shared.counter("timeline.order.cacheKeptFull")
+        _ = store.enrich(items)
+        return store.rebuildRevision == revision
+            && PhotoDiagnostics.shared.counter("timeline.order.cacheKeptFull") == kept
+    }
+
+    /// Fails each prepare, step and exec call of each operation once. For `enrich` the operation judges the failure.
+    /// For every other operation the sweep asks `rebuildUnlessBusy()` what to do. Returns how many calls made the
+    /// operation fail, so a sweep that reaches nothing cannot pass.
+    private func sweep(
+        _ kind: CallFault.Kind, answer: SQLiteFailure, volumeIsFull: Bool? = false, keeps: Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> [Operation: Int] {
+        var failures: [Operation: Int] = [:]
+        for operation in Operation.allCases {
+            var target = 1
+            while true {
+                let (store, run) = try store(for: operation, probe: probe(answer, volumeIsFull: volumeIsFull))
+                defer { store.close() }
+                let fault = CallFault(kind, target: target)
+                let revision = store.rebuildRevision
+                let kept = PhotoDiagnostics.shared.counter("timeline.order.cacheKeptFull")
+                fault.arm(on: store.connectionForTesting)
+                let succeeded = run()
+                fault.disarm(on: store.connectionForTesting)
+                if !fault.fired { break }
+                target += 1
+                if succeeded { continue }
+                failures[operation, default: 0] += 1
+                let name = "\(operation), \(kind) \(target - 1)"
+                if !operation.judgesItsOwnFailure {
+                    XCTAssertEqual(store.rebuildUnlessBusy(), !keeps, name, file: file, line: line)
+                }
+                XCTAssertEqual(store.rebuildRevision, revision &+ (keeps ? 0 : 1), name, file: file, line: line)
+                XCTAssertEqual(
+                    PhotoDiagnostics.shared.counter("timeline.order.cacheKeptFull"), kept + (keeps ? 1 : 0), name,
+                    file: file, line: line)
+            }
+        }
+        return failures
+    }
+
+    func testAFullDiskAtAnyPrepareStepOrExecKeepsTheCache() throws {
+        for kind in [CallFault.Kind.statement, .preparation, .row] {
+            let failures = try sweep(kind, answer: fullDisk, keeps: true)
+            // A row follows only the reads: the page of candidates, the page of the sweep and the scan of `enrich`.
+            let reached = kind == .row ? [Operation.synchronize, .nextPage, .enrichPublished] : Operation.allCases
+            for operation in reached {
+                XCTAssertGreaterThan(failures[operation] ?? 0, 0, "\(operation), \(kind): the sweep reached a call")
+            }
+        }
+    }
+
+    /// A call that succeeds leaves no failure behind, whatever the probe would answer.
+    func testASuccessfulOperationLeavesNothingToKeep() throws {
+        for operation in Operation.allCases {
+            let (store, run) = try store(for: operation, probe: probe(fullDisk))
+            defer { store.close() }
+            XCTAssertTrue(run(), "\(operation) succeeds")
+            let revision = store.rebuildRevision
+            XCTAssertTrue(store.rebuildUnlessBusy(), "\(operation): no failure to judge, so the cache is rebuilt")
+            XCTAssertEqual(store.rebuildRevision, revision &+ 1)
+        }
+    }
+
+    func testAFailureThatSaysNothingAboutTheDiskStillRebuildsAtAnyPrepareStepOrExec() throws {
+        let corrupt = SQLiteFailure(code: SQLITE_CORRUPT, systemErrno: ENOSPC)
+        let bareIOError = SQLiteFailure(code: SQLITE_IOERR, systemErrno: 0)
+        let cantOpen = SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT)
+        for kind in [CallFault.Kind.statement, .preparation, .row] {
+            for (answer, volumeIsFull) in [(corrupt, true), (bareIOError, true), (cantOpen, false), (cantOpen, nil)] {
+                let failures = try sweep(kind, answer: answer, volumeIsFull: volumeIsFull, keeps: false)
+                XCTAssertFalse(failures.isEmpty)
+            }
+        }
+    }
+
+    func testACantOpenAnswerKeepsTheCacheOnlyWhenTheVolumeIsFull() throws {
+        let cantOpen = SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT)
+        let failures = try sweep(.statement, answer: cantOpen, volumeIsFull: true, keeps: true)
+        XCTAssertFalse(failures.isEmpty)
+    }
+
+    private struct Snapshot: Equatable {
+        let bytes: [Data?]
+        let fileNumbers: [NSNumber?]
+
+        init(of url: URL) {
+            let urls = ["", "-wal", "-shm"].map { URL(fileURLWithPath: url.path + $0) }
+            bytes = urls.map { try? Data(contentsOf: $0) }
+            fileNumbers = urls.map {
+                (try? FileManager.default.attributesOfItem(atPath: $0.path))?[.systemFileNumber] as? NSNumber
+            }
+        }
+    }
+
+    /// Limits the file of the open store to its current size, so the next write that needs a page ends with
+    /// `SQLITE_FULL`, as SQLite reports a full disk.
+    private func limitToCurrentSize(of store: TimelineOrderMetadataStore, extraPages: Int32 = 0) throws {
+        var statement: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(store.connectionForTesting, "PRAGMA page_count;", -1, &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        let pages = sqlite3_column_int(statement, 0) + extraPages
+        sqlite3_finalize(statement)
+        XCTAssertEqual(
+            sqlite3_exec(store.connectionForTesting, "PRAGMA max_page_count=\(pages);", nil, nil, nil), SQLITE_OK)
+    }
+
+    private func pageCount(of store: TimelineOrderMetadataStore) -> Int32 {
+        var statement: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(store.connectionForTesting, "PRAGMA page_count;", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        return sqlite3_column_int(statement, 0)
+    }
+
+    private func rowCount(at url: URL) -> Int32 {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT count(*) FROM photo_order;", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        return sqlite3_column_int(statement, 0)
+    }
+
+    /// The first chunk of a synchronization commits, the second chunk meets the full disk. The rows of the first chunk
+    /// stay, and the cache is not rebuilt.
+    func testARealFullDiskInALaterChunkKeepsTheCommittedRows() throws {
+        let items = (0..<3_000).map { photo(String($0), time: Double(500 + $0)) }
+        let scratch = try XCTUnwrap(
+            TimelineOrderMetadataStore(
+                url: try directory().appendingPathComponent("scratch.sqlite"), policy: noWaitPolicy))
+        defer { scratch.close() }
+        let emptyPages = pageCount(of: scratch)
+        XCTAssertTrue(
+            scratch.synchronize(
+                Array(items[0..<TimelineOrderMetadataStore.synchronizationChunkSize]), classifiedUIDs: []))
+        let firstChunkPages = pageCount(of: scratch) - emptyPages
+
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+        defer { store.close() }
+        try limitToCurrentSize(of: store, extraPages: firstChunkPages + 2)
+        let revision = store.rebuildRevision
+
+        XCTAssertFalse(store.synchronize(items, classifiedUIDs: []), "the second chunk did not fit")
+        XCTAssertFalse(store.rebuildUnlessBusy(), "a full disk says nothing about the file: the cache stays")
+
+        XCTAssertEqual(store.rebuildRevision, revision, "no rebuild happened")
+        XCTAssertEqual(
+            rowCount(at: url), Int32(TimelineOrderMetadataStore.synchronizationChunkSize), "the committed chunk stays")
+    }
+
+    func testARealFullDiskInARecordWriteKeepsTheCacheByteForByte() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+        defer { store.close() }
+        let items = [photo("a"), photo("b")]
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: []))
+        try limitToCurrentSize(of: store)
+        let before = Snapshot(of: url)
+        let revision = store.rebuildRevision
+
+        let identity = String(repeating: "x", count: 200_000)
+        let written = store.record(
+            [
+                items[0].uid: TimelineOrderMetadata(
+                    exactCaptureTime: Date(timeIntervalSince1970: 500.2), stableIdentity: identity)
+            ])
+        XCTAssertFalse(written, "the write did not fit")
+        XCTAssertFalse(store.rebuildUnlessBusy(), "a full disk says nothing about the file: the cache stays")
+
+        XCTAssertEqual(store.rebuildRevision, revision, "no rebuild happened")
+        XCTAssertEqual(Snapshot(of: url), before, "the file is the same file with the same bytes")
+        XCTAssertEqual(
+            sqlite3_exec(store.connectionForTesting, "PRAGMA max_page_count=1000000;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(try store.nextPage().map(\.uid), items.map(\.uid), "the rows are still there")
+        XCTAssertTrue(store.record([items[0].uid: .init(exactCaptureTime: Date(timeIntervalSince1970: 500.2))]))
+    }
+
+    func testARealFullDiskInASynchronizationKeepsTheCacheByteForByte() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+        defer { store.close() }
+        try limitToCurrentSize(of: store)
+        let before = Snapshot(of: url)
+        let revision = store.rebuildRevision
+
+        let items = (0..<1_000).map { photo(String($0), time: Double(500 + $0)) }
+        XCTAssertFalse(store.synchronize(items, classifiedUIDs: []), "the rows did not fit")
+        XCTAssertFalse(store.rebuildUnlessBusy(), "a full disk says nothing about the file: the cache stays")
+
+        XCTAssertEqual(store.rebuildRevision, revision, "no rebuild happened")
+        XCTAssertEqual(Snapshot(of: url), before, "the file is the same file with the same bytes")
+        XCTAssertEqual(
+            sqlite3_exec(store.connectionForTesting, "PRAGMA max_page_count=1000000;", nil, nil, nil), SQLITE_OK)
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: []), "the next pass succeeds")
+    }
+
+    /// An earlier full disk must not keep a cache that a later, different failure broke.
+    func testAnEarlierFullDiskDoesNotHoldBackTheRebuildAfterALaterOperation() throws {
+        for operation in [Operation.synchronize, .nextPage, .record, .publish] {
+            let url = try directory().appendingPathComponent("order.sqlite")
+            let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+            defer { store.close() }
+            let items = [photo("a"), photo("b")]
+            let metadata = TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: 500.2))
+            XCTAssertTrue(store.synchronize(items, classifiedUIDs: []))
+            XCTAssertTrue(store.record([items[0].uid: metadata]))
+            try limitToCurrentSize(of: store)
+            let identity = String(repeating: "x", count: 200_000)
+            XCTAssertFalse(
+                store.record(
+                    [
+                        items[1].uid: TimelineOrderMetadata(
+                            exactCaptureTime: metadata.exactCaptureTime, stableIdentity: identity)
+                    ]))
+            XCTAssertEqual(
+                sqlite3_exec(store.connectionForTesting, "PRAGMA max_page_count=1000000;", nil, nil, nil), SQLITE_OK)
+
+            switch operation {
+            case .synchronize:
+                XCTAssertTrue(store.synchronize(items + [photo("c")], classifiedUIDs: []))
+            case .nextPage:
+                XCTAssertEqual(try store.nextPage().map(\.uid), items.map(\.uid))
+            case .record:
+                XCTAssertTrue(store.record([items[1].uid: metadata]))
+            case .publish:
+                XCTAssertFalse(try store.publishCompletedSeconds(), "the second still has an uninspected photo")
+            case .enrichBeforePublication, .enrichPublished:
+                XCTFail("enrich does not begin a separate operation")
+            }
+            let revision = store.rebuildRevision
+            XCTAssertTrue(store.rebuildUnlessBusy(), "\(operation): no failure is left")
+            XCTAssertEqual(store.rebuildRevision, revision &+ 1, "\(operation)")
+        }
+    }
+
+    /// A failure is judged once. A second call has no failure to judge and rebuilds, as before.
+    func testAFullDiskIsJudgedOnce() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: noWaitPolicy))
+        defer { store.close() }
+        XCTAssertTrue(store.synchronize([photo("a")], classifiedUIDs: []))
+        try limitToCurrentSize(of: store)
+        let identity = String(repeating: "x", count: 200_000)
+        XCTAssertFalse(
+            store.record(
+                [
+                    photo("a").uid: TimelineOrderMetadata(
+                        exactCaptureTime: Date(timeIntervalSince1970: 500.2), stableIdentity: identity)
+                ]))
+        let revision = store.rebuildRevision
+
+        XCTAssertFalse(store.rebuildUnlessBusy())
+        XCTAssertEqual(store.rebuildRevision, revision)
+        XCTAssertTrue(store.rebuildUnlessBusy())
+        XCTAssertEqual(store.rebuildRevision, revision &+ 1)
+    }
 }

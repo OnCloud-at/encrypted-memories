@@ -667,24 +667,30 @@ public enum SQLiteStoreSchemaGate {
         guard sqlite3_prepare_v2(db, "PRAGMA index_list(\(literal(table)));", -1, &statement, nil) == SQLITE_OK
         else { return nil }
         defer { sqlite3_finalize(statement) }
-        var indexes: [Index] = []
+        var listed: [(name: String, isUnique: Bool, origin: String, isPartial: Bool)] = []
         var result = sqlite3_step(statement)
         while result == SQLITE_ROW {
-            guard let name = text(statement, 1),
-                let origin = text(statement, 3),
-                let columns = indexColumns(in: db, index: name)
-            else { return nil }
-            indexes.append(
-                Index(
-                    name: name,
-                    isUnique: sqlite3_column_int(statement, 2) != 0,
-                    origin: origin,
-                    isPartial: sqlite3_column_int(statement, 4) != 0,
-                    columns: columns
+            guard let name = text(statement, 1), let origin = text(statement, 3) else { return nil }
+            listed.append(
+                (
+                    name: name, isUnique: sqlite3_column_int(statement, 2) != 0, origin: origin,
+                    isPartial: sqlite3_column_int(statement, 4) != 0
                 ))
             result = sqlite3_step(statement)
         }
         guard result == SQLITE_DONE else { return nil }
+        // The columns come after the list statement is finalized. The finalize of a healthy statement resets the
+        // error code of the connection, so a failure of the column query inside the open list would be lost.
+        sqlite3_finalize(statement)
+        statement = nil
+        var indexes: [Index] = []
+        for entry in listed {
+            guard let columns = indexColumns(in: db, index: entry.name) else { return nil }
+            indexes.append(
+                Index(
+                    name: entry.name, isUnique: entry.isUnique, origin: entry.origin, isPartial: entry.isPartial,
+                    columns: columns))
+        }
         return indexes.sorted { $0.name < $1.name }
     }
 
