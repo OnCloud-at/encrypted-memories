@@ -43,6 +43,14 @@ private struct StartedBackupRun: Sendable {
     let task: Task<Void, Never>
 }
 
+/// How the pass of a background window ended.
+public enum BackgroundCatchUpEnd: Equatable, Sendable {
+    /// The pass ran, a pass of the app ran instead, or there was nothing to start.
+    case done
+    /// The pass waited for the first network path, and the window ended before a path came.
+    case noNetworkPath
+}
+
 /// Coordinates shared Photo Library backup behavior across Apple platforms.
 ///
 /// Consent contract: backup never enables itself. `enableBackup()` is the only entry point that
@@ -837,23 +845,26 @@ public final class PhotoLibraryBackupController {
     /// Runs one catch-up pass for an OS background window.
     /// `onRunStarted` receives the run ID for expiration-safe cancellation.
     /// Checkpointed state lets the next pass resume unfinished work.
+    @discardableResult
     public func backgroundCatchUp(
         owner: BackupExecutionOwner = .background,
         onRunStarted: (@MainActor (String) -> Void)? = nil
-    ) async {
+    ) async -> BackgroundCatchUpEnd {
         var started = startSync(owner: owner)
         if started == nil, lastStartWasDeferred {
             // The pass waits for the first network path. The window stays open until that pass ends.
             started = await waitForDeferredStart()
+            if started == nil, waitsForFirstNetworkPath { return .noNetworkPath }
         } else if started == nil, let run = automaticRunInTheBackground() {
             // Nobody watches this automatic pass, so it runs on the window's time until it ends or the window ends.
             onRunStarted?(run.runID)
             await waitForAdoptedRun(run)
-            return
+            return .done
         }
-        guard let run = started else { return }
+        guard let run = started else { return .done }
         onRunStarted?(run.runID)
         await run.task.value
+        return .done
     }
 
     /// The single entry point that starts a pass. Acquires durable execution ownership before any
