@@ -20,12 +20,21 @@ private final class PhotoBackupProcessingAttempt {
 final class PhotoBackupBackgroundCoordinator {
     static let shared = PhotoBackupBackgroundCoordinator()
 
-    static let processingTaskIdentifier = "at.oncloud.encryptedmemories.photo-backup.processing"
+    nonisolated static let processingTaskIdentifier = "at.oncloud.encryptedmemories.photo-backup.processing"
 
     private static let controllerReadyTimeout: Duration = .seconds(30)
 
     private let scheduler = BGTaskScheduler.shared
     private let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "PhotoBackupBackground")
+    private lazy var submitter = BackgroundTaskRequestSubmitter(
+        cancelRequest: {
+            BGTaskScheduler.shared.cancel(
+                taskRequestWithIdentifier: PhotoBackupBackgroundCoordinator.processingTaskIdentifier)
+        },
+        onErrorAfterCancel: { [logger] error in
+            logger.error(
+                "Photo-backup submission failed after a cancel: \(error.localizedDescription, privacy: .public)")
+        })
     private var didRegister = false
     private var registrationIssue: BackupExecutionOpportunityIssue?
     private var processingIssue: BackupExecutionOpportunityIssue?
@@ -121,7 +130,7 @@ final class PhotoBackupBackgroundCoordinator {
 
     private func stopScheduling(detachController: Bool) {
         schedulingStopped = true
-        scheduler.cancel(taskRequestWithIdentifier: Self.processingTaskIdentifier)
+        submitter.cancel()
         processingIssue = nil
         publishExecutionIssue()
         PhotoBackupBackgroundGrace.shared.end()
@@ -148,25 +157,42 @@ final class PhotoBackupBackgroundCoordinator {
 
     /// Keeps one future catch-up request pending. Submission replaces an existing request with the
     /// same identifier; errors are logged rather than silently turning background backup into a no-op.
-    @discardableResult
-    func scheduleProcessingCatchUp(controller: PhotoLibraryBackupController? = nil) -> Bool {
-        guard !schedulingStopped, !BackupLocalDataPurge.isPurgePending() else { return false }
-        let request = BGProcessingTaskRequest(identifier: Self.processingTaskIdentifier)
+    func scheduleProcessingCatchUp(controller: PhotoLibraryBackupController? = nil) {
+        guard !schedulingStopped, !BackupLocalDataPurge.isPurgePending() else { return }
+        var earliestBeginDate: Date?
+        if let date = controller?.nextAutomaticAttemptAt, date > Date() {
+            earliestBeginDate = date
+        }
+        submitter.submit(
+            blocking: { try scheduler.submit(Self.processingRequest(earliestBeginDate: earliestBeginDate)) },
+            offMainThread: Self.offMainSubmission(earliestBeginDate: earliestBeginDate),
+            completion: { [weak self] error in
+                guard let self else { return }
+                guard let error else {
+                    self.processingIssue = nil
+                    self.publishExecutionIssue(to: controller)
+                    return
+                }
+                self.processingIssue = Self.executionIssue(for: error)
+                self.publishExecutionIssue(to: controller)
+                self.logger.error(
+                    "Photo-backup processing submission failed: \(error.localizedDescription, privacy: .public)")
+            })
+    }
+
+    nonisolated static func processingRequest(earliestBeginDate: Date?) -> BGProcessingTaskRequest {
+        let request = BGProcessingTaskRequest(identifier: processingTaskIdentifier)
         request.requiresNetworkConnectivity = true
         request.requiresExternalPower = false
-        if let date = controller?.nextAutomaticAttemptAt, date > Date() {
-            request.earliestBeginDate = date
-        }
-        do {
-            try scheduler.submit(request)
-            processingIssue = nil
-            publishExecutionIssue(to: controller)
-            return true
-        } catch {
-            processingIssue = Self.executionIssue(for: error)
-            publishExecutionIssue(to: controller)
-            logger.error("Photo-backup processing submission failed: \(error.localizedDescription, privacy: .public)")
-            return false
+        request.earliestBeginDate = earliestBeginDate
+        return request
+    }
+
+    /// The iOS 27 call, which must not run on the main thread; nil before iOS 27.
+    nonisolated static func offMainSubmission(earliestBeginDate: Date?) -> (@Sendable () async throws -> Void)? {
+        guard #available(iOS 27.0, *) else { return nil }
+        return {
+            try await BGTaskScheduler.shared.submitTaskRequest(processingRequest(earliestBeginDate: earliestBeginDate))
         }
     }
 
@@ -177,31 +203,34 @@ final class PhotoBackupBackgroundCoordinator {
         // fail, or wait for account restoration.
         scheduleProcessingCatchUp()
 
-        let completion = PhotoBackupTaskCompletion(task: task)
+        let completion = BackgroundWindowCompletion(kind: .photoBackup) { task.setTaskCompleted(success: $0) }
+        // Every end waits, bounded, until the window's requests reached the scheduler: before iOS 27 the request went
+        // out at once, before the window ended.
+        let pendingRequests: @Sendable () async -> Void = { [submitter] in await submitter.pendingSubmissionsEnded() }
         let attempt = PhotoBackupProcessingAttempt()
         attempt.work = Task { @MainActor [weak self] in
             guard !attempt.didExpire else {
-                completion.finish(success: false)
+                await completion.finish(.expired, after: pendingRequests)
                 return
             }
             // A launch without a scene has not started the account yet.
             BackgroundLaunchAccountStart.shared.ensureStarted()
             guard let self, let controller = await self.waitForController() else {
-                completion.finish(success: false)
+                await completion.finish(attempt.didExpire ? .expired : .failed, after: pendingRequests)
                 return
             }
             guard !attempt.didExpire else {
-                completion.finish(success: false)
+                await completion.finish(.expired, after: pendingRequests)
                 return
             }
             guard controller.isEnabled else {
                 self.backupStopped()
-                completion.finish(success: true)
+                await completion.finish(.notNeeded, after: pendingRequests)
                 return
             }
             guard !controller.isUserPaused else {
                 self.backupPaused()
-                completion.finish(success: true)
+                await completion.finish(.notNeeded, after: pendingRequests)
                 return
             }
 
@@ -213,7 +242,10 @@ final class PhotoBackupBackgroundCoordinator {
                 }
             }
             self.scheduleProcessingCatchUp(controller: controller)
-            completion.finish(success: !attempt.didExpire && !Task.isCancelled)
+            // The state is read when the window ends, after the wait, as before the wait existed.
+            await completion.finish(after: pendingRequests) {
+                (.afterWork(didExpire: attempt.didExpire, didComplete: !Task.isCancelled), nil)
+            }
         }
 
         task.expirationHandler = { [weak self] in
@@ -224,7 +256,7 @@ final class PhotoBackupBackgroundCoordinator {
                 if let runID = attempt.runID {
                     controller?.stopBackgroundWindowRun(runID: runID)
                 }
-                _ = self?.scheduleProcessingCatchUp(controller: controller)
+                self?.scheduleProcessingCatchUp(controller: controller)
             }
         }
     }
@@ -256,24 +288,5 @@ final class PhotoBackupBackgroundCoordinator {
         case .immediateRunIneligible: return .immediateRunIneligible
         @unknown default: return .unknown
         }
-    }
-}
-
-private final class PhotoBackupTaskCompletion: @unchecked Sendable {
-    private let lock = NSLock()
-    private let task: BGTask
-    private var didFinish = false
-
-    init(task: BGTask) {
-        self.task = task
-    }
-
-    func finish(success: Bool) {
-        let shouldFinish = lock.withLock {
-            guard !didFinish else { return false }
-            didFinish = true
-            return true
-        }
-        if shouldFinish { task.setTaskCompleted(success: success) }
     }
 }
