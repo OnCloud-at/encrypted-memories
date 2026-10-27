@@ -533,9 +533,9 @@ public actor SeriesDissolutionOrchestrator {
         return didReset
     }
 
-    /// Gives every copy what its source had in the library before the series leaves it: the favorite tag of its
-    /// member or of the main photo, and the own albums of its album source (see `albumSources`). The favorite tags are
-    /// read from the server on each attempt; the album memberships come from `albums`, which may answer from a cache.
+    /// Gives each copy the favorite tag of its member, or of the main photo when the member is not standalone, and the
+    /// own albums of its album source (see `albumSources`). Favorite tags are read from the server on each attempt;
+    /// album memberships come from `albums`, which may answer from a cache.
     /// Each confirmed write is journaled, so a retry never adds a copy to the same album twice. Shared albums are
     /// skipped: their writes cannot address a foreign volume. A failed album write stops the operation before the
     /// series leaves the library.
@@ -544,10 +544,12 @@ public actor SeriesDissolutionOrchestrator {
         // Every copy is confirmed in this phase. A missing identifier would silently skip a carry-over write.
         guard journal.allFavoritesConfirmed else { throw SeriesDissolutionError.copyNotConfirmed }
         let mainUID = journal.seriesMainUID
+        let sources = try await albumSources(of: journal)
         let favorites = try await remote.favoriteUIDs(among: journal.seriesUIDs)
         let untagged = journal.favorites.indices.filter { index in
             !journal.favorites[index].favoriteTagAdded
-                && (favorites.contains(mainUID) || favorites.contains(journal.favorites[index].memberUID))
+                && (favorites.contains(journal.favorites[index].memberUID)
+                    || (!sources[index].standalone && favorites.contains(mainUID)))
         }
         if !untagged.isEmpty {
             try await remote.markFavorite(try untagged.map { try copyUID(of: journal.favorites[$0]) })
@@ -555,15 +557,15 @@ public actor SeriesDissolutionOrchestrator {
             try journalStore.save(journal)
         }
 
-        let sources = try await albumSources(of: journal)
         let albumIDsBySource = try await albums.ownAlbumIDsByPhoto(
-            containing: Self.union(sources, []), ownVolumeID: try await remote.ownPhotosVolumeID())
+            containing: Self.union(sources.map(\.source), []), ownVolumeID: try await remote.ownPhotosVolumeID())
         var seenAlbumIDs = Set<String>()
-        let ownAlbumIDs = sources.flatMap { albumIDsBySource[$0] ?? [] }.filter { seenAlbumIDs.insert($0).inserted }
+        let ownAlbumIDs = sources.flatMap { albumIDsBySource[$0.source] ?? [] }
+            .filter { seenAlbumIDs.insert($0).inserted }
         for albumID in ownAlbumIDs {
             try Task.checkCancellation()
             let missing = journal.favorites.indices.filter {
-                albumIDsBySource[sources[$0]]?.contains(albumID) == true
+                albumIDsBySource[sources[$0].source]?.contains(albumID) == true
                     && !journal.favorites[$0].addedAlbumIDs.contains(albumID)
             }
             guard !missing.isEmpty else { continue }
@@ -579,14 +581,16 @@ public actor SeriesDissolutionOrchestrator {
     /// The photo whose own albums each copy joins, in the order of `journal.favorites`. A standalone member (no main
     /// photo) has albums of its own. A related photo joins albums only through its main photo, so its copy takes the
     /// albums of that main photo. A member whose role the server does not report takes the albums of the series main.
-    private func albumSources(of journal: SeriesDissolutionJournal) async throws -> [PhotoUID] {
+    private func albumSources(
+        of journal: SeriesDissolutionJournal
+    ) async throws -> [(source: PhotoUID, standalone: Bool)] {
         let mainUID = journal.seriesMainUID
         let members = Self.union(journal.favorites.map(\.memberUID).filter { $0 != mainUID }, [])
         let roles = members.isEmpty ? [:] : try await remote.memberRoles(of: members)
         return journal.favorites.map { favorite in
-            guard let link = roles[favorite.memberUID], link.hasExplicitPhotoState else { return mainUID }
-            guard let mainLinkID = link.mainPhotoLinkID else { return favorite.memberUID }
-            return PhotoUID(volumeID: favorite.memberUID.volumeID, nodeID: mainLinkID)
+            guard let link = roles[favorite.memberUID], link.hasExplicitPhotoState else { return (mainUID, false) }
+            guard let mainLinkID = link.mainPhotoLinkID else { return (favorite.memberUID, true) }
+            return (PhotoUID(volumeID: favorite.memberUID.volumeID, nodeID: mainLinkID), false)
         }
     }
 

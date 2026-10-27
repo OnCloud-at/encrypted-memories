@@ -249,6 +249,60 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.favoriteNodeIDs, ["m2", copyOfM2.nodeID])
     }
 
+    func testStandaloneCopiesFollowTheirOwnFavoriteTagsAndRelatedCopiesFollowTheMain() async throws {
+        server.makeStandalone(["m2", "m3"])
+        server.markFavoriteNodeIDs(["m1", "m3"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series,
+            favoriteUIDs: [member("m2"), member("m3"), member("m4"), main])
+
+        guard copies.count == 4 else { return XCTFail("all four copies must exist") }
+        XCTAssertEqual(
+            server.favoriteNodeIDs, ["m1", "m3", copies[1].nodeID, copies[2].nodeID, copies[3].nodeID])
+        XCTAssertFalse(server.favoriteNodeIDs.contains(copies[0].nodeID), "an unmarked single frame stays unmarked")
+        XCTAssertTrue(server.favoriteNodeIDs.contains(copies[1].nodeID), "the marked single frame keeps its tag")
+        XCTAssertTrue(server.favoriteNodeIDs.contains(copies[2].nodeID), "a related photo follows the main photo")
+        XCTAssertTrue(server.favoriteNodeIDs.contains(copies[3].nodeID), "the selected main photo keeps its tag")
+        XCTAssertEqual(Array(server.reads.prefix(2)), [.roles, .favorites])
+        XCTAssertEqual(server.trashCalls.map { Set($0) }, [[main, member("m2"), member("m3")]])
+    }
+
+    func testAnUnknownRoleKeepsTheMainPhotosFavoriteRule() async throws {
+        server.makeStandalone(["m2"])
+        server.withholdPhotoRole(["m2"])
+        server.markFavoriteNodeIDs(["m1"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.favoriteNodeIDs, expected(["m1"], copies))
+        XCTAssertEqual(server.trashCalls, [[main]])
+    }
+
+    func testOldJournalKeepsAConfirmedFavoriteWriteButDoesNotAddAnUnconfirmedOne() async throws {
+        server.makeStandalone(["m2", "m3"])
+        server.markFavoriteNodeIDs(["m1", "old-copy"])
+        server.addRemoteRow(name: "m2.HEIC", contentOf: "m2", state: .active, linkID: "old-copy", clientUID: nil)
+        server.addRemoteRow(name: "m3.HEIC", contentOf: "m3", state: .active, linkID: "pending-copy", clientUID: nil)
+        let oldJournal = SeriesDissolutionJournal(
+            seriesMainUID: main, seriesUIDs: series,
+            favorites: [
+                .init(memberUID: member("m2"), copyUID: member("old-copy"), favoriteTagAdded: true),
+                .init(memberUID: member("m3"), copyUID: member("pending-copy"), favoriteTagAdded: false),
+            ])
+        try journalStore.save(oldJournal)
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
+
+        XCTAssertEqual(copies, [member("old-copy"), member("pending-copy")])
+        XCTAssertEqual(
+            server.favoriteNodeIDs, ["m1", "old-copy"], "the recorded tag stays; the pending tag is skipped")
+        XCTAssertFalse(server.events.contains(.favorite), "the retry does not repeat the confirmed write")
+        XCTAssertEqual(server.trashCalls.map { Set($0) }, [[main, member("m2"), member("m3")]])
+    }
+
     func testTheCopyOfAStandaloneMemberJoinsItsOwnAlbumsAndARelatedPhotoFollowsTheMainPhoto() async throws {
         server.makeStandalone(["m2"])
         server.addAlbum("album-of-m2", volumeID: "own", members: ["m2"])
@@ -782,6 +836,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     UploadDuplicateChecking, @unchecked Sendable
 {
     enum Event: Equatable { case upload, trash, favorite, albumAdd }
+    enum Read: Equatable { case roles, favorites }
 
     private struct Node {
         var name: String
@@ -810,6 +865,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var _uploads: [PhotoUploadRequest] = []
     private var _trashCalls: [[PhotoUID]] = []
     private var _events: [Event] = []
+    private var _reads: [Read] = []
     private var _favorites = Set<String>()
     /// Album memberships of this fake Proton, keyed by album node id, plus the volume the album lives in.
     private var _albums: [String: (volumeID: String, members: Set<String>)] = [:]
@@ -833,6 +889,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     var uploads: [PhotoUploadRequest] { lock.withLock { _uploads } }
     var trashCalls: [[PhotoUID]] { lock.withLock { _trashCalls } }
     var events: [Event] { lock.withLock { _events } }
+    var reads: [Read] { lock.withLock { _reads } }
     var activeCopyUIDs: Set<PhotoUID> {
         lock.withLock {
             Set(nodes.filter { $0.value.isCopy && $0.value.state == .active }.map { uid($0.key) })
@@ -947,6 +1004,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     func memberRoles(of uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
         try lock.withLock {
+            _reads.append(.roles)
             if roleReadFailures > 0 {
                 roleReadFailures -= 1
                 throw UploadError.retryableBackend(code: 503, message: "role read unavailable")
@@ -973,7 +1031,10 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     }
 
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
-        lock.withLock { Set(uids.filter { _favorites.contains($0.nodeID) }) }
+        lock.withLock {
+            _reads.append(.favorites)
+            return Set(uids.filter { _favorites.contains($0.nodeID) })
+        }
     }
 
     func markFavorite(_ uids: [PhotoUID]) async throws {
