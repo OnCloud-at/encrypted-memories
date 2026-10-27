@@ -11,6 +11,7 @@ import ProtonDriveBackend
 import TimelineCore
 import UIKit
 import UploadCore
+import os
 
 #if DEBUG
     /// A deterministic, offline account for hosted tests and UI tests. Debug builds only.
@@ -538,10 +539,20 @@ import UploadCore
         }
     }
 
-    enum MobileFixtureError: Error {
+    enum MobileFixtureError: Error, VideoPlaybackClassifiable {
         case bitmap
         case unavailable
         case pendingAccountPurge
+        case rateLimited
+        case permanentVideoFailure
+
+        var videoPlaybackError: VideoPlaybackError? {
+            switch self {
+            case .rateLimited: .quotaOrRateLimited
+            case .permanentVideoFailure: .decryptionFailed
+            default: nil
+            }
+        }
     }
 
     /// One owned album in memory, so the UI tests can add photos to an album without an account.
@@ -652,9 +663,21 @@ import UploadCore
         {
             throw MobileFixtureError.unavailable
         }
+        /// The first preparation of the video hits a rate limit, which the viewer retries silently. The second fails in a
+        /// way that a new attempt can change, and every later one fails for good, so the UI tests see each outcome of
+        /// the failure view.
         func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
-            throw MobileFixtureError.unavailable
+            let attempt = streamingAttempts.withLock { count in
+                count += 1
+                return count
+            }
+            switch attempt {
+            case 1: throw MobileFixtureError.rateLimited
+            case 2: throw MobileFixtureError.unavailable
+            default: throw MobileFixtureError.permanentVideoFailure
+            }
         }
+        private let streamingAttempts = OSAllocatedUnfairLock(initialState: 0)
         func prefetchEncrypted(for uid: PhotoUID) async throws {}
         func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
             guard uid.nodeID == MobileSignedInFixture.videoNodeID else {

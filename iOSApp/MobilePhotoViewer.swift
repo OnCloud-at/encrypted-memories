@@ -1806,7 +1806,10 @@ private struct MobileVideoPage: View {
     /// The streaming asset is the only strong owner of the range resource-loader, which AVFoundation holds
     /// weakly - it must live as long as the player, or every protonvideo:// range request goes unserved.
     @State private var streamingAsset: StreamingVideoAsset?
-    @State private var failed = false
+    /// The classified cause of the failure that the page shows; nil while nothing failed.
+    @State private var failure: VideoPlaybackError?
+    /// Changes when the person taps Retry, so the preparation task starts again.
+    @State private var retryCount = 0
     @State private var poster: UIImage?
     @State private var pinch = ViewerPinchState()
     @State private var drag = ViewerDragState()
@@ -1832,11 +1835,16 @@ private struct MobileVideoPage: View {
 
     var body: some View {
         ZStack {
-            if failed {
-                ContentUnavailableView(
-                    L10n.string("viewer.playback_failed"),
-                    systemImage: "exclamationmark.triangle"
-                )
+            if let failure {
+                ContentUnavailableView {
+                    Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(failure.userMessage)
+                } actions: {
+                    if failure.isRetryable {
+                        RetryButton(.prominent) { retryCount += 1 }
+                    }
+                }
                 .foregroundStyle(.white)
             } else if let player {
                 MobileNativeVideoPlayer(
@@ -1902,7 +1910,8 @@ private struct MobileVideoPage: View {
                 uid: item.uid,
                 current: isCurrent,
                 sourceRevision: libraryModel.scopePresentationRevision,
-                sourceIdentity: sourceIdentity
+                sourceIdentity: sourceIdentity,
+                retryCount: retryCount
             )
         ) { await prepare() }
         .task(id: playbackAttachment?.generation) {
@@ -1947,6 +1956,7 @@ private struct MobileVideoPage: View {
         let current: Bool
         let sourceRevision: UInt64
         let sourceIdentity: ObjectIdentifier?
+        let retryCount: Int
     }
 
     @MainActor
@@ -2105,7 +2115,7 @@ private struct MobileVideoPage: View {
         guard isCurrent, player == nil, let backend = libraryModel.backend else { return }
         playbackGeneration &+= 1
         let generation = playbackGeneration
-        failed = false
+        failure = nil
         let activity = LibraryRuntimeState.shared.beginActivity(.videoPlayback)
         defer {
             if playbackActivity !== activity { activity.end() }
@@ -2115,10 +2125,11 @@ private struct MobileVideoPage: View {
                 "[ViewerPerf] video prepare start uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
         }
         do {
-            let streaming =
+            let streaming = try await VideoPreparationRetry.run {
                 item.uid.isLocalPending
-                ? try await libraryModel.viewerMedia.makeStreamingAsset(for: item.uid)
-                : try await backend.makeStreamingAsset(for: item.uid)
+                    ? try await libraryModel.viewerMedia.makeStreamingAsset(for: item.uid)
+                    : try await backend.makeStreamingAsset(for: item.uid)
+            }
             guard !Task.isCancelled, isCurrent,
                 generation == playbackGeneration,
                 requestedSourceIdentity == sourceIdentity,
@@ -2157,7 +2168,7 @@ private struct MobileVideoPage: View {
                 requestedSourceIdentity == sourceIdentity,
                 requestedSourceRevision == libraryModel.scopePresentationRevision
             else { return }
-            failed = true
+            failure = VideoPlaybackError.classify(error)
         }
     }
 
@@ -2225,13 +2236,13 @@ private struct MobileVideoPage: View {
     }
 
     private func failPlayback(
-        _: VideoPlaybackError,
+        _ error: VideoPlaybackError,
         generation: UInt64,
         player observedPlayer: AVPlayer,
         item observedItem: AVPlayerItem
     ) {
         guard isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem) else { return }
-        failed = true
+        failure = error
         playbackGeneration &+= 1
         playbackAttachment = nil
         playbackSourceIdentity = nil
