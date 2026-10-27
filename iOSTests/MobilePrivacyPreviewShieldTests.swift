@@ -70,7 +70,10 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
             {
                 probes = plan.visibleSlots.compactMap { slot in
                     let rect = grid.metalView.convert(slot.viewportRect, to: window)
-                    guard rect.minY > 140, rect.maxY < window.bounds.height - 100 else { return nil }
+                    // The probe reads the pixel at the center of the tile, so that point must lie clear of the bars.
+                    // A tile taller than the clear band, like 233 pt tiles on the 678 pt outer display of iPhone Duo,
+                    // still gives a probe when its center is clear.
+                    guard rect.midY > 140, rect.midY < window.bounds.height - 100 else { return nil }
                     let item = items[slot.index]
                     guard let section = fixture.sections.firstIndex(where: { $0.items.contains(item) }),
                         let index = fixture.sections[section].items.firstIndex(of: item)
