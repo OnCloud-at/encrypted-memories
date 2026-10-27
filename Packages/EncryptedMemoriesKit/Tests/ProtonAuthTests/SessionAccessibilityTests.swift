@@ -1,5 +1,6 @@
 import AppleSecurityCore
 import Foundation
+import PhotosCore
 import Security
 import Testing
 
@@ -85,6 +86,50 @@ import Testing
         let controller = ProtonAuthController(
             store: storage, authenticator: NeverAuthenticator(), lockedReadIsChecking: true)
         #expect(controller.bootstrap() == .checking)
+    }
+
+    /// What the background windows learn from one bootstrap; `before` is the read that it replaces.
+    @MainActor private func backgroundRead(
+        after load: Result<ProtonSession?, any Error>, replacing before: BackgroundSessionRead
+    ) -> BackgroundSessionRead {
+        let reads = BackgroundAccountReadiness(grace: {})
+        reads.record(before)
+        let controller = ProtonAuthController(
+            store: StubSessionStorage(load: load), authenticator: NeverAuthenticator(), lockedReadIsChecking: true,
+            sessionReads: reads)
+        controller.bootstrap()
+        return reads.lastRead
+    }
+
+    @MainActor @Test func aReadSessionTellsTheBackgroundWindowsThatTheSignInIsReadable() {
+        #expect(backgroundRead(after: .success(session), replacing: .unreadable) == .readable)
+    }
+
+    @MainActor @Test func aMissingSessionTellsTheBackgroundWindowsThatNoAccountIsSignedIn() {
+        #expect(backgroundRead(after: .success(nil), replacing: .notYet) == .absent)
+    }
+
+    @MainActor @Test func aLockDenialTellsTheBackgroundWindowsThatTheReadWasRefused() {
+        let denied = AppleSecurityError(operation: .read, status: errSecInteractionNotAllowed)
+        #expect(backgroundRead(after: .failure(denied), replacing: .readable) == .unreadable)
+    }
+
+    /// Only a missing session means no account; any other failed read keeps the window's bounded wait.
+    @MainActor @Test func anotherFailedReadDecidesNothingForTheBackgroundWindows() {
+        let failed = AppleSecurityError(operation: .read, status: errSecNotAvailable)
+        #expect(backgroundRead(after: .failure(failed), replacing: .absent) == .notYet)
+    }
+
+    @MainActor @Test func aDamagedSessionDecidesNothingForTheBackgroundWindows() {
+        let keychain = ClassRecordingKeychain()
+        keychain.seed(Data("not a session".utf8), class: .afterFirstUnlockThisDeviceOnly)
+        let reads = BackgroundAccountReadiness(grace: {})
+        reads.record(.absent)
+        let controller = ProtonAuthController(
+            store: store(keychain, .afterFirstUnlockThisDeviceOnly), authenticator: NeverAuthenticator(),
+            lockedReadIsChecking: true, sessionReads: reads)
+        controller.bootstrap()
+        #expect(reads.lastRead == .notYet)
     }
 
     @MainActor @Test func withoutBackgroundLaunchesALockDenialReportsASignOutAsBefore() {

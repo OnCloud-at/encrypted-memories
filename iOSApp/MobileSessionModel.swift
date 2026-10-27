@@ -48,7 +48,7 @@ final class MobileSessionModel: ObservableObject {
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
         injectDefaultCryptoImplementation()
         sessionStore = SessionKeychainStore(accessibility: .afterFirstUnlockThisDeviceOnly)
-        let authentication = AuthenticationFactory().make(store: sessionStore)
+        let authentication = AuthenticationFactory().make(store: sessionStore, sessionReads: .shared)
         authController = authentication.controller
         startupCleanup = authentication.cleanup
         isCheckingSession = true
@@ -79,6 +79,8 @@ final class MobileSessionModel: ObservableObject {
                 self?.startupCleanup.noteProtectedDataUnavailable()
             }
         }
+        // A background window whose last read was refused asks for one more read before it ends.
+        BackgroundAccountReadiness.shared.installReread { [weak self] in self?.bootstrapSessionIfNeeded() }
         beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
     }
 
@@ -99,13 +101,15 @@ final class MobileSessionModel: ObservableObject {
         let lockedReadIsChecking = true
         let protectedDataSource = \UIApplication.isProtectedDataAvailable
 
-        func make(store: SessionKeychainStore) -> (controller: ProtonAuthController, cleanup: ProtonAuthStartupCleanup)
-        {
+        /// `sessionReads` learns each read of the saved session; only the process's own model passes it.
+        func make(
+            store: SessionKeychainStore, sessionReads: BackgroundAccountReadiness? = nil
+        ) -> (controller: ProtonAuthController, cleanup: ProtonAuthStartupCleanup) {
             let source = protectedDataSource
             return (
                 ProtonAuthController(
                     store: store, authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories),
-                    lockedReadIsChecking: lockedReadIsChecking),
+                    lockedReadIsChecking: lockedReadIsChecking, sessionReads: sessionReads),
                 ProtonAuthStartupCleanup(isProtectedDataAvailable: { UIApplication.shared[keyPath: source] })
             )
         }

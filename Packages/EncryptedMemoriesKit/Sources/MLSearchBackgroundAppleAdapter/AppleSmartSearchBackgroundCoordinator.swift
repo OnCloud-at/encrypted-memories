@@ -284,9 +284,15 @@ public final class AppleSmartSearchBackgroundCoordinator {
                 // A launch without a scene has not started the account yet; an operation that the window's end
                 // cancelled before it ran starts nothing and ends below.
                 BackgroundLaunchAccountStart.shared.ensureStarted(unlessCancelled: Task.isCancelled)
-                guard let lifecycle = await self.reference.whenReady(timeout: .seconds(30)),
-                    !Task.isCancelled, self.reference.value === lifecycle
-                else {
+                let wait = await BackgroundAccountReadiness.shared.wait(for: self.reference, timeout: .seconds(30))
+                if case .cannotRun = wait {
+                    // The reads of the saved sign-in show that no account can come in this window.
+                    self.processing.removeValue(forKey: id)
+                    await completion.finish(
+                        wait.outcomeWithoutService(didExpire: completion.didExpire), after: pendingRequests)
+                    return
+                }
+                guard case .ready(let lifecycle) = wait, !Task.isCancelled, self.reference.value === lifecycle else {
                     self.processing.removeValue(forKey: id)
                     await finish(nil)
                     return

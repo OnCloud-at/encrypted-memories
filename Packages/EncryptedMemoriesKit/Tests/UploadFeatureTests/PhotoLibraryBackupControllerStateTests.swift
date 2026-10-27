@@ -2282,8 +2282,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let runs = PassCounter()
             let windowEnds = PassCounter()
             let window = Task { @MainActor in
-                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
+                let end = await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
                 _ = windowEnds.increment()
+                return end
             }
 
             _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 && firstPathWait.isWaiting }
@@ -2300,7 +2301,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(scans.count, 1, "the deferred pass scanned inside the window")
             XCTAssertEqual(runs.count, 1, "the window received exactly one run")
             XCTAssertEqual(owners.values, [.iOSBackgroundTask], "the pass keeps the kind of the background window")
-            await window.value
+            let end = await window.value
+            XCTAssertEqual(end, .done, "the pass ran after the path came or the first-path wait ended")
             XCTAssertEqual(windowEnds.count, 1, "the window ends exactly once")
             await controller.shutdown()
         }
@@ -2317,8 +2319,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let runs = PassCounter()
             let windowEnds = PassCounter()
             let window = Task { @MainActor in
-                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
+                let end = await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
                 _ = windowEnds.increment()
+                return end
             }
             _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
             XCTAssertEqual(windowEnds.count, 0)
@@ -2329,6 +2332,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
             XCTAssertTrue(ended, "an expired window ends at once")
             XCTAssertEqual(runs.count, 0)
+            let end = await window.value
+            XCTAssertEqual(end, .noNetworkPath, "the window ended while its pass still waited for the first path")
             runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
             try await Task.sleep(for: .milliseconds(500))
             XCTAssertEqual(scans.count, 0, "the pass of the expired window does not run after it")
@@ -2450,8 +2455,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let runs = PassCounter()
             let windowEnds = PassCounter()
             let window = Task { @MainActor in
-                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
+                let end = await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
                 _ = windowEnds.increment()
+                return end
             }
             _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
 
@@ -2461,7 +2467,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(ended)
             XCTAssertEqual(runs.count, 0, "the window cannot stop the explicit pass at its expiration")
             XCTAssertEqual(owners.values, [.manual])
-            await window.value
+            let end = await window.value
+            XCTAssertEqual(end, .done, "the path came; the explicit pass runs on its own")
             await controller.shutdown()
         }
 

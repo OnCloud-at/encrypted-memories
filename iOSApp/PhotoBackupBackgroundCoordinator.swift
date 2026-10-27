@@ -215,8 +215,10 @@ final class PhotoBackupBackgroundCoordinator {
             }
             // A launch without a scene has not started the account yet.
             BackgroundLaunchAccountStart.shared.ensureStarted()
-            guard let self, let controller = await self.waitForController() else {
-                await completion.finish(attempt.didExpire ? .expired : .failed, after: pendingRequests)
+            let wait = await self?.waitForController() ?? .notReady
+            guard let self, case .ready(let controller) = wait else {
+                let outcome = wait.outcomeWithoutService(didExpire: attempt.didExpire)
+                await completion.finish(outcome, after: pendingRequests)
                 return
             }
             guard !attempt.didExpire else {
@@ -235,16 +237,19 @@ final class PhotoBackupBackgroundCoordinator {
             }
 
             defer { attempt.runID = nil }
-            await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
+            let catchUp = await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
                 attempt.runID = runID
                 if attempt.didExpire {
                     controller.stopBackgroundWindowRun(runID: runID)
                 }
             }
             self.scheduleProcessingCatchUp(controller: controller)
+            let waitedForNetwork = catchUp == .noNetworkPath
             // The state is read when the window ends, after the wait, as before the wait existed.
             await completion.finish(after: pendingRequests) {
-                (.afterWork(didExpire: attempt.didExpire, didComplete: !Task.isCancelled), nil)
+                let outcome = BackgroundWindowOutcome.afterWork(
+                    didExpire: attempt.didExpire, didComplete: !Task.isCancelled, waitedForNetwork: waitedForNetwork)
+                return (outcome, nil)
             }
         }
 
@@ -261,14 +266,12 @@ final class PhotoBackupBackgroundCoordinator {
         }
     }
 
-    private func waitForController() async -> PhotoLibraryBackupController? {
-        let controller = await PhotoLibraryBackupSharedRef.shared.controllerWhenReady(
-            timeout: Self.controllerReadyTimeout
-        )
-        if controller == nil, !Task.isCancelled {
+    private func waitForController() async -> BackgroundAccountWait<PhotoLibraryBackupController> {
+        let wait = await PhotoLibraryBackupSharedRef.shared.controllerWhenReady(timeout: Self.controllerReadyTimeout)
+        if case .notReady = wait, !Task.isCancelled {
             logger.error("Photo-backup controller was not ready during the background launch window")
         }
-        return controller
+        return wait
     }
 
     private func publishExecutionIssue(to controller: PhotoLibraryBackupController? = nil) {

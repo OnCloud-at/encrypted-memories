@@ -1,5 +1,6 @@
 import AppleSecurityCore
 import Foundation
+import PhotosCore
 import Security
 import os
 
@@ -56,6 +57,8 @@ public final class ProtonAuthController {
     /// True where a background launch can find the device locked since its restart (iOS); there a lock denial keeps
     /// checking. Elsewhere it reports a sign-out as before, so no state waits for a retry that never comes.
     private let lockedReadIsChecking: Bool
+    /// Learns every read of the saved session and every sign-out, for the background windows.
+    private let sessionReads: BackgroundAccountReadiness?
     private var signInTask: Task<Void, Never>?
     private var signInTimeoutTask: Task<Void, Never>?
     private var signInAttemptID: UUID?
@@ -64,9 +67,11 @@ public final class ProtonAuthController {
         store: any ProtonSessionStorage = SessionKeychainStore(),
         authenticator: any ProtonAuthenticating,
         signInTimeout: Duration = .seconds(300),
-        lockedReadIsChecking: Bool = false
+        lockedReadIsChecking: Bool = false,
+        sessionReads: BackgroundAccountReadiness? = nil
     ) {
         self.store = store
+        self.sessionReads = sessionReads
         self.authenticator = authenticator
         self.signInTimeout = signInTimeout
         self.lockedReadIsChecking = lockedReadIsChecking
@@ -83,18 +88,22 @@ public final class ProtonAuthController {
                 // The session was readable, so an item of an older class moves now; a failure keeps the session.
                 let migration = store.migrateAccessibilityIfNeeded()
                 if migration == .failed { Self.logger.error("Session protection class not updated; retried later") }
+                sessionReads?.record(.readable)
                 return setState(.signedIn(session))
             }
+            sessionReads?.record(.absent)
             return setState(.signedOut(error: nil))
         } catch let error as AppleSecurityError
             where lockedReadIsChecking && error.status == errSecInteractionNotAllowed
         {
             // The device has not been unlocked since it started. The session exists but cannot be read yet: keep
             // checking, never report a sign-out. The app retries when protected data becomes available.
+            sessionReads?.record(.unreadable)
             return setState(.checking)
         } catch {
             // A damaged or unsupported item cannot become readable by waiting: it reports a sign-out. The item itself
-            // stays where it is; only an explicit sign-out removes it.
+            // stays where it is; only an explicit sign-out removes it. A background window keeps its bounded wait.
+            sessionReads?.record(.notYet)
             return setState(.signedOut(error: Self.message(for: error)))
         }
     }
@@ -124,6 +133,7 @@ public final class ProtonAuthController {
                 guard signInAttemptID == attemptID else { return }
                 try store.save(session)
                 finishSignInAttempt(attemptID)
+                sessionReads?.record(.readable)
                 setState(.signedIn(session), notify: onStateChange)
             } catch is CancellationError {
                 guard signInAttemptID == attemptID else { return }
@@ -171,6 +181,7 @@ public final class ProtonAuthController {
         signInTask = nil
         signInTimeoutTask = nil
         signInAttemptID = nil
+        sessionReads?.record(.absent)
         do {
             try store.clear()
             return setState(.signedOut(error: nil))

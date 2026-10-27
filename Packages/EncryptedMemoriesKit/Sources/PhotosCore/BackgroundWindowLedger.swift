@@ -39,6 +39,12 @@ public enum BackgroundWindowOutcome: String, Codable, Sendable, CaseIterable, Co
         return didComplete ? .ran : .failed
     }
 
+    /// The end of a window whose work started. A pass that waited for the first network path until the window ended
+    /// records that, also when the window expired.
+    public static func afterWork(didExpire: Bool, didComplete: Bool, waitedForNetwork: Bool) -> Self {
+        waitedForNetwork ? .noNetwork : afterWork(didExpire: didExpire, didComplete: didComplete)
+    }
+
     /// The outcome once the end's wait for the requests returned: a window that expired during that wait is recorded as
     /// expired, not as a run. Other outcomes stay.
     public func afterTheEndWait(didExpire: Bool) -> Self {
