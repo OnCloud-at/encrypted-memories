@@ -48,6 +48,10 @@ public enum SupportDiagnosticsExporter {
         let librarySync: LibrarySyncSupportSnapshot
         let backup: Backup
         let recentEvents: RecentEvents
+        /// The last OS background windows of iOS. macOS records none: it has no such windows, so the section is empty.
+        /// Each record has one of the eight outcomes of `BackgroundWindowOutcome`; `unfinished` marks a window whose end
+        /// was never recorded.
+        let backgroundWindows: BackgroundWindowSupportSnapshot
         let schemaVersion: Int
         let generatedAt: Date
         let appVersion: String
@@ -67,7 +71,8 @@ public enum SupportDiagnosticsExporter {
         diagnostics: PhotoDiagnostics = .shared,
         bundle: Bundle = .main,
         sources: SupportDiagnosticsSources = .shared,
-        trail: SupportEventTrail = .shared
+        trail: SupportEventTrail = .shared,
+        backgroundWindows: BackgroundWindowLedger = .shared
     ) async throws -> Data {
         let snapshot = runtimeState.snapshot()
         let metrics = await resourceCoordinator.metrics()
@@ -85,7 +90,8 @@ public enum SupportDiagnosticsExporter {
                 pendingGrid: sources.pendingGridSnapshot()
             ),
             recentEvents: Report.RecentEvents(events: trailExport.events, dropped: trailExport.dropped),
-            schemaVersion: 2,
+            backgroundWindows: backgroundWindows.supportSnapshot(),
+            schemaVersion: 3,
             generatedAt: now,
             appVersion: buildInfo.version ?? "unknown",
             appBuild: buildInfo.build ?? "unknown",
