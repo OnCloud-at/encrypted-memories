@@ -534,8 +534,8 @@ public actor SeriesDissolutionOrchestrator {
     }
 
     /// Gives each copy the favorite tag of its member, or of the main photo when the member is not standalone, and the
-    /// own albums of its album source (see `albumSources`). Favorite tags are read from the server on each attempt;
-    /// album memberships come from `albums`, which may answer from a cache.
+    /// own albums of its album source (see `albumSources`). Favorite tags and album memberships are read fresh on each
+    /// attempt.
     /// Each confirmed write is journaled, so a retry never adds a copy to the same album twice. Shared albums are
     /// skipped: their writes cannot address a foreign volume. A failed album write stops the operation before the
     /// series leaves the library.
@@ -557,7 +557,7 @@ public actor SeriesDissolutionOrchestrator {
             try journalStore.save(journal)
         }
 
-        let albumIDsBySource = try await albums.ownAlbumIDsByPhoto(
+        let albumIDsBySource = try await CurrentAlbumCarryOver(base: albums).ownAlbumIDsByPhoto(
             containing: Self.union(sources.map(\.source), []), ownVolumeID: try await remote.ownPhotosVolumeID())
         var seenAlbumIDs = Set<String>()
         let ownAlbumIDs = sources.flatMap { albumIDsBySource[$0.source] ?? [] }

@@ -303,6 +303,51 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.trashCalls.map { Set($0) }, [[main, member("m2"), member("m3")]])
     }
 
+    func testCopiesJoinCurrentAlbumsInsteadOfCachedMemberships() async throws {
+        server.makeStandalone(["m2"])
+        server.addAlbum("old", volumeID: "own", members: ["m1", "m2"])
+        server.addAlbum("new", volumeID: "own", members: [])
+        server.cacheAlbumMemberships()
+        server.addAlbum("old", volumeID: "own", members: [])
+        server.addAlbum("new", volumeID: "own", members: ["m1", "m2"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+
+        XCTAssertEqual(server.albumMembers("new"), expected(["m1", "m2"], copies))
+        XCTAssertEqual(server.albumMembers("old"), [], "the copies must not join the album the photos left")
+        XCTAssertEqual(server.freshAlbumReads, [[member("m2"), main]], "one batched fresh read covers both sources")
+        XCTAssertTrue(server.cachedAlbumReads.isEmpty)
+        XCTAssertEqual(server.trashCalls.map { Set($0) }, [[main, member("m2")]])
+    }
+
+    func testAFailedFreshAlbumReadKeepsTheJournalForOneBatchedRetry() async throws {
+        server.addAlbum("album", volumeID: "own", members: ["m1"])
+        server.failNextAlbumRead()
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            XCTFail("the failed fresh read must stop the operation")
+        } catch {}
+
+        let journal = try XCTUnwrap(journalStore.journal(forSeries: main))
+        XCTAssertEqual(journal.phase, .copyingFavorites)
+        XCTAssertEqual(journal.confirmedFavoriteCount, 2)
+        XCTAssertTrue(server.trashCalls.isEmpty)
+        XCTAssertEqual(server.freshAlbumReads, [[main]])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+
+        XCTAssertEqual(server.freshAlbumReads, [[main], [main]], "each attempt makes one batched fresh read")
+        XCTAssertTrue(server.cachedAlbumReads.isEmpty)
+        XCTAssertEqual(server.uploads.count, 2, "the retry reuses both confirmed copies")
+        XCTAssertEqual(server.albumMembers("album"), expected(["m1"], copies))
+        XCTAssertEqual(server.trashCalls, [[main]])
+        XCTAssertNil(try journalStore.journal(forSeries: main))
+    }
+
     func testTheCopyOfAStandaloneMemberJoinsItsOwnAlbumsAndARelatedPhotoFollowsTheMainPhoto() async throws {
         server.makeStandalone(["m2"])
         server.addAlbum("album-of-m2", volumeID: "own", members: ["m2"])
@@ -869,6 +914,9 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var _favorites = Set<String>()
     /// Album memberships of this fake Proton, keyed by album node id, plus the volume the album lives in.
     private var _albums: [String: (volumeID: String, members: Set<String>)] = [:]
+    private var cachedAlbums: [String: (volumeID: String, members: Set<String>)]?
+    private var _freshAlbumReads: [[PhotoUID]] = []
+    private var _cachedAlbumReads: [[PhotoUID]] = []
     /// Links whose state answer carries no Photo role data.
     private var _withheldRoles = Set<String>()
     private var _trashRemainsActive = false
@@ -890,6 +938,8 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     var trashCalls: [[PhotoUID]] { lock.withLock { _trashCalls } }
     var events: [Event] { lock.withLock { _events } }
     var reads: [Read] { lock.withLock { _reads } }
+    var freshAlbumReads: [[PhotoUID]] { lock.withLock { _freshAlbumReads } }
+    var cachedAlbumReads: [[PhotoUID]] { lock.withLock { _cachedAlbumReads } }
     var activeCopyUIDs: Set<PhotoUID> {
         lock.withLock {
             Set(nodes.filter { $0.value.isCopy && $0.value.state == .active }.map { uid($0.key) })
@@ -934,6 +984,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     func addAlbum(_ albumID: String, volumeID: String, members: [String]) {
         lock.withLock { _albums[albumID] = (volumeID, Set(members)) }
     }
+    func cacheAlbumMemberships() { lock.withLock { cachedAlbums = _albums } }
     /// Makes the nodes related photos of the series main photo on the server, even when the caller does not know them.
     func addServerRelatedNodeIDs(_ ids: [String]) {
         lock.withLock {
@@ -1051,17 +1102,37 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     // SeriesAlbumCarryOver
 
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
+        try await albums(containing: [uid])[uid] ?? []
+    }
+
+    func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
         try lock.withLock {
-            if albumReadFailures > 0 {
-                albumReadFailures -= 1
-                throw UploadError.retryableBackend(code: 503, message: "album read unavailable")
-            }
-            return
-                _albums
-                .filter { $0.value.members.contains(uid.nodeID) }
-                .map { SeriesAlbumReference(volumeID: $0.value.volumeID, albumID: $0.key) }
-                .sorted { $0.albumID < $1.albumID }
+            _cachedAlbumReads.append(uids)
+            return try albumMemberships(uids, in: cachedAlbums ?? _albums)
         }
+    }
+
+    func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        try lock.withLock {
+            _freshAlbumReads.append(uids)
+            return try albumMemberships(uids, in: _albums)
+        }
+    }
+
+    private func albumMemberships(
+        _ uids: [PhotoUID], in albums: [String: (volumeID: String, members: Set<String>)]
+    ) throws -> [PhotoUID: [SeriesAlbumReference]] {
+        if albumReadFailures > 0 {
+            albumReadFailures -= 1
+            throw UploadError.retryableBackend(code: 503, message: "album read unavailable")
+        }
+        return Dictionary(
+            uids.map { uid in
+                let matches = albums.filter { $0.value.members.contains(uid.nodeID) }
+                    .map { SeriesAlbumReference(volumeID: $0.value.volumeID, albumID: $0.key) }
+                    .sorted { $0.albumID < $1.albumID }
+                return (uid, matches)
+            }, uniquingKeysWith: { first, _ in first })
     }
 
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
