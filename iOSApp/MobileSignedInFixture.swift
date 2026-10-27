@@ -663,10 +663,13 @@ import os
         {
             throw MobileFixtureError.unavailable
         }
-        /// The first preparation of the video hits a rate limit, which the viewer retries silently. The second fails in a
-        /// way that a new attempt can change, and every later one fails for good, so the UI tests see each outcome of
-        /// the failure view.
+        /// Without the scenario argument the video never prepares and fails in a changeable way, as before. With
+        /// `-EncryptedMemoriesVideoFailureScenario` the first preparation hits a rate limit, which the viewer retries
+        /// silently, the second fails in a way that a new attempt can change, and every later one fails for good.
         func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
+            guard ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesVideoFailureScenario") else {
+                throw MobileFixtureError.unavailable
+            }
             let attempt = streamingAttempts.withLock { count in
                 count += 1
                 return count

@@ -27,15 +27,22 @@ struct VideoPreparationRetryTests {
     @Test func aRateLimitThatLastsThrowsItAfterTheLastWait() async {
         let waits = Recorder()
         let attempts = Recorder()
-        await #expect(throws: Error.self) {
-            try await VideoPreparationRetry.run(
+        var thrown: (any Error)?
+        do {
+            _ = try await VideoPreparationRetry.run(
                 wait: { await waits.record($0) },
-                attempt: {
+                attempt: { () async throws -> String in
                     // A loop that does not advance through the waits ends here, with the wrong waits.
                     if await attempts.record(.zero) > 10 { throw CancellationError() }
                     throw rateLimit
                 })
+        } catch {
+            thrown = error
         }
+        let terminal = thrown.map { $0 as NSError }
+        #expect(terminal?.domain == rateLimit.domain)
+        #expect(terminal?.code == rateLimit.code)
+        #expect(thrown.map(VideoPlaybackError.classify) == .quotaOrRateLimited)
         #expect(await waits.durations == [.seconds(3), .seconds(8), .seconds(20)])
         #expect(await attempts.count == 4, "the first attempt and one after each wait")
     }
@@ -88,12 +95,54 @@ struct VideoPreparationRetryTests {
 
     @Test func aCancellationOfTheAttemptIsNotRetried() async {
         let waits = Recorder()
+        let attempts = Recorder()
         await #expect(throws: CancellationError.self) {
             try await VideoPreparationRetry.run(
                 wait: { await waits.record($0) },
-                attempt: { throw CancellationError() })
+                attempt: { () async throws -> String in
+                    await attempts.record(.zero)
+                    throw CancellationError()
+                })
         }
-        #expect(await waits.durations.isEmpty)
+        #expect(await waits.count == 0)
+        #expect(await attempts.count == 1)
+    }
+
+    /// Even a policy that offers a wait for every failure does not retry a cancellation.
+    @Test func aCancellationIsNotRetriedEvenWhenThePolicyOffersAWait() async {
+        let waits = Recorder()
+        let attempts = Recorder()
+        await #expect(throws: CancellationError.self) {
+            try await VideoPreparationRetry.run(
+                delays: { _ in [.zero] },
+                wait: { await waits.record($0) },
+                attempt: { () async throws -> String in
+                    await attempts.record(.zero)
+                    throw CancellationError()
+                })
+        }
+        #expect(await waits.count == 0)
+        #expect(await attempts.count == 1)
+    }
+
+    /// A failure of a cancelled attempt is rethrown at once, as it is; the loop neither waits nor turns it into a
+    /// cancellation.
+    @Test func aRateLimitOfACancelledAttemptIsRethrownAtOnceWithoutAWait() async {
+        let waits = Recorder()
+        var thrown: (any Error)?
+        do {
+            _ = try await VideoPreparationRetry.run(
+                wait: { await waits.record($0) },
+                attempt: { () async throws -> String in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    throw rateLimit
+                })
+        } catch {
+            thrown = error
+        }
+        #expect(!(thrown is CancellationError))
+        #expect(thrown.map(VideoPlaybackError.classify) == .quotaOrRateLimited)
+        #expect(await waits.count == 0)
     }
 }
 

@@ -51,9 +51,12 @@ final class MobileLibraryUITests: XCTestCase {
     }
 
     /// The viewer asks again silently after a rate limit and shows no message for it. A failure that a new attempt can
-    /// change offers Try again, and one that no attempt changes offers none. The fixture rate-limits the first
-    /// preparation, fails the second in a changeable way and every later one for good.
+    /// change offers Try again, and one that no attempt changes offers none. The scenario argument makes the fixture
+    /// rate-limit the first preparation, fail the second in a changeable way and every later one for good.
     func testTheFailedVideoOffersTryAgainOnlyWhenAnotherAttemptCanChangeIt() {
+        app.terminate()
+        app.launchArguments += ["-EncryptedMemoriesVideoFailureScenario"]
+        app.launch()
         XCTAssertTrue(firstVideo.waitForExistence(timeout: 60), "the library grid shows no video")
         firstVideo.tap()
 
