@@ -4,6 +4,8 @@ import Foundation
 public enum BackgroundWindowKind: String, Codable, Sendable, CaseIterable, Comparable {
     case photoBackup
     case smartSearch
+    /// The short app refresh task that only scans the photo library for the backup.
+    case libraryRefresh
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 }

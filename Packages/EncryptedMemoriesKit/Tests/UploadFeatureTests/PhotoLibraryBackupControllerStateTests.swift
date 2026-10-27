@@ -3099,6 +3099,549 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             return clock
         }
 
+        // MARK: Refresh window (#832)
+
+        /// A backup with one runnable photo in the queue, while no scene is in the foreground unless `inForeground`. The
+        /// network is known and usable unless `networkKnown` is false.
+        private func makeRefreshFixture(
+            prefix: String, networkKnown: Bool = true, inForeground: Bool = false
+        ) throws -> ControllerFixture {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update { $0.executionOpportunity = inForeground ? .foregroundActive : .backgroundPermitted }
+            if networkKnown {
+                runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            }
+            return try makeWiFiWaitFixture(
+                prefix: prefix, source: .mobileDataOff(runtime), firstNetworkPathWait: .seconds(60))
+        }
+
+        private func queueSummary(_ fixture: ControllerFixture) throws -> UploadBackupSyncQueueSummary {
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            return queue.summary()
+        }
+
+        func testARefreshScanScansUnderItsOwnOwnerAndUploadsNothing() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-only")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            let before = try queueSummary(fixture)
+            XCTAssertEqual(before.waiting, 1, "one photo waits for its upload")
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .scanned)
+            XCTAssertEqual(owners.values, [.iOSRefreshTask])
+            XCTAssertEqual(controller.reconcileStartsForTesting, 0, "the runner never drains, so nothing uploads")
+            XCTAssertEqual(try queueSummary(fixture), before, "the photo still waits")
+            XCTAssertFalse(controller.isAutoResumeScheduledForTesting, "a refresh scan in the background plans no pass")
+            XCTAssertFalse(controller.isSyncing)
+            // The counter sees a drain: an ordinary pass of the same backup starts one.
+            controller.syncNow()
+            let drained = await waitUntil { controller.reconcileStartsForTesting == 1 }
+            XCTAssertTrue(drained, "an ordinary pass starts the reconcile loop")
+            await controller.shutdown()
+        }
+
+        /// A scene came to the foreground during the scan and found the pass busy. The end of the scan then plans the
+        /// next pass as every pass does, so the person's backup does not wait for the next change.
+        func testARefreshScanThatEndsInTheForegroundPlansTheNextPassAsBefore() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-foreground", inForeground: true)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .scanned)
+            XCTAssertEqual(controller.consecutiveNoProgressRunsForTesting, 0, "a scan is no pass without progress")
+            let passStarted = await waitUntil { controller.reconcileStartsForTesting == 1 }
+            XCTAssertTrue(passStarted, "the person's pass starts after the scan")
+            await controller.shutdown()
+        }
+
+        func testARefreshScanDoesNotWaitForTheFirstNetworkPath() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-no-path", networkKnown: false)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .scanned, "a scan needs no network")
+            XCTAssertEqual(scans.count, 1)
+            XCTAssertEqual(controller.deferredStartWaiterCountForTesting, 0)
+            await controller.shutdown()
+        }
+
+        func testARefreshScanStartsNothingWhileAnotherPassRuns() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-busy")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let release = LockedFlag(false)
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                while !release.value, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+            }
+            controller.syncNow()
+            let running = await waitUntil { scans.count == 1 }
+            XCTAssertTrue(running)
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .notNeeded, "the running pass scans too")
+            XCTAssertEqual(scans.count, 1, "never a second scan")
+            release.value = true
+            await controller.waitForSyncRunCompletionForTesting()
+            await controller.shutdown()
+        }
+
+        /// A pass that waits for the first network path keeps its start: the refresh scan does not take the lock it
+        /// would need when the path arrives.
+        func testARefreshScanStartsNothingWhileAPassWaitsForTheFirstNetworkPath() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-deferred", networkKnown: false)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            controller.syncNow()
+            XCTAssertFalse(controller.isSyncing, "the pass waits for the first path")
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .notNeeded)
+            XCTAssertEqual(scans.count, 0)
+            await controller.shutdown()
+        }
+
+        /// A long window whose pass waits for the first network path keeps its start as well.
+        func testARefreshScanStartsNothingWhileALongWindowWaitsForTheFirstNetworkPath() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-window-waits", networkKnown: false)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            let window = Task { @MainActor in await controller.backgroundCatchUp(owner: .iOSBackgroundTask) }
+            let waiting = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            XCTAssertTrue(waiting, "the long window waits for the first path")
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .notNeeded)
+            XCTAssertEqual(scans.count, 0)
+            window.cancel()
+            _ = await window.value
+            await controller.shutdown()
+        }
+
+        /// A long window arrives while a refresh scan runs. The scan yields its lock, and the long window's pass scans and
+        /// uploads; the refresh window needed nothing.
+        func testALongWindowTakesTheLockOverFromARefreshScan() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-yields")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                if scans.increment() == 1 {
+                    while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                    throw CancellationError()
+                }
+            }
+            let refresh = Task { @MainActor in
+                await self.runRefreshWindow(events: WindowEvents(), wait: .ready(controller))
+            }
+            let scanning = await waitUntil { scans.count == 1 }
+            XCTAssertTrue(scanning)
+
+            // A long window that does not stop the scan would wait for it forever; the watchdog bounds the test.
+            let watchdogFired = LockedFlag(false)
+            let watchdog = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                watchdogFired.value = true
+                controller.stopSync()
+            }
+            let longWindow = Task { @MainActor in await controller.backgroundCatchUp(owner: .iOSBackgroundTask) }
+            let catchUp = await longWindow.value
+            watchdog.cancel()
+
+            XCTAssertFalse(watchdogFired.value, "the long window stopped the scan itself")
+            XCTAssertEqual(catchUp, .done)
+            XCTAssertEqual(owners.values, [.iOSRefreshTask, .iOSBackgroundTask], "the long window's pass scanned")
+            XCTAssertEqual(controller.reconcileStartsForTesting, 1, "the long window's pass drained the queue")
+            // A scan that did not yield would hold forever; stopping it bounds the test.
+            controller.stopSync()
+            let refreshOutcome = await refresh.value
+            XCTAssertEqual(refreshOutcome, .notNeeded)
+            await controller.shutdown()
+        }
+
+        /// The long window expired while the scan it stopped came to its end: it starts no pass.
+        func testAnExpiredLongWindowStartsNoPassAfterTheRefreshScanEnded() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-yield-expired")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let release = LockedFlag(false)
+            controller.replaceScanForTesting {
+                // The first scan ends only when the test releases it, also after a stop.
+                if scans.increment() == 1 {
+                    while !release.value { try? await Task.sleep(for: .milliseconds(10)) }
+                }
+            }
+            let refresh = Task { @MainActor in await controller.backgroundRefreshScan() }
+            let scanning = await waitUntil { scans.count == 1 }
+            XCTAssertTrue(scanning)
+            let window = Task { @MainActor in await controller.backgroundCatchUp(owner: .iOSBackgroundTask) }
+            let stopping = await waitUntil { controller.isRunnerStopPendingForTesting }
+            XCTAssertTrue(stopping, "the long window stopped the scan")
+
+            // The iOS expiration handler cancels the long window's work while it waits for the scan's end.
+            window.cancel()
+            release.value = true
+
+            let end = await window.value
+            XCTAssertEqual(end, .done)
+            _ = await refresh.value
+            XCTAssertEqual(controller.reconcileStartsForTesting, 0, "an expired window starts no pass")
+            XCTAssertEqual(scans.count, 1)
+            await controller.shutdown()
+        }
+
+        /// Another run holds the lock, for example after a crash of a run whose lease has not ended yet. Its pass
+        /// covers the scan: nothing was needed.
+        func testARefreshScanWhileAnotherRunHoldsTheLockIsNotNeeded() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-busy-lock")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            let end = await controller.backgroundRefreshScan()
+            XCTAssertEqual(end, .notNeeded)
+            let outcome = await runRefreshWindow(events: WindowEvents(), wait: .ready(controller))
+            XCTAssertEqual(outcome, .notNeeded)
+            XCTAssertEqual(scans.count, 0)
+            XCTAssertTrue(lock.release(runID: "other-live-run"))
+            await controller.shutdown()
+        }
+
+        /// The retry date of the remote index holds upload passes, not the scan.
+        func testARefreshScanRunsWhileTheRemoteIndexWaitsForItsRetry() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-index-retry")
+            defer { fixture.cleanup() }
+            try holdAutomaticPasses(in: fixture)
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .scanned)
+            XCTAssertEqual(scans.count, 1)
+            await controller.shutdown()
+        }
+
+        /// The person's retry waits for Wi-Fi, which is back. The refresh window must not start that upload pass.
+        func testARefreshScanNeverStartsTheResumedManualRetry() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: true)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "refresh-scan-manual-retry", source: signals.source, firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            await controller.retryUserResolvableWork()
+            let waiting = await waitUntil { controller.status.phase == .waitingForWiFi && !controller.isSyncing }
+            XCTAssertTrue(waiting, "the manual pass waits for Wi-Fi")
+            // Publish the snapshot without notifying the observer: the retry could resume now.
+            signals.setWaitsForWiFi(false)
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .scanned)
+            XCTAssertEqual(owners.values, [.manual, .iOSRefreshTask])
+            await controller.shutdown()
+        }
+
+        func testTheEndOfTheWindowStopsTheRefreshScanAndFreesTheLock() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-stopped")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting {
+                if scans.increment() == 1 {
+                    while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                    throw CancellationError()
+                }
+            }
+            let runIDs = OwnerRecorder()
+            let window = Task { @MainActor in
+                await controller.backgroundRefreshScan { runIDs.record(BackupExecutionOwner(rawValue: $0)) }
+            }
+            let started = await waitUntil { scans.count == 1 && !runIDs.values.isEmpty }
+            XCTAssertTrue(started)
+
+            let runID = try XCTUnwrap(runIDs.values.first ?? nil).rawValue
+            controller.stopBackgroundWindowRun(runID: runID)
+
+            let end = await window.value
+            XCTAssertEqual(end, .stopped)
+            let next = await controller.backgroundRefreshScan()
+            XCTAssertEqual(next, .scanned, "the stopped scan released the lock")
+            XCTAssertEqual(scans.count, 2)
+            await controller.shutdown()
+        }
+
+        private final class WindowEvents {
+            var values: [String] = []
+            var limit: Duration?
+        }
+
+        private func runRefreshWindow(
+            events: WindowEvents, lowPower: Bool = false, didExpire: (() -> Bool)? = nil,
+            wait: BackgroundAccountWait<PhotoLibraryBackupController>
+        ) async -> BackgroundWindowOutcome {
+            await PhotoLibraryRefreshWindow.run(
+                scheduleNext: { events.values.append("next") },
+                isLowPowerModeOn: { lowPower },
+                startAccount: { events.values.append("account") },
+                waitForController: { limit in
+                    events.values.append("wait")
+                    events.limit = limit
+                    return wait
+                },
+                didExpire: didExpire ?? { false },
+                backupStopped: { events.values.append("backup stopped") },
+                backupPaused: { events.values.append("backup paused") },
+                onRunStarted: { _ in })
+        }
+
+        func testARefreshWindowSubmitsItsNextRequestFirstAndWaitsFifteenSecondsForTheAccount() async {
+            let events = WindowEvents()
+            let outcome = await runRefreshWindow(events: events, wait: .cannotRun(.noAccount))
+            XCTAssertEqual(events.values, ["next", "account", "wait"])
+            XCTAssertEqual(events.limit, .seconds(15))
+            XCTAssertEqual(outcome, .noAccount)
+        }
+
+        func testARefreshWindowInLowPowerModeDoesNothing() async {
+            let events = WindowEvents()
+            let outcome = await runRefreshWindow(events: events, lowPower: true, wait: .notReady)
+            XCTAssertEqual(outcome, .notNeeded)
+            XCTAssertEqual(events.values, ["next"], "no account start and no scan")
+        }
+
+        func testARefreshWindowWithoutItsAccountRecordsWhy() async {
+            let locked = await runRefreshWindow(events: WindowEvents(), wait: .cannotRun(.endedAtOnceLocked))
+            XCTAssertEqual(locked, .endedAtOnceLocked)
+            let late = await runRefreshWindow(events: WindowEvents(), wait: .notReady)
+            XCTAssertEqual(late, .failed)
+            let expired = await runRefreshWindow(events: WindowEvents(), didExpire: { true }, wait: .notReady)
+            XCTAssertEqual(expired, .expired)
+        }
+
+        func testARefreshWindowWithBackupOffOrPausedScansNothing() async throws {
+            let off = try makeControllerFixture(prefix: "refresh-window-off")
+            defer { off.cleanup() }
+            let offScans = PassCounter()
+            off.controller.replaceScanForTesting { _ = offScans.increment() }
+            let offEvents = WindowEvents()
+            let offOutcome = await runRefreshWindow(events: offEvents, wait: .ready(off.controller))
+            XCTAssertEqual(offOutcome, .notNeeded)
+            XCTAssertEqual(offScans.count, 0)
+            XCTAssertEqual(offEvents.values.last, "backup stopped", "as the long window, the window stops scheduling")
+            await off.controller.shutdown()
+
+            let paused = try makeRefreshFixture(prefix: "refresh-window-paused")
+            defer { paused.cleanup() }
+            let pausedScans = PassCounter()
+            paused.controller.replaceScanForTesting { _ = pausedScans.increment() }
+            paused.controller.pauseBackup()
+            let pausedEvents = WindowEvents()
+            let pausedOutcome = await runRefreshWindow(events: pausedEvents, wait: .ready(paused.controller))
+            XCTAssertEqual(pausedOutcome, .notNeeded)
+            XCTAssertEqual(pausedScans.count, 0)
+            XCTAssertEqual(pausedEvents.values.last, "backup paused")
+            await paused.controller.shutdown()
+        }
+
+        /// The window expired while it waited for the account: no scan starts in it.
+        func testARefreshWindowThatExpiredDuringTheAccountWaitScansNothing() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-window-expired")
+            defer { fixture.cleanup() }
+            let scans = PassCounter()
+            fixture.controller.replaceScanForTesting { _ = scans.increment() }
+            let outcome = await runRefreshWindow(
+                events: WindowEvents(), didExpire: { true }, wait: .ready(fixture.controller))
+            XCTAssertEqual(outcome, .expired)
+            XCTAssertEqual(scans.count, 0)
+            await fixture.controller.shutdown()
+        }
+
+        func testARefreshWindowWhoseScanWasStoppedFailed() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-window-stopped")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.replaceScanForTesting {
+                await MainActor.run { controller.stopSync() }
+                while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                throw CancellationError()
+            }
+            let outcome = await runRefreshWindow(events: WindowEvents(), wait: .ready(controller))
+            XCTAssertEqual(outcome, .failed, "a scan stopped before the window's end did not do its work")
+            await controller.shutdown()
+        }
+
+        func testARefreshWindowThatExpiredDuringItsScanExpired() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-window-expired-scan")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let expired = LockedFlag(false)
+            controller.replaceScanForTesting {
+                expired.value = true
+                await MainActor.run { controller.stopSync() }
+                while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                throw CancellationError()
+            }
+            let outcome = await runRefreshWindow(
+                events: WindowEvents(), didExpire: { expired.value }, wait: .ready(controller))
+            XCTAssertEqual(outcome, .expired)
+            await controller.shutdown()
+        }
+
+        func testARefreshWindowThatExpiredAfterItsScanExpired() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-window-expired-after-scan")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let expired = LockedFlag(false)
+            controller.replaceScanForTesting { expired.value = true }
+            let outcome = await runRefreshWindow(
+                events: WindowEvents(), didExpire: { expired.value }, wait: .ready(controller))
+            XCTAssertEqual(outcome, .expired, "an expiry decides first, as for every window")
+            await controller.shutdown()
+        }
+
+        func testARefreshScanThatFailsReportsAFailure() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-scan-fails")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.replaceScanForTesting { throw UploadError.backend("scan state could not be saved") }
+            let end = await controller.backgroundRefreshScan()
+            XCTAssertEqual(end, .failed)
+            let outcome = await runRefreshWindow(events: WindowEvents(), wait: .ready(controller))
+            XCTAssertEqual(outcome, .failed)
+            await controller.shutdown()
+        }
+
+        /// Without photo access no scan can start; that is a failure, not "nothing needed".
+        func testARefreshWindowWithoutPhotoAccessFails() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-window-no-access")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            controller.setAccessStateForTesting(.denied)
+            let end = await controller.backgroundRefreshScan()
+            XCTAssertEqual(end, .couldNotStart)
+            let outcome = await runRefreshWindow(events: WindowEvents(), wait: .ready(controller))
+            XCTAssertEqual(outcome, .failed)
+            XCTAssertEqual(scans.count, 0)
+            await controller.shutdown()
+        }
+
+        /// The window's end stops a scan while a scene is in the foreground and the queue is empty. The person's pass
+        /// starts after it, and the stopped scan does not count as a pass without progress.
+        func testARefreshScanStoppedInTheForegroundStartsThePersonsPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .foregroundActive
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeControllerFixture(
+                prefix: "refresh-scan-foreground-stopped", identityResolver: FakeIdentityResolver(),
+                runtimeSignals: .mobileDataOff(runtime))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.setEnabledForTesting()
+            controller.setAccessStateForTesting(.full)
+            // An empty queue, as after a finished backup.
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            XCTAssertEqual(queue.summary().total, 0)
+            queue.close()
+            let scans = PassCounter()
+            controller.replaceScanForTesting {
+                if scans.increment() == 1 {
+                    while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                    throw CancellationError()
+                }
+            }
+            let runIDs = OwnerRecorder()
+            let window = Task { @MainActor in
+                await controller.backgroundRefreshScan { runIDs.record(BackupExecutionOwner(rawValue: $0)) }
+            }
+            let started = await waitUntil { scans.count == 1 && !runIDs.values.isEmpty }
+            XCTAssertTrue(started)
+            guard let runID = runIDs.values.first??.rawValue else {
+                window.cancel()
+                _ = await window.value
+                return XCTFail("the refresh scan did not start")
+            }
+
+            controller.stopBackgroundWindowRun(runID: runID)
+
+            let end = await window.value
+            XCTAssertEqual(end, .stopped)
+            XCTAssertEqual(controller.consecutiveNoProgressRunsForTesting, 0)
+            let passStarted = await waitUntil { controller.reconcileStartsForTesting == 1 }
+            XCTAssertTrue(passStarted, "the person's pass starts after the stopped scan")
+            await controller.shutdown()
+        }
+
+        func testARefreshWindowThatScannedRan() async throws {
+            let fixture = try makeRefreshFixture(prefix: "refresh-window-ran")
+            defer { fixture.cleanup() }
+            let scans = PassCounter()
+            fixture.controller.replaceScanForTesting { _ = scans.increment() }
+            let outcome = await runRefreshWindow(events: WindowEvents(), wait: .ready(fixture.controller))
+            XCTAssertEqual(outcome, .ran)
+            XCTAssertEqual(scans.count, 1)
+            await fixture.controller.shutdown()
+        }
+
+        func testARefreshWindowIsRecordedAsItsOwnKind() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "refresh-window-kind-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let ledger = BackgroundWindowLedger(
+                fileURL: directory.appendingPathComponent("windows.json"), isPurgePending: { false })
+            let heard = LockedFlag(true)
+            let completion = PhotoLibraryRefreshWindow.begin(ledger: ledger) { heard.value = $0 }
+            await completion.finish(.notNeeded, after: {})
+            XCTAssertEqual(ledger.records().map(\.kind), [.libraryRefresh])
+            XCTAssertEqual(ledger.supportSnapshot().counts.map(\.kind), [.libraryRefresh])
+        }
+
         /// Records a remote index issue with a retry date in an hour, which holds every pass except an explicit one.
         private func holdAutomaticPasses(in fixture: ControllerFixture) throws {
             let queue = try XCTUnwrap(
