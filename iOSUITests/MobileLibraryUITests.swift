@@ -50,6 +50,29 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(firstVideo.waitForExistence(timeout: 10), "the library did not return")
     }
 
+    /// The viewer asks again silently after a rate limit and shows no message for it. A failure that a new attempt can
+    /// change offers Try again, and one that no attempt changes offers none. The scenario argument makes the fixture
+    /// rate-limit the first preparation, fail the second in a changeable way and every later one for good.
+    func testTheFailedVideoOffersTryAgainOnlyWhenAnotherAttemptCanChangeIt() {
+        app.terminate()
+        app.launchArguments += ["-EncryptedMemoriesVideoFailureScenario"]
+        app.launch()
+        XCTAssertTrue(firstVideo.waitForExistence(timeout: 60), "the library grid shows no video")
+        firstVideo.tap()
+
+        let tryAgain = app.buttons["Try again"]
+        XCTAssertTrue(
+            tryAgain.waitForExistence(timeout: 30), "a failure that a new attempt can change offers no Try again")
+        XCTAssertTrue(app.staticTexts["The video couldn’t be played."].exists, "the silent retry did not run")
+        XCTAssertFalse(app.staticTexts["Proton is busy right now."].exists, "the rate limit showed a message")
+
+        tryAgain.tap()
+        XCTAssertTrue(
+            app.staticTexts["The video couldn’t be decrypted."].waitForExistence(timeout: 20),
+            "Try again did not prepare the video again")
+        XCTAssertFalse(app.buttons["Try again"].exists, "a failure that no new attempt changes still offers Try again")
+    }
+
     func testTheAlbumButtonOfTheViewerAddsTheOpenPhotoToAnAlbum() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         firstPhoto.tap()
