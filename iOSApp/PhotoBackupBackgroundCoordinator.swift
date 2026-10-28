@@ -21,6 +21,8 @@ final class PhotoBackupBackgroundCoordinator {
     static let shared = PhotoBackupBackgroundCoordinator()
 
     nonisolated static let processingTaskIdentifier = "at.oncloud.encryptedmemories.photo-backup.processing"
+    /// The short app refresh task, which only scans the photo library (PhotoLibraryRefreshWindow).
+    nonisolated static let refreshTaskIdentifier = "at.oncloud.encryptedmemories.photo-backup.refresh"
 
     private static let controllerReadyTimeout: Duration = .seconds(30)
 
@@ -34,6 +36,15 @@ final class PhotoBackupBackgroundCoordinator {
         onErrorAfterCancel: { [logger] error in
             logger.error(
                 "Photo-backup submission failed after a cancel: \(error.localizedDescription, privacy: .public)")
+        })
+    private lazy var refreshSubmitter = BackgroundTaskRequestSubmitter(
+        cancelRequest: {
+            BGTaskScheduler.shared.cancel(
+                taskRequestWithIdentifier: PhotoBackupBackgroundCoordinator.refreshTaskIdentifier)
+        },
+        onErrorAfterCancel: { [logger] error in
+            logger.error(
+                "Library-refresh submission failed after a cancel: \(error.localizedDescription, privacy: .public)")
         })
     private var didRegister = false
     private var registrationIssue: BackupExecutionOpportunityIssue?
@@ -62,10 +73,25 @@ final class PhotoBackupBackgroundCoordinator {
             }
         }
 
-        if !processingRegistered {
+        let refreshRegistered = scheduler.register(
+            forTaskWithIdentifier: Self.refreshTaskIdentifier,
+            using: nil
+        ) { task in
+            guard let refreshTask = task as? BGAppRefreshTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            Task { @MainActor in
+                Self.shared.handleRefreshTask(refreshTask)
+            }
+        }
+
+        if !processingRegistered || !refreshRegistered {
             registrationIssue = .registrationFailed
             publishExecutionIssue()
-            logger.error("Photo-backup processing-task registration failed")
+            logger.error(
+                "Background task registration failed: processing \(processingRegistered), refresh \(refreshRegistered)"
+            )
         }
     }
 
@@ -131,6 +157,7 @@ final class PhotoBackupBackgroundCoordinator {
     private func stopScheduling(detachController: Bool) {
         schedulingStopped = true
         submitter.cancel()
+        refreshSubmitter.cancel()
         processingIssue = nil
         publishExecutionIssue()
         PhotoBackupBackgroundGrace.shared.end()
@@ -178,6 +205,36 @@ final class PhotoBackupBackgroundCoordinator {
                 self.logger.error(
                     "Photo-backup processing submission failed: \(error.localizedDescription, privacy: .public)")
             })
+        scheduleLibraryRefresh()
+    }
+
+    /// Keeps one refresh request pending, `PhotoLibraryRefreshWindow.nextRequestDelay` after it is planned; a new
+    /// submission replaces the pending one. Its errors are logged; the processing request reports the scheduler's state.
+    func scheduleLibraryRefresh() {
+        guard !schedulingStopped, !BackupLocalDataPurge.isPurgePending() else { return }
+        let earliestBeginDate = Date().addingTimeInterval(PhotoLibraryRefreshWindow.nextRequestDelay)
+        refreshSubmitter.submit(
+            blocking: { try scheduler.submit(Self.refreshRequest(earliestBeginDate: earliestBeginDate)) },
+            offMainThread: Self.offMainRefreshSubmission(earliestBeginDate: earliestBeginDate),
+            completion: { [weak self] error in
+                guard let error else { return }
+                self?.logger.error(
+                    "Library-refresh submission failed: \(error.localizedDescription, privacy: .public)")
+            })
+    }
+
+    nonisolated static func refreshRequest(earliestBeginDate: Date) -> BGAppRefreshTaskRequest {
+        let request = BGAppRefreshTaskRequest(identifier: refreshTaskIdentifier)
+        request.earliestBeginDate = earliestBeginDate
+        return request
+    }
+
+    /// The iOS 27 call for the refresh request, which must not run on the main thread; nil before iOS 27.
+    nonisolated static func offMainRefreshSubmission(earliestBeginDate: Date) -> (@Sendable () async throws -> Void)? {
+        guard #available(iOS 27.0, *) else { return nil }
+        return {
+            try await BGTaskScheduler.shared.submitTaskRequest(refreshRequest(earliestBeginDate: earliestBeginDate))
+        }
     }
 
     nonisolated static func processingRequest(earliestBeginDate: Date?) -> BGProcessingTaskRequest {
@@ -262,6 +319,44 @@ final class PhotoBackupBackgroundCoordinator {
                     controller?.stopBackgroundWindowRun(runID: runID)
                 }
                 self?.scheduleProcessingCatchUp(controller: controller)
+            }
+        }
+    }
+
+    /// A refresh window scans the photo library and uploads nothing (PhotoLibraryRefreshWindow).
+    private func handleRefreshTask(_ task: BGAppRefreshTask) {
+        let completion = PhotoLibraryRefreshWindow.begin { task.setTaskCompleted(success: $0) }
+        let pendingRequests: @Sendable () async -> Void = { [refreshSubmitter] in
+            await refreshSubmitter.pendingSubmissionsEnded()
+        }
+        let attempt = PhotoBackupProcessingAttempt()
+        attempt.work = Task { @MainActor [weak self] in
+            let outcome = await PhotoLibraryRefreshWindow.run(
+                scheduleNext: { self?.scheduleLibraryRefresh() },
+                isLowPowerModeOn: { ProcessInfo.processInfo.isLowPowerModeEnabled },
+                startAccount: { BackgroundLaunchAccountStart.shared.ensureStarted() },
+                waitForController: { await PhotoLibraryBackupSharedRef.shared.controllerWhenReady(timeout: $0) },
+                didExpire: { attempt.didExpire },
+                backupStopped: { self?.backupStopped() },
+                backupPaused: { self?.backupPaused() },
+                onRunStarted: { runID in
+                    attempt.runID = runID
+                    if attempt.didExpire {
+                        PhotoLibraryBackupSharedRef.shared.controller?.stopBackgroundWindowRun(runID: runID)
+                    }
+                })
+            attempt.runID = nil
+            await completion.finish(after: pendingRequests) {
+                (outcome.afterTheEndWait(didExpire: attempt.didExpire), nil)
+            }
+        }
+        task.expirationHandler = {
+            Task { @MainActor in
+                attempt.didExpire = true
+                attempt.work?.cancel()
+                if let runID = attempt.runID {
+                    PhotoLibraryBackupSharedRef.shared.controller?.stopBackgroundWindowRun(runID: runID)
+                }
             }
         }
     }

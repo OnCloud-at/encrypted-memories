@@ -12,6 +12,7 @@ import Testing
         let iOS27 = OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
         try #require(ProcessInfo.processInfo.isOperatingSystemAtLeast(iOS27))
         #expect(PhotoBackupBackgroundCoordinator.offMainSubmission(earliestBeginDate: nil) != nil)
+        #expect(PhotoBackupBackgroundCoordinator.offMainRefreshSubmission(earliestBeginDate: Date()) != nil)
         #expect(AppleSmartSearchBackgroundCoordinator.offMainSubmission(earliestBeginDate: Date()) != nil)
     }
 
@@ -25,6 +26,9 @@ import Testing
         #expect(search.earliestBeginDate == date, "the date counts from schedule(), not from the send")
         #expect(search.requiresExternalPower)
         #expect(!search.requiresNetworkConnectivity)
+        let refresh = PhotoBackupBackgroundCoordinator.refreshRequest(earliestBeginDate: date)
+        #expect(refresh.identifier == "at.oncloud.encryptedmemories.photo-backup.refresh")
+        #expect(refresh.earliestBeginDate == date)
     }
 
     /// The expiration handler marks the expiry before it cancels. Whatever moment the expiry comes, the read never

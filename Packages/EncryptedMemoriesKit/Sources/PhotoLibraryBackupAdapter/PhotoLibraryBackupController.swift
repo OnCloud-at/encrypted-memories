@@ -43,6 +43,32 @@ private struct StartedBackupRun: Sendable {
     let task: Task<Void, Never>
 }
 
+/// How the scan of a refresh window ended.
+public enum BackgroundRefreshScanEnd: Equatable, Sendable {
+    /// The scan ran to its end.
+    case scanned
+    /// Another pass runs, waits to start, or holds the lock; it scans too.
+    case notNeeded
+    /// The pass of a long background window took the lock over; it scans and uploads.
+    case yielded
+    /// No scan could start: the local state, the lock, the photo access, a shutdown, or a stop still in progress.
+    case couldNotStart
+    /// The scan was stopped, for example at the end of the window; the next pass continues from what it saved.
+    case stopped
+    /// The scan failed.
+    case failed
+}
+
+/// How a refresh scan ended, kept by the scan's task for its window.
+@MainActor
+private final class RefreshScanResult {
+    var end = BackgroundRefreshScanEnd.stopped
+    /// A long background window took the lock over.
+    var yielded = false
+    /// The scan could not start because another run holds the lock.
+    var lockWasBusy = false
+}
+
 /// How the pass of a background window ended.
 public enum BackgroundCatchUpEnd: Equatable, Sendable {
     /// The pass ran, a pass of the app ran instead, or there was nothing to start.
@@ -233,6 +259,8 @@ public final class PhotoLibraryBackupController {
     private var adoptedRunWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     /// The last `startSync` call deferred its pass to the first network path.
     private var lastStartWasDeferred = false
+    /// The result of the active run when it only scans, for a refresh window.
+    private var activeRefreshScan: RefreshScanResult?
     private let firstNetworkPathWait: Duration
     private let heartbeatInterval: TimeInterval
     private var firstNetworkPathWaitTask: Task<Void, Never>?
@@ -850,6 +878,14 @@ public final class PhotoLibraryBackupController {
         owner: BackupExecutionOwner = .background,
         onRunStarted: (@MainActor (String) -> Void)? = nil
     ) async -> BackgroundCatchUpEnd {
+        if let refreshScan = activeRefreshScan, let scan = syncTask {
+            // A refresh scan holds the lock, and this window needs it to upload: the scan yields and this pass scans.
+            refreshScan.yielded = true
+            stopCurrentSync()
+            await scan.value
+            // The window may have expired while the scan ended; then it starts no pass.
+            guard !Task.isCancelled else { return .done }
+        }
         var started = startSync(owner: owner)
         if started == nil, lastStartWasDeferred {
             // The pass waits for the first network path. The window stays open until that pass ends.
@@ -867,11 +903,29 @@ public final class PhotoLibraryBackupController {
         return .done
     }
 
+    /// The scan of a refresh window: it puts new and changed photos into the queue and uploads nothing. It does not wait
+    /// for a network path. It starts nothing while another pass runs or waits to start; the window checks first that
+    /// backup is on and not paused.
+    public func backgroundRefreshScan(
+        onRunStarted: (@MainActor (String) -> Void)? = nil
+    ) async -> BackgroundRefreshScanEnd {
+        // A pass that waits for the first network path needs the lock when the path arrives.
+        guard !isSyncing, deferredStartOwner == nil, deferredBackgroundOwner == nil else { return .notNeeded }
+        let result = RefreshScanResult()
+        guard let run = startSync(owner: .iOSRefreshTask, refreshScan: result) else {
+            return result.lockWasBusy ? .notNeeded : .couldNotStart
+        }
+        onRunStarted?(run.runID)
+        await run.task.value
+        return result.end
+    }
+
     /// The single entry point that starts a pass. Acquires durable execution ownership before any
     /// draining: a crashed/expired owner's stale lock is reaped here, and a live lock held by a
     /// different run makes this call stand down instead of starting a second drainer.
-    private func startSync(owner: BackupExecutionOwner) -> StartedBackupRun? {
+    private func startSync(owner: BackupExecutionOwner, refreshScan: RefreshScanResult? = nil) -> StartedBackupRun? {
         lastStartWasDeferred = false
+        let scanOnly = refreshScan != nil
         guard !isShuttingDown, isEnabled, !isUserPaused, accessState.allowsBackup, !isSyncing,
             !isRetiringInstantWork, runnerStopTask == nil,
             let engine, let runner, let queueStore, let catalogStore
@@ -881,7 +935,7 @@ public final class PhotoLibraryBackupController {
             refreshFromQueue()
             return nil
         }
-        guard !waitsForFirstNetworkPath else {
+        guard scanOnly || !waitsForFirstNetworkPath else {
             // A pass before the first network path would end as "Waiting for Wi-Fi" on Wi-Fi, too.
             if owner != .foreground, owner != .manual {
                 if deferredBackgroundOwner == nil { deferredBackgroundOwner = owner }
@@ -914,12 +968,12 @@ public final class PhotoLibraryBackupController {
             // A window that took the automatic pass but started no run gives it back, so the path observer starts it.
             if tookAutomaticDeferral, activeRunID == nil, deferredStartOwner == nil { deferredStartOwner = .foreground }
         }
-        if manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait, owner != .manual {
+        if !scanOnly, manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait, owner != .manual {
             let run = startSync(owner: .manual)
             // A window cannot own or expire the person's resumed retry.
             return owner == .foreground ? run : nil
         }
-        if owner != .manual,
+        if !scanOnly, owner != .manual,
             let retryAt = queueStore.runtimeIssue(for: .remoteIndexPreparation)?.nextAttemptAt,
             retryAt > Date()
         {
@@ -948,6 +1002,7 @@ public final class PhotoLibraryBackupController {
         case .busy:
             // Another live run owns the queue (e.g. a foreground pass while a BG window fires).
             // Stand down: its own drain covers the work; a second drainer is never allowed.
+            refreshScan?.lockWasBusy = true
             return nil
         case .unavailable:
             lastMessage = L10n.string("backup.error_execution_lock_unavailable")
@@ -956,6 +1011,7 @@ public final class PhotoLibraryBackupController {
         }
         activeRunID = runID
         activeRunOwner = owner
+        activeRefreshScan = refreshScan
 
         // Retry previously failed items once per launch.
         if !didAutoRetryFailedThisLaunch {
@@ -988,6 +1044,32 @@ public final class PhotoLibraryBackupController {
             let scanBody: (@Sendable () async throws -> Void)? = nil
         #endif
 
+        if let refreshScan {
+            // A refresh window: the scan alone. Without the reconcile loop the runner never drains, so nothing uploads.
+            let task = Task {
+                [weak self, monitor, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody] in
+                await statusSetupTask?.value
+                self?.refreshFromQueue()
+                self?.beginScanPhase()
+                var end = BackgroundRefreshScanEnd.stopped
+                do {
+                    try await Self.scanLibrary(
+                        by: self, scanBody: scanBody, monitor: monitor, engine: engine, runner: runner,
+                        queueStore: queueStore, catalogStore: catalogStore)
+                    end = .scanned
+                } catch is CancellationError {
+                } catch {
+                    end = .failed
+                    self?.reportScanFailure(error)
+                }
+                self?.finishScanPhase()
+                refreshScan.end = end == .stopped && refreshScan.yielded ? .yielded : end
+                await self?.finishSync(runID: runID)
+            }
+            syncTask = task
+            return StartedBackupRun(runID: runID, task: task)
+        }
+
         // The task inherits the main actor, but all heavy phases (`scan`, `runUntilDrained`) are
         // awaits onto other actors/off-actor structs - the main thread stays free for UI.
         #if DEBUG
@@ -1013,6 +1095,9 @@ public final class PhotoLibraryBackupController {
             let scanDone = BackupScanSignal()
             var scanFinished = false
             let workIntent: LibraryWorkIntent = owner == .manual ? .userInitiated : .automatic
+            #if DEBUG
+                self?.reconcileStartsForTesting += 1
+            #endif
             async let reconcile: BackupSyncProgress = Self.reconcileWhileScanning(
                 runner: runner,
                 scanDone: scanDone,
@@ -1020,23 +1105,9 @@ public final class PhotoLibraryBackupController {
                 queue: queueStore
             )
             do {
-                if let scanBody {
-                    try await scanBody()
-                } else {
-                    try await Self.replayCatalogIfQueueNeedsRecovery(
-                        catalogStore: catalogStore,
-                        queueStore: queueStore,
-                        engine: engine
-                    )
-                    let preparedChanges = await Self.prepareChangesOffMainActor(monitor)
-                    try await self?.runScanPass(
-                        engine: engine,
-                        runner: runner,
-                        catalogStore: catalogStore,
-                        changes: preparedChanges.changes,
-                        commitChanges: { monitor.commit(preparedChanges) }
-                    )
-                }
+                try await Self.scanLibrary(
+                    by: self, scanBody: scanBody, monitor: monitor, engine: engine, runner: runner,
+                    queueStore: queueStore, catalogStore: catalogStore)
                 scanFinished = true
             } catch is CancellationError {
                 // The one-shot completion signal below releases the reconcile loop cleanly.
@@ -1067,6 +1138,28 @@ public final class PhotoLibraryBackupController {
         }
         syncTask = task
         return StartedBackupRun(runID: runID, task: task)
+    }
+
+    /// The scan of a pass: it replays the catalog when the queue may be incomplete, then enqueues the library's changes.
+    /// The backup pass and the refresh scan share it. A test can replace it with `scanBody`.
+    private nonisolated static func scanLibrary(
+        by controller: PhotoLibraryBackupController?, scanBody: (@Sendable () async throws -> Void)?,
+        monitor: PhotoLibraryChangeMonitor, engine: UploadBackupSyncEngine, runner: BackupSyncRunner,
+        queueStore: UploadBackupSyncQueueManifestStore, catalogStore: PhotoLibraryCatalogManifestStore
+    ) async throws {
+        if let scanBody {
+            try await scanBody()
+            return
+        }
+        try await replayCatalogIfQueueNeedsRecovery(catalogStore: catalogStore, queueStore: queueStore, engine: engine)
+        let preparedChanges = await prepareChangesOffMainActor(monitor)
+        try await controller?.runScanPass(
+            engine: engine,
+            runner: runner,
+            catalogStore: catalogStore,
+            changes: preparedChanges.changes,
+            commitChanges: { monitor.commit(preparedChanges) }
+        )
     }
 
     /// Replays durable inventory only when the queue may be incomplete.
@@ -1433,6 +1526,8 @@ public final class PhotoLibraryBackupController {
 
         /// Background windows that wait for their deferred pass.
         internal var deferredStartWaiterCountForTesting: Int { deferredStartWaiters.count }
+        /// How many passes started the reconcile loop, the only caller of the runner.
+        internal private(set) var reconcileStartsForTesting = 0
 
         @discardableResult
         internal func installSyncRunForTesting(
@@ -2015,8 +2110,10 @@ public final class PhotoLibraryBackupController {
         heartbeatTask?.cancel()
         heartbeatTask = nil
         lockStore?.release(runID: runID)
+        let scannedOnly = activeRefreshScan != nil
         activeRunID = nil
         activeRunOwner = nil
+        activeRefreshScan = nil
         isSyncing = false
         #if DEBUG
             completingSyncRuns += 1
@@ -2056,6 +2153,12 @@ public final class PhotoLibraryBackupController {
             // The runner's last callback can reach the projector after this projection; keep its Wi-Fi wait.
             finalProgress.isPausedByPolicy = true
             finalProgress.isWaitingForWiFi = true
+        }
+        // A refresh scan uploads nothing, so it never counts as a pass without progress. In the background it plans and
+        // starts no pass. A scene that came to the foreground during the scan found the pass busy: its pass starts now.
+        if scannedOnly {
+            if !runtimeSignals.current().isAppInBackground { syncNow() }
+            return
         }
         let currentBackedUp = finalProgress.backedUp
         if currentBackedUp > backedUpAtRunStart {

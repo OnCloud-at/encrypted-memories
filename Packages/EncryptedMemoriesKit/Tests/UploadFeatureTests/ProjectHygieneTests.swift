@@ -251,8 +251,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(project.contains("ENCRYPTED_MEMORIES_PROTON_CHANNEL: alpha"))
     }
 
-    /// Background execution stays limited to BGProcessingTask work with the two identifiers the apps register.
-    /// App Review rejects keep-alive modes, and an undeclared identifier fails registration only at runtime.
+    /// Background execution stays limited to the two BGProcessingTask identifiers and the one BGAppRefreshTask
+    /// identifier that the app registers. A refresh task needs the `fetch` mode (BackgroundTasks BGTask.h). App Review
+    /// rejects keep-alive modes, and an undeclared identifier fails registration only at runtime.
     func testIOSBackgroundTaskDeclarationsStayMinimal() throws {
         let infoData = try Data(contentsOf: repoRoot.appendingPathComponent("iOSApp/Info.plist"))
         let info = try XCTUnwrap(
@@ -264,8 +265,10 @@ final class ProjectHygieneTests: XCTestCase {
             [
                 "at.oncloud.encryptedmemories.photo-backup.processing",
                 "at.oncloud.encryptedmemories.smart-search.processing",
+                "at.oncloud.encryptedmemories.photo-backup.refresh",
             ])
-        XCTAssertEqual(info["UIBackgroundModes"] as? [String], ["processing"], "no keep-alive background mode")
+        XCTAssertEqual(
+            info["UIBackgroundModes"] as? [String], ["fetch", "processing"], "no keep-alive background mode")
     }
 
     func testPhotoLibraryBackupAdapterStaysUIAndSDKFree() {
