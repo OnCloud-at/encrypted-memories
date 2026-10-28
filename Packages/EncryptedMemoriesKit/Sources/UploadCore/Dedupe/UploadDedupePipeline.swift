@@ -287,7 +287,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
         let remoteItems: [RemotePhotoDuplicate]
         do {
-            remoteItems = try await duplicates(forNameHash: nameHash)
+            // A retained trash fact needs fresh evidence, not a name row cached by an earlier run.
+            remoteItems =
+                preservesKnownDeletion
+                ? try await checker.findDuplicates(nameHashes: [nameHash])
+                : try await duplicates(forNameHash: nameHash)
             try Task.checkCancellation()
         } catch {
             if Task.isCancelled || UploadError.isCancellation(error) {
@@ -425,10 +429,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     decision = nameDecision
                 }
             }
-            // A vanished trash entry does not revoke the person's deletion. Keep that decision for this exact
-            // resource identity; an active duplicate above still converges without a new upload.
+            // A vanished trash entry does not revoke the person's deletion, but the cached fact cannot prove
+            // the copy is still trashed. Keep upload blocked until fresh proof settles this exact resource.
             if decision.uploadsBytes, preservesKnownDeletion {
-                decision = .skip(.deletedRemotely, remoteLinkID: cached?.remoteLinkID)
+                decision = .skip(.inconsistentRemoteState, remoteLinkID: cached?.remoteLinkID)
             }
             if decision.uploadsBytes, !replacement.isEmpty, !provesLive,
                 descriptor.source.kind == .photoLibraryAsset, descriptor.source.resource == .primary,

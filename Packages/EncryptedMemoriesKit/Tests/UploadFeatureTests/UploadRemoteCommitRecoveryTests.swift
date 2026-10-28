@@ -467,10 +467,10 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
         let state = try XCTUnwrap(UploadBackupStateManifestStore(url: stateURL))
         XCTAssertTrue(queue.upsert(entry))
-        // Both the initial settlement and the runner's immediate reconciliation must fail
-        // before eligible-only mode leaves a durable receipt for the simulated restart.
+        // The initial settlement fails; its backoff leaves a durable receipt for the simulated restart.
+        // Reopening replays that receipt without calling the uploader again.
         let identityResolver = RecoveryIdentityRecorder(
-            failures: 2,
+            failures: 1,
             preflight: UploadPreflightResult(identity: identity, decision: .upload)
         )
         let uploader = MockUploader()

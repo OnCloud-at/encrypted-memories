@@ -120,6 +120,10 @@ public actor BackupSyncRunner {
     /// Keyed by `sourceKey`. A claim never takes rows of these sources: a running item can leave its row runnable
     /// for a moment, for example `needsRemoteReconciliation` while the paired video of its photo uploads.
     private var runningSources: [String: RunningSource] = [:]
+    /// An interrupted source waits for the next drain, even when a concurrent scan makes it due again.
+    private var deferredSources: [String: UploadSourceIdentity] = [:]
+    /// At most 128 deferred-source SQL parameters, plus the current upload pool, before the next drain.
+    private static let maxDeferredSourcesPerDrain = 64
     /// Wakes the scheduling loop when a row is enqueued, an item settles, the runtime changes, or a waiting row
     /// becomes runnable.
     private var schedulerWaiter: CheckedContinuation<Void, Never>?
@@ -332,6 +336,7 @@ public actor BackupSyncRunner {
         resourcePressureStreak = 0
         claimedItemCount = 0
         runningSources = [:]
+        deferredSources = [:]
         schedulerWakePending = false
         defer {
             remoteIndexPreparationGeneration = nil
@@ -439,6 +444,14 @@ public actor BackupSyncRunner {
         // hold back new starts.
         await withDiscardingTaskGroup { group in
             while true {
+                if deferredSources.count >= Self.maxDeferredSourcesPerDrain {
+                    guard claimedItemCount > 0 else {
+                        stopRequested = true
+                        break
+                    }
+                    await waitForSchedulerWake()
+                    continue
+                }
                 let mayStart =
                     !stopRequested && !Task.isCancelled && !storeFailed
                     && resourcePressureStreak < configuration.batchSize
@@ -648,7 +661,8 @@ public actor BackupSyncRunner {
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
         return queue.claimRunnable(
-            limit: claimLimit, claimedAt: now(), excludingSourcesOf: runningSources.values.map(\.source))
+            limit: claimLimit, claimedAt: now(),
+            excludingSourcesOf: runningSources.values.map(\.source) + Array(deferredSources.values))
     }
 
     /// Processes a claimed row, then the other revisions of its source that the same claim returned. Each settled
@@ -759,7 +773,7 @@ public actor BackupSyncRunner {
         excludingSourcesOf excludedSources: [UploadSourceIdentity] = []
     ) -> TimeInterval? {
         let currentTime = now()
-        var dates = [queue.nextRunnableDate(excludingSourcesOf: excludedSources)]
+        var dates = [queue.nextRunnableDate(excludingSourcesOf: excludedSources + Array(deferredSources.values))]
         if policy == .freeUploadSlots {
             dates.append(queue.earliestEntry(in: .blockedByDraft)?.updatedAt)
         }
@@ -825,7 +839,10 @@ public actor BackupSyncRunner {
         if peek.count < Self.primeBatch {
             peek += queue.entries(in: .queuedForUpload, updatedBefore: cutoff, limit: Self.primeBatch - peek.count)
         }
-        peek.removeAll { $0.isDismissedSourceRecheck }
+        peek.removeAll {
+            $0.isDismissedSourceRecheck
+                || deferredSources[Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)] != nil
+        }
         guard !peek.isEmpty else { return }
         let descriptors = peek.map { entry in
             UploadResourceDescriptor(
@@ -878,6 +895,23 @@ public actor BackupSyncRunner {
         if !isSourceRecheck { adjustProgress(from: checkingEntry.state, to: .checking) }
         emitProgress()
 
+        // Another revision of this source can already belong to the same claim. Release it without another read.
+        if deferredSources[Self.sourceKey(kind: checkingEntry.source.kind, identifier: checkingEntry.source.identifier)]
+            != nil
+        {
+            if isSourceRecheck {
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
+                parkRemoteReconciliation(
+                    checkingEntry, reconciliation: reconciliation, from: persistedState,
+                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
+                        ?? L10n.string("error.upload_cancelled"))
+            } else {
+                deferInterruptedSource(checkingEntry, from: persistedState)
+            }
+            return
+        }
+
         let resolved: BackupResolvedResource?
         do {
             let resolvingEntry = checkingEntry
@@ -914,14 +948,6 @@ public actor BackupSyncRunner {
                 revert(checkingEntry, from: persistedState)
             }
             return
-        } catch is CancellationError {
-            _ = recordCancellation(CancellationError(), for: checkingEntry)
-            if isSourceRecheck {
-                preserveDismissedSourceRecheck(checkingEntry)
-                return
-            }
-            revert(checkingEntry, from: persistedState)
-            return
         } catch {
             if recordCancellation(error, for: checkingEntry) {
                 if isSourceRecheck {
@@ -932,6 +958,7 @@ public actor BackupSyncRunner {
                 return
             }
             if isSourceRecheck {
+                if UploadError.isCancellation(error) { rememberDeferredSource(checkingEntry) }
                 let definitiveMissing: Bool
                 switch error as? UploadError {
                 case .sourceReportedMissing, .fileMissing: definitiveMissing = true
@@ -943,7 +970,8 @@ public actor BackupSyncRunner {
                     retainDismissedSourceRecheck(checkingEntry)
                 } else {
                     let failedRead =
-                        !definitiveMissing && !stopRequested && !Task.isCancelled
+                        !definitiveMissing && !UploadError.isCancellation(error)
+                        && !stopRequested && !Task.isCancelled
                         && configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
                     let readyAt: Date?
                     if case .sourceNotReady(_, let until) = error as? UploadError {
@@ -1092,16 +1120,10 @@ public actor BackupSyncRunner {
             let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
             revert(entry, from: current)
             return
-        } catch is CancellationError {
-            _ = recordCancellation(CancellationError(), for: entry)
-            let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
-            revert(entry, from: current)
-            return
         } catch let settlement as UploadRemoteCommitSettlementError {
             if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
             if settlement.reconciliationPersisted {
-                adjustProgress(from: .uploading, to: .needsRemoteReconciliation)
-                emitProgress()
+                parkPersistedRemoteCommit(entry, from: .uploading, message: settlement.settlementMessage)
             } else {
                 stopRequested = true
             }
@@ -1514,15 +1536,15 @@ public actor BackupSyncRunner {
         from state: UploadBackupSyncQueueState,
         message: String
     ) {
-        let nextAttempt = now().addingTimeInterval(
-            max(1, configuration.retry.delay(afterAttempts: entry.attempts + 1))
-        )
+        rememberDeferredSource(entry)
+        let issue = boundedDeferralIssue(detail: message, previous: BackupIssueRecord.decode(entry.lastError))
+        let nextAttempt = issue.nextAttemptAt ?? now().addingTimeInterval(30)
         guard
             queue.markNeedsRemoteReconciliation(
                 source: entry.source,
                 revision: entry.revision,
                 reconciliation: reconciliation,
-                lastError: message,
+                lastError: issue.persistedValue,
                 updatedAt: nextAttempt
             )
         else {
@@ -1531,6 +1553,25 @@ public actor BackupSyncRunner {
         }
         adjustProgress(from: state, to: .needsRemoteReconciliation)
         emitProgress()
+    }
+
+    /// The first local settlement failure uses the same backoff as a later reconciliation failure.
+    private func parkPersistedRemoteCommit(
+        _ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState, message: String
+    ) {
+        if sourceWasRemoved(entry) { return }
+        guard let persisted = queue.entry(for: entry.source, revision: entry.revision),
+            let reconciliation = persisted.remoteCommitReconciliation
+        else {
+            PhotoDiagnostics.shared.increment("backup.remoteCommitReconciliationUnavailable")
+            PhotoDiagnostics.shared.emitDebug(
+                "BackupSync", ["kind": BackupIssueKind.localState.rawValue, "error": "Committed receipt unavailable"])
+            stopRequested = true
+            return
+        }
+        parkRemoteReconciliation(
+            entry, reconciliation: reconciliation, from: state,
+            message: message)
     }
 
     // MARK: - Compound settlement (secondaries after the primary)
@@ -1615,8 +1656,6 @@ public actor BackupSyncRunner {
                 retryOrPark(entry, from: persistedState, error: error)
                 return
             case .reconciliationPending:
-                adjustProgress(from: persistedState, to: .needsRemoteReconciliation)
-                emitProgress()
                 return
             case .blockedByDraft:
                 do {
@@ -1766,10 +1805,6 @@ public actor BackupSyncRunner {
                     source: entry.source, revision: entry.revision,
                     retired: Set(editReplacement.journal.entry(for: entry.source).retired)
                 )
-            } catch is CancellationError {
-                _ = recordCancellation(CancellationError(), for: entry)
-                revert(entry, from: persistedState)
-                return
             } catch {
                 if stopRequested {
                     revert(entry, from: persistedState)
@@ -1994,19 +2029,18 @@ public actor BackupSyncRunner {
             } catch let settlement as UploadRemoteCommitSettlementError {
                 if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
                 if settlement.reconciliationPersisted {
+                    parkPersistedRemoteCommit(entry, from: .uploading, message: settlement.settlementMessage)
                     return .reconciliationPending
                 }
                 stopRequested = true
                 return .cancelled
             } catch is BackupWorkDeferredError {
                 return .cancelled
-            } catch is CancellationError {
-                _ = recordCancellation(CancellationError(), for: entry)
-                return .cancelled
             } catch {
                 if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
                     return .cancelled
                 }
+                if UploadError.isCancellation(error) { return .failed(remaining: remaining, error: error) }
                 lastError = error
             }
         }
@@ -2288,10 +2322,34 @@ public actor BackupSyncRunner {
     /// A policy or source snapshot changed during preparation. Requeue without cancelling the operation.
     private struct BackupWorkDeferredError: Error {}
 
-    /// Cancellation of a removed source belongs only to that source. Other transport cancellation ends the pass.
+    private func rememberDeferredSource(_ entry: UploadBackupSyncQueueEntry) {
+        deferredSources[Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier)] = entry.source
+    }
+
+    /// Environmental waits use a separate persisted ordinal, never the item's finite failure budget.
+    private func boundedDeferralIssue(detail: String, previous: BackupIssueRecord?) -> BackupIssueRecord {
+        var issue = automaticRetryIssue(kind: .unknown, detail: detail, previous: previous)
+        let delay = min(900, max(30, configuration.retry.delay(afterAttempts: issue.automaticRetryAttempt)))
+        let due = now().addingTimeInterval(delay)
+        issue.nextAttemptAt = max(previous?.nextAttemptAt ?? due, due)
+        return issue
+    }
+
+    private func deferInterruptedSource(_ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState) {
+        rememberDeferredSource(entry)
+        let detail = L10n.string("error.upload_cancelled")
+        let previous = BackupIssueRecord.decode(entry.lastError)
+        let issue = boundedDeferralIssue(detail: detail, previous: previous?.detail == detail ? previous : nil)
+        deferSource(entry, from: state, until: issue.nextAttemptAt ?? now().addingTimeInterval(30), issue: issue)
+    }
+
+    /// An item cancellation retries only that item. Stop, task cancellation and setup cancellation end the pass.
     private func recordCancellation(_ error: any Error, for entry: UploadBackupSyncQueueEntry? = nil) -> Bool {
         guard UploadError.isCancellation(error) else { return false }
-        if let entry, sourceWasRemoved(entry) { return true }
+        if let entry {
+            if sourceWasRemoved(entry) { return true }
+            guard stopRequested || Task.isCancelled else { return false }
+        }
         if runCancellationError == nil { runCancellationError = error }
         stopRequested = true
         return true
@@ -2306,6 +2364,10 @@ public actor BackupSyncRunner {
         if sourceWasRemoved(entry) { return }
         if error is BackupWorkDeferredError || recordCancellation(error, for: entry) {
             revert(entry, from: oldState)
+            return
+        }
+        if UploadError.isCancellation(error) {
+            deferInterruptedSource(entry, from: oldState)
             return
         }
         if case UploadError.fileMissing = error {

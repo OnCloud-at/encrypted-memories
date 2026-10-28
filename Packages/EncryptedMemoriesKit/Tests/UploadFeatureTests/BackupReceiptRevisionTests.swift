@@ -118,7 +118,8 @@ final class BackupReceiptRevisionTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 1)
         let hashes = hasher.hashCount
 
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         _ = await makeRunner(identityResolver: pipeline, events: events).runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertEqual(uploader.requests.count, 1, "the committed bytes are never uploaded again")
@@ -174,7 +175,8 @@ final class BackupReceiptRevisionTests: XCTestCase {
 
         resolver.setModified(resolver.defaultModified, for: entry.source.identifier)
         hasher.contentSeeds[path] = nil
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         let recorder = RecordingIdentityResolver(inner: pipeline)
         _ = await makeRunner(identityResolver: recorder).runUntilDrained(mode: .eligibleOnly)
 
@@ -201,7 +203,8 @@ final class BackupReceiptRevisionTests: XCTestCase {
         let changed = resolver.defaultModified.addingTimeInterval(120)
         resolver.setModified(changed, for: entry.source.identifier)
         hasher.contentSeeds[URL(fileURLWithPath: entry.source.identifier).path] = "changed content"
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         _ = await makeRunner(identityResolver: pipeline).runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertEqual(uploader.requests.count, 2, "the changed revision uploads its own bytes")
@@ -229,7 +232,8 @@ final class BackupReceiptRevisionTests: XCTestCase {
             source: entry.source, revision: UploadBackupRevision(date: changed),
             originalFilename: entry.originalFilename, byteCount: entry.byteCount, updatedAt: clock.now)
         XCTAssertTrue(queueStore.upsert(newer))
-        clock.advance(by: 2)
+        let due = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+        clock.advance(by: max(0, due.timeIntervalSince(clock.now)))
         // One item at a time: the newer revision runs first, the receipt of the old one after it.
         let recorder = RecordingIdentityResolver(inner: pipeline)
         _ = await makeRunner(identityResolver: recorder, concurrency: 1).runUntilDrained(mode: .eligibleOnly)
