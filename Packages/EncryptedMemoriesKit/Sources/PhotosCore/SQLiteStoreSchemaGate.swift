@@ -44,6 +44,14 @@ public enum SQLiteRebuildableStoreOutcome {
 /// columns, constraints, and indexes produced by this build's schema SQL. This keeps schema changes explicit
 /// and prevents markerless or future files from being modified while an older build tries to open them.
 public enum SQLiteStoreSchemaGate {
+    typealias ReadWriteOpen = (String, UnsafeMutablePointer<OpaquePointer?>, Int32) -> Int32
+    static func liveReadWriteOpen(
+        _ path: String, _ handle: UnsafeMutablePointer<OpaquePointer?>, _ flags: Int32
+    )
+        -> Int32
+    {
+        sqlite3_open_v2(path, handle, flags, nil)
+    }
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "SQLiteStore")
     /// `SQLITE_TRANSIENT`: SQLite copies bound text and blobs before the bind call returns.
     public static var transientDestructor: sqlite3_destructor_type {
@@ -107,6 +115,19 @@ public enum SQLiteStoreSchemaGate {
         createDirectory: ((URL) throws -> Void)? = nil,
         probe: SQLiteFailureProbe = .live
     ) -> SQLiteRebuildableStoreOutcome {
+        openRebuildableStoreOutcome(
+            at: url, schemaSQL: schemaSQL, policy: policy, enforceForeignKeys: enforceForeignKeys,
+            verifyVersion: verifyVersion, stampVersion: stampVersion, copyItem: copyItem,
+            createDirectory: createDirectory, probe: probe, openReadWrite: liveReadWriteOpen)
+    }
+
+    static func openRebuildableStoreOutcome(
+        at url: URL, schemaSQL: String, policy: LibraryDatabasePolicy, enforceForeignKeys: Bool = false,
+        verifyVersion: (OpaquePointer?) -> Bool, stampVersion: (OpaquePointer?) -> Bool,
+        copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
+        createDirectory: ((URL) throws -> Void)? = nil, probe: SQLiteFailureProbe = .live,
+        openReadWrite: ReadWriteOpen
+    ) -> SQLiteRebuildableStoreOutcome {
         func open() -> SQLiteStoreOpenResult {
             openStore(
                 at: url,
@@ -117,7 +138,8 @@ public enum SQLiteStoreSchemaGate {
                 stampVersion: stampVersion,
                 copyItem: copyItem,
                 createDirectory: createDirectory,
-                probe: probe
+                probe: probe,
+                openReadWrite: openReadWrite
             )
         }
         switch open() {
@@ -160,7 +182,8 @@ public enum SQLiteStoreSchemaGate {
         stampVersion: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
         createDirectory: ((URL) throws -> Void)? = nil,
-        probe: SQLiteFailureProbe = .live
+        probe: SQLiteFailureProbe = .live,
+        openReadWrite: ReadWriteOpen = liveReadWriteOpen
     ) -> SQLiteStoreOpenResult {
         let compatibility = compatibility(
             at: url,
@@ -178,9 +201,8 @@ public enum SQLiteStoreSchemaGate {
         let flags =
             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
             | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
-        guard sqlite3_open_v2(url.path, &opened, flags, nil) == SQLITE_OK, let handle = opened else {
-            sqlite3_close(opened)
-            return .failed
+        guard openReadWrite(url.path, &opened, flags) == SQLITE_OK, let handle = opened else {
+            return probe.keepsFileAfterFailedOpen(closing: opened) ? .retryLater : .failed
         }
         // The verification below waits as long as the busy timeout and tells a lock from another schema.
         let busy = SQLiteBusyRecorder(timeoutMs: policy.busyTimeoutMs)
