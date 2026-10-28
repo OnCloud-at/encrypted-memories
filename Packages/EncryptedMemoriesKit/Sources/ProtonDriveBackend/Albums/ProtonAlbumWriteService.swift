@@ -1,3 +1,4 @@
+import AlbumCore
 import CryptoKit
 import Foundation
 import PhotosCore
@@ -37,6 +38,26 @@ struct AlbumAttachResult: Sendable {
     var firstFailureMessage: String? {
         for value in outcomes.values { if case .failed(_, let message) = value { return message } }
         return nil
+    }
+
+    func requireComplete(for items: [PhotoUID]) throws {
+        var succeeded = 0
+        var failures: [AlbumWriteItemFailure] = []
+        for item in items {
+            switch outcomes[item.nodeID] {
+            case .attached?, .alreadyMember?:
+                succeeded += 1
+            case .failed(let code, let message)?:
+                failures.append(AlbumWriteItemFailure(linkID: item.nodeID, code: code, message: message))
+            case nil:
+                failures.append(
+                    AlbumWriteItemFailure(linkID: item.nodeID, code: nil, message: "album response missing"))
+            }
+        }
+        guard failures.isEmpty else {
+            throw AlbumError.partialAddWithCauses(
+                succeeded: succeeded, total: items.count, message: failures[0].message, failures: failures)
+        }
     }
 }
 

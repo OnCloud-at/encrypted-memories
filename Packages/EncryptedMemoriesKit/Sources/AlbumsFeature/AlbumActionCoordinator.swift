@@ -172,7 +172,7 @@ public final class AlbumActionCoordinator {
             return .completed(albumID: albumID)
         } catch {
             if let albumError = error as? AlbumError,
-                case .albumCreatedButPhotosNotAdded(let albumID, _, _) = albumError
+                case .albumCreatedButPhotosNotAdded(let albumID, _, _, _) = albumError
             {
                 await reloadAfterMutation()
                 actionFailure = AlbumActionFailure(
