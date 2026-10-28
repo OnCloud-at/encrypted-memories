@@ -15,7 +15,7 @@ import XCTest
 /// Attachments support OS visual comparison; they are not pixel-equality or physical-device acceptance.
 final class MobileGridChromeTests: XCTestCase {
     @MainActor func testSelectionChromePreservesGridAndFloatingNavigation() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let cacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: cacheDirectory) }
         let cache = ThumbnailCache(rootDirectory: cacheDirectory)

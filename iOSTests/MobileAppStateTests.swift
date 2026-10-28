@@ -327,7 +327,7 @@ private func waitUntil(
         image: UIImage,
         size: CGSize
     ) throws -> (UIWindow, UIHostingController<MobileZoomableImage>, UIScrollView) {
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try #require(UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         let host = UIHostingController(
             rootView: MobileZoomableImage(
@@ -354,7 +354,7 @@ private func waitUntil(
     ) throws -> (
         UIWindow, UIHostingController<ViewerImagePageProbe>
     ) {
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try #require(UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         let host = UIHostingController(rootView: page)
         window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
