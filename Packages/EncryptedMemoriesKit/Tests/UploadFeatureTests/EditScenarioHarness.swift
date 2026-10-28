@@ -889,14 +889,18 @@ struct EditScenarioAlbumSource: AlbumSyncLocalAlbumSource {
 /// manifest. Then it reports the unresolved album rows.
 final class EditScenarioAlbumBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
     let device: EditScenarioHarness
-    init(device: EditScenarioHarness) { self.device = device }
+    private let waitsForScheduledRetries: Bool
+    init(device: EditScenarioHarness, waitsForScheduledRetries: Bool = false) {
+        self.device = device
+        self.waitsForScheduledRetries = waitsForScheduledRetries
+    }
 
     func ensureBackedUp(
         localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
     ) async throws -> AlbumSyncBackupReport {
         try device.resetAlbumSyncScratch()
         try await device.enqueue()
-        await device.pass()
+        if waitsForScheduledRetries { await device.drain() } else { await device.pass() }
         return try AlbumSyncBackupReport.read(from: device.queue, localIdentifiers: localIdentifiers)
     }
 

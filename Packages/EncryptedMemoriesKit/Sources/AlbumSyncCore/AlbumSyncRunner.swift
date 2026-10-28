@@ -208,7 +208,9 @@ public actor AlbumSyncRunner {
                 links[identifier] = AlbumSyncRemoteLink(
                     uid: link.uid, sha1Hex: link.sha1Hex, isTrashed: true)
             case nil:
-                break
+                // A retained trash fact blocks upload, but only this read can label the copy trashed now.
+                // An uncertain link must not enter the attach or same-content adoption plan.
+                if link.isTrashed { links[identifier] = nil }
             }
         }
         let sameContent = try await membersWithSameContent(links: links, children: children)

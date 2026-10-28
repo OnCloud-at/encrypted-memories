@@ -223,6 +223,25 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(!report.isFullySynced)
     }
 
+    @Test func retainedTrashWithoutFreshStateCannotAttachOrAdopt() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["same-content"]
+        remote.sameContent = ["sha-trash": ["same-content"]]
+        let (runner, _, backup, _) = makeRunner(
+            contents: ["album": ["photo"]], links: ["photo": link("trash", trashed: true)], remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(remote.deletionRequests == [["trash"]])
+        #expect(remote.attachedBatches.isEmpty)
+        #expect(remote.sameContentRequests.isEmpty)
+        #expect(backup.runs == [["photo"]])
+        #expect(report.attached == 0)
+        #expect(report.alreadyMember == 0)
+        #expect(report.trashedSkipped == 0)
+        #expect(report.unattachable == 1)
+        #expect(!report.problems.contains { $0.issue == .remoteDeletion })
+        #expect(!report.isFullySynced)
+    }
+
     @Test func unknownOrFailedDeletionEvidenceKeepsTheExistingAttach() async throws {
         for fails in [false, true] {
             let remote = FakeRemoteOps()
@@ -326,6 +345,7 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         let (runner, remote, _, _) = makeRunner(
             contents: ["album": ["known", "missing", "trashed"]],
             links: ["known": link("existing"), "trashed": link("deleted", trashed: true)], backup: backup)
+        remote.deletionStates = ["deleted": .trashed]
         let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
         #expect(backup.proofRuns == [["missing"]])
         #expect(remote.attachedBatches.flatMap { $0 } == ["existing", "proven"])
@@ -1069,6 +1089,7 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
             contents: ["local-1": ["a", "b"]],
             links: ["a": link("l-a"), "b": link("l-b", trashed: true)]
         )
+        remote.deletionStates = ["l-b": .trashed]
         let report = try await runner.sync(album: album)
         #expect(remote.attachedBatches.flatMap(\.self) == ["l-a"])
         #expect(report.trashedSkipped == 1)
