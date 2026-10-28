@@ -544,9 +544,11 @@ public final class AlbumSyncController {
         syncTask = Task { [weak self] in
             while let album = self?.dequeueNextAlbum() {
                 do {
+                    let generation = self?.recoveryGeneration
                     let recoveryContext = try await self?.captureRecoveryContext()
                     let report = try await runner.sync(album: album, resolution: .automatic)
-                    self?.recordFinishedRun(report.problems, albumID: album.id, recoveryContext: recoveryContext)
+                    let currentContext = generation == self?.recoveryGeneration ? recoveryContext : nil
+                    self?.recordFinishedRun(report.problems, albumID: album.id, recoveryContext: currentContext)
                     self?.remoteAlbumsChangedDuringBatch = true
                     self?.showStopResult(after: .finished(report))
                 } catch let error as AlbumSyncError {
