@@ -25,9 +25,9 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Select"].exists)
     }
 
-    func testAPhotoOpensInTheViewerAndClosesAgain() {
+    func testAPhotoOpensInTheViewerAndClosesAgain() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
-        firstPhoto.tap()
+        try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
 
         let close = app.buttons["Close"]
         XCTAssertTrue(close.waitForExistence(timeout: 10), "the viewer did not open")
@@ -73,9 +73,9 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Try again"].exists, "a failure that no new attempt changes still offers Try again")
     }
 
-    func testTheAlbumButtonOfTheViewerAddsTheOpenPhotoToAnAlbum() {
+    func testTheAlbumButtonOfTheViewerAddsTheOpenPhotoToAnAlbum() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
-        firstPhoto.tap()
+        try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
 
         let addToAlbum = app.buttons["Add to Album"].firstMatch
         XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10), "the viewer shows no album button")
@@ -94,9 +94,9 @@ final class MobileLibraryUITests: XCTestCase {
 
     /// Every fixture photo is an edit with an original. The More menu shows the original, marks it with a badge, and
     /// returns to the edited version.
-    func testTheViewerShowsTheOriginalOfAnEditedPhotoAndTheEditAgain() {
+    func testTheViewerShowsTheOriginalOfAnEditedPhotoAndTheEditAgain() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
-        firstPhoto.tap()
+        try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
         XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10), "the viewer did not open")
 
         let more = app.buttons.matching(NSPredicate(format: "label == 'More actions' OR label == 'More'")).firstMatch
@@ -118,32 +118,34 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(wait(for: badge, "exists == false", timeout: 10), "the edited version still carries the badge")
     }
 
-    func testSelectingPhotosShowsTheirActionsAndDoneEndsTheSelection() {
+    func testSelectingPhotosShowsTheirActionsAndDoneEndsTheSelection() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        let column = try app.verticalTabColumn()
         app.buttons["Select"].tap()
-        firstPhoto.tap()
+        let selectedPhoto = try app.visiblePhoto(beside: column)
+        selectedPhoto.tap()
 
-        XCTAssertTrue(wait(for: firstPhoto, "isSelected == true"), "the tapped photo is not selected")
+        XCTAssertTrue(wait(for: selectedPhoto, "isSelected == true"), "the tapped photo is not selected")
         XCTAssertTrue(app.buttons["Share selected items"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["Move selected items to Trash"].isEnabled)
 
         app.buttons["Done"].tap()
         XCTAssertTrue(app.buttons["Select"].waitForExistence(timeout: 5))
-        XCTAssertTrue(wait(for: firstPhoto, "isSelected == false"), "Done must clear the selection")
+        XCTAssertTrue(wait(for: selectedPhoto, "isSelected == false"), "Done must clear the selection")
     }
 
     func testTabsSwitchToCollectionsBackToTheLibraryAndToSearch() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
 
-        app.tabBars.buttons["Collections"].tap()
+        app.tab(titled: "Collections").tap()
         XCTAssertTrue(
             wait(for: firstPhoto, "exists == false", timeout: 20), "the library grid stays visible under Collections")
 
-        app.tabBars.buttons["Library"].tap()
+        app.tab(titled: "Library").tap()
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
 
         // The search tab turns the tab bar into a search field, so it comes last.
-        app.tabBars.buttons["Search"].tap()
+        app.tab(titled: "Search").tap()
         XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search shows no search field")
     }
 
@@ -151,7 +153,7 @@ final class MobileLibraryUITests: XCTestCase {
     /// with the keyboard up and with the keyboard down.
     func testTheSmartSearchHintScrollsAboveTheSearchField() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
-        app.tabBars.buttons["Search"].tap()
+        app.tab(titled: "Search").tap()
         let searchField = app.searchFields.firstMatch
         XCTAssertTrue(searchField.waitForExistence(timeout: 10), "Search shows no search field")
         // The fixture account has Smart Search off, so the hint ends the suggestions.
@@ -190,12 +192,12 @@ final class MobileLibraryUITests: XCTestCase {
         sleep(1)
     }
 
-    func testReturningFromBackgroundRestoresTheViewerWithPreviewProtection() {
+    func testReturningFromBackgroundRestoresTheViewerWithPreviewProtection() throws {
         app.terminate()
         app.launchArguments += ["-EncryptedMemories.blurAppPreview", "YES"]
         app.launch()
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
-        firstPhoto.tap()
+        try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
         XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
 
         XCUIDevice.shared.press(.home)
@@ -219,7 +221,7 @@ final class MobileLibraryUITests: XCTestCase {
         previewSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         XCTAssertTrue(wait(for: previewSwitch, "value == '\(changedValue)'"))
 
-        app.buttons["Settings"].tap()
+        app.backButton(to: "Settings").tap()
         app.buttons["Done"].tap()
         app.buttons["Proton Account and Settings"].tap()
         app.buttons["Privacy"].tap()
@@ -229,9 +231,15 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(wait(for: reopenedSwitch, "value == '\(initialValue)'"))
     }
 
-    func testPrivacySwitchHidesTheMapTab() {
+    func testPrivacySwitchHidesTheMapTab() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
-        XCTAssertTrue(app.tabBars.buttons["Map"].exists)
+        let geometry = XCTAttachment(string: app.debugDescription)
+        geometry.name = "Map tab role and bar geometry"
+        geometry.lifetime = .keepAlways
+        add(geometry)
+        let mapTab = try app.verifiedTab(titled: "Map")
+        let libraryTab = try app.verifiedTab(titled: "Library")
+        XCTAssertTrue(mapTab.exists)
 
         app.buttons["Proton Account and Settings"].tap()
         app.buttons["Privacy"].tap()
@@ -240,11 +248,11 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertEqual(mapSwitch.value as? String, "1")
         mapSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         XCTAssertTrue(wait(for: mapSwitch, "value == '0'"))
-        app.buttons["Settings"].tap()
+        app.backButton(to: "Settings").tap()
         app.buttons["Done"].tap()
 
-        XCTAssertTrue(wait(for: app.tabBars.buttons["Map"], "exists == false", timeout: 20))
-        XCTAssertTrue(app.tabBars.buttons["Library"].exists)
+        XCTAssertTrue(wait(for: mapTab, "exists == false", timeout: 20))
+        XCTAssertTrue(libraryTab.exists)
     }
 
     func testRemoveLocationSwitchPersistsAfterClosingSettings() throws {
@@ -260,7 +268,7 @@ final class MobileLibraryUITests: XCTestCase {
         let changedValue = originalValue == "0" ? "1" : "0"
         XCTAssertTrue(wait(for: removeLocationSwitch, "value == '\(changedValue)'"))
 
-        app.buttons["Settings"].tap()
+        app.backButton(to: "Settings").tap()
         app.buttons["Done"].tap()
         app.buttons["Proton Account and Settings"].tap()
         app.buttons["Privacy"].tap()

@@ -34,7 +34,7 @@ final class MobilePausedBackupUITests: XCTestCase {
         resume.tap()
         let resumed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: resume)
         XCTAssertEqual(XCTWaiter.wait(for: [resumed], timeout: 10), .completed)
-        app.navigationBars.buttons.element(boundBy: 0).tap()
+        app.backButton(to: "Settings").tap()
         let done = app.buttons["Done"]
         XCTAssertTrue(done.waitForExistence(timeout: 5))
         done.tap()

@@ -30,6 +30,7 @@ enum MobileTimelineSurface: Equatable {
 struct MobileTimelineScreen: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.verticalBarEdge) private var verticalBarEdge
     @Environment(MobileLibraryModel.self) private var model
     let surface: MobileTimelineSurface
     /// Whether the Photos tab is the active surface. Threaded into the grid so a hidden grid stops its
@@ -267,9 +268,11 @@ struct MobileTimelineScreen: View {
             }
             ToolbarSpacer(.fixed, placement: .topBarTrailing)
         }
-        ToolbarItem(placement: .topBarTrailing) {
-            Button(selection.isSelecting ? L10n.string("action.done") : L10n.string("action.select")) {
+        ProminentToolbarItem(placement: .topBarTrailing, isProminent: selection.isSelecting) {
+            Button {
                 selection.toggleMode(reduceMotion: reduceMotion)
+            } label: {
+                MobileSelectionModeLabel(isSelecting: selection.isSelecting)
             }
             .disabled(!canSelect)
             .opacity(launchChromeVisible ? 1 : 0)
@@ -480,7 +483,7 @@ struct MobileTimelineScreen: View {
                 // Extend the scroll surface below the floating navigation and tab bars. The UIKit grid keeps
                 // its safe-area content inset, so only the newest edge exposes protected space below the final
                 // row; as soon as the user scrolls away, thumbnails move naturally beneath Liquid Glass.
-                .ignoresSafeArea(.container, edges: [.top, .horizontal, .bottom])
+                .ignoresSafeArea(.container, edges: verticalBarEdge == nil ? .all : [.top, .bottom])
                 .allowsHitTesting(launchChromeVisible && !showsLibraryLoadingCover && !showsSearchLanding)
                 .accessibilityHidden(!launchChromeVisible || showsLibraryLoadingCover)
                 .accessibilityHidden(showsSearchLanding)
@@ -555,9 +558,11 @@ struct MobileTimelineScreen: View {
                             controller: backup, uploadCoordinator: model.facade?.uploadCoordinator
                         )
                         .toolbar {
-                            ToolbarItem(placement: .confirmationAction) {
-                                Button(L10n.string("action.done")) {
+                            ProminentToolbarItem(placement: .confirmationAction) {
+                                Button {
                                     showEmptyLibraryBackupSettings = false
+                                } label: {
+                                    Label(L10n.string("action.done"), systemImage: "checkmark").textBarItem()
                                 }
                             }
                         }

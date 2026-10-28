@@ -230,10 +230,15 @@ final class MobileDuplicatesUITests: XCTestCase {
         keepScreenshot("duplicates-ios-slim-scan")
     }
 
-    func testMergeAllUsesAnAlertWithShortLocalizedActionsAndCancelKeepsTheGroups() {
+    func testMergeAllUsesAnAlertWithShortLocalizedActionsAndCancelKeepsTheGroups() throws {
         for language in ["en", "de"] {
             openDuplicates(fixture: "-EncryptedMemoriesDuplicatesFixture", language: language)
+            let tabTitles =
+                language == "de" ? ["Mediathek", "Sammlungen", "Suchen"] : ["Library", "Collections", "Search"]
+            let verticalColumn = try app.verticalTabColumn(titles: tabTitles)
             revealGroup(1)
+            // A vertical bar reserves space beside the list; horizontal bars keep the full-window centre.
+            let contentColumn = group(1).frame
             app.buttons["duplicates.mergeAll"].tap()
             let alert = app.alerts.firstMatch
             XCTAssertTrue(alert.waitForExistence(timeout: 10), "Merge All uses a native alert")
@@ -257,7 +262,18 @@ final class MobileDuplicatesUITests: XCTestCase {
                     : "The copies are identical. One photo of each group stays, with its favorites and albums. 2 photos move to Recently Deleted."
             ]
             XCTAssertTrue(message.exists)
-            XCTAssertEqual(alert.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 2)
+            let geometry = XCTAttachment(string: app.debugDescription)
+            geometry.name = "Duplicate alert content geometry"
+            geometry.lifetime = .keepAlways
+            add(geometry)
+            print(
+                "[Duplicates content] column=\(contentColumn) window=\(app.windows.firstMatch.frame) alert=\(alert.frame)"
+            )
+            if verticalColumn != nil {
+                XCTAssertEqual(alert.frame.midX, contentColumn.midX, accuracy: 2)
+            } else {
+                XCTAssertEqual(alert.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 2)
+            }
             print(
                 "[Duplicates alert] language=\(language) alert=\(alert.frame) confirm=\(confirm.frame) cancel=\(cancel.frame)"
             )

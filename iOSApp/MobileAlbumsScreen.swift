@@ -518,8 +518,10 @@ private struct MobileFilterGridScreen: View {
     }
 
     @ToolbarContentBuilder private func routeToolbarContent() -> some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) { topTrailingToolbarAction }
-            .mobileVisibilityPriority(.high)
+        ProminentToolbarItem(placement: .topBarTrailing, isProminent: selection.isSelecting) {
+            topTrailingToolbarAction
+        }
+        .mobileVisibilityPriority(.high)
         if filter == .trash {
             ToolbarItem(placement: .bottomBar) {
                 Button {
@@ -570,7 +572,11 @@ private struct MobileFilterGridScreen: View {
 
     @ViewBuilder private var topTrailingToolbarAction: some View {
         if selection.isSelecting {
-            Button(L10n.string("action.done")) { selection.finish() }
+            Button {
+                selection.finish()
+            } label: {
+                MobileSelectionModeLabel(isSelecting: true)
+            }
         } else if case .album = filter {
             albumActionsMenu
         } else if filter == .trash, isEmptyingTrash {

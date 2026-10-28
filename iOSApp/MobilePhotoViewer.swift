@@ -40,6 +40,7 @@ struct MobilePhotoViewer: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.verticalBarEdge) private var verticalBarEdge
     @State private var index: Int
     @State private var chromeVisible = true
     @State private var burstSelection = BurstSelectionModel()
@@ -187,6 +188,7 @@ struct MobilePhotoViewer: View {
                     )
                     .id(item.uid)
                 }
+                .backgroundExtensionEffect(isEnabled: verticalBarEdge != nil)
             }
             // The Live Photo status sits on the media inside the safe area, below the navigation bar.
             .overlay(alignment: .topLeading) {
@@ -417,7 +419,7 @@ struct MobilePhotoViewer: View {
 
     /// Close is the primary navigation control: it stays at the top of a vertical bar and never overflows.
     private var viewerCloseItem: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
+        ToolbarItem(placement: .cancellationAction) {
             Button {
                 dismiss()
             } label: {
