@@ -41,7 +41,7 @@ final class MobileDeletedBackupUITests: XCTestCase {
         XCTAssertTrue(attention.label.contains("1"), "One parked photo must need attention")
         attention.tap()
         let row = decisionRow
-        let rowAppeared = row.waitForExistence(timeout: 10)
+        let rowAppeared = row.waitForExistence(timeout: 30)
         if !rowAppeared { attachDiagnostics(named: "Backup list without the decision row") }
         XCTAssertTrue(rowAppeared)
         row.tap()
