@@ -51,6 +51,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         libraryChangeDelay: Duration = .zero,
         unreadableRetryDelay: Duration = .seconds(60),
         unreadableRetryLimit: Duration = .seconds(30 * 60),
+        clock: ResultWriteClock? = nil,
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) -> PendingBackupCoordinator {
         PendingBackupCoordinator(
@@ -72,7 +73,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 unreadableRetryDelay: unreadableRetryDelay,
                 unreadableRetryLimit: unreadableRetryLimit
             ),
-            now: { [date] in date },
+            now: { [date] in clock?.now ?? date },
             sleep: sleep
         )
     }
@@ -1991,6 +1992,502 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             delays.values, [.seconds(60), .seconds(120), .seconds(60)], "a new episode starts at one minute")
     }
 
+    // MARK: - Rejected result writes (#770 D3)
+
+    func testAConfirmedTrashWhoseCompletionCannotBeWrittenIsSentOnce() async throws {
+        try await rejectedWrite(.trashCompletion, repeatedWaits: true)
+    }
+
+    func testADoneFavoriteWhoseCompletionCannotBeWrittenIsSentOnce() async throws {
+        try await rejectedWrite(.actionCompletion, repeatedWaits: true)
+    }
+
+    func testAFailedFavoriteWhoseFailureCannotBeWrittenIsNotSentAgain() async throws {
+        try await rejectedWrite(.actionFailure)
+    }
+
+    func testARetryOfAnActionThatCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.actionRetry)
+    }
+
+    func testAnUnansweredTrashWhoseRetryCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.trashRetry)
+    }
+
+    func testADeferWithoutAVolumeThatCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.noVolume)
+    }
+
+    func testABeginThatCannotBeWrittenSendsNothing() async throws {
+        try await rejectedWrite(.begin)
+    }
+
+    func testAQueueRemovalWhoseCompletionCannotBeWrittenRunsOnce() async throws {
+        try await rejectedWrite(.queueCompletion)
+    }
+
+    func testAQueueRemovalWhoseRetryCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.queueRetry)
+    }
+
+    func testAnActionDeferWithoutAVolumeThatCannotBeWrittenWaitsForTheBackoff() async throws {
+        try await rejectedWrite(.actionNoVolume)
+    }
+
+    func testAQueueCompletionSurvivesRepeatedRejectedWrites() async throws {
+        try await rejectedWrite(.queueCompletion, repeatedWaits: true)
+    }
+
+    func testASavedQueueCompletionEndsTheWriteBackoff() async throws {
+        try await savedCompletionEndsBackoff(.queueCompletion)
+    }
+
+    func testASavedFavoriteCompletionEndsTheWriteBackoff() async throws {
+        try await savedCompletionEndsBackoff(.actionCompletion)
+    }
+
+    private func savedCompletionEndsBackoff(_ rejected: RejectedWrite) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        if rejected.isQueue {
+            failure.remove(from: store)
+            includedLater("later")
+            try failure.install(on: store)
+        }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60))
+        try await waitUntil { clock.waits.count >= 2 }
+        try await settle()
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(4940)], "a saved result leaves only ordinary future work")
+        if rejected.isQueue {
+            XCTAssertEqual(store.sourceState(for: key("write"))?.needsQueueSync, false)
+            XCTAssertEqual(effects.removed, [["write"]])
+        } else {
+            XCTAssertTrue(store.actions().isEmpty)
+            XCTAssertEqual(effects.favorites.count, 1)
+        }
+    }
+
+    func testASavedTrashRetryDispatchesOnlyAtItsPersistedDate() async throws {
+        try await savedRetryDispatchesAtItsDate(.trashRetry)
+    }
+
+    func testASavedFavoriteRetryDispatchesOnlyAtItsPersistedDate() async throws {
+        try await savedRetryDispatchesAtItsDate(.actionRetry)
+    }
+
+    private func savedRetryDispatchesAtItsDate(_ rejected: RejectedWrite) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60))
+        try await waitUntil {
+            rejected.isAction
+                ? store.actions().first?.attempts == 1
+                : store.sourceState(for: key("write"))?.attempts == 1
+        }
+        try await settle()
+        let next =
+            rejected.isAction
+            ? store.actions().first?.nextAttemptAt
+            : store.sourceState(for: key("write"))?.nextAttemptAt
+        XCTAssertEqual(next, date.addingTimeInterval(120))
+        XCTAssertEqual(rejected.isAction ? effects.favorites.count : effects.trashed.joined().count, 1)
+        XCTAssertTrue(clock.waits.dropFirst().contains(.seconds(60)), "the persisted date registers an ordinary retry")
+        effects.favoriteResult = .done
+        effects.trashRetry = []
+        clock.advance(by: .seconds(59))
+        try await settle()
+        XCTAssertEqual(rejected.isAction ? effects.favorites.count : effects.trashed.joined().count, 1)
+        clock.advance(by: .seconds(1))
+        try await waitUntil {
+            rejected.isAction ? effects.favorites.count == 2 : effects.trashed.joined().count == 2
+        }
+        try await settle()
+        XCTAssertEqual(rejected.isAction ? effects.favorites.count : effects.trashed.joined().count, 2)
+        if rejected.isAction {
+            XCTAssertTrue(store.actions().isEmpty)
+        } else {
+            XCTAssertEqual(store.sourceState(for: key("write"))?.needsRemoteTrash, false)
+        }
+    }
+
+    func testAnOlderPendingQueueCompletionKeepsTheNewGenerationOwed() async throws {
+        try await newerEffectSurvivesPendingCompletion(.queueCompletion)
+    }
+
+    func testAnOlderPendingTrashCompletionKeepsTheNewRemoteOwed() async throws {
+        try await newerEffectSurvivesPendingCompletion(.trashCompletion)
+    }
+
+    private func newerEffectSurvivesPendingCompletion(_ rejected: RejectedWrite) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        let original = try XCTUnwrap(store.sourceState(for: key("write")))
+        failure.remove(from: store)
+        let laterRemote = rejected.isQueue ? nil : PhotoUID(volumeID: "vol", nodeID: "new-link")
+        let newer = try XCTUnwrap(
+            store.exclude(
+                [PendingExclusionRequest(key: key("write"), presentation: nil, remote: laterRemote)],
+                at: date.addingTimeInterval(1))?.first)
+        XCTAssertEqual(newer.generation, original.generation + 1)
+        XCTAssertTrue(
+            Self.setColumns(
+                "next_attempt_at=\(date.timeIntervalSince1970 + 600)"
+                    + (rejected.isQueue ? "" : ", needs_queue_sync=0"),
+                of: "write", at: storeURL))
+        clock.advance(by: .seconds(60))
+        try await waitUntil { clock.waits.count >= 2 }
+        try await settle()
+        let kept = try XCTUnwrap(store.sourceState(for: key("write")))
+        XCTAssertEqual(kept.generation, newer.generation)
+        XCTAssertEqual(kept.remote, laterRemote)
+        XCTAssertTrue(
+            rejected.isQueue ? kept.needsQueueSync : kept.needsRemoteTrash,
+            "the old completion cannot settle the newer decision")
+        XCTAssertEqual(kept.remoteTrashed, false)
+        XCTAssertNil(kept.remoteOperation)
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(540)])
+        XCTAssertEqual(rejected.isQueue ? effects.removed.count : effects.trashed.joined().count, 1)
+        clock.advance(by: .seconds(540))
+        try await waitUntil {
+            rejected.isQueue ? effects.removed.count == 2 : effects.trashed.joined().count == 2
+        }
+        try await settle()
+        XCTAssertEqual(rejected.isQueue ? effects.removed.count : effects.trashed.joined().count, 2)
+        let finished = try XCTUnwrap(store.sourceState(for: key("write")))
+        XCTAssertEqual(rejected.isQueue ? finished.needsQueueSync : finished.needsRemoteTrash, false)
+        if !rejected.isQueue { XCTAssertEqual(effects.trashed.last, [try XCTUnwrap(laterRemote)]) }
+    }
+
+    func testANewerFavoriteValueCanRunWhileAnOlderCompletionWaits() async throws {
+        try await newerFavoriteSurvivesPendingCompletion(favorite: false, offset: 0)
+    }
+
+    func testANewerFavoriteDateCanRunWhileAnOlderCompletionWaits() async throws {
+        try await newerFavoriteSurvivesPendingCompletion(favorite: true, offset: 1)
+    }
+
+    private func newerFavoriteSurvivesPendingCompletion(favorite: Bool, offset: Int64) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(.actionCompletion)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(clock.waits, [.seconds(60)])
+        clock.advance(by: .seconds(offset))
+        let stored = await coordinator.setFavorite(
+            [PhotoUID(localPending: .photoLibrary, identifier: "write")], favorite: favorite)
+        XCTAssertTrue(stored)
+        try await settle()
+        XCTAssertEqual(effects.favoriteValues, [true, favorite], "a distinct newer SQL action identity can run")
+        let action = try XCTUnwrap(store.actions().first)
+        XCTAssertEqual(action.desired, favorite)
+        XCTAssertEqual(action.createdAt, date.addingTimeInterval(Double(offset)))
+        XCTAssertEqual(clock.waits, [.seconds(60)], "neither unsaved action registers a one-second timer")
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60 - offset))
+        try await waitUntil { store.actions().isEmpty && clock.waits.count >= 2 }
+        try await settle()
+        XCTAssertTrue(store.actions().isEmpty)
+        XCTAssertEqual(effects.favoriteValues, [true, favorite], "repair saves both results without another request")
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(4940)])
+    }
+
+    func testAPendingFavoriteResultSuppressesAnotherDispatchAndShortTimer() async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(.actionCompletion)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        let accepted = await coordinator.setFavorite([], favorite: true)
+        XCTAssertTrue(accepted)
+        try await settle()
+        XCTAssertEqual(effects.favoriteValues, [true])
+        XCTAssertEqual(clock.waits, [.seconds(60)], "the owed action waits on reconcile, not a short action timer")
+    }
+
+    func testARejectedFavoriteResultOutsideReconcileStartsTheWriteBackoff() async throws {
+        includedLater("write")
+        _ = favoriteFixture("write")
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        try await startRejectedWriteClock(clock)
+        XCTAssertEqual(clock.waits, [.seconds(5000)])
+        let failure = SourceListFailure(
+            table: "pending_action", untilRemoved: true, action: SQLITE_DELETE)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let stored = await coordinator.setFavorite(
+            [PhotoUID(localPending: .photoLibrary, identifier: "write")], favorite: true)
+        XCTAssertTrue(stored)
+        try await waitUntil { clock.waits.count >= 2 }
+        try await settle()
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(effects.favoriteValues, [true])
+        XCTAssertEqual(store.actions().count, 1)
+        XCTAssertEqual(
+            clock.waits, [.seconds(5000), .seconds(60)],
+            "a rejected action result outside reconcile starts the degraded retry")
+    }
+
+    func testAFutureDateOfAnUnsavedKeyCannotShortenItsBackoff() async throws {
+        try await pendingFutureDateKeepsItsBackoff(healthyOther: false)
+    }
+
+    func testAHealthyOtherKeyKeepsItsEarlierRetryBesideAnUnsavedResult() async throws {
+        try await pendingFutureDateKeepsItsBackoff(healthyOther: true)
+    }
+
+    private func pendingFutureDateKeepsItsBackoff(healthyOther: Bool) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(.queueCompletion)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        effects.onRemove = { [storeURL, date] in
+            XCTAssertTrue(
+                Self.setColumns(
+                    "next_attempt_at=\(date.timeIntervalSince1970 + 10)", of: "write", at: storeURL))
+        }
+        let healthyRemote = PhotoUID(volumeID: "vol", nodeID: "healthy-link")
+        if healthyOther {
+            failure.remove(from: store)
+            XCTAssertNotNil(
+                store.exclude(
+                    [PendingExclusionRequest(key: key("healthy"), presentation: nil, remote: healthyRemote)], at: date))
+            XCTAssertTrue(
+                Self.setColumns(
+                    "needs_queue_sync=0, next_attempt_at=\(date.timeIntervalSince1970 + 30)",
+                    of: "healthy", at: storeURL))
+            try failure.install(on: store)
+        }
+        try await startRejectedWriteClock(clock)
+        XCTAssertTrue(failure.denied)
+        XCTAssertEqual(store.sourceState(for: key("write"))?.nextAttemptAt, date.addingTimeInterval(10))
+        XCTAssertEqual(effects.removed, [["write"]])
+        XCTAssertEqual(
+            clock.waits, [healthyOther ? .seconds(30) : .seconds(60)],
+            "only another readable key may shorten the degraded backoff")
+        if healthyOther {
+            clock.advance(by: .seconds(30))
+            try await waitUntil { effects.trashed.joined().contains(healthyRemote) && clock.waits.count >= 2 }
+            try await settle()
+            XCTAssertEqual(Array(effects.trashed.joined()), [healthyRemote])
+            XCTAssertEqual(effects.removed, [["write"]], "the unsaved key does not dispatch again")
+            XCTAssertEqual(clock.waits, [.seconds(30), .seconds(120)])
+        }
+    }
+
+    private func startRejectedWriteClock(_ clock: ResultWriteClock) async throws {
+        await coordinator.close()
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        try await waitUntil { !clock.waits.isEmpty }
+        try await settle()
+        XCTAssertFalse(clock.waits.isEmpty, "a real timer must register before its delay is checked")
+    }
+
+    private enum RejectedWrite {
+        case trashCompletion, actionCompletion, actionFailure, actionRetry, trashRetry, noVolume, begin
+        case queueCompletion, queueRetry, actionNoVolume
+
+        var isAction: Bool {
+            switch self {
+            case .actionCompletion, .actionFailure, .actionRetry, .actionNoVolume: true
+            default: false
+            }
+        }
+
+        var isQueue: Bool { self == .queueCompletion || self == .queueRetry }
+
+        var deniedAction: Int32 { self == .actionCompletion ? SQLITE_DELETE : SQLITE_UPDATE }
+
+        var deniedColumn: String? {
+            switch self {
+            case .queueCompletion: "needs_queue_sync"
+            case .trashCompletion: "remote_trashed"
+            case .actionCompletion: nil
+            case .actionFailure: "failed"
+            case .actionRetry, .trashRetry, .noVolume, .queueRetry, .actionNoVolume: "attempts"
+            case .begin: "remote_op"
+            }
+        }
+    }
+
+    private func prepareRejectedWrite(
+        _ rejected: RejectedWrite
+    ) throws -> (SourceListFailure, ResultWriteClock, PhotoUID) {
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-write")
+        if rejected.isAction {
+            includedLater("write")
+            XCTAssertNotEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: key("write"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+                .failed)
+            XCTAssertTrue(store.setFavoriteIntent(key("write"), favorite: true, at: date))
+        } else {
+            XCTAssertNotNil(
+                store.exclude(
+                    [
+                        PendingExclusionRequest(
+                            key: key("write"), presentation: nil, remote: rejected.isQueue ? nil : remote)
+                    ], at: date))
+            if !rejected.isQueue {
+                XCTAssertTrue(Self.setColumns("needs_queue_sync=0", of: "write", at: storeURL))
+            }
+        }
+        if rejected == .trashRetry { effects.trashRetry = [remote] }
+        if rejected == .noVolume || rejected == .actionNoVolume { effects.volumeID = nil }
+        if rejected == .queueRetry { effects.removeSucceeds = false }
+        if rejected == .actionFailure { effects.favoriteResult = .permanentFailure }
+        if rejected == .actionRetry { effects.favoriteResult = .retry }
+        let failure = SourceListFailure(
+            table: rejected.isAction ? "pending_action" : "source_state", untilRemoved: true,
+            action: rejected.deniedAction, column: rejected.deniedColumn)
+        try failure.install(on: store)
+        return (failure, ResultWriteClock(date), remote)
+    }
+
+    private func rejectedWrite(
+        _ rejected: RejectedWrite, repeatedWaits: Bool = false,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let (failure, clock, _) = try prepareRejectedWrite(rejected)
+        defer { failure.remove(from: store) }
+        defer { clock.releaseAll() }
+        await coordinator.close()
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        try await waitUntil { !clock.waits.isEmpty }
+        XCTAssertTrue(failure.denied, "the real result write must be rejected", file: file, line: line)
+
+        let expected: [Duration] =
+            repeatedWaits
+            ? [
+                .seconds(60), .seconds(120), .seconds(240), .seconds(480), .seconds(960), .seconds(1800),
+                .seconds(1800),
+            ]
+            : [.seconds(60)]
+        for (index, delay) in expected.enumerated() {
+            try await waitUntil { clock.waits.count > index }
+            XCTAssertEqual(
+                Array(clock.waits.prefix(index + 1)), Array(expected.prefix(index + 1)),
+                "a rejected result waits for the degraded backoff", file: file, line: line)
+            guard clock.waits.count > index, clock.waits[index] == delay else { return }
+            let sent =
+                rejected.isAction
+                ? effects.favorites.count
+                : rejected.isQueue ? effects.removed.count : effects.trashed.joined().count
+            XCTAssertEqual(
+                sent, rejected == .noVolume || rejected == .begin || rejected == .actionNoVolume ? 0 : 1,
+                "an unsaved result is not sent again", file: file, line: line)
+            if index + 1 < expected.count { clock.advance(by: delay) }
+        }
+
+        failure.remove(from: store)
+        effects.volumeID = "photos-volume"
+        clock.advance(by: expected.last!)
+        try await waitUntil {
+            if rejected.isAction {
+                let actions = store.actions()
+                switch rejected {
+                case .actionCompletion: return actions.isEmpty
+                case .actionFailure: return actions.first?.failed == true
+                default: return actions.first?.attempts == 1
+                }
+            }
+            let state = store.sourceState(for: key("write"))
+            if rejected == .trashRetry || rejected == .noVolume || rejected == .queueRetry {
+                return state?.attempts == 1
+            }
+            return rejected.isQueue ? state?.needsQueueSync == false : state?.needsRemoteTrash == false
+        }
+        if rejected.isAction {
+            let actions = store.actions()
+            switch rejected {
+            case .actionCompletion:
+                XCTAssertTrue(actions.isEmpty, "the saved completion removes the action", file: file, line: line)
+            case .actionFailure:
+                XCTAssertEqual(actions.first?.failed, true, "the saved failure stays final", file: file, line: line)
+            default:
+                XCTAssertEqual(actions.first?.attempts, 1, "the retry time is saved", file: file, line: line)
+            }
+            XCTAssertEqual(
+                effects.favorites.count, rejected == .actionNoVolume ? 0 : 1,
+                "repair saves the result without another request", file: file, line: line)
+        } else {
+            let state = store.sourceState(for: key("write"))
+            if rejected == .trashRetry || rejected == .noVolume || rejected == .queueRetry {
+                XCTAssertEqual(state?.attempts, 1, "the retry time is saved", file: file, line: line)
+                XCTAssertGreaterThan(state?.nextAttemptAt ?? .distantPast, clock.now, file: file, line: line)
+            } else {
+                XCTAssertEqual(
+                    rejected.isQueue ? state?.needsQueueSync : state?.needsRemoteTrash, false,
+                    "the completion is saved", file: file, line: line)
+            }
+            XCTAssertEqual(
+                rejected.isQueue ? effects.removed.count : effects.trashed.joined().count,
+                rejected == .noVolume ? 0 : 1,
+                "repair saves the result before another request", file: file, line: line)
+        }
+        await coordinator.close()
+    }
+
+    /// Advances only when the test requests it. Every registered wait has its own gate.
+    private final class ResultWriteClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Date
+        private var recorded: [Duration] = []
+        private var sleeping: [(Date, OpenGate)] = []
+        var now: Date { lock.withLock { value } }
+        var waits: [Duration] { lock.withLock { recorded } }
+
+        init(_ date: Date) { value = date }
+
+        func sleep(_ duration: Duration) async throws {
+            let gate = OpenGate()
+            lock.withLock {
+                recorded.append(duration)
+                let parts = duration.components
+                let seconds = Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+                sleeping.append((value.addingTimeInterval(seconds), gate))
+            }
+            await gate.wait()
+            try Task.checkCancellation()
+        }
+
+        func advance(by duration: Duration) {
+            let due = lock.withLock { () -> [OpenGate] in
+                let parts = duration.components
+                value = value.addingTimeInterval(Double(parts.seconds) + Double(parts.attoseconds) / 1e18)
+                let due = sleeping.filter { $0.0 <= value }.map(\.1)
+                sleeping.removeAll { $0.0 <= value }
+                return due
+            }
+            due.forEach { $0.open() }
+        }
+
+        func releaseAll() {
+            let gates = lock.withLock {
+                defer { sleeping.removeAll() }
+                return sleeping.map(\.1)
+            }
+            gates.forEach { $0.open() }
+        }
+    }
+
     // MARK: - Unreadable source states, round 2 (#770)
 
     private func favoriteFixture(_ id: String) -> PhotoUID {
@@ -3110,11 +3607,18 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         private var done = false
         private let table: String
         private let untilRemoved: Bool
+        private let action: Int32
+        private let column: String?
         var denied: Bool { lock.withLock { done } }
 
-        init(table: String = "source_state", untilRemoved: Bool = false) {
+        init(
+            table: String = "source_state", untilRemoved: Bool = false,
+            action: Int32 = SQLITE_READ, column: String? = nil
+        ) {
             self.table = table
             self.untilRemoved = untilRemoved
+            self.action = action
+            self.column = column
         }
 
         func install(on store: PendingBackupManifestStore) throws {
@@ -3122,10 +3626,12 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             connection.withLock {
                 _ = sqlite3_set_authorizer(
                     connection.database,
-                    { context, action, table, _, _, _ in
-                        guard let context, action == SQLITE_READ, let table else { return SQLITE_OK }
+                    { context, action, table, column, _, _ in
+                        guard let context, let table else { return SQLITE_OK }
                         let failure = Unmanaged<SourceListFailure>.fromOpaque(context).takeUnretainedValue()
-                        guard String(cString: table) == failure.table else { return SQLITE_OK }
+                        guard action == failure.action, String(cString: table) == failure.table,
+                            failure.column == nil || column.map({ String(cString: $0) }) == failure.column
+                        else { return SQLITE_OK }
                         return failure.lock.withLock {
                             guard !failure.done || failure.untilRemoved else { return SQLITE_OK }
                             failure.done = true
@@ -3196,8 +3702,11 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     private var _trashed: [[PhotoUID]] = []
     private var _restored: [[PhotoUID]] = []
     private var _favorites: [PhotoUID] = []
+    private var _favoriteValues: [Bool] = []
     private var _removeSucceeds = true
     private var _albumResult = PendingEffectResult.done
+    private var _favoriteResult = PendingEffectResult.done
+    private var _volumeID: String? = "photos-volume"
     private var _trashRetry = Set<PhotoUID>()
     private var _order: [String] = []
 
@@ -3208,6 +3717,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     var trashed: [[PhotoUID]] { lock.withLock { _trashed } }
     var restored: [[PhotoUID]] { lock.withLock { _restored } }
     var favorites: [PhotoUID] { lock.withLock { _favorites } }
+    var favoriteValues: [Bool] { lock.withLock { _favoriteValues } }
     var removeSucceeds: Bool {
         get { lock.withLock { _removeSucceeds } }
         set { lock.withLock { _removeSucceeds = newValue } }
@@ -3215,6 +3725,14 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     var albumResult: PendingEffectResult {
         get { lock.withLock { _albumResult } }
         set { lock.withLock { _albumResult = newValue } }
+    }
+    var favoriteResult: PendingEffectResult {
+        get { lock.withLock { _favoriteResult } }
+        set { lock.withLock { _favoriteResult = newValue } }
+    }
+    var volumeID: String? {
+        get { lock.withLock { _volumeID } }
+        set { lock.withLock { _volumeID = newValue } }
     }
     /// Photos that the fake Proton trash leaves without an answer.
     var trashRetry: Set<PhotoUID> {
@@ -3270,7 +3788,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
             return _onVolumeLookup
         }
         hook?()
-        return "photos-volume"
+        return volumeID
     }
 
     /// Holds the next trash request until the gate opens.
@@ -3306,8 +3824,11 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
 
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult {
         await favoriteGate?.pass()
-        lock.withLock { _favorites.append(uid) }
-        return .done
+        return lock.withLock {
+            _favorites.append(uid)
+            _favoriteValues.append(favorite)
+            return _favoriteResult
+        }
     }
 
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult {
