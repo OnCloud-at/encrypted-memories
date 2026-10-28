@@ -246,7 +246,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     @discardableResult
     public func pruneAcknowledgedHandoffs(olderThan cutoff: Date) -> Bool {
         connection.withLock {
-            // An unfinished action still needs its source's Proton photo, and so does an unfinished trash.
+            // Unfinished work needs its handoffs. A completed trash also keeps the latest handoff until the source
+            // returns to the backup: a restart may still have to discover its later upload.
             execute(
                 """
                 DELETE FROM handoff
@@ -258,7 +259,14 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                   AND NOT EXISTS (
                     SELECT 1 FROM source_state s
                     WHERE s.source_kind=handoff.source_kind AND s.source_id=handoff.source_id
-                      AND s.needs_remote_trash=1
+                      AND (s.needs_remote_trash=1 OR (
+                        s.desired='excluded' AND s.remote_trashed=1
+                        AND handoff.rowid=(
+                          SELECT h.rowid FROM handoff h
+                          WHERE h.source_kind=handoff.source_kind AND h.source_id=handoff.source_id
+                          ORDER BY h.created_at DESC, h.revision_us DESC LIMIT 1
+                        )
+                      ))
                   );
                 """
             ) { sqlite3_bind_double($0, 1, cutoff.timeIntervalSince1970) }
@@ -507,12 +515,28 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         remoteLinkID: String? = nil,
         at date: Date
     ) -> Bool {
+        completeEffectResult(effect, for: key, generation: generation, remoteLinkID: remoteLinkID, at: date) != .failed
+    }
+
+    enum EffectCompletionResult: Sendable, Equatable {
+        case failed, saved, laterHandoffUnreadable
+    }
+
+    /// A confirmed completion and the discovery of its next photo are separate durable steps. A failed lookup must
+    /// never make the coordinator replay the completion of a photo that is already saved as trashed.
+    func completeEffectResult(
+        _ effect: PendingSourceEffect,
+        for key: PendingSourceKey,
+        generation: Int64,
+        remoteLinkID: String? = nil,
+        at date: Date
+    ) -> EffectCompletionResult {
         connection.withLock {
-            transaction {
+            var movesOn = false
+            let committed = transaction {
                 guard case .readable(let current) = sourceStateLocked(key) else { return false }
                 guard let state = current else { return true }
                 var sql: String
-                var movesOn = false
                 switch effect {
                 case .queueSync:
                     // A newer generation wrote its own queue sync request; keep it.
@@ -540,26 +564,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     bindKey(stmt, key, from: 2)
                 }
                 guard updated else { return false }
-                if movesOn, state.desired == .excluded, let latest = latestHandoffLocked(key).handoff,
-                    latest.remote.nodeID != state.remote?.nodeID
-                {
-                    guard
-                        execute(
-                            """
-                            UPDATE source_state
-                            SET needs_remote_trash=1, needs_remote_restore=0, remote_volume_id=?, remote_link_id=?,
-                                remote_trashed=0, listed_in_trash=0, attempts=0, next_attempt_at=?, updated_at=?
-                            WHERE source_kind=? AND source_id=? AND desired='excluded';
-                            """,
-                            bind: { stmt in
-                                bindText(stmt, 1, latest.remote.volumeID)
-                                bindText(stmt, 2, latest.remote.nodeID)
-                                sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
-                                sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
-                                bindKey(stmt, key, from: 5)
-                            })
-                    else { return false }
-                }
                 return execute(
                     """
                     DELETE FROM source_state
@@ -568,7 +572,59 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     """
                 ) { bindKey($0, key) }
             }
+            guard committed else { return .failed }
+            guard movesOn else { return .saved }
+            return resumeLaterTrashLocked(for: key, at: date) == .unreadable ? .laterHandoffUnreadable : .saved
         }
+    }
+
+    enum LaterTrashResult: Sendable, Equatable {
+        case unchanged, scheduled, unreadable
+    }
+
+    /// Used by completion, retry and startup. Each key has its own transaction, so a failed read or write of one
+    /// source cannot roll back another source's progress.
+    func resumeLaterTrash(for key: PendingSourceKey, at date: Date) -> LaterTrashResult {
+        connection.withLock { resumeLaterTrashLocked(for: key, at: date) }
+    }
+
+    private func resumeLaterTrashLocked(for key: PendingSourceKey, at date: Date) -> LaterTrashResult {
+        var result = LaterTrashResult.unchanged
+        let committed = transaction {
+            guard case .readable(let current) = sourceStateLocked(key) else { return false }
+            // A newer decision, outstanding operation or already scheduled target owns its own work.
+            guard let state = current, state.desired == .excluded, state.remoteTrashed,
+                !state.needsRemoteTrash, !state.needsRemoteRestore, state.remoteOperation == nil,
+                let previous = state.remote
+            else { return true }
+            switch latestHandoffLocked(key) {
+            case .unreadable:
+                result = .unreadable
+                return true
+            case .readable(let latest?):
+                guard latest.remote.nodeID != previous.nodeID else { return true }
+                guard
+                    execute(
+                        """
+                        UPDATE source_state
+                        SET needs_remote_trash=1, needs_remote_restore=0, remote_volume_id=?, remote_link_id=?,
+                            remote_trashed=0, listed_in_trash=0, attempts=0, next_attempt_at=?, updated_at=?
+                        WHERE source_kind=? AND source_id=? AND desired='excluded';
+                        """,
+                        bind: { stmt in
+                            bindText(stmt, 1, latest.remote.volumeID)
+                            bindText(stmt, 2, latest.remote.nodeID)
+                            sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
+                            sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                            bindKey(stmt, key, from: 5)
+                        })
+                else { return false }
+                result = .scheduled
+                return true
+            case .readable(nil): return true
+            }
+        }
+        return committed ? result : .unreadable
     }
 
     /// Marks a trash or restore request as sent, right before the reconciler dispatches it. Only states that

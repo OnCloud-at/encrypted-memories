@@ -131,6 +131,386 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         snapshot.tiles.map(\.key.identifier)
     }
 
+    // MARK: - Later trash after an unreadable handoff (#842)
+
+    func testLaterTrashRetriesAfterTheLatestHandoffDoesNotDecode() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode)
+    }
+
+    func testLaterTrashRetriesAfterTheLatestHandoffCannotBePrepared() async throws {
+        try await laterTrashAfterUnreadableHandoff(.prepare)
+    }
+
+    func testLaterTrashRetriesAfterTheLatestHandoffStepIsInterrupted() async throws {
+        try await laterTrashAfterUnreadableHandoff(.step)
+    }
+
+    func testLaterTrashRetriesAfterItsSourceRereadIsInterrupted() async throws {
+        try await laterTrashAfterUnreadableHandoff(.sourceRead)
+    }
+
+    func testLaterTrashRetriesAfterItsSchedulingWriteIsRejected() async throws {
+        try await laterTrashAfterUnreadableHandoff(.write)
+    }
+
+    func testLaterTrashRepeatedReadFailureKeepsBackingOffWithoutResendingTheEarlierUpload() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode, repeatFailure: true)
+    }
+
+    func testLaterTrashRetryDoesNotUndoANewerReturnToBackup() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode, returnToBackup: true)
+    }
+
+    func testLaterTrashRecoveryStartsAgainAfterRepairAndAnotherUnreadableCommit() async throws {
+        try await laterTrashAfterUnreadableHandoff(.decode, secondEpisode: true)
+    }
+
+    private enum LaterHandoffFault { case decode, prepare, step, write, sourceRead }
+
+    private func seedLaterTrash(acknowledgedAt createdAt: Date) throws -> PhotoUID {
+        let later = PhotoUID(volumeID: "vol", nodeID: "later-upload")
+        XCTAssertNotNil(
+            store.exclude(
+                [PendingExclusionRequest(key: key("later"), presentation: nil, remote: earlier)], at: date))
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key("later"), revision: revision, remote: later, kind: .uploaded, createdAt: createdAt)),
+            .excludedRemoteNeedsTrash)
+        XCTAssertTrue(store.acknowledgeHandoffs([(key("later"), revision)]))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key("later"), generation: 1, at: date))
+        XCTAssertEqual(store.sourceState(for: key("later"))?.remote, earlier)
+        return later
+    }
+
+    private func laterTrashAfterUnreadableHandoff(
+        _ fault: LaterHandoffFault, repeatFailure: Bool = false, returnToBackup: Bool = false,
+        secondEpisode: Bool = false
+    ) async throws {
+        await coordinator.close()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let later = try seedLaterTrash(acknowledgedAt: date)
+        let gate = LookupGate()
+        defer { gate.open() }
+        effects.trashGate = gate
+        let running = try XCTUnwrap(coordinator)
+        let trigger = key("trigger").localUID
+        let pass = Task { await running.restore([trigger]) }
+        guard await gate.entered(within: .seconds(5)) else {
+            gate.open()
+            _ = await pass.value
+            XCTFail("the earlier upload never reached the trash gate")
+            return
+        }
+        let denial = SourceListFailure(
+            table: fault == .write ? "source_state" : "handoff", untilRemoved: true,
+            action: fault == .write ? SQLITE_UPDATE : SQLITE_READ, column: fault == .write ? "remote_link_id" : nil)
+        let interruption = KeyedReadFailure(
+            matching: fault == .sourceRead
+                ? "FROM source_state WHERE source_kind=? AND source_id=?" : Self.latestHandoffRead,
+            skip: fault == .sourceRead ? 1 : 0, limit: fault == .sourceRead ? 1 : .max)
+        defer { denial.remove(from: store) }
+        defer { interruption.remove(from: store) }
+        switch fault {
+        case .decode:
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later';"))
+        case .prepare: try denial.install(on: store)
+        case .step: try interruption.install(on: store)
+        case .write: try denial.install(on: store)
+        case .sourceRead: try interruption.install(on: store)
+        }
+        gate.open()
+        _ = await pass.value
+
+        let completed = try XCTUnwrap(store.sourceState(for: key("later")))
+        XCTAssertTrue(completed.remoteTrashed, "the confirmed trash of A must be saved independently of the B read")
+        XCTAssertFalse(completed.needsRemoteTrash, "an unreadable B is not permission to trash A again")
+        XCTAssertNil(completed.remoteOperation, "the confirmed request is no longer in flight")
+        XCTAssertEqual(completed.remote, earlier)
+        XCTAssertEqual(Array(effects.trashed.joined()), [earlier])
+        if fault == .prepare || fault == .write { XCTAssertTrue(denial.denied, "the requested SQL must actually fail") }
+        if fault == .step { XCTAssertGreaterThan(interruption.count, 0, "the latest handoff step must actually fail") }
+        if fault == .sourceRead {
+            XCTAssertEqual(interruption.count, 1, "only the helper's second source read must fail")
+        }
+        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        XCTAssertEqual(clock.waits, [.seconds(60)], "the unreadable later handoff must keep a degraded retry")
+        if repeatFailure {
+            clock.advance(by: .seconds(60))
+            try await waitUntil { clock.waits.contains(.seconds(120)) }
+            XCTAssertEqual(clock.waits, [.seconds(60), .seconds(120)])
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier], "the second denied cycle must not resend A")
+        }
+        if returnToBackup {
+            let returned = await coordinator.restore([key("later").localUID])
+            XCTAssertTrue(returned)
+            XCTAssertEqual(effects.restored, [[earlier]], "the person's later return restores the confirmed A")
+        }
+
+        denial.remove(from: store)
+        interruption.remove(from: store)
+        if fault == .decode {
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='later';"))
+        }
+        clock.advance(by: repeatFailure ? .seconds(120) : .seconds(60))
+        if returnToBackup {
+            _ = await coordinator.restore([trigger])
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier], "a newer included source must never trash B")
+            await coordinator.close()
+            return
+        }
+        try await waitUntil { effects.trashed.joined().contains(later) }
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [earlier, later], "repair must trash B once without resending A")
+        let finished = try XCTUnwrap(store.sourceState(for: key("later")))
+        XCTAssertEqual(finished.remote, later)
+        XCTAssertTrue(finished.remoteTrashed)
+        XCTAssertFalse(finished.needsRemoteTrash)
+        _ = await coordinator.restore([trigger])
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [earlier, later], "another reconcile must not resend either photo")
+        if secondEpisode {
+            let next = PhotoUID(volumeID: "vol", nodeID: "next-upload")
+            let newest = PhotoUID(volumeID: "vol", nodeID: "newest-upload")
+            for (revision, remote) in [(Int64(11), next), (Int64(12), newest)] {
+                XCTAssertEqual(
+                    store.recordHandoff(
+                        PendingHandoff(
+                            key: key("later"), revision: UploadBackupRevision(rawValue: revision), remote: remote,
+                            kind: .uploaded, createdAt: clock.now.addingTimeInterval(Double(revision)))),
+                    .excludedRemoteNeedsTrash)
+            }
+            // The next committed upload stays due until its date, then its confirmed trash discovers another fault.
+            clock.advance(by: .seconds(12))
+            let nextGate = LookupGate()
+            defer { nextGate.open() }
+            effects.trashGate = nextGate
+            let nextPass = Task { await running.restore([trigger]) }
+            guard await nextGate.entered(within: .seconds(5)) else {
+                nextGate.open()
+                _ = await nextPass.value
+                XCTFail("the second episode did not reach its trash gate")
+                return
+            }
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later' AND revision_us=12;"))
+            nextGate.open()
+            _ = await nextPass.value
+            try await waitUntil { clock.waits.filter { $0 == .seconds(60) }.count >= 2 }
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier, later, next])
+            XCTAssertEqual(clock.waits.last, .seconds(60), "a new failure episode starts at the first backoff again")
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='later' AND revision_us=12;"))
+            clock.advance(by: .seconds(60))
+            try await waitUntil { effects.trashed.joined().contains(newest) }
+            XCTAssertEqual(Array(effects.trashed.joined()), [earlier, later, next, newest])
+        }
+        await coordinator.close()
+    }
+
+    func testLaterTrashRecoveryKeepsAnOldAcknowledgedHandoffAfterRestart() async throws {
+        await coordinator.close()
+        let later = try seedLaterTrash(acknowledgedAt: date.addingTimeInterval(-8 * 24 * 60 * 60))
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later';"))
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key("later"), generation: 1, remoteLinkID: earlier.nodeID, at: date)
+        )
+        XCTAssertTrue(try XCTUnwrap(store.sourceState(for: key("later"))).remoteTrashed)
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='later';"))
+        recorder.finish()
+        store.close()
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        recorder = PendingBackupEventRecorder(
+            store: store, replacementLedger: .shared(accountDataDirectory: directory), now: { [date] in date })
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+
+        try await waitUntil { effects.trashed.joined().contains(later) }
+        XCTAssertEqual(Array(effects.trashed.joined()), [later], "startup must recover B without resending saved A")
+        XCTAssertEqual(store.latestHandoffsRead(for: [key("later")])[key("later")]?.handoff?.remote, later)
+        XCTAssertEqual(store.sourceState(for: key("later"))?.remote, later)
+        await coordinator.close()
+    }
+
+    private func seedLaterTrashRecoveryBatch(_ count: Int) throws {
+        for index in 0..<count {
+            let id = "batch-\(index)"
+            let before = PhotoUID(volumeID: "vol", nodeID: "a-\(index)")
+            XCTAssertNotNil(
+                store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: before)], at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: 1, at: date))
+            XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+        }
+        // These acknowledged commits arrived before the process ended; no event remains to wake the new coordinator.
+        let connection = try KeyedReadFailure.connection(of: store)
+        connection.withLock {
+            for index in 0..<count {
+                XCTAssertEqual(
+                    sqlite3_exec(
+                        connection.database,
+                        """
+                        INSERT INTO handoff VALUES('photoLibraryAsset', 'batch-\(index)', 9, 'vol', 'b-\(index)',
+                          'uploaded', \(date.timeIntervalSince1970), 1);
+                        """, nil, nil, nil), SQLITE_OK)
+            }
+        }
+    }
+
+    func testLaterTrashStartupRecoveryReadsANewerGeneration() async throws {
+        try await laterTrashStartupReadsNewDecision(returnFirst: false)
+    }
+
+    func testLaterTrashStartupRecoveryReusesAKeyAfterReturn() async throws {
+        try await laterTrashStartupReadsNewDecision(returnFirst: true)
+    }
+
+    private func laterTrashStartupReadsNewDecision(returnFirst: Bool) async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(1)
+        // An unrelated incomplete row makes later reconciles reload the complete source inventory.
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key("bad"), presentation: nil, remote: nil)], at: date))
+        try setDesired("invalid", of: "bad")
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let target = PhotoUID(volumeID: "vol", nodeID: "b-0")
+        try await waitUntil { effects.trashed.joined().contains(target) }
+        XCTAssertEqual(Array(effects.trashed.joined()), [target])
+        let first = try XCTUnwrap(store.sourceState(for: key("batch-0")))
+        if returnFirst {
+            let returned = await coordinator.restore([key("batch-0").localUID])
+            XCTAssertTrue(returned)
+            XCTAssertNil(store.sourceState(for: key("batch-0")), "the returned source leaves the pending store")
+        }
+
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='batch-0';"))
+        let excluded = try XCTUnwrap(
+            store.exclude(
+                [PendingExclusionRequest(key: key("batch-0"), presentation: nil, remote: earlier)], at: date)?.first)
+        XCTAssertEqual(excluded.generation, returnFirst ? first.generation : first.generation + 1)
+        XCTAssertTrue(store.completeEffect(.queueSync, for: excluded.key, generation: excluded.generation, at: date))
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: excluded.key, generation: excluded.generation, remoteLinkID: earlier.nodeID, at: date
+            ))
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
+        _ = await coordinator.restore([key("trigger").localUID])
+
+        try await waitUntil { effects.trashed.joined().count >= 2 }
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [target, target], "a new decision must re-enter startup recovery")
+        await coordinator.close()
+    }
+
+    func testLaterTrashRecoveryAdvancesHealthyKeysBesideAnUnreadableKeyAcrossBatches() async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(201)
+        let failure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+
+        try await waitUntil { effects.trashed.joined().count >= 200 }
+        XCTAssertEqual(failure.count, 1)
+        XCTAssertEqual(effects.trashed.joined().count, 200, "all healthy keys must advance across the batch boundary")
+        XCTAssertTrue(effects.trashed.joined().allSatisfy { $0.nodeID.hasPrefix("b-") })
+        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        try await settle()
+        XCTAssertEqual(
+            clock.waits.last, .seconds(60), "healthy startup groups must not postpone the failed key's retry")
+        failure.remove(from: store)
+        clock.advance(by: .seconds(60))
+        try await waitUntil { effects.trashed.joined().count >= 201 }
+        XCTAssertEqual(effects.trashed.joined().count, 201, "the failed key must remain retryable")
+        XCTAssertEqual(Set(effects.trashed.joined()).count, 201, "recovery must not repeat completed targets")
+        await coordinator.close()
+    }
+
+    func testLaterTrashStartupYieldsAfterOneBatchAndStopsWritingAfterClose() async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(201)
+        let gate = LookupGate()
+        defer { gate.open() }
+        effects.trashGate = gate
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertGreaterThan(snapshot.membershipRevision, 0, "the first snapshot must precede recovery's remote work")
+        guard await gate.entered(within: .seconds(5)) else {
+            XCTFail("the first recovery batch did not reach its trash gate")
+            await coordinator.close()
+            return
+        }
+        let beforeClose = store.sourceStates()
+        XCTAssertEqual(beforeClose.filter { $0.remote?.nodeID.hasPrefix("b-") == true }.count, 100)
+        await coordinator.close()
+        gate.open()
+        try await settle()
+        XCTAssertEqual(store.sourceStates(), beforeClose, "close must prevent the queued second batch from writing")
+    }
+
+    func testLaterTrashUnreadableStartupSchedulesBackoffUntilRepair() async throws {
+        await coordinator.close()
+        try seedLaterTrashRecoveryBatch(1)
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='batch-0';"))
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        try await settle()
+        XCTAssertEqual(clock.waits, [.seconds(60)], "an unreadable-only batch must still start reconciliation backoff")
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
+        clock.advance(by: .seconds(60))
+        let target = PhotoUID(volumeID: "vol", nodeID: "b-0")
+        try await waitUntil { effects.trashed.joined().contains(target) }
+        XCTAssertEqual(Array(effects.trashed.joined()), [target])
+        await coordinator.close()
+    }
+
+    func testLaterTrashUnchangedRecoveryKeepsTheExistingTimerAndPublication() async throws {
+        await coordinator.close()
+        XCTAssertNotNil(
+            store.exclude(
+                [PendingExclusionRequest(key: key("unchanged"), presentation: nil, remote: earlier)], at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key("unchanged"), generation: 1, at: date))
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key("unchanged"), generation: 1, at: date))
+        excludedLater("future")
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key("future"), generation: 1, at: date))
+        let before = store.sourceStates()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+        await coordinator.start()
+        let first = await coordinator.currentSnapshot()
+        try await waitUntil { !clock.waits.isEmpty }
+        try await settle()
+
+        XCTAssertEqual(clock.waits, [.seconds(5000)], "a batch without new work must not replace the existing timer")
+        XCTAssertEqual(store.sourceStates(), before, "unchanged recovery must not update any source-state value")
+        let after = await coordinator.currentSnapshot()
+        XCTAssertEqual(
+            after.membershipRevision, first.membershipRevision, "recovery must not publish another membership")
+        XCTAssertTrue(effects.trashed.isEmpty)
+        clock.advance(by: .seconds(5000))
+        let target = PhotoUID(volumeID: "vol", nodeID: "future")
+        try await waitUntil { effects.trashed.joined().contains(target) }
+        XCTAssertEqual(
+            Array(effects.trashed.joined()), [target], "the retained timer must still dispatch the other source")
+        await coordinator.close()
+    }
+
     func testDismissedMissingSourceRecheckStaysHiddenThroughIncrementalReloadAndRelaunch() async throws {
         enqueue("acknowledged", state: .discovered)
         await coordinator.start()

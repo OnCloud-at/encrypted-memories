@@ -137,6 +137,12 @@ public actor PendingBackupCoordinator {
 
     private var pendingEffectWrites: [PendingSourceKey: PendingEffectWrite] = [:]
     private var pendingActionWrites: [PendingActionID: PendingActionWrite] = [:]
+    /// A's completion is durable, but its latest handoff still has to establish whether B needs the trash.
+    private var unreadableLaterTrashKeys = Set<PendingSourceKey>()
+    private var startupLaterTrashKeys = Set<PendingSourceKey>()
+    private var startupLaterTrashGenerations: [PendingSourceKey: Int64] = [:]
+    private var laterTrashRecoveryTask: Task<Void, Never>?
+    private static let laterTrashBatchSize = 100
     /// A rejected dispatch marker sent nothing; the next reconcile tries it again.
     private var beginFailedKeys = Set<PendingSourceKey>()
     private var writesDegraded: Bool {
@@ -297,6 +303,7 @@ public actor PendingBackupCoordinator {
         await refreshMetadata()
         await refreshExcludedAccessibility()
         publishMembership(force: true)
+        queueLaterTrashRecovery()
         await reconcile()
         await runDueActions()
     }
@@ -312,6 +319,9 @@ public actor PendingBackupCoordinator {
         reconcileTimer?.cancel()
         actionTimer?.cancel()
         excludedCheckTask?.cancel()
+        laterTrashRecoveryTask?.cancel()
+        startupLaterTrashKeys.removeAll()
+        startupLaterTrashGenerations.removeAll()
         snapshotContinuation.finish()
     }
 
@@ -459,6 +469,10 @@ public actor PendingBackupCoordinator {
         guard !keys.isEmpty else { return true }
         for key in keys { _ = nextActionToken(for: key) }
         guard let states = store.include(keys, at: now()) else { return false }
+        for key in keys {
+            startupLaterTrashKeys.remove(key)
+            startupLaterTrashGenerations.removeValue(forKey: key)
+        }
         // Only the person's return starts a new attempt; a queue reload cannot clear the block.
         for key in keys { recorder?.replacementLedger.readmit(key) }
         excludedMissing.subtract(keys)
@@ -806,6 +820,10 @@ public actor PendingBackupCoordinator {
             case .readable(let state):
                 sourceStates[key] = state
                 unreadableSourceStates.remove(key)
+                if state?.desired != .excluded {
+                    startupLaterTrashKeys.remove(key)
+                    startupLaterTrashGenerations.removeValue(forKey: key)
+                }
             case .unreadable:
                 // The last known state stays; the source waits until a read succeeds.
                 unreadableSourceStates.insert(key)
@@ -1208,7 +1226,7 @@ public actor PendingBackupCoordinator {
     /// Order matters. A restore brings the Proton photo back before the source returns to the backup, so
     /// the duplicate check never mistakes the trashed photo for a deliberate remote deletion. A delete
     /// removes queue work before it trashes, so nothing uploads in between.
-    private func reconcile() async {
+    private func reconcile(retryLaterTrash: Bool = true) async {
         guard !closed else { return }
         guard !reconcileRunning else {
             reconcileAgain = true
@@ -1216,9 +1234,20 @@ public actor PendingBackupCoordinator {
         }
         reconcileRunning = true
         defer { reconcileRunning = false }
-        if sourceStatesIncomplete { loadSourceStates() }
+        if sourceStatesIncomplete {
+            loadSourceStates()
+            queueLaterTrashRecovery()
+        }
         if !unreadableSourceStates.isEmpty { reloadSourceStates(Array(unreadableSourceStates)) }
+        let laterTrashKeys = retryLaterTrash ? Array(unreadableLaterTrashKeys) : []
         retryPendingWrites()
+        for offset in stride(from: 0, to: laterTrashKeys.count, by: Self.laterTrashBatchSize) {
+            guard !closed else { return }
+            let batch = Array(laterTrashKeys[offset..<min(offset + Self.laterTrashBatchSize, laterTrashKeys.count)])
+            resumeLaterTrash(batch)
+            await Task.yield()
+        }
+        guard !closed else { return }
         repeat {
             reconcileAgain = false
             var incomplete = false
@@ -1254,7 +1283,56 @@ public actor PendingBackupCoordinator {
             // while an action awaits the network still runs another pass.
             await runDueActions()
         } while reconcileAgain && !closed
-        scheduleReconcileTimer()
+        scheduleReconcileTimer(advanceBackoff: retryLaterTrash)
+    }
+
+    /// Startup already loaded the source states. Reuse those keys after the first publication, and re-read each
+    /// current decision in the store before writing. Incomplete loads add their repaired rows on a later pass.
+    private func queueLaterTrashRecovery() {
+        guard !closed else { return }
+        // At most one remembered generation per current excluded source. Unknown keys retry independently below;
+        // this cache only stops an incomplete load from continually refilling its own startup queue.
+        startupLaterTrashGenerations = startupLaterTrashGenerations.filter {
+            sourceStates[$0.key]?.desired == .excluded
+        }
+        for state in sourceStates.values where state.desired == .excluded && state.remoteTrashed {
+            guard startupLaterTrashGenerations[state.key] != state.generation else { continue }
+            startupLaterTrashGenerations[state.key] = state.generation
+            startupLaterTrashKeys.insert(state.key)
+        }
+        guard laterTrashRecoveryTask == nil, !startupLaterTrashKeys.isEmpty else { return }
+        laterTrashRecoveryTask = Task { [weak self] in await self?.recoverLaterTrash() }
+    }
+
+    private func recoverLaterTrash() async {
+        defer { laterTrashRecoveryTask = nil }
+        while !closed, !Task.isCancelled, !startupLaterTrashKeys.isEmpty {
+            let keys = Array(startupLaterTrashKeys.prefix(Self.laterTrashBatchSize))
+            startupLaterTrashKeys.subtract(keys)
+            if resumeLaterTrash(keys) {
+                // These keys were just read. Do not retry their failure again in this same recovery pass.
+                await reconcile(retryLaterTrash: false)
+            }
+            await Task.yield()
+        }
+    }
+
+    @discardableResult
+    private func resumeLaterTrash(_ keys: [PendingSourceKey]) -> Bool {
+        var needsReconcile = false
+        for key in keys {
+            switch store.resumeLaterTrash(for: key, at: now()) {
+            case .unreadable:
+                unreadableLaterTrashKeys.insert(key)
+                needsReconcile = true
+            case .scheduled:
+                unreadableLaterTrashKeys.remove(key)
+                needsReconcile = true
+            case .unchanged: unreadableLaterTrashKeys.remove(key)
+            }
+        }
+        reloadSourceStates(keys)
+        return needsReconcile
     }
 
     private func performQueueSync(_ states: [PendingSourceState]) async {
@@ -1368,8 +1446,14 @@ public actor PendingBackupCoordinator {
         let saved: Bool
         switch write {
         case .complete(let effect, let generation, let remoteLinkID):
-            saved = store.completeEffect(
+            let result = store.completeEffectResult(
                 effect, for: key, generation: generation, remoteLinkID: remoteLinkID, at: date)
+            saved = result != .failed
+            if result == .laterHandoffUnreadable {
+                unreadableLaterTrashKeys.insert(key)
+            } else if saved, effect == .remoteTrash {
+                unreadableLaterTrashKeys.remove(key)
+            }
         case .deferAttempt:
             saved = store.deferEffects(for: key, at: date)
         }
@@ -1395,15 +1479,18 @@ public actor PendingBackupCoordinator {
         }
     }
 
-    private func scheduleReconcileTimer() {
+    private func scheduleReconcileTimer(advanceBackoff: Bool = true) {
         reconcileTimer?.cancel()
         reconcileTimer = nil
         guard !closed else { return }
         let delay: Duration
-        if sourceStatesDegraded || actionsDegraded || writesDegraded {
+        if sourceStatesDegraded || actionsDegraded || writesDegraded || !unreadableLaterTrashKeys.isEmpty {
             // An unreadable row or an unsaved result stays due, so its stored date would retry it every second.
             let limit = configuration.unreadableRetryLimit
-            let next = unreadableRetry.map { $0 > limit / 2 ? limit : $0 * 2 } ?? configuration.unreadableRetryDelay
+            let next =
+                advanceBackoff
+                ? unreadableRetry.map { $0 > limit / 2 ? limit : $0 * 2 } ?? configuration.unreadableRetryDelay
+                : unreadableRetry ?? configuration.unreadableRetryDelay
             // At least one second, whatever the configuration says, so a zero or negative limit never spins.
             let backoff = max(.seconds(1), min(next, limit))
             unreadableRetry = backoff
