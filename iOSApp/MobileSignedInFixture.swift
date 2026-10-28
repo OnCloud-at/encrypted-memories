@@ -100,7 +100,8 @@ import os
         /// Signs the shared account runtime in with this fixture. Library content first, then the session, so the
         /// runtime's session observer finds an already configured account and does not start a network backend.
         func install() {
-            let albums = MobileFixtureAlbums()
+            let albums = MobileFixtureAlbums(
+                startsEmpty: ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesEmptyAlbumFixture"))
             runtime.libraryModel.installIsolatedLibrary(
                 session: session, store: runtime.sessionModel.sessionStore, backend: backend,
                 sections: MobileUITestLaunch.libraryLoadScenario == nil ? sections : [],
@@ -562,12 +563,15 @@ import os
             canList: true, canCreate: true, canAddPhotos: true, canSetCover: false, canReadMemberships: true)
 
         private let lock = NSLock()
+        private let startsEmpty: Bool
         private var createdAlbums: [(id: AlbumID, title: String)] = []
         private var members: [AlbumID: Set<PhotoUID>] = [:]
 
+        init(startsEmpty: Bool = false) { self.startsEmpty = startsEmpty }
+
         func listAlbums() async throws -> [AlbumSummary] {
             lock.withLock {
-                ([(id: "fixture-album", title: Self.albumTitle)] + createdAlbums).map { album in
+                ((startsEmpty ? [] : [(id: "fixture-album", title: Self.albumTitle)]) + createdAlbums).map { album in
                     AlbumSummary(
                         id: album.id, title: album.title, photoCount: members[album.id]?.count ?? 0, coverPhotoID: nil)
                 }

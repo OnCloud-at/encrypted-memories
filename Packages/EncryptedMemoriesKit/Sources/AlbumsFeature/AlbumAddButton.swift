@@ -8,6 +8,7 @@ import SwiftUI
 public struct AlbumAddButton: View {
     #if os(iOS)
         @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+        @Environment(\.verticalSizeClass) private var verticalSizeClass
     #endif
     private let coordinator: AlbumActionCoordinator
     private let photoUIDs: [PhotoUID]
@@ -57,7 +58,7 @@ public struct AlbumAddButton: View {
 
     private var regularPresentation: Bool? {
         #if os(iOS)
-            horizontalSizeClass == .regular
+            AlbumPresentationTraits.usesRegularSizing(horizontal: horizontalSizeClass, vertical: verticalSizeClass)
         #else
             nil
         #endif

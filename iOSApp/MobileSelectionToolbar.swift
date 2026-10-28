@@ -1,3 +1,4 @@
+import AlbumsFeature
 import DesignSystemCore
 import PhotosCore
 import SwiftUI
@@ -24,6 +25,8 @@ struct MobileSelectionModeLabel: View {
 /// `ToolbarSpacer(.flexible)` is the documented system space item ("Spacers can ... be flexible and push items
 /// apart"); it separates the three Liquid Glass groups and adapts with the bar, unlike manual padding.
 struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     let selection: MobileGridSelectionController
     /// Whether the surface can add the selection to an album (the shared album coordinator is available).
     let canAddToAlbum: Bool
@@ -32,7 +35,7 @@ struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
     @Binding var showAlbumPicker: Bool
     let onShare: () -> Void
     let onTrash: () -> Void
-    @ViewBuilder let albumPicker: () -> AlbumPicker
+    @ViewBuilder let albumPicker: (Bool) -> AlbumPicker
 
     private var isSelecting: Bool { selection.isSelecting }
     private var actionsDisabled: Bool { selection.selected.isEmpty || selection.isBusy }
@@ -63,7 +66,11 @@ struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
             }
             .disabled(actionsDisabled || !canAddToAlbum)
             .accessibilityLabel(L10n.string("albums.add_selection_title"))
-            .popover(isPresented: $showAlbumPicker, arrowEdge: .bottom) { albumPicker() }
+            .popover(isPresented: $showAlbumPicker, arrowEdge: .bottom) {
+                albumPicker(
+                    AlbumPresentationTraits.usesRegularSizing(
+                        horizontal: horizontalSizeClass, vertical: verticalSizeClass))
+            }
             .mobileSelectionItemVisibility(isSelecting)
         }
         .sharedBackgroundVisibility(isSelecting ? .automatic : .hidden)

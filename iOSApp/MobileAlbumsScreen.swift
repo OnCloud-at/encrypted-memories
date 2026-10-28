@@ -18,6 +18,8 @@ struct MobileCollectionsScreen: View {
     /// `@Environment` over the `@Observable` model: Collections reads only `backend`/`thumbnailFeed`, so a
     /// timeline snapshot change no longer re-renders this list.
     @Environment(MobileLibraryModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var showCreateAlbum = false
     @State private var pendingSharedAlbumLeave: SharedAlbumSummary?
 
@@ -131,6 +133,8 @@ struct MobileCollectionsScreen: View {
                 if let coordinator = model.albumActions {
                     AlbumCreationSheet(
                         coordinator: coordinator,
+                        regularPresentation: AlbumPresentationTraits.usesRegularSizing(
+                            horizontal: horizontalSizeClass, vertical: verticalSizeClass),
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in showCreateAlbum = false }
                     )
@@ -334,7 +338,6 @@ private struct MobileAlbumRow: View {
 
 /// Presents the shared timeline grid for a `PhotoFilter` route. The route supplies the title and data source.
 private struct MobileFilterGridScreen: View {
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(MobileLibraryModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let title: String
@@ -554,12 +557,12 @@ private struct MobileFilterGridScreen: View {
                         showAlbumPhotoActions = true
                     }
                 },
-                albumPicker: {
+                albumPicker: { regularPresentation in
                     if let coordinator = model.albumActions {
                         AlbumDestinationPicker(
                             coordinator: coordinator,
                             photoUIDs: snapshot.orderedUIDs(including: selection.selected),
-                            regularPresentation: horizontalSizeClass == .regular,
+                            regularPresentation: regularPresentation,
                             onAlbumsChanged: { model.noteAlbumsChanged() },
                             onCompleted: { _ in
                                 showAlbumPicker = false

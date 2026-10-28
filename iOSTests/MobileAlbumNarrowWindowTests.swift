@@ -9,6 +9,13 @@ import XCTest
 
 /// Measures the native picker in a resized test window; this does not simulate Split View or a fold.
 final class MobileAlbumNarrowWindowTests: XCTestCase {
+    func testRegularSizingRequiresBothRegularSizeClasses() {
+        XCTAssertTrue(AlbumPresentationTraits.usesRegularSizing(horizontal: .regular, vertical: .regular))
+        XCTAssertFalse(AlbumPresentationTraits.usesRegularSizing(horizontal: .regular, vertical: .compact))
+        XCTAssertFalse(AlbumPresentationTraits.usesRegularSizing(horizontal: .compact, vertical: .regular))
+        XCTAssertFalse(AlbumPresentationTraits.usesRegularSizing(horizontal: nil, vertical: .regular))
+    }
+
     @MainActor func testCompactWindowKeepsAlbumPickerInsideAvailableWidth() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
@@ -31,7 +38,12 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
             window.rootViewController = nil
             previousKeyWindow?.makeKey()
         }
-        try await Task.sleep(for: .seconds(2))
+        await fulfillment(
+            of: [
+                XCTNSPredicateExpectation(
+                    predicate: NSPredicate(format: "presentedViewController != nil"), object: root)
+            ],
+            timeout: 10)
         let presented = try XCTUnwrap(root.presentedViewController, "The album picker must be presented")
         let frame = presented.view.convert(presented.view.bounds, to: window)
         print("[Album narrow window] window=\(window.bounds) presented=\(frame)")
@@ -55,7 +67,11 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
             regularWindow.isHidden = true
             regularWindow.rootViewController = nil
         }
-        try await Task.sleep(for: .seconds(2))
+        await fulfillment(
+            of: [
+                XCTNSPredicateExpectation(
+                    predicate: NSPredicate(format: "presentedViewController != nil"), object: regularRoot)
+            ], timeout: 10)
         let regularPicker = try XCTUnwrap(regularRoot.presentedViewController, "The regular album picker must open")
         let regularFrame = regularPicker.view.convert(regularPicker.view.bounds, to: regularWindow)
         print("[Album narrow window] regular window=\(regularWindow.bounds) presented=\(regularFrame)")

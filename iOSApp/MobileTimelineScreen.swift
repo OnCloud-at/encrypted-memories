@@ -28,7 +28,6 @@ enum MobileTimelineSurface: Equatable {
 /// The shared library and search timeline. Each native tab owns only its presentation state; both surfaces
 /// use the same Metal grid, projection pipeline, selection contract and viewer router.
 struct MobileTimelineScreen: View {
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.verticalBarEdge) private var verticalBarEdge
@@ -290,12 +289,12 @@ struct MobileTimelineScreen: View {
             showAlbumPicker: $showAlbumPicker,
             onShare: startShare,
             onTrash: { selection.showTrashConfirm = true },
-            albumPicker: {
+            albumPicker: { regularPresentation in
                 if let coordinator = model.albumActions {
                     AlbumDestinationPicker(
                         coordinator: coordinator,
                         photoUIDs: model.selectedUIDs(selection.selected),
-                        regularPresentation: horizontalSizeClass == .regular,
+                        regularPresentation: regularPresentation,
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in
                             showAlbumPicker = false

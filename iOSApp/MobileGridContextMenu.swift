@@ -108,6 +108,7 @@ import SwiftUI
 
 private struct MobileGridContextMenuPresentation: ViewModifier {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Bindable var controller: MobileGridContextMenuController
     let model: MobileLibraryModel
     let onRemoved: (Set<PhotoUID>) -> Void
@@ -118,7 +119,8 @@ private struct MobileGridContextMenuPresentation: ViewModifier {
                 if let coordinator = model.albumActions {
                     AlbumDestinationPicker(
                         coordinator: coordinator, photoUIDs: payload.photos.map(\.uid),
-                        regularPresentation: horizontalSizeClass == .regular,
+                        regularPresentation: AlbumPresentationTraits.usesRegularSizing(
+                            horizontal: horizontalSizeClass, vertical: verticalSizeClass),
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in controller.albumItems = nil })
                 }
