@@ -1747,8 +1747,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertFalse(delays.values.contains(.seconds(1)))
     }
 
-    /// A trash finished, the store now owes the trash of a later commit, and the source's keyed read fails. The pass
-    /// must not trust the last known state and dispatch the new trash again and again; it waits for the backoff.
+    /// The queue result is saved before the trash starts. Only the reads after that trash fail; the pending
+    /// trash completion prevents another dispatch when the backoff opens the next pass.
     func testATrashWhoseStateCannotBeReadAfterwardsIsNotDispatchedAgainInTheSamePass() async throws {
         XCTAssertNotNil(
             store.exclude(
@@ -1760,32 +1760,50 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let url = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
         XCTAssertTrue(Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 500)", of: "s", at: url))
         let gate = OpenGate()
+        defer { gate.open() }
+        let retryGate = OpenGate()
+        defer { retryGate.open() }
+        let trashGate = LookupGate()
+        defer { trashGate.open() }
+        effects.trashGate = trashGate
         let delays = DelayLog()
         await coordinator.close()
         coordinator = makeCoordinator(
             checkmarkDuration: .seconds(5),
             sleep: { duration in
                 delays.append(duration)
-                if duration == .seconds(500) { await gate.wait() } else { try await Task.sleep(for: .seconds(3600)) }
+                if duration == .seconds(500) {
+                    await gate.wait()
+                } else if duration == .seconds(60) {
+                    await retryGate.wait()
+                } else {
+                    try await Task.sleep(for: .seconds(3600))
+                }
             })
         await coordinator.start()
-        let started = ContinuousClock.now + .seconds(5)
-        while !delays.values.contains(.seconds(500)), ContinuousClock.now < started {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        // The store now owes the trash of photo B, while the coordinator still knows photo A.
+        try await waitUntil { delays.values.contains(.seconds(500)) }
+        XCTAssertTrue(delays.values.contains(.seconds(500)), "the initial retry is held before the fault")
+        // The store now owes photo B. Its queue completion must succeed before the read fault starts.
         XCTAssertTrue(
             Self.setColumns("remote_link_id='b', next_attempt_at=\(date.timeIntervalSince1970)", of: "s", at: url))
+        gate.open()
+        guard await trashGate.entered(within: .seconds(5)) else {
+            XCTFail("photo B never reached the trash gate")
+            await coordinator.close()
+            return
+        }
+        let beforeTrash = try XCTUnwrap(store.sourceState(for: key("s")))
+        XCTAssertFalse(beforeTrash.needsQueueSync, "queue completion is durable before the fault")
         let failure = KeyedReadFailure()
         try failure.install(on: store)
         defer { failure.remove(from: store) }
-
-        gate.open()
-
-        let deadline = ContinuousClock.now + .seconds(5)
-        while !delays.values.contains(.seconds(60)), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        trashGate.open()
+        try await waitUntil { delays.values.contains(.seconds(60)) }
+        XCTAssertTrue(delays.values.contains(.seconds(60)), "the rejected trash completion starts the backoff")
+        retryGate.open()
+        try await waitUntil { delays.values.contains(.seconds(120)) }
+        XCTAssertTrue(
+            delays.values.contains(.seconds(120)), "the next pass retries persistence and doubles the backoff")
         XCTAssertGreaterThan(failure.count, 0)
         XCTAssertEqual(effects.trashed.joined().filter { $0.nodeID == "b" }.count, 1, "photo B is sent once per pass")
         XCTAssertTrue(delays.values.contains(.seconds(60)), "the source waits for the backoff")
