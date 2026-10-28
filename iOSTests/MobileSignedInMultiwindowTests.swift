@@ -237,11 +237,22 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         try await waitUntil("reactivated window shows the reconfigured library") {
             grids(in: firstWindow).count == 1 && grids(in: firstWindow).first?.thumbnailFeed === fixture.feed
         }
-        let gridA3 = try XCTUnwrap(grids(in: firstWindow).first)
-        let resumedBefore = gridA3.renderTickCount
-        gridA3.handleImagesAvailable()
-        try await waitUntil("reactivated grid renders again") { gridA3.renderTickCount > resumedBefore }
-        note("reactivated first window: grid renders again (ticks \(resumedBefore) -> \(gridA3.renderTickCount))")
+        // The window may rebuild its grid while the scene returns. Wake whichever grid the window shows now, and
+        // count its ticks from the moment it appears.
+        var probe = try XCTUnwrap(grids(in: firstWindow).first)
+        var resumedBefore = probe.renderTickCount
+        try await waitUntil("reactivated grid renders again") {
+            guard let current = grids(in: firstWindow).first(where: { $0.thumbnailFeed === fixture.feed }) else {
+                return false
+            }
+            if current !== probe {
+                probe = current
+                resumedBefore = current.renderTickCount
+            }
+            current.handleImagesAvailable()
+            return current.renderTickCount > resumedBefore
+        }
+        note("reactivated first window: grid renders again (ticks \(resumedBefore) -> \(probe.renderTickCount))")
         let reopened = Set(windowScenes().map(\.session.persistentIdentifier))
         UIApplication.shared.activateSceneSession(for: UISceneSessionActivationRequest(role: .windowApplication)) {
             XCTFail("third scene activation failed: \($0)")
@@ -263,7 +274,8 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
             _ in
         }
         try await waitUntil("first scene is active again") { firstScene.activationState == .foregroundActive }
-        XCTAssertEqual(runtime.appliedOpportunity, .foregroundActive)
+        // The shared ledger follows the scene's phase asynchronously, and a scene the platform kept reports too.
+        try await waitUntil("the account follows the active window") { runtime.appliedOpportunity == .foregroundActive }
     }
 
     // MARK: - Helpers
