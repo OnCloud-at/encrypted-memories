@@ -76,7 +76,15 @@ You own your pull request until a maintainer merges or closes it. A review can t
 
 ## Local verification
 
-Run focused tests while you work. Run these gates before requesting review:
+Run focused tests while you work. Before you request review, run these local checks:
+
+- the focused tests of the code that you changed;
+- the style check of the changed files: `BASE_SHA=<base> HEAD_SHA=<head> ./scripts/verify-swift-style.sh`;
+- the shell build of each app that your change touches (see below);
+- the device runs that CI does not do: the iPhone Duo simulator, iPad, repeated runs of a flaky test,
+  macOS runtime behavior, and mutation runs.
+
+Run the full local gates only when your change touches storage, a migration, backup, or deletion:
 
 ```bash
 ./scripts/verify-tests.sh
@@ -84,6 +92,10 @@ Run focused tests while you work. Run these gates before requesting review:
 ./scripts/verify-ios-app-tests.sh ui
 ./scripts/verify-universal-core.sh fast
 ```
+
+A pull request runs only repository hygiene and the Swift style check on Linux. The merge queue runs the package
+tests, the iOS app and UI tests, and both platform builds before the merge. For every gate that you did not run
+locally, write "covered by the merge queue" in the pull request.
 
 `ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=1 ./scripts/verify-tests.sh` skips the vendored SDK tests for a quick local run.
 CI refuses this switch, and the gate before review runs without it.
