@@ -9,7 +9,7 @@ import XCTest
 final class MobilePrivacyPreviewShieldTests: XCTestCase {
     @MainActor func testInactivePreviewBlursContentWithoutTurningBlack() async throws {
         let scene = try XCTUnwrap(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 200, height: 200)
         window.overrideUserInterfaceStyle = .dark
@@ -41,7 +41,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
 
     @MainActor func testProductionMetalGridRetainsItsColorsInTheBlurredPreview() async throws {
         let scene = try XCTUnwrap(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            UIApplication.shared.foregroundWindowScene)
         let fixture = try await MobileSignedInFixture(itemsPerSection: 6)
         defer { fixture.removeCache() }
         // Put distinct fixture colors next to each other, starting with the brightest thumbnails.
@@ -192,7 +192,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
     }
 
     @MainActor func testPreviewFadesInAndOutAndSurvivesRapidReactivation() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let previous = scene.windows.first(where: \.isKeyWindow)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = UIViewController()
@@ -234,7 +234,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
     }
 
     @MainActor func testBackgroundNotificationFinishesTheFadeBeforeTheSnapshot() async throws {
-        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let previous = scene.windows.first(where: \.isKeyWindow)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = UIViewController()
@@ -317,7 +317,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
 
     @MainActor func testSceneLifecycleCoversAndRestoresTheRegisteredWindow() throws {
         let scene = try XCTUnwrap(
-            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = UIViewController()
         let original = UserDefaults.standard.object(forKey: AppSettingsKey.blurAppPreview)
