@@ -513,6 +513,25 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.trashCalls, [[main]])
     }
 
+    func testAPartialAlbumWriteKeepsTheSeriesAndDoesNotJournalTheBatch() async throws {
+        server.addAlbum("album-own", volumeID: "own", members: ["m1"])
+        server.failNextAlbumWriteAfterOneAdd()
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
+            XCTFail("a partial album write must stop before trash")
+        } catch {}
+        XCTAssertTrue(server.trashCalls.isEmpty)
+        let journal = try XCTUnwrap(journalStore.journal(forSeries: main))
+        XCTAssertEqual(journal.phase, .copyingFavorites)
+        XCTAssertTrue(journal.favorites.allSatisfy { $0.addedAlbumIDs.isEmpty })
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
+        XCTAssertEqual(server.albumMembers("album-own"), expected(["m1"], copies))
+        XCTAssertEqual(server.uploads.count, 2, "the retry reuses both confirmed copies")
+        XCTAssertEqual(server.trashCalls, [[main]])
+    }
+
     func testACancelDuringAnAlbumWriteStopsBeforeTheTrashAndTheRetryAddsEachAlbumOnce() async throws {
         server.addAlbum("album-a", volumeID: "own", members: ["m1"])
         server.addAlbum("album-b", volumeID: "own", members: ["m1"])
@@ -902,6 +921,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var trashFailures = 0
     private var favoriteFailures = 0
     private var albumFailures = 0
+    private var partialAlbumFailures = 0
     private var albumCancels = Set<String>()
     private var albumCancellationErrors = Set<String>()
     private var cancelsAfterAlbumWrite = Set<String>()
@@ -994,6 +1014,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     func failNextFavoriteWrite() { lock.withLock { favoriteFailures = 1 } }
     func failNextAlbumWrite() { lock.withLock { albumFailures = 1 } }
+    func failNextAlbumWriteAfterOneAdd() { lock.withLock { partialAlbumFailures = 1 } }
     /// The next write to the album cancels the task that sends it, as a sign-out or a closed screen does. The network
     /// layer reports that cancel as `URLError.cancelled`.
     func cancelDuringAlbumWrite(to albumID: String) { lock.withLock { _ = albumCancels.insert(albumID) } }
@@ -1137,6 +1158,11 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
         try lock.withLock {
+            if partialAlbumFailures > 0 {
+                partialAlbumFailures -= 1
+                if let first = uids.first { _albums[albumID]?.members.insert(first.nodeID) }
+                throw UploadError.retryableBackend(code: 429, message: "partial album write")
+            }
             if albumCancels.remove(albumID) != nil {
                 withUnsafeCurrentTask { $0?.cancel() }
                 throw URLError(.cancelled)

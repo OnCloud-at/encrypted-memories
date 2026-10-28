@@ -130,12 +130,8 @@ public final class ProtonClientFacade {
                             + "ok=\(result.attachedCount + result.alreadyMemberCount) failed=\(result.failedCount) "
                             + "reason=\(result.firstFailureMessage ?? "unknown")"
                     )
-                    throw AlbumError.partialAdd(
-                        succeeded: result.attachedCount + result.alreadyMemberCount,
-                        total: photoUIDs.count,
-                        message: result.firstFailureMessage ?? "add to album failed"
-                    )
                 }
+                try result.requireComplete(for: photoUIDs)
             },
             removeProvider: { photoUIDs, albumID in
                 try await bridge.removePhotos(photoUIDs, fromAlbum: albumID)

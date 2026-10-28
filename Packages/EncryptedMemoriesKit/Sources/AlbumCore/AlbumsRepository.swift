@@ -238,7 +238,8 @@ public actor AlbumsRepository: AlbumManaging {
                 albumName: trimmed,
                 message: (error as? AlbumError)?.diagnosticDescription
                     ?? (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+                    ?? error.localizedDescription,
+                cause: (error as? AlbumError)?.writeCause ?? AlbumWriteCause(error)
             )
         }
         return albumID
@@ -332,9 +333,10 @@ public actor AlbumsRepository: AlbumManaging {
         )
     }
 
-    private static func normalized(_ error: Error) -> AlbumError {
+    private static func normalized(_ error: Error) -> any Error {
+        if error is CancellationError { return error }
         if let albumError = error as? AlbumError { return albumError }
-        return .backend((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        return AlbumError.requestFailed(AlbumWriteCause(error))
     }
 
     private static func unique(_ photoUIDs: [PhotoUID]) -> [PhotoUID] {
