@@ -11,6 +11,7 @@
     final class AlbumToolbarRenderingTests: XCTestCase {
         @MainActor func testAlbumSheetKeepsItsTextActionsOnMac() async throws {
             _ = NSApplication.shared
+            try requireVisionOCR()
             let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
             let host = NSHostingController(
@@ -22,20 +23,28 @@
             for _ in 0..<100 where window.attachedSheet == nil {
                 try await Task.sleep(for: .milliseconds(50))
             }
-            let sheet = try XCTUnwrap(window.attachedSheet)
+            let sheet = try XCTUnwrap(window.attachedSheet, "Album Mac: attachedSheet unavailable")
             defer { sheet.orderOut(nil) }
             try await Task.sleep(for: .milliseconds(500))
-            let view = try XCTUnwrap(sheet.contentView?.superview)
+            let contentView = try XCTUnwrap(sheet.contentView, "Album Mac: sheet contentView unavailable")
+            let view = try XCTUnwrap(contentView.superview, "Album Mac: contentView superview unavailable")
             for appearance in [NSAppearance.Name.aqua, .darkAqua] {
                 sheet.appearance = NSAppearance(named: appearance)
                 try await Task.sleep(for: .milliseconds(300))
                 view.layoutSubtreeIfNeeded()
-                let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+                let bitmap = try XCTUnwrap(
+                    view.bitmapImageRepForCachingDisplay(in: view.bounds), "Album Mac: bitmapRep unavailable")
                 view.cacheDisplay(in: view.bounds, to: bitmap)
                 let request = VNRecognizeTextRequest()
                 request.recognitionLevel = .accurate
                 request.recognitionLanguages = ["de-DE", "en-US"]
-                try VNImageRequestHandler(cgImage: XCTUnwrap(bitmap.cgImage)).perform([request])
+                let image = try XCTUnwrap(bitmap.cgImage, "Album Mac: bitmap cgImage unavailable")
+                do {
+                    try VNImageRequestHandler(cgImage: image).perform([request])
+                } catch {
+                    XCTFail("Album Mac: Vision.perform failed: \(error)")
+                    throw error
+                }
                 let visibleText = request.results?.compactMap { $0.topCandidates(1).first?.string } ?? []
                 print("[Album Mac] visible text=\(visibleText)")
                 XCTAssertTrue(visibleText.contains(L10n.string("action.cancel")))
@@ -51,6 +60,27 @@
                     try data.write(to: url.appendingPathComponent("album-\(appearance.rawValue).png"))
                 }
             }
+        }
+
+        @MainActor private func requireVisionOCR() throws {
+            let renderer = ImageRenderer(
+                content: Text("Cancel Create")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.black)
+                    .padding(20)
+                    .background(.white))
+            renderer.scale = 2
+            let image = try XCTUnwrap(renderer.cgImage, "Album Mac: Vision probe bitmap cgImage unavailable")
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["de-DE", "en-US"]
+            do {
+                try VNImageRequestHandler(cgImage: image).perform([request])
+            } catch {
+                throw XCTSkip("Vision OCR unavailable on this runner")
+            }
+            let text = request.results?.compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ") ?? ""
+            guard !text.isEmpty else { throw XCTSkip("Vision OCR unavailable on this runner") }
         }
     }
 #endif
