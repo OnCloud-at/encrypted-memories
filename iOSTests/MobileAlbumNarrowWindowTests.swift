@@ -55,10 +55,11 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         root.presentedViewController?.dismiss(animated: false)
         window.isHidden = true
         let regularWindow = UIWindow(windowScene: scene)
-        regularWindow.frame = CGRect(x: 0, y: 0, width: 400, height: 700)
+        regularWindow.frame = CGRect(x: 0, y: 0, width: 400, height: 1000)
         regularWindow.traitOverrides.horizontalSizeClass = .regular
         let regularRoot = UIHostingController(
-            rootView: AlbumAddButton(coordinator: coordinator, photoUIDs: [photo], isPresented: .constant(true)))
+            rootView: AlbumAddButton(coordinator: coordinator, photoUIDs: [photo], isPresented: .constant(true))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top))
         regularRoot.traitOverrides.horizontalSizeClass = .regular
         regularWindow.rootViewController = regularRoot
         regularWindow.makeKeyAndVisible()
@@ -77,6 +78,8 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         print("[Album narrow window] regular window=\(regularWindow.bounds) presented=\(regularFrame)")
         XCTAssertGreaterThanOrEqual(regularFrame.width, 300, "The regular picker must have usable width")
         XCTAssertGreaterThan(regularFrame.height, 0)
+        XCTAssertGreaterThanOrEqual(regularFrame.height, 380, "The regular picker must show its content")
+        XCTAssertLessThanOrEqual(regularFrame.height, 391, "The regular picker must keep its height bounded")
         XCTAssertGreaterThanOrEqual(regularFrame.minX, regularWindow.bounds.minX - 1)
         XCTAssertLessThanOrEqual(regularFrame.maxX, regularWindow.bounds.maxX + 1)
     }

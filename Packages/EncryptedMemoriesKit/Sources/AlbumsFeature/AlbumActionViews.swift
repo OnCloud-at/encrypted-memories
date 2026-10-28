@@ -179,9 +179,11 @@ public struct AlbumDestinationPicker: View {
         #endif
     }
 
-    private var pickerHeight: CGFloat {
-        coordinator.albums.isEmpty ? 210 : min(390, 145 + CGFloat(coordinator.albums.count) * 42)
-    }
+    #if os(macOS)
+        private var pickerHeight: CGFloat {
+            coordinator.albums.isEmpty ? 210 : min(390, 145 + CGFloat(coordinator.albums.count) * 42)
+        }
+    #endif
 
     @ViewBuilder private var destinationRows: some View {
         if coordinator.isLoading, coordinator.albums.isEmpty {
@@ -256,7 +258,7 @@ public struct AlbumDestinationPicker: View {
 
         func body(content: Content) -> some View {
             if regular {
-                content.frame(idealWidth: width, maxWidth: width, idealHeight: height, maxHeight: height)
+                content.frame(idealWidth: width, maxWidth: width, idealHeight: height)
             } else {
                 content
             }
