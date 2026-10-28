@@ -9,6 +9,164 @@ import UploadCore
 
 @Suite("SDK album catalog")
 struct SDKAlbumCatalogBackendTests {
+    @Test(.enabled(if: D1SupportOverheadProbe.enabled))
+    func benchmarkD1NodeFactsCollectionOverhead() async throws {
+        let photos = (0..<64).map {
+            photoNode(
+                id: "benchmark-\($0)", albumIDs: [],
+                additionalMetadata: [
+                    AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"Test camera"}"#.utf8)),
+                    AdditionalMetadata(name: "Media", utf8JsonValue: Data(#"{"Width":4032,"Height":3024}"#.utf8)),
+                ])
+        }
+        let nodes = Dictionary(uniqueKeysWithValues: photos.map {
+            ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0))
+        })
+        let uids = photos.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
+        let requested = uids + uids
+        let referenceClient = FakeSDKPhotoCatalogClient()
+        await referenceClient.configureNodes(nodes)
+        let expected = try await SDKAlbumCatalogBackend(client: referenceClient).nodeFacts(of: requested)
+        #expect(expected.count == 64)
+
+        try await D1SupportOverheadProbe.pairs(workload: "nodeFacts64") { enabled in
+            let client = FakeSDKPhotoCatalogClient()
+            await client.configureNodes(nodes)
+            let collector = enabled ? SupportWorkMeasurements() : nil
+            let backend = SDKAlbumCatalogBackend(client: client, workMeasurements: collector)
+            let (last, elapsed) = try await D1SupportOverheadProbe.timed {
+                var last: [PhotoUID: ExactDuplicateNodeFacts] = [:]
+                for _ in 0..<64 { last = try await backend.nodeFacts(of: requested) }
+                return last
+            }
+            #expect(last == expected)
+            #expect(await client.getNodeCalls == 4096)
+            #expect(await client.maximumConcurrentGetNodeCalls <= 4)
+            if let collector {
+                let state = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.nodeFactsBatch.rawValue]
+                #expect(state.started == 64 && state.completed == 64 && state.inProgress == 0)
+                #expect(state.counters == [0, 0, 8192, 4096, 4096, 4096, 4096])
+            }
+            return elapsed
+        }
+    }
+
+    @Test(.enabled(if: D1SupportOverheadProbe.enabled))
+    func benchmarkD1ViewerCollectionOverhead() async throws {
+        let photo = photoNode(
+            id: "benchmark-viewer", albumIDs: [],
+            additionalMetadata: [
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"Test camera"}"#.utf8)),
+                AdditionalMetadata(name: "Media", utf8JsonValue: Data(#"{"Width":4032,"Height":3024}"#.utf8)),
+            ])
+        let nodes = [photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)]
+        let uid = PhotoUID(volumeID: photo.uid.volumeID, nodeID: photo.uid.nodeID)
+        let referenceClient = FakeSDKPhotoCatalogClient()
+        await referenceClient.configureNodes(nodes)
+        let expected = try await SDKPhotoMetadataReader.read(for: uid, client: referenceClient)
+
+        try await D1SupportOverheadProbe.pairs(workload: "viewerRead") { enabled in
+            let client = FakeSDKPhotoCatalogClient()
+            await client.configureNodes(nodes)
+            let collector = enabled ? SupportWorkMeasurements() : nil
+            let (last, elapsed) = try await D1SupportOverheadProbe.timed {
+                var last: SDKPhotoMetadataReader.ReadResult?
+                for _ in 0..<2048 {
+                    last = try await SDKPhotoMetadataReader.read(for: uid, client: client, workMeasurements: collector)
+                }
+                return last
+            }
+            let actual = try #require(last)
+            #expect(actual.metadata == expected.metadata && actual.timelineOrder == expected.timelineOrder)
+            #expect(await client.getNodeCalls == 2048)
+            if let collector {
+                let state = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.viewerRead.rawValue]
+                #expect(state.started == 2048 && state.completed == 2048 && state.inProgress == 0)
+                #expect(state.counters == [0, 0, 2048, 2048, 2048, 2048, 2048])
+            }
+            return elapsed
+        }
+    }
+
+    @Test func diagnosticNodeFactsCountActualReadsWithoutRetainingInputs() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(
+            id: "private-photo-id", albumIDs: [],
+            additionalMetadata: [AdditionalMetadata(
+                name: "Camera", utf8JsonValue: Data(#"{"Device":"private-camera-name"}"#.utf8))])
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)])
+        let uid = PhotoUID(volumeID: "volume", nodeID: "private-photo-id")
+        let measurements = SupportWorkMeasurements()
+        let facts = try await SDKAlbumCatalogBackend(client: client, workMeasurements: measurements)
+            .nodeFacts(of: [uid, uid])
+        #expect(facts[uid]?.fingerprint.device == "private-camera-name")
+        #expect(await client.getNodeCalls == 1)
+        let snapshot = measurements.workMeasurementSupportSnapshot()
+        let state = snapshot.passes[SupportMeasurementKind.nodeFactsBatch.rawValue]
+        #expect(state.counters == [0, 0, 2, 1, 1, 1, 1])
+        #expect(state.samples.last?.outcome == 0)
+        let exported = String(decoding: try JSONEncoder().encode(snapshot), as: UTF8.self)
+        #expect(!exported.contains("private-photo-id"))
+        #expect(!exported.contains("private-camera-name"))
+        #expect(!exported.contains(".jpg"))
+    }
+
+    @Test func diagnosticViewerReadsDistinguishNilFromProducedMetadata() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(id: "private-photo", albumIDs: [])
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)])
+        let measurements = SupportWorkMeasurements()
+        let uid = PhotoUID(volumeID: "volume", nodeID: "private-photo")
+        for _ in 0..<2 {
+            _ = try await SDKPhotoMetadataReader.read(for: uid, client: client, workMeasurements: measurements)
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await SDKPhotoMetadataReader.read(
+                for: PhotoUID(volumeID: "volume", nodeID: "private-missing"),
+                client: client, workMeasurements: measurements)
+        }
+        let state = measurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.viewerRead.rawValue]
+        #expect(await client.getNodeCalls == 3)
+        #expect(state.completed == 3)
+        #expect(state.counters == [0, 0, 3, 3, 3, 3, 2])
+        #expect(state.samples.last?.counters == [0, 0, 1, 1, 1, 1, 0])
+        #expect(state.samples.last?.outcome == 2)
+    }
+
+    @Test func diagnosticCancelledSDKReadInventsNoReturnOrFacts() async throws {
+        let client = FakeSDKPhotoCatalogClient(nodeDelay: .seconds(3600))
+        let measurements = SupportWorkMeasurements()
+        let operation = Task {
+            try await SDKPhotoMetadataReader.read(
+                for: PhotoUID(volumeID: "volume", nodeID: "private-photo"),
+                client: client, workMeasurements: measurements)
+        }
+        defer { operation.cancel() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await client.getNodeCalls == 0, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(await client.getNodeCalls == 1)
+        operation.cancel()
+        await #expect(throws: CancellationError.self) { try await operation.value }
+        let state = measurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.viewerRead.rawValue]
+        #expect(state.counters == [0, 0, 1, 1, 1, 0, 0])
+        #expect(state.samples.last?.outcome == 3)
+    }
+
+    @Test func diagnosticNodeFactsKeepTheExistingConcurrencyLimit() async throws {
+        let client = FakeSDKPhotoCatalogClient(nodeDelay: .milliseconds(1))
+        let photos = (0..<8).map { photoNode(id: "photo-\($0)", albumIDs: []) }
+        await client.configureNodes(Dictionary(uniqueKeysWithValues: photos.map {
+            ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0))
+        }))
+        let measurements = SupportWorkMeasurements()
+        let uids = photos.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
+        let facts = try await SDKAlbumCatalogBackend(client: client, workMeasurements: measurements).nodeFacts(of: uids)
+        #expect(facts.count == 8)
+        #expect(await client.maximumConcurrentGetNodeCalls <= 4)
+        let state = measurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.nodeFactsBatch.rawValue]
+        #expect(state.counters == [0, 0, 8, 8, 8, 8, 8])
+    }
+
     @Test func detailReadUsesOneRequestForDisplayAndOrderMetadata() async throws {
         let client = FakeSDKPhotoCatalogClient()
         let photo = photoNode(

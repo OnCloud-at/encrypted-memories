@@ -16,6 +16,7 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
     private var journals: [WeakSource] = []
     private weak var places: (any PhotoPlaceSupportSource)?
     private weak var requests: (any RemoteRequestSupportSource)?
+    private weak var workMeasurements: (any SupportWorkMeasurementSource)?
     private var pendingGrid = PendingGridSupportSnapshot()
     private let trail: SupportEventTrail
 
@@ -59,6 +60,26 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
     public func requestSnapshot() async -> RemoteRequestSupportSnapshot? {
         let source = lock.withLock { requests }
         return await source?.remoteRequestSupportSnapshot()
+    }
+
+    public func registerWorkMeasurements(_ source: any SupportWorkMeasurementSource) {
+        lock.withLock { workMeasurements = source }
+    }
+
+    /// A retired account cannot remove the replacement account's measurement source.
+    public func unregisterWorkMeasurements(_ source: any SupportWorkMeasurementSource) {
+        lock.withLock {
+            if workMeasurements === source { workMeasurements = nil }
+        }
+    }
+
+    public func workMeasurementSnapshot() -> SupportWorkMeasurementSnapshot {
+        let source = lock.withLock { workMeasurements }
+        guard let source else { return .unavailable }
+        let snapshot = source.workMeasurementSupportSnapshot()
+        return lock.withLock {
+            workMeasurements === source ? snapshot : .unavailable
+        }
     }
 
     public func registerPlaces(_ source: any PhotoPlaceSupportSource) {

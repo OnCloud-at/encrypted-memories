@@ -5,6 +5,14 @@ enum ProtonRequestScope: CaseIterable, Hashable, Sendable {
     case api
     case storageDownload
     case storageUpload
+
+    var measurementQueue: SupportMeasurementQueue {
+        switch self {
+        case .api: .api
+        case .storageDownload: .storageDownload
+        case .storageUpload: .storageUpload
+        }
+    }
 }
 
 enum ProtonRequestPriority: Int, CaseIterable, Sendable, Comparable {
@@ -125,6 +133,7 @@ actor ProtonRequestGovernor {
         let priorityHandle: PriorityHandle?
         let sequence: UInt64
         let enqueuedAt: Date
+        let measurementEnqueuedAt: Duration?
         let label: ProtonRequestLabel?
         let cause: String
         let continuation: CheckedContinuation<Permit, Error>
@@ -157,6 +166,7 @@ actor ProtonRequestGovernor {
         }
     }
 
+    nonisolated let workMeasurements: SupportWorkMeasurements
     private let configuration: Configuration
     private let now: @Sendable () -> Date
     /// Lock-based so a nonisolated caller can open and close a cause without an actor hop.
@@ -178,11 +188,13 @@ actor ProtonRequestGovernor {
     init(
         configuration: Configuration = .production,
         now: @escaping @Sendable () -> Date = { Date() },
+        workMeasurements: SupportWorkMeasurements = SupportWorkMeasurements(),
         summaryLog: @escaping @Sendable ([String: String]) -> Void = {
             PhotoDiagnostics.shared.emitDebug("ProtonRequests", $0)
         }
     ) {
         self.configuration = configuration
+        self.workMeasurements = workMeasurements
         self.now = now
         self.summaryLog = summaryLog
         states = Dictionary(
@@ -222,6 +234,7 @@ actor ProtonRequestGovernor {
                         priorityHandle: priorityHandle,
                         sequence: sequence,
                         enqueuedAt: now(),
+                        measurementEnqueuedAt: workMeasurements.instant(),
                         label: label,
                         cause: cause,
                         continuation: continuation
@@ -445,6 +458,7 @@ actor ProtonRequestGovernor {
             let index = state.waiters.firstIndex(where: { $0.id == id })
         else { return }
         let waiter = state.waiters.remove(at: index)
+        workMeasurements.recordQueueWait(scope.measurementQueue, since: waiter.measurementEnqueuedAt, cancelled: true)
         states[scope] = state
         waiter.continuation.resume(throwing: CancellationError())
         drain(scope)
@@ -490,6 +504,7 @@ actor ProtonRequestGovernor {
 
             let index = bestWaiterIndex(in: state.waiters, now: timestamp)
             let waiter = state.waiters.remove(at: index)
+            workMeasurements.recordQueueWait(scope.measurementQueue, since: waiter.measurementEnqueuedAt, cancelled: false)
             state.inFlight += 1
             state.activePermitIDs.insert(waiter.id)
             state.admitted.append(timestamp)

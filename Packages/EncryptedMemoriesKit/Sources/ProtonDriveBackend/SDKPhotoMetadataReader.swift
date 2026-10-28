@@ -15,21 +15,33 @@ enum SDKPhotoMetadataReader {
     }
 
     /// Reuses the SDK's decrypted sections from the same node read as the Info panel.
-    static func read(for uid: PhotoUID, client: any SDKPhotoCatalogClient) async throws -> ReadResult {
-        let node = try await SDKCancellableOperation.run { token in
-            try await client.getNode(
-                nodeUid: SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), cancellationToken: token)
-        } cancel: { token in
-            try? await client.cancelGetNode(cancellationToken: token)
-        }
-        try Task.checkCancellation()
-        switch node {
-        case .photo(let photo):
-            return read(name: photo.name, mimeType: photo.mediaType, revision: photo.activeRevision)
-        case .file(let file):
-            return read(name: file.name, mimeType: file.mediaType, revision: file.activeRevision)
-        default:
-            throw CocoaError(.fileReadUnknown)
+    static func read(
+        for uid: PhotoUID, client: any SDKPhotoCatalogClient, workMeasurements: SupportWorkMeasurements? = nil
+    ) async throws -> ReadResult {
+        try await WorkMeasurementOperation.run(.viewerRead, collector: workMeasurements) { measurement in
+            measurement?.record(.nodesRequested)
+            measurement?.record(.nodesUnique)
+            let node = try await SDKCancellableOperation.run { token in
+                measurement?.record(.nodeCallsStarted)
+                let value = try await client.getNode(
+                    nodeUid: SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), cancellationToken: token)
+                measurement?.record(.nodeCallsReturned)
+                return value
+            } cancel: { token in
+                try? await client.cancelGetNode(cancellationToken: token)
+            }
+            try Task.checkCancellation()
+            let result: ReadResult
+            switch node {
+            case .photo(let photo):
+                result = read(name: photo.name, mimeType: photo.mediaType, revision: photo.activeRevision)
+            case .file(let file):
+                result = read(name: file.name, mimeType: file.mediaType, revision: file.activeRevision)
+            default:
+                throw CocoaError(.fileReadUnknown)
+            }
+            measurement?.record(.factsCreated)
+            return result
         }
     }
 

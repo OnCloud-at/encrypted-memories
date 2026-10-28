@@ -1,8 +1,84 @@
+import CoreFoundation
 import XCTest
 
 @testable import PhotosCore
 
 final class SupportDiagnosticsExporterTests: XCTestCase {
+    func testD1MeasurementsExportOnlyFixedIntegerFieldsAndRejectStaleSources() async throws {
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        let first = SupportWorkMeasurements()
+        let current = SupportWorkMeasurements()
+        sources.registerWorkMeasurements(first)
+        sources.registerWorkMeasurements(current)
+        sources.unregisterWorkMeasurements(first)
+        let pass = try XCTUnwrap(current.begin(.timelineReconcile))
+        pass.record(.unlockSucceeded, count: 2)
+        pass.record(.decryptSucceeded)
+        pass.finish(.success)
+        let runtime = LibraryRuntimeState()
+        let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false)
+        let forbidden = ["private-photo-id", "private-name.jpg", "private-account", "https://private.invalid"]
+        for value in forbidden {
+            diagnostics.increment("timeline.order." + value)
+            diagnostics.emitSupport("ResourceState", ["uid": value, "name": value, "error": value])
+        }
+        let data = try await SupportDiagnosticsExporter.makeJSONData(
+            runtimeState: runtime,
+            resourceCoordinator: LibraryResourceCoordinator(runtimeState: runtime),
+            diagnostics: diagnostics,
+            bundle: Bundle(for: Self.self), sources: sources, trail: SupportEventTrail())
+        let report = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let section = try XCTUnwrap(report["measurements"] as? [String: Any])
+        XCTAssertEqual(section["availability"] as? Int, 1)
+        let serialized = String(decoding: try JSONSerialization.data(withJSONObject: section), as: UTF8.self)
+        for value in forbidden { XCTAssertFalse(serialized.contains(value)) }
+        func verify(_ value: Any) {
+            if let object = value as? [String: Any] {
+                for item in object.values { verify(item) }
+            } else if let array = value as? [Any] {
+                for item in array { verify(item) }
+            } else if let number = value as? NSNumber {
+                XCTAssertNotEqual(CFGetTypeID(number), CFBooleanGetTypeID())
+                XCTAssertEqual(number.doubleValue.rounded(), number.doubleValue)
+            } else {
+                XCTFail("Measurement values must be integer counters or fixed counter containers")
+            }
+        }
+        verify(section)
+        XCTAssertEqual(current.workMeasurementSupportSnapshot().passes[3].counters[0], 2)
+        sources.unregisterWorkMeasurements(current)
+        XCTAssertEqual(sources.workMeasurementSnapshot(), .unavailable)
+    }
+
+    func testSourceReplacementDuringSnapshotCannotExportTheRetiredMeasurements() {
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        let current = SupportWorkMeasurements()
+        let old = ReplacingWorkMeasurementSource {
+            sources.registerWorkMeasurements(current)
+        }
+        sources.registerWorkMeasurements(old)
+        XCTAssertEqual(sources.workMeasurementSnapshot(), .unavailable)
+        XCTAssertEqual(sources.workMeasurementSnapshot().availability, 1)
+    }
+
+    func testSchemaFourExportsOnlyUnavailableD1MeasurementsWithoutSource() async throws {
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        let runtime = LibraryRuntimeState()
+        let data = try await SupportDiagnosticsExporter.makeJSONData(
+            runtimeState: runtime,
+            resourceCoordinator: LibraryResourceCoordinator(runtimeState: runtime),
+            diagnostics: PhotoDiagnostics(debugConsoleLogsEnabled: false),
+            bundle: Bundle(for: Self.self), sources: sources, trail: SupportEventTrail())
+        let report = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(report["schemaVersion"] as? Int, 4)
+        let measurements = try XCTUnwrap(report["measurements"] as? [String: Any])
+        XCTAssertEqual(Set(measurements.keys), Set(["availability", "passes", "governorWaits"]))
+        XCTAssertEqual(measurements["availability"] as? Int, 0)
+        XCTAssertEqual((measurements["passes"] as? [Any])?.count, 0)
+        XCTAssertEqual((measurements["governorWaits"] as? [Any])?.count, 0)
+    }
+
     func testSuggestionCacheDiagnosticsExposeOutcomesWithoutContent() {
         let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false)
         diagnostics.emitSupport(
@@ -130,7 +206,7 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         )
         let text = String(decoding: data, as: UTF8.self)
 
-        XCTAssertTrue(text.contains("\"schemaVersion\" : 3"))
+        XCTAssertTrue(text.contains("\"schemaVersion\" : 4"))
         XCTAssertTrue(text.contains("\"appBuild\""))
         XCTAssertTrue(text.contains("\"appCommit\""))
         XCTAssertTrue(text.contains("serious"))
@@ -235,6 +311,19 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         XCTAssertNil(event?.fields["ocrText"])
         XCTAssertNil(event?.fields["query"])
         XCTAssertNil(event?.fields["modelInput"])
+    }
+}
+
+private final class ReplacingWorkMeasurementSource: SupportWorkMeasurementSource, @unchecked Sendable {
+    let replace: @Sendable () -> Void
+
+    init(replace: @escaping @Sendable () -> Void) {
+        self.replace = replace
+    }
+
+    func workMeasurementSupportSnapshot() -> SupportWorkMeasurementSnapshot {
+        replace()
+        return SupportWorkMeasurements().workMeasurementSupportSnapshot()
     }
 }
 

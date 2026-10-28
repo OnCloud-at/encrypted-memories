@@ -15,6 +15,23 @@ struct DriveSDKBridgePriorityScopeTests {
         case originalData, streamOriginalBytes, writeOriginal, preview, prefetchEncrypted, streamingAsset
     }
 
+    @Test func failedTimelineMeasuresTotalWithoutInventingEnumerationOrTags() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let governor = ProtonRequestGovernor()
+        let bridge = try await makeBridge(directory: directory, governor: governor)
+        await #expect(throws: (any Error).self) { try await bridge.loadTimelineSnapshot() }
+        let state = governor.workMeasurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.timelineLoad.rawValue]
+        let sample = try #require(state.samples.first)
+        #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+        #expect(sample.outcome == 2)
+        #expect(sample.enumerationClass == -1 && sample.tagsClass == -1)
+        #expect(sample.totalClass >= 0)
+        await bridge.shutdown()
+        #expect(governor.workMeasurements.workMeasurementSupportSnapshot().availability == 0)
+    }
+
     @Test(arguments: Entry.allCases)
     func aFailedReadEndsItsPriorityScope(entry: Entry) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
