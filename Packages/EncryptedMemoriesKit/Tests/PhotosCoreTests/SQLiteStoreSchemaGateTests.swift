@@ -453,6 +453,26 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         return false
     }
 
+    func testRealFullAfterOpenIsAlreadyKeptDuringVerification() throws {
+        let directory = try scratchDirectory()
+        let url = try markedStore(in: directory)
+        var checks = 0
+        let outcome = openMarkerStore(
+            at: url,
+            verifyVersion: { db in
+                checks += 1
+                if checks == 1 { return self.markerVersionIsCurrent(db) }
+                XCTAssertNotNil(sqlite3_db_filename(db, "main"))
+                XCTAssertEqual(sqlite3_exec(db, "PRAGMA max_page_count=1;", nil, nil, nil), SQLITE_OK)
+                XCTAssertEqual(
+                    sqlite3_exec(db, "INSERT INTO marker VALUES (zeroblob(1000000));", nil, nil, nil), SQLITE_FULL)
+                return false
+            })
+        XCTAssertEqual(checks, 2)
+        XCTAssertTrue(isRetryLater(outcome))
+        XCTAssertEqual(markerRowCount(at: url), 2)
+    }
+
     private func closeIfOpened(_ outcome: SQLiteRebuildableStoreOutcome) -> Bool {
         guard case .opened(let handle) = outcome else { return false }
         sqlite3_close(handle)

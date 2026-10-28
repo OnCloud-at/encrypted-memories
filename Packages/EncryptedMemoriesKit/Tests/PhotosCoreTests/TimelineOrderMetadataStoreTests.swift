@@ -191,6 +191,129 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
         store.close()
     }
 
+    func testFailedReadWriteOpenOnFullVolumeKeepsTheCacheAndOpensLater() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        try filledCache(at: url, policy: policy)
+        var keeper: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &keeper), SQLITE_OK)
+        defer { sqlite3_close(keeper) }
+        XCTAssertEqual(sqlite3_exec(keeper, "PRAGMA journal_mode=WAL;", nil, nil, nil), SQLITE_OK)
+        let paths = ["", "-wal", "-shm"].map { URL(fileURLWithPath: url.path + $0) }
+        let before = try paths.map { try Data(contentsOf: $0) }
+        let probe = SQLiteFailureProbe(failure: { db, _ in SQLiteFailure(of: db) }, volumeIsFull: { _, _ in true })
+        var calls = 0
+        let store = TimelineOrderMetadataStore(
+            url: url, policy: policy, probe: probe,
+            openReadWrite: { path, db, flags in
+                calls += 1
+                let rc = sqlite3_open_v2(path, db, flags, nil)
+                if calls > 1 { return rc }
+                guard rc == SQLITE_OK, let handle = db.pointee else { return rc }
+                XCTAssertNotNil(sqlite3_db_filename(handle, "main"))
+                XCTAssertEqual(sqlite3_exec(handle, "PRAGMA max_page_count=1;", nil, nil, nil), SQLITE_OK)
+                let failure = sqlite3_exec(
+                    handle, "INSERT INTO order_revision VALUES (zeroblob(1000000));", nil, nil, nil)
+                XCTAssertEqual(failure, SQLITE_FULL)
+                return failure
+            })
+        XCTAssertNil(store)
+        store?.close()
+        XCTAssertEqual(calls, 1, "a kept cache is not opened again or replaced")
+        XCTAssertEqual(paths.map { try? Data(contentsOf: $0) }, before.map(Optional.some))
+        let reopened = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: policy))
+        defer { reopened.close() }
+        XCTAssertEqual(try reopened.nextPage().count, 2)
+    }
+
+    func testFailedReadWriteOpenClassificationAndReplacement() throws {
+        let answers: [(String, SQLiteFailure, Bool?, Bool)] = [
+            ("CANTOPEN, full", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), true, true),
+            ("CORRUPT, full", SQLiteFailure(code: SQLITE_CORRUPT, systemErrno: 0), true, false),
+            ("IOERR, full", SQLiteFailure(code: SQLITE_IOERR, systemErrno: 0), true, false),
+            ("CANTOPEN, room", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), false, false),
+            ("CANTOPEN, unknown", SQLiteFailure(code: SQLITE_CANTOPEN, systemErrno: ENOENT), nil, false),
+            ("FULL, room", SQLiteFailure(code: SQLITE_FULL, systemErrno: 0), false, false),
+            ("FULL, unknown", SQLiteFailure(code: SQLITE_FULL, systemErrno: 0), nil, false),
+        ]
+        for (name, answer, volume, keeps) in answers {
+            let url = try directory().appendingPathComponent("order.sqlite")
+            let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+            try filledCache(at: url, policy: policy)
+            let probe = SQLiteFailureProbe(failure: { _, _ in answer }, volumeIsFull: { _, _ in volume })
+            var calls = 0
+            let store = TimelineOrderMetadataStore(
+                url: url, policy: policy, probe: probe,
+                openReadWrite: { path, db, flags in
+                    calls += 1
+                    let rc = sqlite3_open_v2(path, db, flags, nil)
+                    guard calls == 1, rc == SQLITE_OK, let handle = db.pointee else { return rc }
+                    XCTAssertNotNil(sqlite3_db_filename(handle, "main"), name)
+                    let failed = sqlite3_exec(handle, "SELECT * FROM no_such_table;", nil, nil, nil)
+                    XCTAssertNotEqual(failed, SQLITE_OK, name)
+                    return failed
+                })
+            if keeps {
+                XCTAssertNil(store, name)
+                XCTAssertEqual(calls, 1, name)
+                let reopened = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: policy), name)
+                XCTAssertEqual(try reopened.nextPage().count, 2, name)
+                reopened.close()
+            } else {
+                let replacement = try XCTUnwrap(store, name)
+                XCTAssertEqual(calls, 2, name)
+                XCTAssertEqual(try replacement.nextPage().count, 0, name)
+                replacement.close()
+            }
+        }
+    }
+
+    func testARealFailedOpenWithoutAFileNameStillReplacesTheCache() throws {
+        let base = try directory()
+        let url = base.appendingPathComponent("order.sqlite")
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        try filledCache(at: url, policy: policy)
+        let probe = SQLiteFailureProbe(failure: { db, _ in SQLiteFailure(of: db) }, volumeIsFull: { _, _ in true })
+        var calls = 0
+        let store = try XCTUnwrap(
+            TimelineOrderMetadataStore(
+                url: url, policy: policy, probe: probe,
+                openReadWrite: { path, db, flags in
+                    calls += 1
+                    let rc = sqlite3_open_v2(calls == 1 ? base.path : path, db, flags, nil)
+                    if calls == 1 {
+                        XCTAssertEqual(rc, SQLITE_CANTOPEN)
+                        XCTAssertNotNil(db.pointee)
+                        XCTAssertNil(sqlite3_db_filename(db.pointee, "main"))
+                    }
+                    return rc
+                }))
+        defer { store.close() }
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(try store.nextPage().count, 0)
+    }
+
+    func testAFailedOpenWithoutAHandleStillReplacesTheCache() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        try filledCache(at: url, policy: policy)
+        let probe = SQLiteFailureProbe(
+            failure: { _, _ in SQLiteFailure(code: SQLITE_FULL, systemErrno: 0) },
+            volumeIsFull: { _, _ in true })
+        var calls = 0
+        let store = try XCTUnwrap(
+            TimelineOrderMetadataStore(
+                url: url, policy: policy, probe: probe,
+                openReadWrite: { path, db, flags in
+                    calls += 1
+                    if calls == 1 { return SQLITE_CANTOPEN }
+                    return sqlite3_open_v2(path, db, flags, nil)
+                }))
+        defer { store.close() }
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(try store.nextPage().count, 0)
+    }
+
     func testACacheThatCannotBeReadIsStillReplaced() throws {
         let url = try directory().appendingPathComponent("order.sqlite")
         let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)

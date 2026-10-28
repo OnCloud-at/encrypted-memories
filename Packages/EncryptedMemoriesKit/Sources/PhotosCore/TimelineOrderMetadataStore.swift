@@ -78,7 +78,10 @@ public final class TimelineOrderMetadataStore {
     }
 
     /// `probe` answers whether a failed check says anything about the file. A test supplies it.
-    init?(url: URL, policy: LibraryDatabasePolicy, probe: SQLiteFailureProbe) {
+    init?(
+        url: URL, policy: LibraryDatabasePolicy, probe: SQLiteFailureProbe,
+        openReadWrite: SQLiteStoreSchemaGate.ReadWriteOpen = SQLiteStoreSchemaGate.liveReadWriteOpen
+    ) {
         self.url = url
         self.policy = policy
         self.probe = probe
@@ -96,7 +99,7 @@ public final class TimelineOrderMetadataStore {
                     return sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1
                 },
                 stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK },
-                probe: probe)
+                probe: probe, openReadWrite: openReadWrite)
         }
         switch open() {
         case .opened(let handle):
