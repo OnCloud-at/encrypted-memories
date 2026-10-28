@@ -119,6 +119,49 @@ import UploadCore
         #expect(await calls.events.isEmpty)
     }
 
+    @Test func changedEpochCannotSupplyEvidence() async throws {
+        #expect(
+            try await makeOps(checker: RecoveryChecker(epoch: "changed")).photoRecoveryState(for: record())
+                == .unavailable)
+    }
+
+    @Test func differentNameCannotSupplyEvidence() async throws {
+        #expect(
+            try await makeOps(checker: RecoveryChecker(rowNameHash: "other")).photoRecoveryState(for: record())
+                == .unavailable)
+    }
+
+    @Test(arguments: [nil, RemotePhotoDuplicate.LinkState.draft])
+    func missingOrDraftDuplicateStateIsUnavailable(state: RemotePhotoDuplicate.LinkState?) async throws {
+        #expect(
+            try await makeOps(checker: RecoveryChecker(state: state?.rawValue ?? 2, duplicateState: state))
+                .photoRecoveryState(for: record()) == .unavailable)
+    }
+
+    @Test func conflictingExactRowsCannotSupplyEvidence() async throws {
+        #expect(
+            try await makeOps(checker: RecoveryChecker(conflictingRow: true)).photoRecoveryState(for: record())
+                == .unavailable)
+    }
+
+    @Test(arguments: ["volume", "epoch"])
+    func emptyAdapterContextIsUnavailable(field: String) async throws {
+        var ops = makeOps(checker: RecoveryChecker(epoch: field == "epoch" ? "" : "epoch"))
+        if field == "volume" { ops.recoveryVolumeProvider = { "" } }
+        #expect(try await ops.photoRecoveryContext() == nil)
+    }
+
+    @Test func emptyNodeCannotDispatch() async throws {
+        let calls = RecoveryCalls()
+        var ops = makeOps(checker: RecoveryChecker())
+        ops.recoveryRestore = { await calls.restore($0) }
+        let context = try #require(try await ops.photoRecoveryContext())
+        await #expect(throws: AlbumSyncPhotoRecovery.Error.unavailable) {
+            try await ops.restorePhoto(.init(volumeID: "own-volume", nodeID: ""), context: context) {}
+        }
+        #expect(await calls.events.isEmpty)
+    }
+
     private func record() -> UploadIdentityRecord {
         .init(
             source: .init(kind: .photoLibraryAsset, identifier: "asset"), filename: "photo",
@@ -160,6 +203,9 @@ private final class RecoveryChecker: UploadDuplicateChecking, @unchecked Sendabl
     let role: String
     let failureStage: String?
     let otherActiveCopy: Bool
+    let epoch: String
+    let rowNameHash: String
+    let conflictingRow: Bool
     private let lock = NSLock()
     private var reads = (metadata: 0, name: 0)
     var metadataReads: Int { lock.withLock { reads.metadata } }
@@ -167,7 +213,8 @@ private final class RecoveryChecker: UploadDuplicateChecking, @unchecked Sendabl
     init(
         state: Int? = 2, complete: Bool = true, contentHash: String = "content",
         duplicateState: RemotePhotoDuplicate.LinkState? = .trashed, role: String = "main", failureStage: String? = nil,
-        otherActiveCopy: Bool = false
+        otherActiveCopy: Bool = false, epoch: String = "epoch", rowNameHash: String = "name",
+        conflictingRow: Bool = false
     ) {
         self.state = state
         self.complete = complete
@@ -176,18 +223,25 @@ private final class RecoveryChecker: UploadDuplicateChecking, @unchecked Sendabl
         self.role = role
         self.failureStage = failureStage
         self.otherActiveCopy = otherActiveCopy
+        self.epoch = epoch
+        self.rowNameHash = rowNameHash
+        self.conflictingRow = conflictingRow
     }
-    func hashKeyEpoch() async throws -> String { "epoch" }
+    func hashKeyEpoch() async throws -> String { epoch }
     func nameHash(forCorrectedName name: String) async throws -> String { "name" }
     func contentHash(forSHA1Hex sha1Hex: String) async throws -> String { contentHash }
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
         if failureStage == "name" { throw URLError(.notConnectedToInternet) }
         lock.withLock { reads.name += 1 }
         var rows = [
-            RemotePhotoDuplicate(nameHash: "name", contentHash: contentHash, linkState: duplicateState, linkID: "trash")
+            RemotePhotoDuplicate(
+                nameHash: rowNameHash, contentHash: contentHash, linkState: duplicateState, linkID: "trash")
         ]
         if otherActiveCopy {
             rows.insert(.init(nameHash: "name", contentHash: contentHash, linkState: .active, linkID: "other"), at: 0)
+        }
+        if conflictingRow {
+            rows.append(.init(nameHash: "name", contentHash: contentHash, linkState: .active, linkID: "trash"))
         }
         return rows
     }

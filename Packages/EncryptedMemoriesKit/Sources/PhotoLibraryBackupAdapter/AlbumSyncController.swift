@@ -27,6 +27,7 @@ public final class AlbumSyncController {
         var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
         var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
         var localSource: any AlbumSyncLocalAlbumSource = PhotoKitAlbumSource()
+        var backupExecutorOverride: (any AlbumSyncBackupExecuting)? = nil
         var recoveryCatalog: @Sendable (String) -> any UploadBackupAssetCatalog = {
             PhotoLibraryBackupCatalog(localIdentifiers: [$0])
         }
@@ -145,7 +146,7 @@ public final class AlbumSyncController {
     private var recoveryGeneration = UUID()
     private var recoveryContexts: [String: AlbumSyncPhotoRecovery.Context] = [:]
     private let runner: AlbumSyncRunner?
-    private let backupExecutor: PhotoAlbumBackupExecutor?
+    private let backupExecutor: (any AlbumSyncBackupExecuting)?
     private let remoteLinkLookup: (any AlbumSyncRemoteLinkLookup)?
     private let localSource: any AlbumSyncLocalAlbumSource
     private let mappingStore: AlbumSyncMappingStore?
@@ -180,11 +181,12 @@ public final class AlbumSyncController {
         self.remoteOps = remoteOps
         self.identityResolver = identityResolver
         recoveryCatalog = configuration.recoveryCatalog
+        let recoveryTempStore = BackupTempFileStore(
+            directory: configuration.accountDataDirectory.appendingPathComponent("album-sync-restore-temp"))
+        recoveryTempStore.sweep()
         recoveryResourceResolver =
             configuration.recoveryResourceResolver
-            ?? PhotoLibraryResourceResolver(
-                tempStore: BackupTempFileStore(
-                    directory: configuration.accountDataDirectory.appendingPathComponent("album-sync-restore-temp")))
+            ?? PhotoLibraryResourceResolver(tempStore: recoveryTempStore)
         currentAccessState = configuration.currentAccessState
         changeSleep = configuration.changeSleep
         localSource = configuration.localSource
@@ -206,12 +208,14 @@ public final class AlbumSyncController {
         remoteLinkLookup = lookup
 
         if let mappingStore, let lookup, let identityResolver {
-            let executor = PhotoAlbumBackupExecutor(
-                accountDataDirectory: directory,
-                databasePolicy: configuration.databasePolicy,
-                identityResolver: identityResolver,
-                uploader: uploader
-            )
+            let executor =
+                configuration.backupExecutorOverride
+                ?? PhotoAlbumBackupExecutor(
+                    accountDataDirectory: directory,
+                    databasePolicy: configuration.databasePolicy,
+                    identityResolver: identityResolver,
+                    uploader: uploader
+                )
             backupExecutor = executor
             runner = AlbumSyncRunner(
                 localSource: localSource,
@@ -402,7 +406,6 @@ public final class AlbumSyncController {
     private func invalidateRecovery() {
         recoveryGeneration = UUID()
         recoveryTask?.cancel()
-        recoveryContextTask?.cancel()
     }
 
     private func captureRecoveryContext() async throws -> AlbumSyncPhotoRecovery.Context? {
@@ -413,11 +416,15 @@ public final class AlbumSyncController {
         do {
             context = try await task.value
         } catch {
-            if UploadError.isCancellation(error) || error is CancellationError { throw error }
+            if UploadError.isCancellation(error) {
+                if stopState.isRequested || isShuttingDown { throw AlbumSyncError.stopped }
+                throw error
+            }
             context = nil
         }
+        if stopState.isRequested || isShuttingDown { throw AlbumSyncError.stopped }
         try Task.checkCancellation()
-        guard !task.isCancelled, !isShuttingDown, !stopState.isRequested else { throw AlbumSyncError.stopped }
+        if task.isCancelled { throw CancellationError() }
         return context
     }
 
@@ -478,6 +485,7 @@ public final class AlbumSyncController {
 
     public func stopSync() {
         invalidateRecovery()
+        recoveryContextTask?.cancel()
         stopState.stopPressed(isSyncing: isSyncing, queuedAlbums: queuedAlbumIDs.count)
         queuedAlbumIDs.removeAll()
         changeDebounceTask?.cancel()
@@ -495,6 +503,7 @@ public final class AlbumSyncController {
     public func shutdown() async {
         isShuttingDown = true
         invalidateRecovery()
+        recoveryContextTask?.cancel()
         let activeRecovery = recoveryTask
         changeSubscription?.cancel()
         changeSubscription = nil

@@ -123,6 +123,7 @@ import UploadCore
                 record: record(), descriptor: descriptor(), remote: remote, expectedContext: await remote.context
             ) { throw CancellationError() }
         }
+        #expect(await remote.evidenceReads == 0)
         #expect(await remote.restored.isEmpty)
     }
 
@@ -148,6 +149,60 @@ import UploadCore
         }
     }
 
+    @Test func catalogRequiresExactlyOneMatchingSource() async throws {
+        let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset")
+        let other = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "other")
+        func candidate(_ identity: UploadSourceIdentity) -> UploadBackupAssetCandidate {
+            .init(
+                snapshot: .init(source: identity, revision: .init(rawValue: 1), resourceCount: 1),
+                originalFilename: "photo")
+        }
+        let wanted = candidate(source)
+        let unrelated = candidate(other)
+        #expect(
+            try await AlbumSyncPhotoRecovery.candidate(
+                for: source,
+                catalog: RecoveryCatalog(rows: [unrelated, wanted])) == wanted)
+        for rows in [[UploadBackupAssetCandidate](), [unrelated], [wanted, wanted]] {
+            await #expect(throws: AlbumSyncPhotoRecovery.Error.unavailable) {
+                try await AlbumSyncPhotoRecovery.candidate(for: source, catalog: RecoveryCatalog(rows: rows))
+            }
+        }
+    }
+
+    @Test(arguments: [
+        UploadSourceIdentity(kind: .fileURL, identifier: "asset"),
+        UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset", resource: .livePairedVideo),
+    ])
+    func onlyPrimaryPhotoLibrarySourceCanRestore(source: UploadSourceIdentity) async {
+        var target = record()
+        target.source = source
+        let remote = RecoveryRemote()
+        await #expect(throws: AlbumSyncPhotoRecovery.Error.unavailable) {
+            try await AlbumSyncPhotoRecovery.restore(
+                record: target, descriptor: descriptor(source: source),
+                remote: remote, expectedContext: await remote.context, validate: {})
+        }
+        #expect(await remote.restored.isEmpty)
+    }
+
+    @Test(arguments: ["volume", "epoch"])
+    func emptyContextCannotRestore(field: String) async {
+        var target = record()
+        let context = AlbumSyncPhotoRecovery.Context(
+            sessionID: UUID(),
+            volumeID: field == "volume" ? "" : "volume", hashKeyEpoch: field == "epoch" ? "" : "epoch")
+        target.remoteVolumeID = context.volumeID
+        target.hashKeyEpoch = context.hashKeyEpoch
+        let remote = RecoveryRemote(context: context)
+        await #expect(throws: AlbumSyncPhotoRecovery.Error.unavailable) {
+            try await AlbumSyncPhotoRecovery.restore(
+                record: target, descriptor: descriptor(),
+                remote: remote, expectedContext: context, validate: {})
+        }
+        #expect(await remote.restored.isEmpty)
+    }
+
     private func record() -> UploadIdentityRecord {
         .init(
             source: .init(kind: .photoLibraryAsset, identifier: "asset"), filename: "photo.heic",
@@ -157,9 +212,12 @@ import UploadCore
             outcome: "duplicateTrashed", updatedAt: Date(timeIntervalSince1970: 1000))
     }
 
-    private func descriptor(digest: Data? = Data(repeating: 1, count: 20)) -> UploadResourceDescriptor {
+    private func descriptor(
+        digest: Data? = Data(repeating: 1, count: 20),
+        source: UploadSourceIdentity = .init(kind: .photoLibraryAsset, identifier: "asset")
+    ) -> UploadResourceDescriptor {
         .init(
-            source: .init(kind: .photoLibraryAsset, identifier: "asset"),
+            source: source,
             fileURL: URL(fileURLWithPath: "/unused"), filename: "photo.heic", fileSize: 4,
             modificationDate: Date(timeIntervalSince1970: 1000),
             precomputedSHA1Digest: digest)
@@ -174,7 +232,10 @@ private actor RecoveryRemote: AlbumSyncRemoteAlbumOps {
 
     private var changesSession = false
     func changeSessionAfterEvidence() { changesSession = true }
-    init(state: AlbumSyncPhotoRecovery.RemoteState = .trashed) { self.state = state }
+    init(state: AlbumSyncPhotoRecovery.RemoteState = .trashed, context: AlbumSyncPhotoRecovery.Context? = nil) {
+        self.state = state
+        if let context { self.context = context }
+    }
     func photoRecoveryContext() async throws -> AlbumSyncPhotoRecovery.Context? { context }
     func photoRecoveryState(for record: UploadIdentityRecord) async throws -> AlbumSyncPhotoRecovery.RemoteState {
         evidenceReads += 1
@@ -203,4 +264,14 @@ private struct DefaultRecoveryRemote: AlbumSyncRemoteAlbumOps {
     func createAlbum(name: String) async throws -> String { "album" }
     func childMainLinkIDs(albumID: String) async throws -> Set<String> { [] }
     func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult { .init() }
+}
+
+private struct RecoveryCatalog: UploadBackupAssetCatalog {
+    let rows: [UploadBackupAssetCandidate]
+    func candidates() -> AsyncThrowingStream<UploadBackupAssetCandidate, any Error> {
+        AsyncThrowingStream { continuation in
+            for row in rows { continuation.yield(row) }
+            continuation.finish()
+        }
+    }
 }
