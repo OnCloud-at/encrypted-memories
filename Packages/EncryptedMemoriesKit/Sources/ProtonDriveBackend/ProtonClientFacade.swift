@@ -223,10 +223,11 @@ public final class ProtonClientFacade {
             uploadIdentityResolver: identityResolver,
             accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent(),
             accountDatabasePolicy: bridge.uploadManifestPolicy,
-            albumSyncRemoteOps: ProtonAlbumSyncRemoteOps(
+            albumSyncRemoteOps: ProtonAlbumSyncRemoteOps.withRecovery(
                 service: albumWrite,
                 listProvider: { try await albumsRepo.listAlbums() },
-                duplicateChecker: identityComposition.duplicateChecker
+                duplicateChecker: identityComposition.duplicateChecker,
+                bridge: bridge
             ),
             accountInfoRefresher: { try await bridge.refreshAccountInfo() },
             shutdownHandler: {
