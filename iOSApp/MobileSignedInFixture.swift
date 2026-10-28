@@ -555,33 +555,47 @@ import os
         }
     }
 
-    /// One owned album in memory, so the UI tests can add photos to an album without an account.
+    /// Owned albums in memory, so UI tests can create albums and add photos without an account.
     final class MobileFixtureAlbums: AlbumCatalogBackend, AlbumWriteBackend, @unchecked Sendable {
         static let albumTitle = "Fixture Album"
         static let capabilities = AlbumCapabilities(
-            canList: true, canCreate: false, canAddPhotos: true, canSetCover: false, canReadMemberships: true)
+            canList: true, canCreate: true, canAddPhotos: true, canSetCover: false, canReadMemberships: true)
 
         private let lock = NSLock()
-        private var members: [PhotoUID] = []
+        private var createdAlbums: [(id: AlbumID, title: String)] = []
+        private var members: [AlbumID: Set<PhotoUID>] = [:]
 
         func listAlbums() async throws -> [AlbumSummary] {
-            let count = lock.withLock { members.count }
-            return [AlbumSummary(id: "fixture-album", title: Self.albumTitle, photoCount: count, coverPhotoID: nil)]
+            lock.withLock {
+                ([(id: "fixture-album", title: Self.albumTitle)] + createdAlbums).map { album in
+                    AlbumSummary(
+                        id: album.id, title: album.title, photoCount: members[album.id]?.count ?? 0, coverPhotoID: nil)
+                }
+            }
         }
         func listSharedWithMeAlbums() async throws -> [SharedAlbumSummary] { [] }
         func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws {}
         func albumMemberships(for photoUIDs: [PhotoUID]) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
-            let members = lock.withLock { Set(self.members) }
+            let members = lock.withLock { self.members }
             return Dictionary(
                 uniqueKeysWithValues: photoUIDs.map { uid in
-                    let album = AlbumNodeIdentifier(volumeID: uid.volumeID, nodeID: "fixture-album")
-                    return (uid, members.contains(uid) ? [album] : [])
+                    let albums = Set(
+                        members.compactMap { albumID, photos in
+                            photos.contains(uid) ? AlbumNodeIdentifier(volumeID: uid.volumeID, nodeID: albumID) : nil
+                        })
+                    return (uid, albums)
                 })
         }
-        func createAlbum(name: String) async throws -> AlbumID { throw MobileFixtureError.unavailable }
+        func createAlbum(name: String) async throws -> AlbumID {
+            lock.withLock {
+                let id = "fixture-created-album-\(createdAlbums.count)"
+                createdAlbums.append((id: id, title: name))
+                return id
+            }
+        }
         func deleteAlbum(albumID: AlbumID) async throws { throw MobileFixtureError.unavailable }
         func addPhotos(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws {
-            lock.withLock { members += photoUIDs.filter { !members.contains($0) } }
+            lock.withLock { members[albumID, default: []].formUnion(photoUIDs) }
         }
         func removePhotos(_ photoUIDs: [PhotoUID], from albumID: AlbumID) async throws {
             throw MobileFixtureError.unavailable

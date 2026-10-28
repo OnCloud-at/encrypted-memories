@@ -125,6 +125,7 @@ final class MobileTimelineChromeTests: XCTestCase {
                 items += navigationItem.leadingItemGroups.flatMap(\.barButtonItems)
                 items += navigationItem.centerItemGroups.flatMap(\.barButtonItems)
                 items += navigationItem.trailingItemGroups.flatMap(\.barButtonItems)
+                items += navigationItem.pinnedTrailingGroup?.barButtonItems ?? []
             }
         }
         return items

@@ -601,8 +601,12 @@ struct MobileFailedBackupSheet: View {
                     : L10n.string("backup.failed_sheet_title")
             )
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
+                ProminentToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("backup.failed_sheet_done"), systemImage: "checkmark").textBarItem()
+                    }
                 }
                 .mobileVisibilityPriority(.high)
                 if let controller, items.offersUserRetry {

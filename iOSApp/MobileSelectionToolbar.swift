@@ -2,6 +2,19 @@ import DesignSystemCore
 import PhotosCore
 import SwiftUI
 
+/// The same selection action in the timeline, collections and map clusters.
+struct MobileSelectionModeLabel: View {
+    let isSelecting: Bool
+
+    var body: some View {
+        Label(
+            isSelecting ? L10n.string("action.done") : L10n.string("action.select"),
+            systemImage: isSelecting ? "checkmark" : "checkmark.circle"
+        )
+        .textBarItem()
+    }
+}
+
 /// One native selection bar for every grid surface: library, filtered collections, album grids and map clusters.
 ///
 /// Every action is a separate native toolbar item with a symbol-and-title label. Horizontal bars show the

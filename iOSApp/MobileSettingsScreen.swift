@@ -49,8 +49,12 @@ struct MobileSettingsScreen: View {
             .observesStoragePressure($storagePressure)
             .toolbar {
                 if showsDismissButton {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button(L10n.string("action.done")) { dismiss() }
+                    ProminentToolbarItem(placement: .confirmationAction) {
+                        Button {
+                            dismiss()
+                        } label: {
+                            Label(L10n.string("action.done"), systemImage: "checkmark").textBarItem()
+                        }
                     }
                     .mobileVisibilityPriority(.high)
                 }
@@ -358,8 +362,12 @@ private struct MobileBugReportSheet: View {
             }
             .mobileNavigationTitle(L10n.string("settings.bug_report_title"))
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("action.done")) { dismiss() }
+                ProminentToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("action.done"), systemImage: "checkmark").textBarItem()
+                    }
                 }
                 .mobileVisibilityPriority(.high)
             }
