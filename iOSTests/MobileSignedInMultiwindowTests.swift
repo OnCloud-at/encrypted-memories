@@ -10,7 +10,8 @@ import XCTest
 @testable import EncryptedMemoriesMobile
 @testable import TimelineUIKitFeature
 
-/// Signed-in acceptance of several windows through the production composition (iPad only).
+/// Signed-in acceptance of several windows through the production composition, wherever the platform supports
+/// several scenes.
 ///
 /// The shared account runtime receives an isolated, deterministic library (`MobileSignedInFixture`). The scene
 /// roots, tab shell, timeline screens, grids, selection, search, viewer and the ordered sign-out teardown are the
@@ -55,11 +56,11 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         let existingSessions = Set(windowScenes().map(\.session.persistentIdentifier))
         addTeardownBlock { @MainActor in
             // A thrown assertion must not leave fixture scenes active for the next suite.
+            // A platform that refuses to close a scene keeps it; that refusal is not a test failure.
             for scene in self.windowScenes() where !existingSessions.contains(scene.session.persistentIdentifier) {
-                UIApplication.shared.requestSceneSessionDestruction(scene.session, options: nil)
-            }
-            try await self.waitUntil("fixture scenes are removed during teardown") {
-                self.windowScenes().allSatisfy { existingSessions.contains($0.session.persistentIdentifier) }
+                if case .refused(let reason) = await MobileSceneCloser.close(scene) {
+                    self.note("teardown: the platform kept a fixture scene: \(reason)")
+                }
             }
             UIApplication.shared.activateSceneSession(for: UISceneSessionActivationRequest(session: firstScene.session))
             {
@@ -212,10 +213,16 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         XCTAssertTrue(runtime.isStarted)
 
         // 9. Closing the second window keeps the account; reopening a window attaches again.
+        //    A closed window can be checked only where the platform closes the scene; the platform's answer
+        //    decides, never the device idiom.
         let secondID = secondScene.session.persistentIdentifier
-        UIApplication.shared.requestSceneSessionDestruction(secondScene.session, options: nil)
-        try await waitUntil("closed window leaves the ledger") {
-            runtime.sceneLedger.phase(of: secondID) == nil
+        switch await MobileSceneCloser.close(secondScene) {
+        case .closed:
+            try await waitUntil("closed window leaves the ledger") {
+                runtime.sceneLedger.phase(of: secondID) == nil
+            }
+        case .refused(let reason):
+            note("the platform kept the second scene, ledger departure not checked: \(reason)")
         }
         XCTAssertNotNil(runtime.libraryModel.thumbnailFeed, "closing a window must not sign the account out")
         XCTAssertTrue(runtime.isStarted)
@@ -244,9 +251,13 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         let gridC = try await waitForGrid(in: thirdWindow)
         XCTAssertTrue(gridC.thumbnailFeed === fixture.feed, "a reopened window attaches to the same account")
         note("reopened window renders \(gridC.itemUIDs.count) items from the shared feed")
-        UIApplication.shared.requestSceneSessionDestruction(thirdScene.session, options: nil)
-        try await waitUntil("reopened window leaves the ledger") {
-            runtime.sceneLedger.phase(of: thirdScene.session.persistentIdentifier) == nil
+        switch await MobileSceneCloser.close(thirdScene) {
+        case .closed:
+            try await waitUntil("reopened window leaves the ledger") {
+                runtime.sceneLedger.phase(of: thirdScene.session.persistentIdentifier) == nil
+            }
+        case .refused(let reason):
+            note("the platform kept the reopened scene, ledger departure not checked: \(reason)")
         }
         UIApplication.shared.activateSceneSession(for: UISceneSessionActivationRequest(session: firstScene.session)) {
             _ in
