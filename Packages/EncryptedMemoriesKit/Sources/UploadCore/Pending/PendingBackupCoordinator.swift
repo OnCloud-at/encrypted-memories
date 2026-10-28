@@ -107,6 +107,46 @@ public actor PendingBackupCoordinator {
     }
     /// The last pass over the pending actions could not read every action or every handoff it needed.
     private var actionsDegraded: Bool { actionsIncomplete || !unreadableHandoffKeys.isEmpty }
+    /// Results that must be saved before the same effect or action can be dispatched again.
+    private enum PendingEffectWrite {
+        case complete(PendingSourceEffect, generation: Int64, remoteLinkID: String?)
+        case deferAttempt
+    }
+
+    /// The same identity that the store checks before changing or deleting an action.
+    private struct PendingActionID: Hashable {
+        let key: PendingSourceKey
+        let kind: String
+        let albumID: String
+        let desired: Bool
+        let createdAt: Date
+
+        init(_ action: PendingAction) {
+            key = action.key
+            kind = action.kind.rawValue
+            albumID = action.albumID
+            desired = action.desired
+            createdAt = action.createdAt
+        }
+    }
+
+    private struct PendingActionWrite {
+        let action: PendingAction
+        let result: PendingEffectResult
+    }
+
+    private var pendingEffectWrites: [PendingSourceKey: PendingEffectWrite] = [:]
+    private var pendingActionWrites: [PendingActionID: PendingActionWrite] = [:]
+    /// A rejected dispatch marker sent nothing; the next reconcile tries it again.
+    private var beginFailedKeys = Set<PendingSourceKey>()
+    private var writesDegraded: Bool {
+        !pendingEffectWrites.isEmpty || !pendingActionWrites.isEmpty || !beginFailedKeys.isEmpty
+    }
+
+    private func effectWriteIsPending(_ key: PendingSourceKey) -> Bool {
+        pendingEffectWrites[key] != nil || beginFailedKeys.contains(key)
+    }
+
     private var savedFromApp = Set<String>()
     private var metadata: [PendingSourceKey: PendingPresentationMetadata] = [:]
     /// The revision each cached metadata entry belongs to; a new revision can change the capture time.
@@ -1178,6 +1218,7 @@ public actor PendingBackupCoordinator {
         defer { reconcileRunning = false }
         if sourceStatesIncomplete { loadSourceStates() }
         if !unreadableSourceStates.isEmpty { reloadSourceStates(Array(unreadableSourceStates)) }
+        retryPendingWrites()
         repeat {
             reconcileAgain = false
             var incomplete = false
@@ -1217,6 +1258,7 @@ public actor PendingBackupCoordinator {
     }
 
     private func performQueueSync(_ states: [PendingSourceState]) async {
+        let states = states.filter { !effectWriteIsPending($0.key) }
         guard !states.isEmpty else { return }
         let date = now()
         let excluded = states.filter { $0.desired == .excluded }
@@ -1234,19 +1276,23 @@ public actor PendingBackupCoordinator {
     }
 
     private func performRemote(_ effect: PendingSourceEffect, _ states: [PendingSourceState]) async {
+        let states = states.filter { !effectWriteIsPending($0.key) }
         guard !states.isEmpty else { return }
         let date = now()
         let volume = await effects.photosVolumeID()
         guard !closed else { return }
         guard let volume else {
-            for state in states { _ = store.deferEffects(for: state.key, at: date) }
+            for state in states { writeEffect(.deferAttempt, for: state.key, at: date) }
             reloadSourceStates(states.map(\.key))
             return
         }
         // Marked right before dispatch, and only while the state still wants this effect for the same
         // generation: a decision taken during the volume lookup wins. Until a confirmed completion, new
         // decisions treat the request as possibly done.
-        guard let marked = store.beginRemoteOperation(effect, for: states) else { return }
+        guard let marked = store.beginRemoteOperation(effect, for: states) else {
+            beginFailedKeys.formUnion(states.map(\.key))
+            return
+        }
         let dispatched = states.filter { marked.contains($0.key) }
         guard !dispatched.isEmpty else {
             reloadSourceStates(states.map(\.key))
@@ -1289,10 +1335,11 @@ public actor PendingBackupCoordinator {
     ) {
         for state in states {
             if succeeded(state) {
-                _ = store.completeEffect(
-                    effect, for: state.key, generation: state.generation, remoteLinkID: state.remote?.nodeID, at: date)
+                writeEffect(
+                    .complete(effect, generation: state.generation, remoteLinkID: state.remote?.nodeID),
+                    for: state.key, at: date)
             } else {
-                _ = store.deferEffects(for: state.key, at: date)
+                writeEffect(.deferAttempt, for: state.key, at: date)
             }
         }
         reloadSourceStates(states.map(\.key))
@@ -1300,13 +1347,61 @@ public actor PendingBackupCoordinator {
         scheduleMembershipPublish()
     }
 
+    /// Retries result persistence before reading due work. No remote operation runs here.
+    private func retryPendingWrites() {
+        beginFailedKeys.removeAll()
+        let effects = pendingEffectWrites
+        let actionWrites = pendingActionWrites
+        for (key, write) in effects { writeEffect(write, for: key, at: now()) }
+        for write in actionWrites.values {
+            writeAction(write.action, result: write.result, at: now())
+        }
+        reloadSourceStates(Array(Set(effects.keys).union(actionWrites.keys.map(\.key))))
+        if !actionWrites.isEmpty {
+            actions = store.actions()
+            listsDirty = true
+            scheduleMembershipPublish()
+        }
+    }
+
+    private func writeEffect(_ write: PendingEffectWrite, for key: PendingSourceKey, at date: Date) {
+        let saved: Bool
+        switch write {
+        case .complete(let effect, let generation, let remoteLinkID):
+            saved = store.completeEffect(
+                effect, for: key, generation: generation, remoteLinkID: remoteLinkID, at: date)
+        case .deferAttempt:
+            saved = store.deferEffects(for: key, at: date)
+        }
+        if saved {
+            pendingEffectWrites.removeValue(forKey: key)
+        } else {
+            pendingEffectWrites[key] = write
+        }
+    }
+
+    private func writeAction(_ action: PendingAction, result: PendingEffectResult, at date: Date) {
+        let saved: Bool
+        switch result {
+        case .done: saved = store.completeAction(action)
+        case .retry: saved = store.retryAction(action, at: date)
+        case .permanentFailure: saved = store.failAction(action)
+        }
+        let id = PendingActionID(action)
+        if saved {
+            pendingActionWrites.removeValue(forKey: id)
+        } else {
+            pendingActionWrites[id] = PendingActionWrite(action: action, result: result)
+        }
+    }
+
     private func scheduleReconcileTimer() {
         reconcileTimer?.cancel()
         reconcileTimer = nil
         guard !closed else { return }
         let delay: Duration
-        if sourceStatesDegraded || actionsDegraded {
-            // An unreadable row stays due in the store, so the next effect date would retry it every second.
+        if sourceStatesDegraded || actionsDegraded || writesDegraded {
+            // An unreadable row or an unsaved result stays due, so its stored date would retry it every second.
             let limit = configuration.unreadableRetryLimit
             let next = unreadableRetry.map { $0 > limit / 2 ? limit : $0 * 2 } ?? configuration.unreadableRetryDelay
             // At least one second, whatever the configuration says, so a zero or negative limit never spins.
@@ -1333,8 +1428,10 @@ public actor PendingBackupCoordinator {
     /// The next future retry of a readable source with an owed effect, from the last known states.
     private func readableNextEffectDate() -> Date? {
         let current = now()
+        let pendingKeys = Set(pendingEffectWrites.keys).union(pendingActionWrites.keys.map(\.key))
+            .union(beginFailedKeys)
         return sourceStates.values.filter { state in
-            !unreadableSourceStates.contains(state.key)
+            !unreadableSourceStates.contains(state.key) && !pendingKeys.contains(state.key)
                 && (state.needsQueueSync || state.needsRemoteTrash || state.needsRemoteRestore)
                 && state.nextAttemptAt > current
         }.map(\.nextAttemptAt).min()
@@ -1371,12 +1468,15 @@ public actor PendingBackupCoordinator {
             let latest = handoffs.compactMapValues(\.handoff)
             // Actions of sources without a Proton photo wait for their handoff event, not for a timer. An unreadable
             // handoff or an incomplete read is retried through the reconcile backoff, see `scheduleActionTimer`.
-            let due = read.actions.filter { latest[$0.key] != nil && actionIsEligible($0.key) }
+            let due = read.actions.filter {
+                latest[$0.key] != nil && actionIsEligible($0.key)
+                    && pendingActionWrites[PendingActionID($0)] == nil
+            }
             guard !due.isEmpty else { break }
             let volume = await effects.photosVolumeID()
             guard !closed else { return }
             guard let volume else {
-                for action in due { _ = store.retryAction(action, at: now()) }
+                for action in due { writeAction(action, result: .retry, at: now()) }
                 break
             }
             for action in due {
@@ -1391,11 +1491,8 @@ public actor PendingBackupCoordinator {
                     case .addToAlbum: await effects.addToAlbum(remote, albumID: action.albumID)
                     }
                 guard !closed else { return }
-                switch result {
-                case .done: _ = store.completeAction(action)
-                case .retry: _ = store.retryAction(action, at: now())
-                case .permanentFailure:
-                    _ = store.failAction(action)
+                writeAction(action, result: result, at: now())
+                if result == .permanentFailure {
                     PhotoDiagnostics.shared.increment("pending.actionFailed")
                 }
             }
@@ -1430,7 +1527,9 @@ public actor PendingBackupCoordinator {
         actionTimer = nil
         guard !closed else { return }
         let read = store.actionsRead()
-        let pending = read.actions.filter { !$0.failed }
+        let pending = read.actions.filter {
+            !$0.failed && pendingActionWrites[PendingActionID($0)] == nil
+        }
         let handoffs = store.latestHandoffsRead(for: Array(Set(pending.map(\.key))))
         // A pass is clean only when its dispatch reads and this scheduling read both read everything.
         actionsIncomplete = dispatchIncomplete || !read.complete
@@ -1438,9 +1537,9 @@ public actor PendingBackupCoordinator {
         // Owed actions that cannot be read, or whose Proton photo cannot be read, wait for the reconcile backoff. A
         // reconcile schedules it itself when it ends; a degraded wait that is already set keeps its delay.
         if !reconcileRunning {
-            if actionsDegraded, unreadableRetry == nil {
+            if actionsDegraded || writesDegraded, unreadableRetry == nil {
                 scheduleReconcileTimer()
-            } else if !actionsDegraded, !sourceStatesDegraded, unreadableRetry != nil {
+            } else if !actionsDegraded, !sourceStatesDegraded, !writesDegraded, unreadableRetry != nil {
                 // Every read is clean again outside a reconcile: the episode ends, and a new failure starts over.
                 scheduleReconcileTimer()
             }
