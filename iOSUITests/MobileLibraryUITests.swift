@@ -92,6 +92,23 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(wait(for: album, "isEnabled == false"), "the album does not hold the photo")
     }
 
+    func testTheGridContextMenuOpensAndCancelsTheAlbumPicker() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        try app.visiblePhoto(beside: app.verticalTabColumn()).press(forDuration: 1.2)
+        let addToAlbum = app.buttons["Add to Album"].firstMatch
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10), "the context menu has no album action")
+        addToAlbum.tap()
+        let cancel = app.barButton(titled: "Cancel")
+        XCTAssertTrue(cancel.waitForExistence(timeout: 10), "the album picker did not open")
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "Grid context menu album picker hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+        XCTAssertTrue(cancel.isHittable)
+        cancel.tap()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "Cancel did not return to the library")
+    }
+
     /// Every fixture photo is an edit with an original. The More menu shows the original, marks it with a badge, and
     /// returns to the edited version.
     func testTheViewerShowsTheOriginalOfAnEditedPhotoAndTheEditAgain() throws {

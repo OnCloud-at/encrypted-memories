@@ -14,6 +14,7 @@ import TimelineUIKitFeature
 /// Lists a tapped cluster's member photos in the shared UIKit grid. It reuses the Photos selection and viewer
 /// routes, and reverse-geocodes the cluster center for the navigation title.
 struct MobileMapClusterSeriesScreen: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let coordinate: CLLocationCoordinate2D
     private let pager: PhotoLocationClusterPager
 
@@ -83,6 +84,7 @@ struct MobileMapClusterSeriesScreen: View {
                     AlbumDestinationPicker(
                         coordinator: coordinator,
                         photoUIDs: model.selectedUIDs(selection.selected),
+                        regularPresentation: horizontalSizeClass == .regular,
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in
                             showAlbumPicker = false

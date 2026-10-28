@@ -6,6 +6,9 @@ import SwiftUI
 /// in a popover anchored to the button; each platform places it in its native toolbar. Adding, creating, capability
 /// gating, and failures stay in `AlbumActionCoordinator`.
 public struct AlbumAddButton: View {
+    #if os(iOS)
+        @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
     private let coordinator: AlbumActionCoordinator
     private let photoUIDs: [PhotoUID]
     @Binding private var isPresented: Bool
@@ -42,6 +45,7 @@ public struct AlbumAddButton: View {
             AlbumDestinationPicker(
                 coordinator: coordinator,
                 photoUIDs: photoUIDs,
+                regularPresentation: regularPresentation,
                 onAlbumsChanged: onAlbumsChanged,
                 onCompleted: { albumID in
                     isPresented = false
@@ -49,5 +53,13 @@ public struct AlbumAddButton: View {
                 }
             )
         }
+    }
+
+    private var regularPresentation: Bool? {
+        #if os(iOS)
+            horizontalSizeClass == .regular
+        #else
+            nil
+        #endif
     }
 }

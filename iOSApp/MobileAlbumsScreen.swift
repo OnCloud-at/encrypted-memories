@@ -334,6 +334,7 @@ private struct MobileAlbumRow: View {
 
 /// Presents the shared timeline grid for a `PhotoFilter` route. The route supplies the title and data source.
 private struct MobileFilterGridScreen: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(MobileLibraryModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let title: String
@@ -558,6 +559,7 @@ private struct MobileFilterGridScreen: View {
                         AlbumDestinationPicker(
                             coordinator: coordinator,
                             photoUIDs: snapshot.orderedUIDs(including: selection.selected),
+                            regularPresentation: horizontalSizeClass == .regular,
                             onAlbumsChanged: { model.noteAlbumsChanged() },
                             onCompleted: { _ in
                                 showAlbumPicker = false

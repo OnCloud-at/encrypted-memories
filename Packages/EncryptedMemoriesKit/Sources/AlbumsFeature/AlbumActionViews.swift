@@ -37,6 +37,7 @@ public struct AlbumCreationSheet: View {
         #if os(macOS)
             .frame(width: 360, height: photoUIDs.isEmpty ? 170 : 195)
         #else
+            .modifier(AlbumRegularPresentationSize(width: 360, height: photoUIDs.isEmpty ? 210 : 250))
             .presentationDetents([.height(photoUIDs.isEmpty ? 210 : 250)])
             .presentationDragIndicator(.visible)
         #endif
@@ -49,6 +50,7 @@ public struct AlbumCreationSheet: View {
 public struct AlbumDestinationPicker: View {
     private let coordinator: AlbumActionCoordinator
     private let photoUIDs: [PhotoUID]
+    private let regularPresentation: Bool?
     private let onAlbumsChanged: () -> Void
     private let onCompleted: (AlbumID) -> Void
 
@@ -57,11 +59,13 @@ public struct AlbumDestinationPicker: View {
     public init(
         coordinator: AlbumActionCoordinator,
         photoUIDs: [PhotoUID],
+        regularPresentation: Bool? = nil,
         onAlbumsChanged: @escaping () -> Void = {},
         onCompleted: @escaping (AlbumID) -> Void
     ) {
         self.coordinator = coordinator
         self.photoUIDs = photoUIDs
+        self.regularPresentation = regularPresentation
         self.onAlbumsChanged = onAlbumsChanged
         self.onCompleted = onCompleted
     }
@@ -139,6 +143,9 @@ public struct AlbumDestinationPicker: View {
         #if os(macOS)
             .frame(width: 330, height: pickerHeight)
         #else
+            .modifier(
+                AlbumRegularPresentationSize(width: 330, height: pickerHeight, regular: regularPresentation ?? false)
+            )
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         #endif
@@ -155,11 +162,9 @@ public struct AlbumDestinationPicker: View {
         #endif
     }
 
-    #if os(macOS)
-        private var pickerHeight: CGFloat {
-            coordinator.albums.isEmpty ? 210 : min(390, 145 + CGFloat(coordinator.albums.count) * 42)
-        }
-    #endif
+    private var pickerHeight: CGFloat {
+        coordinator.albums.isEmpty ? 210 : min(390, 145 + CGFloat(coordinator.albums.count) * 42)
+    }
 
     @ViewBuilder private var destinationRows: some View {
         if coordinator.isLoading, coordinator.albums.isEmpty {
@@ -224,6 +229,25 @@ public struct AlbumDestinationPicker: View {
         }
     }
 }
+
+#if os(iOS)
+    /// Give fitted regular presentations a bounded ideal size while compact sheets keep their native detents.
+    private struct AlbumRegularPresentationSize: ViewModifier {
+        @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+        let width: CGFloat
+        let height: CGFloat
+        var regular: Bool? = nil
+
+        func body(content: Content) -> some View {
+            let regular = regular ?? (horizontalSizeClass == .regular)
+            if regular {
+                content.frame(idealWidth: width, maxWidth: width, idealHeight: height, maxHeight: height)
+            } else {
+                content
+            }
+        }
+    }
+#endif
 
 private struct AlbumNameForm: View {
     let coordinator: AlbumActionCoordinator
