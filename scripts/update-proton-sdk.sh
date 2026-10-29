@@ -19,12 +19,38 @@ if [[ ! -f "$PIN_FILE" || ${#PATCHES[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# Transient GitHub connection failures must not fail a queued SDK restore. Retry a git
+# network command only for a connection error (exit 128 with a connection message);
+# every other failure (authentication, missing ref, wrong commit) aborts immediately
+# with its original message and exit code.
+retry_git() {
+  local output status attempt
+  for attempt in 1 2 3; do
+    status=0
+    output="$(git "$@" 2>&1)" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+      [[ -n "$output" ]] && printf '%s\n' "$output"
+      return 0
+    fi
+    printf '%s\n' "$output" >&2
+    if [[ "$status" -ne 128 ]] || ! printf '%s\n' "$output" \
+      | grep -Eq 'Failed to connect|Could not resolve host|Connection timed out|Connection reset|early EOF'; then
+      return "$status"
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      echo "Transient connection error from 'git $*', retrying (attempt $attempt of 3)..." >&2
+      if [[ "$attempt" -eq 1 ]]; then sleep 5; else sleep 15; fi
+    fi
+  done
+  return "$status"
+}
+
 if [ ! -d "$SDK_DIR/.git" ]; then
   echo "Cloning sdk-swift..."
-  git clone "$REPO" "$SDK_DIR"
+  retry_git clone "$REPO" "$SDK_DIR"
 fi
 
-git -C "$SDK_DIR" fetch --tags --quiet "$REPO"
+retry_git -C "$SDK_DIR" fetch --tags --quiet "$REPO"
 
 EXPECTED_COMMIT="$(tr -d '[:space:]' < "$PIN_FILE")"
 [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
