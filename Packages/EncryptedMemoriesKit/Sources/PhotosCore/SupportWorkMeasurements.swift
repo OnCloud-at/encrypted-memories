@@ -10,7 +10,8 @@ public enum SupportMeasurementOutcome: Int, Sendable {
 }
 
 public enum SupportMeasurementCounter: Int, CaseIterable, Sendable {
-    case unlockSucceeded, decryptSucceeded, nodesRequested, nodesUnique, nodeCallsStarted, nodeCallsReturned, factsCreated
+    case unlockSucceeded, decryptSucceeded, nodesRequested, nodesUnique, nodeCallsStarted, nodeCallsReturned,
+        factsCreated
 }
 
 public enum SupportMeasurementPhase: Int, Sendable {
@@ -80,8 +81,12 @@ public final class SupportWorkMeasurements: SupportWorkMeasurementSource, @unche
     private let enabled: Bool
     private let clock: @Sendable () -> Duration
     private var closed = false
-    private var passes = SupportMeasurementKind.allCases.map { SupportWorkMeasurementSnapshot.Passes(kind: $0.rawValue) }
-    private var waits = SupportMeasurementQueue.allCases.map { SupportWorkMeasurementSnapshot.QueueWaits(scope: $0.rawValue) }
+    private var passes = SupportMeasurementKind.allCases.map {
+        SupportWorkMeasurementSnapshot.Passes(kind: $0.rawValue)
+    }
+    private var waits = SupportMeasurementQueue.allCases.map {
+        SupportWorkMeasurementSnapshot.QueueWaits(scope: $0.rawValue)
+    }
 
     public init(enabled: Bool = true, now: (@Sendable () -> Duration)? = nil) {
         self.enabled = enabled

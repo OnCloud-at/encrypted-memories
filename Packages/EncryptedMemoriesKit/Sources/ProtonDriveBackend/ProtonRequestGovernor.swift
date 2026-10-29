@@ -504,7 +504,8 @@ actor ProtonRequestGovernor {
 
             let index = bestWaiterIndex(in: state.waiters, now: timestamp)
             let waiter = state.waiters.remove(at: index)
-            workMeasurements.recordQueueWait(scope.measurementQueue, since: waiter.measurementEnqueuedAt, cancelled: false)
+            workMeasurements.recordQueueWait(
+                scope.measurementQueue, since: waiter.measurementEnqueuedAt, cancelled: false)
             state.inFlight += 1
             state.activePermitIDs.insert(waiter.id)
             state.admitted.append(timestamp)

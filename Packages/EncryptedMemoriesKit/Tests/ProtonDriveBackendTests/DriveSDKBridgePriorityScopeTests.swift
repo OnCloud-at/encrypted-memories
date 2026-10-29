@@ -22,7 +22,8 @@ struct DriveSDKBridgePriorityScopeTests {
         let governor = ProtonRequestGovernor()
         let bridge = try await makeBridge(directory: directory, governor: governor)
         await #expect(throws: (any Error).self) { try await bridge.loadTimelineSnapshot() }
-        let state = governor.workMeasurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.timelineLoad.rawValue]
+        let state = governor.workMeasurements.workMeasurementSupportSnapshot().passes[
+            SupportMeasurementKind.timelineLoad.rawValue]
         let sample = try #require(state.samples.first)
         #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
         #expect(sample.outcome == 2)

@@ -670,7 +670,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 supportSource = .sdkCache
                 measurement?.setTimelineSource(.sdkCache)
                 let collector = SDKEnumerationCollector<PhotoTimelineItem>()
-                let items = try await WorkMeasurementOperation.phase(.enumeration, pass: measurement) { [photosClient] in
+                let items = try await WorkMeasurementOperation.phase(.enumeration, pass: measurement) {
+                    [photosClient] in
                     try await SDKCancellableOperation.run { [photosClient] cancellationToken in
                         try await photosClient.enumerateTimeline(
                             in: root,

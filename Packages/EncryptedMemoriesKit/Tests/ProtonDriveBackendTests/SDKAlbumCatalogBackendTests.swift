@@ -19,9 +19,10 @@ struct SDKAlbumCatalogBackendTests {
                     AdditionalMetadata(name: "Media", utf8JsonValue: Data(#"{"Width":4032,"Height":3024}"#.utf8)),
                 ])
         }
-        let nodes = Dictionary(uniqueKeysWithValues: photos.map {
-            ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0))
-        })
+        let nodes = Dictionary(
+            uniqueKeysWithValues: photos.map {
+                ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0))
+            })
         let uids = photos.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
         let requested = uids + uids
         let referenceClient = FakeSDKPhotoCatalogClient()
@@ -43,7 +44,8 @@ struct SDKAlbumCatalogBackendTests {
             #expect(await client.getNodeCalls == 4096)
             #expect(await client.maximumConcurrentGetNodeCalls <= 4)
             if let collector {
-                let state = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.nodeFactsBatch.rawValue]
+                let state = collector.workMeasurementSupportSnapshot().passes[
+                    SupportMeasurementKind.nodeFactsBatch.rawValue]
                 #expect(state.started == 64 && state.completed == 64 && state.inProgress == 0)
                 #expect(state.counters == [0, 0, 8192, 4096, 4096, 4096, 4096])
             }
@@ -80,7 +82,8 @@ struct SDKAlbumCatalogBackendTests {
             #expect(actual.metadata == expected.metadata && actual.timelineOrder == expected.timelineOrder)
             #expect(await client.getNodeCalls == 2048)
             if let collector {
-                let state = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.viewerRead.rawValue]
+                let state = collector.workMeasurementSupportSnapshot().passes[
+                    SupportMeasurementKind.viewerRead.rawValue]
                 #expect(state.started == 2048 && state.completed == 2048 && state.inProgress == 0)
                 #expect(state.counters == [0, 0, 2048, 2048, 2048, 2048, 2048])
             }
@@ -92,8 +95,10 @@ struct SDKAlbumCatalogBackendTests {
         let client = FakeSDKPhotoCatalogClient()
         let photo = photoNode(
             id: "private-photo-id", albumIDs: [],
-            additionalMetadata: [AdditionalMetadata(
-                name: "Camera", utf8JsonValue: Data(#"{"Device":"private-camera-name"}"#.utf8))])
+            additionalMetadata: [
+                AdditionalMetadata(
+                    name: "Camera", utf8JsonValue: Data(#"{"Device":"private-camera-name"}"#.utf8))
+            ])
         await client.configureNodes([photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)])
         let uid = PhotoUID(volumeID: "volume", nodeID: "private-photo-id")
         let measurements = SupportWorkMeasurements()
@@ -155,9 +160,11 @@ struct SDKAlbumCatalogBackendTests {
     @Test func diagnosticNodeFactsKeepTheExistingConcurrencyLimit() async throws {
         let client = FakeSDKPhotoCatalogClient(nodeDelay: .milliseconds(1))
         let photos = (0..<8).map { photoNode(id: "photo-\($0)", albumIDs: []) }
-        await client.configureNodes(Dictionary(uniqueKeysWithValues: photos.map {
-            ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0))
-        }))
+        await client.configureNodes(
+            Dictionary(
+                uniqueKeysWithValues: photos.map {
+                    ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0))
+                }))
         let measurements = SupportWorkMeasurements()
         let uids = photos.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
         let facts = try await SDKAlbumCatalogBackend(client: client, workMeasurements: measurements).nodeFacts(of: uids)

@@ -104,7 +104,8 @@ final class SupportWorkMeasurementsTests: XCTestCase {
         pass.setTimelineSource(.sdkCache)
         pass.finish(.partial)
         let sample = try XCTUnwrap(
-            collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.timelineLoad.rawValue].samples.first)
+            collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.timelineLoad.rawValue].samples
+                .first)
         XCTAssertEqual(sample.enumerationClass, 0)
         XCTAssertEqual(sample.tagsClass, -1)
         XCTAssertEqual(sample.totalClass, 0)
@@ -138,7 +139,8 @@ final class SupportWorkMeasurementsTests: XCTestCase {
             }
         }
         pass.finish(.success)
-        let counters = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.nodeFactsBatch.rawValue].counters
+        let counters = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.nodeFactsBatch.rawValue]
+            .counters
         XCTAssertEqual(counters[SupportMeasurementCounter.nodeCallsStarted.rawValue], 100)
         XCTAssertEqual(counters[SupportMeasurementCounter.nodeCallsReturned.rawValue], 100)
     }
@@ -150,7 +152,9 @@ final class SupportWorkMeasurementsTests: XCTestCase {
         pass.record(.unlockSucceeded)
         pass.record(.decryptSucceeded, count: -1)
         pass.finish(.success)
-        let counters = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.timelineReconcile.rawValue].counters
+        let counters = collector.workMeasurementSupportSnapshot().passes[
+            SupportMeasurementKind.timelineReconcile.rawValue
+        ].counters
         XCTAssertEqual(counters[0], Int.max)
         XCTAssertEqual(counters[1], 0)
     }

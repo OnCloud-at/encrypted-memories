@@ -35,7 +35,8 @@ extension DriveSessionStubSuite {
                 let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 defer { try? FileManager.default.removeItem(at: directory) }
-                let store = try #require(UploadIdentityManifestStore(url: directory.appendingPathComponent("index.sqlite")))
+                let store = try #require(
+                    UploadIdentityManifestStore(url: directory.appendingPathComponent("index.sqlite")))
                 defer { store.close() }
                 let session = makeSession()
                 let collector = enabled ? SupportWorkMeasurements() : nil
@@ -49,11 +50,15 @@ extension DriveSessionStubSuite {
                         store: store, lineageStore: nil, progress: { _ in }, workMeasurements: collector)
                 }
                 #expect(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
-                #expect(Set(store.remoteContentRecords(contentHash: hash, hashKeyEpoch: "epoch", limit: 128).map(\.remoteLinkID)) == Set(ids))
+                #expect(
+                    Set(
+                        store.remoteContentRecords(contentHash: hash, hashKeyEpoch: "epoch", limit: 128).map(
+                            \.remoteLinkID)) == Set(ids))
                 #expect(try metadataRequestLinkIDs() == ids.sorted())
                 #expect(StubURLProtocol.requests().count == 4)
                 if let collector {
-                    let state = collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.indexRebuild.rawValue]
+                    let state = collector.workMeasurementSupportSnapshot().passes[
+                        SupportMeasurementKind.indexRebuild.rawValue]
                     #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
                     #expect(state.counters[0] == 64 && state.counters[1] == 64)
                     #expect(state.samples.last?.outcome == 0)
@@ -89,12 +94,14 @@ extension DriveSessionStubSuite {
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
                 material: Self.material(rootKey: keys.root), session: makeSession(), crypto: keys.crypto,
                 store: content, lineageStore: nil, progress: { _ in }, workMeasurements: measurements)
-            let state = measurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.indexRebuild.rawValue]
+            let state = measurements.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.indexRebuild.rawValue]
             #expect(state.started == 1 && state.completed == 1)
             #expect(state.counters[SupportMeasurementCounter.unlockSucceeded.rawValue] == 3)
             #expect(state.counters[SupportMeasurementCounter.decryptSucceeded.rawValue] == 2)
             #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
-            let exported = String(decoding: try JSONEncoder().encode(measurements.workMeasurementSupportSnapshot()), as: UTF8.self)
+            let exported = String(
+                decoding: try JSONEncoder().encode(measurements.workMeasurementSupportSnapshot()), as: UTF8.self)
             #expect(!exported.contains("bad-decrypt") && !exported.contains("good"))
         }
 
@@ -103,15 +110,21 @@ extension DriveSessionStubSuite {
             defer { fixture.close() }
             StubURLProtocol.route(
                 "GET /drive/volumes/vol1/events/one",
-                json: #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"event-photo","Type":2,"State":1}}]}"#)
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"event-photo","Type":2,"State":1}}]}"#
+            )
             try routeMetadata([
-                try fixture.keys.activePhoto("event-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
-                try fixture.keys.activePhoto("repair-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
+                try fixture.keys.activePhoto(
+                    "event-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
+                try fixture.keys.activePhoto(
+                    "repair-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
             ])
             let measurements = SupportWorkMeasurements()
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
-                material: Self.material(rootKey: fixture.keys.root), session: makeSession(), crypto: fixture.keys.crypto,
-                store: fixture.content, lineageStore: fixture.lineage, progress: { _ in }, workMeasurements: measurements)
+                material: Self.material(rootKey: fixture.keys.root), session: makeSession(),
+                crypto: fixture.keys.crypto,
+                store: fixture.content, lineageStore: fixture.lineage, progress: { _ in },
+                workMeasurements: measurements)
             let snapshot = measurements.workMeasurementSupportSnapshot()
             let events = snapshot.passes[SupportMeasurementKind.eventUpdate.rawValue]
             let repairs = snapshot.passes[SupportMeasurementKind.lineageRepair.rawValue]

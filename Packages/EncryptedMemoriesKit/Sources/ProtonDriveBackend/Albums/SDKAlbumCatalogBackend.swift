@@ -415,7 +415,9 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
                     case .photo(let photo):
                         fact = .init(
                             isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
-                            albums: photo.albumUids.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) },
+                            albums: photo.albumUids.map {
+                                SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID)
+                            },
                             fingerprint: SDKPhotoMetadataReader.fingerprint(
                                 captureTime: photo.captureTime, name: photo.name, mimeType: photo.mediaType,
                                 revision: photo.activeRevision))

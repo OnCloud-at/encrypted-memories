@@ -48,7 +48,8 @@ import Testing
             Issue.record("the original error must propagate")
         } catch { #expect(error as? MeasurementProbeError == .rejected) }
         let sample = try #require(
-            collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.timelineLoad.rawValue].samples.first)
+            collector.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.timelineLoad.rawValue].samples
+                .first)
         #expect(sample.enumerationClass == 1)
         #expect(sample.tagsClass == -1)
         #expect(sample.totalClass == 1)
