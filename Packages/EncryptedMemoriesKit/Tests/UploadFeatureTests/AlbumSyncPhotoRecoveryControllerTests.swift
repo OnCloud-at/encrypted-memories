@@ -314,6 +314,79 @@ final class AlbumSyncPhotoRecoveryControllerTests: XCTestCase {
             })
     }
 
+    func testShutdownWaitsForTheActiveSyncTaskBeforeReturning() async throws {
+        let gate = RecoveryGate()
+        let source = RecoveryCountingSource()
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            onContext: { await gate.wait() }, localSource: source,
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                fixture.controller.syncNow(albumID: "local-album")
+                await fulfillment(of: [gate.entered], timeout: 5)
+                XCTAssertTrue(fixture.controller.isSyncing)
+                let done = RecoveryCompletion()
+                let shutdown = Task {
+                    await fixture.controller.shutdown()
+                    done.mark()
+                }
+                await fulfillment(of: [gate.cancelled], timeout: 5)
+                // The runner stop and the executor stop have both returned, so shutdown waits at
+                // the active sync join. Until the held context read returns, the batch is running.
+                await fulfillment(of: [probe.executorStopped], timeout: 5)
+                XCTAssertTrue(fixture.controller.isSyncing, "The batch still owns the context read at the join")
+                // Until the held context read returns, the active sync task is still running, so
+                // shutdown must not have returned yet. Short negative window in the style of
+                // MLSmartSearchLifecycleTests' shutdown-waits test.
+                try await Task.sleep(for: .milliseconds(150))
+                XCTAssertFalse(done.isDone, "Shutdown must wait for the active sync task to finish")
+                await gate.release()
+                await shutdown.value
+                XCTAssertTrue(done.isDone)
+                XCTAssertFalse(fixture.controller.isSyncing, "Shutdown returned after the sync task finished")
+                let finished = await gate.finished
+                XCTAssertTrue(finished, "The released context read finished before shutdown returned")
+                XCTAssertEqual(source.reads, 0)
+                XCTAssertEqual(probe.stopCalls, 2)
+                XCTAssertEqual(probe.ensureBackedUpCalls, 0)
+            })
+    }
+
+    func testSyncNowCannotStartABatchWhileShutdownIsRunning() async throws {
+        let gate = RecoveryGate()
+        let source = RecoveryCountingSource()
+        let probe = RecoveryShutdownProbeBackup(holdsFirstStop: true)
+        try await withFixture(
+            onContext: { await gate.wait() }, localSource: source,
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                fixture.controller.syncNow(albumID: "local-album")
+                await fulfillment(of: [gate.entered], timeout: 5)
+                let shutdown = Task { await fixture.controller.shutdown() }
+                // The held executor stop parks shutdown after it cleared the queue and cancelled
+                // the active batch, with the batch winding down.
+                await fulfillment(of: [probe.firstStopEntered], timeout: 5)
+                await gate.release()
+                await waitForSync(fixture.controller)
+                XCTAssertFalse(fixture.controller.isSyncing)
+                fixture.controller.syncNow(albumID: "local-album")
+                XCTAssertFalse(
+                    fixture.controller.isSyncing, "syncNow must not start a new batch during shutdown")
+                XCTAssertEqual(probe.ensureBackedUpCalls, 0)
+                XCTAssertEqual(source.reads, 0)
+                probe.releaseFirstStop()
+                await shutdown.value
+                XCTAssertEqual(probe.stopCalls, 2)
+                XCTAssertFalse(fixture.controller.isSyncing)
+            })
+    }
+
     func testNonDeletionProblemCannotAuthorizeRestore() async throws {
         try await withFixture { fixture in
             let item = BackupFailedItem(
@@ -847,6 +920,84 @@ private final class RecoveryCountingSource: AlbumSyncLocalAlbumSource, @unchecke
         lock.withLock { count += 1 }
         throw CancellationError()
     }
+}
+
+/// Wraps the scenario backup and counts executor entries and `stop()` calls. The first `stop()`
+/// can be held so a test parks `shutdown()` between the runner stop and the rest of its teardown.
+private final class RecoveryShutdownProbeBackup: AlbumSyncBackupExecuting, @unchecked Sendable {
+    private let lock = NSLock()
+    private let holdsFirstStop: Bool
+    private var base: (any AlbumSyncBackupExecuting)?
+    private var stops = 0
+    private var backups = 0
+    private var firstStopContinuation: CheckedContinuation<Void, Never>?
+    private var firstStopReleased = false
+    let firstStopEntered = XCTestExpectation(description: "Shutdown reached the first executor stop")
+    let executorStopped = XCTestExpectation(description: "Shutdown passed its executor stop")
+
+    init(holdsFirstStop: Bool = false) {
+        self.holdsFirstStop = holdsFirstStop
+    }
+
+    var stopCalls: Int { lock.withLock { stops } }
+    var ensureBackedUpCalls: Int { lock.withLock { backups } }
+
+    func setBase(_ base: any AlbumSyncBackupExecuting) {
+        lock.withLock { self.base = base }
+    }
+
+    func ensureBackedUp(
+        localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
+    ) async throws -> AlbumSyncBackupReport {
+        lock.withLock { backups += 1 }
+        guard let base = lock.withLock({ base }) else { throw CancellationError() }
+        return try await base.ensureBackedUp(localIdentifiers: localIdentifiers, onProgress: onProgress)
+    }
+
+    func remoteProofLinks(for localIdentifiers: [String]) async throws -> [String: AlbumSyncRemoteLink] {
+        guard let base = lock.withLock({ base }) else { return [:] }
+        return try await base.remoteProofLinks(for: localIdentifiers)
+    }
+
+    func stop() async {
+        let count = lock.withLock {
+            stops += 1
+            return stops
+        }
+        // The first stop belongs to the runner's stop call inside shutdown(); the second one is
+        // shutdown's own backup stop, whose return puts shutdown at the active sync join.
+        if count == 1 { firstStopEntered.fulfill() }
+        if holdsFirstStop, count == 1 {
+            await withCheckedContinuation { continuation in
+                let resumeNow = lock.withLock {
+                    if firstStopReleased { return true }
+                    firstStopContinuation = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+        if let base = lock.withLock({ base }) { await base.stop() }
+        if count == 2 { executorStopped.fulfill() }
+    }
+
+    func releaseFirstStop() {
+        let continuation = lock.withLock {
+            firstStopReleased = true
+            let held = firstStopContinuation
+            firstStopContinuation = nil
+            return held
+        }
+        continuation?.resume()
+    }
+}
+
+/// Thread-safe completion flag for asserting that a background task has not finished yet.
+private final class RecoveryCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func mark() { lock.withLock { done = true } }
+    var isDone: Bool { lock.withLock { done } }
 }
 
 private final class RecoveryCancellationState: @unchecked Sendable {
