@@ -29,6 +29,46 @@ final class PendingBackupStoreTests: XCTestCase {
         PendingPresentationMetadata(captureTime: date, mediaType: "image/heic", displayName: name)
     }
 
+    func testReverseHandoffLookupRejectsADecodedPrefix() throws {
+        let healthy = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
+        let healthyRemote = PhotoUID(volumeID: "vol", nodeID: "link-0")
+        for (source, target) in [(healthy, healthyRemote), (key, remote)] {
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: source, revision: UploadBackupRevision(rawValue: 7), remote: target,
+                        kind: .uploaded, createdAt: date)), .recorded)
+        }
+        try withRawPendingDatabase { db in
+            XCTAssertEqual(
+                sqlite3_exec(db, "UPDATE handoff SET kind='invalid' WHERE source_id='asset-1';", nil, nil, nil),
+                SQLITE_OK)
+        }
+        let before = try pendingTables()
+
+        let found = store.handoffs(forRemoteLinkIDs: [healthyRemote.nodeID, remote.nodeID])
+
+        XCTAssertTrue(found.isEmpty, "an unreadable requested lookup cannot expose its healthy prefix")
+        XCTAssertEqual(try pendingTables(), before, "discovery must not change durable state")
+    }
+
+    func testReverseHandoffLookupReturnsACompleteHealthyBatch() throws {
+        let healthy = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
+        let healthyRemote = PhotoUID(volumeID: "vol", nodeID: "link-0")
+        for (source, target) in [(healthy, healthyRemote), (key, remote)] {
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: source, revision: UploadBackupRevision(rawValue: 7), remote: target,
+                        kind: .uploaded, createdAt: date)), .recorded)
+        }
+
+        let found = store.handoffs(forRemoteLinkIDs: [healthyRemote.nodeID, remote.nodeID])
+
+        XCTAssertEqual(found.map(\.key), [healthy, key])
+        XCTAssertTrue(store.isOperational())
+    }
+
     func testLaterTrashPruningKeepsAnUnreadableAcknowledgedHandoffAfterConfirmedTrash() throws {
         let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier-upload")
         XCTAssertNotNil(

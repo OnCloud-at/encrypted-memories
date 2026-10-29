@@ -172,6 +172,12 @@ public enum PendingHandoffRead: Sendable, Equatable {
     }
 }
 
+/// An exhaustive reverse lookup of handoffs. An unreadable request exposes no partial result.
+public enum PendingHandoffsRead: Sendable, Equatable {
+    case unreadable
+    case complete([PendingHandoff])
+}
+
 /// The actions that decoded, and whether the read was complete. An incomplete read can leave out owed actions.
 public struct PendingActionsRead: Sendable, Equatable {
     public let actions: [PendingAction]
