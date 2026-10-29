@@ -77,19 +77,21 @@ extension DriveSessionStubSuite {
             let keys = try LineageKeys()
             var badKey = try keys.activePhoto("bad-key", attributes: "{}")
             badKey.removeValue(forKey: "NodePassphrase")
+            var badPassphrase = try keys.activePhoto("bad-passphrase", attributes: "{}")
+            badPassphrase["NodePassphrase"] = "not-an-encrypted-passphrase"
             var badDecrypt = try keys.activePhoto("bad-decrypt", attributes: "{}")
             badDecrypt["XAttr"] = "not-an-encrypted-message"
             let badJSON = try keys.activePhoto("bad-json", attributes: "not-json")
             let good = try keys.activePhoto("good", attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
             StubURLProtocol.reset()
             StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
-            let listed = ["good", "bad-key", "bad-decrypt", "bad-json"].map {
+            let listed = ["good", "bad-key", "bad-passphrase", "bad-decrypt", "bad-json"].map {
                 ["LinkID": $0, "CaptureTime": 1, "Tags": [], "RelatedPhotos": []] as [String: Any]
             }
             let listing = try JSONSerialization.data(withJSONObject: ["Code": 1000, "Photos": listed])
             StubURLProtocol.route(
                 "GET /drive/volumes/vol1/photos", json: String(decoding: listing, as: UTF8.self))
-            try routeMetadata([good, badKey, badDecrypt, badJSON])
+            try routeMetadata([good, badKey, badPassphrase, badDecrypt, badJSON])
             let measurements = SupportWorkMeasurements()
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
                 material: Self.material(rootKey: keys.root), session: makeSession(), crypto: keys.crypto,
