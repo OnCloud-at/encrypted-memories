@@ -209,6 +209,85 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(wait(for: selectedPhoto, "isSelected == false"), "Done must clear the selection")
     }
 
+    func testSelectionAppearsOnlyOnPhotoGrids() {
+        func capture(_ phase: String) {
+            let ax = XCTAttachment(string: app.debugDescription)
+            ax.name = "Grid selection AX " + phase
+            ax.lifetime = .keepAlways
+            add(ax)
+
+            let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screenshot.name = "Grid selection screen " + phase
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+        }
+
+        func tapVisibleCenter(_ element: XCUIElement, name: String) -> Bool {
+            XCTAssertTrue(element.exists, "\(name) must exist")
+            guard element.exists else { return false }
+
+            let frame = element.frame
+            let window = app.windows.firstMatch.frame
+            let center = CGPoint(x: frame.midX, y: frame.midY)
+            let safePoint = !frame.isEmpty && window.contains(center)
+            XCTAssertTrue(safePoint, "\(name) center must be inside the window")
+            guard safePoint else { return false }
+
+            element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            return true
+        }
+
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60), "Library grid must load")
+        XCTAssertTrue(app.buttons["Select"].waitForExistence(timeout: 10), "Library must offer Select")
+        app.tab(titled: "Search").tap()
+
+        let field = app.searchFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 10), "Search field must open")
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 10), "Search must show the keyboard")
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.6)).tap()
+            XCTAssertTrue(wait(for: keyboard, "exists == false", timeout: 10), "Keyboard must close")
+        }
+
+        XCTAssertTrue(app.staticTexts["For You"].waitForExistence(timeout: 30), "Suggestions must be visible")
+        XCTAssertTrue(wait(for: firstPhoto, "exists == false", timeout: 10), "Suggestions must replace the grid")
+        let suggestion = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH 'Spring 2026'")
+        ).firstMatch
+        XCTAssertTrue(suggestion.waitForExistence(timeout: 10), "Fixture suggestion must be present")
+        capture("suggestions")
+        XCTAssertFalse(app.buttons["Select"].exists, "Suggestions must not offer Select")
+
+        guard tapVisibleCenter(suggestion, name: "Suggestion") else { return }
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 30), "Suggestion must show a photo grid")
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            XCTAssertTrue(app.buttons["Select"].waitForExistence(timeout: 10), "Result grid must offer Select")
+        }
+        capture("results")
+
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            let submit = keyboard.buttons["Search"]
+            XCTAssertTrue(submit.waitForExistence(timeout: 10), "Keyboard Search must exist")
+            submit.tap()
+            XCTAssertTrue(wait(for: keyboard, "exists == false", timeout: 10), "Keyboard must close")
+        }
+        XCTAssertFalse(keyboard.exists, "The keyboard must not cover the Library tap")
+        guard !keyboard.exists else { return }
+        let library = app.tab(titled: "Library")
+        guard tapVisibleCenter(library, name: "Library tab") else { return }
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 30), "Library grid must return")
+
+        let select = app.buttons["Select"]
+        XCTAssertTrue(select.waitForExistence(timeout: 10), "Library must still offer Select")
+        guard tapVisibleCenter(select, name: "Select") else { return }
+        let done = app.buttons["Done"]
+        XCTAssertTrue(done.waitForExistence(timeout: 10), "Selection must offer Done")
+        guard tapVisibleCenter(done, name: "Done") else { return }
+        XCTAssertTrue(select.waitForExistence(timeout: 10), "Done must end selection")
+        capture("library")
+    }
+
     func testTabsSwitchToCollectionsBackToTheLibraryAndToSearch() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
 
