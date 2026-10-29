@@ -271,46 +271,21 @@ final class MobileLibraryUITests: XCTestCase {
             library.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
             XCTAssertTrue(wait(for: library, "isSelected == true", timeout: 10), "Library must be selected")
         } else if UIDevice.current.userInterfaceIdiom == .phone {
-            let library = app.tab(titled: "Library")
-            let submit = keyboard.buttons.matching(
-                NSPredicate(format: "label ==[c] 'Search' OR label ==[c] 'Return'")
-            ).firstMatch
-            let submitReady = submit.waitForExistence(timeout: 10) && submit.isHittable
-            if !submitReady {
-                let ax = XCTAttachment(string: app.debugDescription)
-                ax.name = "Search submit hierarchy"
-                ax.lifetime = .keepAlways
-                add(ax)
-            }
-            XCTAssertTrue(submitReady, "Search or Return key must be reachable")
-            guard submitReady else { return }
-            submit.tap()
-            if library.isHittable {
-                library.tap()
-            } else {
-                let ax = XCTAttachment(string: app.debugDescription)
-                ax.name = "Search dismissal hierarchy"
-                ax.lifetime = .keepAlways
-                add(ax)
-                XCTAssertTrue(library.exists, "Library tab must exist to end search")
-                guard library.exists else { return }
-                let frame = library.frame
-                let window = app.windows.firstMatch.frame
-                let point = CGPoint(x: frame.midX, y: frame.midY)
-                let keyboardVisible = keyboard.exists
-                let keyboardFrame = keyboardVisible ? keyboard.frame : .zero
-                // The iPhone probe measured a 6 pt gap below the keyboard at this midpoint.
-                let distance = max(
-                    keyboardFrame.minX - point.x, point.x - keyboardFrame.maxX,
-                    keyboardFrame.minY - point.y, point.y - keyboardFrame.maxY)
-                let safePoint =
-                    !frame.isEmpty && window.contains(point)
-                    && (!keyboardVisible || (!keyboardFrame.contains(point) && distance >= 4))
-                XCTAssertTrue(safePoint, "Library tap point must be inside the window and clear of the keyboard")
-                guard safePoint else { return }
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
-                    .withOffset(CGVector(dx: point.x - window.minX, dy: point.y - window.minY)).tap()
-            }
+            let close = app.buttons["Close"]
+            XCTAssertTrue(close.waitForExistence(timeout: 10), "Native search Close must exist")
+            XCTAssertEqual(app.buttons.matching(identifier: "Close").count, 1, "Close must be unique")
+            let frame = close.frame
+            let window = app.windows.firstMatch.frame
+            let keyboardFrame = keyboard.frame
+            let point = CGPoint(x: frame.midX, y: frame.midY)
+            let ax = XCTAttachment(string: app.debugDescription)
+            ax.name = "Search close hierarchy"
+            ax.lifetime = .keepAlways
+            add(ax)
+            XCTAssertTrue(!frame.isEmpty && window.contains(point), "Close center must be in the window")
+            XCTAssertFalse(keyboardFrame.contains(point), "Close center must be outside the keyboard")
+            XCTAssertFalse(field.frame.contains(point), "Close center must be outside the text field")
+            close.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         } else {
             XCTFail("Unsupported device idiom for search dismissal")
             return
