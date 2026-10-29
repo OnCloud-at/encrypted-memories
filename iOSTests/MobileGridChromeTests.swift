@@ -147,7 +147,7 @@ struct ChromeProbeShell: View {
                             showAlbumPicker: .constant(false),
                             onShare: {},
                             onTrash: {},
-                            albumPicker: { EmptyView() }
+                            albumPicker: { _ in EmptyView() }
                         )
                     }
                     .mobileSelectionBars(isSelecting: state.isSelecting)

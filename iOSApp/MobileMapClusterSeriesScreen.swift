@@ -78,11 +78,12 @@ struct MobileMapClusterSeriesScreen: View {
             showAlbumPicker: $showAlbumPicker,
             onShare: startShare,
             onTrash: { selection.showTrashConfirm = true },
-            albumPicker: {
+            albumPicker: { regularPresentation in
                 if let coordinator = model.albumActions {
                     AlbumDestinationPicker(
                         coordinator: coordinator,
                         photoUIDs: model.selectedUIDs(selection.selected),
+                        regularPresentation: regularPresentation,
                         onAlbumsChanged: { model.noteAlbumsChanged() },
                         onCompleted: { _ in
                             showAlbumPicker = false

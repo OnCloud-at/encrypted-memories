@@ -92,6 +92,80 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(wait(for: album, "isEnabled == false"), "the album does not hold the photo")
     }
 
+    func testTheGridContextMenuOpensAndCancelsTheAlbumPicker() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        try app.visiblePhoto(beside: app.verticalTabColumn()).press(forDuration: 1.2)
+        let addToAlbum = app.buttons["Add to Album"].firstMatch
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10), "the context menu has no album action")
+        addToAlbum.tap()
+        let cancel = app.barButton(titled: "Cancel")
+        XCTAssertTrue(cancel.waitForExistence(timeout: 10), "the album picker did not open")
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "Grid context menu album picker hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+        XCTAssertTrue(cancel.isHittable)
+        let album = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(album.waitForExistence(timeout: 10))
+        let list = app.collectionViews.containing(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(list.waitForExistence(timeout: 10))
+        XCTAssertTrue(list.frame.contains(album.frame), "The first album must fit inside the context menu list")
+        XCTAssertTrue(album.isHittable, "The first album must be directly tappable")
+        cancel.tap()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "Cancel did not return to the library")
+    }
+
+    func testAlbumPickerShowsItsFirstAlbumWithoutScrolling() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
+        let addToAlbum = app.buttons["Add to Album"].firstMatch
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10))
+        addToAlbum.tap()
+        let album = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(album.waitForExistence(timeout: 10))
+        let list = app.collectionViews.containing(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(list.waitForExistence(timeout: 10))
+        XCTAssertTrue(list.frame.contains(album.frame), "The first album must fit inside the visible list")
+        XCTAssertTrue(album.isHittable, "The first album must be directly tappable")
+        album.tap()
+        XCTAssertTrue(wait(for: album, "exists == false", timeout: 20))
+    }
+
+    func testAlbumPickerShowsItsEmptyStateWithoutScrolling() throws {
+        app.terminate()
+        app.launchArguments += ["-EncryptedMemoriesEmptyAlbumFixture"]
+        app.launch()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
+        let addToAlbum = app.buttons["Add to Album"].firstMatch
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10))
+        addToAlbum.tap()
+        let empty = app.staticTexts["No albums yet"]
+        XCTAssertTrue(empty.waitForExistence(timeout: 10))
+        let list = app.collectionViews.containing(.staticText, identifier: "No albums yet").firstMatch
+        XCTAssertTrue(list.waitForExistence(timeout: 10))
+        XCTAssertTrue(list.frame.contains(empty.frame), "The empty state must fit inside the visible list")
+        XCTAssertTrue(empty.isHittable, "The empty state must be visible without scrolling")
+    }
+
+    func testSelectionToolbarShowsTheFirstAlbumWithoutScrolling() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        let column = try app.verticalTabColumn()
+        app.barButton(titled: "Select").tap()
+        try app.visiblePhoto(beside: column).tap()
+        let addToAlbum = app.barButton(titled: "Add to Album")
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10))
+        addToAlbum.tap()
+        let album = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(album.waitForExistence(timeout: 10))
+        let list = app.collectionViews.containing(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(list.waitForExistence(timeout: 10))
+        XCTAssertTrue(list.frame.contains(album.frame), "The first album must fit inside the visible selection list")
+        XCTAssertTrue(album.isHittable, "The first album must be directly tappable")
+        album.tap()
+        XCTAssertTrue(wait(for: album, "exists == false", timeout: 20))
+    }
+
     /// Every fixture photo is an edit with an original. The More menu shows the original, marks it with a badge, and
     /// returns to the edited version.
     func testTheViewerShowsTheOriginalOfAnEditedPhotoAndTheEditAgain() throws {

@@ -3,22 +3,36 @@ import DesignSystemCore
 import PhotosCore
 import SwiftUI
 
+#if os(iOS)
+    /// Presentation facts are captured before opening a sheet or popover.
+    public enum AlbumPresentationTraits {
+        public static func usesRegularSizing(
+            horizontal: UserInterfaceSizeClass?, vertical: UserInterfaceSizeClass?
+        ) -> Bool {
+            horizontal == .regular && vertical == .regular
+        }
+    }
+#endif
+
 /// Shared adaptive name form. The system presentation supplied by each platform remains native;
 /// validation, progress and partial-success behavior stay identical.
 public struct AlbumCreationSheet: View {
     private let coordinator: AlbumActionCoordinator
     private let photoUIDs: [PhotoUID]
+    private let regularPresentation: Bool
     private let onAlbumsChanged: () -> Void
     private let onCompleted: (AlbumID) -> Void
 
     public init(
         coordinator: AlbumActionCoordinator,
         photoUIDs: [PhotoUID] = [],
+        regularPresentation: Bool = false,
         onAlbumsChanged: @escaping () -> Void = {},
         onCompleted: @escaping (AlbumID) -> Void = { _ in }
     ) {
         self.coordinator = coordinator
         self.photoUIDs = photoUIDs
+        self.regularPresentation = regularPresentation
         self.onAlbumsChanged = onAlbumsChanged
         self.onCompleted = onCompleted
     }
@@ -37,6 +51,10 @@ public struct AlbumCreationSheet: View {
         #if os(macOS)
             .frame(width: 360, height: photoUIDs.isEmpty ? 170 : 195)
         #else
+            .modifier(
+                AlbumRegularPresentationSize(
+                    width: 360, height: photoUIDs.isEmpty ? 210 : 250, regular: regularPresentation)
+            )
             .presentationDetents([.height(photoUIDs.isEmpty ? 210 : 250)])
             .presentationDragIndicator(.visible)
         #endif
@@ -49,6 +67,7 @@ public struct AlbumCreationSheet: View {
 public struct AlbumDestinationPicker: View {
     private let coordinator: AlbumActionCoordinator
     private let photoUIDs: [PhotoUID]
+    private let regularPresentation: Bool?
     private let onAlbumsChanged: () -> Void
     private let onCompleted: (AlbumID) -> Void
 
@@ -57,11 +76,13 @@ public struct AlbumDestinationPicker: View {
     public init(
         coordinator: AlbumActionCoordinator,
         photoUIDs: [PhotoUID],
+        regularPresentation: Bool? = nil,
         onAlbumsChanged: @escaping () -> Void = {},
         onCompleted: @escaping (AlbumID) -> Void
     ) {
         self.coordinator = coordinator
         self.photoUIDs = photoUIDs
+        self.regularPresentation = regularPresentation
         self.onAlbumsChanged = onAlbumsChanged
         self.onCompleted = onCompleted
     }
@@ -139,7 +160,10 @@ public struct AlbumDestinationPicker: View {
         #if os(macOS)
             .frame(width: 330, height: pickerHeight)
         #else
-            .presentationDetents([.medium, .large])
+            .modifier(
+                AlbumRegularPresentationSize(width: 330, height: 390, regular: regularPresentation ?? false)
+            )
+            .presentationDetents(regularPresentation == true ? [.height(390)] : [.medium, .large])
             .presentationDragIndicator(.visible)
         #endif
         .task(id: photoUIDs) {
@@ -224,6 +248,23 @@ public struct AlbumDestinationPicker: View {
         }
     }
 }
+
+#if os(iOS)
+    /// Give fitted regular presentations a bounded ideal size while compact sheets keep their native detents.
+    private struct AlbumRegularPresentationSize: ViewModifier {
+        let width: CGFloat
+        let height: CGFloat
+        let regular: Bool
+
+        func body(content: Content) -> some View {
+            if regular {
+                content.frame(idealWidth: width, maxWidth: width, idealHeight: height)
+            } else {
+                content
+            }
+        }
+    }
+#endif
 
 private struct AlbumNameForm: View {
     let coordinator: AlbumActionCoordinator
