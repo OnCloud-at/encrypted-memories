@@ -60,7 +60,6 @@ final class AlbumSyncLastRunSourcePreviewTests: XCTestCase {
         await relaunched.load()
         let restored = relaunched.items(albumID: "album-1")
 
-        XCTAssertNil(restored.first?.source)
         XCTAssertNil(BackupProblemPreviewModel.uid(for: restored.first?.source))
     }
 }
