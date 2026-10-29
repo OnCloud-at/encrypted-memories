@@ -268,20 +268,22 @@ struct MobileTimelineScreen: View {
             }
             ToolbarSpacer(.fixed, placement: .topBarTrailing)
         }
-        ProminentToolbarItem(placement: .topBarTrailing, isProminent: selection.isSelecting) {
-            Button {
-                selection.toggleMode(reduceMotion: reduceMotion)
-            } label: {
-                MobileSelectionModeLabel(isSelecting: selection.isSelecting)
+        if !showsSearchLanding || selection.isSelecting {
+            ProminentToolbarItem(placement: .topBarTrailing, isProminent: selection.isSelecting) {
+                Button {
+                    selection.toggleMode(reduceMotion: reduceMotion)
+                } label: {
+                    MobileSelectionModeLabel(isSelecting: selection.isSelecting)
+                }
+                .disabled(!canSelect)
+                .opacity(launchChromeVisible ? 1 : 0)
+                .allowsHitTesting(launchChromeVisible)
+                .accessibilityHidden(!launchChromeVisible)
             }
-            .disabled(!canSelect)
-            .opacity(launchChromeVisible ? 1 : 0)
-            .allowsHitTesting(launchChromeVisible)
-            .accessibilityHidden(!launchChromeVisible)
+            .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
+            // Select/Done must stay in the bar on every bar axis: it is the only way to leave selection mode.
+            .mobileVisibilityPriority(.high)
         }
-        .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
-        // Select/Done must stay in the bar on every bar axis: it is the only way to leave selection mode.
-        .mobileVisibilityPriority(.high)
         // Keep all item identities mounted. The system can then morph the bar as one native transition.
         MobileSelectionToolbarItems(
             selection: selection,
