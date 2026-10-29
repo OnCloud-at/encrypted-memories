@@ -271,6 +271,7 @@ final class LocalizationTests: XCTestCase {
             "device.requires_metal3 %@",
             "device.unsupported_reassurance", "device.unsupported_title",
             "albums.photo_count %lld",
+            "trash.empty_blocked_merge_message", "trash.empty_blocked_journal_message", "trash.empty_failed_message",
         ]
         for key in reps {
             let langs = cov[key] ?? []

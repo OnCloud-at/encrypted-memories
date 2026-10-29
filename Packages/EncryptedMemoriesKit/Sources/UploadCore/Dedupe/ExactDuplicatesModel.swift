@@ -86,12 +86,6 @@ extension ExactDuplicateMerging {
     /// Mergers without a merge journal leave no merge open.
     public func resolvePendingMerges() async {}
 
-    /// Mergers without a merge journal leave no merge open.
-    public func confirmNoPendingMerges() async -> Bool { true }
-
-    /// Mergers without a merge journal leave no trashed copy to an open merge.
-    public func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
-
     /// Mergers without shared listings merge each batch on its own.
     public func merge(
         _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun

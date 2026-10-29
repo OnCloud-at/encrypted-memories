@@ -9,6 +9,7 @@ import SwiftUI
 import TimelineCore
 import TimelineUIKitFeature
 import UIKit
+import UploadCore
 
 /// Hosts smart filters, albums, and Trash through the shared `PhotoFilter` routes. Each route opens the
 /// shared timeline grid; a new smart filter adds a row instead of another screen.
@@ -778,7 +779,7 @@ private struct MobileFilterGridScreen: View {
             phase = .loaded
         } catch {
             actionErrorTitle = L10n.string("trash.empty_failed_title")
-            actionError = L10n.string("trash.empty_failed_message")
+            actionError = L10n.string(dynamicKey: RecentlyDeletedEmptying.failureMessageKey(for: error))
         }
     }
 }

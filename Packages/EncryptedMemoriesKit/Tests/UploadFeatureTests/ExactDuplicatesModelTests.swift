@@ -3104,6 +3104,8 @@ private final class TrashLog {
 
 /// Answers from memory. Without a configured outcome, a merge trashes every member except the kept one.
 private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Sendable {
+    func confirmNoPendingMerges() async -> Bool { true }
+    func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
     struct Merge: Equatable {
         let group: String
         let kept: PhotoUID

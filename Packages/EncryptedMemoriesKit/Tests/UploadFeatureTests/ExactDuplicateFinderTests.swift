@@ -3261,6 +3261,30 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: file), saved, "the file stays where it is")
     }
 
+    func testUnreadableMergeJournalReportsReasonAndKeepsTrash() async throws {
+        try XCTSkipIf(getuid() == 0, "root reads a file without read permission")
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        XCTAssertTrue(mergeJournal.record([pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)]))
+        let file = directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName)
+        let saved = try Data(contentsOf: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
+        let trash = CountingTrash()
+        for merger in [true, false] {
+            do {
+                try await RecentlyDeletedEmptying.empty(
+                    trash, checkingMergesWith: merger ? finder : nil, accountDataDirectory: directory)
+                XCTFail("an unreadable journal must block emptying")
+            } catch {
+                XCTAssertEqual((error as? RecentlyDeletedEmptying.PendingMergeCheck)?.reason, .journalUnreadable)
+            }
+            XCTAssertEqual(trash.emptied, 0)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        XCTAssertEqual(try Data(contentsOf: file), saved)
+    }
+
     private func assertKeepsTheTrash(
         _ expression: @autoclosure () async throws -> Void, file: StaticString = #filePath, line: UInt = #line
     ) async {
