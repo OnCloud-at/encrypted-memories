@@ -454,7 +454,8 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
                     emitDiagnostics(
                         [
                             "strategy": "deepWarm",
-                            "block": "\(block.index)", "reason": reason, "error": "\(error)",
+                            "block": "\(block.index)", "reason": reason,
+                            "error": String(describing: type(of: error)),
                         ], throttleSeconds: 0.5)
                 }
                 self.lock.withLock {
@@ -502,7 +503,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
                             "strategy": "prefetch",
                             "block": "\(block.index)",
                             "reason": reason,
-                            "error": "\(error)",
+                            "error": String(describing: type(of: error)),
                         ], throttleSeconds: 0.5)
                 }
                 self.lock.withLock {
