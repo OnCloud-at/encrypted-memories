@@ -19,6 +19,23 @@ CONNECTION_ERROR = (
 AUTHENTICATION_ERROR = (
     "fatal: Authentication failed for 'https://github.com/ProtonDriveApps/sdk-swift.git/'"
 )
+URL = "https://github.com/ProtonDriveApps/sdk-swift.git/"
+# One realistic git failure message per retry pattern; macOS and Linux runners use
+# different texts for the same transport failure.
+TRANSIENT_MESSAGES = (
+    ("Failed to connect", CONNECTION_ERROR),
+    ("Could not resolve host", f"fatal: unable to access '{URL}': Could not resolve host: github.com"),
+    ("Connection timed out", f"fatal: unable to access '{URL}': Failed to connect to github.com port 443: Connection timed out"),
+    ("Connection reset", f"RPC failed; curl 56 Recv failure: Connection reset by peer"),
+    ("early EOF", "fatal: early EOF"),
+    ("SSL_ERROR_SYSCALL", f"fatal: unable to access '{URL}': OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443"),
+    ("Operation timed out", f"fatal: unable to access '{URL}': Recv failure: Operation timed out"),
+    ("Resolving timed out", f"fatal: unable to access '{URL}': Resolving timed out after 5000 milliseconds"),
+    ("Empty reply from server", f"fatal: unable to access '{URL}': Empty reply from server"),
+    ("transfer closed with outstanding read data", f"RPC failed; curl 18 transfer closed with outstanding read data remaining"),
+    ("gnutls_handshake", f"fatal: unable to access '{URL}': gnutls_handshake() failed: The TLS connection was non-properly terminated."),
+    ("HTTP/2 stream not closed cleanly", "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly: INTERNAL_ERROR (err 2)"),
+)
 
 # Every stub records itself in $STUB_LOG. The fake git replays the scripted clone
 # failures, then builds the small checkout tree the script expects; no network is used.
@@ -184,6 +201,39 @@ class UpdateProtonSdkScriptTests(unittest.TestCase):
             f"git -C Vendor/sdk-swift checkout --quiet --force {COMMIT}",
             self.invocations(),
         )
+
+    def test_each_transient_transport_message_is_retried(self) -> None:
+        for pattern, message in TRANSIENT_MESSAGES:
+            with self.subTest(pattern=pattern):
+                # subTest shares the fixture, so every iteration starts from clean counters.
+                for counter in ("clone-attempts", "fetch-attempts"):
+                    (self.state / counter).unlink(missing_ok=True)
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.run_script(STUB_CLONE_FAILURES="1", STUB_CLONE_ERROR=message)
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.clone_attempts(), 2, pattern)
+                self.assertIn("attempt 1 of 3", result.stderr, pattern)
+                self.assertIn(message, result.stderr, pattern)
+                self.assertIn(
+                    f"git -C Vendor/sdk-swift rev-parse refs/tags/{TAG}^{{commit}}",
+                    self.invocations(),
+                )
+                self.assertIn(
+                    f"git -C Vendor/sdk-swift checkout --quiet --force {COMMIT}",
+                    self.invocations(),
+                )
+
+    def test_an_exit_code_one_with_a_connection_message_fails_without_a_retry(self) -> None:
+        result = self.run_script(STUB_CLONE_FAILURES="1", STUB_CLONE_EXIT="1")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.clone_attempts(), 1)
+        self.assertIn(CONNECTION_ERROR, result.stderr)
+        self.assertNotIn("attempt 1 of 3", result.stderr)
+        self.assertFalse([line for line in self.invocations() if line.startswith("sleep")])
+        self.assertFalse([line for line in self.invocations() if " rev-parse " in line])
 
     def test_an_authentication_failure_fails_immediately_without_a_retry(self) -> None:
         result = self.run_script(STUB_CLONE_FAILURES="1", STUB_CLONE_ERROR=AUTHENTICATION_ERROR)

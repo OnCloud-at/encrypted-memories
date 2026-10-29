@@ -20,9 +20,10 @@ if [[ ! -f "$PIN_FILE" || ${#PATCHES[@]} -eq 0 ]]; then
 fi
 
 # Transient GitHub connection failures must not fail a queued SDK restore. Retry a git
-# network command only for a connection error (exit 128 with a connection message);
-# every other failure (authentication, missing ref, wrong commit) aborts immediately
-# with its original message and exit code.
+# network command only for a connection or transport error (exit 128 with a matching
+# message); macOS and Linux runners report these failures with different texts. Every
+# other failure (authentication, missing ref, wrong commit, HTTP 5xx) aborts
+# immediately with its original message and exit code.
 retry_git() {
   local output status attempt
   for attempt in 1 2 3; do
@@ -33,8 +34,9 @@ retry_git() {
       return 0
     fi
     printf '%s\n' "$output" >&2
-    if [[ "$status" -ne 128 ]] || ! printf '%s\n' "$output" \
-      | grep -Eq 'Failed to connect|Could not resolve host|Connection timed out|Connection reset|early EOF'; then
+    if [[ "$status" -ne 128 ]] || ! grep -Eq \
+      'Failed to connect|Could not resolve host|Connection timed out|Connection reset|early EOF|SSL_ERROR_SYSCALL|Operation timed out|Resolving timed out|Empty reply from server|transfer closed with outstanding read data|gnutls_handshake|HTTP/2 stream .* was not closed cleanly' \
+      <<<"$output"; then
       return "$status"
     fi
     if [[ "$attempt" -lt 3 ]]; then
