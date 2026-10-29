@@ -238,15 +238,17 @@ final class MobileLibraryUITests: XCTestCase {
         if UIDevice.current.userInterfaceIdiom == .phone {
             field.typeText("Spring")
         }
-        let library = app.tab(titled: "Library")
         if UIDevice.current.userInterfaceIdiom == .pad {
             let openScreenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             openScreenshot.name = "Search open with keyboard"
             openScreenshot.lifetime = .keepAlways
             add(openScreenshot)
+            let valueBeforeOutsideTap = field.value as? String
             app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.6)).tap()
             XCTAssertTrue(wait(for: keyboard, "exists == false", timeout: 10), "Outside tap must hide keyboard")
             XCTAssertTrue(field.exists, "Search field must remain after the outside tap")
+            XCTAssertEqual(field.value as? String, valueBeforeOutsideTap, "Outside tap must not change the search text")
+            XCTAssertFalse(app.buttons["Close"].exists, "Outside tap must not open the viewer")
             let search = app.tab(titled: "Search")
             XCTAssertTrue(search.exists && search.isSelected, "Search tab must remain selected after outside tap")
             let outsideScreenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
@@ -266,10 +268,10 @@ final class MobileLibraryUITests: XCTestCase {
             let safePoint = !frame.isEmpty && window.contains(point)
             XCTAssertTrue(safePoint, "Library tap point must be inside the window")
             guard safePoint else { return }
-            app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
-                .withOffset(CGVector(dx: point.x - window.minX, dy: point.y - window.minY)).tap()
+            library.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
             XCTAssertTrue(wait(for: library, "isSelected == true", timeout: 10), "Library must be selected")
         } else if UIDevice.current.userInterfaceIdiom == .phone {
+            let library = app.tab(titled: "Library")
             let submit = keyboard.buttons.matching(
                 NSPredicate(format: "label ==[c] 'Search' OR label ==[c] 'Return'")
             ).firstMatch

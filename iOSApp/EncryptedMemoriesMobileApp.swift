@@ -525,7 +525,7 @@ private struct MobileSearchTabScreen: View {
         )
         .searchFocused($isSearchFocused)
         .onChange(of: isActive, initial: true) { _, active in
-            isSearchFocused = active
+            isSearchFocused = active && tabBarPlacement == .topBar
         }
         .smartSearchScopes(
             scope: $searchScope,
