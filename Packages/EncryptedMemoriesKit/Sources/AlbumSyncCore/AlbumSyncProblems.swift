@@ -160,6 +160,7 @@ actor AlbumSyncLastRunFile {
         var issue: BackupIssueKind
         var isPermanent: Bool
         var isRetryable: Bool
+        var source: UploadSourceIdentity?
     }
 
     private let url: URL
@@ -177,7 +178,7 @@ actor AlbumSyncLastRunFile {
                 // An unknown category falls back to the issue's own category.
                 BackupFailedItem(
                     id: item.id, filename: item.filename, reason: item.reason, isPermanent: item.isPermanent,
-                    issue: item.issue, isRetryable: item.isRetryable,
+                    issue: item.issue, isRetryable: item.isRetryable, source: item.source,
                     category: BackupIssueCategory(rawValue: item.category))
             }
         }
@@ -190,7 +191,7 @@ actor AlbumSyncLastRunFile {
                 StoredItem(
                     id: item.id, filename: item.filename, reason: item.reason,
                     category: item.category.rawValue, issue: item.issue, isPermanent: item.isPermanent,
-                    isRetryable: item.isRetryable)
+                    isRetryable: item.isRetryable, source: item.source)
             }
         }
         if stored.isEmpty {

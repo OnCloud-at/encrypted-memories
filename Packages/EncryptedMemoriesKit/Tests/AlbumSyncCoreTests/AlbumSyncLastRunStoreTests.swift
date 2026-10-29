@@ -127,4 +127,61 @@ import UploadCore
         #expect(store.items(albumID: "L1").count == AlbumSyncLastRunStore.itemLimit)
         #expect(store.items(albumID: "L1").first?.id == "0")
     }
+
+    @Test func sourcesSurviveARelaunch() async throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourced = [
+            BackupFailedItem(
+                id: "album/a", filename: "a.heic", reason: "attach reason", isPermanent: false, isRetryable: true,
+                source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-a"),
+                category: .userResolvable),
+            BackupFailedItem(
+                id: "queue-b", filename: "b.heic", reason: "gone reason", isPermanent: true, issue: .sourceMissing,
+                source: UploadSourceIdentity(
+                    kind: .photoLibraryAsset, identifier: "asset-b", resource: .livePairedVideo)),
+        ]
+        let store = await relaunch(directory)
+        store.record(sourced + [items[0]], albumID: "L1")
+        await store.flush()
+
+        let loaded = await relaunch(directory).items(albumID: "L1")
+
+        #expect(loaded.map(\.id) == ["album/a", "queue-b", "album/a"])
+        #expect(loaded.map(\.source) == [sourced[0].source, sourced[1].source, nil])
+    }
+
+    /// The released writer stored seven fields per row; this fixture is generated from a legacy struct
+    /// with exactly those fields, so its bytes are the bytes the released writer produced.
+    @Test func anOldFileWithoutSourcesKeepsEveryRow() async throws {
+        struct LegacyStoredItem: Codable {
+            var id: String
+            var filename: String
+            var reason: String
+            var category: String
+            var issue: BackupIssueKind
+            var isPermanent: Bool
+            var isRetryable: Bool
+        }
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let legacy = [
+            "L1": [
+                LegacyStoredItem(
+                    id: "album/a", filename: "a.heic", reason: "attach reason", category: "userResolvable",
+                    issue: .unknown, isPermanent: false, isRetryable: true),
+                LegacyStoredItem(
+                    id: "queue-b", filename: "b.heic", reason: "gone reason", category: "permanent",
+                    issue: .sourceMissing, isPermanent: true, isRetryable: false),
+            ]
+        ]
+        let data = try JSONEncoder().encode(legacy)
+        try data.write(to: directory.appendingPathComponent(AlbumSyncLastRunStore.fileName))
+
+        let loaded = await relaunch(directory).items(albumID: "L1")
+
+        #expect(loaded.map(\.id) == ["album/a", "queue-b"])
+        #expect(loaded.map(\.filename) == ["a.heic", "b.heic"])
+        #expect(loaded.compactMap(\.source).isEmpty)
+    }
 }
