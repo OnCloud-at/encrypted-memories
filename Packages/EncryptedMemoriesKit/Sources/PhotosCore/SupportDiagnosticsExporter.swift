@@ -63,6 +63,7 @@ public enum SupportDiagnosticsExporter {
         let diagnostics: PhotoDiagnosticsSupportSnapshot
         /// Nil without a signed-in session.
         let requests: RemoteRequestSupportSnapshot?
+        let measurements: SupportWorkMeasurementSnapshot
     }
 
     public static func makeJSONData(
@@ -91,7 +92,7 @@ public enum SupportDiagnosticsExporter {
             ),
             recentEvents: Report.RecentEvents(events: trailExport.events, dropped: trailExport.dropped),
             backgroundWindows: backgroundWindows.supportSnapshot(),
-            schemaVersion: 3,
+            schemaVersion: 4,
             generatedAt: now,
             appVersion: buildInfo.version ?? "unknown",
             appBuild: buildInfo.build ?? "unknown",
@@ -124,7 +125,8 @@ public enum SupportDiagnosticsExporter {
                 maximumWaitMilliseconds: metrics.maximumWaitMilliseconds
             ),
             diagnostics: diagnostics.supportSnapshot(),
-            requests: await sources.requestSnapshot()
+            requests: await sources.requestSnapshot(),
+            measurements: sources.workMeasurementSnapshot()
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

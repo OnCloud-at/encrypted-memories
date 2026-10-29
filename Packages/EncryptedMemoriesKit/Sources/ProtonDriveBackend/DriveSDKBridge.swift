@@ -23,6 +23,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let uploadClientUID: String
     private let driveSession: DriveSession
     private let requestGovernor: ProtonRequestGovernor
+    private nonisolated let workMeasurements: SupportWorkMeasurements
     private let expensiveUploadAccess: ExpensiveUploadAccess
     private let relatedFileOperations: RelatedFileOperations
     /// Keeps uploads that avoid expensive networks apart from uploads that may use them, so `expensiveUploadAccess`
@@ -209,6 +210,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         self.uploadClientUID = prepared.uploadClientUID
         self.driveSession = prepared.driveSession
         self.requestGovernor = prepared.requestGovernor
+        self.workMeasurements = prepared.requestGovernor.workMeasurements
         self.expensiveUploadAccess = prepared.expensiveUploadAccess
         self.timelineStore = prepared.timelineStore
         self.timelineOrderStore = prepared.timelineOrderStore
@@ -341,6 +343,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             relatedFileOperations: .sdk)
         SupportDiagnosticsSources.shared.registerLibrary(self)
         SupportDiagnosticsSources.shared.registerRequests(requestGovernor)
+        SupportDiagnosticsSources.shared.registerWorkMeasurements(workMeasurements)
         DebugLog.log("bridge: EncryptedMemoriesClient created ✓")
     }
 
@@ -351,6 +354,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             isShutDown = true
             SupportDiagnosticsSources.shared.unregisterLibrary(self)
             SupportDiagnosticsSources.shared.unregisterRequests(requestGovernor)
+            SupportDiagnosticsSources.shared.unregisterWorkMeasurements(workMeasurements)
+            workMeasurements.close()
             timelineLoadGeneration &+= 1
             shutdownGate.closeAdmission()
             timelineLoadTask?.task.cancel()
@@ -448,6 +453,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func performTimelineLoad(generation: UInt64) async throws -> TimelineLoadSnapshot {
+        let measurement = workMeasurements.begin(.timelineLoad)
+        var measurementOutcome = SupportMeasurementOutcome.failure
+        defer { measurement?.finish(Task.isCancelled ? .cancelled : measurementOutcome) }
         var supportSource = LibrarySyncSupportSnapshot.SourcePath.preparation
         do {
             try checkTimelineLoad(generation: generation)
@@ -542,6 +550,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             switch source {
             case .authoritativePhotosList:
                 supportSource = continuityRecoveryRequired ? .continuity : .authoritative
+                measurement?.setTimelineSource(.authoritative)
                 let remoteChanges: TimelineRemoteEventChanges?
                 if continuityRecoveryRequired {
                     remoteChanges = nil
@@ -646,6 +655,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
             case .localStore:
                 supportSource = .localStore
+                measurement?.setTimelineSource(.localStore)
                 guard let localSections else { throw TimelineLocalRebuildUnavailableError() }
                 sections = localSections
                 reconciliationItems = localSections.flatMap(\.items)
@@ -658,30 +668,39 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
             case .sdkCache:
                 supportSource = .sdkCache
+                measurement?.setTimelineSource(.sdkCache)
                 let collector = SDKEnumerationCollector<PhotoTimelineItem>()
-                let items = try await SDKCancellableOperation.run { [photosClient] cancellationToken in
-                    try await photosClient.enumerateTimeline(
-                        in: root,
-                        cancellationToken: cancellationToken,
-                        onPhotoEnumerated: { result in collector.receive(result) }
-                    )
-                    return try collector.collected()
-                } cancel: { [photosClient] cancellationToken in
-                    try? await photosClient.cancelEnumerateTimeline(cancellationToken: cancellationToken)
+                let items = try await WorkMeasurementOperation.phase(.enumeration, pass: measurement) {
+                    [photosClient] in
+                    try await SDKCancellableOperation.run { [photosClient] cancellationToken in
+                        try await photosClient.enumerateTimeline(
+                            in: root,
+                            cancellationToken: cancellationToken,
+                            onPhotoEnumerated: { result in collector.receive(result) }
+                        )
+                        return try collector.collected()
+                    } cancel: { [photosClient] cancellationToken in
+                        try? await photosClient.cancelEnumerateTimeline(cancellationToken: cancellationToken)
+                    }
                 }
                 try checkTimelineLoad(generation: generation)
                 librarySupport.listedPhotoCount = items.count
                 DebugLog.log("timeline: SDK cache enumerated \(items.count) items ✓")
-                let enrichment = await TimelineTagEnrichmentLoader.load {
-                    [driveSession, volumeID = root.volumeID] tag, onPage in
-                    try await driveSession.forEachPhotosListPage(
-                        volumeID: volumeID,
-                        tag: tag.rawValue,
-                        onPage: onPage
-                    )
+                let enrichment = await WorkMeasurementOperation.phase(.tags, pass: measurement) {
+                    [driveSession, volumeID = root.volumeID] in
+                    await TimelineTagEnrichmentLoader.load { tag, onPage in
+                        try await driveSession.forEachPhotosListPage(
+                            volumeID: volumeID,
+                            tag: tag.rawValue,
+                            onPage: onPage
+                        )
+                    }
                 }
                 try checkTimelineLoad(generation: generation)
-                if enrichment.wasCancelled { throw CancellationError() }
+                if enrichment.wasCancelled {
+                    measurementOutcome = .cancelled
+                    throw CancellationError()
+                }
 
                 let videoNodeIDs: Set<String>
                 if let videos = enrichment.videos.value {
@@ -865,6 +884,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             recordSupportEvent(
                 .libraryLoadSucceeded, sourcePath: supportSource,
                 count: source == .localStore ? nil : librarySupport.listedPhotoCount)
+            measurementOutcome = enrichmentComplete ? .success : .partial
             return TimelineLoadSnapshot(sections: sections, validationToken: validationToken)
         } catch is TimelineContinuityRecoveryPendingError {
             librarySupport.lastFailedLoad = .init(
@@ -874,6 +894,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             DebugLog.log("timeline: continuity recovery is still converging")
             throw TimelineContinuityRecoveryPendingError()
         } catch {
+            measurementOutcome = UploadError.isCancellation(error) ? .cancelled : .failure
             let errorKind = Self.supportLoadErrorKind(error)
             librarySupport.lastFailedLoad = .init(timestamp: Date(), sourcePath: supportSource, errorKind: errorKind)
             recordSupportEvent(.libraryLoadFailed, sourcePath: supportSource, errorKind: errorKind)
@@ -1102,6 +1123,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func reconcileTimelineMetadata(pass: TimelineMetadataReconciliation.Pass) async {
         guard metadataReconciliation.isCurrent(pass), !Task.isCancelled else { return }
+        let measurement = workMeasurements.begin(.timelineReconcile)
+        var measurementOutcome = SupportMeasurementOutcome.failure
+        defer { measurement?.finish(Task.isCancelled ? .cancelled : measurementOutcome) }
         let pageReader = TimelineMetadataPageReader(
             inventory: pass.inventory, orderStore: timelineOrderStore, timelineStore: timelineStore)
         var changed = false
@@ -1201,7 +1225,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                                     continue
                                 }
                                 let unlocked = try crypto.unlockNode(key: key, passphrase: passphrase, parent: rootKey)
-                                order[candidate.uid] = decoder.decode(try crypto.decryptXAttr(xattr, node: unlocked))
+                                measurement?.record(.unlockSucceeded)
+                                let decrypted = try crypto.decryptXAttr(xattr, node: unlocked)
+                                measurement?.record(.decryptSucceeded)
+                                order[candidate.uid] = decoder.decode(decrypted)
                             } else {
                                 order[candidate.uid] = TimelineOrderMetadata()
                             }
@@ -1219,7 +1246,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     throw TimelineOrderMetadataError.unavailable
                 }
             }
+            measurementOutcome = .success
         } catch is CancellationError {
+            measurementOutcome = .cancelled
             DebugLog.log("timeline: metadata reconciliation cancelled; persisted pages will resume")
         } catch is TimelineOrderMetadataError {
             timelineOrderStore?.rebuildUnlessBusy()
@@ -1762,7 +1791,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             client: photosClient,
             admission: shutdownGate,
             sharedAlbumSnapshotCache: sharedAlbumSnapshotCache,
-            requestCause: requestCause(.albums)
+            requestCause: requestCause(.albums),
+            workMeasurements: workMeasurements
         )
     }
 
@@ -2171,7 +2201,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
-        let read = try await SDKPhotoMetadataReader.read(for: uid, client: photosClient)
+        let read = try await SDKPhotoMetadataReader.read(
+            for: uid, client: photosClient, workMeasurements: workMeasurements)
         let metadata = read.metadata
         if let timelineOrderStore,
             !timelineOrderStore.recordResolvedMetadata(
@@ -2568,7 +2599,8 @@ extension DriveSDKBridge: PhotoUploading {
             photosClient: photosClient,
             contentIndexStore: store,
             lineageIndexStore: lineageStore,
-            firstBuildGate: firstIndexBuildGate
+            firstBuildGate: firstIndexBuildGate,
+            workMeasurements: workMeasurements
         ) { [self] in
             try await photosShareContext()
         }

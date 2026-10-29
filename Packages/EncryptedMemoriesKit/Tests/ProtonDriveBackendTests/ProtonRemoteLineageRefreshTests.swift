@@ -18,6 +18,124 @@ private let lineageCryptoReady: Void = {
 
 extension DriveSessionStubSuite {
     @Suite struct ProtonRemoteLineageRefreshTests {
+        @Test(.enabled(if: D1SupportOverheadProbe.enabled))
+        func benchmarkD1IndexRebuildCollectionOverhead() async throws {
+            let keys = try LineageKeys()
+            let ids = (0..<64).map { "benchmark-\($0)" }
+            let links = try ids.map {
+                try keys.activePhoto($0, attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            }
+            let listed = ids.map {
+                ["LinkID": $0, "CaptureTime": 1, "Tags": [], "RelatedPhotos": []] as [String: Any]
+            }
+            let listing = try JSONSerialization.data(withJSONObject: ["Code": 1000, "Photos": listed])
+            let material = Self.material(rootKey: keys.root)
+            let hash = ProtonPhotoHMAC.hex(message: "abcd", key: material.hashKey)
+            try await D1SupportOverheadProbe.pairs(workload: "indexRebuild64") { enabled in
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let store = try #require(
+                    UploadIdentityManifestStore(url: directory.appendingPathComponent("index.sqlite")))
+                defer { store.close() }
+                let session = makeSession()
+                let collector = enabled ? SupportWorkMeasurements() : nil
+                StubURLProtocol.reset()
+                StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+                StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: String(decoding: listing, as: UTF8.self))
+                try routeMetadata(links)
+                let (_, elapsed) = try await D1SupportOverheadProbe.timed {
+                    try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                        material: material, session: session, crypto: keys.crypto,
+                        store: store, lineageStore: nil, progress: { _ in }, workMeasurements: collector)
+                }
+                #expect(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+                #expect(
+                    Set(
+                        store.remoteContentRecords(contentHash: hash, hashKeyEpoch: "epoch", limit: 128).map(
+                            \.remoteLinkID)) == Set(ids))
+                #expect(try metadataRequestLinkIDs() == ids.sorted())
+                #expect(StubURLProtocol.requests().count == 4)
+                if let collector {
+                    let state = collector.workMeasurementSupportSnapshot().passes[
+                        SupportMeasurementKind.indexRebuild.rawValue]
+                    #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+                    #expect(state.counters[0] == 64 && state.counters[1] == 64)
+                    #expect(state.samples.last?.outcome == 0)
+                }
+                return elapsed
+            }
+        }
+
+        @Test func diagnosticsCountSuccessfulCryptoBeforeLaterFailures() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let keys = try LineageKeys()
+            var badKey = try keys.activePhoto("bad-key", attributes: "{}")
+            badKey.removeValue(forKey: "NodePassphrase")
+            var badPassphrase = try keys.activePhoto("bad-passphrase", attributes: "{}")
+            badPassphrase["NodePassphrase"] = "not-an-encrypted-passphrase"
+            var badDecrypt = try keys.activePhoto("bad-decrypt", attributes: "{}")
+            badDecrypt["XAttr"] = "not-an-encrypted-message"
+            let badJSON = try keys.activePhoto("bad-json", attributes: "not-json")
+            let good = try keys.activePhoto("good", attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+            let listed = ["good", "bad-key", "bad-passphrase", "bad-decrypt", "bad-json"].map {
+                ["LinkID": $0, "CaptureTime": 1, "Tags": [], "RelatedPhotos": []] as [String: Any]
+            }
+            let listing = try JSONSerialization.data(withJSONObject: ["Code": 1000, "Photos": listed])
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos", json: String(decoding: listing, as: UTF8.self))
+            try routeMetadata([good, badKey, badPassphrase, badDecrypt, badJSON])
+            let measurements = SupportWorkMeasurements()
+            try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                material: Self.material(rootKey: keys.root), session: makeSession(), crypto: keys.crypto,
+                store: content, lineageStore: nil, progress: { _ in }, workMeasurements: measurements)
+            let state = measurements.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.indexRebuild.rawValue]
+            #expect(state.started == 1 && state.completed == 1)
+            #expect(state.counters[SupportMeasurementCounter.unlockSucceeded.rawValue] == 3)
+            #expect(state.counters[SupportMeasurementCounter.decryptSucceeded.rawValue] == 2)
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+            let exported = String(
+                decoding: try JSONEncoder().encode(measurements.workMeasurementSupportSnapshot()), as: UTF8.self)
+            #expect(!exported.contains("bad-decrypt") && !exported.contains("good"))
+        }
+
+        @Test func diagnosticsSeparateEventCryptoFromLineageRepairCrypto() async throws {
+            let fixture = try RepairFixture(unresolved: ["repair-photo"])
+            defer { fixture.close() }
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"event-photo","Type":2,"State":1}}]}"#
+            )
+            try routeMetadata([
+                try fixture.keys.activePhoto(
+                    "event-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
+                try fixture.keys.activePhoto(
+                    "repair-photo", attributes: #"{"iOS.photos":{"ICloudID":"private-cloud"}}"#),
+            ])
+            let measurements = SupportWorkMeasurements()
+            try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                material: Self.material(rootKey: fixture.keys.root), session: makeSession(),
+                crypto: fixture.keys.crypto,
+                store: fixture.content, lineageStore: fixture.lineage, progress: { _ in },
+                workMeasurements: measurements)
+            let snapshot = measurements.workMeasurementSupportSnapshot()
+            let events = snapshot.passes[SupportMeasurementKind.eventUpdate.rawValue]
+            let repairs = snapshot.passes[SupportMeasurementKind.lineageRepair.rawValue]
+            #expect(events.completed == 1 && repairs.completed == 1)
+            #expect(events.counters[0] == 1 && events.counters[1] == 1)
+            #expect(repairs.counters[0] == 1 && repairs.counters[1] == 1)
+            #expect(snapshot.passes[SupportMeasurementKind.indexRebuild.rawValue].started == 0)
+        }
+
         @Test func missingBehindOrFailedLineageUsesTheContentEventPath() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

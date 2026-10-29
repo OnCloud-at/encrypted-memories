@@ -260,19 +260,22 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     private let admission: JoinedShutdownGate?
     private let sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache
     private let requestCause: ProtonRequestCauseBinding?
+    private let workMeasurements: SupportWorkMeasurements?
 
     init(
         client: any SDKPhotoCatalogClient,
         maximumConcurrentNodeLoads: Int = 4,
         admission: JoinedShutdownGate? = nil,
         sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache(),
-        requestCause: ProtonRequestCauseBinding? = nil
+        requestCause: ProtonRequestCauseBinding? = nil,
+        workMeasurements: SupportWorkMeasurements? = nil
     ) {
         self.client = client
         self.maximumConcurrentNodeLoads = max(1, maximumConcurrentNodeLoads)
         self.admission = admission
         self.sharedAlbumSnapshotCache = sharedAlbumSnapshotCache
         self.requestCause = requestCause
+        self.workMeasurements = workMeasurements
     }
 
     func listAlbums() async throws -> [AlbumSummary] {
@@ -399,31 +402,38 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     /// each photo, `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
     func nodeFacts(of photoUIDs: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await withAdmission {
-            let uniqueUIDs = Array(Set(photoUIDs))
-            let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
-            let nodes = try await self.loadNodes(sdkUIDs)
-            var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
-            for (sdkUID, node) in nodes {
-                let fact: ExactDuplicateNodeFacts
-                switch node {
-                case .photo(let photo):
-                    fact = .init(
-                        isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
-                        albums: photo.albumUids.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) },
-                        fingerprint: SDKPhotoMetadataReader.fingerprint(
-                            captureTime: photo.captureTime, name: photo.name, mimeType: photo.mediaType,
-                            revision: photo.activeRevision))
-                case .file(let file):
-                    // A plain file has no capture time, so two files cannot prove the same metadata.
-                    fact = .init(
-                        isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize,
-                        fingerprint: .matchingOnly(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)))
-                case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
-                case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
+            try await WorkMeasurementOperation.run(.nodeFactsBatch, collector: self.workMeasurements) { measurement in
+                measurement?.record(.nodesRequested, count: photoUIDs.count)
+                let uniqueUIDs = Array(Set(photoUIDs))
+                measurement?.record(.nodesUnique, count: uniqueUIDs.count)
+                let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
+                let nodes = try await self.loadNodes(sdkUIDs, measurement: measurement)
+                var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
+                for (sdkUID, node) in nodes {
+                    let fact: ExactDuplicateNodeFacts
+                    switch node {
+                    case .photo(let photo):
+                        fact = .init(
+                            isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
+                            albums: photo.albumUids.map {
+                                SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID)
+                            },
+                            fingerprint: SDKPhotoMetadataReader.fingerprint(
+                                captureTime: photo.captureTime, name: photo.name, mimeType: photo.mediaType,
+                                revision: photo.activeRevision))
+                    case .file(let file):
+                        // A plain file has no capture time, so two files cannot prove the same metadata.
+                        fact = .init(
+                            isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize,
+                            fingerprint: .matchingOnly(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)))
+                    case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
+                    case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
+                    }
+                    facts[PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)] = fact
+                    measurement?.record(.factsCreated)
                 }
-                facts[PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)] = fact
+                return facts
             }
-            return facts
         }
     }
 
@@ -491,11 +501,16 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         }
     }
 
-    private func loadNodes(_ uids: [SDKNodeUid]) async throws -> [(SDKNodeUid, DriveNode?)] {
+    private func loadNodes(
+        _ uids: [SDKNodeUid], measurement: SupportWorkMeasurementPass? = nil
+    ) async throws -> [(SDKNodeUid, DriveNode?)] {
         let client = client
         return try await BoundedConcurrency.throwingMap(uids, limit: maximumConcurrentNodeLoads) { uid in
             let node = try await SDKCancellableOperation.run { token in
-                try await client.getNode(nodeUid: uid, cancellationToken: token)
+                measurement?.record(.nodeCallsStarted)
+                let value = try await client.getNode(nodeUid: uid, cancellationToken: token)
+                measurement?.record(.nodeCallsReturned)
+                return value
             } cancel: { token in
                 try? await client.cancelGetNode(cancellationToken: token)
             }
