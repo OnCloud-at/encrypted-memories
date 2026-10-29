@@ -402,6 +402,7 @@ import os
     /// `checking` leaves the library check running: its index is not built, and its build stays at 1,234 of 15,000.
     /// The first copy of each group is a favorite in an own album, so the screen shows badges and a reason.
     final class MobileFixtureDuplicates: ExactDuplicateMerging, @unchecked Sendable {
+        func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
         private let lock = NSLock()
         private var groups: [ExactDuplicateGroup]
         private let checking: Bool

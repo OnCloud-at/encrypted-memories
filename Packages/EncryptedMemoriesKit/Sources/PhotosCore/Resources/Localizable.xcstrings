@@ -5249,15 +5249,29 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Recently Deleted couldn’t be emptied. The items are still there."
+            "value": "Recently Deleted couldn’t be emptied. Try again later."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "„Zuletzt gelöscht“ konnte nicht geleert werden. Die Objekte sind weiterhin dort."
+            "value": "„Zuletzt gelöscht“ konnte nicht geleert werden. Versuche es später erneut."
           }
         }
+      }
+    },
+    "trash.empty_blocked_merge_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "A duplicate merge is still being checked, so Recently Deleted can’t be emptied yet. Nothing was deleted. Try again later." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eine Zusammenführung von Duplikaten wird noch geprüft, deshalb kann „Zuletzt gelöscht“ noch nicht geleert werden. Es wurde nichts gelöscht. Versuche es später erneut." } }
+      }
+    },
+    "trash.empty_blocked_journal_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The record of earlier duplicate merges can’t be read, so Recently Deleted can’t be emptied. Nothing was deleted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Aufzeichnung früherer Zusammenführungen von Duplikaten kann nicht gelesen werden, deshalb kann „Zuletzt gelöscht“ nicht geleert werden. Es wurde nichts gelöscht." } }
       }
     },
     "trash.empty_failed_title": {

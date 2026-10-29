@@ -775,7 +775,7 @@ final class MobileLibraryModel {
     /// backup and stay in Apple Photos.
     func emptyTrash(includesProtonTrash: Bool = true) async throws {
         guard let backend else { return }
-        let removePending: (([PhotoUID]) async -> Bool)? = pendingGrid.map { pendingGrid in
+        let removePending: (@MainActor ([PhotoUID]) async -> Bool)? = pendingGrid.map { pendingGrid in
             { await pendingGrid.removeFromTrashList($0) }
         }
         try await TrashEmptying.empty(
