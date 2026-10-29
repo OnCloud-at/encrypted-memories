@@ -466,9 +466,18 @@ public actor PendingBackupCoordinator {
     public func restore(_ uids: [PhotoUID]) async -> Bool {
         guard !closed else { return false }
         let keys = uids.compactMap(PendingSourceKey.init(localUID:))
+        return await restore(keys)
+    }
+
+    private func restore(_ keys: [PendingSourceKey], confirmedRemotes: [PhotoUID] = []) async -> Bool {
+        guard !closed else { return false }
         guard !keys.isEmpty else { return true }
         for key in keys { _ = nextActionToken(for: key) }
-        guard let states = store.include(keys, at: now()) else { return false }
+        let states =
+            confirmedRemotes.isEmpty
+            ? store.include(keys, at: now())
+            : store.includeRestoredInProton(keys, confirmedRemotes: confirmedRemotes, at: now())
+        guard let states else { return false }
         for key in keys {
             startupLaterTrashKeys.remove(key)
             startupLaterTrashGenerations.removeValue(forKey: key)
@@ -487,15 +496,17 @@ public actor PendingBackupCoordinator {
     /// Restores the sources behind Proton photos that the person restored from the Proton trash, when a
     /// pending delete had moved them there.
     public func restoreSources(ofRemote uids: [PhotoUID]) async {
+        guard !closed, !uids.isEmpty else { return }
         let linkIDs = Set(uids.map(\.nodeID))
+        guard case .complete(let handoffs) = store.handoffsRead(forRemoteLinkIDs: Array(linkIDs)) else { return }
         // The earlier upload of a deleted edit can have no handoff left; the delete recorded it as its photo.
         let deleted = sourceStates.values.filter { state in
             state.remote.map { linkIDs.contains($0.nodeID) } == true
         }.map(\.key)
-        let keys = Set(store.handoffs(forRemoteLinkIDs: Array(linkIDs)).map(\.key) + deleted)
+        let keys = Set(handoffs.map(\.key) + deleted)
             .filter { sourceStates[$0]?.desired == .excluded }
         guard !keys.isEmpty else { return }
-        await restore(keys.map(\.localUID))
+        _ = await restore(Array(keys), confirmedRemotes: uids)
     }
 
     /// "Endgültig löschen" / "Papierkorb leeren": the entries leave "Zuletzt gelöscht", the photos stay

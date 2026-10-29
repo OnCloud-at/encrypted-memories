@@ -213,15 +213,23 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
-    /// The handoff whose Proton photo is `remote`, for a restore from the Proton trash.
+    /// The handoffs for a complete reverse lookup. Use `handoffsRead` to distinguish unreadable from absent.
     public func handoffs(forRemoteLinkIDs linkIDs: [String]) -> [PendingHandoff] {
-        guard !linkIDs.isEmpty else { return [] }
+        guard case .complete(let handoffs) = handoffsRead(forRemoteLinkIDs: linkIDs) else { return [] }
+        return handoffs
+    }
+
+    /// Only SQLITE_DONE for every requested link, with every row decoded, proves a complete lookup.
+    public func handoffsRead(forRemoteLinkIDs linkIDs: [String]) -> PendingHandoffsRead {
+        guard !linkIDs.isEmpty else { return .complete([]) }
         return connection.withLock {
             var result: [PendingHandoff] = []
             for linkID in linkIDs {
-                result += handoffsLocked(where: "remote_link_id=?") { self.bindText($0, 1, linkID) }
+                let read = handoffsReadLocked(where: "remote_link_id=?") { self.bindText($0, 1, linkID) }
+                guard read.complete else { return .unreadable }
+                result += read.handoffs
             }
-            return result
+            return .complete(result)
         }
     }
 
@@ -465,6 +473,20 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Writes desired = included for excluded sources in one transaction and returns the new states.
     /// Sources without a row were never excluded and are skipped.
     public func include(_ keys: [PendingSourceKey], at date: Date) -> [PendingSourceState]? {
+        include(keys, confirmedLinkIDs: [], at: date)
+    }
+
+    /// Only matching current targets count as restored. Other sources keep their ordinary restore compensation.
+    /// Keep the stored UID as provenance and an in-flight operation until its callback.
+    public func includeRestoredInProton(
+        _ keys: [PendingSourceKey], confirmedRemotes: [PhotoUID], at date: Date
+    ) -> [PendingSourceState]? {
+        include(keys, confirmedLinkIDs: Set(confirmedRemotes.map(\.nodeID)), at: date)
+    }
+
+    private func include(
+        _ keys: [PendingSourceKey], confirmedLinkIDs: Set<String>, at date: Date
+    ) -> [PendingSourceState]? {
         guard !keys.isEmpty else { return [] }
         return connection.withLock {
             var states: [PendingSourceState] = []
@@ -472,6 +494,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 for key in keys {
                     guard case .readable(let current) = sourceStateLocked(key) else { return false }
                     guard let previous = current, previous.desired == .excluded else { continue }
+                    let restoredInProton = previous.remote.map { confirmedLinkIDs.contains($0.nodeID) } == true
                     guard
                         execute(
                             """
@@ -479,16 +502,20 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                             SET desired='included', generation=generation+1, needs_queue_sync=1,
                                 needs_remote_trash=0,
                                 needs_remote_restore=CASE
+                                  WHEN ?=1 THEN 0
                                   WHEN remote_trashed=1 OR remote_op='remoteTrash' THEN 1 ELSE 0
                                 END,
+                                remote_trashed=CASE WHEN ?=1 THEN 0 ELSE remote_trashed END,
                                 listed_in_trash=0,
                                 attempts=0, next_attempt_at=?, updated_at=?
                             WHERE source_kind=? AND source_id=?;
                             """,
                             bind: { stmt in
-                                sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
-                                sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
-                                bindKey(stmt, key, from: 3)
+                                sqlite3_bind_int(stmt, 1, restoredInProton ? 1 : 0)
+                                sqlite3_bind_int(stmt, 2, restoredInProton ? 1 : 0)
+                                sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
+                                sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                                bindKey(stmt, key, from: 5)
                             }),
                         let state = sourceStateLocked(key).state
                     else { return false }
@@ -544,6 +571,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     sql = "UPDATE source_state SET needs_queue_sync=0, attempts=0, updated_at=?"
                 case .remoteTrash where remoteLinkID != nil && remoteLinkID != state.remote?.nodeID:
                     // A later decision chose another photo for the trash; that trash stays due.
+                    sql = "UPDATE source_state SET remote_op=NULL, attempts=0, updated_at=?"
+                case .remoteTrash
+                where state.generation != generation && state.desired == .included
+                    && remoteLinkID != nil && remoteLinkID == state.remote?.nodeID
+                    && state.remoteOperation == .remoteTrash && !state.remoteTrashed && !state.needsRemoteRestore:
+                    // The trash applied before a confirmed Proton restore; only its acknowledgement was delayed.
                     sql = "UPDATE source_state SET remote_op=NULL, attempts=0, updated_at=?"
                 case .remoteTrash:
                     movesOn = true
@@ -909,17 +942,29 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     private func handoffsLocked(where condition: String, bind: ((OpaquePointer?) -> Void)? = nil) -> [PendingHandoff] {
+        handoffsReadLocked(where: condition, bind: bind).handoffs
+    }
+
+    private func handoffsReadLocked(
+        where condition: String, bind: ((OpaquePointer?) -> Void)? = nil
+    ) -> (handoffs: [PendingHandoff], complete: Bool) {
         var result: [PendingHandoff] = []
-        _ = query(
+        var decoded = true
+        let queried = query(
             """
             SELECT source_kind, source_id, revision_us, remote_volume_id, remote_link_id, kind, created_at, acknowledged
             FROM handoff WHERE \(condition) ORDER BY created_at;
             """,
             bind: bind
         ) { stmt in
-            if let handoff = handoffRow(stmt) { result.append(handoff) } else { connection.markFailed() }
+            if let handoff = handoffRow(stmt) {
+                result.append(handoff)
+            } else {
+                decoded = false
+                connection.markFailed()
+            }
         }
-        return result
+        return (result, queried && decoded)
     }
 
     private func handoffRow(_ stmt: OpaquePointer?) -> PendingHandoff? {

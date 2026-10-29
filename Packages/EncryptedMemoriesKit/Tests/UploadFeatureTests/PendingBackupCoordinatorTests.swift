@@ -131,6 +131,201 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         snapshot.tiles.map(\.key.identifier)
     }
 
+    // MARK: - Confirmed Proton restore (#829)
+
+    func testConfirmedRemoteRestoreOfPhotoSendsNoSecondRestore() async throws {
+        try await assertConfirmedRemoteRestore(mediaType: "image/heic", isLivePhoto: false)
+    }
+
+    func testConfirmedRemoteRestoreOfVideoSendsNoSecondRestore() async throws {
+        try await assertConfirmedRemoteRestore(mediaType: "video/quicktime", isLivePhoto: false)
+    }
+
+    func testConfirmedRemoteRestoreOfLivePhotoSendsNoSecondRestore() async throws {
+        try await assertConfirmedRemoteRestore(mediaType: "image/heic", isLivePhoto: true)
+    }
+
+    func testRestoringAHistoricalHandoffStillRestoresTheDifferentCurrentTrashTarget() async throws {
+        let id = "historical-restore"
+        let sourceKey = key(id)
+        let historical = PhotoUID(volumeID: "vol", nodeID: "historical-A")
+        let current = PhotoUID(volumeID: "vol", nodeID: "current-B")
+        enqueue(id, state: .uploading)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: sourceKey, revision: UploadBackupRevision(rawValue: revision.rawValue - 1),
+                    remote: historical, kind: .uploaded, createdAt: date.addingTimeInterval(-1))), .recorded)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: sourceKey, revision: revision, remote: current, kind: .uploaded, createdAt: date)),
+            .recorded)
+        await coordinator.start()
+        await waitForSnapshot("the current handoff is B") { $0.tiles.first?.handoff == current }
+        let excluded = await coordinator.exclude([sourceKey.localUID])
+        XCTAssertTrue(excluded)
+        let before = try XCTUnwrap(store.sourceState(for: sourceKey))
+        XCTAssertEqual(before.desired, .excluded)
+        XCTAssertEqual(before.remote, current)
+        XCTAssertTrue(before.remoteTrashed)
+        XCTAssertEqual(effects.trashed, [[current]], "B really reached the fake remote trash")
+        XCTAssertEqual(store.handoffs(forRemoteLinkIDs: [historical.nodeID]).map(\.key), [sourceKey])
+        let pendingStore = try XCTUnwrap(store)
+        let pendingEffects = try XCTUnwrap(effects)
+        effects.onVolumeLookup = {
+            guard let state = pendingStore.sourceState(for: sourceKey) else {
+                XCTFail("B's compensation must remain durable before its restore dispatch")
+                return
+            }
+            XCTAssertEqual(state.remote, current)
+            XCTAssertTrue(state.remoteTrashed, "restoring A is not evidence that B left the trash")
+            XCTAssertTrue(state.needsRemoteRestore, "B still needs the ordinary include compensation")
+        }
+        effects.onReturn = {
+            XCTAssertEqual(pendingEffects.restored, [[current]], "restore B before returning the local source")
+            XCTAssertFalse(pendingStore.sourceState(for: sourceKey)?.remoteTrashed ?? true)
+        }
+
+        // Only A was restored by the person; B still needs its ordinary remote restore.
+        await coordinator.restoreSources(ofRemote: [historical])
+
+        XCTAssertEqual(effects.restored, [[current]], "a historical A handoff must not silently mark B restored")
+        XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
+        XCTAssertEqual(effects.returned, [[sourceKey]])
+    }
+
+    private func assertConfirmedRemoteRestore(mediaType: String, isLivePhoto: Bool) async throws {
+        let id = "restored-source"
+        enqueue(id, state: .uploading)
+        metadata.set(
+            key(id),
+            PendingPresentationMetadata(
+                captureTime: date, mediaType: mediaType, isLivePhoto: isLivePhoto, displayName: "restored-media"))
+        await coordinator.start()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "restored-photo")
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the handoff belongs to the source") { $0.tiles.first?.handoff == remote }
+        let excluded = await coordinator.exclude([key(id).localUID])
+        XCTAssertTrue(excluded)
+        let prior = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(prior.remoteTrashed)
+        let pendingStore = try XCTUnwrap(store)
+        let sourceKey = key(id)
+        effects.onReturn = {
+            guard let state = pendingStore.sourceState(for: sourceKey) else {
+                XCTFail("the included source must remain durable until queue acknowledgement")
+                return
+            }
+            XCTAssertEqual(state.remote, remote, "the confirmed restored UID remains provenance")
+            XCTAssertEqual(state.generation, prior.generation + 1)
+            XCTAssertTrue(state.needsQueueSync)
+            XCTAssertFalse(state.remoteTrashed)
+            XCTAssertFalse(state.needsRemoteTrash)
+            XCTAssertFalse(state.needsRemoteRestore)
+        }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(effects.restored.isEmpty, "Proton already restored this photo")
+        XCTAssertEqual(effects.returned, [[sourceKey]])
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertFalse(snapshot.excludedTiles.contains { $0.key == sourceKey })
+        await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertTrue(effects.restored.isEmpty)
+        XCTAssertEqual(effects.returned, [[sourceKey]], "repeating the same restore is idempotent")
+    }
+
+    func testRemoteRestoreRefusesAReverseLookupThatCannotBePrepared() async throws {
+        let remote = try await prepareRemoteRestoreLookup()
+        let before = try XCTUnwrap(store.sourceState(for: key("lookup-source")))
+        let failure = SourceListFailure(table: "handoff")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        failure.remove(from: store)
+        XCTAssertTrue(failure.denied, "the real reverse SELECT must be rejected")
+        XCTAssertEqual(store.sourceState(for: before.key), before)
+        XCTAssertTrue(effects.restored.isEmpty, "unreadable discovery grants no restore effect")
+        XCTAssertTrue(effects.returned.isEmpty, "cached state must not bypass unreadable discovery")
+    }
+
+    func testRemoteRestoreRefusesAnInterruptedReverseLookup() async throws {
+        let remote = try await prepareRemoteRestoreLookup()
+        let before = try XCTUnwrap(store.sourceState(for: key("lookup-source")))
+        let failure = KeyedReadFailure(matching: "FROM handoff WHERE remote_link_id=?", limit: 1)
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        failure.remove(from: store)
+        XCTAssertEqual(failure.count, 1, "the real reverse SELECT must be interrupted")
+        XCTAssertEqual(store.sourceState(for: before.key), before)
+        XCTAssertTrue(effects.restored.isEmpty)
+        XCTAssertTrue(effects.returned.isEmpty, "an interrupted read cannot become cached absence")
+    }
+
+    private func prepareRemoteRestoreLookup() async throws -> PhotoUID {
+        let id = "lookup-source"
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "lookup-photo")
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the reverse lookup has a real handoff") { $0.tiles.first?.handoff == remote }
+        let excluded = await coordinator.exclude([key(id).localUID])
+        XCTAssertTrue(excluded)
+        XCTAssertTrue(try XCTUnwrap(store.sourceState(for: key(id))).remoteTrashed)
+        return remote
+    }
+
+    func testConfirmedRemoteRestoreKeepsADelayedTrashAcknowledgementFromRestoringAgain() async throws {
+        let id = "delayed-trash"
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "delayed-trash-photo")
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the handoff is visible") { $0.tiles.first?.handoff == remote }
+        let gate = LookupGate()
+        effects.trashCompletionGate = gate
+        let running = try XCTUnwrap(coordinator)
+        let sourceKey = key(id)
+        let held = Task { await running.exclude([sourceKey.localUID]) }
+        let reached = await gate.entered(within: .seconds(5))
+        guard reached else {
+            XCTFail("the trash must apply before its acknowledgement is held")
+            gate.open()
+            _ = await held.value
+            return
+        }
+        defer { gate.open() }
+        XCTAssertEqual(effects.trashed, [[remote]], "the fake remote already applied the trash")
+        do {
+            let inFlight = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(inFlight.remoteOperation, .remoteTrash)
+
+            // Proton has now restored the photo; only the earlier trash acknowledgement is delayed.
+            await coordinator.restoreSources(ofRemote: [remote])
+            let included = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(included.desired, .included)
+            XCTAssertEqual(included.remote, remote)
+            XCTAssertFalse(included.needsRemoteRestore, "the confirmed restore must not schedule a redundant call")
+            XCTAssertFalse(included.remoteTrashed)
+        } catch {
+            gate.open()
+            _ = await held.value
+            throw error
+        }
+        gate.open()
+        let excluded = await held.value
+
+        XCTAssertTrue(excluded)
+        XCTAssertTrue(effects.restored.isEmpty, "the old acknowledgement must not restore this photo again")
+        XCTAssertEqual(effects.returned, [[sourceKey]])
+    }
+
     // MARK: - Later trash after an unreadable handoff (#842)
 
     func testLaterTrashRetriesAfterTheLatestHandoffDoesNotDecode() async throws {
@@ -2337,8 +2532,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(failure.denied, "the second load must fail")
         failure.remove(from: store)
         await coordinator.restoreSources(ofRemote: [PhotoUID(volumeID: "vol", nodeID: "link-kept")])
+        XCTAssertTrue(effects.restored.isEmpty, "Proton already restored the photo")
         XCTAssertEqual(
-            effects.restored.joined().map(\.nodeID), ["link-kept"], "the last known state finds the deleted source")
+            effects.returned, [[key("kept")]], "the last known state returns the deleted source to backup")
     }
 
     func testAZeroRetryDelayStillWaitsASecond() {
@@ -4196,13 +4392,22 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     }
     private var _trashGate: LookupGate?
 
+    /// Holds only the acknowledgement after the fake remote records its applied trash.
+    var trashCompletionGate: LookupGate? {
+        get { lock.withLock { _trashCompletionGate } }
+        set { lock.withLock { _trashCompletionGate = newValue } }
+    }
+    private var _trashCompletionGate: LookupGate?
+
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
         await trashGate?.pass()
-        return lock.withLock {
+        let answer = lock.withLock {
             _trashed.append(uids)
             _order.append("trash")
             return PendingBatchEffectResult(retry: _trashRetry.intersection(uids))
         }
+        await trashCompletionGate?.pass()
+        return answer
     }
 
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
