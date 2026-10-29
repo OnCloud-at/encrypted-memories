@@ -490,10 +490,12 @@ private struct MobileAdaptiveTabShell: View {
 /// `.searchable` to the parent `TabView` propagates ordinary top search chrome into the library on iOS 26.
 private struct MobileSearchTabScreen: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
+    @Environment(\.tabBarPlacement) private var tabBarPlacement
     let isActive: Bool
     @Binding var searchText: String
     @Binding var searchScope: MLSearchScope
     @State private var history = TimelineSearchHistory()
+    @FocusState private var isSearchFocused: Bool
     /// Structured suggestions that were selected from the landing, keyed by their title in the history.
     @State private var historySuggestions: [String: TimelineSearchSuggestion] = [:]
     @State private var recentRepresentatives: [String: PhotoUID] = [:]
@@ -518,8 +520,13 @@ private struct MobileSearchTabScreen: View {
         )
         .searchable(
             text: $searchText,
+            placement: tabBarPlacement == .topBar ? .navigationBarDrawer(displayMode: .always) : .automatic,
             prompt: Text(L10n.string("search.prompt \(L10n.string("library.title"))"))
         )
+        .searchFocused($isSearchFocused)
+        .onChange(of: isActive, initial: true) { _, active in
+            isSearchFocused = active
+        }
         .smartSearchScopes(
             scope: $searchScope,
             availableScopes: libraryModel.smartSearch?.availableSearchScopes ?? [.all],
