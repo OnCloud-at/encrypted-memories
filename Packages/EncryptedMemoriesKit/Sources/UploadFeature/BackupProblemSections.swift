@@ -41,8 +41,8 @@ public struct BackupProblemRow<Actions: View>: View {
 
     public var body: some View {
         HStack(alignment: .top, spacing: rowSpacing) {
-            if let previews, let uid = BackupProblemPreviewModel.uid(for: item.source) {
-                LocalPhotoThumbnail(uid: uid) { await previews.thumbnail(for: $0) }
+            LocalPhotoThumbnail(uid: BackupProblemPreviewModel.uid(for: item.source)) { uid in
+                await previews?.thumbnail(for: uid)
             }
             Image(systemName: item.category.symbolName)
                 .foregroundStyle(item.isPermanent ? detailColor : .orange)

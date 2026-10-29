@@ -5,13 +5,13 @@ import SwiftUI
 
 /// The same decorative thumbnail in excluded-photo and backup-problem rows.
 public struct LocalPhotoThumbnail: View {
-    private let uid: PhotoUID
+    private let uid: PhotoUID?
     private let retainsImageOnDisappear: Bool
     private let load: @Sendable (PhotoUID) async -> CGImage?
     @State private var state = LocalPhotoThumbnailState()
 
     public init(
-        uid: PhotoUID, retainsImageOnDisappear: Bool = false,
+        uid: PhotoUID?, retainsImageOnDisappear: Bool = false,
         load: @escaping @Sendable (PhotoUID) async -> CGImage?
     ) {
         self.uid = uid
@@ -21,7 +21,7 @@ public struct LocalPhotoThumbnail: View {
 
     public var body: some View {
         ZStack {
-            if let image = state.image(for: uid) {
+            if let uid, let image = state.image(for: uid) {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .scaledToFill()
@@ -34,7 +34,10 @@ public struct LocalPhotoThumbnail: View {
         .frame(width: 40, height: 40)
         .clipShape(.rect(cornerRadius: 7))
         .accessibilityHidden(true)
-        .task(id: uid) { await state.load(uid, retainingImage: retainsImageOnDisappear, using: load) }
+        .task(id: uid) {
+            guard let uid else { return }
+            await state.load(uid, retainingImage: retainsImageOnDisappear, using: load)
+        }
         .onDisappear { state.clear(retainingImage: retainsImageOnDisappear) }
     }
 }
