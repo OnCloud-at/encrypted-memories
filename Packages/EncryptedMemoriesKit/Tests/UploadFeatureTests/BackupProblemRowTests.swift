@@ -50,9 +50,23 @@
                 "a row without a previews model reserves the same thumbnail square")
 
             // A direct symbol guard: the leading 40 columns hold the photo symbol's ink, not only flat fill.
-            let symbol = try await Self.capture(withoutModel).inkCount(columns: 0..<40)
+            let withoutModelPixels = try await Self.capture(withoutModel)
+            let symbol = withoutModelPixels.inkCount(columns: 0..<40)
             XCTAssertGreaterThanOrEqual(symbol, 25, "the placeholder shows the photo symbol")
             XCTAssertLessThanOrEqual(symbol, 1_000, "the placeholder square is mostly flat fill")
+
+            // The same guards for a row that has a source but no previews model.
+            let withSourceWithoutModel = BackupProblemRow(item: Self.item(source: Self.photo))
+            XCTAssertGreaterThanOrEqual(
+                Self.fittedSize(of: withSourceWithoutModel).height, 40,
+                "a row with a source but no previews model reserves the height of the thumbnail square")
+            XCTAssertEqual(
+                Self.fittedSize(of: withSourceWithoutModel), Self.fittedSize(of: withSource),
+                "a row with a source but no previews model reserves the same thumbnail square")
+            let withSourceWithoutModelPixels = try await Self.capture(withSourceWithoutModel)
+            XCTAssertEqual(
+                withSourceWithoutModelPixels.takeInk(), withoutModelPixels.takeInk(),
+                "a row with a source but no previews model draws the placeholder of a row without a source")
         }
 
         func testMixedRowsLineUpAndARowWithoutASourceRequestsNoPicture() async throws {
