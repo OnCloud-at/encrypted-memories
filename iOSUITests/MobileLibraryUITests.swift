@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 /// Taps through the iOS app like a person does, on the offline fixture account: no Proton account, no network.
@@ -221,6 +222,79 @@ final class MobileLibraryUITests: XCTestCase {
         // The search tab turns the tab bar into a search field, so it comes last.
         app.tab(titled: "Search").tap()
         XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search shows no search field")
+    }
+
+    func testSearchTabActivatesAndReturnsToLibrary() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        app.tab(titled: "Search").tap()
+        let field = app.searchFields.firstMatch
+        let fieldExists = field.waitForExistence(timeout: 10)
+        XCTAssertTrue(fieldExists, "Search tab must show a search field")
+        guard fieldExists else { return }
+        let keyboard = app.keyboards.firstMatch
+        let keyboardExists = keyboard.waitForExistence(timeout: 10)
+        XCTAssertTrue(keyboardExists, "Search tab must focus the keyboard")
+        guard keyboardExists else { return }
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            field.typeText("Spring")
+        }
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            let openScreenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            openScreenshot.name = "Search open with keyboard"
+            openScreenshot.lifetime = .keepAlways
+            add(openScreenshot)
+            let valueBeforeOutsideTap = field.value as? String
+            app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.6)).tap()
+            XCTAssertTrue(wait(for: keyboard, "exists == false", timeout: 10), "Outside tap must hide keyboard")
+            XCTAssertTrue(field.exists, "Search field must remain after the outside tap")
+            XCTAssertEqual(field.value as? String, valueBeforeOutsideTap, "Outside tap must not change the search text")
+            XCTAssertFalse(app.buttons["Close"].exists, "Outside tap must not open the viewer")
+            let search = app.tab(titled: "Search")
+            XCTAssertTrue(search.exists && search.isSelected, "Search tab must remain selected after outside tap")
+            let outsideScreenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            outsideScreenshot.name = "Search after outside tap"
+            outsideScreenshot.lifetime = .keepAlways
+            add(outsideScreenshot)
+            let ax = XCTAttachment(string: app.debugDescription)
+            ax.name = "Search dismissal hierarchy"
+            ax.lifetime = .keepAlways
+            add(ax)
+            let library = app.tab(titled: "Library")
+            XCTAssertTrue(library.exists, "Library tab must exist to end search")
+            guard library.exists else { return }
+            let frame = library.frame
+            let window = app.windows.firstMatch.frame
+            let point = CGPoint(x: frame.midX, y: frame.midY)
+            let safePoint = !frame.isEmpty && window.contains(point)
+            XCTAssertTrue(safePoint, "Library tap point must be inside the window")
+            guard safePoint else { return }
+            library.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            XCTAssertTrue(wait(for: library, "isSelected == true", timeout: 10), "Library must be selected")
+        } else if UIDevice.current.userInterfaceIdiom == .phone {
+            let close = app.buttons["Close"]
+            XCTAssertTrue(close.waitForExistence(timeout: 10), "Native search Close must exist")
+            XCTAssertEqual(app.buttons.matching(identifier: "Close").count, 1, "Close must be unique")
+            let frame = close.frame
+            let window = app.windows.firstMatch.frame
+            let keyboardFrame = keyboard.frame
+            let point = CGPoint(x: frame.midX, y: frame.midY)
+            let ax = XCTAttachment(string: app.debugDescription)
+            ax.name = "Search close hierarchy"
+            ax.lifetime = .keepAlways
+            add(ax)
+            XCTAssertTrue(!frame.isEmpty && window.contains(point), "Close center must be in the window")
+            XCTAssertFalse(keyboardFrame.contains(point), "Close center must be outside the keyboard")
+            XCTAssertFalse(field.frame.contains(point), "Close center must be outside the text field")
+            close.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        } else {
+            XCTFail("Unsupported device idiom for search dismissal")
+            return
+        }
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60), "Library did not return")
+        XCTAssertTrue(wait(for: app.searchFields.firstMatch, "exists == false", timeout: 10), "Search field remains")
+        app.tab(titled: "Search").tap()
+        XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search must reactivate")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "Search must refocus the keyboard")
     }
 
     /// The end of the search suggestions scrolls clear of the bottom search field, so the Smart Search hint can be read
