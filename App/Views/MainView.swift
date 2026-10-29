@@ -1844,7 +1844,8 @@ struct MainView: View {
                 selectedUIDs = []
                 selectionMode = false
             } catch {
-                trashActionFailureMessage = L10n.string(dynamicKey: RecentlyDeletedEmptying.failureMessageKey(for: error))
+                trashActionFailureMessage = L10n.string(
+                    dynamicKey: RecentlyDeletedEmptying.failureMessageKey(for: error))
             }
         }
     }

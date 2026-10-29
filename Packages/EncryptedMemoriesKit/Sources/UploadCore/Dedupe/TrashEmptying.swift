@@ -26,8 +26,7 @@ import PhotosCore
             }
         }
         guard includesProtonTrash else {
-            do { try await removePendingItems() }
-            catch is PendingRemovalFailed { throw CancellationError() }
+            do { try await removePendingItems() } catch is PendingRemovalFailed { throw CancellationError() }
             return
         }
         do {
