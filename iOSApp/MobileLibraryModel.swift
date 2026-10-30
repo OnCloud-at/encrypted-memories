@@ -384,7 +384,12 @@ final class MobileLibraryModel {
 
     /// LRU byte ceiling for `originalsCache`, enforced after each viewer store so a long session of large
     /// HEIC/video originals can't grow the on-disk cache without bound.
-    let originalsCacheCapBytes: Int64 = 512 * 1024 * 1024
+    let originalsCacheCapBytes: Int64 = {
+        switch DiskCacheBudgetPolicy(platform: .mobile).originalsBudget {
+        case .bytes(let bytes): return bytes
+        case .unlimited: return Int64.max
+        }
+    }()
 
     private var configuredUID: String?
     private var store: SessionKeychainStore?

@@ -10,7 +10,12 @@ public struct ThumbnailCacheConfiguration: Sendable, Equatable {
 
     /// Shared Core preview default. The thumbnail feed promises complete persisted coverage, so an automatic
     /// thumbnail cap would evict older blobs while its coverage checkpoint still reports them as present.
-    public static let defaultPreviewDiskBudgetBytes: Int64 = 2_147_483_648
+    public static let defaultPreviewDiskBudgetBytes: Int64 = {
+        switch DiskCacheBudgetPolicy(platform: .mobile).previewBudget {
+        case .bytes(let bytes): return bytes
+        case .unlimited: return Int64.max
+        }
+    }()
 
     public init(
         dataMemoryBudgetBytes: Int = 128 * 1024 * 1024,
