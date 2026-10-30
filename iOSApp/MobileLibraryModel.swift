@@ -1874,7 +1874,7 @@ final class MobileLibraryModel {
     }
 
     private static func message(for error: Error) -> String {
-        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        LibraryLoadFailureMessage.message(for: error)
     }
 }
 

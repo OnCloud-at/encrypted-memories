@@ -60,10 +60,11 @@ public final class TimelineViewModel {
         case loading
         case empty
         case loaded([TimelineSection])
-        case failed(String)
+        /// `retryable` requests the retry affordance in the shell.
+        case failed(String, retryable: Bool)
     }
 
-    public private(set) var state: State = .loading {
+    public internal(set) var state: State = .loading {
         didSet { contentRevision &+= 1 }
     }
     /// Monotonic identity for the active route's canonical content. Search workers key results to it so a
@@ -153,7 +154,9 @@ public final class TimelineViewModel {
                 authority: wholeLibraryInventoryAuthority
             )
         {
-            if let failure = initialLibraryLoadState.failure { return .failed(failure.message) }
+            if let failure = initialLibraryLoadState.failure {
+                return .failed(failure.message, retryable: failure.retryable)
+            }
             return .loading
         }
         guard showsPendingPhotos || showsPendingTrash else { return state }
@@ -418,12 +421,21 @@ public final class TimelineViewModel {
         } catch {
             guard filter == f else { return }
             // Keep the cached view on a refresh error; surface failure only if we have nothing to show.
-            if case .loaded = state {} else { state = .failed(error.localizedDescription) }
+            if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
         }
     }
 
     #if DEBUG
         func cancelInitialLoadForTesting() { initialLoadTask?.cancel() }
+        /// Replays first-load events through the production reducer, then mirrors a resulting failure
+        /// into the grid state exactly like `loadAll` does. Isolates the non-retryable verdict, which no
+        /// production producer emits yet, for tests.
+        func applyIsolatedInitialLoadEventsForTesting(_ events: [LibraryLoadEvent]) {
+            for event in events { applyInitialLoad(event) }
+            if let failure = initialLibraryLoadState.failure {
+                surfaceLoadFailure(failure.message)
+            }
+        }
         /// Runs after a trash or restore projection computed its result and before it writes it.
         @ObservationIgnored var afterProjectionComputedForTesting: (@MainActor () async -> Void)?
     #endif
@@ -459,7 +471,7 @@ public final class TimelineViewModel {
     public func reportInitialContentFailure() {
         let message = L10n.string("error.load_library_title")
         applyInitialLoad(.contentLoadFailed(message: message))
-        if initialLibraryLoadState.failure != nil { state = .failed(message) }
+        if initialLibraryLoadState.failure != nil { surfaceLoadFailure(message) }
     }
 
     /// Shows a caller-provided, already-resolved item set in the existing timeline grid without asking the
@@ -772,15 +784,22 @@ public final class TimelineViewModel {
             // A cancelled owner cannot publish. A backend cancellation of an active read is a load failure.
             guard !Task.isCancelled, filter == .all else { return }
             initialLoadFailureReason = error is any LibraryChangeTerminalError ? .scopeAccessLost : .other
-            applyInitialLoad(.failed(message: error.localizedDescription, retryable: true))
+            applyInitialLoad(.failed(message: LibraryLoadFailureMessage.message(for: error), retryable: true))
             // Keep showing the cached timeline on a refresh error; surface failure only if we have
-            // nothing to show.
-            if case .loaded = state {} else { state = .failed(error.localizedDescription) }
+            // nothing to show. The reducer's verdict - not this site - decides the Retry affordance.
+            if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
         }
     }
 
     private func applyInitialLoad(_ event: LibraryLoadEvent) {
         initialLibraryLoadState = LibraryLoadPolicy.reduce(initialLibraryLoadState, event)
+    }
+
+    /// Mirrors a failure into the grid state, carrying the first-load reducer's `retryable` verdict so the
+    /// shell's Retry affordance follows the recorded flag. A failure the reducer never classified (a
+    /// filtered route, a background refresh) stays retryable, as every unclassified failure must.
+    private func surfaceLoadFailure(_ message: String) {
+        state = .failed(message, retryable: initialLibraryLoadState.failure?.retryable ?? true)
     }
 
     /// Show `.all` content and restart the thumbnail crawl only when the flattened item sequence differs from
@@ -932,7 +951,7 @@ public final class TimelineViewModel {
                 failureReason: .cancelled
             )
         } catch {
-            if case .loaded = state {} else { state = .failed(error.localizedDescription) }
+            if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
             let failureReason: TimelineRefreshFailureReason
             if error is any LibraryChangeTerminalError {
                 failureReason = .scopeAccessLost

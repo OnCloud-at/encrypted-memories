@@ -3260,6 +3260,24 @@
         }
       }
     },
+    "error.library_creation_failed": {
+      "extractionState": "manual",
+      "comment": "Library-load error message for a failed library creation. Names no cause.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The library couldn’t be created. Please try again later."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Mediathek konnte nicht erstellt werden. Bitte versuche es später noch einmal."
+          }
+        }
+      }
+    },
     "error.load_library_title": {
       "extractionState": "manual",
       "comment": "Library load-error title.",
