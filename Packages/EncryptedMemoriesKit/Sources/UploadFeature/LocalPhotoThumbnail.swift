@@ -35,7 +35,10 @@ public struct LocalPhotoThumbnail: View {
         .clipShape(.rect(cornerRadius: 7))
         .accessibilityHidden(true)
         .task(id: uid) {
-            guard let uid else { return }
+            guard let uid else {
+                state.clear(retainingImage: retainsImageOnDisappear)
+                return
+            }
             await state.load(uid, retainingImage: retainsImageOnDisappear, using: load)
         }
         .onDisappear { state.clear(retainingImage: retainsImageOnDisappear) }

@@ -1,6 +1,7 @@
 #if os(macOS)
     import AppKit
     import CoreGraphics
+    import Observation
     import PhotosCore
     import SwiftUI
     import UploadCore
@@ -9,7 +10,8 @@
     @testable import UploadFeature
 
     /// Problem-list rows without a Photos source reserve the same thumbnail square as rows with one, show the same
-    /// gray placeholder, and ask for no picture.
+    /// gray placeholder, and ask for no picture. The rendering assertions run on macOS only: their harness draws
+    /// through an AppKit window, while the row view itself is shared with iOS and iPadOS.
     @MainActor
     final class BackupProblemRowTests: XCTestCase {
         private static let renderedWidth = 320
@@ -18,6 +20,8 @@
 
         func testARowWithoutASourceShowsTheSamePlaceholderAsARowWhosePictureCannotLoad() async throws {
             let model = BackupProblemPreviewModel { _ in nil }
+            model.open()
+            defer { model.close() }
             let expected = try await Self.capture(
                 Self.row(source: Self.photo, model: model)
             ).takeInk()
@@ -95,6 +99,51 @@
                 "the category symbol and the text of both rows start at the same edges")
         }
 
+        func testAModelAddedToARowWithAStableUIDStartsTheThumbnailLoad() async throws {
+            let loads = LoadLog()
+            loads.image = Self.magentaBitmap()
+            let box = PreviewModelBox()
+            let renderer = LiveRowRenderer(view: BoxedProblemRow(item: Self.item(source: Self.photo), box: box))
+            defer { renderer.close() }
+            try await renderer.settle()
+            XCTAssertTrue(loads.requested.isEmpty, "a row without a previews model requests no picture")
+            XCTAssertNil(
+                try renderer.snapshot().magentaColumns(), "a row without a previews model shows the placeholder")
+
+            let previews = BackupProblemPreviewModel(load: loads.load)
+            previews.open()
+            defer { previews.close() }
+            box.previews = previews
+            try await renderer.settle()
+            let uid = try XCTUnwrap(BackupProblemPreviewModel.uid(for: Self.photo))
+            XCTAssertEqual(
+                loads.requested, [uid.nodeID],
+                "adding a previews model to a row with a stable uid starts the thumbnail load")
+            XCTAssertNotNil(
+                try renderer.snapshot().magentaColumns(), "the row with an added model shows its loaded picture")
+        }
+
+        func testAModelRemovedFromARowWithAStableUIDClearsTheLoadedImage() async throws {
+            let loads = LoadLog()
+            loads.image = Self.magentaBitmap()
+            let previews = BackupProblemPreviewModel(load: loads.load)
+            previews.open()
+            defer { previews.close() }
+            let box = PreviewModelBox(previews: previews)
+            let renderer = LiveRowRenderer(view: BoxedProblemRow(item: Self.item(source: Self.photo), box: box))
+            defer { renderer.close() }
+            try await renderer.settle()
+            XCTAssertNotNil(
+                try renderer.snapshot().magentaColumns(), "the row with a model shows its loaded picture")
+
+            box.previews = nil
+            try await renderer.settle()
+            XCTAssertNil(
+                try renderer.snapshot().magentaColumns(), "removing the model clears the loaded picture")
+            XCTAssertEqual(
+                loads.requested.count, 1, "removing the model starts no second load")
+        }
+
         // MARK: - Building
 
         private static func item(source: UploadSourceIdentity?) -> BackupFailedItem {
@@ -113,33 +162,10 @@
 
         /// Draws a row in a window long enough for its thumbnail task to settle, then caches the drawn pixels.
         private static func capture(_ view: some View) async throws -> DrawnPixels {
-            let framed =
-                view
-                .frame(
-                    width: CGFloat(Self.renderedWidth),
-                    height: CGFloat(Self.renderedHeight)
-                )
-                .background(Color.white)
-                .environment(\.colorScheme, .light)
-            let host = NSHostingView(rootView: framed)
-            host.frame = NSRect(x: 0, y: 0, width: Self.renderedWidth, height: Self.renderedHeight)
-            let window = NSWindow(
-                contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
-            window.contentView = host
-            window.orderFrontRegardless()
-            defer { window.orderOut(nil) }
-            for _ in 0..<10 {
-                host.layoutSubtreeIfNeeded()
-                host.displayIfNeeded()
-                try await Task.sleep(for: .milliseconds(30))
-            }
-            let rep = try XCTUnwrap(
-                NSBitmapImageRep(
-                    bitmapDataPlanes: nil, pixelsWide: Self.renderedWidth, pixelsHigh: Self.renderedHeight,
-                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                    colorSpaceName: .deviceRGB, bytesPerRow: Self.renderedWidth * 4, bitsPerPixel: 32))
-            host.cacheDisplay(in: host.bounds, to: rep)
-            return DrawnPixels(rep: rep)
+            let renderer = LiveRowRenderer(view: view)
+            defer { renderer.close() }
+            try await renderer.settle()
+            return try renderer.snapshot()
         }
 
         /// The one preview square the row loads, in a color no other row content uses.
@@ -161,10 +187,73 @@
     @MainActor
     private final class LoadLog {
         private(set) var requested: [String] = []
+        var image: CGImage?
 
         func load(_ uid: PhotoUID) async -> CGImage? {
             requested.append(uid.nodeID)
-            return nil
+            return image
+        }
+    }
+
+    /// Holds the preview model of a mounted row so a test can add or remove it while the row keeps its uid.
+    @MainActor
+    @Observable
+    private final class PreviewModelBox {
+        var previews: BackupProblemPreviewModel?
+        init(previews: BackupProblemPreviewModel? = nil) { self.previews = previews }
+    }
+
+    /// A problem row whose previews model comes from a mutable box, not from the row's initializer.
+    private struct BoxedProblemRow: View {
+        let item: BackupFailedItem
+        let box: PreviewModelBox
+
+        var body: some View {
+            BackupProblemRow(item: item, previews: box.previews)
+        }
+    }
+
+    /// A row view in a live window whose picture task can run. `close` removes the window.
+    @MainActor
+    private final class LiveRowRenderer {
+        private static let width = 320
+        private static let height = 80
+        private let host: NSHostingView<AnyView>
+        private let window: NSWindow
+
+        init(view: some View) {
+            let framed = AnyView(
+                view.frame(width: CGFloat(Self.width), height: CGFloat(Self.height))
+                    .background(Color.white).environment(\.colorScheme, .light))
+            host = NSHostingView(rootView: framed)
+            host.frame = NSRect(x: 0, y: 0, width: Self.width, height: Self.height)
+            window = NSWindow(
+                contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host
+            window.orderFrontRegardless()
+        }
+
+        func close() {
+            window.orderOut(nil)
+        }
+
+        /// Lets the mounted row redraw while its picture task settles.
+        func settle() async throws {
+            for _ in 0..<10 {
+                host.layoutSubtreeIfNeeded()
+                host.displayIfNeeded()
+                try await Task.sleep(for: .milliseconds(30))
+            }
+        }
+
+        func snapshot() throws -> DrawnPixels {
+            let rep = try XCTUnwrap(
+                NSBitmapImageRep(
+                    bitmapDataPlanes: nil, pixelsWide: Self.width, pixelsHigh: Self.height,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: Self.width * 4, bitsPerPixel: 32))
+            host.cacheDisplay(in: host.bounds, to: rep)
+            return DrawnPixels(rep: rep)
         }
     }
 

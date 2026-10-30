@@ -41,7 +41,9 @@ public struct BackupProblemRow<Actions: View>: View {
 
     public var body: some View {
         HStack(alignment: .top, spacing: rowSpacing) {
-            LocalPhotoThumbnail(uid: BackupProblemPreviewModel.uid(for: item.source)) { uid in
+            LocalPhotoThumbnail(
+                uid: previews == nil ? nil : BackupProblemPreviewModel.uid(for: item.source)
+            ) { uid in
                 await previews?.thumbnail(for: uid)
             }
             Image(systemName: item.category.symbolName)
