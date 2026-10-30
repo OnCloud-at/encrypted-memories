@@ -37,6 +37,43 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
     }
 
+    func testViewerKeepsTheVerticalBarBackgroundBlack() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        guard let column = try app.verticalTabColumn() else {
+            throw XCTSkip("The window has no vertical tab column")
+        }
+        try app.visiblePhoto(beside: column).tap()
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
+        let image = try XCTUnwrap(app.screenshot().image.cgImage)
+        func pixel(x: CGFloat, y: CGFloat) throws -> [UInt8] {
+            let rect = CGRect(x: CGFloat(image.width) * x, y: CGFloat(image.height) * y, width: 1, height: 1)
+            let point = try XCTUnwrap(image.cropping(to: rect))
+            var rgba: [UInt8] = [0, 0, 0, 0]
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            try rgba.withUnsafeMutableBytes { bytes in
+                let context = try XCTUnwrap(
+                    CGContext(
+                        data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                        space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+                context.draw(point, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+            }
+            return rgba
+        }
+        let photo = try pixel(x: 0.25, y: 0.45)
+        XCTAssertGreaterThan(photo[0], 50, "SETUP: the purple fixture photo must be visible")
+        let barBackground = try pixel(x: 0.98, y: 0.45)
+        XCTAssertLessThan(barBackground[0], 25, "The background beyond the photo must be black")
+        XCTAssertLessThan(barBackground[1], 25)
+        XCTAssertLessThan(barBackground[2], 25)
+    }
+
+    #if ISSUE924_EXPECT_VERTICAL
+        func testExpectedVerticalTabColumnIsPresent() throws {
+            XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+            XCTAssertNotNil(try app.verticalTabColumn(), "The expected vertical tab column must be present")
+        }
+    #endif
+
     /// Swiping down closes the viewer for a video too, also while its stream cannot play.
     func testSwipingDownOnAVideoClosesTheViewer() {
         XCTAssertTrue(firstVideo.waitForExistence(timeout: 60), "the library grid shows no video")

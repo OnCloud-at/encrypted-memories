@@ -40,7 +40,6 @@ struct MobilePhotoViewer: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
-    @Environment(\.verticalBarEdge) private var verticalBarEdge
     @State private var index: Int
     @State private var chromeVisible = true
     @State private var burstSelection = BurstSelectionModel()
@@ -188,7 +187,6 @@ struct MobilePhotoViewer: View {
                     )
                     .id(item.uid)
                 }
-                .backgroundExtensionEffect(isEnabled: verticalBarEdge != nil)
             }
             // The Live Photo status sits on the media inside the safe area, below the navigation bar.
             .overlay(alignment: .topLeading) {
@@ -1006,6 +1004,10 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
         pvc.dataSource = context.coordinator
         pvc.delegate = context.coordinator
         pvc.view.backgroundColor = .clear
+        for scrollView in pvc.view.subviews.compactMap({ $0 as? UIScrollView }) {
+            scrollView.leftEdgeEffect.isHidden = true
+            scrollView.rightEdgeEffect.isHidden = true
+        }
         pvc.setViewControllers([context.coordinator.pageController(at: index)], direction: .forward, animated: false)
         return pvc
     }
@@ -2337,6 +2339,8 @@ struct MobileZoomableImage: UIViewRepresentable {
         scrollView.bouncesZoom = true
         scrollView.showsVerticalScrollIndicator = false
         scrollView.showsHorizontalScrollIndicator = false
+        scrollView.leftEdgeEffect.isHidden = true
+        scrollView.rightEdgeEffect.isHidden = true
         scrollView.backgroundColor = .clear
         scrollView.contentInsetAdjustmentBehavior = .never
 
