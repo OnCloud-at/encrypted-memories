@@ -119,7 +119,7 @@ actor ProtonAlbumWriteService {
     /// burst of gopenpgp work for a large selection.
     private static let payloadPreparationConcurrency = 4
 
-    private struct RootMaterial: Sendable {
+    struct RootMaterial: Sendable {
         let context: PhotosShareContext
         let rootKey: UnlockableKey
         let rootHashKey: Data
@@ -164,17 +164,20 @@ actor ProtonAlbumWriteService {
 
     private var rootMaterial: RootMaterial?
     private var rootMaterialTask: Task<RootMaterial, any Error>?
+    private let rootMaterialResolver: PhotosRootMaterialResolver
     private var albumMaterials: [String: AlbumMaterial] = [:]
 
     init(
         session: DriveSession,
         crypto: DriveCrypto,
+        rootMaterialResolver: PhotosRootMaterialResolver = PhotosRootMaterialResolver(),
         admission: JoinedShutdownGate? = nil,
         requestCause: ProtonRequestCauseBinding? = nil,
         contextProvider: @Sendable @escaping () async throws -> PhotosShareContext
     ) {
         self.session = session
         self.crypto = crypto
+        self.rootMaterialResolver = rootMaterialResolver
         self.admission = admission
         self.requestCause = requestCause
         self.contextProvider = contextProvider
@@ -660,37 +663,34 @@ actor ProtonAlbumWriteService {
 
     // MARK: Key material
 
-    private func resolveRootMaterial() async throws -> RootMaterial {
+    func resolveRootMaterial() async throws -> RootMaterial {
+        try Task.checkCancellation()
         if let rootMaterial { return rootMaterial }
-        if let rootMaterialTask { return try await rootMaterialTask.value }
-        let session = self.session
-        let crypto = self.crypto
-        let contextProvider = self.contextProvider
-        let task = Task { () -> RootMaterial in
-            let context = try await contextProvider()
-            let bootstrap = try await session.getJSON(
-                "/drive/shares/\(context.shareID)", as: AlbumShareBootstrap.self
-            )
-            let shareKey = try crypto.unlockShare(key: bootstrap.key, passphrase: bootstrap.passphrase)
-            let rootLink = try await session.getJSON(
-                "/drive/shares/\(context.shareID)/links/\(context.rootLinkID)", as: AlbumRootLinkResponse.self
-            )
-            guard let armoredHashKey = rootLink.link.folderProperties?.nodeHashKey else {
-                throw ProtonAlbumWriteError.missingRootHashKey
+        if let rootMaterialTask { return try await rootMaterialTask.valueUntilCancelled() }
+        let task = Task { [self] in
+            defer { rootMaterialTask = nil }
+            return try await withAdmission { service in
+                try await service.loadRootMaterial()
             }
-            let rootKey = try crypto.unlockNode(
-                key: rootLink.link.nodeKey, passphrase: rootLink.link.nodePassphrase, parent: shareKey
-            )
-            let rootHashKey = Data(try crypto.decryptNodeHashKey(armoredHashKey, node: rootKey).utf8)
-            guard let signer = crypto.signer(preferredAddressID: bootstrap.addressID) else {
-                throw ProtonAlbumWriteError.noSigningKey
-            }
-            DebugLog.log("[AlbumWrite] root material resolved ✓")
-            return RootMaterial(context: context, rootKey: rootKey, rootHashKey: rootHashKey, signer: signer)
         }
         rootMaterialTask = task
-        defer { rootMaterialTask = nil }
-        let resolved = try await task.value
+        return try await task.valueUntilCancelled()
+    }
+
+    private func loadRootMaterial() async throws -> RootMaterial {
+        let context = try await contextProvider()
+        let common: PhotosRootMaterialResolver.Material
+        do {
+            common = try await rootMaterialResolver.resolve(session: session, crypto: crypto, context: context)
+        } catch PhotosRootMaterialError.missingHashKey {
+            throw ProtonAlbumWriteError.missingRootHashKey
+        }
+        try Task.checkCancellation()
+        guard let signer = crypto.signer(preferredAddressID: common.preferredAddressID) else {
+            throw ProtonAlbumWriteError.noSigningKey
+        }
+        let resolved = RootMaterial(
+            context: common.context, rootKey: common.rootKey, rootHashKey: common.hashKey, signer: signer)
         rootMaterial = resolved
         return resolved
     }
@@ -716,36 +716,6 @@ actor ProtonAlbumWriteService {
 }
 
 // MARK: - Wire models (PascalCase JSON)
-
-private struct AlbumShareBootstrap: Decodable {
-    let key: String
-    let passphrase: String
-    let addressID: String?
-    enum CodingKeys: String, CodingKey {
-        case key = "Key"
-        case passphrase = "Passphrase"
-        case addressID = "AddressID"
-    }
-}
-
-private struct AlbumRootLinkResponse: Decodable {
-    let link: Link
-    enum CodingKeys: String, CodingKey { case link = "Link" }
-    struct Link: Decodable {
-        let nodeKey: String
-        let nodePassphrase: String
-        let folderProperties: FolderProperties?
-        enum CodingKeys: String, CodingKey {
-            case nodeKey = "NodeKey"
-            case nodePassphrase = "NodePassphrase"
-            case folderProperties = "FolderProperties"
-        }
-        struct FolderProperties: Decodable {
-            let nodeHashKey: String?
-            enum CodingKeys: String, CodingKey { case nodeHashKey = "NodeHashKey" }
-        }
-    }
-}
 
 private struct AlbumLinkResponse: Decodable {
     let link: Link

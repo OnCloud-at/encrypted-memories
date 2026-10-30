@@ -64,6 +64,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
 
     private var material: Material?
     private var materialTask: Task<Material, any Error>?
+    let rootMaterialResolver: PhotosRootMaterialResolver
+    private let ownsRootMaterialResolver: Bool
     private var remoteContentIndexTask: Task<Void, any Error>?
     /// Names the build in `remoteContentIndexTask`, so a build that ends clears only itself.
     private var remoteContentIndexBuild = 0
@@ -98,6 +100,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     init(
         session: DriveSession,
         crypto: DriveCrypto,
+        rootMaterialResolver: PhotosRootMaterialResolver? = nil,
         photosClient: any SDKPhotoDuplicatesClient,
         contentIndexStore: any UploadRemoteContentIndexStore,
         lineageIndexStore: UploadRemoteLineageIndexStore? = nil,
@@ -111,6 +114,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         self.material = material
         self.session = session
         self.crypto = crypto
+        self.rootMaterialResolver = rootMaterialResolver ?? PhotosRootMaterialResolver()
+        self.ownsRootMaterialResolver = rootMaterialResolver == nil
         self.photosClient = photosClient
         self.contentIndexStore = contentIndexStore
         self.lineageIndexStore = lineageIndexStore
@@ -484,6 +489,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         remoteContentIndexTask = nil
         let unfinished = Array(unfinishedRemoteContentIndexBuilds.values)
         for build in unfinished { build.cancel() }
+        let resolving = materialTask
+        resolving?.cancel()
+        if ownsRootMaterialResolver { await rootMaterialResolver.shutdown() }
+        _ = await resolving?.result
         for build in unfinished { _ = await build.result }
     }
 
@@ -522,43 +531,32 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     /// service's lifetime (the bridge is rebuilt on sign-in, so the cache can't outlive the
     /// account). Coalesced behind a task so concurrent first calls resolve once.
     private func resolveMaterial() async throws -> Material {
+        try Task.checkCancellation()
+        guard !isShutDown else { throw CancellationError() }
         if let material { return material }
-        if let materialTask { return try await materialTask.value }
-        let session = self.session
-        let crypto = self.crypto
-        let contextProvider = self.contextProvider
-        let task = Task { () -> Material in
-            let context = try await contextProvider()
-            let bootstrap = try await session.getJSON("/drive/shares/\(context.shareID)", as: DedupeShareBootstrap.self)
-            let shareKey = try crypto.unlockShare(key: bootstrap.key, passphrase: bootstrap.passphrase)
-            let response = try await session.getJSON(
-                "/drive/shares/\(context.shareID)/links/\(context.rootLinkID)",
-                as: DedupeRootLinkResponse.self
-            )
-            guard let armoredHashKey = response.link.folderProperties?.nodeHashKey else {
-                throw ProtonUploadDedupeError.missingRootHashKey
-            }
-            let nodeKey = try crypto.unlockNode(
-                key: response.link.nodeKey,
-                passphrase: response.link.nodePassphrase,
-                parent: shareKey
-            )
-            let hashKey = Data(try crypto.decryptNodeHashKey(armoredHashKey, node: nodeKey).utf8)
-            // Irreversible fingerprint for manifest validity - never the key itself.
-            let epoch = SHA256.hash(data: hashKey).prefix(8).map { String(format: "%02x", $0) }.joined()
-            DebugLog.log("[Dedupe] photos root hash key resolved (epoch \(epoch))")
-            return Material(context: context, rootKey: nodeKey, hashKey: hashKey, epoch: epoch)
+        if let materialTask { return try await materialTask.valueUntilCancelled() }
+        let task = Task { [self] in
+            defer { materialTask = nil }
+            return try await loadMaterial()
         }
         materialTask = task
-        defer { materialTask = nil }
+        return try await task.valueUntilCancelled()
+    }
+
+    private func loadMaterial() async throws -> Material {
+        let context = try await contextProvider()
+        let common: PhotosRootMaterialResolver.Material
         do {
-            let resolved = try await task.value
-            material = resolved
-            return resolved
-        } catch {
-            DebugLog.log("[Dedupe] hash key resolution FAILED - \(error)")
-            throw error
+            common = try await rootMaterialResolver.resolve(session: session, crypto: crypto, context: context)
+        } catch PhotosRootMaterialError.missingHashKey {
+            throw ProtonUploadDedupeError.missingRootHashKey
         }
+        try Task.checkCancellation()
+        guard !isShutDown else { throw CancellationError() }
+        let epoch = SHA256.hash(data: common.hashKey).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let resolved = Material(context: common.context, rootKey: common.rootKey, hashKey: common.hashKey, epoch: epoch)
+        material = resolved
+        return resolved
     }
 
     // MARK: Remote content index
@@ -1286,36 +1284,6 @@ enum ProtonRemoteContentIndexLookup {
 
 // MARK: - Wire models (PascalCase JSON)
 
-private struct DedupeShareBootstrap: Decodable {
-    let key: String
-    let passphrase: String
-    enum CodingKeys: String, CodingKey {
-        case key = "Key"
-        case passphrase = "Passphrase"
-    }
-}
-
-private struct DedupeRootLinkResponse: Decodable {
-    let link: Link
-    enum CodingKeys: String, CodingKey { case link = "Link" }
-
-    struct Link: Decodable {
-        let nodeKey: String
-        let nodePassphrase: String
-        let folderProperties: FolderProperties?
-        enum CodingKeys: String, CodingKey {
-            case nodeKey = "NodeKey"
-            case nodePassphrase = "NodePassphrase"
-            case folderProperties = "FolderProperties"
-        }
-
-        struct FolderProperties: Decodable {
-            let nodeHashKey: String?
-            enum CodingKeys: String, CodingKey { case nodeHashKey = "NodeHashKey" }
-        }
-    }
-}
-
 // MARK: - Duplicates endpoint (DriveSession)
 
 /// One row of `DuplicateHashes` from the find-duplicates endpoint. `linkState`: 0 = draft,
@@ -1359,7 +1327,7 @@ extension DriveSession {
 extension Task where Success: Sendable, Failure == any Error {
     /// The task's result for one waiter. A cancelled waiter throws `CancellationError` at once; the task itself keeps
     /// running for its other waiters.
-    fileprivate func valueUntilCancelled() async throws -> Success {
+    func valueUntilCancelled() async throws -> Success {
         let waiter = CancellableTaskWaiter<Success>()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in

@@ -30,6 +30,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// always describes every running upload.
     private nonisolated let uploadNetworkAdmission = UploadNetworkAdmission()
     private nonisolated let sharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
+    private nonisolated let rootMaterialResolver = PhotosRootMaterialResolver()
     private var photosRoot: SDKNodeUid?
     private var photosShareID: String?
     /// App-owned SQLite timeline metadata store (`library-v1.sqlite`, PhotosCore). The bridge is
@@ -364,6 +365,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             quotaRefresh?.cancel()
             photoNameBackfill.close()
         }
+        await rootMaterialResolver.shutdown()
         await shutdownGate.run { [weak self] in
             await self?.performShutdown()
         }
@@ -2596,6 +2598,7 @@ extension DriveSDKBridge: PhotoUploading {
         let service = ProtonUploadDedupeService(
             session: driveSession,
             crypto: crypto,
+            rootMaterialResolver: rootMaterialResolver,
             photosClient: photosClient,
             contentIndexStore: store,
             lineageIndexStore: lineageStore,
@@ -2631,6 +2634,7 @@ extension DriveSDKBridge: PhotoUploading {
         ProtonAlbumWriteService(
             session: driveSession,
             crypto: crypto,
+            rootMaterialResolver: rootMaterialResolver,
             admission: shutdownGate,
             requestCause: requestCause(.albums)
         ) { [self] in
