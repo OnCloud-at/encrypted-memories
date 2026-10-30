@@ -178,6 +178,7 @@
 
         @MainActor
         public func updateUIView(_ uiView: UIKitTimelineGridHostView, context: Context) {
+            uiView.setNeedsLayout()
             uiView.onFirstContentReady = onFirstContentReady
             uiView.onOpenPhoto = onOpenPhoto
             uiView.onToggleSelection = onToggleSelection
@@ -251,6 +252,19 @@
         private let renderFrameOverride: (() -> GridRenderOutcome)?
         private weak var contentReplacementSnapshot: UIView?
         private var contentReplacementUsesSurfaceFade = false
+        private struct InsetInputs: Equatable {
+            let safeArea: UIEdgeInsets
+            let viewport: CGRect
+            let windowBounds: CGRect
+            let tabBars: [GridBottomInsetPolicy.TabBar]
+        }
+        private var lastInsetInputs: InsetInputs?
+        private var lastInsetBounds: CGRect?
+        private var insetFollowUpScheduled = false
+        #if DEBUG
+            var insetFollowUpCount = 0
+            var insetFollowUpPending: Bool { insetFollowUpScheduled }
+        #endif
 
         private var device: MTLDevice?
         var renderer: MetalGridRenderer?
@@ -738,6 +752,10 @@
         }
 
         public override func layoutSubviews() {
+            if lastInsetBounds != bounds {
+                lastInsetBounds = bounds
+                scheduleInsetFollowUp()
+            }
             let resizePosition = captureViewportResizePositionIfNeeded()
             super.layoutSubviews()
             metalView.frame = bounds
@@ -756,10 +774,14 @@
         public override func safeAreaInsetsDidChange() {
             super.safeAreaInsetsDidChange()
             setNeedsLayout()
+            scheduleInsetFollowUp()
         }
 
         public override func didMoveToWindow() {
             super.didMoveToWindow()
+            lastInsetInputs = nil
+            setNeedsLayout()
+            scheduleInsetFollowUp()
             if window == nil {
                 suspendRenderLoop()
             } else {
@@ -769,6 +791,37 @@
                 if framePump.isActive, !sceneIsBackgrounded { resumeRenderLoop() }
             }
             invalidateAccessibilityElements()
+        }
+
+        public override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+            super.traitCollectionDidChange(previousTraitCollection)
+            setNeedsLayout()
+            scheduleInsetFollowUp()
+        }
+
+        private func scheduleInsetFollowUp() {
+            guard !insetFollowUpScheduled, canUpdateInset else { return }
+            insetFollowUpScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.insetFollowUpScheduled = false
+                guard self.canUpdateInset else { return }
+                #if DEBUG
+                    self.insetFollowUpCount += 1
+                #endif
+                self.setNeedsLayout()
+                self.layoutIfNeeded()
+            }
+        }
+
+        private var canUpdateInset: Bool {
+            guard window != nil, framePump.isActive, !sceneIsBackgrounded else { return false }
+            var view: UIView? = self
+            while let current = view {
+                guard !current.isHidden, current.alpha > 0 else { return false }
+                view = current.superview
+            }
+            return true
         }
 
         /// Tab/surface activation from the SwiftUI host. An inactive grid must not keep the display link alive
@@ -782,6 +835,7 @@
                 // Resume only makes sense once we are in a window; otherwise `didMoveToWindow` will resume on
                 // attach (the pump is now active), so this is safe either way.
                 if window != nil { resumeRenderLoop() }
+                scheduleInsetFollowUp()
             } else {
                 suspendRenderLoop()
             }
@@ -949,19 +1003,73 @@
             }
         }
 
-        /// Keeps the last row of content clear of the bottom bar / home indicator: the scroll surface extends
-        /// under the (translucent) bar for the full-bleed look, but the content range ends above it, so fully
-        /// scrolled to the newest photo every thumbnail of the final row stays visible and tappable. Safe-area
-        /// driven - tab bar, home indicator, orientation and iPad sidebar layouts all flow through the same inset.
-        /// Also adds a top inset equal to safeAreaInsets.top so the first row rests below the navigation bar
-        /// instead of being covered by it.
+        /// Keep the newest row clear of a horizontal bottom tab bar, and the first row below the navigation bar.
         private func applyContentInsets() {
             let top = safeAreaInsets.top
-            let bottom = safeAreaInsets.bottom
+            let bars = window.map { visibleTabBarFrames(in: $0) } ?? []
+            let viewport = window.map { convert(bounds, to: $0) } ?? .zero
+            let inputs = InsetInputs(
+                safeArea: safeAreaInsets, viewport: viewport, windowBounds: window?.bounds ?? .zero, tabBars: bars)
+            guard inputs != lastInsetInputs else { return }
+            lastInsetInputs = inputs
+            let bottom = GridBottomInsetPolicy.inset(
+                safeBottom: safeAreaInsets.bottom, viewport: viewport, tabBars: bars)
             if scrollView.contentInset.top != top || scrollView.contentInset.bottom != bottom {
                 scrollView.contentInset = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
             }
             scrollView.verticalScrollIndicatorInsets = UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
+        }
+
+        func visibleTabBarFrames(in window: UIWindow) -> [GridBottomInsetPolicy.TabBar] {
+            var result: [GridBottomInsetPolicy.TabBar] = []
+            var seen: Set<ObjectIdentifier> = []
+            func add(_ bar: UITabBar) {
+                guard bar.window === window, seen.insert(ObjectIdentifier(bar)).inserted else { return }
+                let frame = bar.convert(bar.bounds, to: window)
+                var visible = frame.intersection(window.bounds)
+                var ancestor: UIView? = bar
+                var depth = 0
+                while let view = ancestor, depth <= 40 {
+                    guard !view.isHidden, view.alpha > 0 else { return }
+                    if view.clipsToBounds { visible = visible.intersection(view.convert(view.bounds, to: window)) }
+                    if view === window { break }
+                    ancestor = view.superview
+                    depth += 1
+                }
+                guard ancestor === window, !visible.isNull, !visible.isEmpty else { return }
+                result.append(.init(frame: frame, visibleFrame: visible))
+            }
+            var controllers: [(UIViewController, Int)] = window.rootViewController.map { [($0, 0)] } ?? []
+            var controllerIndex = 0
+            var seenControllers: Set<ObjectIdentifier> = []
+            while controllerIndex < controllers.count && controllerIndex < 400 {
+                let (controller, depth) = controllers[controllerIndex]
+                controllerIndex += 1
+                guard depth <= 40, seenControllers.insert(ObjectIdentifier(controller)).inserted else { continue }
+                if let tabs = controller as? UITabBarController, tabs.isViewLoaded { add(tabs.tabBar) }
+                guard depth < 40 else { continue }
+                for child in controller.children {
+                    guard controllers.count < 400 else { break }
+                    controllers.append((child, depth + 1))
+                }
+                if let presented = controller.presentedViewController, controllers.count < 400 {
+                    controllers.append((presented, depth + 1))
+                }
+            }
+            var views: [(UIView, Int)] = [(window, 0)]
+            var index = 0
+            while index < views.count && index < 400 {
+                let (view, depth) = views[index]
+                index += 1
+                guard depth <= 40, !view.isHidden, view.alpha > 0 else { continue }
+                if let bar = view as? UITabBar { add(bar) }
+                guard depth < 40 else { continue }
+                for child in view.subviews {
+                    guard views.count < 400 else { break }
+                    views.append((child, depth + 1))
+                }
+            }
+            return result
         }
 
         /// The largest valid vertical content offset given the current content size and bottom inset.
