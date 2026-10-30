@@ -13,10 +13,10 @@ import Testing
 /// Every failure reaches the view through a production route: a throwing repository drives `load()`
 /// for the retryable case, and the non-retryable case is replayed through the first-load reducer
 /// seam that production uses for the same mirroring.
-/// The direction of the comparison matters: the render with `retryable: true` must carry the
-/// Retry button's layout weight, moving the error text's ink centroid measurably upward, and the
-/// render with `retryable: false` must not. An inverted switch swaps those roles and fails these
-/// checks.
+/// The direction of the comparison matters: with `retryable: true` the actions row joins the
+/// centered stack, so the stack grows and its first ink row moves up; with `retryable: false` it does
+/// not. The comparison is strict and has no pixel or row threshold, so it holds for any font or
+/// renderer metrics, and an inverted switch fails it.
 @MainActor
 @Suite struct TimelineViewRetryVisibilityTests {
     @Test func onlineRetryButtonFollowsTheFailureFlagByDirection() async throws {
@@ -35,20 +35,26 @@ import Testing
             Self.differingPixels(shown, shownRepeated) == 0,
             "Renders of the same failure state must be identical")
 
-        // Only the Retry affordance may shift the layout. The glass button draws no offscreen ink,
-        // so the directional signal is the centroid of that ink: adding the actions row to the
-        // centered stack moves it measurably upward (measured shift: 12 rows; message-length noise
-        // stays under 2 rows, so 6 is a wide margin both ways). An inverted switch puts the button
-        // in the bare render instead, flipping both comparisons and failing these checks.
+        // Only the Retry affordance may change the render. Its layout height makes the centered stack
+        // taller, so the first ink row (the title symbol) sits higher; whether the renderer also draws
+        // the glass button itself does not matter. Strict inequalities hold for any metrics, and an
+        // inverted switch flips both of them.
         let bare = try renderReplayedFailure(message: message, retryable: false)
+        let bareRepeated = try renderReplayedFailure(message: message, retryable: false)
         let withButton = try renderReplayedFailure(message: message, retryable: true)
         #expect(
-            Self.centroidRow(withButton) + 6 < Self.centroidRow(bare),
-            "The retryable flag must add the Retry button's layout weight (centroids: \(Self.centroidRow(withButton)) vs \(Self.centroidRow(bare)))"
+            Self.differingPixels(bare, bareRepeated) == 0,
+            "Renders of the failure without the Retry button must be identical")
+        #expect(
+            Self.differingPixels(withButton, bare) > 0,
+            "The retryable flag must change the render")
+        #expect(
+            Self.firstInkRow(withButton) < Self.firstInkRow(bare),
+            "The retryable flag must add the Retry button's layout height (first ink rows: \(Self.firstInkRow(withButton)) vs \(Self.firstInkRow(bare)))"
         )
         #expect(
-            Self.centroidRow(shown) + 6 < Self.centroidRow(bare),
-            "The real failure route must draw the Retry button (centroids: \(Self.centroidRow(shown)) vs \(Self.centroidRow(bare)))"
+            Self.firstInkRow(shown) < Self.firstInkRow(bare),
+            "The real failure route must draw the Retry button (first ink rows: \(Self.firstInkRow(shown)) vs \(Self.firstInkRow(bare)))"
         )
     }
 
@@ -121,23 +127,18 @@ import Testing
         differingPixelOffsets(lhs, rhs).count
     }
 
-    /// Row of the vertical centroid of the render's ink (pixels departing from the corner surface
-    /// background). The glass Retry button itself draws no offscreen ink, but its presence in the
-    /// actions row moves the centered stack, so the centroid is the directional signal.
-    private static func centroidRow(_ pixels: [UInt8]) -> Double {
+    /// Row of the first pixel that departs from the corner surface background. The centered error
+    /// stack starts higher when it is taller, so this row moves up when the Retry button joins it.
+    private static func firstInkRow(_ pixels: [UInt8]) -> Int {
         let background = (pixels[0], pixels[1], pixels[2])
-        var weighted = 0.0
-        var count = 0.0
         for offset in stride(from: 0, to: pixels.count, by: 4) {
             let departs =
                 abs(Int(pixels[offset]) - Int(background.0)) > 8
                 || abs(Int(pixels[offset + 1]) - Int(background.1)) > 8
                 || abs(Int(pixels[offset + 2]) - Int(background.2)) > 8
-            guard departs else { continue }
-            weighted += Double(offset / 4 / 480)
-            count += 1
+            if departs { return offset / 4 / 480 }
         }
-        return count > 0 ? weighted / count : -1
+        return Int.max
     }
 
     private struct FailingStartupRepository: PhotosRepository {
