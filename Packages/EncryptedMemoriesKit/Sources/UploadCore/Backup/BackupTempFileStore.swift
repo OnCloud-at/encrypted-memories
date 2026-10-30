@@ -61,8 +61,8 @@ public final class BackupTempFileStore: @unchecked Sendable {
 
     public convenience init(
         directory: URL,
-        maximumBytes: Int64 = 2 << 30,  // 2 GiB
-        minimumFreeBytes: Int64 = 1 << 30  // 1 GiB
+        maximumBytes: Int64 = DiskCacheBudgetPolicy(platform: .mobile).backupMaximumBytes,
+        minimumFreeBytes: Int64 = DiskCacheBudgetPolicy(platform: .mobile).backupMinimumFreeBytes
     ) {
         self.init(
             directory: directory,
@@ -70,6 +70,22 @@ public final class BackupTempFileStore: @unchecked Sendable {
             minimumFreeBytes: minimumFreeBytes,
             availableCapacity: DeviceStorage.availableCapacity(at:),
             now: { Date() }
+        )
+    }
+
+    convenience init(
+        directory: URL,
+        policyBudget: @Sendable (DiskCacheBudgetPolicy) -> (Int64, Int64),
+        availableCapacity: @Sendable @escaping (URL) -> Int64?,
+        now: @Sendable @escaping () -> Date
+    ) {
+        let (maximumBytes, minimumFreeBytes) = policyBudget(DiskCacheBudgetPolicy(platform: .mobile))
+        self.init(
+            directory: directory,
+            maximumBytes: maximumBytes,
+            minimumFreeBytes: minimumFreeBytes,
+            availableCapacity: availableCapacity,
+            now: now
         )
     }
 
