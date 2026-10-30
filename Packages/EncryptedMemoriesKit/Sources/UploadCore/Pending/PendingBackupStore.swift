@@ -764,7 +764,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     next = max(date.addingTimeInterval(1), until)
                 case .unreadable:
                     assignment = "needs_queue_sync=1"
-                    next = date.addingTimeInterval(60)
+                    next = max(date.addingTimeInterval(60), retryNotBefore ?? date)
                 }
                 guard
                     execute(

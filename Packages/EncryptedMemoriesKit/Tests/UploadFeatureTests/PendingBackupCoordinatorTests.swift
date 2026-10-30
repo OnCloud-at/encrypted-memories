@@ -203,19 +203,46 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(postApplyReads.count, 2, "The genuine trash read and bounded follow-up must both execute")
     }
 
-    func testRemoteRestoreDoesNotReadmitAHealthySubsetWhenADiscoveredKeyIsMissing() async throws {
-        let (good, _, before, _) = try await restoreWithMissingDiscoveredKey()
-        XCTAssertEqual(store.sourceState(for: good), before, "a missing discovered key must not admit a healthy subset")
-        XCTAssertTrue(effects.returned.isEmpty, "the in-memory filter must not silently discard the missing key")
-        XCTAssertTrue(effects.restored.isEmpty)
+    func testRemoteRestoreReadmitsTheExcludedKeyBesideASourceWithoutPendingState() async throws {
+        let (good, missing, before, _) = try await restoreWithMissingDiscoveredKey()
+        XCTAssertEqual(before.desired, .excluded)
+        XCTAssertNotEqual(
+            store.sourceState(for: good)?.desired, .excluded, "A source without pending state must not block it")
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertFalse(snapshot.excludedTiles.contains { $0.key == good })
+        XCTAssertEqual(effects.returned, [[good]], "Only the excluded key returns to the backup")
+        XCTAssertTrue(effects.restored.isEmpty, "Proton already restored this photo")
+        XCTAssertEqual(store.sourceStateRead(for: missing), .readable(nil), "Nothing pending is created for it")
     }
 
-    func testRemoteRestoreReturnsUnreadableForMissingDiscoveredKeys() async throws {
-        let (good, missing, before, result) = try await restoreWithMissingDiscoveredKey()
+    func testRemoteRestoreLeavesASourceWithoutPendingStateOutOfTheResult() async throws {
+        let (good, _, _, result) = try await restoreWithMissingDiscoveredKey()
         XCTAssertTrue(result.discoveryComplete, "the handoffs themselves were read completely")
-        XCTAssertEqual(result.outcomes, [good: .unreadable, missing: .unreadable])
-        XCTAssertEqual(store.sourceState(for: good), before)
+        XCTAssertEqual(Set(result.outcomes.keys), [good], "A source without pending state has no outcome")
+        XCTAssertNotEqual(result.outcomes[good], .unreadable)
+        XCTAssertTrue(result.isReadable, "The host must not report a failed restore")
+    }
+
+    // An upload leaves a handoff; a delete in the timeline only trashes the Proton photo and writes no pending
+    // state. Restoring it from Recently Deleted must not report a failure.
+    func testRestoringAPhotoDeletedOnlyInProtonIsReadableAndChangesNothing() async throws {
+        let id = "timeline-deleted-source"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "timeline-deleted-photo")
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the handoff belongs to the source") { $0.tiles.first?.handoff == remote }
+        XCTAssertEqual(store.sourceStateRead(for: sourceKey), .readable(nil), "The timeline delete wrote no state")
+
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(result.discoveryComplete)
+        XCTAssertEqual(result.outcomes, [:], "Nothing was pending for this source")
+        XCTAssertTrue(result.isReadable, "The host must not report a failed restore")
+        XCTAssertEqual(store.sourceStateRead(for: sourceKey), .readable(nil))
         XCTAssertTrue(effects.returned.isEmpty)
+        XCTAssertTrue(effects.restored.isEmpty)
     }
 
     private func restoreWithMissingDiscoveredKey() async throws -> (
@@ -4856,6 +4883,47 @@ extension PendingBackupCoordinatorTests {
             XCTAssertNil(store.sourceState(for: sourceKey), "Fresh successful proof can retire the retained duty")
             XCTAssertEqual(effects.returned.filter { $0 == [sourceKey] }.count, 4)
         }
+    }
+
+    func testFailedRestoreReadsUseTheSameGrowingWaitsBeforeTheCeiling() async throws {
+        await coordinator.close()
+        let id = "offline-restore-check"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: id)
+        let clock = ResultWriteClock(date)
+        enqueue(id, state: .completed)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: sourceKey, generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+        // No visibility entry: every fresh read fails, as it does offline.
+        let relations = FakeChecker()
+        effects = FakePendingEffects()
+        coordinator = makeCoordinator(relations: relations, clock: clock)
+        await coordinator.start()
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+
+        for (index, delay) in [60, 300, 900].enumerated() {
+            XCTAssertEqual(relations.linkVisibilityCallCount, index + 1, "One fresh read per automatic check")
+            let retained = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertTrue(retained.needsQueueSync)
+            XCTAssertEqual(retained.remote, remote)
+            XCTAssertEqual(retained.attempts, 0)
+            XCTAssertEqual(
+                retained.nextAttemptAt, clock.now.addingTimeInterval(Double(delay)),
+                "Check \(index + 1) waits \(delay) seconds")
+            clock.advance(by: .seconds(delay))
+            _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+        }
+        XCTAssertEqual(relations.linkVisibilityCallCount, 3, "The ceiling stops a fourth automatic read")
+        XCTAssertTrue(effects.returned.isEmpty, "A failed read never reaches the typed effect")
+        XCTAssertTrue(effects.restored.isEmpty)
     }
 
     private struct LookupArmedRestoreResolver: BackupResourceResolving {

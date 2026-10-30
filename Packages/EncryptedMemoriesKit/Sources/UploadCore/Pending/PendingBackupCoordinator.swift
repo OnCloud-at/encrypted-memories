@@ -143,6 +143,8 @@ public actor PendingBackupCoordinator {
     private var startupLaterTrashGenerations: [PendingSourceKey: Int64] = [:]
     private var laterTrashRecoveryTask: Task<Void, Never>?
     private static let laterTrashBatchSize = 100
+    /// The waits after the first, second and third automatic Restore check of one source and generation.
+    private static let restoreRecheckDelays: [TimeInterval] = [60, 300, 900]
     /// A rejected dispatch marker sent nothing; the next reconcile tries it again.
     private var beginFailedKeys = Set<PendingSourceKey>()
     private var writesDegraded: Bool {
@@ -515,15 +517,21 @@ public actor PendingBackupCoordinator {
         let deleted = sourceStates.values.filter { state in
             state.remote.map { linkIDs.contains($0.nodeID) } == true
         }.map(\.key)
-        let keys = Set(handoffs.map(\.key) + deleted)
+        let discovered = Set(handoffs.map(\.key) + deleted)
         var states: [PendingSourceState] = []
-        for key in keys {
-            guard case .readable(let state?) = store.sourceStateRead(for: key) else {
+        for key in discovered {
+            switch store.sourceStateRead(for: key) {
+            case .unreadable:
                 return PendingBackupRestoreResult(
-                    outcomes: Dictionary(uniqueKeysWithValues: keys.map { ($0, .unreadable) }))
+                    outcomes: Dictionary(uniqueKeysWithValues: discovered.map { ($0, .unreadable) }))
+            case .readable(nil):
+                // Nothing is pending: the store deletes a row only once it is included with nothing owed.
+                continue
+            case .readable(let state?):
+                states.append(state)
             }
-            states.append(state)
         }
+        let keys = Set(states.map(\.key))
         let excluded = states.filter { $0.desired == .excluded }.map(\.key)
         for key in keys { restoreRecheckCounts.removeValue(forKey: key) }
         for key in keys { restoreRequests[key, default: 0] += 1 }
@@ -1421,23 +1429,29 @@ public actor PendingBackupCoordinator {
                 previous?.generation == state.generation && previous?.remote == state.remote
                 ? (previous?.count ?? 0) + 1 : 1
             restoreRecheckCounts[state.key] = (state.generation, state.remote, count)
-            let retryNotBefore = restoredKeys.contains(state.key) ? now().addingTimeInterval(60) : nil
+            let delay = Self.restoreRecheckDelays[min(count - 1, 2)]
+            // A late trash gets its first compensation at once and waits a minute after a refused one. A failed
+            // read waits on the same schedule as an incomplete compound, so an offline device keeps its checks.
+            let compensated = restoredKeys.contains(state.key)
+            func retryNotBefore(_ outcome: PendingBackupReturnOutcome) -> Date? {
+                guard outcome == .remoteTrashed else { return now().addingTimeInterval(delay) }
+                return compensated ? now().addingTimeInterval(60) : nil
+            }
             let before = await restoredPhotoOutcome(state)
             guard !closed else { return }
             if let before, before != .completed {
-                finishRestoredReturn(state, outcome: before, retryNotBefore: retryNotBefore)
+                finishRestoredReturn(state, outcome: before, retryNotBefore: retryNotBefore(before))
                 continue
             }
             let outcomes = await effects.returnToBackup([state])
             guard !closed else { return }
             var outcome = outcomes[state.key] ?? .unreadable
             if case .waiting(let until) = outcome {
-                let delays: [TimeInterval] = [60, 300, 900]
-                outcome = .waiting(until: max(until, now().addingTimeInterval(delays[min(count - 1, 2)])))
+                outcome = .waiting(until: max(until, now().addingTimeInterval(delay)))
             }
             if outcome == .completed, let checked = await restoredPhotoOutcome(state) { outcome = checked }
             guard !closed else { return }
-            finishRestoredReturn(state, outcome: outcome, retryNotBefore: retryNotBefore)
+            finishRestoredReturn(state, outcome: outcome, retryNotBefore: retryNotBefore(outcome))
         }
     }
 

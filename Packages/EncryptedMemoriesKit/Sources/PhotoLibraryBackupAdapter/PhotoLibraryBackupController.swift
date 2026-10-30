@@ -537,7 +537,15 @@ public final class PhotoLibraryBackupController {
                 else { return false }
                 return latestCandidate.snapshot == candidate.snapshot
             }
-            guard isCurrent() else { continue }
+            guard isCurrent() else {
+                // A stale check ends the context it registered, so it cannot hold back a later version.
+                if let stale = restoredRechecks[state.key], stale.generation == state.generation {
+                    restoredRechecks.removeValue(forKey: state.key)
+                    admittedRestoreRechecks.remove(state.key)
+                    await identityResolver.endRestoredCompound(stale)
+                }
+                continue
+            }
             do {
                 try await identityResolver.prepareRestoredCompound(context, isCurrent: isCurrent)
                 if restoredRechecks[state.key] != context { admittedRestoreRechecks.remove(state.key) }

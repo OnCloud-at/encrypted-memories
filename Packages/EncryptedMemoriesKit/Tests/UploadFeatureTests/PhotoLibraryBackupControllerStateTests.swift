@@ -4313,6 +4313,40 @@ extension PhotoLibraryBackupControllerStateTests {
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
         }
 
+        /// A crop of the main photo: a real content edit with new bytes, not a metadata change.
+        func publishEditedMain() throws -> (UploadBackupAssetCandidate, Restore829Resolver) {
+            var entry = try XCTUnwrap(catalog.entry(for: key.identifier))
+            entry.modificationDate = try XCTUnwrap(entry.modificationDate).addingTimeInterval(1)
+            entry.pixelWidth += 1
+            XCTAssertTrue(catalog.upsertBatch([entry]))
+            let latest = try XCTUnwrap(
+                PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
+            XCTAssertNotEqual(latest.snapshot.revision, resolver.candidate.snapshot.revision)
+            let edited = Data("edited-restore-829-main".utf8)
+            try edited.write(to: resolver.primary.fileURL)
+            let primary = UploadResourceDescriptor(
+                source: resolver.primary.source, fileURL: resolver.primary.fileURL,
+                filename: resolver.primary.filename, fileSize: Int64(edited.count),
+                modificationDate: try XCTUnwrap(entry.modificationDate),
+                precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: resolver.primary.fileURL))
+            let next = Restore829Resolver(
+                candidate: latest, primary: primary, secondaries: resolver.secondaries, mediaType: resolver.mediaType)
+            next.omitSecondary(true)
+            return (latest, next)
+        }
+
+        /// Drains with a runner that resolves through `resolver` on the same pipeline and uploader.
+        func drain(with resolver: Restore829Resolver) async throws {
+            let runner = BackupSyncRunner(
+                queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
+                resolver: resolver, identityResolver: pipeline, uploader: server,
+                configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
+                events: controller.pendingRecorder, now: { [clock] in clock.now })
+            clock.advance(by: 2)
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            await runner.stop()
+        }
+
         func relaunch() async throws {
             await close()
             try open()
@@ -4701,6 +4735,106 @@ extension PhotoLibraryBackupControllerStateTests {
                 f.state.record(
                     for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)?
                     .pendingResourceCount, 0)
+        }
+    }
+
+    func testANewerEditUploadsWhileAnOlderRestoreWaits() async throws {
+        for registersRestore in [true, false] {
+            try await withRestore829Fixture(.burst) { f in
+                let main = try await f.initialBackup(omittingSecondary: true)
+                let checked = try f.restoredState(main)
+                // Control: the same state without a Restore check through the controller registers no context.
+                if registersRestore {
+                    let admission = await f.controller.returnToBackup([checked])
+                    guard case .waiting? = admission[f.key] else {
+                        return XCTFail("The omitted burst must remain pending")
+                    }
+                    await f.drain()
+                    let outcome = await f.controller.returnToBackup([checked])
+                    guard case .waiting? = outcome[f.key] else { return XCTFail("Restore must still wait") }
+                    XCTAssertTrue(
+                        f.pending.finishRestoreRecheck(
+                            checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+                }
+                let uploadsBefore = f.server.uploadRequestCount
+                let (latest, resolver) = try f.publishEditedMain()
+                let engine = UploadBackupSyncEngine(
+                    preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue)
+                _ = try await engine.enqueueBatch([latest])
+                try await f.drain(with: resolver)
+
+                let row = f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
+                XCTAssertEqual(resolver.resolveCount, 1, "The edit really reached the duplicate check")
+                XCTAssertEqual(row?.state, .completed, "The newer edit backs up while the older Restore waits")
+                XCTAssertEqual(f.server.uploadRequestCount, uploadsBefore + 1, "Exactly the edited main uploads")
+                XCTAssertEqual(
+                    f.identities.record(for: resolver.primary.source)?.sha1Hex,
+                    UploadContentSHA1.hexString(digest: try XCTUnwrap(resolver.primary.precomputedSHA1Digest)))
+            }
+        }
+    }
+
+    func testAStaleRestoreCheckEndsItsContextOnTheNextPass() async throws {
+        try await withRestore829Fixture(.burst) { f in
+            let main = try await f.initialBackup(omittingSecondary: true)
+            let checked = try f.restoredState(main)
+            let admission = await f.controller.returnToBackup([checked])
+            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
+            let primary = f.resolver.primary.withBackupRevision(f.resolver.candidate.snapshot.revision)
+            var guarded = false
+            do { _ = try await f.pipeline.resolve(primary) } catch {
+                guarded = UploadError.isCancellation(error)
+            }
+            XCTAssertFalse(guarded, "The current context admits its own revision")
+            // A new decision replaces the generation that the registered context checked.
+            let excluded = try XCTUnwrap(
+                f.pending.exclude(
+                    [PendingExclusionRequest(key: f.key, presentation: nil, remote: main)], at: f.clock.now)?
+                    .first)
+            XCTAssertNotNil(f.pending.includeRestoredInProton([f.key], confirmedRemotes: [main], at: f.clock.now))
+            XCTAssertNotEqual(excluded.generation, checked.generation)
+            do { _ = try await f.pipeline.resolve(primary) } catch {
+                guarded = UploadError.isCancellation(error)
+            }
+            XCTAssertTrue(guarded, "A stale registered context still guards its own revision")
+
+            let stale = await f.controller.returnToBackup([checked])
+            XCTAssertEqual(stale[f.key], .unreadable, "The stale check reports nothing")
+            guarded = false
+            do { _ = try await f.pipeline.resolve(primary) } catch {
+                guarded = UploadError.isCancellation(error)
+            }
+            XCTAssertFalse(guarded, "The next pass ends the stale context")
+        }
+    }
+
+    func testAStaleOlderCheckKeepsTheNewerRestoreContext() async throws {
+        try await withRestore829Fixture(.burst) { f in
+            let main = try await f.initialBackup(omittingSecondary: true)
+            let older = try f.restoredState(main)
+            let first = await f.controller.returnToBackup([older])
+            guard case .waiting? = first[f.key] else { return XCTFail("The omitted burst must remain pending") }
+            XCTAssertNotNil(
+                f.pending.exclude(
+                    [PendingExclusionRequest(key: f.key, presentation: nil, remote: main)], at: f.clock.now))
+            let newer = try XCTUnwrap(
+                f.pending.includeRestoredInProton([f.key], confirmedRemotes: [main], at: f.clock.now)?.first)
+            XCTAssertNotEqual(newer.generation, older.generation)
+            let second = await f.controller.returnToBackup([newer])
+            guard case .waiting? = second[f.key] else { return XCTFail("The newer Restore must remain pending") }
+            let context = UploadRestoredCompoundContext(
+                source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
+                generation: newer.generation, confirmedRemote: main,
+                requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
+            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                return XCTFail("Fixture prerequisite: the newer context is registered")
+            }
+
+            let stale = await f.controller.returnToBackup([older])
+            XCTAssertEqual(stale[f.key], .unreadable, "The older check is stale")
+            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                return XCTFail("A stale older check must not end the newer context")
+            }
         }
     }
 

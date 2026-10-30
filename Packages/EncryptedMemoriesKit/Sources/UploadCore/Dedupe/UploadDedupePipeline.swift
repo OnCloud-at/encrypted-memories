@@ -136,6 +136,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     private func restoredCheck(for descriptor: UploadResourceDescriptor) throws -> RestoredCheck? {
         let source = UploadSourceIdentity(kind: descriptor.source.kind, identifier: descriptor.source.identifier)
         guard let check = restoredChecks[source] else { return nil }
+        // The source changed since the Restore check began: its context does not guard a newer version.
+        if descriptor.backupRevision != check.context.revision, !check.isCurrent() { return nil }
         guard descriptor.backupRevision == check.context.revision, check.isCurrent() else { throw CancellationError() }
         return check
     }
