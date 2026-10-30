@@ -69,14 +69,17 @@ public struct UploadRestoredCompoundContext: Sendable, Equatable {
     public let revision: UploadBackupRevision
     public let generation: Int64
     public let confirmedRemote: PhotoUID
+    public let requiredMembers: [UploadSourceIdentity.Resource]
 
     public init(
-        source: UploadSourceIdentity, revision: UploadBackupRevision, generation: Int64, confirmedRemote: PhotoUID
+        source: UploadSourceIdentity, revision: UploadBackupRevision, generation: Int64, confirmedRemote: PhotoUID,
+        requiredMembers: [UploadSourceIdentity.Resource] = []
     ) {
         self.source = source
         self.revision = revision
         self.generation = generation
         self.confirmedRemote = confirmedRemote
+        self.requiredMembers = requiredMembers
     }
 }
 

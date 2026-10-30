@@ -519,11 +519,13 @@ public final class PhotoLibraryBackupController {
             }
             guard let entry = catalogStore.presentEntries(for: [state.key.identifier])[state.key.identifier],
                 let candidate = PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)),
+                let plan = PhotoBackupAssetPlanner.exportPlan(for: PhotoLibraryCatalogMapper.info(for: entry)),
                 catalogStore.isOperational()
             else { continue }
             let context = UploadRestoredCompoundContext(
                 source: candidate.snapshot.source, revision: candidate.snapshot.revision,
-                generation: state.generation, confirmedRemote: remote)
+                generation: state.generation, confirmedRemote: remote,
+                requiredMembers: plan.secondaries.map(\.sourceResource))
             let isCurrent: @Sendable () -> Bool = {
                 guard pendingStore.isOperational(), catalogStore.isOperational(),
                     case .readable(let current?) = pendingStore.sourceStateRead(for: state.key),
@@ -533,7 +535,7 @@ public final class PhotoLibraryBackupController {
                     let latestCandidate = PhotoBackupAssetPlanner.candidate(
                         for: PhotoLibraryCatalogMapper.info(for: latest))
                 else { return false }
-                return latestCandidate.snapshot.revision == context.revision
+                return latestCandidate.snapshot == candidate.snapshot
             }
             guard isCurrent() else { continue }
             do {

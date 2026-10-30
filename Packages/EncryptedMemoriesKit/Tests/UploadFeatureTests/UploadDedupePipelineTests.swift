@@ -144,6 +144,8 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     private var contentFindCount = 0
     private var exactFindCount = 0
     var onNameLookup: (@Sendable ([String]) -> Void)?
+    var nameLookupGate: (@Sendable () async -> Void)?
+    var exactLookupGate: (@Sendable () async -> Void)?
     var deletionMetadata = UploadLinkStateSnapshot(states: [:], complete: false)
 
     func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot { deletionMetadata }
@@ -159,6 +161,7 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
 
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
         lock.withLock { nameLookupAttempts += 1 }
+        await nameLookupGate?()
         if let findError { throw findError }
         onNameLookup?(nameHashes)
         return lock.withLock {
@@ -292,6 +295,7 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     }
 
     func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {
+        await exactLookupGate?()
         onExactLookup?()
         return lock.withLock {
             exactFindCount += 1
@@ -2142,6 +2146,93 @@ private final class RebindBeforeNextWriteStore: UploadIdentityStore, @unchecked 
 }
 
 extension UploadDedupePipelineTests {
+    func testCrossSourceRestoreAdoptionRejectsContextRemovedDuringNameLookup() async throws {
+        try await assertRevokedRestoreAdoption(exactFallback: false, removeRegistration: true)
+    }
+
+    func testExactRestoreFallbackRejectsContextRemovedDuringLookup() async throws {
+        try await assertRevokedRestoreAdoption(exactFallback: true, removeRegistration: true)
+    }
+
+    func testRestoreAdoptionRejectsCapturedAuthorityInvalidatedDuringEitherLookup() async throws {
+        for exact in [false, true] {
+            try await assertRevokedRestoreAdoption(exactFallback: exact, removeRegistration: false)
+        }
+    }
+
+    func testRestoreAdoptionKeepsTheCapturedValidityWhenTheSameContextIsRegisteredAgain() async throws {
+        for exact in [false, true] {
+            try await assertRevokedRestoreAdoption(
+                exactFallback: exact, removeRegistration: false, replaceRegistration: true)
+        }
+    }
+
+    private func assertRevokedRestoreAdoption(
+        exactFallback: Bool, removeRegistration: Bool, replaceRegistration: Bool = false
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifest = try XCTUnwrap(
+            UploadIdentityManifestStore(url: directory.appendingPathComponent("identity.sqlite")))
+        defer { manifest.close() }
+        let checker = FakeChecker()
+        let date = Date(timeIntervalSince1970: 1000)
+        let pipeline = UploadDedupePipeline(store: manifest, checker: checker, now: { date })
+        let digest = Data(repeating: 0xCA, count: 20)
+        let hex = UploadContentSHA1.hexString(digest: digest)
+        let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "revoked-restore")
+        let descriptor = UploadResourceDescriptor(
+            source: source, fileURL: directory.appendingPathComponent("RESTORE.HEIC"),
+            filename: "RESTORE.HEIC", fileSize: 20, modificationDate: date,
+            precomputedSHA1Digest: digest, backupRevision: .init(rawValue: 7))
+        let before = UploadIdentityRecord(
+            source: source, filename: descriptor.filename, correctedName: descriptor.filename,
+            fileSize: descriptor.fileSize, modificationDate: date, sha1Hex: hex,
+            nameHash: "nh(RESTORE.HEIC)", contentHash: "ch(\(hex))", hashKeyEpoch: "epoch-1", updatedAt: date)
+        XCTAssertTrue(manifest.upsert(before))
+        if exactFallback {
+            checker.findError = UploadError.backend("Detailed name lookup unavailable")
+            checker.exactActiveDuplicates = [.init(volumeID: "vol", nodeID: "donor")]
+        } else {
+            var donor = before
+            donor.source = .init(kind: .photoLibraryAsset, identifier: "other-source")
+            donor.remoteVolumeID = "vol"
+            donor.remoteLinkID = "donor"
+            donor.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+            XCTAssertTrue(manifest.upsert(donor))
+        }
+        checker.linkVisibilityByID["donor"] = .init(isActive: true, mainPhotoLinkID: nil)
+        let current = Restore829Validity()
+        let context = UploadRestoredCompoundContext(
+            source: source, revision: .init(rawValue: 7), generation: 2,
+            confirmedRemote: .init(volumeID: "vol", nodeID: "confirmed"))
+        try await pipeline.prepareRestoredCompound(context, isCurrent: { current.value })
+        let reached = Restore829Validity()
+        let revoke: @Sendable () async -> Void = {
+            reached.invalidate()
+            if removeRegistration { await pipeline.endRestoredCompound(context) } else { current.invalidate() }
+            if replaceRegistration {
+                do { try await pipeline.prepareRestoredCompound(context, isCurrent: { true }) } catch {
+                    XCTFail("Fixture prerequisite: the replacement registration must succeed: \(error)")
+                }
+            }
+        }
+        if exactFallback { checker.exactLookupGate = revoke } else { checker.nameLookupGate = revoke }
+        var cancelled = false
+        do {
+            _ = try await pipeline.resolve(descriptor)
+        } catch {
+            if UploadError.isCancellation(error) { cancelled = true } else { throw error }
+        }
+        XCTAssertFalse(reached.value, "The suspended lookup must revoke the original restore authority")
+        XCTAssertFalse(Task.isCancelled, "The registry change, not task cancellation, must reject the result")
+        XCTAssertTrue(cancelled, "A revoked restore cannot adopt a different source's remote photo")
+        XCTAssertEqual(manifest.record(for: source), before, "No adoption write may survive revoked authority")
+        XCTAssertEqual(checker.exactFindCallCount, exactFallback ? 1 : 0)
+        await pipeline.uploadDidFail(descriptor)
+    }
+
     private struct Restore829Checker: UploadDuplicateChecking {
         let inner: FakeChecker
         let omitted: Set<String>
@@ -2177,7 +2268,8 @@ extension UploadDedupePipelineTests {
     private func restore829PipelineCase(
         confirmed: RemoteLinkVisibility?, destination: RemoteLinkVisibility?, member: RemoteLinkVisibility?,
         underDestination: Bool = false, revisionMismatch: Bool = false,
-        invalidateDuringRead: Bool = false, sourceID: String = "restore-source", endDuringRelatedRead: Bool = false
+        invalidateDuringRead: Bool = false, sourceID: String = "restore-source", endDuringRelatedRead: Bool = false,
+        asBurstMember: Bool = false
     ) async throws -> (UploadDuplicateDecision?, Bool, UploadIdentityRecord?) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -2196,7 +2288,8 @@ extension UploadDedupePipelineTests {
         let hex = UploadContentSHA1.hexString(digest: digest)
         let source = UploadSourceIdentity(
             kind: .photoLibraryAsset, identifier: sourceID,
-            resource: endDuringRelatedRead || invalidateDuringRead ? .burstMember(ordinal: 0) : .livePairedVideo)
+            resource: asBurstMember || endDuringRelatedRead || invalidateDuringRead
+                ? .burstMember(ordinal: 0) : .livePairedVideo)
         let d = UploadResourceDescriptor(
             source: source, fileURL: directory.appendingPathComponent("video"),
             filename: "RESTORE.MOV", fileSize: 20, modificationDate: Date(timeIntervalSince1970: 1000),
@@ -2289,6 +2382,35 @@ extension UploadDedupePipelineTests {
         let (decision, cancelled, row) = try await restore829PipelineCase(
             confirmed: main, destination: main,
             member: .init(isActive: true, mainPhotoLinkID: "destination"), underDestination: true)
+        XCTAssertFalse(cancelled)
+        XCTAssertEqual(decision, .skip(.activeDuplicate, remoteLinkID: "member"))
+        XCTAssertEqual(row?.outcome, UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
+    }
+
+    func testRestoredBurstCannotAdoptAMemberWithoutFreshMemberProof() async throws {
+        let main = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+        let cases: [(String, RemoteLinkVisibility?)] = [
+            ("missing", nil),
+            ("inactive", .init(isActive: false, mainPhotoLinkID: "destination")),
+            ("inferred", .init(isActive: true, mainPhotoLinkID: "destination", hasExplicitPhotoState: false)),
+            ("wrong parent", .init(isActive: true, mainPhotoLinkID: "foreign")),
+        ]
+        for (label, member) in cases {
+            let (decision, cancelled, row) = try await restore829PipelineCase(
+                confirmed: main, destination: main, member: member, underDestination: true, asBurstMember: true)
+            XCTAssertFalse(cancelled, label)
+            XCTAssertFalse(try XCTUnwrap(decision).uploadsBytes, label)
+            XCTAssertNotEqual(decision, .skip(.activeDuplicate, remoteLinkID: "member"), label)
+            XCTAssertEqual(row?.remoteLinkID, "member", label)
+            XCTAssertEqual(row?.outcome, UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue, label)
+        }
+    }
+
+    func testRestoredBurstAdoptsAMemberWithFreshStateAndDestinationMembership() async throws {
+        let main = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+        let (decision, cancelled, row) = try await restore829PipelineCase(
+            confirmed: main, destination: main,
+            member: .init(isActive: true, mainPhotoLinkID: "destination"), underDestination: true, asBurstMember: true)
         XCTAssertFalse(cancelled)
         XCTAssertEqual(decision, .skip(.activeDuplicate, remoteLinkID: "member"))
         XCTAssertEqual(row?.outcome, UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)

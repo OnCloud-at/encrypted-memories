@@ -110,13 +110,26 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         guard let check = restoredChecks[context.source], check.context == context, check.isCurrent() else {
             return .unreadable
         }
-        let read = try await checker.linkVisibility(of: [context.confirmedRemote.nodeID])
+        let members = context.requiredMembers.map { resource in
+            store.record(
+                for: UploadSourceIdentity(
+                    kind: context.source.kind, identifier: context.source.identifier, resource: resource))?.remoteLinkID
+        }
+        let read = try await checker.linkVisibility(
+            of: Array(Set([context.confirmedRemote.nodeID] + members.compactMap { $0 })).sorted())
         try Task.checkCancellation()
         guard check.isCurrent(), restoredChecks[context.source]?.context == context,
             let state = read[context.confirmedRemote.nodeID], state.hasExplicitPhotoState
         else { return .unreadable }
-        if state.isActiveMain { return .completed }
-        return state.trashTime != nil ? .remoteTrashed : .unreadable
+        guard state.isActiveMain else { return state.trashTime != nil ? .remoteTrashed : .unreadable }
+        guard
+            members.allSatisfy({ link in
+                guard let link, let member = read[link] else { return false }
+                return member.hasExplicitPhotoState && member.isActive
+                    && member.mainPhotoLinkID == context.confirmedRemote.nodeID
+            })
+        else { return .waiting(until: now().addingTimeInterval(60)) }
+        return .completed
     }
 
     @discardableResult
@@ -125,6 +138,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         guard let check = restoredChecks[source] else { return nil }
         guard descriptor.backupRevision == check.context.revision, check.isCurrent() else { throw CancellationError() }
         return check
+    }
+
+    private func validateRestoredCheck(_ captured: RestoredCheck?, for descriptor: UploadResourceDescriptor) throws {
+        let current = try restoredCheck(for: descriptor)
+        guard captured?.context == current?.context else { throw CancellationError() }
+        guard captured?.isCurrent() != false else { throw CancellationError() }
     }
 
     public func remoteAssetProofs(
@@ -153,13 +172,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     public func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         try Task.checkCancellation()
+        let restoring = try restoredCheck(for: descriptor)
         if let primingCancellation, primingCancellation.sources.contains(descriptor.source) {
             throw primingCancellation.error
         }
         let corrected = ProtonPhotoNameCorrection.correctedName(for: descriptor.filename)
         let epoch = try await checker.hashKeyEpoch()
         try Task.checkCancellation()
-        let restoring = try restoredCheck(for: descriptor)
         let cached = store.record(for: descriptor.source)
         let hmacReusable =
             cached.map { $0.isValid(for: descriptor, hashKeyEpoch: epoch) && $0.correctedName == corrected } ?? false
@@ -191,6 +210,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let remoteLink = cached.remoteLinkID,
             let digest = UploadContentSHA1.digest(fromHex: cached.sha1Hex)
         {
+            try validateRestoredCheck(restoring, for: descriptor)
             let identity = UploadIdentity(
                 correctedName: cached.correctedName, nameHash: cached.nameHash,
                 sha1Hex: cached.sha1Hex, sha1Digest: digest, contentHash: cached.contentHash
@@ -243,8 +263,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         let replacement = try await replacementScope(
             for: descriptor, cached: cached, sha1Hex: sha1Hex, nameHash: nameHash, contentHash: contentHash)
         try Task.checkCancellation()
-        func result(_ decision: UploadDuplicateDecision) -> UploadPreflightResult {
-            UploadPreflightResult(
+        func result(_ decision: UploadDuplicateDecision) throws -> UploadPreflightResult {
+            do { try validateRestoredCheck(restoring, for: descriptor) } catch {
+                releasePendingUploadClaims(ownedBy: descriptor)
+                throw error
+            }
+            return UploadPreflightResult(
                 identity: identity, decision: decision,
                 lineage: decision.uploadsBytes ? lineage(of: replacement, for: descriptor) : nil)
         }
@@ -266,6 +290,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             outcome: hmacReusable ? cached?.outcome : nil,
             updatedAt: now()
         )
+        try validateRestoredCheck(restoring, for: descriptor)
         try persistRecord(record, readFrom: cached)
 
         // Account-wide content dedupe + same-run coalescing. Loop invariant on exit: either we
@@ -296,13 +321,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     allowsAdoption = true
                 }
                 if allowsAdoption {
-                    try restoredCheck(for: descriptor)
+                    try validateRestoredCheck(restoring, for: descriptor)
                     record.remoteVolumeID = known.remoteVolumeID
                     record.remoteLinkID = knownLink
                     record.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
                     record.updatedAt = now()
                     try persistRecord(record)
-                    return result(.skip(.knownFromManifest, remoteLinkID: knownLink))
+                    return try result(.skip(.knownFromManifest, remoteLinkID: knownLink))
                 }
             }
             guard pendingContentUploads[contentKey] != nil else {
@@ -372,13 +397,14 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 let decision = UploadDuplicateDecision.skip(.activeDuplicate, remoteLinkID: exact.nodeID)
                 do {
                     try Task.checkCancellation()
+                    try validateRestoredCheck(restoring, for: descriptor)
                     try persist(decision, in: &record, readFrom: cached)
                 } catch {
                     releasePendingUploadClaims(ownedBy: descriptor)
                     throw error
                 }
                 releasePendingUploadClaims(ownedBy: descriptor)
-                return result(decision)
+                return try result(decision)
             }
             releasePendingUploadClaims(ownedBy: descriptor)
             throw detailedLookupError
@@ -495,13 +521,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 }
             }
             try Task.checkCancellation()
-            if let restoring {
-                guard restoring.isCurrent(), restoredChecks[restoring.context.source]?.context == restoring.context
-                else {
-                    throw CancellationError()
-                }
-            }
-            try restoredCheck(for: descriptor)
+            try validateRestoredCheck(restoring, for: descriptor)
             try noteRestored(decision, in: replacement, of: descriptor.source)
             if decision != .awaitDeletionCheck {
                 try replacementJournal?.clearDeletionCheck(for: descriptor.source)
@@ -512,7 +532,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw error
         }
         if !decision.uploadsBytes { releasePendingUploadClaims(ownedBy: descriptor) }
-        return result(decision)
+        return try result(decision)
     }
 
     /// Complete lineage reads can discover a live main without a local manifest. Failed or incomplete reads leave

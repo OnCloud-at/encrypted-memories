@@ -742,7 +742,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Waiting preserves both the provenance and the obligation, without consuming an effect attempt.
     @discardableResult
     public func finishRestoreRecheck(
-        _ checked: PendingSourceState, outcome: PendingBackupReturnOutcome, at date: Date
+        _ checked: PendingSourceState, outcome: PendingBackupReturnOutcome, at date: Date, retryNotBefore: Date? = nil
     ) -> Bool {
         connection.withLock {
             transaction {
@@ -758,7 +758,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     next = date
                 case .remoteTrashed:
                     assignment = "remote_trashed=1, needs_remote_restore=1"
-                    next = date
+                    next = max(date, retryNotBefore ?? date)
                 case .waiting(let until):
                     assignment = "needs_queue_sync=1"
                     next = max(date.addingTimeInterval(1), until)

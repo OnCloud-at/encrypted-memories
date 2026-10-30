@@ -4466,14 +4466,34 @@ extension PhotoLibraryBackupControllerStateTests {
 
     func testStopDuringRestoredBurstMemberUploadRetainsTheExactRestoreDuty() async throws {
         try await withRestore829Fixture(.burst) { f in
-            let main = try await f.initialBackup(omittingSecondary: true)
+            let main = try await f.initialBackup()
+            let priorMember = try XCTUnwrap(f.resolver.secondaries.first)
+            let priorMemberUID = try XCTUnwrap(f.identities.record(for: priorMember.descriptor.source)?.remoteLinkID)
+            var catalogEntry = try XCTUnwrap(f.catalog.entry(for: f.key.identifier))
+            catalogEntry.modificationDate = try XCTUnwrap(catalogEntry.modificationDate).addingTimeInterval(1)
+            XCTAssertTrue(f.catalog.upsertBatch([catalogEntry]))
+            let latest = try XCTUnwrap(
+                PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: catalogEntry)))
+            let updatedBytes = Data("updated-owned-burst-member".utf8)
+            try updatedBytes.write(to: priorMember.descriptor.fileURL)
+            let updatedMember = UploadResourceDescriptor(
+                source: priorMember.descriptor.source, fileURL: priorMember.descriptor.fileURL,
+                filename: priorMember.descriptor.filename, fileSize: Int64(updatedBytes.count),
+                modificationDate: try XCTUnwrap(catalogEntry.modificationDate),
+                precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: priorMember.descriptor.fileURL))
+            f.resolver = Restore829Resolver(
+                candidate: latest, primary: f.resolver.primary,
+                secondaries: [.init(descriptor: updatedMember, mediaType: priorMember.mediaType)],
+                mediaType: f.resolver.mediaType)
             let checked = try f.restoredState(main, marker: true)
-            guard !f.controller.isEnabled, f.server.uploadRequestCount == 1,
-                f.server.links.count == 1, f.server.links.first?.uid == main,
+            guard !f.controller.isEnabled, f.server.uploadRequestCount == 2,
+                f.server.links.count == 2, f.server.links.first?.uid == main,
                 f.server.links.first?.state == .active, f.resolver.secondaries.count == 1,
                 checked.remote == main, checked.needsQueueSync, checked.remoteOperation == .remoteTrash,
                 let member = f.resolver.secondaries.first, member.descriptor.source.resource.isBurstMember,
-                f.identities.record(for: member.descriptor.source) == nil
+                f.identities.record(for: member.descriptor.source)?.remoteLinkID == priorMemberUID,
+                f.identities.record(for: member.descriptor.source)?.isValid(for: member.descriptor) == false,
+                f.server.links.first(where: { $0.linkID == priorMemberUID })?.state == .active
             else { throw Restore829StopFixtureError.invalid("initial backup/restore fixture") }
             let admission = await f.controller.returnToBackup([checked])
             guard case .waiting? = admission[f.key],
@@ -4518,8 +4538,8 @@ extension PhotoLibraryBackupControllerStateTests {
                     active.state == .uploading, active.remoteCommitReconciliation == nil,
                     case .readable(let owed?) = f.pending.sourceStateRead(for: f.key),
                     owed.generation == checked.generation, owed.remote == main, owed.needsQueueSync,
-                    owed.remoteOperation == .remoteTrash, f.server.uploadRequestCount == 1,
-                    f.server.links.count == 1, f.server.links.first?.state == .active
+                    owed.remoteOperation == .remoteTrash, f.server.uploadRequestCount == 2,
+                    f.server.links.count == 2, f.server.links.first?.state == .active
                 else { throw Restore829StopFixtureError.invalid("real active member-upload prerequisite") }
                 stop = Task {
                     await runner.stop()
@@ -4575,8 +4595,8 @@ extension PhotoLibraryBackupControllerStateTests {
                 XCTAssertTrue(interruptedIdentity.isValid(for: member.descriptor))
                 XCTAssertNil(interruptedIdentity.remoteLinkID)
                 XCTAssertFalse(interruptedIdentity.provesUpload)
-                XCTAssertEqual(f.server.uploadRequestCount, 1)
-                XCTAssertEqual(f.server.links.count, 1)
+                XCTAssertEqual(f.server.uploadRequestCount, 2)
+                XCTAssertEqual(f.server.links.count, 2)
                 XCTAssertEqual(f.server.links.first?.uid, main)
                 XCTAssertEqual(f.server.links.first?.state, .active)
                 let pendingOutcome = await f.controller.returnToBackup([checked])
@@ -4591,11 +4611,13 @@ extension PhotoLibraryBackupControllerStateTests {
                 _ = await drain?.value
                 let completed = await f.controller.returnToBackup([checked])
                 XCTAssertEqual(completed[f.key], .completed)
-                XCTAssertEqual(f.server.uploadRequestCount, 2, "Only the missing member commits")
+                XCTAssertEqual(f.server.uploadRequestCount, 3, "Only the updated member commits")
                 XCTAssertEqual(f.server.links.filter { $0.mainLinkID == nil && $0.state == .active }.map(\.uid), [main])
                 let members = f.server.links.filter { $0.mainLinkID == main.nodeID && $0.state == .active }
-                XCTAssertEqual(members.count, 1)
-                XCTAssertEqual(f.identities.record(for: member.descriptor.source)?.remoteLinkID, members.first?.linkID)
+                XCTAssertEqual(members.count, 2)
+                XCTAssertEqual(members.first(where: { $0.linkID == priorMemberUID })?.state, .active)
+                let updated = try XCTUnwrap(members.first(where: { $0.linkID != priorMemberUID }))
+                XCTAssertEqual(f.identities.record(for: member.descriptor.source)?.remoteLinkID, updated.linkID)
                 XCTAssertEqual(uploader.cancelledTokens, [request.cancellationToken])
                 if completed[f.key] == .completed {
                     XCTAssertTrue(f.pending.finishRestoreRecheck(checked, outcome: .completed, at: f.clock.now))
@@ -4646,26 +4668,70 @@ extension PhotoLibraryBackupControllerStateTests {
         }
     }
 
-    func testRestoredBurstRecoversAnActuallyOmittedMemberUnderItsMain() async throws {
+    func testRestoredBurstKeepsAnActuallyOmittedMemberPendingWithoutUpload() async throws {
         try await withRestore829Fixture(.burst) { f in
             let main = try await f.initialBackup(omittingSecondary: true)
             XCTAssertEqual(f.server.uploadRequestCount, 1, "The initial resolved compound really omitted the member")
             let checked = try f.restoredState(main)
+            let primary = f.identities.record(for: f.resolver.candidate.snapshot.source)
+            let priorState = f.state.record(
+                for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)
             let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst needs a real recheck") }
+            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
             await f.drain()
             let outcome = await f.controller.returnToBackup([checked])
-            XCTAssertEqual(outcome[f.key], .completed)
-            XCTAssertEqual(f.server.uploadRequestCount, 2, "Exactly the missing member uploads")
+            guard case .waiting? = outcome[f.key] else { return XCTFail("A missing member cannot complete Restore") }
+            XCTAssertTrue(
+                f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+            let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
+            XCTAssertTrue(retained.needsQueueSync)
+            XCTAssertEqual(retained.remote, main)
+            XCTAssertEqual(retained.generation, checked.generation)
+            XCTAssertEqual(retained.attempts, checked.attempts)
+            XCTAssertEqual(f.server.uploadRequestCount, 1, "Restore cannot upload the missing member")
             let members = f.server.links.filter { $0.state == .active && $0.mainLinkID == main.nodeID }
-            XCTAssertEqual(members.count, 1)
+            XCTAssertEqual(members.count, 0)
+            XCTAssertNil(f.identities.record(for: try XCTUnwrap(f.resolver.secondaries.first).descriptor.source))
+            XCTAssertEqual(f.identities.record(for: f.resolver.candidate.snapshot.source), primary)
             XCTAssertEqual(
-                f.identities.record(for: try XCTUnwrap(f.resolver.secondaries.first).descriptor.source)?.remoteLinkID,
-                members.first?.linkID)
+                f.state.record(
+                    for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision),
+                priorState)
             XCTAssertEqual(
                 f.state.record(
                     for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)?
                     .pendingResourceCount, 0)
+        }
+    }
+
+    func testRestoredLivePhotoKeepsATrashedPairedVideoPendingWithoutUpload() async throws {
+        try await withRestore829Fixture(.live) { f in
+            let main = try await f.initialBackup()
+            let checked = try f.restoredState(main, retainMemberTrash: true, marker: true)
+            let paired = try XCTUnwrap(f.resolver.secondaries.first).descriptor.source
+            let member = try XCTUnwrap(f.identities.record(for: paired)?.remoteLinkID)
+            f.server.personTrash(.init(volumeID: "vol", nodeID: member))
+            let uploads = f.server.uploadRequestCount
+            let before = f.identities.record(for: paired)
+            let admission = await f.controller.returnToBackup([checked])
+            guard case .waiting? = admission[f.key] else { return XCTFail("A trashed paired video stays pending") }
+            await f.drain()
+            let outcome = await f.controller.returnToBackup([checked])
+            guard case .waiting? = outcome[f.key] else {
+                return XCTFail("A skipped paired video is not a complete Restore")
+            }
+            XCTAssertTrue(
+                f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+            let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
+            XCTAssertTrue(retained.needsQueueSync)
+            XCTAssertEqual(retained.remote, main)
+            XCTAssertEqual(retained.generation, checked.generation)
+            XCTAssertEqual(retained.remoteOperation, .remoteTrash)
+            XCTAssertEqual(retained.attempts, checked.attempts)
+            XCTAssertEqual(f.identities.record(for: paired), before)
+            XCTAssertEqual(f.server.uploadRequestCount, uploads)
+            XCTAssertEqual(f.server.links.first { $0.linkID == member }?.state, .trashed)
+            XCTAssertEqual(f.server.links.first { $0.linkID == main.nodeID }?.state, .active)
         }
     }
 
@@ -4771,7 +4837,8 @@ extension PhotoLibraryBackupControllerStateTests {
             _ = await f.controller.returnToBackup([checked])
             let context = UploadRestoredCompoundContext(
                 source: f.resolver.candidate.snapshot.source,
-                revision: f.resolver.candidate.snapshot.revision, generation: checked.generation, confirmedRemote: main)
+                revision: f.resolver.candidate.snapshot.revision, generation: checked.generation, confirmedRemote: main,
+                requiredMembers: f.resolver.secondaries.map { $0.descriptor.source.resource })
             let active = try await f.pipeline.restoredPhotoOutcome(context)
             XCTAssertEqual(active, .completed)
             let other = UploadDedupePipeline(store: FakeIdentityStore(), checker: f.server)
@@ -4847,6 +4914,8 @@ extension PhotoLibraryBackupControllerStateTests {
                 await coordinator.start()
                 XCTAssertTrue(try XCTUnwrap(f.pending.sourceState(for: f.key)).needsQueueSync)
                 await f.drain()
+                let recheck = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                f.clock.advance(by: max(0, recheck.nextAttemptAt.timeIntervalSince(f.clock.now)))
                 let completed = await coordinator.restoreSources(ofRemote: [main])
                 XCTAssertEqual(completed.outcomes[f.key], .completed)
                 XCTAssertNil(

@@ -4790,6 +4790,234 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
 }
 
 extension PendingBackupCoordinatorTests {
+    func testIncompleteRestoreChecksBackOffAndStopUntilRestartOrAnExplicitRestore() async throws {
+        for resume in ["restart", "explicit restore"] {
+            await coordinator.close()
+            let id = "bounded-compound-\(resume)"
+            let sourceKey = key(id)
+            let remote = PhotoUID(volumeID: "vol", nodeID: id)
+            let clock = ResultWriteClock(date)
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+                ),
+                .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: sourceKey, generation: excluded.generation,
+                    remoteLinkID: remote.nodeID, at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+            let relations = FakeChecker()
+            relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+            effects = FakePendingEffects()
+            effects.typedReturnOverride = [sourceKey: .waiting(until: date)]
+            coordinator = makeCoordinator(relations: relations, clock: clock)
+            await coordinator.start()
+            _ = await coordinator.restoreSources(ofRemote: [remote])
+
+            for (index, delay) in [60, 300, 900].enumerated() {
+                XCTAssertEqual(effects.returned.filter { $0 == [sourceKey] }.count, index + 1)
+                let retained = try XCTUnwrap(store.sourceState(for: sourceKey))
+                XCTAssertTrue(retained.needsQueueSync)
+                XCTAssertEqual(retained.remote, remote)
+                XCTAssertEqual(retained.attempts, 0)
+                XCTAssertEqual(retained.nextAttemptAt, clock.now.addingTimeInterval(Double(delay)))
+                clock.advance(by: .seconds(delay))
+                if index < 2 {
+                    // An unrelated trigger joins a real reconcile but must not reset this source's ceiling.
+                    _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+                }
+            }
+            let reads = relations.linkVisibilityCallCount
+            _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+            XCTAssertEqual(
+                effects.returned.filter { $0 == [sourceKey] }.count, 3, "The session ceiling stops effect calls")
+            XCTAssertEqual(relations.linkVisibilityCallCount, reads, "The ceiling stops even the preceding fresh read")
+            let paused = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertTrue(paused.needsQueueSync)
+            XCTAssertEqual(paused.remote, remote)
+            XCTAssertEqual(paused.attempts, 0)
+            XCTAssertTrue(effects.restored.isEmpty)
+            XCTAssertTrue(effects.trashed.isEmpty)
+
+            effects.typedReturnOverride = [sourceKey: .completed]
+            clock.advance(by: .seconds(1))
+            if resume == "restart" {
+                await coordinator.close()
+                coordinator = makeCoordinator(relations: relations, clock: clock)
+                await coordinator.start()
+            } else {
+                let completed = await coordinator.restoreSources(ofRemote: [remote])
+                XCTAssertEqual(completed.outcomes[sourceKey], .completed)
+            }
+            XCTAssertNil(store.sourceState(for: sourceKey), "Fresh successful proof can retire the retained duty")
+            XCTAssertEqual(effects.returned.filter { $0 == [sourceKey] }.count, 4)
+        }
+    }
+
+    private struct LookupArmedRestoreResolver: BackupResourceResolving {
+        let resource: BackupResolvedResource
+        let arm: @Sendable () async -> Void
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            await arm()
+            return resource
+        }
+    }
+
+    func testRevokedRestoreAdoptionCannotCreateARunnerHandoffOrRemoteTrash() async throws {
+        for exactFallback in [false, true] {
+            await coordinator.close()
+            let id = exactFallback ? "revoked-exact" : "revoked-manifest"
+            let target = source(id)
+            let targetKey = key(id)
+            let date = self.date
+            let pending = try XCTUnwrap(store)
+            let manifest = try XCTUnwrap(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("\(id)-identities.sqlite")))
+            defer { manifest.close() }
+            let state = try XCTUnwrap(
+                UploadBackupStateManifestStore(url: directory.appendingPathComponent("\(id)-backup.sqlite")))
+            defer { state.close() }
+            let checker = FakeChecker()
+            let pipeline = UploadDedupePipeline(store: manifest, checker: checker, now: { date })
+            let digest = Data(repeating: 0xCA, count: 20)
+            let hex = UploadContentSHA1.hexString(digest: digest)
+            let descriptor = UploadResourceDescriptor(
+                source: target, fileURL: directory.appendingPathComponent(id), filename: "\(id).heic",
+                fileSize: 20, modificationDate: date, precomputedSHA1Digest: digest, backupRevision: revision)
+            let before = UploadIdentityRecord(
+                source: target, filename: descriptor.filename, correctedName: descriptor.filename,
+                fileSize: 20, modificationDate: date, sha1Hex: hex,
+                nameHash: "nh(\(descriptor.filename))", contentHash: "ch(\(hex))", hashKeyEpoch: "epoch-1",
+                updatedAt: date)
+            XCTAssertTrue(manifest.upsert(before))
+            if exactFallback {
+                checker.exactActiveDuplicates = [.init(volumeID: "vol", nodeID: "foreign-donor")]
+            } else {
+                var donor = before
+                donor.source = source("donor-\(id)")
+                donor.remoteVolumeID = "vol"
+                donor.remoteLinkID = "foreign-donor"
+                donor.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+                XCTAssertTrue(manifest.upsert(donor))
+            }
+            checker.linkVisibilityByID["foreign-donor"] = .init(isActive: true, mainPhotoLinkID: nil)
+            let context = UploadRestoredCompoundContext(
+                source: target, revision: revision, generation: 2,
+                confirmedRemote: .init(volumeID: "vol", nodeID: "confirmed"))
+            try await pipeline.prepareRestoredCompound(context, isCurrent: { true })
+            let reached = AppliedTrashReadCount()
+            let revoke: @Sendable () async -> Void = {
+                _ = reached.next()
+                XCTAssertNotNil(pending.exclude([.init(key: targetKey, presentation: nil, remote: nil)], at: date))
+                await pipeline.endRestoredCompound(context)
+            }
+            let candidate = UploadBackupAssetCandidate(
+                snapshot: .init(source: target, revision: revision, resourceCount: 1),
+                originalFilename: descriptor.filename, byteCount: 20)
+            let resolver = LookupArmedRestoreResolver(
+                resource: .init(
+                    candidate: candidate, descriptor: descriptor, mediaType: "image/heic", captureDate: date),
+                arm: {
+                    // Arm after the real runner primes, so the suspended lookup belongs to resolve itself.
+                    await pipeline.invalidateCachedRemoteState()
+                    if exactFallback {
+                        checker.findError = UploadError.backend("Detailed lookup unavailable")
+                        checker.exactLookupGate = revoke
+                    } else {
+                        checker.nameLookupGate = revoke
+                    }
+                })
+            enqueue(id, state: .queuedForUpload)
+            let uploader = MockUploader()
+            let clock = BackupTestClock(start: date)
+            let runner = BackupSyncRunner(
+                queue: queue, preflight: UploadBackupPreflightIndex(store: state), resolver: resolver,
+                identityResolver: pipeline, uploader: uploader,
+                configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
+                events: recorder, now: { clock.now })
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            await runner.stop()
+
+            XCTAssertEqual(reached.count, 1, "The real runner must reach exactly the gated adoption lookup")
+            XCTAssertEqual(manifest.record(for: target), before, "Revocation cannot write a donor identity")
+            XCTAssertTrue(
+                store.latestHandoffs(for: [targetKey]).isEmpty, "No donor handoff may reach the pending store")
+            let excluded = try XCTUnwrap(store.sourceState(for: targetKey))
+            XCTAssertEqual(excluded.desired, .excluded)
+            XCTAssertNil(excluded.remote)
+            XCTAssertFalse(excluded.needsRemoteTrash)
+            XCTAssertTrue(uploader.requests.isEmpty)
+            let interrupted = try XCTUnwrap(queue.entry(for: target, revision: revision))
+            XCTAssertEqual(interrupted.attempts, 0)
+            XCTAssertFalse(interrupted.state.isTerminalSuccess)
+            effects = FakePendingEffects()
+            coordinator = makeCoordinator()
+            await coordinator.start()
+            XCTAssertTrue(
+                effects.trashed.isEmpty, "A revoked adoption cannot schedule remote trash through reconciliation")
+        }
+    }
+
+    func testPersistentRestoreRefusalDefersCompensationWithoutBurningAttempts() async throws {
+        await coordinator.close()
+        let id = "persistently-refused-restore"
+        let remote = PhotoUID(volumeID: "vol", nodeID: "refused-main")
+        let clock = ResultWriteClock(date)
+        enqueue(id, state: .completed)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key(id), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: key(id), generation: excluded.generation,
+                remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+        let relations = FakeChecker()
+        let refused = try XCTUnwrap(effects)
+        // A permanent per-item refusal is settled by the batch adapter, but the fresh read stays trashed.
+        // After three requests the fixture reports an unavailable read, so a broken loop ends on data,
+        // not a timeout. More than one request before the persisted due time is the direct failure.
+        relations.onVisibilityLookup = {
+            relations.linkVisibilityByID[remote.nodeID] = .init(
+                isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_000)
+            if refused.restored.count >= 3 {
+                relations.linkVisibilityError = UploadError.backend("Bounded refusal fixture exhausted")
+            }
+        }
+        coordinator = makeCoordinator(relations: relations, clock: clock)
+        await coordinator.start()
+
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertEqual(effects.restored, [[remote]], "One refusal must defer the next remote compensation")
+        let retained = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(retained.needsRemoteRestore, "A refused restore still owes its exact photo")
+        XCTAssertTrue(retained.needsQueueSync)
+        XCTAssertEqual(retained.remote, remote)
+        XCTAssertEqual(retained.attempts, 0, "An unsuccessful recheck cannot burn the effect budget")
+        XCTAssertEqual(retained.nextAttemptAt, date.addingTimeInterval(60))
+        clock.advance(by: .seconds(59))
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertEqual(effects.restored, [[remote]], "The persisted delay must also gate a new reconcile call")
+        clock.advance(by: .seconds(1))
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertEqual(effects.restored, [[remote], [remote]], "Exactly one retry becomes due after the delay")
+        let retried = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(retried.needsRemoteRestore)
+        XCTAssertEqual(retried.remote, remote)
+        XCTAssertEqual(retried.attempts, 0)
+        XCTAssertEqual(retried.nextAttemptAt, clock.now.addingTimeInterval(60))
+        XCTAssertTrue(effects.returned.isEmpty, "A still-trashed main cannot enter the compound recheck")
+    }
+
     func testMissingTypedRestoreOutcomeIsUnreadableAndKeepsItsUIDOwed() async throws {
         await coordinator.close()
         let id = "missing-typed-outcome"
