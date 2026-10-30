@@ -144,6 +144,53 @@
                 loads.requested.count, 1, "removing the model starts no second load")
         }
 
+        func testReplacingTheModelLoadsThePictureForTheSameUID() async throws {
+            let first = BackupProblemPreviewModel { _ in nil }
+            first.open()
+            defer { first.close() }
+            let loads = LoadLog()
+            loads.image = Self.magentaBitmap()
+            let second = BackupProblemPreviewModel(load: loads.load)
+            second.open()
+            defer { second.close() }
+            let box = PreviewModelBox(previews: first)
+            let renderer = LiveRowRenderer(view: BoxedProblemRow(item: Self.item(source: Self.photo), box: box))
+            defer { renderer.close() }
+            try await renderer.settle()
+            XCTAssertNil(try renderer.snapshot().magentaColumns())
+
+            box.previews = second
+            try await renderer.settle()
+            XCTAssertEqual(loads.requested, [try XCTUnwrap(BackupProblemPreviewModel.uid(for: Self.photo)).nodeID])
+            XCTAssertNotNil(
+                try renderer.snapshot().magentaColumns(), "the new model's picture replaces the placeholder")
+        }
+
+        func testReplacingTheModelKeepsThePictureWhileTheNewLoadIsPending() async throws {
+            let first = BackupProblemPreviewModel { _ in Self.magentaBitmap() }
+            first.open()
+            defer { first.close() }
+            let held = HeldLoad()
+            let second = BackupProblemPreviewModel(load: held.load)
+            second.open()
+            defer {
+                held.finish()
+                second.close()
+            }
+            let box = PreviewModelBox(previews: first)
+            let renderer = LiveRowRenderer(view: BoxedProblemRow(item: Self.item(source: Self.photo), box: box))
+            defer { renderer.close() }
+            try await renderer.settle()
+            XCTAssertNotNil(try renderer.snapshot().magentaColumns())
+            box.previews = second
+            try await renderer.settle()
+            XCTAssertTrue(held.started, "the replacement model starts its load")
+            XCTAssertNotNil(try renderer.snapshot().magentaColumns(), "the picture stays visible during the load")
+            held.finish()
+            try await renderer.settle()
+            XCTAssertNotNil(try renderer.snapshot().magentaColumns(), "the new picture remains visible")
+        }
+
         // MARK: - Building
 
         private static func item(source: UploadSourceIdentity?) -> BackupFailedItem {
@@ -169,7 +216,7 @@
         }
 
         /// The one preview square the row loads, in a color no other row content uses.
-        nonisolated private static func magentaBitmap() -> CGImage? {
+        nonisolated fileprivate static func magentaBitmap() -> CGImage? {
             let side = 8
             guard
                 let context = CGContext(
@@ -192,6 +239,22 @@
         func load(_ uid: PhotoUID) async -> CGImage? {
             requested.append(uid.nodeID)
             return image
+        }
+    }
+
+    @MainActor
+    private final class HeldLoad {
+        private(set) var started = false
+        private var continuation: CheckedContinuation<CGImage?, Never>?
+
+        func load(_ uid: PhotoUID) async -> CGImage? {
+            started = true
+            return await withCheckedContinuation { continuation = $0 }
+        }
+
+        func finish() {
+            continuation?.resume(returning: BackupProblemRowTests.magentaBitmap())
+            continuation = nil
         }
     }
 

@@ -7,15 +7,17 @@ import SwiftUI
 public struct LocalPhotoThumbnail: View {
     private let uid: PhotoUID?
     private let retainsImageOnDisappear: Bool
+    private let reloadID: ObjectIdentifier?
     private let load: @Sendable (PhotoUID) async -> CGImage?
     @State private var state = LocalPhotoThumbnailState()
 
     public init(
-        uid: PhotoUID?, retainsImageOnDisappear: Bool = false,
+        uid: PhotoUID?, retainsImageOnDisappear: Bool = false, reloadID: ObjectIdentifier? = nil,
         load: @escaping @Sendable (PhotoUID) async -> CGImage?
     ) {
         self.uid = uid
         self.retainsImageOnDisappear = retainsImageOnDisappear
+        self.reloadID = reloadID
         self.load = load
     }
 
@@ -34,14 +36,19 @@ public struct LocalPhotoThumbnail: View {
         .frame(width: 40, height: 40)
         .clipShape(.rect(cornerRadius: 7))
         .accessibilityHidden(true)
-        .task(id: uid) {
+        .task(id: TaskID(uid: uid, reloadID: reloadID)) {
             guard let uid else {
                 state.clear(retainingImage: retainsImageOnDisappear)
                 return
             }
-            await state.load(uid, retainingImage: retainsImageOnDisappear, using: load)
+            await state.load(uid, retainingImage: retainsImageOnDisappear || reloadID != nil, using: load)
         }
         .onDisappear { state.clear(retainingImage: retainsImageOnDisappear) }
+    }
+
+    private struct TaskID: Equatable {
+        let uid: PhotoUID?
+        let reloadID: ObjectIdentifier?
     }
 }
 
