@@ -376,6 +376,7 @@ final class MobileLibraryModel {
     /// Encrypted thumbnail cache retained for Settings diagnostics and clear actions. Decoded previews remain
     /// in RAM, while video bytes are managed by the backend.
     private var thumbnailCache: ThumbnailCache?
+    @ObservationIgnored private var thumbnailSupportSource: ThumbnailCacheSupportGroup?
 
     /// Encrypted on-disk cache for decrypted originals. The viewer seeds it; fullscreen opens and share/export
     /// reuse it before the network. Plaintext originals stay inside this AES-GCM store.
@@ -896,6 +897,10 @@ final class MobileLibraryModel {
             },
             purgeLostScope: { [weak self] in
                 guard let self else { return }
+                if let source = self.thumbnailSupportSource {
+                    SupportDiagnosticsSources.shared.unregisterThumbnailCaches(source)
+                    self.thumbnailSupportSource = nil
+                }
                 self.cacheContext = nil
                 self.thumbnailCache = nil
                 self.originalsCache = nil
@@ -1284,6 +1289,10 @@ final class MobileLibraryModel {
     }
 
     private func teardown() {
+        if let source = thumbnailSupportSource {
+            SupportDiagnosticsSources.shared.unregisterThumbnailCaches(source)
+            thumbnailSupportSource = nil
+        }
         LibraryRuntimeState.shared.beginNewGeneration()
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         isSigningOut = purgeClaim != nil
@@ -1370,6 +1379,10 @@ final class MobileLibraryModel {
         store: SessionKeychainStore,
         preserveVisibleSnapshot: Bool = false
     ) {
+        if let source = thumbnailSupportSource {
+            SupportDiagnosticsSources.shared.unregisterThumbnailCaches(source)
+            thumbnailSupportSource = nil
+        }
         LibraryRuntimeState.shared.beginNewGeneration()
         isSigningOut = false
         signOutCleanupFailed = false
@@ -1428,6 +1441,9 @@ final class MobileLibraryModel {
             originals.enforceByteCap(originalsCap)
         }
         originalsCache = originals
+        let supportSource = ThumbnailCacheSupportGroup([cache, originals])
+        thumbnailSupportSource = supportSource
+        SupportDiagnosticsSources.shared.registerThumbnailCaches(supportSource)
 
         // Register UIKit pressure and lifecycle signals with the shared governor. Cache registrations are
         // identity-keyed, so a new session replaces the previous cache and feed.
