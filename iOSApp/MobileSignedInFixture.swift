@@ -629,6 +629,7 @@ import os
         var favoriteLoader: (@Sendable () async throws -> Set<PhotoUID>)? = nil
         var favoriteWriter: (@Sendable ([PhotoUID], Bool) async throws -> Void)? = nil
         var trashEmptier: (@Sendable () async throws -> Void)? = nil
+        var streamingAssetLoader: (@Sendable (PhotoUID) async throws -> StreamingVideoAsset)? = nil
         /// Recently Deleted lists every fixture photo until it is emptied.
         let trashState = MobileFixtureTrashState()
 
@@ -686,6 +687,7 @@ import os
         /// `-EncryptedMemoriesVideoFailureScenario` the first preparation hits a rate limit, which the viewer retries
         /// silently, the second fails in a way that a new attempt can change, and every later one fails for good.
         func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
+            if let streamingAssetLoader { return try await streamingAssetLoader(uid) }
             guard ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesVideoFailureScenario") else {
                 throw MobileFixtureError.unavailable
             }

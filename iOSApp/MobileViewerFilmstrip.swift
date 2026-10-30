@@ -43,6 +43,8 @@ struct MobileViewerFilmstrip: UIViewRepresentable {
         collectionView.alwaysBounceVertical = false
         collectionView.showsHorizontalScrollIndicator = false
         collectionView.showsVerticalScrollIndicator = false
+        collectionView.leftEdgeEffect.isHidden = true
+        collectionView.rightEdgeEffect.isHidden = true
         collectionView.contentInsetAdjustmentBehavior = .never
         collectionView.decelerationRate = .fast
         collectionView.accessibilityLabel = L10n.string("a11y.photo_library_grid")
