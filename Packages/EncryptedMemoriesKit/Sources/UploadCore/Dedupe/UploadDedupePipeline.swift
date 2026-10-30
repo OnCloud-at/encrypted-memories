@@ -22,6 +22,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     private let batchSize: Int
     private let replacementJournal: (any EditReplacementJournaling)?
     private let now: @Sendable () -> Date
+    private struct RestoredCheck: Sendable {
+        let context: UploadRestoredCompoundContext
+        let isCurrent: @Sendable () -> Bool
+    }
+    private var restoredChecks: [UploadSourceIdentity: RestoredCheck] = [:]
 
     /// Per-batch remote view from each name hash to matching remote items.
     private var duplicateCache: [String: [RemotePhotoDuplicate]] = [:]
@@ -87,6 +92,41 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     // MARK: - UploadIdentityResolving
 
+    public func prepareRestoredCompound(
+        _ context: UploadRestoredCompoundContext, isCurrent: @escaping @Sendable () -> Bool
+    ) async throws {
+        try Task.checkCancellation()
+        guard context.source.resource == .primary, isCurrent() else { throw CancellationError() }
+        restoredChecks[context.source] = RestoredCheck(context: context, isCurrent: isCurrent)
+    }
+
+    public func endRestoredCompound(_ context: UploadRestoredCompoundContext) async {
+        if restoredChecks[context.source]?.context == context { restoredChecks.removeValue(forKey: context.source) }
+    }
+
+    public func restoredPhotoOutcome(
+        _ context: UploadRestoredCompoundContext
+    ) async throws -> PendingBackupReturnOutcome {
+        guard let check = restoredChecks[context.source], check.context == context, check.isCurrent() else {
+            return .unreadable
+        }
+        let read = try await checker.linkVisibility(of: [context.confirmedRemote.nodeID])
+        try Task.checkCancellation()
+        guard check.isCurrent(), restoredChecks[context.source]?.context == context,
+            let state = read[context.confirmedRemote.nodeID], state.hasExplicitPhotoState
+        else { return .unreadable }
+        if state.isActiveMain { return .completed }
+        return state.trashTime != nil ? .remoteTrashed : .unreadable
+    }
+
+    @discardableResult
+    private func restoredCheck(for descriptor: UploadResourceDescriptor) throws -> RestoredCheck? {
+        let source = UploadSourceIdentity(kind: descriptor.source.kind, identifier: descriptor.source.identifier)
+        guard let check = restoredChecks[source] else { return nil }
+        guard descriptor.backupRevision == check.context.revision, check.isCurrent() else { throw CancellationError() }
+        return check
+    }
+
     public func remoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
@@ -119,6 +159,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         let corrected = ProtonPhotoNameCorrection.correctedName(for: descriptor.filename)
         let epoch = try await checker.hashKeyEpoch()
         try Task.checkCancellation()
+        let restoring = try restoredCheck(for: descriptor)
         let cached = store.record(for: descriptor.source)
         let hmacReusable =
             cached.map { $0.isValid(for: descriptor, hashKeyEpoch: epoch) && $0.correctedName == corrected } ?? false
@@ -255,6 +296,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     allowsAdoption = true
                 }
                 if allowsAdoption {
+                    try restoredCheck(for: descriptor)
                     record.remoteVolumeID = known.remoteVolumeID
                     record.remoteLinkID = knownLink
                     record.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
@@ -431,7 +473,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             // A vanished trash entry does not revoke the person's deletion, but the cached fact cannot prove
             // the copy is still trashed. Keep upload blocked until fresh proof settles this exact resource.
-            if decision.uploadsBytes, preservesKnownDeletion {
+            if let link = relatedReads.restoredMemberLinkID, relatedReads.restoredMemberIsUnderDestination {
+                decision = .skip(.activeDuplicate, remoteLinkID: link)
+            }
+            if decision.uploadsBytes, preservesKnownDeletion, relatedReads.restoredMemberLinkID == nil {
                 decision = .skip(.inconsistentRemoteState, remoteLinkID: cached?.remoteLinkID)
             }
             if decision.uploadsBytes, !replacement.isEmpty, !provesLive,
@@ -450,6 +495,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 }
             }
             try Task.checkCancellation()
+            if let restoring {
+                guard restoring.isCurrent(), restoredChecks[restoring.context.source]?.context == restoring.context
+                else {
+                    throw CancellationError()
+                }
+            }
+            try restoredCheck(for: descriptor)
             try noteRestored(decision, in: replacement, of: descriptor.source)
             if decision != .awaitDeletionCheck {
                 try replacementJournal?.clearDeletionCheck(for: descriptor.source)
@@ -686,6 +738,39 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         requiresActiveMain: Bool = false,
         relatedReads: inout RelatedProofReads
     ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
+        if !relatedReads.restoredMemberChecked {
+            relatedReads.restoredMemberChecked = true
+            if let check = try restoredCheck(for: descriptor), let destination = descriptor.mainRemoteLinkID,
+                let cached = store.record(for: descriptor.source), cached.isValid(for: descriptor),
+                cached.outcome == UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue,
+                let member = cached.remoteLinkID
+            {
+                let confirmed = check.context.confirmedRemote.nodeID
+                let visibility = try await checker.linkVisibility(
+                    of: Array(Set([confirmed, destination, member])).sorted())
+                try Task.checkCancellation()
+                guard check.isCurrent(), restoredChecks[check.context.source]?.context == check.context else {
+                    throw CancellationError()
+                }
+                if let oldMain = visibility[confirmed], oldMain.hasExplicitPhotoState, oldMain.isActiveMain,
+                    let newMain = visibility[destination], newMain.hasExplicitPhotoState, newMain.isActiveMain,
+                    let file = visibility[member], file.hasExplicitPhotoState, file.isActive,
+                    file.mainPhotoLinkID == confirmed || file.mainPhotoLinkID == destination
+                {
+                    relatedReads.restoredMemberLinkID = member
+                    relatedReads.restoredMemberIsUnderDestination = file.mainPhotoLinkID == destination
+                }
+            }
+        }
+        // Only the exact retained member with fresh positive proof can replace its earlier trash row.
+        let remoteItems = remoteItems.map { item in
+            guard item.linkID == relatedReads.restoredMemberLinkID, item.linkID != nil,
+                item.contentHash == contentHash, item.linkState == .trashed
+            else { return item }
+            return RemotePhotoDuplicate(
+                nameHash: item.nameHash, contentHash: item.contentHash, linkState: .active,
+                linkID: item.linkID, clientUID: item.clientUID)
+        }
         if descriptor.source.resource.isBurstMember {
             return (
                 try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor), false
@@ -979,6 +1064,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         var relatedByMain: [String: Set<String>] = [:]
         var visibility: [String: RemoteLinkVisibility] = [:]
         var askedLinks: Set<String> = []
+        var restoredMemberChecked = false
+        var restoredMemberLinkID: String?
+        var restoredMemberIsUnderDestination = false
     }
 
     /// Applies the burst-member rule. The server names the related photos of the member's main photo only when

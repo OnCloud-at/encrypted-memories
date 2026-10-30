@@ -562,6 +562,45 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return changed > 0
     }
 
+    public var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? {
+        { [self] observed, date in reopenRestoredCompound(observed, at: date) }
+    }
+
+    /// Reopens exactly the terminal row that the restore recheck saw. A receipt or a newer revision owns its work.
+    public func reopenRestoredCompound(_ observed: UploadBackupSyncQueueEntry, at date: Date) -> Bool? {
+        let changed: Int? = connection.withLock {
+            guard observed.state.isTerminalSuccess, observed.remoteCommitReconciliation == nil else { return 0 }
+            var stmt: OpaquePointer?
+            guard
+                connection.requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        UPDATE backup_sync_queue SET state='discovered', attempts=0, last_error=NULL, updated_at=?
+                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=? AND state=?
+                          AND updated_at=? AND last_error IS ? AND remote_commit_reconciliation IS NULL
+                          AND NOT EXISTS (SELECT 1 FROM backup_sync_queue q
+                            WHERE q.source_kind=backup_sync_queue.source_kind AND q.source_id=backup_sync_queue.source_id
+                              AND q.revision_us>backup_sync_queue.revision_us);
+                        """, -1, &stmt, nil) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
+            bindText(stmt, 2, observed.source.kind.rawValue)
+            bindText(stmt, 3, observed.source.identifier)
+            bindText(stmt, 4, observed.source.resource.rawValue)
+            sqlite3_bind_int64(stmt, 5, observed.revision.rawValue)
+            bindText(stmt, 6, observed.state.rawValue)
+            sqlite3_bind_double(stmt, 7, observed.updatedAt.timeIntervalSince1970)
+            bindNullableText(stmt, 8, observed.lastError)
+            guard connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+            return Int(sqlite3_changes(db))
+        }
+        guard let changed else { return nil }
+        if changed > 0 { notify(UploadBackupSyncQueueChange(sources: [observed.source], enqueued: true)) }
+        return changed > 0
+    }
+
     public func entries(
         in state: UploadBackupSyncQueueState,
         updatedBefore: Date,

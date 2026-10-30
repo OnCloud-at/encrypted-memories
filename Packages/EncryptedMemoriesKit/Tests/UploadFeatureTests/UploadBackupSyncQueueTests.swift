@@ -61,6 +61,8 @@ final class UploadBackupSyncQueueTests: XCTestCase {
     private final class MemoryBackupStore: UploadBackupStateStore, @unchecked Sendable {
         private let lock = NSLock()
         private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
+        private var writes = 0
+        var upsertCount: Int { lock.withLock { writes } }
 
         func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
             lock.withLock { rows[source]?[revision] }
@@ -71,7 +73,10 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         }
 
         func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { rows[record.source, default: [:]][record.revision] = record }
+            lock.withLock {
+                writes += 1
+                rows[record.source, default: [:]][record.revision] = record
+            }
             return true
         }
 
@@ -1860,5 +1865,250 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         } catch is CancellationError {
             XCTAssertEqual(queue.count(), 0)
         }
+    }
+}
+
+extension UploadBackupSyncQueueTests {
+    func testUnsupportedRestoreCASRefusesBeforeAnyPreflightOrQueueWrite() async throws {
+        let inner = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("unsupported-restore.sqlite")))
+        defer { inner.close() }
+        let photo = candidate(id: "restored", revision: 42)
+        let row = UploadBackupSyncQueueEntry(
+            source: photo.snapshot.source, revision: photo.snapshot.revision,
+            originalFilename: photo.originalFilename, state: .completed, attempts: 3,
+            lastError: "kept", updatedAt: Date(timeIntervalSince1970: 1_000))
+        XCTAssertTrue(inner.upsert(row))
+        let log = BackupEventLog()
+        let queue: any UploadBackupSyncQueueStore = SpyQueueStore(inner: inner, log: log)
+        let state = MemoryBackupStore()
+        let engine = UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue)
+
+        XCTAssertNil(queue.restoredCompoundReopener, "A store must explicitly supply the atomic capability")
+        do {
+            _ = try await engine.reopenRestoredCompound(photo, isCurrent: { true })
+            XCTFail("An unsupported terminal recheck must fail, rather than return a temporary wait")
+        } catch let error as UploadError {
+            guard case .backend(let message) = error else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertEqual(message, L10n.string("backup.error_local_state_unavailable"))
+        }
+        XCTAssertEqual(state.upsertCount, 0, "Refusal must precede markPending")
+        XCTAssertEqual(state.count(), 0)
+        XCTAssertEqual(inner.entry(for: row.source, revision: row.revision), row)
+        XCTAssertTrue(log.events.isEmpty, "Refusal must not call any queue writer")
+        XCTAssertTrue(inner.isOperational(), "Unsupported is not a SQLite failure")
+    }
+
+    func testDefaultRestoreCapabilityKeepsMissingAndNonterminalAdmission() async throws {
+        let existingStates: [UploadBackupSyncQueueState?] = [nil, .discovered]
+        for existingState in existingStates {
+            let inner = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")))
+            defer { inner.close() }
+            let photo = candidate(id: "restored", revision: 42)
+            let row = existingState.map {
+                UploadBackupSyncQueueEntry(
+                    source: photo.snapshot.source, revision: photo.snapshot.revision,
+                    originalFilename: photo.originalFilename, state: $0, updatedAt: Date(timeIntervalSince1970: 1_000))
+            }
+            if let row { XCTAssertTrue(inner.upsert(row)) }
+            let log = BackupEventLog()
+            let queue: any UploadBackupSyncQueueStore = SpyQueueStore(inner: inner, log: log)
+            let state = MemoryBackupStore()
+            let engine = UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue)
+
+            let admitted = try await engine.reopenRestoredCompound(photo, isCurrent: { true })
+
+            XCTAssertTrue(admitted, "Only the terminal branch needs the atomic capability")
+            XCTAssertEqual(state.upsertCount, 1)
+            XCTAssertEqual(
+                state.record(for: photo.snapshot.source, revision: photo.snapshot.revision)?.pendingResourceCount, 1)
+            XCTAssertEqual(inner.entry(for: photo.snapshot.source, revision: photo.snapshot.revision), row)
+            XCTAssertTrue(log.events.isEmpty)
+        }
+    }
+
+    func testManifestRestoreCapabilityDispatchesThroughTheQueueContract() async throws {
+        let inner = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("supported-restore.sqlite")))
+        defer { inner.close() }
+        let photo = candidate(id: "restored", revision: 42)
+        let row = UploadBackupSyncQueueEntry(
+            source: photo.snapshot.source, revision: photo.snapshot.revision,
+            originalFilename: photo.originalFilename, state: .completed, attempts: 3,
+            lastError: "kept", updatedAt: Date(timeIntervalSince1970: 1_000))
+        XCTAssertTrue(inner.upsert(row))
+        let queue: any UploadBackupSyncQueueStore = inner
+        let state = MemoryBackupStore()
+        let engine = UploadBackupSyncEngine(
+            preflight: UploadBackupPreflightIndex(store: state), queue: queue,
+            now: { Date(timeIntervalSince1970: 2_000) })
+
+        XCTAssertNotNil(queue.restoredCompoundReopener)
+        let admitted = try await engine.reopenRestoredCompound(photo, isCurrent: { true })
+
+        XCTAssertTrue(admitted)
+        XCTAssertEqual(state.upsertCount, 1)
+        let reopened = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(reopened.state, .discovered)
+        XCTAssertEqual(reopened.attempts, 0)
+        XCTAssertNil(reopened.lastError)
+        XCTAssertNil(reopened.remoteCommitReconciliation)
+        XCTAssertEqual(reopened.updatedAt, Date(timeIntervalSince1970: 2_000))
+    }
+}
+
+extension UploadBackupSyncQueueTests {
+    func testRestoredCompoundCASRefusesEveryChangedObservedField() throws {
+        for mutation in ["state='uploading'", "updated_at=1001", "last_error='changed'"] {
+            let url = tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")
+            let q = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+            defer { q.close() }
+            let observed = UploadBackupSyncQueueEntry(
+                source: source("restore-CAS"), revision: revision(42),
+                originalFilename: "photo.heic", state: .completed, attempts: 3, lastError: "kept",
+                updatedAt: Date(timeIntervalSince1970: 1000))
+            XCTAssertTrue(q.upsert(observed))
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+            let handle = try XCTUnwrap(db)
+            defer { sqlite3_close(handle) }
+            XCTAssertEqual(sqlite3_exec(handle, "UPDATE backup_sync_queue SET \(mutation);", nil, nil, nil), SQLITE_OK)
+            let before = try XCTUnwrap(q.entry(for: observed.source, revision: observed.revision))
+            XCTAssertEqual(q.reopenRestoredCompound(observed, at: Date(timeIntervalSince1970: 2000)), false, mutation)
+            XCTAssertEqual(q.entry(for: observed.source, revision: observed.revision), before)
+            XCTAssertTrue(q.isOperational())
+        }
+    }
+
+    func testRestoredCompoundCASPreservesAReceiptAddedAfterObservation() throws {
+        let q = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("receipt-CAS.sqlite")))
+        defer { q.close() }
+        let observed = UploadBackupSyncQueueEntry(
+            source: source("restore-CAS"), revision: revision(42),
+            originalFilename: "photo.heic", state: .completed, updatedAt: Date(timeIntervalSince1970: 1000))
+        XCTAssertTrue(q.upsert(observed))
+        let evidence = UploadRemoteCommitReconciliation(
+            source: observed.source,
+            identity: UploadIdentity(
+                correctedName: "photo.heic", nameHash: "nh", sha1Hex: String(repeating: "ab", count: 20),
+                sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "ch"),
+            receipt: .init(remoteVolumeID: "vol", remoteLinkID: "committed"))
+        XCTAssertTrue(
+            q.markNeedsRemoteReconciliation(
+                source: observed.source, revision: observed.revision,
+                reconciliation: evidence, lastError: nil, updatedAt: observed.updatedAt))
+        // Match the observed state/date/reason again, so the receipt fence alone distinguishes this row.
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(tempDir.appendingPathComponent("receipt-CAS.sqlite").path, &db), SQLITE_OK)
+        let handle = try XCTUnwrap(db)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE backup_sync_queue SET state='completed', last_error=NULL;", nil, nil, nil),
+            SQLITE_OK)
+        let before = try XCTUnwrap(q.entry(for: observed.source, revision: observed.revision))
+        XCTAssertEqual(before.remoteCommitReconciliation, evidence, "The setup must retain the committed receipt")
+        XCTAssertEqual(q.reopenRestoredCompound(observed, at: Date(timeIntervalSince1970: 2000)), false)
+        XCTAssertEqual(q.entry(for: observed.source, revision: observed.revision), before)
+    }
+
+    func testRestoredCompoundCASPreservesANewerRevision() throws {
+        let q = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("revision-CAS.sqlite")))
+        defer { q.close() }
+        let old = UploadBackupSyncQueueEntry(
+            source: source("restore-CAS"), revision: revision(42),
+            originalFilename: "photo.heic", state: .completed, updatedAt: Date(timeIntervalSince1970: 1000))
+        var newer = old
+        newer.revision = revision(43)
+        newer.state = .discovered
+        XCTAssertTrue(q.upsert(old))
+        XCTAssertTrue(q.upsert(newer))
+        XCTAssertEqual(q.reopenRestoredCompound(old, at: Date(timeIntervalSince1970: 2000)), false)
+        XCTAssertEqual(q.entry(for: old.source, revision: old.revision), old)
+        XCTAssertEqual(q.entry(for: newer.source, revision: newer.revision), newer)
+    }
+}
+
+extension UploadBackupSyncQueueTests {
+    func testRestoredCompoundCASChangesOnlyItsExactSourceKindIdentifierAndResource() throws {
+        let q = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("neighbors-CAS.sqlite")))
+        defer { q.close() }
+        let observed = UploadBackupSyncQueueEntry(
+            source: source("restore-CAS"), revision: revision(42),
+            originalFilename: "photo.heic", state: .completed, updatedAt: Date(timeIntervalSince1970: 1000))
+        var otherKind = observed
+        otherKind.source = .init(kind: .fileURL, identifier: observed.source.identifier)
+        var otherID = observed
+        otherID.source = source("other")
+        var otherResource = observed
+        otherResource.source = source("restore-CAS", resource: .livePairedVideo)
+        for row in [observed, otherKind, otherID, otherResource] { XCTAssertTrue(q.upsert(row)) }
+        XCTAssertEqual(q.reopenRestoredCompound(observed, at: Date(timeIntervalSince1970: 2000)), true)
+        for row in [otherKind, otherID, otherResource] {
+            XCTAssertEqual(
+                q.entry(for: row.source, revision: row.revision), row,
+                "The CAS cannot reopen another kind, identifier or resource")
+        }
+    }
+}
+
+extension UploadBackupSyncQueueTests {
+    func testRestoredCompoundCASRejectsObservedActiveStateAndAnEarlierOwnedReceipt() throws {
+        for receiptCase in [false, true] {
+            let url = tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")
+            let q = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+            defer { q.close() }
+            var observed = UploadBackupSyncQueueEntry(
+                source: source("restore-observed"), revision: revision(42),
+                originalFilename: "photo.heic", state: receiptCase ? .completed : .uploading,
+                updatedAt: Date(timeIntervalSince1970: 1000))
+            if receiptCase {
+                observed.remoteCommitReconciliation = .init(
+                    source: observed.source,
+                    identity: .init(
+                        correctedName: "photo.heic", nameHash: "nh", sha1Hex: String(repeating: "ab", count: 20),
+                        sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "ch"),
+                    receipt: .init(remoteVolumeID: "vol", remoteLinkID: "committed"))
+            }
+            XCTAssertTrue(q.upsert(observed))
+            if receiptCase {
+                var db: OpaquePointer?
+                XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+                let handle = try XCTUnwrap(db)
+                defer { sqlite3_close(handle) }
+                XCTAssertEqual(
+                    sqlite3_exec(
+                        handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=NULL;", nil, nil, nil),
+                    SQLITE_OK)
+            }
+            let current = try XCTUnwrap(q.entry(for: observed.source, revision: observed.revision))
+            XCTAssertEqual(
+                q.reopenRestoredCompound(observed, at: Date(timeIntervalSince1970: 2000)), false,
+                "Only the exact receipt-free terminal observation grants this CAS")
+            XCTAssertEqual(q.entry(for: current.source, revision: current.revision), current)
+        }
+    }
+}
+
+extension UploadBackupSyncQueueTests {
+    func testRestoredCompoundCASCannotBorrowANewerReplacementWhenTheObservedRowDisappeared() throws {
+        let q = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("replacement-CAS.sqlite")))
+        defer { q.close() }
+        let observed = UploadBackupSyncQueueEntry(
+            source: source("restore-replaced"), revision: revision(42),
+            originalFilename: "photo.heic", state: .completed, updatedAt: Date(timeIntervalSince1970: 1000))
+        var newer = observed
+        newer.revision = revision(43)
+        XCTAssertTrue(q.upsert(observed))
+        XCTAssertTrue(q.remove(source: observed.source, revision: observed.revision))
+        XCTAssertTrue(q.upsert(newer))
+        XCTAssertEqual(q.reopenRestoredCompound(observed, at: Date(timeIntervalSince1970: 2000)), false)
+        XCTAssertEqual(
+            q.entry(for: newer.source, revision: newer.revision), newer,
+            "The latest terminal row cannot lend its identity to an older observation")
     }
 }

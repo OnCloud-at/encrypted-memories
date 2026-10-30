@@ -493,7 +493,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             let committed = transaction {
                 for key in keys {
                     guard case .readable(let current) = sourceStateLocked(key) else { return false }
-                    guard let previous = current, previous.desired == .excluded else { continue }
+                    guard let previous = current, previous.desired == .excluded else {
+                        if !confirmedLinkIDs.isEmpty { return false }
+                        continue
+                    }
                     let restoredInProton = previous.remote.map { confirmedLinkIDs.contains($0.nodeID) } == true
                     guard
                         execute(
@@ -734,6 +737,54 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     // MARK: - Deferred actions
+
+    /// A recheck can retire only the included decision and photo that it actually checked.
+    /// Waiting preserves both the provenance and the obligation, without consuming an effect attempt.
+    @discardableResult
+    public func finishRestoreRecheck(
+        _ checked: PendingSourceState, outcome: PendingBackupReturnOutcome, at date: Date
+    ) -> Bool {
+        connection.withLock {
+            transaction {
+                guard case .readable(let current) = sourceStateLocked(checked.key) else { return false }
+                guard let current, current.desired == .included, current.needsQueueSync,
+                    current.generation == checked.generation, current.remote == checked.remote
+                else { return true }
+                let assignment: String
+                let next: Date
+                switch outcome {
+                case .completed:
+                    assignment = "needs_queue_sync=0, remote_op=NULL, attempts=0"
+                    next = date
+                case .remoteTrashed:
+                    assignment = "remote_trashed=1, needs_remote_restore=1"
+                    next = date
+                case .waiting(let until):
+                    assignment = "needs_queue_sync=1"
+                    next = max(date.addingTimeInterval(1), until)
+                case .unreadable:
+                    assignment = "needs_queue_sync=1"
+                    next = date.addingTimeInterval(60)
+                }
+                guard
+                    execute(
+                        "UPDATE source_state SET \(assignment), next_attempt_at=?, updated_at=? WHERE source_kind=? AND source_id=?;",
+                        bind: { stmt in
+                            sqlite3_bind_double(stmt, 1, next.timeIntervalSince1970)
+                            sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
+                            bindKey(stmt, checked.key, from: 3)
+                        })
+                else { return false }
+                guard outcome == .completed else { return true }
+                return execute(
+                    """
+                    DELETE FROM source_state WHERE source_kind=? AND source_id=? AND desired='included'
+                      AND needs_queue_sync=0 AND needs_remote_trash=0 AND needs_remote_restore=0 AND remote_op IS NULL;
+                    """
+                ) { bindKey($0, checked.key) }
+            }
+        }
+    }
 
     /// Stores the desired favorite state of a pending source. A later toggle replaces it.
     @discardableResult

@@ -281,6 +281,8 @@ public final class PhotoLibraryBackupController {
     private var lastProjectedProgress = BackupSyncProgress()
     private var executionOpportunityIssue: BackupExecutionOpportunityIssue?
     private let identityResolver: (any UploadIdentityResolving)?
+    private var restoredRechecks: [PendingSourceKey: UploadRestoredCompoundContext] = [:]
+    private var admittedRestoreRechecks = Set<PendingSourceKey>()
 
     #if DEBUG
         private var runnerStopOperationForTesting: (@Sendable () async -> Void)?
@@ -458,6 +460,13 @@ public final class PhotoLibraryBackupController {
     /// Removes excluded photos from queued and in-flight work, like a deletion in Apple Photos.
     public func removeFromBackup(identifiers: [String]) async -> Bool {
         guard let runner, queueStore?.isOperational() == true else { return false }
+        for identifier in identifiers {
+            let key = PendingSourceKey(kind: .photoLibraryAsset, identifier: identifier)
+            if let context = restoredRechecks.removeValue(forKey: key) {
+                await identityResolver?.endRestoredCompound(context)
+            }
+            admittedRestoreRechecks.remove(key)
+        }
         _ = await runner.removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
         return queueStore?.isOperational() == true
     }
@@ -493,6 +502,100 @@ public final class PhotoLibraryBackupController {
         refreshFromQueue()
         if isEnabled, !isUserPaused, !candidates.isEmpty { syncNow() }
         return true
+    }
+
+    /// Reconstructs a restore recheck from the pending store. Enqueue success alone never acknowledges it.
+    public func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
+        var outcomes: [PendingSourceKey: PendingBackupReturnOutcome] = [:]
+        for state in states {
+            outcomes[state.key] = .unreadable
+            guard !isShuttingDown, let engine, let identityResolver, let pendingStore, let catalogStore,
+                let queueStore, pendingStore.isOperational(), catalogStore.isOperational(), queueStore.isOperational(),
+                state.key.kind == .photoLibraryAsset, let remote = state.remote
+            else { continue }
+            guard !isSyncing, !isRetiringInstantWork else {
+                outcomes[state.key] = .waiting(until: Date().addingTimeInterval(30))
+                continue
+            }
+            guard let entry = catalogStore.presentEntries(for: [state.key.identifier])[state.key.identifier],
+                let candidate = PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)),
+                catalogStore.isOperational()
+            else { continue }
+            let context = UploadRestoredCompoundContext(
+                source: candidate.snapshot.source, revision: candidate.snapshot.revision,
+                generation: state.generation, confirmedRemote: remote)
+            let isCurrent: @Sendable () -> Bool = {
+                guard pendingStore.isOperational(), catalogStore.isOperational(),
+                    case .readable(let current?) = pendingStore.sourceStateRead(for: state.key),
+                    current.desired == .included, current.needsQueueSync,
+                    current.generation == state.generation, current.remote == remote,
+                    let latest = catalogStore.presentEntries(for: [state.key.identifier])[state.key.identifier],
+                    let latestCandidate = PhotoBackupAssetPlanner.candidate(
+                        for: PhotoLibraryCatalogMapper.info(for: latest))
+                else { return false }
+                return latestCandidate.snapshot.revision == context.revision
+            }
+            guard isCurrent() else { continue }
+            do {
+                try await identityResolver.prepareRestoredCompound(context, isCurrent: isCurrent)
+                if restoredRechecks[state.key] != context { admittedRestoreRechecks.remove(state.key) }
+                restoredRechecks[state.key] = context
+                guard !isShuttingDown, isCurrent() else { continue }
+                let remoteOutcome = try await identityResolver.restoredPhotoOutcome(context)
+                guard !isShuttingDown, isCurrent() else { continue }
+                guard remoteOutcome == .completed else {
+                    outcomes[state.key] = remoteOutcome
+                    continue
+                }
+                let row = queueStore.entry(for: context.source, revision: context.revision)
+                guard queueStore.isOperational() else { continue }
+                if admittedRestoreRechecks.contains(state.key), let row, row.state.isTerminalSuccess,
+                    row.remoteCommitReconciliation == nil
+                {
+                    outcomes[state.key] = .completed
+                    restoredRechecks.removeValue(forKey: state.key)
+                    admittedRestoreRechecks.remove(state.key)
+                    await identityResolver.endRestoredCompound(context)
+                    continue
+                }
+                guard !isSyncing, !isRetiringInstantWork else {
+                    outcomes[state.key] = .waiting(until: Date().addingTimeInterval(30))
+                    continue
+                }
+                if let deferral = await Self.restoredCompoundDeferral(
+                    engine: engine, candidate: candidate, isCurrent: isCurrent)
+                {
+                    outcomes[state.key] = deferral
+                    continue
+                }
+                guard !isShuttingDown, isCurrent() else { continue }
+                _ = try await engine.enqueueBatch([candidate])
+                guard !isShuttingDown, isCurrent() else { continue }
+                restoredRechecks[state.key] = context
+                admittedRestoreRechecks.insert(state.key)
+                outcomes[state.key] = .waiting(until: Date().addingTimeInterval(30))
+                refreshFromQueue()
+                if isEnabled, !isUserPaused { syncNow() }
+            } catch {
+                outcomes[state.key] = .unreadable
+            }
+        }
+        return outcomes
+    }
+
+    /// Nil admits the recheck. A failure remains distinct from temporarily owned work.
+    internal static func restoredCompoundDeferral(
+        engine: UploadBackupSyncEngine, candidate: UploadBackupAssetCandidate,
+        isCurrent: @Sendable () -> Bool
+    ) async -> PendingBackupReturnOutcome? {
+        do {
+            guard try await engine.reopenRestoredCompound(candidate, isCurrent: isCurrent) else {
+                return .waiting(until: Date().addingTimeInterval(30))
+            }
+            return nil
+        } catch {
+            return .unreadable
+        }
     }
 
     // MARK: - Enable / disable (explicit consent only)
@@ -1649,6 +1752,9 @@ public final class PhotoLibraryBackupController {
         await activeStatusSetup?.value
         await activeEnqueue?.value
         await joinInstantWorkTasksForShutdown()
+        for context in restoredRechecks.values { await identityResolver?.endRestoredCompound(context) }
+        restoredRechecks.removeAll()
+        admittedRestoreRechecks.removeAll()
         await runner?.setOnProgress(nil)
         await statusProjector?.stop()
         idleTimerHook?(false)

@@ -1908,7 +1908,7 @@ public actor BackupSyncRunner {
             if stopRequested { return .cancelled }
             do {
                 let outcome: SecondaryScopedOutcome = try await identityResolver.withUploadDecision(
-                    secondary.descriptor.withWorkIntent(workIntent).relatedTo(
+                    secondary.descriptor.withWorkIntent(workIntent).withBackupRevision(uploadedRevision).relatedTo(
                         mainRemoteLinkID: primaryUID.nodeID, requiresRelatedMatch: requiresRelatedMatch),
                     onRemoteCommit: { [queue, now] identity, receipt in
                         let reconciliation = UploadRemoteCommitReconciliation(

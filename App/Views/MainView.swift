@@ -1784,6 +1784,7 @@ struct MainView: View {
         let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
         isTrashMutating = true
+        let restoredPendingGrid = model.pendingGrid
         // The account configuration this restore belongs to; a later sign-in rejects its location clean-up.
         let locationOwner = OfflineLibraryManager.shared.captureLocationOwner()
         Task {
@@ -1803,7 +1804,7 @@ struct MainView: View {
             }
             do {
                 try await backend.restore(uids)
-                model.pendingGrid?.photosRestored(uids)
+                let pendingRestore = await restoredPendingGrid?.restoreSources(ofRemote: uids)
                 await timelineModel.commitRestore(items)
                 await OfflineLibraryManager.shared.reconcileLocations(
                     items: timelineModel.wholeLibraryItemsForLocations,
@@ -1812,6 +1813,9 @@ struct MainView: View {
                     recrawlRestoredItems: true
                 )
                 await reloadFavorites()
+                if pendingRestore?.isReadable == false {
+                    trashActionFailureMessage = String(localized: "alert.restore_failed_message")
+                }
                 selectionMode = false
                 selectedUIDs = []
                 if closeViewer { closePhoto() }

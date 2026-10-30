@@ -5026,6 +5026,24 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertFalse(harness.journal.entry(for: edited.source).lastUploadWasEdit)
     }
 
+    func testCompoundSecondariesReceiveTheCurrentQueueRevision() async throws {
+        let entry = seedEntry("restore-revision.heic")
+        resolver.setSecondaries(["restore-revision.mov"], for: entry.source.identifier)
+        let pipeline = UploadDedupePipeline(store: identityStore, hasher: hasher, checker: checker)
+        let observed = RestoreRevisionRecordingResolver(inner: pipeline)
+
+        _ = await makeRunner(identityResolver: observed).runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["restore-revision.heic", "restore-revision.mov"])
+        let descriptors = observed.descriptors
+        XCTAssertEqual(descriptors.count, 2, "the real pipeline must resolve both compound resources")
+        XCTAssertEqual(
+            descriptors.map(\.backupRevision), [entry.revision, entry.revision],
+            "a restored secondary must use the same exact queue revision as its primary")
+        XCTAssertEqual(uploader.requests.last?.mainPhotoUID, testUID("restore-revision.heic"))
+    }
+
     func testSeriesUploadsMembersAsRelatedPhotosWithTheBurstsTag() async throws {
         let entry = seedEntry("IMG_0001.HEIC")
         resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
@@ -6422,5 +6440,33 @@ extension BackupSyncRunnerTests {
         XCTAssertTrue(progress.isWaitingForWiFi)
         XCTAssertEqual(progress.failed, 0)
         try await runner.checkCancellation()
+    }
+}
+
+/// Observes the real pipeline's descriptors without replacing any duplicate decision or upload settlement.
+private final class RestoreRevisionRecordingResolver: UploadIdentityResolving, @unchecked Sendable {
+    let inner: UploadDedupePipeline
+    private let lock = NSLock()
+    private var recorded: [UploadResourceDescriptor] = []
+    var descriptors: [UploadResourceDescriptor] { lock.withLock { recorded } }
+
+    init(inner: UploadDedupePipeline) { self.inner = inner }
+
+    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+        lock.withLock { recorded.append(descriptor) }
+        return try await inner.resolve(descriptor)
+    }
+
+    func prime(_ descriptors: [UploadResourceDescriptor]) async { await inner.prime(descriptors) }
+    func recordUploaded(
+        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity,
+        remoteVolumeID: String, remoteLinkID: String
+    ) async throws {
+        try await inner.recordUploaded(
+            descriptor, identity: identity, remoteVolumeID: remoteVolumeID, remoteLinkID: remoteLinkID)
+    }
+    func uploadDidFail(_ descriptor: UploadResourceDescriptor) async { await inner.uploadDidFail(descriptor) }
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? {
+        await inner.identityRecord(for: source)
     }
 }
