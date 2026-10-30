@@ -381,7 +381,6 @@
             color.redComponent < Self.inkLimit
                 || color.greenComponent < Self.inkLimit || color.blueComponent < Self.inkLimit
         }
-
     }
 
     /// Which pixels of a row draw content.
