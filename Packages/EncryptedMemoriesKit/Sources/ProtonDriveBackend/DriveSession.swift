@@ -99,60 +99,37 @@ final class DriveSession: @unchecked Sendable {
         retryOn401: Bool = true,
         retryOn429: Bool
     ) async throws -> Data {
-        var req = URLRequest(url: makeURL(path))
-        req.httpMethod = method
-        let auth = authorization()
-        for (k, v) in auth.headers { req.setValue(v, forHTTPHeaderField: k) }
-        if let body {
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        func makeRequest() throws -> BufferedHTTPExecutor.Request {
+            var request = URLRequest(url: makeURL(path))
+            request.httpMethod = method
+            let auth = authorization()
+            for (key, value) in auth.headers { request.setValue(value, forHTTPHeaderField: key) }
+            if let body {
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            }
+            return .init(request: request, credentialGeneration: auth.generation)
         }
 
-        let permit = try await requestGovernor.acquire(scope: .api, label: .api(method: method, path: path))
-        let data: Data
-        let response: URLResponse
+        let result: BufferedHTTPExecutor.Response
         do {
-            (data, response) = try await urlSession.data(for: req)
-        } catch {
-            await requestGovernor.finish(
-                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
-            throw error
-        }
-        guard let http = response as? HTTPURLResponse else {
-            await requestGovernor.finish(permit, statusCode: nil)
+            result = try await BufferedHTTPExecutor.perform(
+                try makeRequest(), urlSession: urlSession, governor: requestGovernor,
+                label: .api(method: method, path: path),
+                retryOn401: retryOn401, retryOn429: retryOn429,
+                retryAfterRateLimit: { _ in try makeRequest() },
+                refreshAfterUnauthorized: { attempt in
+                    guard await self.refreshToken(after: attempt.credentialGeneration) else { return nil }
+                    return try makeRequest()
+                })
+        } catch BufferedHTTPExecutor.Failure.invalidResponse {
             throw ProtonAuthError.invalidResponse
         }
-        await requestGovernor.finish(
-            permit,
-            statusCode: http.statusCode,
-            retryAfter: ProtonRetryAfter.seconds(from: http)
-        )
-
-        if http.statusCode == 429, retryOn429 {
-            return try await authedData(
-                path: path,
-                method: method,
-                body: body,
-                retryOn401: retryOn401,
-                retryOn429: false
-            )
+        guard (200...299).contains(result.response.statusCode) else {
+            throw ProtonAuthError.apiError(
+                code: result.response.statusCode, message: "HTTP \(result.response.statusCode) for \(path)")
         }
-
-        if http.statusCode == 401, retryOn401 {
-            if await refreshToken(after: auth.generation) {
-                return try await authedData(
-                    path: path,
-                    method: method,
-                    body: body,
-                    retryOn401: false,
-                    retryOn429: retryOn429
-                )
-            }
-        }
-        guard (200...299).contains(http.statusCode) else {
-            throw ProtonAuthError.apiError(code: http.statusCode, message: "HTTP \(http.statusCode) for \(path)")
-        }
-        return data
+        return result.data
     }
 
     // MARK: - Token refresh
