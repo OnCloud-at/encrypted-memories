@@ -188,7 +188,9 @@
             XCTAssertNotNil(try renderer.snapshot().magentaColumns(), "the picture stays visible during the load")
             held.finish()
             try await renderer.settle()
-            XCTAssertNotNil(try renderer.snapshot().magentaColumns(), "the new picture remains visible")
+            let replacement = try renderer.snapshot()
+            XCTAssertNil(replacement.magentaColumns(), "the old picture is replaced")
+            XCTAssertNotNil(replacement.cyanColumns(), "the new picture is visible")
         }
 
         // MARK: - Building
@@ -217,6 +219,14 @@
 
         /// The one preview square the row loads, in a color no other row content uses.
         nonisolated fileprivate static func magentaBitmap() -> CGImage? {
+            bitmap(red: 1, green: 0, blue: 1)
+        }
+
+        nonisolated fileprivate static func cyanBitmap() -> CGImage? {
+            bitmap(red: 0, green: 1, blue: 1)
+        }
+
+        nonisolated private static func bitmap(red: CGFloat, green: CGFloat, blue: CGFloat) -> CGImage? {
             let side = 8
             guard
                 let context = CGContext(
@@ -224,7 +234,7 @@
                     space: CGColorSpaceCreateDeviceRGB(),
                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
             else { return nil }
-            context.setFillColor(red: 1, green: 0, blue: 1, alpha: 1)
+            context.setFillColor(red: red, green: green, blue: blue, alpha: 1)
             context.fill(CGRect(x: 0, y: 0, width: side, height: side))
             return context.makeImage()
         }
@@ -253,7 +263,7 @@
         }
 
         func finish() {
-            continuation?.resume(returning: BackupProblemRowTests.magentaBitmap())
+            continuation?.resume(returning: BackupProblemRowTests.cyanBitmap())
             continuation = nil
         }
     }
@@ -354,7 +364,15 @@
 
         /// The columns of the loaded preview square.
         func magentaColumns() -> Range<Int>? {
-            let present = (0..<height).flatMap { y in (0..<width).filter { x in isPreview(colors[y][x]) } }
+            columns { $0.redComponent > 0.78 && $0.greenComponent < 0.24 && $0.blueComponent > 0.78 }
+        }
+
+        func cyanColumns() -> Range<Int>? {
+            columns { $0.redComponent < 0.24 && $0.greenComponent > 0.78 && $0.blueComponent > 0.78 }
+        }
+
+        private func columns(matching predicate: (NSColor) -> Bool) -> Range<Int>? {
+            let present = (0..<height).flatMap { y in (0..<width).filter { x in predicate(colors[y][x]) } }
             guard let first = present.min(), let last = present.max() else { return nil }
             return first..<(last + 1)
         }
@@ -364,9 +382,6 @@
                 || color.greenComponent < Self.inkLimit || color.blueComponent < Self.inkLimit
         }
 
-        private func isPreview(_ color: NSColor) -> Bool {
-            color.redComponent > 0.78 && color.greenComponent < 0.24 && color.blueComponent > 0.78
-        }
     }
 
     /// Which pixels of a row draw content.
