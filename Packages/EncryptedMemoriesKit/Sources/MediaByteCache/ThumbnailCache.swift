@@ -41,6 +41,118 @@ public enum ThumbnailCacheStoreResult: Sendable, Equatable {
 /// the corrupt blob is deleted, while a missing key (locked cache) is a plain miss that keeps the blob - never
 /// a crash.
 public actor ThumbnailCache {
+    public nonisolated func thumbnailCacheSupportSnapshot(
+        deadline: ContinuousClock.Instant
+    ) async -> ThumbnailCacheSupportSnapshot {
+        await supportSnapshotForProbe(deadline: deadline, onEntry: {}, afterLease: {})
+    }
+
+    #if DEBUG
+        nonisolated func supportSnapshotForTesting(
+            deadline: ContinuousClock.Instant, onEntry: @Sendable () -> Void,
+            afterLease: @Sendable () -> Void = {},
+            iteratorProbe: @escaping @Sendable (ThumbnailSupportMetadataIterator.ProbeStep) -> Void = { _ in },
+            now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
+        ) async -> ThumbnailCacheSupportSnapshot {
+            await supportSnapshotForProbe(
+                deadline: deadline, onEntry: onEntry, afterLease: afterLease,
+                iteratorProbe: iteratorProbe, now: now)
+        }
+
+        package nonisolated func setSupportLockProbeForTesting(
+            _ probe: (@Sendable (SupportLockPath, UUID?) -> Void)?
+        ) {
+            writerGeneration.setSupportLockProbeForTesting(probe)
+        }
+    #endif
+
+    private nonisolated func supportSnapshotForProbe(
+        deadline: ContinuousClock.Instant, onEntry: @Sendable () -> Void, afterLease: @Sendable () -> Void,
+        iteratorProbe: @escaping @Sendable (ThumbnailSupportMetadataIterator.ProbeStep) -> Void = { _ in },
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
+    ) async -> ThumbnailCacheSupportSnapshot {
+        onEntry()
+        guard !Task.isCancelled, now() < deadline,
+            let lease = writerGeneration.tryCaptureDiagnosticLease()
+        else { return .unavailable }
+        afterLease()
+        let iterator = ThumbnailSupportMetadataIterator(directory: directory, probe: iteratorProbe) {
+            Task.isCancelled || now() >= deadline
+                || !self.writerGeneration.isCurrentDiagnosticLease(lease)
+        }
+        guard iterator.available else { return .unavailable }
+        let result = await thumbnailCacheSupportSnapshot(
+            deadline: deadline, nextBlobSize: { try iterator.next() },
+            shouldStop: { !self.writerGeneration.isCurrentDiagnosticLease(lease) })
+        return writerGeneration.isCurrentDiagnosticLease(lease) ? result : .unavailable
+    }
+
+    package nonisolated func thumbnailCacheSupportSnapshot(
+        deadline: ContinuousClock.Instant,
+        nextBlobSize: @Sendable () async throws -> Int64?,
+        shouldStop: @Sendable () -> Bool,
+        now: @Sendable () -> ContinuousClock.Instant = { .now }
+    ) async -> ThumbnailCacheSupportSnapshot {
+        let kind: ThumbnailCacheSupportSnapshot.Kind
+        switch storageKind {
+        case .thumbnail: kind = .thumbnail
+        case .preview: kind = .preview
+        case .original: kind = .original
+        case .video: return .unavailable
+        }
+        var buckets = Array(repeating: 0, count: 6)
+        var count = 0
+        var total: Int64 = 0
+        var readErrors = 0
+        var availability = ThumbnailCacheSupportSnapshot.Availability.complete
+        while true {
+            if Task.isCancelled || shouldStop() || now() >= deadline {
+                availability = .partial
+                break
+            }
+            do {
+                guard let size = try await nextBlobSize() else {
+                    if Task.isCancelled || shouldStop() || now() >= deadline { availability = .partial }
+                    break
+                }
+                guard size >= 0 else {
+                    readErrors += 1
+                    availability = .partial
+                    break
+                }
+                let index: Int
+                switch size {
+                case ..<16_384: index = 0
+                case ..<65_536: index = 1
+                case ..<262_144: index = 2
+                case ..<1_048_576: index = 3
+                case ..<4_194_304: index = 4
+                default: index = 5
+                }
+                count += 1
+                buckets[index] += 1
+                let (sum, overflow) = total.addingReportingOverflow(size)
+                total = overflow ? Int64.max : sum
+            } catch is CancellationError {
+                availability = .partial
+                break
+            } catch is ThumbnailSupportMetadataIterator.Stopped {
+                availability = .partial
+                break
+            } catch {
+                readErrors += 1
+                availability = .partial
+                break
+            }
+        }
+        let totalMiB = total / 1_048_576 + (total % 1_048_576 == 0 ? 0 : 1)
+        return ThumbnailCacheSupportSnapshot(
+            availability: availability,
+            caches: [
+                .init(kind: kind, blobCount: count, buckets: buckets, totalMiB: totalMiB, readErrors: readErrors)
+            ])
+    }
+
     private nonisolated(unsafe) let memory = NSCache<NSString, NSData>()  // NSCache is thread-safe
     /// Encrypted blob directory (`<namespace>.enc`).
     private nonisolated let directory: URL

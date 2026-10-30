@@ -64,6 +64,7 @@ public enum SupportDiagnosticsExporter {
         /// Nil without a signed-in session.
         let requests: RemoteRequestSupportSnapshot?
         let measurements: SupportWorkMeasurementSnapshot
+        let thumbnailCaches: ThumbnailCacheSupportSnapshot
     }
 
     public static func makeJSONData(
@@ -126,7 +127,9 @@ public enum SupportDiagnosticsExporter {
             ),
             diagnostics: diagnostics.supportSnapshot(),
             requests: await sources.requestSnapshot(),
-            measurements: sources.workMeasurementSnapshot()
+            measurements: sources.workMeasurementSnapshot(),
+            thumbnailCaches: await sources.thumbnailCacheSnapshot(
+                deadline: ContinuousClock.now.advanced(by: .seconds(2)))
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
