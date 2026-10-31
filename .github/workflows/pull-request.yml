@@ -160,6 +160,7 @@ jobs:
           bash .github/scripts/test_run_ui_tests_with_retry.sh
           python3 .github/scripts/test_swift_style_scripts.py
           python3 scripts/tests/test_verify_tests_script.py
+          python3 .github/scripts/test_upgrade_checkpoints.py
           python3 -B scripts/tests/test_update_proton_sdk.py
 
       - name: Lint GitHub Actions workflows
