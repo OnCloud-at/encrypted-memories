@@ -5471,6 +5471,61 @@ final class BackupSyncRunnerTests: XCTestCase {
             ))
     }
 
+    /// The person trashed a Live Photo's video in Proton, and the trash was emptied later. The photo stays deleted in
+    /// Proton like while its video was in the trash: nothing uploads and it does not end as a failure (#984).
+    func testALivePhotoWhoseTrashedVideoIsEmptiedStaysDeletedInProton() async throws {
+        let entry = seedEntry("live.heic")
+        resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(live.heic)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(live.heic)", contentHash: expectedContentHash(path: "/backup/live.heic"),
+                linkState: .active, linkID: "existing-main")
+        ]
+        checker.remoteItemsByNameHash["nh(live.mov)"] = [trashedPairedVideo()]
+        checker.relatedLinkIDsByMainLinkID["existing-main"] = ["trashed-paired"]
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
+
+        checker.remoteItemsByNameHash["nh(live.mov)"] = []
+        checker.relatedLinkIDsByMainLinkID["existing-main"] = []
+        clock.advance(by: 60)
+        _ = seedEntry("live.heic", ageSeconds: 0)  // A rescan checks the photo again.
+        let progress = await makeRunner().runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty, "nothing uploads")
+        XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(progress.needsAttention, 0)
+    }
+
+    /// The person trashed one photo of a series in Proton, and the trash was emptied later. A later version of the
+    /// series does not upload that photo again and does not end as a failure (#984).
+    func testASeriesPhotoWhoseTrashIsEmptiedIsNotUploadedAgain() async throws {
+        let entry = seedEntry("IMG_0001.HEIC")
+        resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(IMG_0002.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_0002.HEIC)",
+                contentHash: expectedContentHash(path: "/backup/IMG_0001.HEIC#IMG_0002.HEIC"),
+                linkState: .trashed,
+                linkID: "trashed-pick"
+            )
+        ]
+        _ = await makeRunner(tagAdder: SpyTagAdder()).runUntilDrained()
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0003.HEIC"])
+
+        checker.remoteItemsByNameHash["nh(IMG_0002.HEIC)"] = []
+        clock.advance(by: 60)
+        let later = seedEntry("IMG_0001.HEIC", ageSeconds: 0, revisionOffset: 1)
+        let progress = await makeRunner(tagAdder: SpyTagAdder()).runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0003.HEIC"], "nothing uploads again")
+        XCTAssertNotNil(state(of: later))
+        XCTAssertEqual(state(of: later)?.isTerminalSuccess, true)
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(progress.needsAttention, 0)
+    }
+
     func testDraftSecondaryParksLivePhotoInsteadOfClaimingSuccess() async throws {
         let entry = seedEntry("live.heic")
         resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
