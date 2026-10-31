@@ -30,6 +30,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// always describes every running upload.
     private nonisolated let uploadNetworkAdmission = UploadNetworkAdmission()
     private nonisolated let sharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
+    private nonisolated let presentationNodeReads = SDKPresentationNodeReads()
     private nonisolated let rootMaterialResolver = PhotosRootMaterialResolver()
     private var photosRoot: SDKNodeUid?
     private var photosShareID: String?
@@ -393,6 +394,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // Admission is closed and every published operation has settled before this teardown runs.
         // Drain cache-owned SDK tasks now, including flights orphaned by admission cancellation.
         await sharedAlbumSnapshotCache.invalidateAll()
+        await presentationNodeReads.invalidateAndJoin()
 
         let timelineTask = timelineLoadTask?.task
         timelineLoadTask = nil
@@ -1793,6 +1795,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             client: photosClient,
             admission: shutdownGate,
             sharedAlbumSnapshotCache: sharedAlbumSnapshotCache,
+            presentationNodeReads: presentationNodeReads,
             requestCause: requestCause(.albums),
             workMeasurements: workMeasurements
         )
@@ -2204,7 +2207,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
         let read = try await SDKPhotoMetadataReader.read(
-            for: uid, client: photosClient, workMeasurements: workMeasurements)
+            for: uid, client: photosClient, sharing: presentationNodeReads, workMeasurements: workMeasurements)
         let metadata = read.metadata
         if let timelineOrderStore,
             !timelineOrderStore.recordResolvedMetadata(

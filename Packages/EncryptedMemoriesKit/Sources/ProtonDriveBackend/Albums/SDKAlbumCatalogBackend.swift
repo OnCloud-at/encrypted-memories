@@ -251,6 +251,40 @@ actor SDKSharedAlbumSnapshotCache {
     }
 }
 
+/// Viewer reads of one node: the Info panel metadata and the album memberships of the same photo. Overlapping misses of
+/// one client share one SDK `getNode`; each caller keeps its own mapping. Reads for a write (current memberships, merge
+/// facts) never use it, because they need a read that starts after their own request.
+typealias SDKPresentationNodeReads = SharedInFlightOperations<SDKPresentationNodeReadKey, DriveNode?>
+
+struct SDKPresentationNodeReadKey: Hashable, Sendable {
+    let client: ObjectIdentifier
+    let volumeID: String
+    let nodeID: String
+}
+
+enum SDKNodeRead {
+    /// One cancellable `getNode`. With `sharing`, an overlapping read of the same client and node joins it.
+    static func node(
+        _ uid: SDKNodeUid, client: any SDKPhotoCatalogClient, sharing: SDKPresentationNodeReads? = nil,
+        measurement: SupportWorkMeasurementPass? = nil
+    ) async throws -> DriveNode? {
+        let read: @Sendable () async throws -> DriveNode? = {
+            try await SDKCancellableOperation.run { token in
+                measurement?.record(.nodeCallsStarted)
+                let value = try await client.getNode(nodeUid: uid, cancellationToken: token)
+                measurement?.record(.nodeCallsReturned)
+                return value
+            } cancel: { token in
+                try? await client.cancelGetNode(cancellationToken: token)
+            }
+        }
+        guard let sharing else { return try await read() }
+        let key = SDKPresentationNodeReadKey(
+            client: ObjectIdentifier(client), volumeID: uid.volumeID, nodeID: uid.nodeID)
+        return try await sharing.run(key, operation: read)
+    }
+}
+
 /// SDK 0.32.1 catalog/sharing/membership adapter. Enumerations publish only after their native
 /// callback stream completes, and node hydration uses a bounded task group so a large catalog
 /// cannot create one unbounded task per album.
@@ -259,6 +293,7 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     private let maximumConcurrentNodeLoads: Int
     private let admission: JoinedShutdownGate?
     private let sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache
+    private let presentationNodeReads: SDKPresentationNodeReads?
     private let requestCause: ProtonRequestCauseBinding?
     private let workMeasurements: SupportWorkMeasurements?
 
@@ -267,6 +302,7 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         maximumConcurrentNodeLoads: Int = 4,
         admission: JoinedShutdownGate? = nil,
         sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache(),
+        presentationNodeReads: SDKPresentationNodeReads? = nil,
         requestCause: ProtonRequestCauseBinding? = nil,
         workMeasurements: SupportWorkMeasurements? = nil
     ) {
@@ -274,6 +310,7 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         self.maximumConcurrentNodeLoads = max(1, maximumConcurrentNodeLoads)
         self.admission = admission
         self.sharedAlbumSnapshotCache = sharedAlbumSnapshotCache
+        self.presentationNodeReads = presentationNodeReads
         self.requestCause = requestCause
         self.workMeasurements = workMeasurements
     }
@@ -367,22 +404,34 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
             try? await client.cancelLeaveSharedNode(cancellationToken: token)
         }
         await sharedAlbumSnapshotCache.invalidate(client: client)
+        // A viewer read that started before the leave must not answer a later caller.
+        await presentationNodeReads?.invalidate()
     }
 
+    /// May join a viewer read of the same photo that is already running.
     func albumMemberships(
         for photoUIDs: [PhotoUID]
     ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
         try await withAdmission {
-            try await self.performAlbumMemberships(for: photoUIDs)
+            try await self.performAlbumMemberships(for: photoUIDs, sharing: self.presentationNodeReads)
+        }
+    }
+
+    /// Starts its own read for every photo, never a running viewer read: a write depends on the answer.
+    func currentAlbumMemberships(
+        for photoUIDs: [PhotoUID]
+    ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
+        try await withAdmission {
+            try await self.performAlbumMemberships(for: photoUIDs, sharing: nil)
         }
     }
 
     private func performAlbumMemberships(
-        for photoUIDs: [PhotoUID]
+        for photoUIDs: [PhotoUID], sharing: SDKPresentationNodeReads?
     ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
         let uniqueUIDs = Array(Set(photoUIDs))
         let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
-        let nodes = try await loadNodes(sdkUIDs)
+        let nodes = try await loadNodes(sdkUIDs, sharing: sharing)
         var result: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
         result.reserveCapacity(nodes.count)
         for (sdkUID, node) in nodes {
@@ -502,19 +551,11 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     }
 
     private func loadNodes(
-        _ uids: [SDKNodeUid], measurement: SupportWorkMeasurementPass? = nil
+        _ uids: [SDKNodeUid], sharing: SDKPresentationNodeReads? = nil, measurement: SupportWorkMeasurementPass? = nil
     ) async throws -> [(SDKNodeUid, DriveNode?)] {
         let client = client
         return try await BoundedConcurrency.throwingMap(uids, limit: maximumConcurrentNodeLoads) { uid in
-            let node = try await SDKCancellableOperation.run { token in
-                measurement?.record(.nodeCallsStarted)
-                let value = try await client.getNode(nodeUid: uid, cancellationToken: token)
-                measurement?.record(.nodeCallsReturned)
-                return value
-            } cancel: { token in
-                try? await client.cancelGetNode(cancellationToken: token)
-            }
-            return (uid, node)
+            (uid, try await SDKNodeRead.node(uid, client: client, sharing: sharing, measurement: measurement))
         }
     }
 

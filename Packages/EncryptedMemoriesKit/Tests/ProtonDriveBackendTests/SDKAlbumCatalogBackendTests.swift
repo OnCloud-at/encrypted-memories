@@ -846,6 +846,269 @@ struct SDKAlbumCatalogBackendTests {
     }
 }
 
+/// #538: the Info panel and the album memberships of one photo share one SDK node read while both miss.
+@Suite("Shared viewer node reads", .timeLimit(.minutes(1)))
+struct SDKPresentationNodeReadTests {
+    private static let album = SDKNodeUid(volumeID: "volume", nodeID: "album")
+
+    private static func uid(_ node: PhotoNode) -> PhotoUID {
+        PhotoUID(volumeID: node.uid.volumeID, nodeID: node.uid.nodeID)
+    }
+
+    private static func heldClient(
+        _ nodes: [DriveNode], holdCancelled: Bool = false
+    ) async -> FakeSDKPhotoCatalogClient {
+        let client = FakeSDKPhotoCatalogClient(holdGetNode: true, holdCancelledGetNodes: holdCancelled)
+        await client.configureNodes(
+            Dictionary(uniqueKeysWithValues: nodes.map { (Self.identifier($0), $0) }))
+        return client
+    }
+
+    private static func identifier(_ node: DriveNode) -> String {
+        switch node {
+        case .photo(let photo): photo.uid.sdkCompatibleIdentifier
+        case .file(let file): file.uid.sdkCompatibleIdentifier
+        case .album(let album): album.uid.sdkCompatibleIdentifier
+        case .folder(let folder): folder.uid.sdkCompatibleIdentifier
+        }
+    }
+
+    private static func waitUntil(_ condition: @Sendable () async -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while await !condition() {
+            guard ContinuousClock.now < deadline else { throw BoundedWaitTimeout() }
+            await Task.yield()
+        }
+    }
+
+    /// The value of `task`, or a failure after `limit`: a broken share must end the test, not hang it. The race
+    /// resumes once and leaves a task that never ends behind instead of waiting for it.
+    private static func bounded<T: Sendable>(
+        _ task: Task<T, any Error>, _ limit: Duration = .seconds(10)
+    ) async throws -> T {
+        let race = BoundedRace<T>()
+        return try await withCheckedThrowingContinuation { continuation in
+            race.install(continuation)
+            Task { race.finish(await task.result) }
+            Task {
+                try? await Task.sleep(for: limit)
+                if race.finish(.failure(BoundedWaitTimeout())) { task.cancel() }
+            }
+        }
+    }
+
+    private struct BoundedWaitTimeout: Error {}
+
+    /// True once every caller joined the shared read, or, without sharing, started its own read.
+    private static func joinedOrStarted(
+        _ reads: SDKPresentationNodeReads, _ client: FakeSDKPhotoCatalogClient, _ callers: Int
+    ) async -> Bool {
+        let waiting = await reads.waitingCallers
+        let started = await client.getNodeCalls
+        return waiting == callers || started == callers
+    }
+
+    @Test func aViewerReadAndAMembershipReadOfOnePhotoShareOneNodeRead() async throws {
+        let photo = photoNode(id: "photo", albumIDs: [Self.album])
+        let client = await Self.heldClient([DriveNode(photoNode: photo)])
+        let reads = SDKPresentationNodeReads()
+        let backend = SDKAlbumCatalogBackend(client: client, presentationNodeReads: reads)
+        let uid = Self.uid(photo)
+
+        let metadata = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        let memberships = Task { try await backend.albumMemberships(for: [uid]) }
+        try await Self.waitUntil { await Self.joinedOrStarted(reads, client, 2) }
+        await client.releaseHeldGetNodes()
+
+        #expect(try await Self.bounded(metadata).metadata.filename == "photo.jpg")
+        #expect(
+            try await Self.bounded(memberships)[uid] == [AlbumNodeIdentifier(volumeID: "volume", nodeID: "album")])
+        #expect(await client.getNodeCalls == 1)
+    }
+
+    @Test func eachCallerKeepsItsOwnMappingOfASharedFileOrMissingNode() async throws {
+        let file = fileNode(id: "file")
+        let client = await Self.heldClient([DriveNode(fileNode: file)])
+        let reads = SDKPresentationNodeReads()
+        let backend = SDKAlbumCatalogBackend(client: client, presentationNodeReads: reads)
+        let fileUID = PhotoUID(volumeID: "volume", nodeID: "file")
+        let missingUID = PhotoUID(volumeID: "volume", nodeID: "missing")
+
+        let fileMetadata = Task { try await SDKPhotoMetadataReader.read(for: fileUID, client: client, sharing: reads) }
+        let fileMemberships = Task { try await backend.albumMemberships(for: [fileUID]) }
+        let missingMetadata = Task {
+            try await SDKPhotoMetadataReader.read(for: missingUID, client: client, sharing: reads)
+        }
+        let missingMemberships = Task { try await backend.albumMemberships(for: [missingUID]) }
+        try await Self.waitUntil { await Self.joinedOrStarted(reads, client, 4) }
+        await client.releaseHeldGetNodes()
+
+        // The metadata accepts a file node; the memberships require a photo and fail on a missing node.
+        #expect(try await Self.bounded(fileMetadata).metadata.filename == "same.jpg")
+        await #expect(throws: SDKAlbumCatalogError.self) { try await Self.bounded(fileMemberships) }
+        await #expect(throws: CocoaError.self) { try await Self.bounded(missingMetadata) }
+        await #expect(throws: SDKAlbumCatalogError.self) { try await Self.bounded(missingMemberships) }
+        #expect(await client.getNodeCalls == 2)
+    }
+
+    @Test func distinctVolumesAndDistinctClientsReadSeparately() async throws {
+        let own = photoNode(id: "same-node", albumIDs: [])
+        let foreign = photoNode(id: "same-node", albumIDs: [], volumeID: "foreign-volume")
+        let client = await Self.heldClient([DriveNode(photoNode: own), DriveNode(photoNode: foreign)])
+        let otherClient = await Self.heldClient([DriveNode(photoNode: own)])
+        let reads = SDKPresentationNodeReads()
+
+        let ownRead = Task { try await SDKPhotoMetadataReader.read(for: Self.uid(own), client: client, sharing: reads) }
+        let foreignRead = Task {
+            try await SDKPhotoMetadataReader.read(for: Self.uid(foreign), client: client, sharing: reads)
+        }
+        let otherClientRead = Task {
+            try await SDKPhotoMetadataReader.read(for: Self.uid(own), client: otherClient, sharing: reads)
+        }
+        try await Self.waitUntil {
+            let held = await client.heldGetNodeCount
+            let otherHeld = await otherClient.heldGetNodeCount
+            return held == 2 && otherHeld == 1
+        }
+        await client.releaseHeldGetNodes()
+        await otherClient.releaseHeldGetNodes()
+
+        _ = try await (Self.bounded(ownRead), Self.bounded(foreignRead), Self.bounded(otherClientRead))
+        #expect(await client.getNodeCalls == 2)
+        #expect(await otherClient.getNodeCalls == 1)
+    }
+
+    @Test func aCancelledCallerLeavesTheSharedReadToTheOtherCaller() async throws {
+        let photo = photoNode(id: "photo", albumIDs: [Self.album])
+        let client = await Self.heldClient([DriveNode(photoNode: photo)])
+        let reads = SDKPresentationNodeReads()
+        let backend = SDKAlbumCatalogBackend(client: client, presentationNodeReads: reads)
+        let uid = Self.uid(photo)
+
+        let metadata = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        let memberships = Task { try await backend.albumMemberships(for: [uid]) }
+        try await Self.waitUntil { await Self.joinedOrStarted(reads, client, 2) }
+
+        metadata.cancel()
+        await #expect(throws: CancellationError.self) { try await Self.bounded(metadata) }
+        try await Self.waitUntil { await reads.waitingCallers == 1 }
+        #expect(await client.cancelledGetNodeTokens.isEmpty)
+        await client.releaseHeldGetNodes()
+
+        #expect(try await Self.bounded(memberships)[uid]?.count == 1)
+        #expect(await client.getNodeCalls == 1)
+    }
+
+    @Test func aReadThatEveryCallerLeftIsCancelledAndNotJoinedLater() async throws {
+        let photo = photoNode(id: "photo", albumIDs: [])
+        // The cancelled read stays open, so a later caller could still find it.
+        let client = await Self.heldClient([DriveNode(photoNode: photo)], holdCancelled: true)
+        let reads = SDKPresentationNodeReads()
+        let uid = Self.uid(photo)
+
+        let first = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        try await Self.waitUntil { await client.heldGetNodeCount == 1 }
+        first.cancel()
+        await #expect(throws: CancellationError.self) { try await Self.bounded(first) }
+        try await Self.waitUntil { await client.cancelledGetNodeTokens.count == 1 }
+
+        let later = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        try await Self.waitUntil { await client.heldGetNodeCount == 2 }
+        await client.releaseHeldGetNodes()
+        #expect(try await Self.bounded(later).metadata.filename == "photo.jpg")
+        #expect(await client.getNodeCalls == 2)
+    }
+
+    @Test func leavingASharedAlbumStartsANewReadForLaterCallers() async throws {
+        let photo = photoNode(id: "photo", albumIDs: [])
+        let client = await Self.heldClient([DriveNode(photoNode: photo)])
+        let reads = SDKPresentationNodeReads()
+        let backend = SDKAlbumCatalogBackend(client: client, presentationNodeReads: reads)
+        let uid = Self.uid(photo)
+
+        let before = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        try await Self.waitUntil { await client.heldGetNodeCount == 1 }
+        try await backend.leaveSharedAlbum(AlbumNodeIdentifier(volumeID: "volume", nodeID: "shared"))
+        let after = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        try await Self.waitUntil { await client.heldGetNodeCount == 2 }
+        await client.releaseHeldGetNodes()
+
+        _ = try await (Self.bounded(before), Self.bounded(after))
+        #expect(await client.getNodeCalls == 2)
+    }
+
+    @Test func shutdownCancelsAndJoinsARunningSharedRead() async throws {
+        let photo = photoNode(id: "photo", albumIDs: [])
+        let client = await Self.heldClient([DriveNode(photoNode: photo)])
+        let reads = SDKPresentationNodeReads()
+        let uid = Self.uid(photo)
+
+        let read = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        try await Self.waitUntil { await client.heldGetNodeCount == 1 }
+        // The join ends only because the shutdown cancels the read.
+        try await Self.bounded(Task { () async throws in await reads.invalidateAndJoin() })
+
+        #expect(await client.cancelledGetNodeTokens.count == 1)
+        #expect(await client.heldGetNodeCount == 0)
+        await #expect(throws: CancellationError.self) { try await Self.bounded(read) }
+    }
+
+    @Test func aReadForAWriteNeverJoinsARunningViewerRead() async throws {
+        let photo = photoNode(id: "photo", albumIDs: [Self.album])
+        let client = await Self.heldClient([DriveNode(photoNode: photo)])
+        let reads = SDKPresentationNodeReads()
+        let backend = SDKAlbumCatalogBackend(client: client, presentationNodeReads: reads)
+        let repository = AlbumsRepository(catalogBackend: backend, writeBackend: UnusedAlbumWriteBackend())
+        let uid = Self.uid(photo)
+
+        let viewer = Task { try await SDKPhotoMetadataReader.read(for: uid, client: client, sharing: reads) }
+        try await Self.waitUntil { await client.heldGetNodeCount == 1 }
+        let current = Task { try await repository.currentAlbumMemberships(for: [uid]) }
+        try await Self.waitUntil { await client.heldGetNodeCount == 2 }
+        await client.releaseHeldGetNodes()
+
+        _ = try await Self.bounded(viewer)
+        #expect(try await Self.bounded(current)[uid]?.count == 1)
+        #expect(await client.getNodeCalls == 2)
+    }
+}
+
+/// Resumes its continuation with the first result only.
+private final class BoundedRace<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, any Error>?
+    private var result: Result<T, any Error>?
+
+    func install(_ continuation: CheckedContinuation<T, any Error>) {
+        let early = lock.withLock { () -> Result<T, any Error>? in
+            if let result { return result }
+            self.continuation = continuation
+            return nil
+        }
+        if let early { continuation.resume(with: early) }
+    }
+
+    @discardableResult
+    func finish(_ result: Result<T, any Error>) -> Bool {
+        let (won, continuation) = lock.withLock { () -> (Bool, CheckedContinuation<T, any Error>?) in
+            guard self.result == nil else { return (false, nil) }
+            self.result = result
+            defer { self.continuation = nil }
+            return (true, self.continuation)
+        }
+        continuation?.resume(with: result)
+        return won
+    }
+}
+
+private struct UnusedAlbumWriteBackend: AlbumWriteBackend {
+    func createAlbum(name: String) async throws -> AlbumID { throw CancellationError() }
+    func deleteAlbum(albumID: AlbumID) async throws { throw CancellationError() }
+    func addPhotos(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws { throw CancellationError() }
+    func removePhotos(_ photoUIDs: [PhotoUID], from albumID: AlbumID) async throws { throw CancellationError() }
+    func setAlbumCover(albumID: AlbumID, photoUID: PhotoUID) async throws { throw CancellationError() }
+}
+
 private actor CatalogShutdownProbe {
     private(set) var hasReturned = false
 
@@ -891,14 +1154,23 @@ private actor FakeSDKPhotoCatalogClient: SDKPhotoCatalogClient {
     private(set) var sharedEnumerationCalls = 0
     private(set) var leftSharedNodeIdentifiers: [String] = []
     private var concurrentGetNodeCalls = 0
+    private var holdGetNode: Bool
+    /// A cancelled held read stays open until the release, as a native call that has not seen its cancellation yet.
+    private let holdCancelledGetNodes: Bool
+    private var heldGetNodes: [UUID: CheckedContinuation<Void, any Error>] = [:]
+    private(set) var cancelledGetNodeTokens: [UUID] = []
 
     init(
         nodeDelay: Duration = .zero,
+        holdGetNode: Bool = false,
+        holdCancelledGetNodes: Bool = false,
         waitForAlbumCancellation: Bool = false,
         deferAlbumCancellationCompletion: Bool = false,
         waitForAlbumContentCancellation: Bool = false
     ) {
         self.nodeDelay = nodeDelay
+        self.holdGetNode = holdGetNode
+        self.holdCancelledGetNodes = holdCancelledGetNodes
         self.waitForAlbumCancellation = waitForAlbumCancellation
         self.deferAlbumCancellationCompletion = deferAlbumCancellationCompletion
         self.waitForAlbumContentCancellation = waitForAlbumContentCancellation
@@ -992,6 +1264,10 @@ private actor FakeSDKPhotoCatalogClient: SDKPhotoCatalogClient {
             if nodeDelay != .zero {
                 try await Task.sleep(for: nodeDelay)
             }
+            if holdGetNode {
+                if cancelledGetNodeTokens.contains(cancellationToken) { throw CancellationError() }
+                try await withCheckedThrowingContinuation { heldGetNodes[cancellationToken] = $0 }
+            }
             concurrentGetNodeCalls -= 1
             return nodes[nodeUid.sdkCompatibleIdentifier]
         } catch {
@@ -1000,7 +1276,21 @@ private actor FakeSDKPhotoCatalogClient: SDKPhotoCatalogClient {
         }
     }
 
-    func cancelGetNode(cancellationToken: UUID) {}
+    func cancelGetNode(cancellationToken: UUID) {
+        cancelledGetNodeTokens.append(cancellationToken)
+        guard !holdCancelledGetNodes else { return }
+        heldGetNodes.removeValue(forKey: cancellationToken)?.resume(throwing: CancellationError())
+    }
+
+    var heldGetNodeCount: Int { heldGetNodes.count }
+
+    /// Releases the held reads and every later read.
+    func releaseHeldGetNodes() {
+        holdGetNode = false
+        let held = heldGetNodes.values
+        heldGetNodes.removeAll()
+        held.forEach { $0.resume() }
+    }
     func leaveSharedNode(nodeUid: SDKNodeUid, cancellationToken: UUID) async throws {
         leftSharedNodeIdentifiers.append(nodeUid.sdkCompatibleIdentifier)
     }
