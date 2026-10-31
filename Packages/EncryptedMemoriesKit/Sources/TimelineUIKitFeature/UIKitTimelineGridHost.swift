@@ -20,6 +20,7 @@
     /// This is intentionally thin: UIKit owns the scroll surface and drawable, while GridCore, MediaFeedCore,
     /// MetalGridTextureCore, and MetalRenderingCore still own layout, decoded thumbnails, residency, and drawing.
     public struct UIKitTimelineGrid: UIViewRepresentable {
+        @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
         private let items: [PhotoItem]
         /// A monotonic content identity supplied by the owning projection. When present, selection and chrome
         /// updates avoid re-comparing or re-mapping the complete library while preserving a full fallback for
@@ -155,6 +156,7 @@
         @MainActor
         public func makeUIView(context: Context) -> UIKitTimelineGridHostView {
             let view = UIKitTimelineGridHostView()
+            view.setPlaceholderReduceMotion(prefersReducedMotion || accessibilityReduceMotion)
             view.onFirstContentReady = onFirstContentReady
             view.onOpenPhoto = onOpenPhoto
             view.onToggleSelection = onToggleSelection
@@ -179,6 +181,7 @@
         @MainActor
         public func updateUIView(_ uiView: UIKitTimelineGridHostView, context: Context) {
             uiView.setNeedsLayout()
+            uiView.setPlaceholderReduceMotion(prefersReducedMotion || accessibilityReduceMotion)
             uiView.onFirstContentReady = onFirstContentReady
             uiView.onOpenPhoto = onOpenPhoto
             uiView.onToggleSelection = onToggleSelection
@@ -400,9 +403,52 @@
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
         var isApplyingProgrammaticScroll = false
-        /// One-shot per content set: fires once the first settled frame with a resident visible thumbnail is drawn,
-        /// mirroring the macOS coordinator. Reset when a new non-empty UID set lands.
+        /// One-shot after the first settled frame that encodes a resident visible thumbnail.
         private var firstContentReported = false
+        private var firstContentPending = false
+
+        func reportFirstRenderedContent(
+            visibleUIDs: [PhotoUID], isResident: (PhotoUID) -> Bool, frameEncoded: Bool
+        ) {
+            guard frameEncoded, !firstContentReported, !firstContentPending,
+                visibleUIDs.contains(where: isResident),
+                window != nil, framePump.isActive, !sceneIsBackgrounded
+            else { return }
+            firstContentPending = true
+            let generation = contentGeneration
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.contentGeneration == generation else { return }
+                self.firstContentPending = false
+                guard self.window != nil, self.framePump.isActive, !self.sceneIsBackgrounded else { return }
+                self.firstContentReported = true
+                self.onFirstContentReady?()
+            }
+        }
+
+        func invalidateFirstContentForSource() {
+            contentGeneration &+= 1
+            firstContentPending = false
+        }
+        private var placeholderPulse = MetalGridPlaceholderPulse(reduceMotion: UIAccessibility.isReduceMotionEnabled)
+
+        func setPlaceholderReduceMotion(_ enabled: Bool) {
+            if placeholderPulse.setReduceMotion(enabled) { requestRender() }
+        }
+
+        var placeholderIsAnimating: Bool { placeholderPulse.isAnimating }
+
+        private func canRetryPlaceholder(_ uid: PhotoUID) -> Bool {
+            !(thumbnailFeed?.isKnownUnfetchable(uid) ?? false)
+        }
+
+        private func isLoadingPlaceholder(_ uid: PhotoUID, isResident: (PhotoUID) -> Bool) -> Bool {
+            itemIndexByUID[uid] != nil && !isResident(uid) && canRetryPlaceholder(uid)
+        }
+
+        func updatePlaceholderPulse(visibleUIDs: [PhotoUID], isResident: (PhotoUID) -> Bool, now: Double) {
+            placeholderPulse.update(visible: visibleUIDs, now: now) { isLoadingPlaceholder($0, isResident: isResident) }
+        }
+
         /// Guards the deferred main-queue readiness callback. A cached frame may finish on the same runloop turn
         /// that authoritative UIDs replace it; only the generation that actually rendered may acknowledge itself.
         private var contentGeneration: UInt64 = 0
@@ -426,9 +472,9 @@
 
         public private(set) var isMetal3Capable = false
 
-        /// Called on the main actor the first time a visible thumbnail is drawn for the current content - the shell's
-        /// signal that the launch/loading UI can lift onto a real grid. The remaining thumbnails may still load.
-        /// One-shot per content set.
+        /// Called on the main actor after the first frame that encodes a resident visible thumbnail for the current
+        /// content source and revision - the shell's signal that the launch/loading UI can lift onto the grid.
+        /// The remaining thumbnails may still load. One-shot per content set: a changed item order re-arms it.
         public var onFirstContentReady: (() -> Void)?
 
         /// Called on the main actor when the user taps a photo cell, with the tapped item. The shell presents the viewer.
@@ -584,6 +630,7 @@
             }
             let newUIDs = contentChanged ? items.map(\.uid) : itemUIDs
             let uidsChanged = contentChanged && itemUIDs != newUIDs
+            if contentChanged || !revisedContent.isEmpty { invalidateFirstContentForSource() }
             if contentChanged {
                 self.items = items
                 configuredContentRevision = contentRevision
@@ -643,7 +690,6 @@
                 // A range anchored in the previous item order cannot continue in the new one.
                 swipeSelection.cancel()
                 resizeAnchorItemID = nil
-                contentGeneration &+= 1
                 if !isOrderCorrection { committedPhase = nil }
                 cancelLiveZoomState()
                 itemIndexByUID = Dictionary(
@@ -848,6 +894,8 @@
         /// Stop the render loop and drop all in-flight warm work - used both when the view leaves its window and
         /// when the tab deactivates. Visible cache/textures stay resident, so returning redraws immediately.
         private func suspendRenderLoop() {
+            if firstContentPending { invalidateFirstContentForSource() }
+            placeholderPulse.restart()
             displayLink.pause()
             perf.noteLoopPaused(reason: "suspended")
             presentationTiming.resetCadence()
@@ -1591,6 +1639,11 @@
                     draw.index >= 0 && draw.index < itemUIDs.count ? itemUIDs[draw.index] : nil
                 })
             streamTransitionTextures(uids: uids, slotSidePoints: slotSide, textureCache: textureCache)
+            placeholderPulse.update(
+                loadingCount: MetalGridFrameComposer.visibleLoadingCount(
+                    draws: draws, flatUIDs: itemUIDs, viewportSize: viewportSize
+                ) { isLoadingPlaceholder($0, isResident: textureCache.isResident) },
+                now: now)
             let groups = MetalGridFrameComposer.buildTransitionGroups(
                 draws: draws,
                 flatUIDs: itemUIDs,
@@ -1598,12 +1651,16 @@
                 displayMode: displayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
                 decorations: productionDecorations(),
-                now: now
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
             textureCache.evictToBudget()
             guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
-            renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
+            guard renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups) else {
+                return .encodingFailed
+            }
             return finishTransitionDraw(
                 uids: uids, slotSidePoints: slotSide, textureCache: textureCache, renderer: renderer,
                 cpuPreparationMs: cpuPreparationMs, drawableWaitMs: acquisition.waitMs, now: now)
@@ -1632,7 +1689,10 @@
             let activeReveal =
                 textureCache.hasActiveThumbnailReveal(in: uids, now: now)
                 || uploadBadgeAnimator.isAnimating(uids, now: now)
-            return .drawn(hasPendingWork: pinchSettling || warmInFlight || ramReadyMissing > 0 || activeReveal)
+            let uploadsProgressing = MetalGridFrameComposer.hasProgressingVisibleUploads(
+                cache: textureCache, ramReadyMissing: ramReadyMissing)
+            return .drawn(
+                hasPendingWork: pinchSettling || activeReveal || placeholderPulse.isAnimating || uploadsProgressing)
         }
 
         private func renderOverviewDissolve(
@@ -1658,6 +1718,12 @@
             streamTransitionTextures(uids: uids, slotSidePoints: slotSide, textureCache: textureCache)
             let sourceResidentAfter = residentSlotCount(sourceSlots, textureCache: textureCache)
             let targetResidentAfter = residentSlotCount(targetSlots, textureCache: textureCache)
+            placeholderPulse.update(
+                loadingCount: MetalGridFrameComposer.visibleLoadingCount(
+                    source: sourceSlots, target: targetSlots, targetOpacity: plan.targetOpacity,
+                    flatUIDs: itemUIDs, viewportSize: viewportSize
+                ) { isLoadingPlaceholder($0, isResident: textureCache.isResident) },
+                now: now)
             let activeReveal =
                 textureCache.hasActiveThumbnailReveal(in: uids, now: now)
                 || uploadBadgeAnimator.isAnimating(uids, now: now)
@@ -1669,7 +1735,9 @@
                 displayMode: plan.sourceDisplayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
                 decorations: productionDecorations(),
-                now: now
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
             let targetGroups = MetalGridFrameComposer.buildGroups(
                 slots: MetalGridFrameComposer.viewportDrawSlots(targetSlots, viewportSize: viewportSize),
@@ -1678,15 +1746,19 @@
                 displayMode: plan.targetDisplayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
                 decorations: productionDecorations(),
-                now: now
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
             guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
             renderer.renderLayerDissolve(
                 to: acquisition.target,
                 viewportSize: viewportSize,
-                redrawSource: sourceResidentAfter != sourceResidentBefore || activeReveal,
-                redrawTarget: targetResidentAfter != targetResidentBefore || activeReveal,
+                redrawSource: sourceResidentAfter != sourceResidentBefore || activeReveal
+                    || placeholderPulse.needsLayerRedraw,
+                redrawTarget: targetResidentAfter != targetResidentBefore || activeReveal
+                    || placeholderPulse.needsLayerRedraw,
                 sourceGroups: { sourceGroups },
                 targetGroups: { targetGroups },
                 t: Float(plan.targetOpacity)
@@ -1783,6 +1855,7 @@
                 provideImage: { feed?.memoryCGImage(for: $0) },
                 signposts: composeSignposts
             )
+            updatePlaceholderPulse(visibleUIDs: ids.visible, isResident: textureCache.isResident, now: now)
             if let metadataProvider {
                 thumbnailOverlayResolver.noteVisible(
                     ids.visible.filter { textureCache.isResident($0) },
@@ -1796,52 +1869,47 @@
                 displayMode: displayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
                 decorations: productionDecorations(),
-                now: now
+                now: now,
+                placeholderPulse: placeholderPulse,
+                canRetryPlaceholder: canRetryPlaceholder
             ).groups
             textureCache.evictToBudget()
             guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
-            renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
+            guard renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups) else {
+                return .encodingFailed
+            }
 
             let (missingVisible, ramReadyMissing) = missingRetryableTiles(
                 in: ids.visible, isResident: textureCache.isResident)
-            // The first visible thumbnail tells the shell to lift the loading UI onto the grid. Remaining
-            // thumbnails continue loading behind the presented grid.
+            // The first resident visible thumbnail tells the shell to lift the loading UI onto the grid, so a failing
+            // byte route still reaches the shell as a load failure. Remaining thumbnails load there.
             // One-shot per content set; deferred to the next runloop tick so it never mutates observed shell
             // state during a SwiftUI update pass (renderNow can run inside updateUIView and layoutSubviews).
-            if reportFirstContent, !firstContentReported, !ids.visible.isEmpty,
-                ids.visible.contains(where: { textureCache.isResident($0) })
-            {
-                firstContentReported = true
-                let generation = contentGeneration
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.contentGeneration == generation else { return }
-                    self.onFirstContentReady?()
-                }
+            if reportFirstContent {
+                reportFirstRenderedContent(
+                    visibleUIDs: ids.visible, isResident: textureCache.isResident, frameEncoded: true)
             }
             // Warm still-missing visible tiles and the composer's warm list, which, when settled,
             // adds the sources of undersized resident textures whose RAM decode was evicted, so the upgrade can
             // re-decode and sharpen instead of the loop spinning on a pending upgrade it can never satisfy. Mirrors
             // the macOS host, which warms `result.warm`.
             scheduleWarmIfNeeded(warmUnion(missingVisible, streamResult.warm), pixelSize: uploadPixels)
-            // Keep ticking only for work the render loop can make progress on this vsync: a visible tile
-            // already decoded in RAM but held back by the per-frame upload budget (`uploadPending`), a soft-to-sharp
-            // upgrade in flight, or a warm pass running. A visible tile that is still missing with no RAM image is
-            // waiting on the network/disk crawl - the feed's arrival wake (`handleImagesAvailable`) re-arms the loop
-            // when its bytes land, so we idle through that wait instead of spinning full frames the whole time.
-            // RAM-decoded but not yet GPU-resident (the `ramHitGpuMissing` diagnostic): these tiles can fill on
-            // the very next frames within the upload budget - a persistent count means upload-budget starvation.
-            let uploadPending = ramReadyMissing > 0
-            // Residency saturation means neither a deferred upload nor a deferred upgrade can make progress until the
-            // streaming window changes (scroll/zoom, which re-arm on their own), so both are gated on it - matching
-            // the macOS coordinator and avoiding a spin on placeholders that cannot fill this frame.
+            // Keep ticking only for work this loop can finish on its own: the placeholder sweep, a thumbnail fade,
+            // a badge move, decoded images that still wait for the per-frame upload budget, and a soft-to-sharp
+            // upgrade that can progress. A visible tile that is still missing with no RAM image waits on the
+            // network or disk crawl; the feed's arrival wake (`handleImagesAvailable`) re-arms the loop when its
+            // bytes land. Residency saturation stops uploads and upgrades until the streaming window changes
+            // (scroll and zoom re-arm on their own).
             let canMakeProgress = !textureCache.residencySaturatedThisFrame
             let hasPendingWork =
                 forcePendingWork
-                || warmInFlight
+                || placeholderPulse.isAnimating
                 || textureCache.hasActiveThumbnailReveal(in: ids.visible, now: now)
                 || uploadBadgeAnimator.isAnimating(ids.visible, now: now)
-                || ((uploadPending || streamResult.pendingVisibleQualityUpgrade) && canMakeProgress)
+                || MetalGridFrameComposer.hasProgressingVisibleUploads(
+                    cache: textureCache, ramReadyMissing: ramReadyMissing)
+                || (streamResult.pendingVisibleQualityUpgrade && canMakeProgress)
             perf.noteDraw(
                 visible: ids.visible.count, missing: missingVisible.count,
                 ramHitGpuMiss: ramReadyMissing, saturated: textureCache.residencySaturatedThisFrame,

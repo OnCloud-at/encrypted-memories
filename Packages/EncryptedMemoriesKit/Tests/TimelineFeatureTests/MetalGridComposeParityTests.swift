@@ -117,7 +117,9 @@ import Testing
             slots: [slot(0, y: 0)], flatUIDs: [visible], cache: cache,
             displayMode: .squareFillCrop, cornerRadius: 11, decorations: nil, now: startedAt
         )
-        #expect(start.groups[0].quads[0].alpha == 0)
+        let startImage = try #require(start.groups.flatMap(\.quads).first { $0.mode == .textured })
+        #expect(startImage.alpha == 0)
+        #expect(start.groups.flatMap(\.quads).contains { $0.mode == .thumbnailPlaceholder })
         #expect(cache.hasActiveThumbnailReveal(in: [visible], now: startedAt))
 
         let halfwayAt = startedAt + GridThumbnailRevealPolicy.duration * 0.5
@@ -125,7 +127,7 @@ import Testing
             slots: [slot(0, y: 0)], flatUIDs: [visible], cache: cache,
             displayMode: .squareFillCrop, cornerRadius: 11, decorations: nil, now: halfwayAt
         )
-        let halfwayAlpha = halfway.groups[0].quads[0].alpha
+        let halfwayAlpha = try #require(halfway.groups.flatMap(\.quads).first { $0.mode == .textured }).alpha
         #expect(halfwayAlpha > 0.5 && halfwayAlpha < 1)
 
         let settledAt = startedAt + GridThumbnailRevealPolicy.duration

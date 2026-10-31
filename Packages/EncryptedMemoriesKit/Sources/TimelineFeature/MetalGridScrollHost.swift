@@ -325,6 +325,14 @@ final class MetalGridScrollHost: NSView {
             self, selector: #selector(userDidEndScroll),
             name: NSScrollView.didEndLiveScrollNotification, object: scrollView
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(accessibilityDisplayOptionsChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil
+        )
+    }
+
+    @objc private func accessibilityDisplayOptionsChanged() {
+        coordinator.setPlaceholderReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
 
     @objc private func userWillScroll() {
@@ -848,6 +856,7 @@ final class MetalGridScrollHost: NSView {
         // The callback captures this host weakly. Deinit cannot synchronously mutate the main-actor
         // data-source property, and the weak capture makes the orphaned callback a no-op until replacement.
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     /// True while scroll must be frozen: the live pinch (scrub or settle), the commit bridge, or a short
@@ -1043,6 +1052,7 @@ final class MetalGridScrollHost: NSView {
             requestFrame()
             _ = applyResolvedGridProfileIfNeeded(oldFrame: lastViewportScreenFrame, newFrame: viewportScreenFrame())
         } else {
+            coordinator.presentationSuspended()
             liveScrollInputActive = false
             pinchActive = false
             marqueeInputActive = false
@@ -1057,7 +1067,10 @@ final class MetalGridScrollHost: NSView {
         let wasActive = framePump.isActive
         framePump.setActive(window?.occlusionState.contains(.visible) == true)
         if framePump.isActive { requestFrame() }
-        if wasActive, !framePump.isActive { coordinator.retireLocalDemand() }
+        if wasActive, !framePump.isActive {
+            coordinator.presentationSuspended()
+            coordinator.retireLocalDemand()
+        }
         updateDisplayLinkIdleState()
     }
 

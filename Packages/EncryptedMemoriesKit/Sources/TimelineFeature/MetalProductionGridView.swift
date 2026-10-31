@@ -259,6 +259,8 @@ struct MetalProductionGridView: NSViewRepresentable {
         }
         // Keep the SwiftUI level synchronized with the settled pinch level.
         host.onZoomCommit = { settled in levelBinding.wrappedValue = settled }
+        // Report the first resident visible thumbnail to the shell.
+        host.coordinator.connectReadinessProxy(proxy, revision: sourceRevision)
         guard let proxy else { return }
         proxy.windowFrameForItem = { [weak host] uid in host?.windowFrame(forUID: uid) }
         proxy.scrollToItem = { [weak host] uid in host?.scrollToItem(uid) }
@@ -267,8 +269,6 @@ struct MetalProductionGridView: NSViewRepresentable {
         proxy.currentScrollAnchor = { [weak host] in host?.currentScrollAnchor() }
         proxy.zoomIn = stepIn
         proxy.zoomOut = stepOut
-        // Report the first fully rendered frame to the shell.
-        host.coordinator.onContentReady = { [weak proxy] in proxy?.reportContentReady(revision: sourceRevision) }
         // Forward live-resize activity so the shell can suspend expensive overlays.
         host.coordinator.liveResizeChanged = { [weak proxy] active in proxy?.liveResizeChanged?(active) }
         // Forward content-mode changes without changing geometry.
