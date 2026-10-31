@@ -178,6 +178,32 @@ public enum PendingHandoffsRead: Sendable, Equatable {
     case complete([PendingHandoff])
 }
 
+/// Enqueueing alone does not settle a restored compound. Unknown or omitted keys remain unreadable.
+public enum PendingBackupReturnOutcome: Sendable, Equatable {
+    case completed
+    case waiting(until: Date)
+    case unreadable
+    /// A fresh read proves that an earlier in-flight trash applied after the person's restore.
+    case remoteTrashed
+}
+
+public struct PendingBackupRestoreResult: Sendable, Equatable {
+    public var outcomes: [PendingSourceKey: PendingBackupReturnOutcome]
+    public var discoveryComplete: Bool
+
+    /// A pending recheck is readable; incomplete discovery or an unknown source needs an error in the host.
+    public var isReadable: Bool {
+        discoveryComplete && !outcomes.values.contains(.unreadable)
+    }
+
+    public init(
+        outcomes: [PendingSourceKey: PendingBackupReturnOutcome] = [:], discoveryComplete: Bool = true
+    ) {
+        self.outcomes = outcomes
+        self.discoveryComplete = discoveryComplete
+    }
+}
+
 /// The actions that decoded, and whether the read was complete. An incomplete read can leave out owed actions.
 public struct PendingActionsRead: Sendable, Equatable {
     public let actions: [PendingAction]

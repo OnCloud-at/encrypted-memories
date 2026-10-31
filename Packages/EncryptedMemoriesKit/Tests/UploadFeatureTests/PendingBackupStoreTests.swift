@@ -29,6 +29,15 @@ final class PendingBackupStoreTests: XCTestCase {
         PendingPresentationMetadata(captureTime: date, mediaType: "image/heic", displayName: name)
     }
 
+    func testRestoreResultReadabilityDistinguishesUnknownStateFromPendingWork() {
+        XCTAssertTrue(PendingBackupRestoreResult().isReadable)
+        for outcome in [PendingBackupReturnOutcome.completed, .waiting(until: date), .remoteTrashed] {
+            XCTAssertTrue(PendingBackupRestoreResult(outcomes: [key: outcome]).isReadable)
+        }
+        XCTAssertFalse(PendingBackupRestoreResult(discoveryComplete: false).isReadable)
+        XCTAssertFalse(PendingBackupRestoreResult(outcomes: [key: .unreadable]).isReadable)
+    }
+
     func testReverseHandoffLookupRejectsADecodedPrefix() throws {
         let healthy = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
         let healthyRemote = PhotoUID(volumeID: "vol", nodeID: "link-0")
@@ -1158,4 +1167,83 @@ private final class EmptyStateStore: UploadBackupStateStore, @unchecked Sendable
     func hasAnyRecord(for source: UploadSourceIdentity) -> Bool { false }
     func upsert(_ record: UploadBackupAssetRecord) -> Bool { true }
     func count() -> Int { 0 }
+}
+
+extension PendingBackupStoreTests {
+    private func restored829State() throws -> PendingSourceState {
+        let excluded = try XCTUnwrap(
+            store.exclude(
+                [PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: key, generation: excluded.generation,
+                remoteLinkID: remote.nodeID, at: date))
+        return try XCTUnwrap(store.includeRestoredInProton([key], confirmedRemotes: [remote], at: date)?.first)
+    }
+
+    func testRestoreWaitingKeepsUIDAttemptsAndExactDueTimeAcrossSQLiteReopen() throws {
+        let checked = try restored829State()
+        let due = date.addingTimeInterval(120)
+        XCTAssertTrue(store.finishRestoreRecheck(checked, outcome: .waiting(until: due), at: date))
+        let before = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertEqual(before.remote, remote)
+        XCTAssertTrue(before.needsQueueSync)
+        XCTAssertEqual(before.attempts, checked.attempts)
+        XCTAssertEqual(before.nextAttemptAt, due)
+        store.close()
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+        XCTAssertEqual(store.sourceState(for: key), before, "The obligation is durable, not controller memory")
+        XCTAssertTrue(store.finishRestoreRecheck(before, outcome: .waiting(until: date), at: date))
+        XCTAssertEqual(
+            store.sourceState(for: key)?.nextAttemptAt, date.addingTimeInterval(1),
+            "An expired deferral must not create a same-time busy loop")
+    }
+
+    func testRestoreCleanupRejectsEachChangedBindingIndependently() throws {
+        for column in [
+            "generation=generation+1", "remote_link_id='newer-link'", "desired='excluded'", "needs_queue_sync=0",
+        ] {
+            let localURL = directory.appendingPathComponent(UUID().uuidString + ".sqlite")
+            let local = try XCTUnwrap(PendingBackupManifestStore(url: localURL))
+            defer { local.close() }
+            let checked = try XCTUnwrap(
+                local.exclude(
+                    [PendingExclusionRequest(key: key, presentation: nil, remote: remote)], at: date)?.first)
+            XCTAssertEqual(local.beginRemoteOperation(.remoteTrash, for: [checked]), [key])
+            let included = try XCTUnwrap(
+                local.includeRestoredInProton([key], confirmedRemotes: [remote], at: date)?.first)
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(localURL.path, &db), SQLITE_OK)
+            let handle = try XCTUnwrap(db)
+            defer { sqlite3_close(handle) }
+            XCTAssertEqual(sqlite3_exec(handle, "UPDATE source_state SET \(column);", nil, nil, nil), SQLITE_OK)
+            let changed = try XCTUnwrap(local.sourceState(for: key))
+            XCTAssertTrue(local.finishRestoreRecheck(included, outcome: .completed, at: date.addingTimeInterval(1)))
+            XCTAssertEqual(local.sourceState(for: key), changed, "A stale result must preserve \(column)")
+            XCTAssertEqual(local.sourceState(for: key)?.remoteOperation, .remoteTrash)
+        }
+    }
+}
+
+extension PendingBackupStoreTests {
+    func testRestoreCompletionCannotRetireAnOwedRemoteCompensation() throws {
+        for owed in ["needs_remote_restore", "needs_remote_trash"] {
+            let url = directory.appendingPathComponent(UUID().uuidString + ".sqlite")
+            let local = try XCTUnwrap(PendingBackupManifestStore(url: url))
+            defer { local.close() }
+            XCTAssertNotNil(
+                local.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: remote)], at: date))
+            let checked = try XCTUnwrap(
+                local.includeRestoredInProton([key], confirmedRemotes: [remote], at: date)?.first)
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+            let handle = try XCTUnwrap(db)
+            defer { sqlite3_close(handle) }
+            XCTAssertEqual(sqlite3_exec(handle, "UPDATE source_state SET \(owed)=1;", nil, nil, nil), SQLITE_OK)
+            XCTAssertTrue(local.finishRestoreRecheck(checked, outcome: .completed, at: date))
+            let kept = try XCTUnwrap(local.sourceState(for: key), "Completion cannot delete an owed remote action")
+            XCTAssertEqual(kept.remote, remote)
+            XCTAssertTrue(owed == "needs_remote_restore" ? kept.needsRemoteRestore : kept.needsRemoteTrash)
+        }
+    }
 }

@@ -136,12 +136,20 @@ public protocol PendingBackupEffects: Sendable {
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool
     /// Enqueues the sources again after a restore.
     func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool
+    /// Settles the exact included decisions, including their restored-photo provenance.
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome]
     /// The account's photos volume, used for link-only handoffs. Nil while unknown.
     func photosVolumeID() async -> String?
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult
+}
+
+public extension PendingBackupEffects {
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
+        Dictionary(uniqueKeysWithValues: states.map { ($0.key, .unreadable) })
+    }
 }
 
 /// The Proton side of pending decisions, implemented by the backend. Each call reports whether to retry.

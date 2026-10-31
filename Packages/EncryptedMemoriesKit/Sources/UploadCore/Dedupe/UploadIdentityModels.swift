@@ -63,6 +63,26 @@ public struct UploadSourceIdentity: Sendable, Hashable, Codable {
 
 // MARK: - Resource descriptor
 
+/// A durable pending decision supplies this account-local recheck authority; it never grants an upload by itself.
+public struct UploadRestoredCompoundContext: Sendable, Equatable {
+    public let source: UploadSourceIdentity
+    public let revision: UploadBackupRevision
+    public let generation: Int64
+    public let confirmedRemote: PhotoUID
+    public let requiredMembers: [UploadSourceIdentity.Resource]
+
+    public init(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, generation: Int64, confirmedRemote: PhotoUID,
+        requiredMembers: [UploadSourceIdentity.Resource] = []
+    ) {
+        self.source = source
+        self.revision = revision
+        self.generation = generation
+        self.confirmedRemote = confirmedRemote
+        self.requiredMembers = requiredMembers
+    }
+}
+
 /// Everything a source adapter must state about one resource before any bytes are read - the input
 /// to hashing, cache validity, and the duplicate check. Platform adapters only construct these;
 /// they never make dedupe decisions themselves.
@@ -1020,6 +1040,11 @@ public struct DedupeUnavailableIdentityResolver: UploadIdentityResolving {
 /// The pipeline seam `UploadManager` uses to resolve a descriptor into identity and decision.
 /// `UploadDedupePipeline` serves every platform.
 public protocol UploadIdentityResolving: Sendable {
+    func prepareRestoredCompound(
+        _ context: UploadRestoredCompoundContext, isCurrent: @escaping @Sendable () -> Bool
+    ) async throws
+    func restoredPhotoOutcome(_ context: UploadRestoredCompoundContext) async throws -> PendingBackupReturnOutcome
+    func endRestoredCompound(_ context: UploadRestoredCompoundContext) async
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult
     /// Re-checks a still-valid local upload proof against current remote state without ever
     /// returning a fresh-upload decision. Backup uses this only when an unfinished secondary is
@@ -1065,6 +1090,15 @@ public protocol UploadIdentityResolving: Sendable {
 }
 
 public extension UploadIdentityResolving {
+    func prepareRestoredCompound(
+        _ context: UploadRestoredCompoundContext, isCurrent: @escaping @Sendable () -> Bool
+    ) async throws {
+        throw UploadError.backend("Restored compound checking is unavailable")
+    }
+    func restoredPhotoOutcome(_ context: UploadRestoredCompoundContext) async throws -> PendingBackupReturnOutcome {
+        .unreadable
+    }
+    func endRestoredCompound(_ context: UploadRestoredCompoundContext) async {}
     func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? { nil }
     func revalidateKnownRemote(_ descriptor: UploadResourceDescriptor) async throws -> UploadDuplicateDecision? { nil }
     func remoteAssetProofs(

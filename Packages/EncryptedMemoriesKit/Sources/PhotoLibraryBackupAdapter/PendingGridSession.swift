@@ -295,7 +295,11 @@ public final class PendingGridSession {
     public func photosRestored(_ uids: [PhotoUID]) { presenter.showRestored(uids) }
 
     /// A Proton photo came back from the trash; a pending delete that trashed it is undone as well.
-    public func restoreSources(ofRemote uids: [PhotoUID]) async { await coordinator.restoreSources(ofRemote: uids) }
+    @discardableResult
+    public func restoreSources(ofRemote uids: [PhotoUID]) async -> PendingBackupRestoreResult {
+        photosRestored(uids)
+        return await coordinator.restoreSources(ofRemote: uids)
+    }
 
     @discardableResult
     public func removeFromTrashList(_ uids: [PhotoUID]) async -> Bool { await coordinator.removeFromTrashList(uids) }
@@ -421,6 +425,22 @@ private struct SessionEffects: PendingBackupEffects {
         if !photos.isEmpty { succeeded = await photoBackup.returnToBackup(identifiers: photos) }
         if !fileKeys.isEmpty, let files { succeeded = await files.returnToBackup(fileKeys) && succeeded }
         return succeeded
+    }
+
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
+        var outcomes = await photoBackup.returnToBackup(states.filter { $0.key.kind == .photoLibraryAsset })
+        for state in states where state.key.kind == .fileURL {
+            outcomes[state.key] = .unreadable
+            guard let files, let queue = files.queue as? UploadBackupSyncQueueManifestStore, queue.isOperational(),
+                await files.returnToBackup([state.key.identifier]), queue.isOperational()
+            else { continue }
+            let rows = queue.rows(kind: .fileURL, identifiers: [state.key.identifier])
+            guard queue.isOperational(), !rows.isEmpty else { continue }
+            outcomes[state.key] =
+                rows.allSatisfy { $0.state.isTerminalSuccess }
+                ? .completed : .waiting(until: Date().addingTimeInterval(30))
+        }
+        return outcomes
     }
 
     func photosVolumeID() async -> String? { volume.get() }

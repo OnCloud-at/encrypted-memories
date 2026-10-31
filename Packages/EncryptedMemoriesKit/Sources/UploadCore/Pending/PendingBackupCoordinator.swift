@@ -143,6 +143,8 @@ public actor PendingBackupCoordinator {
     private var startupLaterTrashGenerations: [PendingSourceKey: Int64] = [:]
     private var laterTrashRecoveryTask: Task<Void, Never>?
     private static let laterTrashBatchSize = 100
+    /// The waits after the first, second and third automatic Restore check of one source and generation.
+    private static let restoreRecheckDelays: [TimeInterval] = [60, 300, 900]
     /// A rejected dispatch marker sent nothing; the next reconcile tries it again.
     private var beginFailedKeys = Set<PendingSourceKey>()
     private var writesDegraded: Bool {
@@ -207,6 +209,10 @@ public actor PendingBackupCoordinator {
     private var lastMembershipPublish: ContinuousClock.Instant?
     private var reconcileRunning = false
     private var reconcileAgain = false
+    private var restoreReturnOutcomes: [PendingSourceKey: (generation: Int64, outcome: PendingBackupReturnOutcome)] =
+        [:]
+    private var restoreRequests: [PendingSourceKey: Int] = [:]
+    private var restoreRecheckCounts: [PendingSourceKey: (generation: Int64, remote: PhotoUID?, count: Int)] = [:]
     private var reconcileTimer: Task<Void, Never>?
     private var actionsRunning = false
     private var actionsAgain = false
@@ -322,6 +328,8 @@ public actor PendingBackupCoordinator {
         laterTrashRecoveryTask?.cancel()
         startupLaterTrashKeys.removeAll()
         startupLaterTrashGenerations.removeAll()
+        restoreReturnOutcomes.removeAll()
+        restoreRecheckCounts.removeAll()
         snapshotContinuation.finish()
     }
 
@@ -377,6 +385,7 @@ public actor PendingBackupCoordinator {
             states[index] = kept
         }
         let excluded = requests.map(\.key)
+        for key in excluded { restoreRecheckCounts.removeValue(forKey: key) }
         recorder?.replacementLedger.dropSources(requests.map { ($0.key, $0.revision) })
         for state in states { sourceStates[state.key] = state }
         dirty.formUnion(excluded)
@@ -495,18 +504,69 @@ public actor PendingBackupCoordinator {
 
     /// Restores the sources behind Proton photos that the person restored from the Proton trash, when a
     /// pending delete had moved them there.
-    public func restoreSources(ofRemote uids: [PhotoUID]) async {
-        guard !closed, !uids.isEmpty else { return }
+    @discardableResult
+    public func restoreSources(ofRemote uids: [PhotoUID]) async -> PendingBackupRestoreResult {
+        guard !closed, !uids.isEmpty else {
+            return PendingBackupRestoreResult(discoveryComplete: !closed)
+        }
         let linkIDs = Set(uids.map(\.nodeID))
-        guard case .complete(let handoffs) = store.handoffsRead(forRemoteLinkIDs: Array(linkIDs)) else { return }
+        guard case .complete(let handoffs) = store.handoffsRead(forRemoteLinkIDs: Array(linkIDs)) else {
+            return PendingBackupRestoreResult(discoveryComplete: false)
+        }
         // The earlier upload of a deleted edit can have no handoff left; the delete recorded it as its photo.
         let deleted = sourceStates.values.filter { state in
             state.remote.map { linkIDs.contains($0.nodeID) } == true
         }.map(\.key)
-        let keys = Set(handoffs.map(\.key) + deleted)
-            .filter { sourceStates[$0]?.desired == .excluded }
-        guard !keys.isEmpty else { return }
-        _ = await restore(Array(keys), confirmedRemotes: uids)
+        let discovered = Set(handoffs.map(\.key) + deleted)
+        var states: [PendingSourceState] = []
+        for key in discovered {
+            switch store.sourceStateRead(for: key) {
+            case .unreadable:
+                return PendingBackupRestoreResult(
+                    outcomes: Dictionary(uniqueKeysWithValues: discovered.map { ($0, .unreadable) }))
+            case .readable(nil):
+                // Nothing is pending: the store deletes a row only once it is included with nothing owed.
+                continue
+            case .readable(let state?):
+                states.append(state)
+            }
+        }
+        let keys = Set(states.map(\.key))
+        let excluded = states.filter { $0.desired == .excluded }.map(\.key)
+        for key in keys { restoreRecheckCounts.removeValue(forKey: key) }
+        for key in keys { restoreRequests[key, default: 0] += 1 }
+        defer {
+            for key in keys {
+                if let count = restoreRequests[key], count > 1 {
+                    restoreRequests[key] = count - 1
+                } else {
+                    restoreRequests.removeValue(forKey: key)
+                    restoreReturnOutcomes.removeValue(forKey: key)
+                }
+            }
+        }
+        if !excluded.isEmpty {
+            guard await restore(excluded, confirmedRemotes: uids) else {
+                return PendingBackupRestoreResult(
+                    outcomes: Dictionary(uniqueKeysWithValues: keys.map { ($0, .unreadable) }))
+            }
+        } else {
+            await reconcile()
+        }
+        var result = PendingBackupRestoreResult()
+        for state in states {
+            let generation = state.generation + (state.desired == .excluded ? 1 : 0)
+            if let returned = restoreReturnOutcomes[state.key], returned.generation == generation {
+                result.outcomes[state.key] = returned.outcome
+            } else if case .readable(let current?) = store.sourceStateRead(for: state.key),
+                current.desired == .included, current.generation == generation
+            {
+                result.outcomes[state.key] = .waiting(until: current.nextAttemptAt)
+            } else {
+                result.outcomes[state.key] = .unreadable
+            }
+        }
+        return result
     }
 
     /// "Endgültig löschen" / "Papierkorb leeren": the entries leave "Zuletzt gelöscht", the photos stay
@@ -1271,18 +1331,17 @@ public actor PendingBackupCoordinator {
                 // permission of an earlier pass.
                 dueStatesIncomplete = incomplete
                 dueDecodedKeys = decoded
-                return read.states
+                return read.states.filter { !restoreRecheckIsPaused($0) }
             }
-            await performRemote(
-                .remoteRestore,
-                due().filter {
-                    $0.needsRemoteRestore && $0.desired == .included && $0.remote != nil
-                })
+            let restoring = due().filter {
+                $0.needsRemoteRestore && $0.desired == .included && $0.remote != nil
+            }
+            await performRemote(.remoteRestore, restoring)
             guard !closed else { return }
             await performQueueSync(
                 due().filter {
                     $0.needsQueueSync && ($0.desired == .excluded || !$0.needsRemoteRestore)
-                })
+                }, afterRestoring: Set(restoring.map(\.key)))
             guard !closed else { return }
             await performRemote(
                 .remoteTrash,
@@ -1346,7 +1405,9 @@ public actor PendingBackupCoordinator {
         return needsReconcile
     }
 
-    private func performQueueSync(_ states: [PendingSourceState]) async {
+    private func performQueueSync(
+        _ states: [PendingSourceState], afterRestoring restoredKeys: Set<PendingSourceKey>
+    ) async {
         let states = states.filter { !effectWriteIsPending($0.key) }
         guard !states.isEmpty else { return }
         let date = now()
@@ -1356,12 +1417,100 @@ public actor PendingBackupCoordinator {
             guard !closed else { return }
             finish(.queueSync, group, succeeded: ok, at: date)
         }
-        let included = states.filter { $0.desired == .included }
+        let included = states.filter { $0.desired == .included && $0.remote == nil }
         if !included.isEmpty {
             let ok = await effects.returnToBackup(included.map(\.key))
             guard !closed else { return }
             finish(.queueSync, included, succeeded: ok, at: date)
         }
+        for state in states where state.desired == .included && state.remote != nil {
+            let previous = restoreRecheckCounts[state.key]
+            let count =
+                previous?.generation == state.generation && previous?.remote == state.remote
+                ? (previous?.count ?? 0) + 1 : 1
+            restoreRecheckCounts[state.key] = (state.generation, state.remote, count)
+            let delay = Self.restoreRecheckDelays[min(count - 1, 2)]
+            // A late trash gets its first compensation at once and waits a minute after a refused one. A failed
+            // read waits on the same schedule as an incomplete compound, so an offline device does not use up its
+            // three checks within minutes. After the third check the source waits for a new launch or Restore.
+            let compensated = restoredKeys.contains(state.key)
+            func retryNotBefore(_ outcome: PendingBackupReturnOutcome) -> Date? {
+                guard outcome == .remoteTrashed else { return now().addingTimeInterval(delay) }
+                return compensated ? now().addingTimeInterval(60) : nil
+            }
+            // An edit of the source can replace the restored photo after its upload, also while a read runs: that trash
+            // is the replacement, not a late trash, and the newer version is the backup. The journal names the photo
+            // before the replacement trashes it, so a read that sees this trash also sees the journal entry.
+            let before = await restoredPhotoOutcome(state)
+            guard !closed else { return }
+            if before == .remoteTrashed, replacedByEdit(state) {
+                finishRestoredReturn(state, outcome: .completed, retryNotBefore: nil)
+                continue
+            }
+            if let before, before != .completed {
+                finishRestoredReturn(state, outcome: before, retryNotBefore: retryNotBefore(before))
+                continue
+            }
+            let outcomes = await effects.returnToBackup([state])
+            guard !closed else { return }
+            var outcome = outcomes[state.key] ?? .unreadable
+            if case .waiting(let until) = outcome {
+                outcome = .waiting(until: max(until, now().addingTimeInterval(delay)))
+            }
+            if outcome == .completed, let checked = await restoredPhotoOutcome(state) {
+                outcome = checked == .remoteTrashed && replacedByEdit(state) ? .completed : checked
+            }
+            guard !closed else { return }
+            finishRestoredReturn(state, outcome: outcome, retryNotBefore: retryNotBefore(outcome))
+        }
+    }
+
+    /// True when the edit replacement retired the restored photo, or intends to and may have trashed it already.
+    private func replacedByEdit(_ state: PendingSourceState) -> Bool {
+        guard state.key.kind == .photoLibraryAsset, let remote = state.remote, let replacementJournal else {
+            return false
+        }
+        let entry = replacementJournal.entry(
+            for: UploadSourceIdentity(kind: state.key.kind, identifier: state.key.identifier))
+        return entry.retired.contains(remote.nodeID) || entry.retireIntent?[remote.nodeID] != nil
+    }
+
+    /// With a backend reader, neither an omitted link nor a legacy inferred State can settle a restore.
+    /// Other effect implementations must supply their own verified typed outcome.
+    private func restoredPhotoOutcome(_ state: PendingSourceState) async -> PendingBackupReturnOutcome? {
+        guard let relations, let remote = state.remote else { return nil }
+        do {
+            let read = try await relations.linkVisibility(of: [remote.nodeID])
+            guard let visibility = read[remote.nodeID], visibility.hasExplicitPhotoState else { return .unreadable }
+            if visibility.isActiveMain { return .completed }
+            return visibility.trashTime != nil ? .remoteTrashed : .unreadable
+        } catch { return .unreadable }
+    }
+
+    private func finishRestoredReturn(
+        _ state: PendingSourceState, outcome: PendingBackupReturnOutcome, retryNotBefore: Date?
+    ) {
+        guard store.finishRestoreRecheck(state, outcome: outcome, at: now(), retryNotBefore: retryNotBefore) else {
+            beginFailedKeys.insert(state.key)
+            return
+        }
+        if restoreRequests[state.key] != nil {
+            let current = store.sourceStateRead(for: state.key)
+            let stillMatches: Bool
+            switch current {
+            case .readable(nil): stillMatches = outcome == .completed
+            case .readable(let row?): stillMatches = row.generation == state.generation && row.remote == state.remote
+            case .unreadable: stillMatches = false
+            }
+            restoreReturnOutcomes[state.key] = (state.generation, stillMatches ? outcome : .unreadable)
+        }
+        if outcome == .remoteTrashed { reconcileAgain = true }
+        reloadSourceStates([state.key])
+        if !unreadableSourceStates.contains(state.key), sourceStates[state.key] == nil {
+            restoreRecheckCounts.removeValue(forKey: state.key)
+        }
+        listsDirty = true
+        scheduleMembershipPublish()
     }
 
     private func performRemote(_ effect: PendingSourceEffect, _ states: [PendingSourceState]) async {
@@ -1513,7 +1662,9 @@ public actor PendingBackupCoordinator {
             }
         } else {
             unreadableRetry = nil
-            guard let next = store.nextEffectDate() else { return }
+            let next =
+                restoreRecheckCounts.isEmpty ? store.nextEffectDate() : readableNextEffectDate(includingDue: true)
+            guard let next else { return }
             delay = .seconds(max(1, next.timeIntervalSince(now())))
         }
         reconcileTimer = Task { [weak self, sleep] in
@@ -1524,15 +1675,24 @@ public actor PendingBackupCoordinator {
     }
 
     /// The next future retry of a readable source with an owed effect, from the last known states.
-    private func readableNextEffectDate() -> Date? {
+    private func readableNextEffectDate(includingDue: Bool = false) -> Date? {
         let current = now()
         let pendingKeys = Set(pendingEffectWrites.keys).union(pendingActionWrites.keys.map(\.key))
             .union(beginFailedKeys)
         return sourceStates.values.filter { state in
-            !unreadableSourceStates.contains(state.key) && !pendingKeys.contains(state.key)
+            !unreadableSourceStates.contains(state.key) && (includingDue || !pendingKeys.contains(state.key))
+                && !restoreRecheckIsPaused(state)
                 && (state.needsQueueSync || state.needsRemoteTrash || state.needsRemoteRestore)
-                && state.nextAttemptAt > current
+                && (includingDue || state.nextAttemptAt > current)
         }.map(\.nextAttemptAt).min()
+    }
+
+    private func restoreRecheckIsPaused(_ state: PendingSourceState) -> Bool {
+        guard state.desired == .included, state.needsQueueSync,
+            let checked = restoreRecheckCounts[state.key], checked.generation == state.generation,
+            checked.remote == state.remote
+        else { return false }
+        return checked.count >= 3
     }
 
     private static func normalized(_ uid: PhotoUID?, volume: String) -> PhotoUID? {

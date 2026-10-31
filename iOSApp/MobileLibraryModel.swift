@@ -705,9 +705,11 @@ final class MobileLibraryModel {
         try Task.checkCancellation()
         let locationStoreLease = locationStore.captureSessionLease()
         let uids = Set(items.map(\.uid))
+        let restoredPendingGrid = pendingGrid
         try await backend.restore(Array(uids))
         try requireCurrentMutation(mutationLease)
-        pendingGrid?.photosRestored(Array(uids))
+        let pendingRestore = await restoredPendingGrid?.restoreSources(ofRemote: Array(uids))
+        try requireCurrentMutation(mutationLease)
         timelineRemovals.restored(uids)
         timelineMutationGeneration &+= 1
         let generation = timelineMutationGeneration
@@ -733,6 +735,9 @@ final class MobileLibraryModel {
         if shouldRestartLocationCrawl {
             locationCrawl.prepareRestart()
             startLocationCrawlIfNeeded()
+        }
+        if pendingRestore?.isReadable == false {
+            throw UploadError.backend(String(localized: "alert.restore_failed_message"))
         }
     }
 

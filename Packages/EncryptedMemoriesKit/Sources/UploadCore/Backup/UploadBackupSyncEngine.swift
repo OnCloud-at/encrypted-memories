@@ -281,6 +281,36 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         return generation
     }
 
+    /// The pending decision remains durable until a real pass rechecks this exact compound.
+    public func reopenRestoredCompound(
+        _ candidate: UploadBackupAssetCandidate, isCurrent: @Sendable () -> Bool
+    ) async throws -> Bool {
+        try Task.checkCancellation()
+        guard isCurrent() else { return false }
+        guard let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision) else {
+            guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
+            try await preflight.markPending(candidate.snapshot)
+            return isCurrent()
+        }
+        guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
+        guard row.state.isTerminalSuccess else {
+            guard row.remoteCommitReconciliation == nil, !row.state.isActive else { return false }
+            try await preflight.markPending(candidate.snapshot)
+            return isCurrent()
+        }
+        guard let reopen = queue.restoredCompoundReopener else {
+            throw Self.localStateError("Backup queue does not support a restored compound recheck")
+        }
+        try await preflight.markPending(candidate.snapshot)
+        try Task.checkCancellation()
+        guard isCurrent() else { return false }
+        guard let reopened = reopen(row, now()) else {
+            throw Self.localStateError("Backup queue could not recheck a restored compound")
+        }
+        guard reopened else { return false }
+        return true
+    }
+
     public func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
         var missing: [UploadBackupAssetCandidate] = []
         for candidate in candidates {

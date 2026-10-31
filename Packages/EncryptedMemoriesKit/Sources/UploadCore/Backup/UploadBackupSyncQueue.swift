@@ -259,6 +259,9 @@ public enum UploadBackupCatalogReplayState: Int, Sendable, Codable {
 }
 
 public protocol UploadBackupSyncQueueStore: Sendable {
+    /// Optional atomic restore recheck capability. Nil means unsupported, without changing the store.
+    /// The operation returns true after the exact terminal row reopens, false after a lost CAS, or nil on failure.
+    var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? { get }
     /// False after a SQLite operation failed or the store was closed. An empty read is safe to
     /// interpret as "drained" only while this remains true.
     func isOperational() -> Bool
@@ -370,6 +373,8 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 }
 
 public extension UploadBackupSyncQueueStore {
+    var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? { nil }
+
     func updateDismissedSourceRecheck(
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
     ) -> Bool? { nil }

@@ -131,6 +131,203 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         snapshot.tiles.map(\.key.identifier)
     }
 
+    // MARK: - Restore recheck obligations (#829 part 2)
+
+    private final class AppliedTrashReadCount: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        var count: Int { lock.withLock { value } }
+        func next() -> Int {
+            lock.withLock {
+                value += 1
+                return value
+            }
+        }
+    }
+
+    func testConfirmedRestoreRechecksActiveStateAfterLateTrashApplies() async throws {
+        await coordinator.close()
+        let relations = FakeChecker()
+        coordinator = makeCoordinator(relations: relations)
+        let id = "restore-before-trash-applies"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "late-trash-photo")
+        let pendingEffects = try XCTUnwrap(effects)
+        let postApplyReads = AppliedTrashReadCount()
+        // The fake records a trash only after its before-application gate opens. A compensating restore
+        // changes that same server state; the probe never substitutes a canned successful recheck.
+        relations.onVisibilityLookup = { [relations] in
+            // One genuine post-apply trash read must precede the bounded, ordinary read failure.
+            // The second lookup ends this drain even if the compensation obligation is removed.
+            if !pendingEffects.trashed.isEmpty, postApplyReads.next() > 1 {
+                relations.linkVisibilityError = UploadError.backend("The bounded follow-up read is unavailable")
+                return
+            }
+            let active = pendingEffects.trashed.count <= pendingEffects.restored.count
+            relations.linkVisibilityByID[remote.nodeID] = RemoteLinkVisibility(
+                isActive: active, mainPhotoLinkID: nil, trashTime: active ? nil : 1_750_000_001)
+        }
+        defer { relations.onVisibilityLookup = nil }
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the source really owns the restored photo") { $0.tiles.first?.handoff == remote }
+        let gate = LookupGate()
+        effects.trashGate = gate
+        let running = try XCTUnwrap(coordinator)
+        let deleting = Task { await running.exclude([sourceKey.localUID]) }
+        guard await gate.entered(within: .seconds(5)) else {
+            gate.open()
+            _ = await deleting.value
+            return XCTFail("the trash request must wait before applying its remote effect")
+        }
+        do {
+            XCTAssertTrue(effects.trashed.isEmpty, "the server has not applied the held trash")
+            // The person's Proton restore succeeds now, before the old trash takes effect.
+            await coordinator.restoreSources(ofRemote: [remote])
+            let included = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(included.desired, .included)
+            XCTAssertEqual(included.remote, remote)
+        } catch {
+            gate.open()
+            _ = await deleting.value
+            throw error
+        }
+        gate.open()
+        let deleted = await deleting.value
+
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(effects.trashed, [[remote]], "the old trash really applies after the person's restore")
+        XCTAssertGreaterThan(relations.linkVisibilityCallCount, 0, "acknowledgement requires a fresh activity read")
+        XCTAssertEqual(effects.restored, [[remote]], "the later applied trash requires exactly one compensation")
+        XCTAssertEqual(postApplyReads.count, 2, "The genuine trash read and bounded follow-up must both execute")
+    }
+
+    func testRemoteRestoreReadmitsTheExcludedKeyBesideASourceWithoutPendingState() async throws {
+        let (good, missing, before, _) = try await restoreWithMissingDiscoveredKey()
+        XCTAssertEqual(before.desired, .excluded)
+        XCTAssertNotEqual(
+            store.sourceState(for: good)?.desired, .excluded, "A source without pending state must not block it")
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertFalse(snapshot.excludedTiles.contains { $0.key == good })
+        XCTAssertEqual(effects.returned, [[good]], "Only the excluded key returns to the backup")
+        XCTAssertTrue(effects.restored.isEmpty, "Proton already restored this photo")
+        XCTAssertEqual(store.sourceStateRead(for: missing), .readable(nil), "Nothing pending is created for it")
+    }
+
+    func testRemoteRestoreLeavesASourceWithoutPendingStateOutOfTheResult() async throws {
+        let (good, _, _, result) = try await restoreWithMissingDiscoveredKey()
+        XCTAssertTrue(result.discoveryComplete, "the handoffs themselves were read completely")
+        XCTAssertEqual(Set(result.outcomes.keys), [good], "A source without pending state has no outcome")
+        XCTAssertNotEqual(result.outcomes[good], .unreadable)
+        XCTAssertTrue(result.isReadable, "The host must not report a failed restore")
+    }
+
+    // An upload leaves a handoff; a delete in the timeline only trashes the Proton photo and writes no pending
+    // state. Restoring it from Recently Deleted must not report a failure.
+    func testRestoringAPhotoDeletedOnlyInProtonIsReadableAndChangesNothing() async throws {
+        let id = "timeline-deleted-source"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "timeline-deleted-photo")
+        enqueue(id, state: .uploading)
+        await coordinator.start()
+        recorder.recordHandoff(source: source(id), revision: revision, remote: remote, kind: .uploaded)
+        await waitForSnapshot("the handoff belongs to the source") { $0.tiles.first?.handoff == remote }
+        XCTAssertEqual(store.sourceStateRead(for: sourceKey), .readable(nil), "The timeline delete wrote no state")
+
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(result.discoveryComplete)
+        XCTAssertEqual(result.outcomes, [:], "Nothing was pending for this source")
+        XCTAssertTrue(result.isReadable, "The host must not report a failed restore")
+        XCTAssertEqual(store.sourceStateRead(for: sourceKey), .readable(nil))
+        XCTAssertTrue(effects.returned.isEmpty)
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+
+    private func restoreWithMissingDiscoveredKey() async throws -> (
+        PendingSourceKey, PendingSourceKey, PendingSourceState, PendingBackupRestoreResult
+    ) {
+        await coordinator.close()
+        coordinator = makeCoordinator()
+        let good = key("readable-restore-source")
+        let missing = key("missing-restore-source")
+        let remote = PhotoUID(volumeID: "vol", nodeID: "shared-restored-photo")
+        enqueue(good.identifier, state: .uploading)
+        for sourceKey in [good, missing] {
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+                .recorded)
+        }
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: good, presentation: nil, remote: remote)], at: date))
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: good, generation: 1, remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: good, generation: 1, at: date))
+        let before = try XCTUnwrap(store.sourceState(for: good))
+        XCTAssertEqual(store.sourceStateRead(for: missing), .readable(nil))
+        await coordinator.start()
+
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+        return (good, missing, before, result)
+    }
+
+    func testRestoreRecheckCleansMarkerForSameUIDAndGeneration() async throws {
+        try await assertRestoreRecheckMarkerCleanup(changesGeneration: false)
+    }
+
+    func testRestoreRecheckKeepsMarkerForNewerUIDAndGeneration() async throws {
+        try await assertRestoreRecheckMarkerCleanup(changesGeneration: true)
+    }
+
+    private func assertRestoreRecheckMarkerCleanup(changesGeneration: Bool) async throws {
+        await coordinator.close()
+        let id = "restored-marker-source"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "restored-marker-photo")
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        coordinator = makeCoordinator(relations: relations)
+        enqueue(id, state: .alreadyBackedUp)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: sourceKey, presentation: nil, remote: remote)], at: date))
+        let excluded = try XCTUnwrap(store.sourceState(for: sourceKey))
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [excluded]), [sourceKey])
+        XCTAssertTrue(
+            Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 5000)", of: id, at: storeURL))
+        await coordinator.start()
+        let later = date.timeIntervalSince1970 + 5000
+        if changesGeneration {
+            effects.onReturn = { [storeURL] in
+                XCTAssertTrue(
+                    PendingBackupCoordinatorTests.setColumns(
+                        "generation=generation+1, remote_link_id='newer-marker-photo', next_attempt_at=\(later)",
+                        of: id, at: storeURL))
+            }
+        }
+
+        await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertTrue(effects.trashed.isEmpty, "no live trash was started by this marker-recovery fixture")
+        XCTAssertTrue(effects.restored.isEmpty, "a freshly active photo needs no additional restore")
+        if changesGeneration {
+            let current = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertEqual(current.generation, excluded.generation + 2)
+            XCTAssertEqual(current.remote?.nodeID, "newer-marker-photo")
+            XCTAssertEqual(current.remoteOperation, .remoteTrash, "an old recheck never clears a newer marker")
+            XCTAssertTrue(current.needsQueueSync)
+        } else {
+            XCTAssertNil(
+                store.sourceState(for: sourceKey), "a successful same-UID recheck must retire the stale marker row")
+        }
+    }
+
     // MARK: - Confirmed Proton restore (#829)
 
     func testConfirmedRemoteRestoreOfPhotoSendsNoSecondRestore() async throws {
@@ -1881,7 +2078,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
     // Mutation: return nil from `newestEarlierMain`; the restore has no photo to bring back.
     func testRestoringAnEditWithoutAHandoffBringsTheEarlierUploadBack() async throws {
-        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore())
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore(), relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         await coordinator.restore([key("p").localUID])
@@ -1893,7 +2092,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
     // Mutation: drop the source-state lookup in `restoreSources(ofRemote:)`; the source stays deleted.
     func testRestoringTheEarlierUploadFromTheProtonTrashRestoresAnEditWithoutAHandoff() async throws {
-        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore())
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore(), relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         await coordinator.restoreSources(ofRemote: [earlier])
@@ -2105,7 +2306,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     }
 
     func testRestoringADeletedEditBringsTheEarlierUploadBackBeforeTheBackupSeesIt() async throws {
-        try await startPendingEdit()
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEdit(relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         await coordinator.restore([key("p").localUID])
@@ -2116,7 +2319,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     }
 
     func testRestoringAfterAnUndoInPhotosBringsTheEarlierUploadBack() async throws {
-        try await startPendingEdit()
+        let relations = FakeChecker()
+        relations.linkVisibilityByID[earlier.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+        try await startPendingEdit(relations: relations)
         await coordinator.exclude([key("p").localUID])
 
         // The person reverts the edit in Photos while the photo is deleted in the app.
@@ -4140,6 +4345,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         private let lock = NSLock()
         private var interrupted = 0
         private let fragment: String
+        private let armAfter: String?
+        private var armed: Bool
         private var skip: Int
         private var limit: Int
         var count: Int { lock.withLock { interrupted } }
@@ -4147,9 +4354,11 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         /// Lets the first `skip` matching reads pass, then interrupts at most `limit` of them.
         init(
             matching fragment: String = "FROM source_state WHERE source_kind=? AND source_id=?", skip: Int = 0,
-            limit: Int = .max
+            limit: Int = .max, armAfter: String? = nil
         ) {
             self.fragment = fragment
+            self.armAfter = armAfter
+            self.armed = armAfter == nil
             self.skip = skip
             self.limit = limit
         }
@@ -4163,10 +4372,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                         guard let context, let pointer else { return 0 }
                         let statement = OpaquePointer(pointer)
                         let failure = Unmanaged<KeyedReadFailure>.fromOpaque(context).takeUnretainedValue()
-                        guard let sql = sqlite3_sql(statement).map({ String(cString: $0) }),
-                            sql.contains(failure.fragment)
-                        else { return 0 }
+                        guard let sql = sqlite3_sql(statement).map({ String(cString: $0) }) else { return 0 }
+                        if let armAfter = failure.armAfter, sql.contains(armAfter) {
+                            failure.lock.withLock { failure.armed = true }
+                        }
+                        guard sql.contains(failure.fragment) else { return 0 }
                         let interrupts = failure.lock.withLock { () -> Bool in
+                            guard failure.armed else { return false }
                             if failure.skip > 0 {
                                 failure.skip -= 1
                                 return false
@@ -4367,6 +4579,18 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
         }
         hook?()
         return true
+    }
+
+    var typedReturnOverride: [PendingSourceKey: PendingBackupReturnOutcome]? {
+        get { lock.withLock { _typedReturnOverride } }
+        set { lock.withLock { _typedReturnOverride = newValue } }
+    }
+    private var _typedReturnOverride: [PendingSourceKey: PendingBackupReturnOutcome]?
+
+    func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
+        let succeeded = await returnToBackup(states.map(\.key))
+        if let override = typedReturnOverride { return override }
+        return Dictionary(uniqueKeysWithValues: states.map { ($0.key, succeeded ? .completed : .unreadable) })
     }
 
     /// Runs once at the next volume lookup, which comes after a delete is stored and before its trash is sent.
@@ -4590,4 +4814,458 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
     func settleGone(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws {}
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
+}
+
+extension PendingBackupCoordinatorTests {
+    func testIncompleteRestoreChecksBackOffAndStopUntilRestartOrAnExplicitRestore() async throws {
+        for resume in ["restart", "explicit restore"] {
+            await coordinator.close()
+            let id = "bounded-compound-\(resume)"
+            let sourceKey = key(id)
+            let remote = PhotoUID(volumeID: "vol", nodeID: id)
+            let clock = ResultWriteClock(date)
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+                ),
+                .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: sourceKey, generation: excluded.generation,
+                    remoteLinkID: remote.nodeID, at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+            let relations = FakeChecker()
+            relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+            effects = FakePendingEffects()
+            effects.typedReturnOverride = [sourceKey: .waiting(until: date)]
+            coordinator = makeCoordinator(relations: relations, clock: clock)
+            await coordinator.start()
+            _ = await coordinator.restoreSources(ofRemote: [remote])
+
+            for (index, delay) in [60, 300, 900].enumerated() {
+                XCTAssertEqual(effects.returned.filter { $0 == [sourceKey] }.count, index + 1)
+                let retained = try XCTUnwrap(store.sourceState(for: sourceKey))
+                XCTAssertTrue(retained.needsQueueSync)
+                XCTAssertEqual(retained.remote, remote)
+                XCTAssertEqual(retained.attempts, 0)
+                XCTAssertEqual(retained.nextAttemptAt, clock.now.addingTimeInterval(Double(delay)))
+                clock.advance(by: .seconds(delay))
+                if index < 2 {
+                    // An unrelated trigger joins a real reconcile but must not reset this source's ceiling.
+                    _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+                }
+            }
+            let reads = relations.linkVisibilityCallCount
+            _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+            XCTAssertEqual(
+                effects.returned.filter { $0 == [sourceKey] }.count, 3, "The session ceiling stops effect calls")
+            XCTAssertEqual(relations.linkVisibilityCallCount, reads, "The ceiling stops even the preceding fresh read")
+            let paused = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertTrue(paused.needsQueueSync)
+            XCTAssertEqual(paused.remote, remote)
+            XCTAssertEqual(paused.attempts, 0)
+            XCTAssertTrue(effects.restored.isEmpty)
+            XCTAssertTrue(effects.trashed.isEmpty)
+
+            effects.typedReturnOverride = [sourceKey: .completed]
+            clock.advance(by: .seconds(1))
+            if resume == "restart" {
+                await coordinator.close()
+                coordinator = makeCoordinator(relations: relations, clock: clock)
+                await coordinator.start()
+            } else {
+                let completed = await coordinator.restoreSources(ofRemote: [remote])
+                XCTAssertEqual(completed.outcomes[sourceKey], .completed)
+            }
+            XCTAssertNil(store.sourceState(for: sourceKey), "Fresh successful proof can retire the retained duty")
+            XCTAssertEqual(effects.returned.filter { $0 == [sourceKey] }.count, 4)
+        }
+    }
+
+    func testFailedRestoreReadsUseTheSameGrowingWaitsBeforeTheCeiling() async throws {
+        await coordinator.close()
+        let id = "offline-restore-check"
+        let sourceKey = key(id)
+        let remote = PhotoUID(volumeID: "vol", nodeID: id)
+        let clock = ResultWriteClock(date)
+        enqueue(id, state: .completed)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: sourceKey, generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+        // No visibility entry: every fresh read fails, as it does offline.
+        let relations = FakeChecker()
+        effects = FakePendingEffects()
+        coordinator = makeCoordinator(relations: relations, clock: clock)
+        await coordinator.start()
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+
+        for (index, delay) in [60, 300, 900].enumerated() {
+            XCTAssertEqual(relations.linkVisibilityCallCount, index + 1, "One fresh read per automatic check")
+            let retained = try XCTUnwrap(store.sourceState(for: sourceKey))
+            XCTAssertTrue(retained.needsQueueSync)
+            XCTAssertEqual(retained.remote, remote)
+            XCTAssertEqual(retained.attempts, 0)
+            XCTAssertEqual(
+                retained.nextAttemptAt, clock.now.addingTimeInterval(Double(delay)),
+                "Check \(index + 1) waits \(delay) seconds")
+            clock.advance(by: .seconds(delay))
+            _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+        }
+        XCTAssertEqual(relations.linkVisibilityCallCount, 3, "The ceiling stops a fourth automatic read")
+        XCTAssertTrue(effects.returned.isEmpty, "A failed read never reaches the typed effect")
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+
+    func testARestoreCheckTreatsTheTrashOfAPhotoAnEditReplacedAsDone() async throws {
+        for replacement in [
+            "none", "unretired", "retired", "retire intent", "intent during the read", "intent during the final read",
+        ] {
+            await coordinator.close()
+            let id = "edit-replaced-restore-\(replacement.replacingOccurrences(of: " ", with: "-"))"
+            let sourceKey = key(id)
+            let remote = PhotoUID(volumeID: "vol", nodeID: id)
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+                ),
+                .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: sourceKey, generation: excluded.generation, remoteLinkID: remote.nodeID,
+                    at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+            // After the Restore the photo is in the Proton trash again.
+            let relations = FakeChecker()
+            relations.linkVisibilityByID[remote.nodeID] = .init(
+                isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_001)
+            let journal = try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: directory))
+            let photo = source(id)
+            switch replacement {
+            case "retired", "retire intent", "unretired":
+                try journal.addSuperseded(remote, for: photo)
+                try journal.prepareToRetire([remote.nodeID: []], for: photo)
+                if replacement != "retire intent" {
+                    try journal.settle([remote.nodeID], related: [], trashed: true, for: photo)
+                }
+                // The person restored the replaced photo: it is in the library again by choice.
+                if replacement == "unretired" { try journal.unretire([remote.nodeID], for: photo) }
+            case "intent during the read":
+                // The edit replacement writes its intent and trashes the photo while the fresh read runs.
+                relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+                relations.onVisibilityLookup = { [relations] in
+                    try? journal.addSuperseded(remote, for: photo)
+                    try? journal.prepareToRetire([remote.nodeID: []], for: photo)
+                    relations.linkVisibilityByID[remote.nodeID] = .init(
+                        isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_002)
+                }
+            case "intent during the final read":
+                // The compound is complete at the first read; the replacement trashes the photo before the final read.
+                relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+                let reads = AppliedTrashReadCount()
+                relations.onVisibilityLookup = { [relations] in
+                    guard reads.next() == 2 else { return }
+                    try? journal.addSuperseded(remote, for: photo)
+                    try? journal.prepareToRetire([remote.nodeID: []], for: photo)
+                    relations.linkVisibilityByID[remote.nodeID] = .init(
+                        isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_002)
+                }
+            default: break
+            }
+            effects = FakePendingEffects()
+            if replacement == "intent during the final read" { effects.typedReturnOverride = [sourceKey: .completed] }
+            coordinator = makeCoordinator(replacementJournal: journal, relations: relations)
+            await coordinator.start()
+
+            let result = await coordinator.restoreSources(ofRemote: [remote])
+
+            relations.onVisibilityLookup = nil
+            if replacement == "none" || replacement == "unretired" {
+                XCTAssertEqual(effects.restored, [[remote]], "\(replacement): a late trash gets its compensation")
+                XCTAssertNotNil(store.sourceState(for: sourceKey))
+                continue
+            }
+            XCTAssertTrue(effects.restored.isEmpty, "\(replacement): the edit's trash of the old photo stands")
+            if replacement == "intent during the final read" {
+                XCTAssertEqual(
+                    effects.returned, [[sourceKey]], "The race reached the final read after a complete compound")
+            } else {
+                XCTAssertTrue(effects.returned.isEmpty, "\(replacement): the newer version already backed up")
+            }
+            XCTAssertEqual(result.outcomes[sourceKey], .completed, replacement)
+            XCTAssertNil(store.sourceState(for: sourceKey), "\(replacement): the Restore duty is done")
+        }
+    }
+
+    private struct LookupArmedRestoreResolver: BackupResourceResolving {
+        let resource: BackupResolvedResource
+        let arm: @Sendable () async -> Void
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            await arm()
+            return resource
+        }
+    }
+
+    func testRevokedRestoreAdoptionCannotCreateARunnerHandoffOrRemoteTrash() async throws {
+        for exactFallback in [false, true] {
+            await coordinator.close()
+            let id = exactFallback ? "revoked-exact" : "revoked-manifest"
+            let target = source(id)
+            let targetKey = key(id)
+            let date = self.date
+            let pending = try XCTUnwrap(store)
+            let manifest = try XCTUnwrap(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("\(id)-identities.sqlite")))
+            defer { manifest.close() }
+            let state = try XCTUnwrap(
+                UploadBackupStateManifestStore(url: directory.appendingPathComponent("\(id)-backup.sqlite")))
+            defer { state.close() }
+            let checker = FakeChecker()
+            let pipeline = UploadDedupePipeline(store: manifest, checker: checker, now: { date })
+            let digest = Data(repeating: 0xCA, count: 20)
+            let hex = UploadContentSHA1.hexString(digest: digest)
+            let descriptor = UploadResourceDescriptor(
+                source: target, fileURL: directory.appendingPathComponent(id), filename: "\(id).heic",
+                fileSize: 20, modificationDate: date, precomputedSHA1Digest: digest, backupRevision: revision)
+            let before = UploadIdentityRecord(
+                source: target, filename: descriptor.filename, correctedName: descriptor.filename,
+                fileSize: 20, modificationDate: date, sha1Hex: hex,
+                nameHash: "nh(\(descriptor.filename))", contentHash: "ch(\(hex))", hashKeyEpoch: "epoch-1",
+                updatedAt: date)
+            XCTAssertTrue(manifest.upsert(before))
+            if exactFallback {
+                checker.exactActiveDuplicates = [.init(volumeID: "vol", nodeID: "foreign-donor")]
+            } else {
+                var donor = before
+                donor.source = source("donor-\(id)")
+                donor.remoteVolumeID = "vol"
+                donor.remoteLinkID = "foreign-donor"
+                donor.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+                XCTAssertTrue(manifest.upsert(donor))
+            }
+            checker.linkVisibilityByID["foreign-donor"] = .init(isActive: true, mainPhotoLinkID: nil)
+            let context = UploadRestoredCompoundContext(
+                source: target, revision: revision, generation: 2,
+                confirmedRemote: .init(volumeID: "vol", nodeID: "confirmed"))
+            try await pipeline.prepareRestoredCompound(context, isCurrent: { true })
+            let reached = AppliedTrashReadCount()
+            let revoke: @Sendable () async -> Void = {
+                _ = reached.next()
+                XCTAssertNotNil(pending.exclude([.init(key: targetKey, presentation: nil, remote: nil)], at: date))
+                await pipeline.endRestoredCompound(context)
+            }
+            let candidate = UploadBackupAssetCandidate(
+                snapshot: .init(source: target, revision: revision, resourceCount: 1),
+                originalFilename: descriptor.filename, byteCount: 20)
+            let resolver = LookupArmedRestoreResolver(
+                resource: .init(
+                    candidate: candidate, descriptor: descriptor, mediaType: "image/heic", captureDate: date),
+                arm: {
+                    // Arm after the real runner primes, so the suspended lookup belongs to resolve itself.
+                    await pipeline.invalidateCachedRemoteState()
+                    if exactFallback {
+                        checker.findError = UploadError.backend("Detailed lookup unavailable")
+                        checker.exactLookupGate = revoke
+                    } else {
+                        checker.nameLookupGate = revoke
+                    }
+                })
+            enqueue(id, state: .queuedForUpload)
+            let uploader = MockUploader()
+            let clock = BackupTestClock(start: date)
+            let runner = BackupSyncRunner(
+                queue: queue, preflight: UploadBackupPreflightIndex(store: state), resolver: resolver,
+                identityResolver: pipeline, uploader: uploader,
+                configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
+                events: recorder, now: { clock.now })
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            await runner.stop()
+
+            XCTAssertEqual(reached.count, 1, "The real runner must reach exactly the gated adoption lookup")
+            XCTAssertEqual(manifest.record(for: target), before, "Revocation cannot write a donor identity")
+            XCTAssertTrue(
+                store.latestHandoffs(for: [targetKey]).isEmpty, "No donor handoff may reach the pending store")
+            let excluded = try XCTUnwrap(store.sourceState(for: targetKey))
+            XCTAssertEqual(excluded.desired, .excluded)
+            XCTAssertNil(excluded.remote)
+            XCTAssertFalse(excluded.needsRemoteTrash)
+            XCTAssertTrue(uploader.requests.isEmpty)
+            let interrupted = try XCTUnwrap(queue.entry(for: target, revision: revision))
+            XCTAssertEqual(interrupted.attempts, 0)
+            XCTAssertFalse(interrupted.state.isTerminalSuccess)
+            effects = FakePendingEffects()
+            coordinator = makeCoordinator()
+            await coordinator.start()
+            XCTAssertTrue(
+                effects.trashed.isEmpty, "A revoked adoption cannot schedule remote trash through reconciliation")
+        }
+    }
+
+    func testPersistentRestoreRefusalDefersCompensationWithoutBurningAttempts() async throws {
+        await coordinator.close()
+        let id = "persistently-refused-restore"
+        let remote = PhotoUID(volumeID: "vol", nodeID: "refused-main")
+        let clock = ResultWriteClock(date)
+        enqueue(id, state: .completed)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key(id), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: key(id), generation: excluded.generation,
+                remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+        let relations = FakeChecker()
+        let refused = try XCTUnwrap(effects)
+        // A permanent per-item refusal is settled by the batch adapter, but the fresh read stays trashed.
+        // After three requests the fixture reports an unavailable read, so a broken loop ends on data,
+        // not a timeout. More than one request before the persisted due time is the direct failure.
+        relations.onVisibilityLookup = {
+            relations.linkVisibilityByID[remote.nodeID] = .init(
+                isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_000)
+            if refused.restored.count >= 3 {
+                relations.linkVisibilityError = UploadError.backend("Bounded refusal fixture exhausted")
+            }
+        }
+        coordinator = makeCoordinator(relations: relations, clock: clock)
+        await coordinator.start()
+
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertEqual(effects.restored, [[remote]], "One refusal must defer the next remote compensation")
+        let retained = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(retained.needsRemoteRestore, "A refused restore still owes its exact photo")
+        XCTAssertTrue(retained.needsQueueSync)
+        XCTAssertEqual(retained.remote, remote)
+        XCTAssertEqual(retained.attempts, 0, "An unsuccessful recheck cannot burn the effect budget")
+        XCTAssertEqual(retained.nextAttemptAt, date.addingTimeInterval(60))
+        clock.advance(by: .seconds(59))
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertEqual(effects.restored, [[remote]], "The persisted delay must also gate a new reconcile call")
+        clock.advance(by: .seconds(1))
+        _ = await coordinator.restoreSources(ofRemote: [remote])
+        XCTAssertEqual(effects.restored, [[remote], [remote]], "Exactly one retry becomes due after the delay")
+        let retried = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertTrue(retried.needsRemoteRestore)
+        XCTAssertEqual(retried.remote, remote)
+        XCTAssertEqual(retried.attempts, 0)
+        XCTAssertEqual(retried.nextAttemptAt, clock.now.addingTimeInterval(60))
+        XCTAssertTrue(effects.returned.isEmpty, "A still-trashed main cannot enter the compound recheck")
+    }
+
+    func testMissingTypedRestoreOutcomeIsUnreadableAndKeepsItsUIDOwed() async throws {
+        await coordinator.close()
+        let id = "missing-typed-outcome"
+        enqueue(id, state: .completed)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "missing-typed-target")
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key(id), revision: revision,
+                    remote: remote, kind: .uploaded, createdAt: date)), .recorded)
+        let excluded = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?.first)
+        XCTAssertTrue(
+            store.completeEffect(
+                .remoteTrash, for: key(id), generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+        effects.typedReturnOverride = [:]
+        coordinator = makeCoordinator()
+        await coordinator.start()
+
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+
+        XCTAssertEqual(result.outcomes[key(id)], .unreadable)
+        let retained = try XCTUnwrap(store.sourceState(for: key(id)))
+        XCTAssertEqual(retained.remote, remote)
+        XCTAssertTrue(retained.needsQueueSync)
+        XCTAssertEqual(retained.nextAttemptAt, date.addingTimeInterval(60))
+        XCTAssertEqual(retained.attempts, 0)
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+
+    func testUnreadableDiscoveredRestoreKeyReportsTheWholeBatchWithoutReturningAHealthySubset() async throws {
+        await coordinator.close()
+        let remote = PhotoUID(volumeID: "vol", nodeID: "two-source-restore")
+        for id in ["readable-key", "unreadable-key"] {
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: key(id), revision: revision,
+                        remote: remote, kind: .uploaded, createdAt: date)), .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?
+                    .first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: key(id), generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+        }
+        coordinator = makeCoordinator()
+        await coordinator.start()
+        // Startup recovery may read the same keys. Arm only at this restore's reverse query;
+        // its discovery reads follow without an actor suspension.
+        let failure = KeyedReadFailure(limit: 1, armAfter: "FROM handoff WHERE remote_link_id=?")
+        try failure.install(on: store)
+        let result = await coordinator.restoreSources(ofRemote: [remote])
+        failure.remove(from: store)
+        XCTAssertEqual(failure.count, 1, "The keyed discovery read really failed")
+        XCTAssertEqual(result.outcomes, [key("readable-key"): .unreadable, key("unreadable-key"): .unreadable])
+        XCTAssertTrue(effects.returned.isEmpty, "A complete reverse query does not permit a partial source-state read")
+        XCTAssertTrue(effects.restored.isEmpty)
+    }
+}
+
+extension PendingBackupCoordinatorTests {
+    func testConfirmedRestoreRequiresAnExplicitActiveMainBeforeCallingTheTypedEffect() async throws {
+        for kind in ["missing", "inferred", "inactive", "related"] {
+            await coordinator.close()
+            let id = "fresh-coordinator-\(kind)"
+            let remote = PhotoUID(volumeID: "vol", nodeID: "main-\(kind)")
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: key(id), revision: revision, remote: remote,
+                        kind: .uploaded, createdAt: date)), .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: remote)], at: date)?
+                    .first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: key(id), generation: excluded.generation, remoteLinkID: remote.nodeID, at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: excluded.generation, at: date))
+            let relations = FakeChecker()
+            if kind != "missing" {
+                relations.linkVisibilityByID[remote.nodeID] = .init(
+                    isActive: kind != "inactive",
+                    mainPhotoLinkID: kind == "related" ? "foreign" : nil, hasExplicitPhotoState: kind != "inferred")
+            }
+            effects = FakePendingEffects()
+            coordinator = makeCoordinator(relations: relations)
+            await coordinator.start()
+            let result = await coordinator.restoreSources(ofRemote: [remote])
+            XCTAssertEqual(result.outcomes[key(id)], .unreadable, kind)
+            XCTAssertTrue(effects.returned.isEmpty, "No active proof means no controller admission: \(kind)")
+            XCTAssertTrue(try XCTUnwrap(store.sourceState(for: key(id))).needsQueueSync)
+            XCTAssertEqual(store.sourceState(for: key(id))?.remote, remote)
+        }
+    }
 }
