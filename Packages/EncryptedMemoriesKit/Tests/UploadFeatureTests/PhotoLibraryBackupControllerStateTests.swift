@@ -2307,6 +2307,164 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        // The short grace of a pass can expire before a waiting window resumes, so a window must learn its run while
+        // the run starts, before `idleTimerHook` reports it (#472).
+
+        func testAWindowThatStartsItsPassAtOnceIsAdmittedBeforeTheRunIsReportedActive() async throws {
+            try await assertWindowIsAdmittedFirst(resumeAtLaunchWaits: false, pathKnown: true)
+        }
+
+        func testAWindowThatWaitsForItsOwnPassIsAdmittedBeforeTheRunIsReportedActive() async throws {
+            try await assertWindowIsAdmittedFirst(resumeAtLaunchWaits: false)
+        }
+
+        func testAWindowThatWaitsForTheResumeAtLaunchIsAdmittedBeforeTheRunIsReportedActive() async throws {
+            try await assertWindowIsAdmittedFirst(resumeAtLaunchWaits: true)
+        }
+
+        private func assertWindowIsAdmittedFirst(resumeAtLaunchWaits: Bool, pathKnown: Bool = false) async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .backgroundPermitted
+                if pathKnown { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-window-admitted-first", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            // The pass holds its scan until the test stops it, so no second pass can report itself active.
+            controller.replaceScanForTesting { try await Task.sleep(for: .seconds(60)) }
+            var events: [String] = []
+            controller.idleTimerHook = { active in
+                if active { events.append("active:\(controller.activeExecutionRunID ?? "none")") }
+            }
+            if resumeAtLaunchWaits { controller.syncNow() }
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(
+                    owner: .iOSBackgroundTask, onRunStarted: { events.append("started:\($0)") },
+                    onRunAdmitted: { events.append("admitted:\($0)") })
+            }
+            if !pathKnown {
+                _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+                XCTAssertEqual(events, [], "nothing starts before the first path")
+                runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            }
+
+            let started = await waitUntil { events.contains { $0.hasPrefix("started:") } }
+            XCTAssertTrue(started, "the waiting window receives the run")
+            let runID = try XCTUnwrap(events.first.map { String($0.dropFirst("admitted:".count)) })
+            XCTAssertEqual(
+                events, ["admitted:\(runID)", "active:\(runID)", "started:\(runID)"],
+                "the window is admitted to its run before the run is reported active, and once")
+            XCTAssertEqual(controller.executionOwnerForTesting, .iOSBackgroundTask)
+            controller.stopSync()
+            _ = await window.value
+            controller.idleTimerHook = nil
+            await controller.shutdown()
+        }
+
+        func testAWindowThatAForegroundPassOutranksIsNeverAdmittedToThatPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-window-not-admitted", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            controller.syncNow()
+            var admitted: [String] = []
+            var received: [String] = []
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(
+                    owner: .iOSBackgroundTask, onRunStarted: { received.append($0) },
+                    onRunAdmitted: { admitted.append($0) })
+            }
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            _ = await window.value
+            let ran = await waitUntil { scans.count == 1 }
+            XCTAssertTrue(ran, "the foreground pass that waited for the path runs")
+            XCTAssertEqual(admitted, [], "a window must not protect a pass that it does not own")
+            XCTAssertEqual(received, [])
+            await controller.shutdown()
+        }
+
+        func testAWindowThatStoppedWaitingIsNotAdmittedToALaterWindowsPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-window-left-not-admitted", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.replaceScanForTesting { try await Task.sleep(for: .seconds(60)) }
+            var leftAdmissions: [String] = []
+            var laterAdmissions: [String] = []
+            let left = Task { @MainActor in
+                await controller.backgroundCatchUp(
+                    owner: .iOSBackgroundTask, onRunAdmitted: { leftAdmissions.append($0) })
+            }
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            let later = Task { @MainActor in
+                await controller.backgroundCatchUp(
+                    owner: .iOSBackgroundTask, onRunAdmitted: { laterAdmissions.append($0) })
+            }
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 2 }
+            left.cancel()
+            _ = await left.value
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let admitted = await waitUntil { laterAdmissions.count == 1 }
+            XCTAssertTrue(admitted, "the window that still waits is admitted to its pass")
+            XCTAssertEqual(leftAdmissions, [], "a window that stopped waiting is never admitted to a later pass")
+            controller.stopSync()
+            _ = await later.value
+            await controller.shutdown()
+        }
+
+        func testAWindowFromAnEarlierFirstPathWaitIsNotAdmittedToALaterOne() async throws {
+            // "Use Cellular Data" on ends the first wait, and off opens a new one before any path arrives.
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: false, networkDetermined: false)
+            signals.setAppInBackground(true)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-window-earlier-wait-not-admitted", source: signals.source,
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.replaceScanForTesting { try await Task.sleep(for: .seconds(60)) }
+            var earlierAdmissions: [String] = []
+            var laterAdmissions: [String] = []
+            let earlier = Task { @MainActor in
+                await controller.backgroundCatchUp(
+                    owner: .iOSBackgroundTask, onRunAdmitted: { earlierAdmissions.append($0) })
+            }
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            signals.setUsesMobileData(true)
+            controller.mobileDataSettingDidChange()
+            XCTAssertEqual(earlierAdmissions.count, 1, "the first wait ends with the earlier window's pass")
+            controller.stopSync()
+            _ = await earlier.value
+
+            signals.setUsesMobileData(false)
+            let later = Task { @MainActor in
+                await controller.backgroundCatchUp(
+                    owner: .iOSBackgroundTask, onRunAdmitted: { laterAdmissions.append($0) })
+            }
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+            signals.setNetworkDetermined(true)
+            controller.mobileDataSettingDidChange()
+
+            XCTAssertEqual(laterAdmissions.count, 1, "the later window is admitted to its pass")
+            XCTAssertEqual(earlierAdmissions.count, 1, "an ended window is never admitted to a later pass")
+            controller.stopSync()
+            _ = await later.value
+            await controller.shutdown()
+        }
+
         func testAnExpiringBackgroundWindowEndsAtOnceAndDropsItsDeferredPass() async throws {
             let runtime = LibraryRuntimeState.makeProcessState()
             let fixture = try makeWiFiWaitFixture(
