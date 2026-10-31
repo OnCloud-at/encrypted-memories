@@ -4,6 +4,7 @@ import LibraryRuntimeAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import Observation
 import PhotosCore
+import TimelineCore
 import UIKit
 
 /// The process-wide owner of the signed-in account: one session model, one library model, one runtime.
@@ -26,8 +27,8 @@ final class MobileAccountRuntime {
     private(set) var isStarted = false
     private var sessionSubscription: AnyCancellable?
     private var sceneObservers: [NSObjectProtocol] = []
-    private var uploadedLibraryMutationRevision: UInt64?
-    private var completedUploadRevision: Int?
+    private var uploadSignals = UploadRefreshSignalTracker(
+        backupRevision: nil, manualRevision: nil, passIsRunning: false)
     private var wasSigningOut = false
     private let connectedScenes: @MainActor () -> Set<UIScene>
     private let smartSearchForegroundChanged: @MainActor (Bool) -> Void
@@ -69,8 +70,10 @@ final class MobileAccountRuntime {
                 self.libraryModel.configure(session: session, store: self.sessionModel.sessionStore)
             }
         wasSigningOut = libraryModel.isSigningOut
-        uploadedLibraryMutationRevision = libraryModel.photoBackup?.uploadedLibraryMutationRevision
-        completedUploadRevision = libraryModel.facade?.uploadCoordinator.completedUploadRevision
+        uploadSignals = UploadRefreshSignalTracker(
+            backupRevision: libraryModel.photoBackup?.uploadedLibraryMutationRevision,
+            manualRevision: libraryModel.facade?.uploadCoordinator.completedUploadRevision,
+            passIsRunning: libraryModel.photoBackup?.isSyncing ?? false)
         observeLibrarySignals()
         installSceneObservers()
     }
@@ -183,6 +186,7 @@ final class MobileAccountRuntime {
         withObservationTracking {
             _ = libraryModel.isSigningOut
             _ = libraryModel.photoBackup?.uploadedLibraryMutationRevision
+            _ = libraryModel.photoBackup?.isSyncing
             _ = libraryModel.facade?.uploadCoordinator.completedUploadRevision
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
@@ -200,12 +204,15 @@ final class MobileAccountRuntime {
         }
         wasSigningOut = signingOut
 
-        let uploaded = libraryModel.photoBackup?.uploadedLibraryMutationRevision
-        let completed = libraryModel.facade?.uploadCoordinator.completedUploadRevision
-        if uploaded != uploadedLibraryMutationRevision || completed != completedUploadRevision {
-            uploadedLibraryMutationRevision = uploaded
-            completedUploadRevision = completed
-            libraryModel.refreshAfterLocalUpload()
+        let outcome = uploadSignals.observe(
+            backupRevision: libraryModel.photoBackup?.uploadedLibraryMutationRevision,
+            manualRevision: libraryModel.facade?.uploadCoordinator.completedUploadRevision,
+            passIsRunning: libraryModel.photoBackup?.isSyncing ?? false)
+        switch outcome.refresh {
+        case .manualUpload: libraryModel.refreshAfterLocalUpload()
+        case .backupUpload(let passIsRunning): libraryModel.refreshAfterBackupUpload(passIsRunning: passIsRunning)
+        case nil: break
         }
+        if outcome.passEnded { libraryModel.backupPassDidEnd() }
     }
 }

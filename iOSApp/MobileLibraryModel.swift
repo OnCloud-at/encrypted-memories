@@ -415,7 +415,7 @@ final class MobileLibraryModel {
     private var loadToken = 0
     private let libraryChangeMonitor = LibraryChangeMonitor()
     private let libraryRefreshCoalescer = LibraryRefreshCoalescer()
-    private let uploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
+    private let uploadRefreshCoordinator = TimelineUploadRefreshCoordinator(policy: .backupUploads)
     private(set) var applicationIsActive = true
     private(set) var isRefreshingLibrary = false
     /// Wakes analysis-only presentation after a source inventory becomes readable.
@@ -1019,24 +1019,43 @@ final class MobileLibraryModel {
 
     /// Local upload completion is authoritative enough to refresh immediately; repeated signals coalesce.
     func refreshAfterLocalUpload() {
-        guard let recoverySession = session, let refreshLease = currentMutationLease() else { return }
+        guard let work = uploadRefreshWork() else { return }
         Task { [weak self] in
-            guard let self else { return }
-            await self.uploadRefreshCoordinator.request(
-                refresh: { [weak self] _ in
-                    guard let self else { return .cancelled }
-                    return await self.performLibraryRefresh(lease: refreshLease).failureReason
-                },
-                observer: { [weak self] attempt in
-                    guard attempt.failureReason == .scopeAccessLost else { return }
-                    // Retirement joins this refresh worker, so return after registering recovery.
-                    await self?.scheduleScopeRecovery(
-                        expectedSession: recoverySession,
-                        expectedLoadGeneration: refreshLease.loadToken
-                    )
-                }
-            )
+            await self?.uploadRefreshCoordinator.request(refresh: work.refresh, observer: work.observer)
         }
+    }
+
+    /// An upload of the automatic backup starts at most one refresh cycle per interval while the pass runs. A signal
+    /// after the pass ended refreshes at once; `backupPassDidEnd()` publishes the one that waits.
+    func refreshAfterBackupUpload(passIsRunning: Bool) {
+        guard let work = uploadRefreshWork() else { return }
+        uploadRefreshCoordinator.submitBackupUpload(
+            passIsRunning: passIsRunning, refresh: work.refresh, observer: work.observer)
+    }
+
+    /// The backup pass ended: the refresh that the interval holds back runs now.
+    func backupPassDidEnd() {
+        uploadRefreshCoordinator.submitBackupPassEnd()
+    }
+
+    private func uploadRefreshWork() -> (
+        refresh: TimelineUploadRefreshCoordinator.Refresh, observer: TimelineUploadRefreshCoordinator.Observer
+    )? {
+        guard let recoverySession = session, let refreshLease = currentMutationLease() else { return nil }
+        return (
+            refresh: { [weak self] _ in
+                guard let self else { return .cancelled }
+                return await self.performLibraryRefresh(lease: refreshLease).failureReason
+            },
+            observer: { [weak self] attempt in
+                guard attempt.failureReason == .scopeAccessLost else { return }
+                // Retirement joins this refresh worker, so return after registering recovery.
+                await self?.scheduleScopeRecovery(
+                    expectedSession: recoverySession,
+                    expectedLoadGeneration: refreshLease.loadToken
+                )
+            }
+        )
     }
 
     /// Best-effort settings metadata refresh. A failed foreground refresh keeps the last encrypted-cache value

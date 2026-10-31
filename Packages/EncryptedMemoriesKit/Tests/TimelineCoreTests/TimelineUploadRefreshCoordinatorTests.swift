@@ -391,6 +391,164 @@ import Testing
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func backupSignalsDuringARunningPassWaitForTheIntervalAndTheEndOfThePassPublishesOnce() async {
+        let scenario = AutomaticUploadScenario()
+        await scenario.submitBackupSignal(0, passIsRunning: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        for signal in 1...3 {
+            scenario.clock.advance(by: .seconds(6))
+            await scenario.submitBackupSignal(signal, passIsRunning: true)
+        }
+        #expect(await scenario.timeline.times == [.zero], "A running pass causes one refresh cycle per interval")
+
+        scenario.coordinator.submitBackupPassEnd()
+        #expect(await scenario.timeline.waitForCount(2))
+        #expect(await scenario.timeline.times == [.zero, .seconds(18)])
+        #expect(await scenario.timeline.contents == [0, 3], "The end of the pass publishes the latest signal once")
+        scenario.coordinator.submitBackupPassEnd()
+        #expect(await scenario.settlesWithoutAnotherLoad(after: 2), "An end without a new signal loads nothing")
+        await scenario.coordinator.cancel()
+    }
+
+    /// The count that the PR text names: one signal every 3 s for 300 s, loads that finish at once. The expected
+    /// number follows `TimelineRefreshConvergencePolicy.backupUploads`. The formula holds for intervals that are whole
+    /// multiples of 3 s and do not end a cycle on the last step.
+    @Test(.timeLimit(.minutes(1)))
+    func oneHundredBackupSignalsInThreeHundredSecondsLoadOncePerIntervalInsteadOfOncePerSignal() async throws {
+        let interval = Int(TimelineRefreshConvergencePolicy.backupUploads.automaticInterval.components.seconds)
+        try #require(interval > 0 && interval % 3 == 0 && 297 % interval != 0, "The count formula needs this interval")
+        let before = AutomaticUploadScenario()
+        for signal in 0..<100 {
+            if signal > 0 { before.clock.advance(by: .seconds(3)) }
+            let count = await before.timeline.times.count
+            await before.coordinator.request(refresh: { _ in
+                await before.timeline.record(before.clock.now - before.origin, content: signal)
+                return nil
+            })
+            #expect(await before.timeline.waitForCount(count + 1))
+        }
+        #expect(await before.timeline.times.count == 100, "The immediate route loads once per signal")
+        await before.coordinator.cancel()
+
+        // A cycle starts at the first clock step on or after the previous start plus the interval.
+        var starts = [0]
+        while let last = starts.last, (last + interval + 2) / 3 * 3 <= 297 {
+            starts.append((last + interval + 2) / 3 * 3)
+        }
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        for signal in 0..<100 {
+            if signal > 0 { scenario.clock.advance(by: .seconds(3)) }
+            await scenario.submitBackupSignal(signal, passIsRunning: true)
+            // Wait until the load of this step, when one is due, has run.
+            let due = starts.filter { $0 <= signal * 3 }.count
+            #expect(await scenario.timeline.waitForCount(due))
+        }
+        scenario.coordinator.submitBackupPassEnd()
+        #expect(await scenario.timeline.waitForCount(starts.count + 1))
+        let times = await scenario.timeline.times
+        let contents = await scenario.timeline.contents
+        #expect(times.dropLast().map { Int($0.components.seconds) } == starts, "One load per interval")
+        #expect(times.count == starts.count + 1, "One more load at the end of the pass")
+        #expect(times.first == .zero, "The first signal loads at once")
+        #expect(contents.last == 99, "The end of the pass publishes the newest signal")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func theEndOfAPassPublishesTheWaitingSignalEvenAfterAFailedRefresh() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        scenario.coordinator.submitBackupUpload(
+            passIsRunning: true,
+            refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+                return .other
+            })
+        #expect(await scenario.timeline.waitForCount(1))
+        scenario.clock.advance(by: .seconds(3))
+        await scenario.submitBackupSignal(1, passIsRunning: true)
+        scenario.coordinator.submitBackupPassEnd()
+        #expect(await scenario.timeline.waitForCount(2), "The end publishes the waiting signal after a failed refresh")
+        #expect(await scenario.timeline.contents.last == 1)
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aSubmittedPassEndPublishesTheSignalSubmittedBeforeIt() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        await scenario.submitBackupSignal(0, passIsRunning: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        scenario.clock.advance(by: .seconds(3))
+        // No wait between the two submissions: the chain alone keeps the pass end behind its signal.
+        scenario.coordinator.submitBackupUpload(
+            passIsRunning: true,
+            refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                return nil
+            })
+        scenario.coordinator.submitBackupPassEnd()
+        #expect(await scenario.timeline.waitForCount(2), "The pass end follows its signal, so it publishes it at once")
+        #expect(await scenario.timeline.times == [.zero, .seconds(3)])
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func lateSignalsDuringARunningLoadShareOneFollowUpLoad() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        let held = AsyncGate()
+        await scenario.submitBackupSignal(0, passIsRunning: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        scenario.clock.advance(by: .seconds(3))
+        scenario.coordinator.submitBackupUpload(
+            passIsRunning: false,
+            refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                await held.wait()
+                return nil
+            })
+        await scenario.coordinator.testingDrainSubmissions()
+        #expect(await scenario.timeline.waitForCount(2))
+        for signal in 2...5 { await scenario.submitBackupSignal(signal, passIsRunning: false) }
+        await held.open()
+        #expect(await scenario.timeline.waitForCount(3))
+        #expect(await scenario.settlesWithoutAnotherLoad(after: 3))
+        let seen = await scenario.timeline.contents
+        #expect(seen == [0, 1, 5], "Four late signals share one follow-up load, saw \(seen)")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aBackupSignalAfterThePassEndedRefreshesWithoutWaitingForTheInterval() async {
+        let scenario = AutomaticUploadScenario()
+        await scenario.submitBackupSignal(0, passIsRunning: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        scenario.clock.advance(by: .seconds(6))
+        await scenario.submitBackupSignal(1, passIsRunning: false)
+        #expect(await scenario.timeline.waitForCount(2))
+        #expect(
+            await scenario.timeline.times == [.zero, .seconds(6)], "No later pass end comes, so it publishes itself")
+        #expect(await scenario.timeline.contents == [0, 1])
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aManualRefreshStaysImmediateWhileBackupSignalsWait() async {
+        let scenario = AutomaticUploadScenario()
+        await scenario.submitBackupSignal(0, passIsRunning: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        scenario.clock.advance(by: .seconds(6))
+        await scenario.submitBackupSignal(1, passIsRunning: true)
+        await scenario.coordinator.request(refresh: { _ in
+            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 99)
+            return nil
+        })
+        #expect(await scenario.timeline.waitForCount(2))
+        #expect(await scenario.timeline.times == [.zero, .seconds(6)])
+        #expect(
+            await scenario.timeline.contents == [0, 99], "The manual refresh does not wait for the backup interval")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func automaticEndAtTheIntervalBoundaryJoinsTheSameActiveGeneration() async {
         let scenario = AutomaticUploadScenario()
         let secondRelease = AsyncGate()
@@ -1216,11 +1374,11 @@ private struct AutomaticUploadScenario: Sendable {
     let timeline = UploadRefreshTimeline()
     let coordinator: TimelineUploadRefreshCoordinator
 
-    init() {
+    init(policy: TimelineRefreshConvergencePolicy = .init()) {
         let clock = TimelineRefreshTestClock()
         self.clock = clock
         origin = clock.now
-        coordinator = TimelineUploadRefreshCoordinator(clock: clock.dependency)
+        coordinator = TimelineUploadRefreshCoordinator(policy: policy, clock: clock.dependency)
     }
 
     func startTwoSignals(secondRelease: AsyncGate? = nil) async {
@@ -1255,6 +1413,24 @@ private struct AutomaticUploadScenario: Sendable {
             await Task.yield()
         }
         return await coordinator.testingAutomaticState().workerActive == false
+    }
+
+    /// Submits the signal and returns when the coordinator has accepted it.
+    func submitBackupSignal(_ content: Int, passIsRunning: Bool) async {
+        coordinator.submitBackupUpload(
+            passIsRunning: passIsRunning,
+            refresh: { _ in
+                await timeline.record(clock.now - origin, content: content)
+                return nil
+            })
+        await coordinator.testingDrainSubmissions()
+    }
+
+    /// True when no load beyond `count` starts within the negative observation window.
+    func settlesWithoutAnotherLoad(after count: Int) async -> Bool {
+        let end = ContinuousClock.now + negativeObservationWindow
+        while await timeline.times.count <= count, ContinuousClock.now < end { await Task.yield() }
+        return await timeline.times.count == count
     }
 
     func requestSignal(_ content: Int) async {
