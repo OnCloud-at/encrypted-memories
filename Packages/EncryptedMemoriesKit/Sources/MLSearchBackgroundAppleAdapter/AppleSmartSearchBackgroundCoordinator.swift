@@ -145,6 +145,8 @@ public final class AppleSmartSearchBackgroundCoordinator {
                 },
                 offMainThread: Self.offMainSubmission(earliestBeginDate: earliestBeginDate),
                 completion: { [logger] error in
+                    BackgroundWorkLog.system.requestSubmitted(
+                        .smartSearch, earliestBegin: earliestBeginDate, errorCode: error.map { ($0 as NSError).code })
                     guard let error else { return }
                     logger.error(
                         "Smart Search background submission failed: \(error.localizedDescription, privacy: .public)")
@@ -283,8 +285,10 @@ public final class AppleSmartSearchBackgroundCoordinator {
                 }
                 // A launch without a scene has not started the account yet; an operation that the window's end
                 // cancelled before it ran starts nothing and ends below.
+                let waitStart = ContinuousClock.now
                 BackgroundLaunchAccountStart.shared.ensureStarted(unlessCancelled: Task.isCancelled)
                 let wait = await BackgroundAccountReadiness.shared.wait(for: self.reference, timeout: .seconds(30))
+                BackgroundWorkLog.system.accountWait(.smartSearch, wait, waited: .now - waitStart)
                 if case .cannotRun = wait {
                     // The reads of the saved sign-in show that no account can come in this window.
                     self.processing.removeValue(forKey: id)
@@ -311,6 +315,7 @@ public final class AppleSmartSearchBackgroundCoordinator {
             }
             processing[id] = operation
             task.expirationHandler = {
+                BackgroundWorkLog.system.expirationReceived(.smartSearch)
                 completion.markExpired()
                 operation.cancel()
             }

@@ -36,7 +36,14 @@ final class PhotoBackupBackgroundGrace {
         identifier = beginTask {
             [weak self, weak controller] in
             guard let self, self.generation == generation else { return }
-            if let controller, !self.protection.isProtected(owner: controller, runID: runID) {
+            let isProtected = controller.map { self.protection.isProtected(owner: $0, runID: runID) } ?? false
+            BackgroundWorkLog.system.notice(
+                .photoBackup, "grace.expired",
+                [
+                    (.init("protected"), .flag(isProtected)),
+                    (.init("stopsItsPass"), .flag(controller != nil && !isProtected)),
+                ])
+            if let controller, !isProtected {
                 controller.stopSync(runID: runID)
             }
             self.end(generation: generation)

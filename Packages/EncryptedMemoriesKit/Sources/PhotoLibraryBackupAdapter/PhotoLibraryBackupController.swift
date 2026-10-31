@@ -91,6 +91,8 @@ public final class PhotoLibraryBackupController {
         public var databasePolicy: LibraryDatabasePolicy
 
         var makeChangeMonitor: (URL) -> PhotoLibraryChangeMonitor = { PhotoLibraryChangeMonitor(tokenURL: $0) }
+        /// The device log of passes and background windows; tests record it.
+        var backgroundLog: BackgroundWorkLog = .system
         var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
         var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
         /// How often a pass renews its execution lock. The lease lets a crashed owner go after 120 s.
@@ -262,6 +264,19 @@ public final class PhotoLibraryBackupController {
     private var adoptedRunWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     /// The last `startSync` call deferred its pass to the first network path.
     private var lastStartWasDeferred = false
+    private let backgroundLog: BackgroundWorkLog
+    /// The device log's view of the active run: when it started, its counts then, and when its stop was requested.
+    private var runStartedAt = ContinuousClock.now
+    /// The counts at the start of the active run; nil before the first status projection, which gives no baseline.
+    private var progressAtRunStart: BackupSyncProgress?
+    private var hasStatusProjection = false
+    private var runnerStopRequestedAt: ContinuousClock.Instant?
+    private var lastProgressLogAt: ContinuousClock.Instant?
+    /// The queue states that each snapshot counts, also without rows. Other states appear when they have rows.
+    nonisolated private static let loggedQueueStates: Set<UploadBackupSyncQueueState> = [
+        .discovered, .checking, .hashing, .duplicateChecking, .needsRemoteReconciliation, .queuedForUpload, .uploading,
+        .finalizing,
+    ]
     /// The result of the active run when it only scans, for a refresh window.
     private var activeRefreshScan: RefreshScanResult?
     private let firstNetworkPathWait: Duration
@@ -342,6 +357,7 @@ public final class PhotoLibraryBackupController {
         let runtimeSignals = configuration.runtimeSignals
         self.runtimeSignals = runtimeSignals
         firstNetworkPathWait = configuration.firstNetworkPathWait
+        backgroundLog = configuration.backgroundLog
         heartbeatInterval = configuration.heartbeatInterval
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy
@@ -1009,15 +1025,26 @@ public final class PhotoLibraryBackupController {
         var started = startSync(owner: owner, onAdmitted: onRunAdmitted)
         if started == nil, lastStartWasDeferred {
             // The pass waits for the first network path. The window stays open until that pass ends.
+            backgroundLog.notice(.photoBackup, "window.waitsForFirstPath", [(.init("owner"), Self.logValue(owner))])
             started = await waitForDeferredStart(onAdmitted: onRunAdmitted)
             if started == nil, waitsForFirstNetworkPath { return .noNetworkPath }
         } else if started == nil, let run = automaticRunInTheBackground() {
             // Nobody watches this automatic pass, so it runs on the window's time until it ends or the window ends.
+            backgroundLog.notice(.photoBackup, "window.tookOver", [(.init("owner"), Self.logValue(owner))])
             onRunStarted?(run.runID)
             await waitForAdoptedRun(run)
             return .done
         }
-        guard let run = started else { return .done }
+        guard let run = started else {
+            backgroundLog.notice(
+                .photoBackup, "window.noPass",
+                [
+                    (.init("owner"), Self.logValue(owner)), (.init("otherPassRunning"), .flag(isSyncing)),
+                    (.init("enabled"), .flag(isEnabled)), (.init("userPaused"), .flag(isUserPaused)),
+                    (.init("accessAllowed"), .flag(accessState.allowsBackup)),
+                ])
+            return .done
+        }
         onRunStarted?(run.runID)
         await run.task.value
         return .done
@@ -1142,6 +1169,7 @@ public final class PhotoLibraryBackupController {
             didAutoRetryFailedThisLaunch = true
             queueStore.requeueFailed(updatedAt: Date())
         }
+        logPassStart(owner: owner, scanOnly: scanOnly)
 
         autoResumeTask?.cancel()
         autoResumeTask = nil  // a pass is starting; the timer's job is done
@@ -1472,8 +1500,26 @@ public final class PhotoLibraryBackupController {
 
     private func resumeEnabledBackupAfterLaunch() {
         refreshAccessState()
-        guard isEnabled, accessState.allowsBackup, !isSyncing else { return }
+        let inBackground: (BackgroundWorkLog.Key, BackgroundWorkLog.Value) = (
+            .init("inBackground"), .flag(runtimeSignals.current().isAppInBackground)
+        )
+        guard isEnabled, accessState.allowsBackup, !isSyncing else {
+            backgroundLog.notice(
+                .photoBackup, "launch.resume",
+                [
+                    (.init("started"), .flag(false)), (.init("enabled"), .flag(isEnabled)),
+                    (.init("accessAllowed"), .flag(accessState.allowsBackup)),
+                    (.init("otherPassRunning"), .flag(isSyncing)), inBackground,
+                ])
+            return
+        }
         syncNow()
+        backgroundLog.notice(
+            .photoBackup, "launch.resume",
+            [
+                (.init("started"), .flag(isSyncing)), (.init("waitsForFirstPath"), .flag(lastStartWasDeferred)),
+                inBackground,
+            ])
     }
 
     /// Stops only the active run identified by the caller. OS expiration handlers must use this
@@ -1526,6 +1572,9 @@ public final class PhotoLibraryBackupController {
         let task = Task { await runner.stop() }
         runnerStopRunID = runID
         runnerStopTask = task
+        runnerStopRequestedAt = .now
+        backgroundLog.notice(
+            .photoBackup, "pass.stopRequested", [(.init("owner"), Self.logValue(activeRunOwner ?? .foreground))])
     }
 
     #if DEBUG
@@ -1618,6 +1667,17 @@ public final class PhotoLibraryBackupController {
         internal func setEnabledForTesting() {
             isEnabled = true
         }
+
+        /// A library change, as the change monitor reports it.
+        internal func noteLibraryChangeForTesting() {
+            scheduleChangeDrivenSync()
+        }
+
+        /// A change during the pass armed the restart after it.
+        internal var isRestartAfterStopArmedForTesting: Bool { pendingSyncAfterStop }
+
+        /// The first status projection arrived, so a pass start has counts to compare with.
+        internal var hasStatusProjectionForTesting: Bool { hasStatusProjection }
 
         internal func setAccessStateForTesting(_ state: PhotoBackupAccessState) {
             accessState = state
@@ -1996,6 +2056,150 @@ public final class PhotoLibraryBackupController {
         waiters.forEach { $0.resume(returning: run) }
     }
 
+    // MARK: Device log
+
+    /// What follows a pass that ended, for the device log.
+    private enum NextAfterPass: String, BackgroundLogName {
+        case none
+        case foregroundPassAfterScan
+        case restartAfterChange
+        case wiFiWaitEnded
+        case automaticResume
+        case shutdown
+        case anotherPassStarted
+        case localStateUnavailable
+    }
+
+    /// The facts of a pass that are gone once its run is cleared.
+    private struct EndedPass {
+        let owner: BackupExecutionOwner
+        let stopped: Bool
+        let waitedForWiFi: Bool
+        let pausedByPolicy: Bool
+        let startedAt: ContinuousClock.Instant
+        let progressAtStart: BackupSyncProgress?
+        let stopRequestedAt: ContinuousClock.Instant?
+    }
+
+    /// The owner of a pass and, off the main actor, the queue that it starts with.
+    private func logPassStart(owner: BackupExecutionOwner, scanOnly: Bool) {
+        runStartedAt = .now
+        progressAtRunStart = hasStatusProjection ? lastProjectedProgress : nil
+        runnerStopRequestedAt = nil
+        lastProgressLogAt = .now
+        backgroundLog.notice(
+            .photoBackup, "pass.started",
+            [(.init("owner"), Self.logValue(owner)), (.init("scanOnly"), .flag(scanOnly))])
+        // The count reads the whole queue, which is too slow for the main actor on a large library. It counts the queue
+        // when it runs, so its line can come after later lines; the owner names its pass.
+        let ownerField: (BackgroundWorkLog.Key, BackgroundWorkLog.Value) = (.init("owner"), Self.logValue(owner))
+        Task.detached(priority: .utility) { [queueStore, backgroundLog] in
+            guard let counts = queueStore?.queueCounts() else { return }
+            backgroundLog.notice(.photoBackup, "queue.snapshot", [ownerField] + Self.snapshotFields(counts))
+        }
+    }
+
+    nonisolated private static func snapshotFields(
+        _ counts: UploadBackupQueueDiagnostics
+    ) -> [(BackgroundWorkLog.Key, BackgroundWorkLog.Value)] {
+        var fields: [(BackgroundWorkLog.Key, BackgroundWorkLog.Value)] = UploadBackupSyncQueueState.allCases
+            .compactMap { state in
+                let rows = counts.rows[state] ?? 0
+                return loggedQueueStates.contains(state) || rows > 0 ? (.name(state), .count(rows)) : nil
+            }
+        for state in [UploadBackupSyncQueueState.discovered, .checking] {
+            let reasons = (counts.checkReasons[state] ?? [:]).sorted { order($0.key) < order($1.key) }
+            for (reason, rows) in reasons {
+                fields.append((.name(state).dot(key(reason)), .count(rows)))
+            }
+        }
+        return fields
+    }
+
+    /// How a pass ended, and what it settled: rows that reached each successful end state, the change of failed rows,
+    /// and the bytes that its transfers sent.
+    private func logPassEnd(_ ended: EndedPass, progress: BackupSyncProgress) {
+        let now = ContinuousClock.now
+        var fields: [(BackgroundWorkLog.Key, BackgroundWorkLog.Value)] = [
+            (.init("owner"), Self.logValue(ended.owner)), (.init("stopped"), .flag(ended.stopped)),
+        ]
+        if ended.stopped, let requested = ended.stopRequestedAt {
+            fields.append((.init("stopMs"), .milliseconds(now - requested)))
+        }
+        fields += [
+            (.init("durationMs"), .milliseconds(now - ended.startedAt)),
+            (.init("waitedForWiFi"), .flag(ended.waitedForWiFi)),
+            (.init("pausedByPolicy"), .flag(ended.pausedByPolicy)),
+        ]
+        // Before the first status projection the pass has no counts to compare with.
+        guard let start = ended.progressAtStart else {
+            fields.append((.init("baseline"), .word("none")))
+            backgroundLog.notice(.photoBackup, "pass.ended", fields)
+            return
+        }
+        fields += [
+            (.init("completedRows"), .count(progress.uploaded - start.uploaded)),
+            (.init("alreadyBackedUpRows"), .count(progress.alreadyBackedUp - start.alreadyBackedUp)),
+            (
+                .init("skippedRemoteDeletionRows"),
+                .count(progress.skippedRemoteDeletions - start.skippedRemoteDeletions)
+            ),
+            (.init("failedRowsChange"), .count(progress.failed - start.failed)),
+            (.init("sentBytes"), .count(max(0, progress.transferredByteCount - start.transferredByteCount))),
+        ]
+        backgroundLog.notice(.photoBackup, "pass.ended", fields)
+    }
+
+    private func logNext(_ next: NextAfterPass) {
+        backgroundLog.notice(.photoBackup, "pass.next", [(.init("branch"), .name(next))])
+    }
+
+    /// One line of the running pass's counts at most every 30 seconds, when a status projection arrives.
+    private func logProgressIfDue(_ progress: BackupSyncProgress) {
+        guard isSyncing, let last = lastProgressLogAt, ContinuousClock.now - last >= .seconds(30) else { return }
+        lastProgressLogAt = .now
+        backgroundLog.notice(
+            .photoBackup, "pass.progress",
+            [
+                (.init("completed"), .count(progress.uploaded)),
+                (.init("alreadyBackedUp"), .count(progress.alreadyBackedUp)),
+                (.init("checking"), .count(progress.checking)),
+                (.init("queuedForUpload"), .count(progress.uploadQueued)),
+                (.init("uploading"), .count(progress.uploading)), (.init("waiting"), .count(progress.waiting)),
+                (.init("failed"), .count(progress.failed)), (.init("sentBytes"), .count(progress.transferredByteCount)),
+            ])
+    }
+
+    /// The owners that the code names; any other value logs as `other`, so the log never repeats a value from a file.
+    nonisolated private static func logValue(_ owner: BackupExecutionOwner) -> BackgroundWorkLog.Value {
+        switch owner {
+        case .foreground: .word("foreground")
+        case .iOSBackgroundTask: .word("iosBackgroundTask")
+        case .iOSRefreshTask: .word("iosRefreshTask")
+        case .macOSBackgroundActivity: .word("macosBackgroundActivity")
+        case .background: .word("background")
+        case .manual: .word("manual")
+        default: .word("other")
+        }
+    }
+
+    nonisolated private static func key(_ reason: UploadBackupQueueDiagnostics.CheckReason) -> BackgroundWorkLog.Key {
+        switch reason {
+        case .none: BackgroundWorkLog.Key("none")
+        case .unrecognized: BackgroundWorkLog.Key("unrecognized")
+        case .issue(let kind): .name(kind)
+        }
+    }
+
+    /// A fixed order of the reasons, so equal queues give equal lines.
+    nonisolated private static func order(_ reason: UploadBackupQueueDiagnostics.CheckReason) -> String {
+        switch reason {
+        case .none: "0"
+        case .unrecognized: "1"
+        case .issue(let kind): "2" + kind.rawValue
+        }
+    }
+
     private func resumeIfWiFiWaitEnded() {
         guard !isShuttingDown, status.phase == .waitingForWiFi || manualWiFiRetryPending,
             runtimeSignals.current().canEndWiFiWait
@@ -2118,7 +2322,9 @@ public final class PhotoLibraryBackupController {
         else { return }
         lastAppliedStatusProjectionRevision = projection.revision
         lastProjectedProgress = projection.progress
+        hasStatusProjection = true
         nextAutomaticAttemptAt = projection.progress.outstanding.nextAttemptAt
+        logProgressIfDue(projection.progress)
         guard projection.status != status else { return }
         status = projection.status
         noteUploadedLibraryMutation(projection.progress.uploaded)
@@ -2237,6 +2443,11 @@ public final class PhotoLibraryBackupController {
         let stopTask = runnerStopRunID == runID ? runnerStopTask : nil
         await stopTask?.value
         guard activeRunID == runID else { return }
+        // A pass can start during the final projection below; this pass keeps its own start values.
+        let ended = EndedPass(
+            owner: activeRunOwner ?? .foreground, stopped: stopTask != nil, waitedForWiFi: passWaitedForWiFi,
+            pausedByPolicy: passPausedByPolicy, startedAt: runStartedAt, progressAtStart: progressAtRunStart,
+            stopRequestedAt: runnerStopRequestedAt)
         if !isShuttingDown,
             let lock = lockStore?.currentLock(), lock.runID == runID, lock.owner == .manual
         {
@@ -2270,16 +2481,25 @@ public final class PhotoLibraryBackupController {
         }
         let shouldRestart = pendingSyncAfterStop && isEnabled && accessState.allowsBackup
         pendingSyncAfterStop = false
-        guard !isShuttingDown else { return }
+        guard !isShuttingDown else {
+            logPassEnd(ended, progress: lastProjectedProgress)
+            logNext(.shutdown)
+            return
+        }
         let request = nextStatusProjectionRequest()
         let finalProjection = await statusProjector?.projectNow(
             context: request.context,
             generation: statusProjectionGeneration,
             revision: request.revision
         )
-        guard activeRunID == nil else { return }
+        logPassEnd(ended, progress: finalProjection?.progress ?? lastProjectedProgress)
+        guard activeRunID == nil else {
+            logNext(.anotherPassStarted)
+            return
+        }
         guard queueStore?.isOperational() == true, catalogStore?.isOperational() == true else {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
+            logNext(.localStateUnavailable)
             return
         }
         var finalProgress = finalProjection?.progress ?? lastProjectedProgress
@@ -2292,7 +2512,9 @@ public final class PhotoLibraryBackupController {
         // A refresh scan uploads nothing, so it never counts as a pass without progress. In the background it plans and
         // starts no pass. A scene that came to the foreground during the scan found the pass busy: its pass starts now.
         if scannedOnly {
-            if !runtimeSignals.current().isAppInBackground { syncNow() }
+            let inForeground = !runtimeSignals.current().isAppInBackground
+            logNext(inForeground ? .foregroundPassAfterScan : .none)
+            if inForeground { syncNow() }
             return
         }
         let currentBackedUp = finalProgress.backedUp
@@ -2306,11 +2528,15 @@ public final class PhotoLibraryBackupController {
         // its scan). Start the next pass now instead of keeping "Waiting for Wi-Fi" until the fallback.
         let wiFiWaitEnded = (waitedForWiFi || manualWiFiRetryPending) && runtimeSignals.current().canEndWiFiWait
         if shouldRestart {
+            logNext(.restartAfterChange)
             syncNow()
-        } else if wiFiWaitEnded, startSync(owner: .foreground) != nil {
-            return
         } else {
+            if wiFiWaitEnded {
+                logNext(.wiFiWaitEnded)
+                if startSync(owner: .foreground) != nil { return }
+            }
             scheduleAutoResumeIfOutstanding(progress: finalProgress)
+            logNext(autoResumeTask == nil ? .none : .automaticResume)
         }
     }
 

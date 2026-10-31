@@ -58,6 +58,7 @@ final class MobileAccountRuntime {
     /// Idempotent. The first scene root starts the account; later scenes (including simultaneous state
     /// restoration of several windows) attach to the already running runtime.
     func start() {
+        logAccountStart(wasRunning: isStarted)
         guard !isStarted else { return }
         isStarted = true
         libraryModel.configure(session: sessionModel.session, store: sessionModel.sessionStore)
@@ -73,6 +74,23 @@ final class MobileAccountRuntime {
         completedUploadRevision = libraryModel.facade?.uploadCoordinator.completedUploadRevision
         observeLibrarySignals()
         installSceneObservers()
+    }
+
+    /// The device log of each start call: a scene or a background window, with the scenes that iOS has connected.
+    private func logAccountStart(wasRunning: Bool) {
+        let state: BackgroundWorkLog.Value =
+            switch UIApplication.shared.applicationState {
+            case .active: .word("active")
+            case .inactive: .word("inactive")
+            case .background: .word("background")
+            @unknown default: .word("unknown")
+            }
+        BackgroundWorkLog.system.notice(
+            .launch, "account.start",
+            [
+                (.init("result"), wasRunning ? .word("alreadyRunning") : .word("started")),
+                (.init("scenes"), .count(connectedScenes().count)), (.init("appState"), state),
+            ])
     }
 
     // MARK: - Scene activity aggregation

@@ -2465,6 +2465,83 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        // MARK: The device log of a pass
+
+        func testAPassLogsItsStartItsQueueItsStopItsEndAndWhatComesNext() async throws {
+            let lines = RecordedLogLines()
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .backgroundPermitted
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-pass-log", source: .mobileDataOff(runtime),
+                backgroundLog: BackgroundWorkLog { lines.append("\($0.rawValue) \($1)") })
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.replaceScanForTesting { try await Task.sleep(for: .seconds(60)) }
+            let projected = await waitUntil { controller.hasStatusProjectionForTesting }
+            XCTAssertTrue(projected, "the pass compares with the counts of the first projection")
+            let window = Task { @MainActor in await controller.backgroundCatchUp(owner: .iOSBackgroundTask) }
+            _ = await waitUntil { controller.activeExecutionRunID != nil }
+            controller.noteLibraryChangeForTesting()
+            let armed = await waitUntil { controller.isRestartAfterStopArmedForTesting }
+            XCTAssertTrue(armed, "a change during the pass arms the restart after it")
+            controller.stopSync()
+            _ = await window.value
+            let restarted = await waitUntil { lines.values.contains { $0.contains("pass.next") } }
+            XCTAssertTrue(restarted)
+            controller.stopSync()
+            _ = await waitUntil { !controller.isSyncing }
+            _ = await waitUntil { lines.values.filter { $0.contains("queue.snapshot") }.count == 2 }
+            await controller.shutdown()
+
+            let durations = #/Ms=[0-9]+/#
+            let logged = lines.values.map { $0.replacing(durations, with: "Ms=N") }
+            // The queue snapshot is counted off the main actor, so its line has no fixed place among the others.
+            XCTAssertEqual(
+                Array(logged.filter { !$0.contains("queue.snapshot") }.prefix(5)),
+                [
+                    "PhotoBackupBackground pass.started owner=iosBackgroundTask scanOnly=no",
+                    "PhotoBackupBackground pass.stopRequested owner=iosBackgroundTask",
+                    "PhotoBackupBackground pass.ended owner=iosBackgroundTask stopped=yes stopMs=N durationMs=N"
+                        + " waitedForWiFi=no pausedByPolicy=no completedRows=0 alreadyBackedUpRows=0"
+                        + " skippedRemoteDeletionRows=0 failedRowsChange=0 sentBytes=0",
+                    "PhotoBackupBackground pass.next branch=restartAfterChange",
+                    "PhotoBackupBackground pass.started owner=foreground scanOnly=no",
+                ])
+            let snapshots = logged.filter { $0.contains("queue.snapshot") }
+            XCTAssertEqual(snapshots.count, 2, "each pass logs one snapshot")
+            // The pass checks its one row while the snapshot counts, so the line names the states, not fixed counts;
+            // UploadBackupQueueDiagnosticsTests checks the counts.
+            let states =
+                #/^PhotoBackupBackground queue\.snapshot owner=\w+ discovered=\d checking=\d hashing=\d duplicateChecking=\d queuedForUpload=\d uploading=\d finalizing=\d needsRemoteReconciliation=\d( |$)/#
+            for snapshot in snapshots {
+                XCTAssertNotNil(snapshot.firstMatch(of: states), snapshot)
+            }
+        }
+
+        func testAPassBeforeTheFirstStatusProjectionLogsNoBaseline() async throws {
+            let lines = RecordedLogLines()
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-pass-log-no-baseline", source: .mobileDataOff(runtime),
+                backgroundLog: BackgroundWorkLog { lines.append($1) })
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.replaceScanForTesting { try await Task.sleep(for: .seconds(60)) }
+            XCTAssertFalse(controller.hasStatusProjectionForTesting, "the pass starts before the first projection")
+            controller.syncNow()
+            controller.stopSync()
+            let ended = await waitUntil { lines.values.contains { $0.hasPrefix("pass.ended") } }
+            XCTAssertTrue(ended)
+            let line = try XCTUnwrap(lines.values.first { $0.hasPrefix("pass.ended") })
+            XCTAssertTrue(line.hasSuffix(" baseline=none"), line)
+            XCTAssertFalse(line.contains("completedRows"), "without a baseline the line counts nothing")
+            await controller.shutdown()
+        }
+
         func testAnExpiringBackgroundWindowEndsAtOnceAndDropsItsDeferredPass() async throws {
             let runtime = LibraryRuntimeState.makeProcessState()
             let fixture = try makeWiFiWaitFixture(
@@ -3820,11 +3897,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         /// A backup with one runnable row whose scan never touches PhotoKit; only the runner drains.
         private func makeWiFiWaitFixture(
             prefix: String, source: BackupRuntimeSignalSource, dismissedSourceRecheck: Bool = false,
-            firstNetworkPathWait: Duration = .seconds(10)
+            firstNetworkPathWait: Duration = .seconds(10),
+            backgroundLog: BackgroundWorkLog = BackgroundWorkLog { _, _ in }
         ) throws -> ControllerFixture {
             let fixture = try makeControllerFixture(
                 prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: source,
-                firstNetworkPathWait: firstNetworkPathWait)
+                firstNetworkPathWait: firstNetworkPathWait, backgroundLog: backgroundLog)
             fixture.controller.setEnabledForTesting()
             fixture.controller.setAccessStateForTesting(.full)
             let queue = try XCTUnwrap(
@@ -3946,21 +4024,24 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
     private func makeControllerFixture(
         prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil,
-        runtimeSignals: BackupRuntimeSignalSource = .apple, firstNetworkPathWait: Duration = .seconds(10)
+        runtimeSignals: BackupRuntimeSignalSource = .apple, firstNetworkPathWait: Duration = .seconds(10),
+        backgroundLog: BackgroundWorkLog = BackgroundWorkLog { _, _ in }
     ) throws -> ControllerFixture {
         let suite = "\(prefix)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         if enabled { defaults.set(true, forKey: "photoBackup.enabled.v1") }
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(suite, isDirectory: true)
+        var configuration = PhotoLibraryBackupController.Configuration(
+            accountDataDirectory: directory,
+            databasePolicy: .conservative,
+            defaults: defaults,
+            runtimeSignals: runtimeSignals,
+            firstNetworkPathWait: firstNetworkPathWait
+        )
+        configuration.backgroundLog = backgroundLog
         let controller = PhotoLibraryBackupController(
-            configuration: .init(
-                accountDataDirectory: directory,
-                databasePolicy: .conservative,
-                defaults: defaults,
-                runtimeSignals: runtimeSignals,
-                firstNetworkPathWait: firstNetworkPathWait
-            ),
+            configuration: configuration,
             identityResolver: identityResolver,
             uploader: MockUploader()
         )
@@ -5329,4 +5410,14 @@ extension PhotoLibraryBackupControllerStateTests {
             await coordinator.close()
         }
     }
+}
+
+/// The lines of a recorded background log.
+final class RecordedLogLines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+
+    var values: [String] { lock.withLock { lines } }
+
+    func append(_ line: String) { lock.withLock { lines.append(line) } }
 }

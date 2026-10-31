@@ -1,7 +1,7 @@
 import Foundation
 
 /// The OS background task that delivered a window.
-public enum BackgroundWindowKind: String, Codable, Sendable, CaseIterable, Comparable {
+public enum BackgroundWindowKind: String, Codable, Sendable, CaseIterable, Comparable, BackgroundLogName {
     case photoBackup
     case smartSearch
     /// The short app refresh task that only scans the photo library for the backup.
@@ -11,7 +11,7 @@ public enum BackgroundWindowKind: String, Codable, Sendable, CaseIterable, Compa
 }
 
 /// How a background window ended.
-public enum BackgroundWindowOutcome: String, Codable, Sendable, CaseIterable, Comparable {
+public enum BackgroundWindowOutcome: String, Codable, Sendable, CaseIterable, Comparable, BackgroundLogName {
     /// The window did its work.
     case ran
     /// The window could not read the sign-in on a locked device and ended at once.
@@ -98,6 +98,8 @@ public final class BackgroundWindowStart: @unchecked Sendable {
     let purgeGeneration: Int?
     /// Guarded by the ledger lock.
     fileprivate var didEnd = false
+    /// The device log has the end of this window. Guarded by the ledger lock.
+    fileprivate var didLogEnd = false
 
     fileprivate init(record: BackgroundWindowRecord, purgeGeneration: Int?) {
         self.record = record
@@ -147,15 +149,18 @@ public final class BackgroundWindowLedger: @unchecked Sendable {
     private var openStarts: [BackgroundWindowStart] = []
     private let diagnostics: PhotoDiagnostics
     private let isPurgePending: @Sendable () -> Bool
+    private let log: BackgroundWorkLog
 
     public init(
         fileURL: URL?,
         diagnostics: PhotoDiagnostics = .shared,
-        isPurgePending: @escaping @Sendable () -> Bool = { BackupLocalDataPurge.isPurgePending() }
+        isPurgePending: @escaping @Sendable () -> Bool = { BackupLocalDataPurge.isPurgePending() },
+        log: BackgroundWorkLog = .system
     ) {
         self.fileURL = fileURL
         self.diagnostics = diagnostics
         self.isPurgePending = isPurgePending
+        self.log = log
     }
 
     /// A sign-out purge was requested: windows that started before write nothing more.
@@ -167,6 +172,7 @@ public final class BackgroundWindowLedger: @unchecked Sendable {
     /// `unfinished`: a process that iOS ends during the window leaves exactly that.
     public func begin(_ kind: BackgroundWindowKind, at date: Date = Date()) -> BackgroundWindowStart {
         let started = BackgroundWindowRecord(kind: kind, outcome: .unfinished, startedAt: date)
+        log.notice(BackgroundWorkLog.category(for: kind), "window.began", [(.init("kind"), .name(kind))])
         return Self.lock.withLock {
             let generation = updateLocked(startedIn: nil) { $0.append(started) }
             let start = BackgroundWindowStart(record: started, purgeGeneration: generation)
@@ -179,8 +185,11 @@ public final class BackgroundWindowLedger: @unchecked Sendable {
     /// a new record. A second end of the same start writes nothing.
     public func end(_ start: BackgroundWindowStart, with outcome: BackgroundWindowOutcome) {
         let ended = BackgroundWindowRecord(kind: start.record.kind, outcome: outcome, startedAt: start.record.startedAt)
-        Self.lock.withLock {
-            guard !start.didEnd, let generation = start.purgeGeneration else { return }
+        // A window that the ledger cannot record still logs its end once.
+        let isFirstEnd = Self.lock.withLock {
+            let isFirstEnd = !start.didLogEnd
+            start.didLogEnd = true
+            guard !start.didEnd, let generation = start.purgeGeneration else { return isFirstEnd }
             start.didEnd = true
             let index = openStarts.firstIndex { $0 === start }
             // The alike windows that started later and are still open own the last alike unfinished records.
@@ -191,7 +200,12 @@ public final class BackgroundWindowLedger: @unchecked Sendable {
                 if alike.count > laterAlike { records.remove(at: alike[alike.count - 1 - laterAlike]) }
                 records.append(ended)
             }
+            return isFirstEnd
         }
+        guard isFirstEnd else { return }
+        log.notice(
+            BackgroundWorkLog.category(for: ended.kind), "window.ended",
+            [(.init("kind"), .name(ended.kind)), (.init("outcome"), .name(outcome))])
     }
 
     /// The kept records, oldest first.
