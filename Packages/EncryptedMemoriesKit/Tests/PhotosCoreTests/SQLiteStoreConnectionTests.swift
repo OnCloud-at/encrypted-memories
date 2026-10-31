@@ -118,6 +118,30 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         XCTAssertTrue(connection.isOperationalAfterRecovery())
     }
 
+    /// A rollback that failed can leave a transaction open with half a write in it; the store stops (#982).
+    func testAnOpenTransactionStopsTheStoreWithoutARecordedFailure() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertFalse(connection.isOperationalAfterRecovery())
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertTrue(connection.isOperationalAfterRecovery())
+    }
+
+    /// I/O codes that report damaged data stay recorded like a corrupt database.
+    func testAnIOErrorThatReportsDamagedDataStaysRecorded() throws {
+        for code in [SQLITE_IOERR | (32 << 8), SQLITE_IOERR | (33 << 8)] {
+            let connection = try makeConnection()
+            defer { connection.close() }
+            connection.withLock { connection.markFailed(resultCode: code) }
+            XCTAssertFalse(connection.isOperationalAfterRecovery(), "\(code) stays recorded")
+        }
+    }
+
     func testAClosedConnectionNeverRecovers() throws {
         let connection = try makeConnection()
         connection.withLock { connection.markFailed(resultCode: SQLITE_BUSY) }

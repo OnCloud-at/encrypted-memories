@@ -210,7 +210,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         bindKey(stmt, key)
         switch sqlite3_step(stmt) {
         case SQLITE_ROW:
-            guard let handoff = handoffRow(stmt) else { return .unreadable }
+            guard let handoff = handoffRow(stmt) else {
+                Self.noteUndecodableRow()
+                return .unreadable
+            }
             return .readable(handoff)
         case SQLITE_DONE: return .readable(nil)
         default: return .unreadable
@@ -244,7 +247,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             transaction {
                 handoffs.allSatisfy { key, revision in
                     execute(
-                        "UPDATE handoff SET acknowledged=1 WHERE source_kind=? AND source_id=? AND revision_us=?;"
+                        "UPDATE handoff SET acknowledged=1 WHERE source_kind=? AND source_id=? AND revision_us=? "
+                            + "AND kind IN (\(Self.sqlList(PendingHandoffKind.self)));"
                     ) { stmt in
                         bindKey(stmt, key)
                         sqlite3_bind_int64(stmt, 3, revision.rawValue)
@@ -356,10 +360,18 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// excluded: a newer build may have excluded it. That photo waits and its row stays; the other photos go on (#982).
     /// An earlier failed call does not stop this read; a failure of this read answers nil.
     public func excludedIdentifiers(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> Set<String>? {
-        guard !identifiers.isEmpty else { return [] }
+        exclusions(kind: kind, among: identifiers).map { Set($0.keys) }
+    }
+
+    /// The identifiers among `identifiers` that are excluded or have a row that this build cannot read, or nil when
+    /// the store cannot answer. An identifier that is missing from the result is included.
+    public func exclusions(
+        kind: UploadSourceIdentity.Kind, among identifiers: [String]
+    ) -> [String: BackupSourceExclusion]? {
+        guard !identifiers.isEmpty else { return [:] }
         return connection.withLock {
             guard db != nil else { return nil }
-            var result = Set<String>()
+            var result: [String: BackupSourceExclusion] = [:]
             // The key is (source_kind, source_id), and a row whose kind does not decode has no usable key: one read
             // for each chunk finds every row of the identifiers, whatever its kind.
             let unique = Array(Set(identifiers))
@@ -383,10 +395,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         || sourceStateEnumText(stmt, 3).flatMap(PendingSourceEffect.init(rawValue:)) != nil
                     guard let rowKind, let desired, operationReadable else {
                         Self.noteUndecodableRow()
-                        result.insert(identifier)
+                        result[identifier] = .unreadable
                         return
                     }
-                    if rowKind == kind, desired == .excluded { result.insert(identifier) }
+                    if rowKind == kind, desired == .excluded, result[identifier] == nil {
+                        result[identifier] = .excluded
+                    }
                 }
                 guard read else { return nil }
             }
@@ -394,14 +408,15 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
+    /// Identifiers in one read; far below SQLite's limit of bound parameters.
+    private static let identifierChunkSize = 500
+
     /// The raw values of `type` as an SQL list, for a statement that must not touch a row this build cannot read.
     private static func sqlList<Value: RawRepresentable & CaseIterable>(_ type: Value.Type) -> String
     where Value.RawValue == String {
         type.allCases.map { "'\($0.rawValue)'" }.joined(separator: ",")
     }
 
-    /// Identifiers in one read; far below SQLite's limit of bound parameters.
-    private static let identifierChunkSize = 500
 
     /// Writes desired = excluded for each request in one transaction and returns the new states.
     public func exclude(_ requests: [PendingExclusionRequest], at date: Date) -> [PendingSourceState]? {
@@ -728,7 +743,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                             """
                             UPDATE source_state SET remote_op=?
                             WHERE source_kind=? AND source_id=? AND generation=? AND \(condition)
-                              AND remote_link_id=?;
+                              AND remote_link_id=?
+                              AND (remote_op IS NULL OR remote_op IN (\(Self.sqlList(PendingSourceEffect.self))));
                             """,
                             bind: { stmt in
                                 bindText(stmt, 1, effect.rawValue)
@@ -770,12 +786,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return connection.withLock {
             transaction {
                 keys.allSatisfy { key in
-                    // A row that this build cannot read stays as it is; the other rows go on (#982).
-                    switch sourceStateLocked(key) {
-                    case .unreadable: return !connection.operationFailed
-                    case .readable(nil): return true
-                    case .readable: break
-                    }
+                    // A row that this build cannot read stays as it is and the other rows go on; a failed read fails
+                    // the write (#982).
+                    let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { self.bindKey($0, key) }
+                    guard read.queried else { return false }
+                    guard read.succeeded, !read.states.isEmpty else { return true }
                     return execute(
                         "UPDATE source_state SET listed_in_trash=0, updated_at=? WHERE source_kind=? AND source_id=?;"
                     ) { stmt in
@@ -979,7 +994,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     private func sourceStatesLocked(
         where condition: String?,
         bind: ((OpaquePointer?) -> Void)? = nil
-    ) -> (states: [PendingSourceState], succeeded: Bool) {
+    ) -> (states: [PendingSourceState], succeeded: Bool, queried: Bool) {
         var result: [PendingSourceState] = []
         var decoded = true
         let sql =
@@ -1034,7 +1049,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 19))
                 ))
         }
-        return (result, queried && decoded)
+        return (result, queried && decoded, queried)
     }
 
     /// A row that this build cannot decode, for example one that a newer build wrote. The row stays unchanged, its
@@ -1167,16 +1182,24 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             return false
         }
         guard body() else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            rollBack()
             return false
         }
         let commit = sqlite3_exec(db, "COMMIT;", nil, nil, nil)
         guard commit == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            rollBack()
             connection.markFailed(resultCode: commit)
             return false
         }
         return true
+    }
+
+    /// A rollback that fails, or that leaves the transaction open, is a failure of the store.
+    private func rollBack() {
+        let rollback = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+        if rollback != SQLITE_OK || sqlite3_get_autocommit(db) == 0 {
+            connection.markFailed(resultCode: rollback == SQLITE_OK ? nil : rollback)
+        }
     }
 
     private func prepare(_ sql: String, _ stmt: inout OpaquePointer?) -> Bool {

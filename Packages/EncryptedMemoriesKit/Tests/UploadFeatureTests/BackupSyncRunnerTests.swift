@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
@@ -3973,6 +3974,56 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: next), .discovered)
     }
 
+    // MARK: - A pending row that this build cannot read (#982)
+
+    /// A photo was queued, and a newer build then wrote its pending row with a value that this build does not know.
+    /// The photo waits without an attempt; its rows, including a parked receipt of an earlier upload, stay; the next
+    /// photo backs up.
+    func testAQueuedPhotoWithAnUnreadablePendingRowWaitsAndKeepsItsRows() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let parked = seedEntry("waiting.jpg", ageSeconds: 300)
+        let receipt = UploadRemoteCommitReconciliation(
+            source: parked.source,
+            identity: UploadIdentity(
+                correctedName: "waiting.jpg", nameHash: "nh", sha1Hex: String(repeating: "0", count: 40),
+                sha1Digest: Data(repeating: 0, count: 20), contentHash: "ch"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "vol", remoteLinkID: "earlier-upload"))
+        XCTAssertTrue(
+            queueStore.markNeedsRemoteReconciliation(
+                source: parked.source, revision: parked.revision, reconciliation: receipt, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(-300)))
+        let parkedBefore = try XCTUnwrap(queueStore.entry(for: parked.source, revision: parked.revision))
+        let waiting = seedEntry("waiting.jpg", ageSeconds: 120, revisionOffset: 1)
+        let next = seedEntry("next.jpg")
+        let key = PendingSourceKey(waiting.source)
+        XCTAssertNotNil(
+            pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
+        XCTAssertNotNil(pending.include([key], at: clock.now))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(pendingURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
+            SQLITE_OK)
+        sqlite3_close(handle)
+        let recorder = PendingBackupEventRecorder(store: pending)
+        let runner = makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1), events: recorder)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["next.jpg"], "only the photo with a readable row uploads")
+        XCTAssertEqual(state(of: next), .completed)
+        let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision), "the row stays")
+        XCTAssertFalse(kept.state.isTerminalSuccess)
+        XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+        XCTAssertEqual(
+            queueStore.entry(for: parked.source, revision: parked.revision)?.remoteCommitReconciliation,
+            parkedBefore.remoteCommitReconciliation, "the parked receipt stays")
+    }
+
     func testPhotoDeletedDuringItsIdentityPassReleasesItsTempFiles() async throws {
         let entry = seedEntry("deleted-during-download.heic")
         let removing = SourceRemovedDuringResolveResolver(inner: resolver)
@@ -5755,8 +5806,8 @@ private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendabl
         return handoffOutcome
     }
 
-    func isExcluded(source: UploadSourceIdentity) -> Bool? {
-        lock.withLock { exclusionsUnknown ? nil : excluded.contains(source.identifier) }
+    func exclusion(of source: UploadSourceIdentity) -> BackupSourceExclusion? {
+        lock.withLock { exclusionsUnknown ? nil : excluded.contains(source.identifier) ? .excluded : .included }
     }
 
     func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {
