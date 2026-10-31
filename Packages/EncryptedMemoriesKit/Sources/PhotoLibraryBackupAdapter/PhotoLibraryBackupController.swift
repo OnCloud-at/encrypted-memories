@@ -255,6 +255,9 @@ public final class PhotoLibraryBackupController {
     private var deferredBackgroundOwner: BackupExecutionOwner?
     /// Background windows that wait for their deferred pass, so that the OS task ends only when that pass ends.
     private var deferredStartWaiters: [UUID: CheckedContinuation<StartedBackupRun?, Never>] = [:]
+    /// The admission of each waiting window. It runs while the window's run starts, before the run is reported active,
+    /// because a waiting window resumes only later and another callback of the app can run before that.
+    private var deferredStartAdmissions: [UUID: @MainActor (String) -> Void] = [:]
     /// Background windows that hold a run they took over. Each wait ends with that run or with its window.
     private var adoptedRunWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     /// The last `startSync` call deferred its pass to the first network path.
@@ -985,11 +988,15 @@ public final class PhotoLibraryBackupController {
 
     /// Runs one catch-up pass for an OS background window.
     /// `onRunStarted` receives the run ID for expiration-safe cancellation.
+    /// `onRunAdmitted` receives the run ID of the window's own pass, also one that waited for the first network path,
+    /// synchronously while that run starts and before `idleTimerHook` reports it; it must only record state.
+    /// `onRunStarted` follows, for a waiting window when its wait resumes.
     /// Checkpointed state lets the next pass resume unfinished work.
     @discardableResult
     public func backgroundCatchUp(
         owner: BackupExecutionOwner = .background,
-        onRunStarted: (@MainActor (String) -> Void)? = nil
+        onRunStarted: (@MainActor (String) -> Void)? = nil,
+        onRunAdmitted: (@MainActor (String) -> Void)? = nil
     ) async -> BackgroundCatchUpEnd {
         if let refreshScan = activeRefreshScan, let scan = syncTask {
             // A refresh scan holds the lock, and this window needs it to upload: the scan yields and this pass scans.
@@ -999,10 +1006,10 @@ public final class PhotoLibraryBackupController {
             // The window may have expired while the scan ended; then it starts no pass.
             guard !Task.isCancelled else { return .done }
         }
-        var started = startSync(owner: owner)
+        var started = startSync(owner: owner, onAdmitted: onRunAdmitted)
         if started == nil, lastStartWasDeferred {
             // The pass waits for the first network path. The window stays open until that pass ends.
-            started = await waitForDeferredStart()
+            started = await waitForDeferredStart(onAdmitted: onRunAdmitted)
             if started == nil, waitsForFirstNetworkPath { return .noNetworkPath }
         } else if started == nil, let run = automaticRunInTheBackground() {
             // Nobody watches this automatic pass, so it runs on the window's time until it ends or the window ends.
@@ -1036,7 +1043,10 @@ public final class PhotoLibraryBackupController {
     /// The single entry point that starts a pass. Acquires durable execution ownership before any
     /// draining: a crashed/expired owner's stale lock is reaped here, and a live lock held by a
     /// different run makes this call stand down instead of starting a second drainer.
-    private func startSync(owner: BackupExecutionOwner, refreshScan: RefreshScanResult? = nil) -> StartedBackupRun? {
+    private func startSync(
+        owner: BackupExecutionOwner, refreshScan: RefreshScanResult? = nil,
+        onAdmitted: ((String) -> Void)? = nil
+    ) -> StartedBackupRun? {
         lastStartWasDeferred = false
         let scanOnly = refreshScan != nil
         guard !isShuttingDown, isEnabled, !isUserPaused, accessState.allowsBackup, !isSyncing,
@@ -1125,6 +1135,7 @@ public final class PhotoLibraryBackupController {
         activeRunID = runID
         activeRunOwner = owner
         activeRefreshScan = refreshScan
+        onAdmitted?(runID)
 
         // Retry previously failed items once per launch.
         if !didAutoRetryFailedThisLaunch {
@@ -1890,7 +1901,7 @@ public final class PhotoLibraryBackupController {
             runtimeSignals.current().isAppInBackground
         {
             // No scene is in the foreground, so nobody watches the automatic pass: the waiting window runs it.
-            let run = startSync(owner: backgroundOwner)
+            let run = startSync(owner: backgroundOwner, onAdmitted: admitDeferredStartWaiters)
             if run == nil { deferredStartOwner = sessionOwner }
             resumeDeferredStartWaiters(with: run)
         } else if let sessionOwner {
@@ -1900,14 +1911,14 @@ public final class PhotoLibraryBackupController {
             resumeDeferredStartWaiters(with: nil)
             return run
         } else if let backgroundOwner {
-            resumeDeferredStartWaiters(with: startSync(owner: backgroundOwner))
+            resumeDeferredStartWaiters(with: startSync(owner: backgroundOwner, onAdmitted: admitDeferredStartWaiters))
         }
         return nil
     }
 
     /// Waits for the deferred pass of a background window. Cancellation, for example at the OS expiration, ends the
     /// wait at once, and the deferred pass of a background window does not outlive it.
-    private func waitForDeferredStart() async -> StartedBackupRun? {
+    private func waitForDeferredStart(onAdmitted: (@MainActor (String) -> Void)?) async -> StartedBackupRun? {
         let id = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -1917,6 +1928,7 @@ public final class PhotoLibraryBackupController {
                     return
                 }
                 deferredStartWaiters[id] = continuation
+                deferredStartAdmissions[id] = onAdmitted
             }
         } onCancel: {
             Task { @MainActor [weak self] in self?.cancelDeferredStartWait(id) }
@@ -1958,6 +1970,7 @@ public final class PhotoLibraryBackupController {
 
     private func cancelDeferredStartWait(_ id: UUID) {
         guard let continuation = deferredStartWaiters.removeValue(forKey: id) else { return }
+        deferredStartAdmissions.removeValue(forKey: id)
         continuation.resume(returning: nil)
         dropUnwaitedBackgroundDeferral()
     }
@@ -1971,9 +1984,15 @@ public final class PhotoLibraryBackupController {
         firstNetworkPathWaitTask = nil
     }
 
+    /// Admits the run to every window that waits for it, before the run is reported active.
+    private func admitDeferredStartWaiters(_ runID: String) {
+        deferredStartAdmissions.values.forEach { $0(runID) }
+    }
+
     private func resumeDeferredStartWaiters(with run: StartedBackupRun?) {
         let waiters = deferredStartWaiters.values
         deferredStartWaiters.removeAll()
+        deferredStartAdmissions.removeAll()
         waiters.forEach { $0.resume(returning: run) }
     }
 

@@ -7,11 +7,88 @@ import UploadCore
 import os
 
 @MainActor
-private final class PhotoBackupProcessingAttempt {
+final class PhotoBackupProcessingAttempt {
     var didExpire = false
     var runID: String?
     /// The work of this window. Expiration cancels it, so a pass that still waits for the first network path ends.
     var work: Task<Void, Never>?
+    private let protection: BackgroundBackupRunProtection
+    private weak var controller: PhotoLibraryBackupController?
+    private var protectionToken: UUID?
+    #if DEBUG
+        var beforeRunAdmissionForTesting: ((String) -> Void)?
+        private(set) var cancellationReleaseEndedForTesting = false
+    #endif
+
+    init(protection: BackgroundBackupRunProtection = .shared) {
+        self.protection = protection
+    }
+
+    func run(controller: PhotoLibraryBackupController) async -> BackgroundCatchUpEnd {
+        guard !didExpire, !Task.isCancelled else { return .done }
+        self.controller = controller
+        defer {
+            releaseProtection()
+            runID = nil
+            self.controller = nil
+        }
+        return await withTaskCancellationHandler {
+            await controller.backgroundCatchUp(
+                owner: .iOSBackgroundTask,
+                onRunStarted: { runID in
+                    self.runID = runID
+                    #if DEBUG
+                        self.beforeRunAdmissionForTesting?(runID)
+                    #endif
+                    if self.didExpire || Task.isCancelled {
+                        self.releaseProtection()
+                        if !self.protection.isProtected(owner: controller, runID: runID) {
+                            controller.stopBackgroundWindowRun(runID: runID)
+                        }
+                    } else {
+                        self.holdProtection(controller: controller, runID: runID)
+                    }
+                },
+                onRunAdmitted: { runID in
+                    // The run starts for this window, and a waiting window resumes only later: the short grace can
+                    // expire before that, so the protection begins now. `onRunStarted` decides whether the run stays.
+                    guard !self.didExpire else { return }
+                    self.holdProtection(controller: controller, runID: runID)
+                })
+        } onCancel: {
+            Task { @MainActor in
+                self.releaseProtection()
+                #if DEBUG
+                    self.cancellationReleaseEndedForTesting = true
+                #endif
+            }
+        }
+    }
+
+    func expire() {
+        didExpire = true
+        releaseProtection()
+        work?.cancel()
+        if let controller, let runID, !protection.isProtected(owner: controller, runID: runID) {
+            controller.stopBackgroundWindowRun(runID: runID)
+        }
+    }
+
+    /// Refresh scans record their run for cancellation, but never protect an upload pass from the short grace.
+    func noteRefreshRun(controller: PhotoLibraryBackupController?, runID: String) {
+        self.runID = runID
+        if didExpire { controller?.stopBackgroundWindowRun(runID: runID) }
+    }
+
+    private func holdProtection(controller: PhotoLibraryBackupController, runID: String) {
+        guard protectionToken == nil else { return }
+        protectionToken = protection.hold(owner: controller, runID: runID)
+    }
+
+    private func releaseProtection() {
+        if let protectionToken { protection.release(protectionToken) }
+        protectionToken = nil
+    }
 }
 
 /// Owns only the iOS execution opportunities for the shared photo-backup controller.
@@ -293,13 +370,7 @@ final class PhotoBackupBackgroundCoordinator {
                 return
             }
 
-            defer { attempt.runID = nil }
-            let catchUp = await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
-                attempt.runID = runID
-                if attempt.didExpire {
-                    controller.stopBackgroundWindowRun(runID: runID)
-                }
-            }
+            let catchUp = await attempt.run(controller: controller)
             self.scheduleProcessingCatchUp(controller: controller)
             let waitedForNetwork = catchUp == .noNetworkPath
             // The state is read when the window ends, after the wait, as before the wait existed.
@@ -312,12 +383,8 @@ final class PhotoBackupBackgroundCoordinator {
 
         task.expirationHandler = { [weak self] in
             Task { @MainActor in
-                attempt.didExpire = true
-                attempt.work?.cancel()
+                attempt.expire()
                 let controller = PhotoLibraryBackupSharedRef.shared.controller
-                if let runID = attempt.runID {
-                    controller?.stopBackgroundWindowRun(runID: runID)
-                }
                 self?.scheduleProcessingCatchUp(controller: controller)
             }
         }
@@ -340,10 +407,7 @@ final class PhotoBackupBackgroundCoordinator {
                 backupStopped: { self?.backupStopped() },
                 backupPaused: { self?.backupPaused() },
                 onRunStarted: { runID in
-                    attempt.runID = runID
-                    if attempt.didExpire {
-                        PhotoLibraryBackupSharedRef.shared.controller?.stopBackgroundWindowRun(runID: runID)
-                    }
+                    attempt.noteRefreshRun(controller: PhotoLibraryBackupSharedRef.shared.controller, runID: runID)
                 })
             attempt.runID = nil
             await completion.finish(after: pendingRequests) {
