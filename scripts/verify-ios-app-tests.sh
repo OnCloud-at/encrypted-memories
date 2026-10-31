@@ -31,6 +31,17 @@ if [[ -n "${IOS_TEST_PARALLEL_WORKERS:-}" && ! "$IOS_TEST_PARALLEL_WORKERS" =~ ^
   echo "[ios-tests] IOS_TEST_PARALLEL_WORKERS must be a positive integer." >&2
   exit 64
 fi
+# Extra xcodebuild arguments for the test run, for example the retry options of the Duo job. The caller owns the
+# spelling of each argument; this script only splits the value on whitespace. A build takes no test run options, so a
+# value together with build-for-testing is an error instead of a silent drop.
+IOS_TEST_EXTRA_ARGS=()
+if [[ -n "${IOS_TEST_EXTRA_XCODEBUILD_ARGS:-}" && -n "${IOS_TEST_EXTRA_XCODEBUILD_ARGS//[[:space:]]/}" ]]; then
+  if [[ "$ACTION" == "build-for-testing" ]]; then
+    echo "[ios-tests] IOS_TEST_EXTRA_XCODEBUILD_ARGS is set, but build-for-testing takes no test run option." >&2
+    exit 64
+  fi
+  read -r -a IOS_TEST_EXTRA_ARGS <<< "$IOS_TEST_EXTRA_XCODEBUILD_ARGS"
+fi
 # The runner image decides which iPhone simulators exist, and Apple renames the lineup every year. A
 # pinned device name therefore fails as "Unable to find a device matching the provided destination
 # specifier" on a new image. Resolve an installed iPhone instead; IOS_TEST_DESTINATION still overrides it.
@@ -274,6 +285,9 @@ fi
 # drops the simulator sysdiagnose from the result bundle of a failed run. The test results stay.
 if [[ "$ACTION" != "build-for-testing" ]]; then
   set -- "$@" -collect-test-diagnostics never
+fi
+if [[ ${#IOS_TEST_EXTRA_ARGS[@]} -gt 0 ]]; then
+  set -- "$@" "${IOS_TEST_EXTRA_ARGS[@]}"
 fi
 TEST_STATUS=0
 if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_DIAGNOSTICS_PATH:-}" ]]; then
