@@ -54,6 +54,8 @@ final class MobilePausedBackupUITests: XCTestCase {
 
         let cellular = app.switches["backup.useMobileData"]
         XCTAssertTrue(cellular.waitForExistence(timeout: 10), "the backup settings offer no cellular data switch")
+        XCTAssertFalse(
+            app.buttons["backup.excludedPhotos"].exists, "no excluded photo, no row")
         XCTAssertEqual(cellular.label, "Use Cellular Data")
         XCTAssertEqual(cellular.value as? String, "0", "the backup waits for Wi-Fi by default")
         cellular.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()

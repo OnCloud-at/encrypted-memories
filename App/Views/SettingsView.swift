@@ -227,6 +227,7 @@ private struct BackupSettingsTab: View {
                             Image(systemName: "chevron.right")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
                         }
                         .contentShape(Rectangle())
                     }
@@ -819,9 +820,6 @@ private struct PhotoLibraryBackupSection: View {
     }
 }
 
-/// Native macOS presentation over the same shared failed-item and retry contracts as iOS/iPadOS.
-/// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
-/// Sync now is its retry.
 /// The photos excluded from the backup, in a sheet over the Backup settings.
 private struct MacExcludedPhotosSheet: View {
     let appModel: AppModel
@@ -849,6 +847,9 @@ private struct MacExcludedPhotosSheet: View {
     }
 }
 
+/// Native macOS presentation over the same shared failed-item and retry contracts as iOS/iPadOS.
+/// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
+/// Sync now is its retry.
 private struct MacFailedBackupSheet: View {
     enum Source {
         case backup(PhotoLibraryBackupController)
