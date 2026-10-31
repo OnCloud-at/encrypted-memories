@@ -1438,14 +1438,15 @@ public actor PendingBackupCoordinator {
                 guard outcome == .remoteTrashed else { return now().addingTimeInterval(delay) }
                 return compensated ? now().addingTimeInterval(60) : nil
             }
-            // An edit of the source replaced the restored photo after its upload: that trash is the replacement, not a
-            // late trash, and the newer version is the backup.
-            if replacedByEdit(state) {
+            // An edit of the source can replace the restored photo after its upload, also while a read runs: that trash
+            // is the replacement, not a late trash, and the newer version is the backup. The journal names the photo
+            // before the replacement trashes it, so a read that sees this trash also sees the journal entry.
+            let before = await restoredPhotoOutcome(state)
+            guard !closed else { return }
+            if before == .remoteTrashed, replacedByEdit(state) {
                 finishRestoredReturn(state, outcome: .completed, retryNotBefore: nil)
                 continue
             }
-            let before = await restoredPhotoOutcome(state)
-            guard !closed else { return }
             if let before, before != .completed {
                 finishRestoredReturn(state, outcome: before, retryNotBefore: retryNotBefore(before))
                 continue
@@ -1456,7 +1457,9 @@ public actor PendingBackupCoordinator {
             if case .waiting(let until) = outcome {
                 outcome = .waiting(until: max(until, now().addingTimeInterval(delay)))
             }
-            if outcome == .completed, let checked = await restoredPhotoOutcome(state) { outcome = checked }
+            if outcome == .completed, let checked = await restoredPhotoOutcome(state) {
+                outcome = checked == .remoteTrashed && replacedByEdit(state) ? .completed : checked
+            }
             guard !closed else { return }
             finishRestoredReturn(state, outcome: outcome, retryNotBefore: retryNotBefore(outcome))
         }

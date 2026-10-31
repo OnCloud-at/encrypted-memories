@@ -4927,7 +4927,9 @@ extension PendingBackupCoordinatorTests {
     }
 
     func testARestoreCheckTreatsTheTrashOfAPhotoAnEditReplacedAsDone() async throws {
-        for replacement in ["none", "retired", "retire intent"] {
+        for replacement in [
+            "none", "unretired", "retired", "retire intent", "intent during the read", "intent during the final read",
+        ] {
             await coordinator.close()
             let id = "edit-replaced-restore-\(replacement.replacingOccurrences(of: " ", with: "-"))"
             let sourceKey = key(id)
@@ -4951,26 +4953,54 @@ extension PendingBackupCoordinatorTests {
                 isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_001)
             let journal = try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: directory))
             let photo = source(id)
-            if replacement != "none" {
+            switch replacement {
+            case "retired", "retire intent", "unretired":
                 try journal.addSuperseded(remote, for: photo)
                 try journal.prepareToRetire([remote.nodeID: []], for: photo)
-                if replacement == "retired" {
+                if replacement != "retire intent" {
                     try journal.settle([remote.nodeID], related: [], trashed: true, for: photo)
                 }
+                // The person restored the replaced photo: it is in the library again by choice.
+                if replacement == "unretired" { try journal.unretire([remote.nodeID], for: photo) }
+            case "intent during the read":
+                // The edit replacement writes its intent and trashes the photo while the fresh read runs.
+                relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+                relations.onVisibilityLookup = { [relations] in
+                    try? journal.addSuperseded(remote, for: photo)
+                    try? journal.prepareToRetire([remote.nodeID: []], for: photo)
+                    relations.linkVisibilityByID[remote.nodeID] = .init(
+                        isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_002)
+                }
+            case "intent during the final read":
+                // The compound is complete at the first read; the replacement trashes the photo before the final read.
+                relations.linkVisibilityByID[remote.nodeID] = .init(isActive: true, mainPhotoLinkID: nil)
+                let reads = AppliedTrashReadCount()
+                relations.onVisibilityLookup = { [relations] in
+                    guard reads.next() == 2 else { return }
+                    try? journal.addSuperseded(remote, for: photo)
+                    try? journal.prepareToRetire([remote.nodeID: []], for: photo)
+                    relations.linkVisibilityByID[remote.nodeID] = .init(
+                        isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_002)
+                }
+            default: break
             }
             effects = FakePendingEffects()
+            if replacement == "intent during the final read" { effects.typedReturnOverride = [sourceKey: .completed] }
             coordinator = makeCoordinator(replacementJournal: journal, relations: relations)
             await coordinator.start()
 
             let result = await coordinator.restoreSources(ofRemote: [remote])
 
-            if replacement == "none" {
-                XCTAssertEqual(effects.restored, [[remote]], "Control: a late trash gets its compensation")
+            relations.onVisibilityLookup = nil
+            if replacement == "none" || replacement == "unretired" {
+                XCTAssertEqual(effects.restored, [[remote]], "\(replacement): a late trash gets its compensation")
                 XCTAssertNotNil(store.sourceState(for: sourceKey))
                 continue
             }
             XCTAssertTrue(effects.restored.isEmpty, "\(replacement): the edit's trash of the old photo stands")
-            XCTAssertTrue(effects.returned.isEmpty, "\(replacement): the newer version already backed up")
+            if replacement != "intent during the final read" {
+                XCTAssertTrue(effects.returned.isEmpty, "\(replacement): the newer version already backed up")
+            }
             XCTAssertEqual(result.outcomes[sourceKey], .completed, replacement)
             XCTAssertNil(store.sourceState(for: sourceKey), "\(replacement): the Restore duty is done")
         }
