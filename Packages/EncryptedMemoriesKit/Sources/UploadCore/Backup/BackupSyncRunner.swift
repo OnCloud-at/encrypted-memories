@@ -1093,6 +1093,12 @@ public actor BackupSyncRunner {
                             updatedAt: now()
                         )
                     else {
+                        // The row is gone, for example after a deletion or an exclusion. The handoff above keeps
+                        // the photo and, for an exclusion, schedules its trash. Settlement ends as cancelled; the
+                        // runner ends the pass unless it removed this source itself.
+                        if queue.entry(for: entry.source, revision: entry.revision) == nil {
+                            throw CancellationError()
+                        }
                         throw UploadError.backend("Remote commit reconciliation could not be persisted")
                     }
                 },
@@ -1124,6 +1130,10 @@ public actor BackupSyncRunner {
             if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
             if settlement.reconciliationPersisted {
                 parkPersistedRemoteCommit(entry, from: .uploading, message: settlement.settlementMessage)
+            } else if settlement.cancellation != nil, sourceWasRemoved(entry) {
+                // Only this source's work ends. A failed write for a source that is still queued means the local store
+                // failed, and that ends the pass.
+                revert(entry, from: .uploading)
             } else {
                 stopRequested = true
             }
@@ -1931,6 +1941,10 @@ public actor BackupSyncRunner {
                                 updatedAt: now()
                             )
                         else {
+                            // The row is gone, for example after a deletion or an exclusion.
+                            if queue.entry(for: entry.source, revision: entry.revision) == nil {
+                                throw CancellationError()
+                            }
                             throw UploadError.backend("Secondary reconciliation could not be persisted")
                         }
                     },
@@ -2032,7 +2046,7 @@ public actor BackupSyncRunner {
                     parkPersistedRemoteCommit(entry, from: .uploading, message: settlement.settlementMessage)
                     return .reconciliationPending
                 }
-                stopRequested = true
+                if settlement.cancellation == nil || !sourceWasRemoved(entry) { stopRequested = true }
                 return .cancelled
             } catch is BackupWorkDeferredError {
                 return .cancelled
