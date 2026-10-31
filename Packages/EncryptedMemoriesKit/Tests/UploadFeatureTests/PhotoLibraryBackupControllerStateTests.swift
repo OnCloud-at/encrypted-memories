@@ -2489,29 +2489,26 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(armed, "a change during the pass arms the restart after it")
             controller.stopSync()
             _ = await window.value
-            let restarted = await waitUntil { lines.values.contains { $0.contains("pass.next") } }
-            XCTAssertTrue(restarted)
-            controller.stopSync()
-            _ = await waitUntil { !controller.isSyncing }
-            _ = await waitUntil { lines.values.filter { $0.contains("queue.snapshot") }.count == 2 }
+            let decided = await waitUntil { lines.values.contains { $0.contains("pass.next") } }
+            XCTAssertTrue(decided)
+            _ = await waitUntil { lines.values.contains { $0.contains("queue.snapshot") } }
             await controller.shutdown()
 
             let durations = #/Ms=[0-9]+/#
             let logged = lines.values.map { $0.replacing(durations, with: "Ms=N") }
             // The queue snapshot is counted off the main actor, so its line has no fixed place among the others.
             XCTAssertEqual(
-                Array(logged.filter { !$0.contains("queue.snapshot") }.prefix(5)),
+                logged.filter { !$0.contains("queue.snapshot") },
                 [
                     "PhotoBackupBackground pass.started owner=iosBackgroundTask scanOnly=no",
                     "PhotoBackupBackground pass.stopRequested owner=iosBackgroundTask",
                     "PhotoBackupBackground pass.ended owner=iosBackgroundTask stopped=yes stopMs=N durationMs=N"
                         + " waitedForWiFi=no pausedByPolicy=no completedRows=0 alreadyBackedUpRows=0"
                         + " skippedRemoteDeletionRows=0 failedRowsChange=0 sentBytes=0",
-                    "PhotoBackupBackground pass.next branch=restartAfterChange",
-                    "PhotoBackupBackground pass.started owner=foreground scanOnly=no",
-                ])
+                    "PhotoBackupBackground pass.next branch=stoppedInBackground",
+                ], "a stop in the background starts no next pass, also after a change")
             let snapshots = logged.filter { $0.contains("queue.snapshot") }
-            XCTAssertEqual(snapshots.count, 2, "each pass logs one snapshot")
+            XCTAssertEqual(snapshots.count, 1, "each pass logs one snapshot")
             // The pass checks its one row while the snapshot counts, so the line names the states, not fixed counts;
             // UploadBackupQueueDiagnosticsTests checks the counts.
             let states =
@@ -2539,6 +2536,54 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let line = try XCTUnwrap(lines.values.first { $0.hasPrefix("pass.ended") })
             XCTAssertTrue(line.hasSuffix(" baseline=none"), line)
             XCTAssertFalse(line.contains("completedRows"), "without a baseline the line counts nothing")
+            await controller.shutdown()
+        }
+
+        func testAPassThatAStopEndsWhileTheAppIsOnlyInTheBackgroundStartsNoNextPass() async throws {
+            try await assertWhatFollowsAStop(inBackground: true)
+        }
+
+        func testAPassThatAStopEndsInTheForegroundStillRestartsAfterAChange() async throws {
+            try await assertWhatFollowsAStop(inBackground: false)
+        }
+
+        /// iOS ends a background window, and a short background time, with a stop. Then the app must start no more
+        /// work: no restart after a change, no timer for the next pass (#969).
+        private func assertWhatFollowsAStop(inBackground: Bool) async throws {
+            let lines = RecordedLogLines()
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = inBackground ? .backgroundPermitted : .foregroundActive
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-what-follows-a-stop", source: .mobileDataOff(runtime),
+                backgroundLog: BackgroundWorkLog { lines.append($1) })
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                try await Task.sleep(for: .seconds(60))
+            }
+            controller.syncNow()
+            _ = await waitUntil { scans.count == 1 }
+            controller.noteLibraryChangeForTesting()
+            let armed = await waitUntil { controller.isRestartAfterStopArmedForTesting }
+            XCTAssertTrue(armed, "a change during the pass arms the restart after it")
+            controller.stopSync()
+            let decided = await waitUntil { lines.values.contains { $0.hasPrefix("pass.next") } }
+            XCTAssertTrue(decided, "the pass ended")
+            if inBackground {
+                XCTAssertFalse(controller.isSyncing, "no pass restarts after the stop")
+                XCTAssertFalse(controller.isAutoResumeScheduledForTesting, "and no timer plans the next pass")
+                XCTAssertEqual(scans.count, 1)
+            } else {
+                let restarted = await waitUntil { scans.count == 2 }
+                XCTAssertTrue(restarted, "in the foreground the change still restarts the pass")
+            }
+            controller.stopSync()
+            _ = await waitUntil { !controller.isSyncing }
             await controller.shutdown()
         }
 

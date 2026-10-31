@@ -2068,6 +2068,7 @@ public final class PhotoLibraryBackupController {
         case shutdown
         case anotherPassStarted
         case localStateUnavailable
+        case stoppedInBackground
     }
 
     /// The facts of a pass that are gone once its run is cleared.
@@ -2527,6 +2528,13 @@ public final class PhotoLibraryBackupController {
         // Wi-Fi or Ethernet returned, or the setting was turned on, while this pass still ran (for example during
         // its scan). Start the next pass now instead of keeping "Waiting for Wi-Fi" until the fallback.
         let wiFiWaitEnded = (waitedForWiFi || manualWiFiRetryPending) && runtimeSignals.current().canEndWiFiWait
+        // iOS ends a background window, and the short background time, with a stop and then suspends the app. A pass that
+        // a stop ended while no scene is in the foreground therefore starts nothing more; the next window or the next
+        // foreground start continues from the queue and the library's change history.
+        if ended.stopped, runtimeSignals.current().isAppInBackground {
+            logNext(.stoppedInBackground)
+            return
+        }
         if shouldRestart {
             logNext(.restartAfterChange)
             syncNow()
