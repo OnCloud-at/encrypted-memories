@@ -1887,18 +1887,49 @@ final class UploadDedupePipelineTests: XCTestCase {
         await pipeline.uploadDidFail(d)
     }
 
-    func testAFailedVisibilityReadKeepsTheDuplicateDecision() async throws {
+    /// After a failed prime read, the role of a name row is unknown and the row stays listed. The state that is read
+    /// again before the row counts also decides the role: a related file of another photo is no backup of a main
+    /// photo (#879).
+    func testAFailedPrimeReadCannotMakeARootAdoptARelatedFileByItsName() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [activeRow("original-link", contentHash: contentHash)]
+        checker.relatedLinkIDsByMainLinkID["edited-main"] = ["original-link"]
+        checker.linkVisibilityError = UploadError.backend("metadata endpoint down")
+        await pipeline.prime([d])
+        checker.linkVisibilityError = nil
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertNotEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "original-link"))
+        XCTAssertNotEqual(store.record(for: d.source)?.remoteLinkID, "original-link")
+    }
+
+    /// A name row counts as a backup only with a current state (#879). A failed read adopts nothing and writes no
+    /// record; the next check reads the state again and decides by the role that it shows.
+    func testAFailedStateReadOfANameRowAdoptsNothingAndTheRetryReadsTheRole() async throws {
         let d = descriptor()
         let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
         checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [activeRow("original-link", contentHash: contentHash)]
         checker.relatedLinkIDsByMainLinkID["edited-main"] = ["original-link"]
         checker.linkVisibilityError = UploadError.backend("metadata endpoint down")
 
-        let result = try await pipeline.resolve(d)
+        do {
+            let result = try await pipeline.resolve(d)
+            XCTFail("A failed state read must not settle the photo: \(result.decision)")
+        } catch {
+            XCTAssertEqual(error as? UploadError, .backend("metadata endpoint down"))
+        }
+        XCTAssertNil(store.record(for: d.source)?.remoteLinkID)
+        XCTAssertNil(store.record(for: d.source)?.outcome)
+        await pipeline.uploadDidFail(d)
 
-        XCTAssertEqual(
-            result.decision, .skip(.activeDuplicate, remoteLinkID: "original-link"),
-            "an unproven role keeps the decision of the listing")
+        checker.linkVisibilityError = nil
+        let retry = try await pipeline.resolve(d)
+
+        XCTAssertNotEqual(
+            retry.decision, .skip(.activeDuplicate, remoteLinkID: "original-link"),
+            "a related file of another photo is no backup of a main photo")
     }
 
     func testASecondaryAdoptsItsCopyUnderItsMainPhotoWithOneRoleRead() async throws {
@@ -2073,7 +2104,9 @@ final class UploadDedupePipelineTests: XCTestCase {
         XCTAssertEqual(checker.linkVisibilityCallCount, 3, "5 roots in batches of 2 cost 3 reads, not 5")
     }
 
-    func testAFailedPrimeReadKeepsTheDuplicateDecisionsWithoutAReadPerRoot() async throws {
+    /// A name row counts as a backup only with a current state (#879). The states that a failed prime read could not
+    /// give are read again, in batches like the prime read, not once for each root.
+    func testAFailedPrimeReadIsReadAgainInBatchesBeforeTheNameRowsCount() async throws {
         pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker, batchSize: 2)
         let roots = rootsWithActiveTwins(3)
         checker.linkVisibilityError = UploadError.backend("metadata endpoint down")
@@ -2086,7 +2119,7 @@ final class UploadDedupePipelineTests: XCTestCase {
             XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "link-\(index)"))
         }
 
-        XCTAssertEqual(checker.linkVisibilityCallCount, 2, "an unproven role keeps the listing, without a retry")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 4, "3 roots in batches of 2 cost 2 more reads, not 3")
     }
 
     func testResolveCancellationDuringHashingPropagates() async throws {

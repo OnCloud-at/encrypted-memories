@@ -284,6 +284,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
     var readCounts: ReadCounts { lock.withLock { counted } }
     private var counted = ReadCounts()
+    /// The most links that one visibility read asked for.
+    var largestVisibilityRead: Int { lock.withLock { largestVisibility } }
+    private var largestVisibility = 0
 
     /// The album read of this photo answers these albums, as a stale membership cache does.
     func reportStaleAlbums(_ albums: Set<SeriesAlbumReference>, of uid: PhotoUID) {
@@ -544,6 +547,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         if lock.withLock({ cancelVisibilityCaller }) { withUnsafeCurrentTask { $0?.cancel() } }
         return try lock.withLock {
             counted.visibility += 1
+            largestVisibility = max(largestVisibility, linkIDs.count)
             for linkID in linkIDs {
                 if let error = visibilityErrors[linkID] { throw error }
             }

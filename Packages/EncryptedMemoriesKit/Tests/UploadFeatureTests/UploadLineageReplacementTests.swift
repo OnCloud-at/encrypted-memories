@@ -545,18 +545,33 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertEqual(server.links.first { $0.uid == replacement }?.state, .active)
     }
 
-    func testFailedVisibilityReadKeepsTodaysDuplicateDecision() async throws {
+    /// A failed visibility read starts no replacement. The name row of the duplicate needs a current state (#879), so
+    /// the check fails closed without a record; once the read works, it decides like a check that never failed.
+    func testFailedVisibilityReadStartsNoReplacementAndAdoptsNothing() async throws {
         _ = try seed("head")
         let duplicate = try seed("next", filename: "Render.JPG", cloudID: "other-asset")
         let baseline = UploadDedupePipeline(store: FakeIdentityStore(), checker: server)
         let today = try await baseline.resolve(descriptor("next"))
         server.configureOptionalReads(visibilityFails: true)
 
-        let result = try await pipeline.resolve(descriptor("next"))
+        let failed = try? await pipeline.resolve(descriptor("next"))
 
         XCTAssertEqual(today.decision, .skip(.activeDuplicate, remoteLinkID: duplicate.nodeID))
-        XCTAssertEqual(result.decision, today.decision)
+        XCTAssertNil(failed, "a failed state read must not settle the photo")
+        XCTAssertNil(identities.record(for: source)?.remoteLinkID)
         XCTAssertTrue(journal.entry(for: source).isEmpty)
+        server.configureOptionalReads(visibilityFails: false)
+        await pipeline.uploadDidFail(descriptor("next"))
+
+        let result = try await pipeline.resolve(descriptor("next"))
+
+        let otherDirectory = directory.appendingPathComponent("never-failed", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherDirectory, withIntermediateDirectories: true)
+        let otherJournal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: otherDirectory))
+        let neverFailed = try await UploadDedupePipeline(
+            store: FakeIdentityStore(), checker: server, replacementJournal: otherJournal
+        ).resolve(descriptor("next"))
+        XCTAssertEqual(result.decision, neverFailed.decision)
     }
 
     func testMissingLocalEditTimeKeepsTodaysScope() async throws {
