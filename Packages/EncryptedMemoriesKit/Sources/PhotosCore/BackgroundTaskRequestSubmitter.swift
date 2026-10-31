@@ -117,6 +117,26 @@ public final class BackgroundTaskRequestSubmitter {
         return true
     }
 
+    /// The answer of `query`, or nil when `deadline` ends first, by default after `endOfWindowWaitLimit`. The query runs
+    /// off the main thread and a later answer is dropped, so a scheduler call that does not answer cannot hold the end
+    /// of a window.
+    public static func answer<Answer: Sendable>(
+        of query: @escaping @Sendable () async -> Answer,
+        deadline: @escaping @Sendable () async -> Void = BackgroundTaskRequestSubmitter.defaultDeadline
+    ) async -> Answer? {
+        await withCheckedContinuation { continuation in
+            let first = FirstResult<Answer?>(continuation)
+            let timer = Task.detached {
+                await deadline()
+                first.resume(nil)
+            }
+            Task.detached {
+                first.resume(await query())
+                timer.cancel()
+            }
+        }
+    }
+
     /// Removes the pending request. A request that is still on its way is removed again when it lands, unless the task
     /// has been restarted and its current run has sent a request by then; a request that waits behind it is never sent.
     public func cancel() {
@@ -133,7 +153,7 @@ public final class BackgroundTaskRequestSubmitter {
 private final class Deadline: @unchecked Sendable {
     private let lock = NSLock()
     private var ended = false
-    private var waiting: [FirstResult] = []
+    private var waiting: [FirstResult<Bool>] = []
     private var timer: Task<Void, Never>?
 
     init(_ deadline: @escaping @Sendable () async -> Void) {
@@ -146,7 +166,7 @@ private final class Deadline: @unchecked Sendable {
     /// True when `task` ended first, false when the deadline did.
     func race(_ task: Task<Void, Never>) async -> Bool {
         await withCheckedContinuation { continuation in
-            let first = FirstResult(continuation)
+            let first = FirstResult<Bool>(continuation)
             let alreadyEnded = lock.withLock { () -> Bool in
                 if !ended { waiting.append(first) }
                 return ended
@@ -171,7 +191,7 @@ private final class Deadline: @unchecked Sendable {
     }
 
     private func end() {
-        let waiting = lock.withLock { () -> [FirstResult] in
+        let waiting = lock.withLock { () -> [FirstResult<Bool>] in
             ended = true
             defer { self.waiting = [] }
             return self.waiting
@@ -181,16 +201,16 @@ private final class Deadline: @unchecked Sendable {
 }
 
 /// Resumes one continuation with the first of two results; the later result is dropped.
-private final class FirstResult: @unchecked Sendable {
+private final class FirstResult<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<Bool, Never>?
+    private var continuation: CheckedContinuation<Value, Never>?
 
-    init(_ continuation: CheckedContinuation<Bool, Never>) {
+    init(_ continuation: CheckedContinuation<Value, Never>) {
         self.continuation = continuation
     }
 
-    func resume(_ value: Bool) {
-        let continuation = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+    func resume(_ value: Value) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Value, Never>? in
             defer { self.continuation = nil }
             return self.continuation
         }

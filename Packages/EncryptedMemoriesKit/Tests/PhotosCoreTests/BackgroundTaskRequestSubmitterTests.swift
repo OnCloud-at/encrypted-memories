@@ -539,4 +539,33 @@ final class BackgroundTaskRequestSubmitterTests: XCTestCase {
         await submitter.lastSubmissionForTesting?.value
         XCTAssertEqual(cancels, 1)
     }
+
+    func testAQueryThatAnswersBeforeTheDeadlineReturnsItsAnswerFromOffTheMainThread() async {
+        let deadline = AsyncTestSignal()
+
+        let answer = await BackgroundTaskRequestSubmitter.answer(
+            of: { Self.runsOnTheMainThread() }, deadline: { await deadline.wait() })
+
+        XCTAssertEqual(answer, false, "the query answers, off the main thread")
+        deadline.fire()
+    }
+
+    func testTheDeadlineEndsAQueryThatDoesNotAnswer() async {
+        let releaseQuery = AsyncTestSignal()
+        let queryEnded = AsyncTestSignal()
+
+        let answer = await BackgroundTaskRequestSubmitter.answer(
+            of: { () -> Int in
+                // Bounded, so an answer that ignores its deadline fails here instead of hanging the test.
+                _ = await releaseQuery.wait(limit: XCTestCase.backgroundWindowEventLimit)
+                queryEnded.fire()
+                return 1
+            },
+            deadline: {})
+
+        XCTAssertNil(answer, "the deadline ends the wait without the answer")
+        releaseQuery.fire()
+        let ended = await happened(queryEnded)
+        XCTAssertTrue(ended, "the late answer is dropped")
+    }
 }

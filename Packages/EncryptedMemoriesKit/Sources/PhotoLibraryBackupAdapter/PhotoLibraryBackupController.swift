@@ -1091,6 +1091,15 @@ public final class PhotoLibraryBackupController {
             !isRetiringInstantWork, runnerStopTask == nil,
             let engine, let runner, let queueStore, let catalogStore
         else { return nil }
+        if owner == .foreground, runtimeSignals.current().isAppInBackground {
+            // While no scene is in the foreground, only a background window starts a pass. The app's own starts (the
+            // resume at launch, a new photo, the network, a timer, the restart after a pass) wait for the next window
+            // or for the person to open the app; a pass that already runs keeps going.
+            backgroundLog.notice(
+                .photoBackup, "pass.declined",
+                [(.init("owner"), Self.logValue(owner)), (.init("reason"), .word("appInBackground"))])
+            return nil
+        }
         guard queueStore.isOperational(), catalogStore.isOperational(), pendingStoreIsReady else {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
@@ -1132,10 +1141,9 @@ public final class PhotoLibraryBackupController {
         var carriesManualRetry = false
         if !scanOnly, manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait, owner != .manual {
             if runtimeSignals.current().isAppInBackground {
-                // No scene is in the foreground, so nobody watches the person's retry. Only a background window runs it,
-                // as its own pass that holds the window's time and may skip the remote index backoff; any other start
-                // leaves the retry pending for that window.
-                guard owner != .foreground else { return nil }
+                // No scene is in the foreground, so nobody watches the person's retry. Only a background window gets
+                // here; it runs the retry as its own pass that holds the window's time and may skip the remote index
+                // backoff.
                 carriesManualRetry = true
             } else {
                 let run = startSync(owner: .manual)

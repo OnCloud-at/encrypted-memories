@@ -20,7 +20,8 @@ public enum PhotoLibraryRefreshWindow {
     /// Runs the window and returns how it ended. `scheduleNext` submits the next refresh request; it runs first. In Low
     /// Power Mode the window does nothing else. Then the account gets `accountLimit`. Backup off or paused ends the window
     /// through `backupStopped` or `backupPaused`, as the long window does. Then the scan runs until it ends or the
-    /// window's end stops it.
+    /// window's end stops it. A scan that started calls `ensureLongWindowRequest` unless the window expired, so the next
+    /// long window uploads what it queued; the short window keeps no timer of its own.
     public static func run(
         scheduleNext: () -> Void,
         isLowPowerModeOn: () -> Bool,
@@ -29,6 +30,7 @@ public enum PhotoLibraryRefreshWindow {
         didExpire: () -> Bool,
         backupStopped: () -> Void,
         backupPaused: () -> Void,
+        ensureLongWindowRequest: () async -> Void,
         onRunStarted: @escaping @MainActor (String) -> Void
     ) async -> BackgroundWindowOutcome {
         scheduleNext()
@@ -47,11 +49,22 @@ public enum PhotoLibraryRefreshWindow {
             backupPaused()
             return .notNeeded
         }
+        // A scan that started may have queued photos, also when it stopped or failed later; the next long window
+        // uploads them, so iOS must hold a request for one. An expired window ends at once instead.
         switch await controller.backgroundRefreshScan(onRunStarted: onRunStarted) {
-        case .scanned: return didExpire() ? .expired : .ran
+        case .scanned:
+            guard !didExpire() else { return .expired }
+            await ensureLongWindowRequest()
+            return .ran
+        case .stopped:
+            guard !didExpire() else { return .expired }
+            await ensureLongWindowRequest()
+            return .failed
+        case .failed:
+            if !didExpire() { await ensureLongWindowRequest() }
+            return .failed
         case .notNeeded, .yielded: return .notNeeded
-        case .stopped: return didExpire() ? .expired : .failed
-        case .couldNotStart, .failed: return .failed
+        case .couldNotStart: return .failed
         }
     }
 }

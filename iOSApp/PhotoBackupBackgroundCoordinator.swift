@@ -407,8 +407,11 @@ final class PhotoBackupBackgroundCoordinator {
     /// A refresh window scans the photo library and uploads nothing (PhotoLibraryRefreshWindow).
     private func handleRefreshTask(_ task: BGAppRefreshTask) {
         let completion = PhotoLibraryRefreshWindow.begin { task.setTaskCompleted(success: $0) }
-        let pendingRequests: @Sendable () async -> Void = { [refreshSubmitter] in
-            await refreshSubmitter.pendingSubmissionsEnded()
+        // The window can also submit the processing request (ensureLongWindowRequest), so its end waits for both.
+        let pendingRequests: @Sendable () async -> Void = { [refreshSubmitter, submitter] in
+            async let refresh = refreshSubmitter.pendingSubmissionsEnded()
+            async let processing = submitter.pendingSubmissionsEnded()
+            _ = await (refresh, processing)
         }
         let attempt = PhotoBackupProcessingAttempt()
         attempt.work = Task { @MainActor [weak self] in
@@ -420,6 +423,7 @@ final class PhotoBackupBackgroundCoordinator {
                 didExpire: { attempt.didExpire },
                 backupStopped: { self?.backupStopped() },
                 backupPaused: { self?.backupPaused() },
+                ensureLongWindowRequest: { await self?.ensureProcessingRequest() },
                 onRunStarted: { runID in
                     attempt.noteRefreshRun(controller: PhotoLibraryBackupSharedRef.shared.controller, runID: runID)
                 })
@@ -438,6 +442,24 @@ final class PhotoBackupBackgroundCoordinator {
                 }
             }
         }
+    }
+
+    /// Submits the processing request only when none is pending, so a short window never moves the next long one. When
+    /// the scheduler does not answer within the end-of-window limit, the request is submitted: a moved long window is
+    /// better than none.
+    private func ensureProcessingRequest() async {
+        let identifier = Self.processingTaskIdentifier
+        let isPending = await BackgroundTaskRequestSubmitter.answer {
+            await BGTaskScheduler.shared.pendingTaskRequests().contains { $0.identifier == identifier }
+        }
+        BackgroundWorkLog.system.notice(
+            .photoBackup, "request.ensured",
+            [
+                (.init("kind"), .name(BackgroundWindowKind.photoBackup)),
+                (.init("pending"), isPending.map { .flag($0) } ?? .word("unknown")),
+            ])
+        guard isPending != true else { return }
+        scheduleProcessingCatchUp(controller: PhotoLibraryBackupSharedRef.shared.controller)
     }
 
     private func waitForController() async -> BackgroundAccountWait<PhotoLibraryBackupController> {
