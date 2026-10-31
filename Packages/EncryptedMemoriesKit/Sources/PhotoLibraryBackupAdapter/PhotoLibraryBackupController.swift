@@ -1009,6 +1009,8 @@ public final class PhotoLibraryBackupController {
     /// `onRunAdmitted` receives the run ID of the window's own pass, also one that waited for the first network path,
     /// synchronously while that run starts and before `idleTimerHook` reports it; it must only record state.
     /// `onRunStarted` follows, for a waiting window when its wait resumes.
+    /// A window that took over a pass can run a second pass of its own afterwards, for the person's pending retry: both
+    /// callbacks then fire again with the new run ID, and the window holds that run from then on.
     /// Checkpointed state lets the next pass resume unfinished work.
     @discardableResult
     public func backgroundCatchUp(
@@ -1044,6 +1046,15 @@ public final class PhotoLibraryBackupController {
             backgroundLog.notice(.photoBackup, "window.tookOver", [(.init("owner"), Self.logValue(owner))])
             onRunStarted?(run.runID)
             await waitForAdoptedRun(run)
+            // The person's retry waited for Wi-Fi while the taken-over pass ran, and that pass does not carry it. The
+            // window still has time, so it runs the retry as its own pass instead of leaving it to a later window.
+            guard !Task.isCancelled, manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait,
+                let retry = startSync(owner: owner, onAdmitted: onRunAdmitted)
+            else { return .done }
+            backgroundLog.notice(
+                .photoBackup, "window.carriesRetryAfterTakeover", [(.init("owner"), Self.logValue(owner))])
+            onRunStarted?(retry.runID)
+            await retry.task.value
             return .done
         }
         guard let run = started else {
@@ -1711,6 +1722,9 @@ public final class PhotoLibraryBackupController {
 
         /// The person's manual retry waits for Wi-Fi.
         internal var isManualWiFiRetryPendingForTesting: Bool { manualWiFiRetryPending }
+
+        /// Host tests start from a retry that already waits; the package tests reach this state through a manual pass.
+        internal func markManualWiFiRetryPendingForTesting() { manualWiFiRetryPending = true }
 
         /// The first status projection arrived, so a pass start has counts to compare with.
         internal var hasStatusProjectionForTesting: Bool { hasStatusProjection }

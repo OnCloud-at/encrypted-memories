@@ -16,6 +16,7 @@ final class PhotoBackupProcessingAttempt {
     private let endShortGrace: @MainActor () -> Void
     private weak var controller: PhotoLibraryBackupController?
     private var protectionToken: UUID?
+    private var protectedRunID: String?
     #if DEBUG
         var beforeRunAdmissionForTesting: ((String) -> Void)?
         private(set) var cancellationReleaseEndedForTesting = false
@@ -86,8 +87,11 @@ final class PhotoBackupProcessingAttempt {
     }
 
     private func holdProtection(controller: PhotoLibraryBackupController, runID: String) {
-        guard protectionToken == nil else { return }
+        guard protectedRunID != runID else { return }
+        // After the pass it took over, a window can run a pass of its own for the person's retry; it protects that run.
+        releaseProtection()
         protectionToken = protection.hold(owner: controller, runID: runID)
+        protectedRunID = runID
         // The window carries the run from now on; a short grace that a pass began before would only warn and hold.
         endShortGrace()
     }
@@ -95,6 +99,7 @@ final class PhotoBackupProcessingAttempt {
     private func releaseProtection() {
         if let protectionToken { protection.release(protectionToken) }
         protectionToken = nil
+        protectedRunID = nil
     }
 }
 
