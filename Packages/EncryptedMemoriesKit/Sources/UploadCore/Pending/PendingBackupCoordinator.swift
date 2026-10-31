@@ -171,6 +171,10 @@ public actor PendingBackupCoordinator {
     private var excludedAccessible = Set<PendingSourceKey>() {
         didSet { excludedListsCache = nil }
     }
+    /// The excluded sources that the last check of the excluded list examined, or nil when that check saw all of them.
+    /// After an incomplete load a source whose state did not decode is not cached, so the check cannot see it; the next
+    /// load that decodes another excluded source checks the list again.
+    private var excludedCheckExamined: Set<PendingSourceKey>?
     /// Excluded sources that Apple Photos reported gone. The catalog still lists them until a backup pass runs, which
     /// never happens while backup is paused, so a check of the excluded list must not show them again.
     private var excludedMissing = Set<PendingSourceKey>()
@@ -883,6 +887,11 @@ public actor PendingBackupCoordinator {
             loadDecodedKeys = Set(decoded.keys)
         }
         sourceStatesIncomplete = !read.complete
+        if let examined = excludedCheckExamined,
+            read.states.contains(where: { $0.desired == .excluded && !examined.contains($0.key) })
+        {
+            noteLibraryChanged()
+        }
     }
 
     private func reloadSourceStates(_ keys: [PendingSourceKey]) {
@@ -1128,6 +1137,7 @@ public actor PendingBackupCoordinator {
 
     private func refreshExcludedAccessibility() async {
         let excluded = sourceStates.values.filter { $0.desired == .excluded }.map(\.key)
+        excludedCheckExamined = sourceStatesIncomplete ? Set(excluded) : nil
         guard !excluded.isEmpty else {
             if !excludedAccessible.isEmpty {
                 excludedAccessible = []
