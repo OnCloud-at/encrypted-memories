@@ -1041,6 +1041,16 @@ final class PendingBackupStoreTests: XCTestCase {
         }
         XCTAssertEqual(
             store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier: .unreadable])
+
+        // A row of a known kind whose other value cannot be read; the key read meets it before the excluded row.
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    $0, "UPDATE source_state SET source_kind='fileURL', desired='written-by-a-newer-build' "
+                        + "WHERE source_kind='zz-newer-kind';", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertEqual(
+            store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier: .unreadable])
     }
 
     /// The read finds a row of an unknown kind before, between and after the kinds that this build knows (#982).
