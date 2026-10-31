@@ -318,6 +318,7 @@ import UploadCore
                 exposedRunID.map { protection.isProtected(owner: fixture.controller, runID: $0) } == true,
                 "the controller and run must already have protection at their first exposure")
             grace.protectActiveRun(controller: fixture.controller)
+            #expect(system.starts == 0, "the window's run begins no short grace")
             system.expire()
             #expect(
                 !fixture.controller.isRunnerStopPendingForTesting,
@@ -335,7 +336,7 @@ import UploadCore
         #expect(admitted, "the resumed admission must be observed before cleanup")
         #expect(expiredBeforeAdmission)
         #expect(exposedRunID != nil)
-        #expect(system.ended == [system.identifier], "the short assertion still ends exactly once")
+        #expect(system.starts == 0 && system.ended.isEmpty, "a run that a window holds begins no short grace")
         fixture.scan.release()
         let completed = await fixture.waitFor { ended }
         #expect(completed, "the released run must end before cleanup")
@@ -371,6 +372,37 @@ import UploadCore
         fixture.scan.release()
         await attempt.work?.value
         fixture.controller.idleTimerHook = nil
+        await fixture.close()
+    }
+
+    @Test func aWindowThatTakesOverAPassEndsItsShortGrace() async throws {
+        let fixture = try Fixture()
+        let protection = BackgroundBackupRunProtection()
+        let system = GraceSystem()
+        let grace = system.makeGrace(protection: protection)
+        fixture.controller.syncNow()
+        try await fixture.waitUntil { fixture.scan.started }
+        grace.protectActiveRun(controller: fixture.controller)
+        #expect(system.starts == 1, "the automatic pass began its short grace before the window came")
+        let attempt = PhotoBackupProcessingAttempt(protection: protection, endShortGrace: { grace.end() })
+        attempt.work = Task { _ = await attempt.run(controller: fixture.controller) }
+        try await fixture.waitUntil { attempt.runID != nil }
+        #expect(system.ended == [system.identifier], "the window carries the pass now and ends the short grace")
+        #expect(!fixture.controller.isRunnerStopPendingForTesting)
+        fixture.scan.release()
+        await attempt.work?.value
+        await fixture.close()
+    }
+
+    @Test func anUnprotectedPassStillBeginsItsShortGrace() async throws {
+        let fixture = try Fixture()
+        let system = GraceSystem()
+        let grace = system.makeGrace(protection: BackgroundBackupRunProtection())
+        fixture.controller.syncNow()
+        try await fixture.waitUntil { fixture.scan.started }
+        grace.protectActiveRun(controller: fixture.controller)
+        #expect(system.starts == 1, "a pass without a window keeps its short grace")
+        fixture.scan.release()
         await fixture.close()
     }
 
@@ -415,9 +447,9 @@ import UploadCore
         fixture.runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
         try await fixture.waitUntil { fixture.scan.started && attempt.runID != nil }
         #expect(fixture.controller.executionOwnerForTesting == .iOSBackgroundTask)
+        #expect(system.starts == 0, "the window's run begins no short grace")
         system.expire()
         #expect(!fixture.controller.isRunnerStopPendingForTesting)
-        #expect(system.ended == [system.identifier])
         fixture.scan.release()
         await attempt.work?.value
         fixture.controller.idleTimerHook = nil
