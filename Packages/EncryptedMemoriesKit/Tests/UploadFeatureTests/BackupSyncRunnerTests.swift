@@ -4426,6 +4426,42 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(stateStore.count(), 0, "no preflight completeness record may exist for skipped deletions")
     }
 
+    /// The person deleted a backed-up photo in Proton, and the trash was emptied later. Each later check finds no copy:
+    /// the photo stays deleted in Proton, uploads nothing, spends no attempt and needs no attention (#984).
+    func testAPhotoDeletedInProtonStaysDeletedAfterItsTrashIsEmptied() async throws {
+        let entry = seedEntry("emptied.jpg")
+        let hashes = expectedHashes(id: "emptied.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .trashed, linkID: "t-1")
+        ]
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .skippedRemoteDeletion)
+
+        checker.remoteItemsByNameHash[hashes.nameHash] = []
+        for _ in 0..<3 {
+            clock.advance(by: 60)
+            let lookups = checker.nameLookupAttemptCount
+            _ = seedEntry("emptied.jpg", ageSeconds: 0)  // A rescan checks the photo again.
+            let progress = await makeRunner().runUntilDrained()
+
+            XCTAssertGreaterThan(checker.nameLookupAttemptCount, lookups, "the check reads Proton again")
+            let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(row.state, .skippedRemoteDeletion)
+            XCTAssertEqual(row.attempts, 0)
+            XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.kind, .remoteDeletion)
+            XCTAssertEqual(progress.skippedRemoteDeletions, 1)
+            XCTAssertEqual(progress.needsAttention, 0)
+            var problems = 0
+            queueStore.forEachProblemEntry { _ in
+                problems += 1
+                return true
+            }
+            XCTAssertEqual(problems, 0, "no failure under Needs attention")
+            XCTAssertTrue(uploader.requests.isEmpty)
+        }
+    }
+
     func testUploadRecordsManifestBeforeQueueCompletion() async throws {
         let log = BackupEventLog()
         let spyQueue = SpyQueueStore(inner: queueStore, log: log)
