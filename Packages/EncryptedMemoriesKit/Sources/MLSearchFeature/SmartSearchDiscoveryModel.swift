@@ -854,3 +854,53 @@ public final class SmartSearchDiscoveryModel {
         return resolved + carried
     }
 }
+
+/// What the Search landing shows for the suggestions.
+public enum SmartSearchLandingPhase: Equatable, Sendable {
+    case suggestions
+    /// Placeholder rows: the suggestions are being computed.
+    case loading
+    /// Placeholder rows with a short note: the computation waits for the library to settle.
+    case preparing
+    /// A finished computation with no result, or a library without photos.
+    case empty
+}
+
+extension SmartSearchDiscoveryModel {
+    /// The Search landing shows the empty state only for a finished computation without a result or for a library
+    /// without photos. Until a computation has finished, the suggestions are on their way: placeholder rows show
+    /// while it runs, and the same rows with a short note show while it waits for the library to settle.
+    public nonisolated static func landingPhase(
+        hasSuggestions: Bool, hasComputed: Bool, isComputing: Bool, libraryIsEmpty: Bool
+    ) -> SmartSearchLandingPhase {
+        if hasSuggestions { return .suggestions }
+        if hasComputed || libraryIsEmpty { return .empty }
+        return isComputing ? .loading : .preparing
+    }
+}
+
+extension SmartSearchDiscoveryModel.PersistedSnapshot {
+    /// The saved rows that still describe a library that changed since they were computed, for a provisional
+    /// restore. A row stays only when every photo it names is still in the library, and a favorites row only
+    /// while all its photos are favorites. Places and On This Day rows never come back: their content depends on
+    /// the place policy and on the current day, which a changed fingerprint cannot tell apart. Photos that
+    /// arrived since cannot enter a row, so nothing here bypasses the sensitive-content gate. Nil when no For You row stays.
+    func provisional(library: Set<PhotoUID>, favorites: Set<PhotoUID>) -> Self? {
+        let kept = candidates.filter { row in
+            switch row.kind {
+            case .place, .placeSeason, .onThisDay: return false
+            case .favorites: if row.matchingUIDs?.isSubset(of: favorites) != true { return false }
+            default: break
+            }
+            return row.matchingUIDs?.isSubset(of: library) != false
+                && row.representativeUIDs.allSatisfy(library.contains)
+        }
+        // A snapshot with chips only would show the empty state for a result that is not finished.
+        let forYou = Set(forYouIDs)
+        guard kept.contains(where: { forYou.contains($0.id) }) else { return nil }
+        return Self(
+            candidates: kept, forYouIDs: forYouIDs, chipIDs: chipIDs, showsSmartSearchHint: showsSmartSearchHint,
+            visualAvailability: visualAvailability, visualCompletedWhenReady: visualCompletedWhenReady,
+            placeNames: placeNames, placeNamesLocale: placeNamesLocale)
+    }
+}

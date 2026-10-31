@@ -1092,6 +1092,9 @@ final class MobileLibraryModel {
         let crawlItems = items
         let token = loadToken
         isThumbnailPrefetchLoading = !crawlItems.isEmpty
+        let crawlStarted = ContinuousClock.now
+        PhotoDiagnostics.shared.emit(
+            "MediaFeed", ["event": "thumbnailCrawlStarted", "items": "\(crawlItems.count)"])
         prefetchStartTask = Task { [weak self] in
             let uids = await Task.detached(priority: .utility) {
                 ThumbnailCrawlOrder.newestToOldestFromChronological(crawlItems)
@@ -1104,6 +1107,13 @@ final class MobileLibraryModel {
                 return  // A replacement task or teardown owns the current presentation state.
             }
             guard !Task.isCancelled, token == self?.loadToken else { return }
+            let elapsed = crawlStarted.duration(to: .now).components
+            PhotoDiagnostics.shared.emit(
+                "MediaFeed",
+                [
+                    "event": "thumbnailCrawlFinished", "items": "\(crawlItems.count)",
+                    "durationMs": "\(elapsed.seconds * 1_000 + elapsed.attoseconds / 1_000_000_000_000_000)",
+                ])
             self?.isThumbnailPrefetchLoading = false
         }
     }

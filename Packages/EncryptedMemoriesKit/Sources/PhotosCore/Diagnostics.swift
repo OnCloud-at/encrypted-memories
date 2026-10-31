@@ -637,7 +637,13 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         case "MetricKit":
             allowedFields = ["diagnosticPayloads", "metricPayloads"]
         case "SearchSuggestions":
-            allowedFields = ["action", "result", "durationMs"]
+            allowedFields = [
+                "action", "result", "durationMs", "event", "outcome", "versionMatches", "modelMatches",
+                "evidenceComplete", "exactContent", "eligible", "librarySettled", "cacheContentSettled",
+                "generationAllowed", "lowPower", "thermal", "memory", "foreground", "searchCount", "transferCount",
+            ]
+        case "MediaFeed":
+            allowedFields = ["event", "items", "durationMs"]
         case "DeviceIdentityKeychain":
             allowedFields = ["operation", "status"]
         case "MLCatalogRefresh":

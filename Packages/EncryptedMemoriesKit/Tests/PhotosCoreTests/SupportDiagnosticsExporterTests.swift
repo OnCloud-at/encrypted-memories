@@ -94,6 +94,22 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         XCTAssertEqual(snapshot.counters, ["ml.suggestions.snapshotRestored": 1])
     }
 
+    func testSuggestionGateDiagnosticsKeepOnlyFixedScalars() {
+        let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false)
+        diagnostics.emit(
+            "SearchSuggestions",
+            [
+                "event": "refreshBlocked", "eligible": "false", "librarySettled": "false", "searchCount": "1",
+                "uid": "private-photo", "title": "private-title",
+            ])
+        diagnostics.emit("MediaFeed", ["event": "thumbnailCrawlFinished", "items": "9", "uid": "private-photo"])
+        let events = diagnostics.supportSnapshot().events
+        XCTAssertEqual(
+            events.first?.fields,
+            ["event": "refreshBlocked", "eligible": "false", "librarySettled": "false", "searchCount": "1"])
+        XCTAssertEqual(events.last?.fields, ["event": "thumbnailCrawlFinished", "items": "9"])
+    }
+
     func testDisabledDebugLoggingDoesNotBuildFields() {
         let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false)
         var evaluations = 0
