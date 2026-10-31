@@ -73,9 +73,15 @@ public struct BackgroundWorkLog: Sendable {
         }
     }
 
-    public static let system = BackgroundWorkLog { category, line in
-        Logger(subsystem: "at.oncloud.encryptedmemories", category: category.rawValue)
-            .notice("\(line, privacy: .public)")
+    public static let system = persisting(to: .shared)
+
+    /// Writes each line to the unified log and to `file`, which the support file carries.
+    public static func persisting(to file: BackgroundWorkLogFile) -> BackgroundWorkLog {
+        BackgroundWorkLog { category, line in
+            Logger(subsystem: "at.oncloud.encryptedmemories", category: category.rawValue)
+                .notice("\(line, privacy: .public)")
+            file.append(category.rawValue + " " + line)
+        }
     }
 
     private let sink: @Sendable (Category, String) -> Void

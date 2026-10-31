@@ -61,6 +61,30 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         XCTAssertEqual(sources.workMeasurementSnapshot().availability, 1)
     }
 
+    func testTheReportCarriesTheBackgroundLogLines() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SupportBackgroundLog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = BackgroundWorkLogFile(
+            fileURL: directory.appendingPathComponent("background-log-v1.txt"), isPurgePending: { false })
+        file.append(
+            "PhotoBackupBackground window.began kind=photoBackup", at: Date(timeIntervalSince1970: 1_800_000_000))
+        let runtime = LibraryRuntimeState()
+        let data = try await SupportDiagnosticsExporter.makeJSONData(
+            runtimeState: runtime,
+            resourceCoordinator: LibraryResourceCoordinator(runtimeState: runtime),
+            diagnostics: PhotoDiagnostics(debugConsoleLogsEnabled: false),
+            bundle: Bundle(for: Self.self), sources: SupportDiagnosticsSources(trail: SupportEventTrail()),
+            trail: SupportEventTrail(), backgroundLog: file)
+        let report = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        let section = try XCTUnwrap(report["backgroundLog"] as? [String: Any])
+        XCTAssertEqual(
+            section["lines"] as? [String],
+            ["2027-01-15T08:00:00.000Z PhotoBackupBackground window.began kind=photoBackup"])
+        XCTAssertEqual(section["droppedLines"] as? Int, 0)
+    }
+
     func testSchemaFourExportsOnlyUnavailableD1MeasurementsWithoutSource() async throws {
         let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
         let runtime = LibraryRuntimeState()
