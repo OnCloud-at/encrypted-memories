@@ -14,7 +14,7 @@ import UploadCore
         let system = GraceSystem()
         let grace = system.makeGrace(protection: protection)
         let controller = fixture.controller
-        controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         grace.protectActiveRun(controller: controller)
         let attempt = PhotoBackupProcessingAttempt(protection: protection)
@@ -37,7 +37,7 @@ import UploadCore
         let system = GraceSystem()
         let grace = system.makeGrace(protection: BackgroundBackupRunProtection())
         let controller = fixture.controller
-        controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         grace.protectActiveRun(controller: controller)
         let runID = try #require(controller.activeExecutionRunID)
@@ -118,7 +118,7 @@ import UploadCore
         let protection = BackgroundBackupRunProtection()
         let releases = ReleaseCounts()
         releases.observe(protection)
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         let first = PhotoBackupProcessingAttempt(protection: protection)
         let second = PhotoBackupProcessingAttempt(protection: protection)
@@ -173,7 +173,7 @@ import UploadCore
 
     @Test func anOldGraceCallbackCannotStopARenewedGraceForTheSamePass() async throws {
         let fixture = try Fixture()
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         let system = GraceSystem()
         let grace = system.makeGrace(protection: BackgroundBackupRunProtection())
@@ -221,7 +221,7 @@ import UploadCore
     @Test func anExpiredAdoptingWindowKeepsThePassNowVisibleInTheForeground() async throws {
         let fixture = try Fixture()
         let protection = BackgroundBackupRunProtection()
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         let attempt = PhotoBackupProcessingAttempt(protection: protection)
         var ended = false
@@ -324,7 +324,7 @@ import UploadCore
                 !fixture.controller.isRunnerStopPendingForTesting,
                 "grace must not stop the run before its waiting processing admission resumes")
         }
-        if launchResumeWaits { fixture.controller.syncNow() }
+        if launchResumeWaits { fixture.startAutomaticPass() }
         attempt.work = Task {
             _ = await attempt.run(controller: fixture.controller)
             ended = true
@@ -380,7 +380,7 @@ import UploadCore
         let protection = BackgroundBackupRunProtection()
         let system = GraceSystem()
         let grace = system.makeGrace(protection: protection)
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         grace.protectActiveRun(controller: fixture.controller)
         #expect(system.starts == 1, "the automatic pass began its short grace before the window came")
@@ -398,7 +398,7 @@ import UploadCore
         let fixture = try Fixture()
         let system = GraceSystem()
         let grace = system.makeGrace(protection: BackgroundBackupRunProtection())
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         grace.protectActiveRun(controller: fixture.controller)
         #expect(system.starts == 1, "a pass without a window keeps its short grace")
@@ -440,7 +440,7 @@ import UploadCore
         fixture.controller.idleTimerHook = { active in
             if active { grace.protectActiveRun(controller: fixture.controller) }
         }
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         let attempt = PhotoBackupProcessingAttempt(protection: protection)
         attempt.work = Task { _ = await attempt.run(controller: fixture.controller) }
         try await fixture.waitUntil { fixture.controller.deferredStartWaiterCountForTesting == 1 }
@@ -502,7 +502,7 @@ import UploadCore
         let grace = system.makeGrace(protection: BackgroundBackupRunProtection())
         grace.protectActiveRun(controller: fixture.controller)
         #expect(system.starts == 0, "a controller without a run needs no assertion")
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         grace.protectActiveRun(controller: fixture.controller)
         grace.protectActiveRun(controller: fixture.controller)
@@ -518,7 +518,7 @@ import UploadCore
 
     @Test func aRejectedAssertionCanBeRequestedAgain() async throws {
         let fixture = try Fixture()
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         let system = GraceSystem()
         system.identifier = .invalid
@@ -538,7 +538,7 @@ import UploadCore
 
     @Test func aRejectedAssertionsOwnCallbackStillStopsAnUnprotectedPass() async throws {
         let fixture = try Fixture()
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         let system = GraceSystem()
         system.identifier = .invalid
@@ -560,7 +560,7 @@ import UploadCore
         let protection = BackgroundBackupRunProtection()
         let releases = ReleaseCounts()
         releases.observe(protection)
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         let scanStarted = await fixture.waitFor { fixture.scan.started }
         #expect(scanStarted, "the control pass must hold its scan")
         let attempt = PhotoBackupProcessingAttempt(protection: protection)
@@ -703,6 +703,15 @@ import UploadCore
             controller.replaceScanForTesting { [scan] in await scan.hold() }
         }
 
+        /// Starts the automatic pass of the person's visit, then leaves the foreground. In the background only a window
+        /// starts a pass (#832), so a pass that the short grace protects started while a scene was in the foreground.
+        /// Before the first network path the pass waits for it instead.
+        func startAutomaticPass() {
+            runtime.update { $0.executionOpportunity = .foregroundActive }
+            controller.syncNow()
+            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+        }
+
         func waitUntil(_ condition: () -> Bool) async throws {
             let ready = await waitFor(condition)
             try #require(ready, "fixture must reach the held pass")
@@ -743,7 +752,7 @@ import UploadCore
 
     @Test func expirationCancelsTheAdoptedWorkSynchronously() async throws {
         let fixture = try Fixture()
-        fixture.controller.syncNow()
+        fixture.startAutomaticPass()
         try await fixture.waitUntil { fixture.scan.started }
         let attempt = PhotoBackupProcessingAttempt(protection: BackgroundBackupRunProtection())
         attempt.work = Task { _ = await attempt.run(controller: fixture.controller) }
