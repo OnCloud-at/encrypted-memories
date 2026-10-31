@@ -4080,6 +4080,9 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertEqual(resolver.resolveCount(for: waiting.source.identifier), 0, "no export")
         XCTAssertEqual(hasher.hashCount, 0, "no hash")
+        XCTAssertFalse(
+            checker.findBatches.joined().contains(expectedHashes(id: "waiting.jpg").nameHash),
+            "its name does not go to Proton")
         XCTAssertTrue(uploader.requests.isEmpty)
         let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision))
         XCTAssertEqual(kept.state, .discovered, "the claim is released")
@@ -4119,6 +4122,101 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(try pendingStoreRows(at: pendingURL), before, "the pending store stays unchanged")
         XCTAssertNotEqual(state(of: waiting), .alreadyBackedUp)
         XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    /// A photo that the person dismissed after Photos reported it missing keeps its check while its pending row cannot
+    /// be read; its file is not exported (#982).
+    func testADismissedPhotoWithAnUnreadablePendingRowKeepsItsCheckWithoutAnExport() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-recheck.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let entry = seedLibraryEntry("IMG_1.HEIC")
+        let reason = BackupIssueRecord(kind: .sourceMissing, detail: "backup.issue_source_missing").persistedValue
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: reason,
+                updatedAt: clock.now.addingTimeInterval(-60)))
+        try makePendingRowUnreadable(entry.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 0, "no export")
+        let kept = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(kept.isDismissedSourceRecheck, "the dismissed photo keeps its check")
+        XCTAssertEqual(BackupIssueRecord.decode(kept.lastError)?.kind, .sourceMissing)
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the check waits")
+    }
+
+    /// A photo whose pending row becomes unreadable while it is read, and whose copy Proton already holds, waits
+    /// without an attempt: the store refuses its upload record and stays unchanged (#982).
+    func testARefusedRecordOfAPhotoWithAnUnreadableRowSpendsNoAttempt() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-refused.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let waiting = seedEntry("waiting.jpg")
+        let hashes = expectedHashes(id: "waiting.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active, linkID: "remote-1")
+        ]
+        let key = PendingSourceKey(waiting.source)
+        XCTAssertNotNil(
+            pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
+        XCTAssertNotNil(pending.include([key], at: clock.now))
+        let resolving = SourceRemovedDuringResolveResolver(inner: resolver)
+        let path = pendingURL.path
+        resolving.onResolve = { _ in
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+            XCTAssertEqual(
+                sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
+                SQLITE_OK)
+            sqlite3_close(handle)
+        }
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(resolver: resolving, events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+        let rows = try pendingStoreRows(at: pendingURL)
+
+        let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision))
+        XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
+        XCTAssertNotEqual(kept.state, .alreadyBackedUp)
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(rows["handoff"] ?? [], [], "no upload record")
+    }
+
+    /// A photo with a saved upload receipt whose pending row cannot be read keeps its receipt and is not exported
+    /// again (#982).
+    func testASavedReceiptOfAPhotoWithAnUnreadableRowStaysWithoutAnExport() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-receipt.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let parked = seedEntry("waiting.jpg", ageSeconds: 300)
+        let receipt = UploadRemoteCommitReconciliation(
+            source: parked.source,
+            identity: UploadIdentity(
+                correctedName: "waiting.jpg", nameHash: "nh", sha1Hex: String(repeating: "0", count: 40),
+                sha1Digest: Data(repeating: 0, count: 20), contentHash: "ch"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "vol", remoteLinkID: "earlier-upload"))
+        XCTAssertTrue(
+            queueStore.markNeedsRemoteReconciliation(
+                source: parked.source, revision: parked.revision, reconciliation: receipt, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(-300)))
+        try makePendingRowUnreadable(parked.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: parked.source.identifier), 0, "no export")
+        let kept = try XCTUnwrap(queueStore.entry(for: parked.source, revision: parked.revision))
+        XCTAssertEqual(kept.remoteCommitReconciliation, receipt, "the receipt stays")
+        XCTAssertEqual(kept.attempts, parked.attempts, "waiting spends no attempt")
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
     }
 
     /// Excludes and includes the source, then writes a `desired` value that this build cannot read.

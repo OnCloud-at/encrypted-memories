@@ -843,6 +843,9 @@ public actor BackupSyncRunner {
             $0.isDismissedSourceRecheck
                 || deferredSources[Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)] != nil
         }
+        // A photo whose pending row this build cannot read waits at its claim; its name goes to Proton only once its
+        // row reads again (#982).
+        if let events { peek.removeAll { events.exclusion(of: $0.source) == .unreadable } }
         guard !peek.isEmpty else { return }
         let descriptors = peek.map { entry in
             UploadResourceDescriptor(
@@ -913,12 +916,20 @@ public actor BackupSyncRunner {
         }
 
         // A photo with a pending row that this build cannot read waits before its file is exported or hashed: a newer
-        // build may have excluded it. A row with a saved upload receipt takes its usual path; the check before each
-        // transfer stays (#982).
-        if !isSourceRecheck, checkingEntry.remoteCommitReconciliation == nil,
-            events?.exclusion(of: checkingEntry.source) == .unreadable
-        {
-            retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
+        // build may have excluded it. A dismissed photo keeps its check, and a saved upload receipt stays. The check
+        // before each transfer stays (#982).
+        if events?.exclusion(of: checkingEntry.source) == .unreadable {
+            if isSourceRecheck {
+                rememberDeferredSource(checkingEntry)
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
+                parkRemoteReconciliation(
+                    checkingEntry, reconciliation: reconciliation, from: persistedState,
+                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
+                        ?? L10n.string("error.upload_cancelled"))
+            } else {
+                retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
+            }
             return
         }
 
@@ -1351,7 +1362,11 @@ public actor BackupSyncRunner {
                 kind: .deduplicated
             ) == .failed
         else { return true }
-        retryOrPark(entry, from: state, error: UploadError.backend("Pending handoff could not be persisted"))
+        // The store refuses the record of a photo whose pending row it cannot read; that photo waits (#982).
+        let error: Error =
+            events?.exclusion(of: entry.source) == .unreadable
+            ? PendingSourceUnreadableError() : UploadError.backend("Pending handoff could not be persisted")
+        retryOrPark(entry, from: state, error: error)
         return false
     }
 
