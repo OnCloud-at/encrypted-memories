@@ -410,8 +410,10 @@ public final class ExactDuplicatesModel {
     }
     /// The screen waits for its scan and metadata check.
     public private(set) var isCheckingGroups = false
+    /// The metadata check, else the running library check, for example while a reopened screen reads its groups.
     public var checkingGroupsLine: ProgressLine {
-        rankingLine ?? ProgressLine(title: L10n.string("duplicates.ranking_title"), detail: nil, fraction: nil)
+        rankingLine ?? checkLine
+            ?? ProgressLine(title: L10n.string("duplicates.ranking_title"), detail: nil, fraction: nil)
     }
     /// How much of the library the content index covered at the last scan.
     public private(set) var coverage = ExactDuplicateCoverage.complete
@@ -485,6 +487,9 @@ public final class ExactDuplicatesModel {
     /// The metadata of each copy that a ranking read. A screen that opens again splits its groups at once by them.
     /// A merge that finds other metadata drops those of its group.
     @ObservationIgnored private var knownFingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
+    /// The candidates of the last scan that a ranking already read and found to be no duplicates. They leave the list,
+    /// but the check of a reopened screen counts them as done.
+    @ObservationIgnored private var checkedNonDuplicates = 0
     /// The groups that the ranking of this load has read or queued. A failed group waits for the next load or a merge.
     @ObservationIgnored private var rankingRequested: Set<String> = []
     /// The groups that the screen showed since the last pause, until the pause after them ranks their pages.
@@ -884,9 +889,12 @@ public final class ExactDuplicatesModel {
             var shown: [Group] = []
             shown.reserveCapacity(scan.groups.count)
             var usedIDs: Set<String> = []
+            var nonDuplicates = 0
             for scanned in scan.groups {
                 let order = fallback[scanned.id] ?? scanned.members
-                for part in knownParts(of: scanned, earlier: earlier, avoiding: usedIDs) {
+                let parts = knownParts(of: scanned, earlier: earlier, avoiding: usedIDs)
+                if parts.isEmpty { nonDuplicates += 1 }
+                for part in parts {
                     let groupDates = Dictionary(
                         part.members.compactMap { member in dates[member].map { (member, $0) } },
                         uniquingKeysWith: { first, _ in first })
@@ -921,6 +929,7 @@ public final class ExactDuplicatesModel {
                 }
             }
             groups = shown
+            checkedNonDuplicates = nonDuplicates
             // A hash whose members changed needs another verdict, even if it was checked before this rescan.
             rankingRequested.formIntersection(Set(rankingQueue).union(shown.filter(\.isRanked).map(\.id)))
             hasInvalidatedGroups = false
@@ -1019,7 +1028,7 @@ public final class ExactDuplicatesModel {
             rankingToken = token
             // Freeze the workload before splitting or dropping groups. Each attempted candidate counts once,
             // including unreadable candidates; disappearing groups cannot move progress backwards.
-            let checked = checksAllGroups ? groups.filter(\.isRanked).count : 0
+            let checked = checksAllGroups ? groups.filter(\.isRanked).count + checkedNonDuplicates : 0
             rankingFraction = 0
             rankingProgress = ExactDuplicateScanProgress(completed: checked, total: checked + wanted.count)
         }
