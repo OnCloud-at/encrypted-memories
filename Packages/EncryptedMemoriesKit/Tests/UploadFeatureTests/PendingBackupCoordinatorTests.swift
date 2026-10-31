@@ -1744,6 +1744,49 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.trashTiles.map(\.item.uid), [kept], "\"Recently Deleted\" drops them as well")
     }
 
+    /// The state of one excluded photo cannot be read at start and the photo has no handoff, so the check of the
+    /// excluded list cannot examine it. Once a later read of the states succeeds, the check examines that photo.
+    func testAnExcludedPhotoWhoseStateFailedToLoadIsCheckedAgainAfterARead() async throws {
+        let requests = ["good", "bad"].map { id in
+            let presentation = PendingPresentationMetadata(
+                captureTime: date, mediaType: "image/heic", displayName: "\(id).heic")
+            metadata.set(key(id), presentation)
+            return PendingExclusionRequest(key: key(id), presentation: presentation, remote: nil)
+        }
+        XCTAssertNotNil(store.exclude(requests, at: date))
+        try setDesired("invalid", of: "bad")
+        let gate = OpenGate()
+        let delays = DelayLog()
+        await coordinator.close()
+        coordinator = makeCoordinator(sleep: { duration in
+            delays.append(duration)
+            if duration >= .seconds(60), delays.values.filter({ $0 >= .seconds(60) }).count == 1 {
+                await gate.wait()
+            } else {
+                try await Task.sleep(for: duration)
+            }
+        })
+        await coordinator.start()
+        await coordinator.noteLibraryChanged()
+        var deadline = ContinuousClock.now + .seconds(5)
+        while metadata.reads(of: key("good")) < 2 || !delays.values.contains(where: { $0 >= .seconds(60) }),
+            ContinuousClock.now < deadline
+        {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(metadata.reads(of: key("good")), 2, "the start and the library change each checked the list")
+        XCTAssertEqual(metadata.reads(of: key("bad")), 0, "a state that did not load cannot be examined")
+
+        try setDesired("excluded", of: "bad")
+        gate.open()
+
+        deadline = ContinuousClock.now + .seconds(5)
+        while metadata.reads(of: key("bad")) == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(metadata.reads(of: key("bad")), 1, "the next read of the states lets the check examine it")
+    }
+
     func testABurstOfLibraryChangesSharesOneCheck() async throws {
         await coordinator.close()
         let gate = PendingMembershipSleepGate()
