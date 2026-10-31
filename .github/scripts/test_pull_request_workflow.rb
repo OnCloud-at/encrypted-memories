@@ -448,6 +448,27 @@ class PullRequestWorkflowTests < Minitest::Test
       refute (YAML.load_file(path)["on"] || YAML.load_file(path).fetch(true)).key?("merge_group"), File.basename(path)
     end
   end
+
+  # The iPhone Duo UI tests give advice on pull requests that change UI code; they never block a merge.
+  def test_the_duo_ui_tests_run_only_for_ui_pull_requests_and_never_block
+    workflow = YAML.load_file(File.join(WORKFLOWS, "duo-ui-tests.yml"))
+    events = workflow["on"] || workflow.fetch(true)
+    assert_equal ["pull_request"], events.keys
+    paths = events.fetch("pull_request").fetch("paths")
+    %w[iOSApp/** iOSUITests/** project.yml scripts/verify-ios-app-tests.sh scripts/build-paths.sh
+       .github/scripts/run_ui_tests_with_retry.sh .github/workflows/duo-ui-tests.yml].each do |path|
+      assert_includes paths, path
+    end
+    assert_equal ["duo-ui"], workflow.fetch("jobs").keys
+    job = workflow.fetch("jobs").fetch("duo-ui")
+    assert_equal true, job.fetch("continue-on-error")
+    refute job.key?("if"), "the job runs for every matching pull request"
+    # A run takes about 40 to 60 minutes; the limit is 75 minutes.
+    assert_equal 75, job.fetch("timeout-minutes")
+    refute_includes REQUIRED_CHECKS, job.fetch("name")
+    assert_equal({"contents" => "read"}, workflow.fetch("permissions"))
+    assert_equal @workflow.fetch("env").fetch("DEVELOPER_DIR"), workflow.fetch("env").fetch("DEVELOPER_DIR")
+  end
   def test_full_verification_uses_four_mac_runners_without_hygiene_waits
     mac_jobs = @workflow.fetch("jobs").select { |_, job| job["runs-on"] == "xcode-27" }
     assert_equal ["ios-ui-verification", "ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort

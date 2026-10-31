@@ -93,9 +93,13 @@ Run the full local gates only when your change touches storage, a migration, bac
 ./scripts/verify-universal-core.sh fast
 ```
 
-A pull request runs only repository hygiene and the Swift style check on Linux. The merge queue runs the package
+A pull request runs repository hygiene and the Swift style check on Linux. The merge queue runs the package
 tests, the iOS app and UI tests, and both platform builds before the merge. For every gate that you did not run
 locally, write "covered by the merge queue" in the pull request.
+
+A pull request that changes `iOSApp`, `iOSUITests`, `project.yml`, or the UI test scripts also runs the iOS UI tests
+on the iPhone Duo simulator of a hosted runner. The job takes about 40 to 60 minutes and stops after 75 minutes. It is advice, not a gate:
+it is not a required check, and its result never blocks the merge queue. A red Duo job still shows on the pull request.
 
 `ENCRYPTED_MEMORIES_SKIP_SDK_TESTS=1 ./scripts/verify-tests.sh` skips the vendored SDK tests for a quick local run.
 CI refuses this switch, and the gate before review runs without it.
