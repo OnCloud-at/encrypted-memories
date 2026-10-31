@@ -541,6 +541,39 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
+    /// Sends `remote` to the trash for the delete `generation` of an unfinished edit that named no photo, because the
+    /// handoff of the edit could not be read then. Only that same delete, still without a photo and without a remote
+    /// operation, takes it; a restore or a later delete changed the generation, and a commit of the deleted revision
+    /// already named its own photo. Returns the current state, or nil when the write failed.
+    public func trashEarlierUpload(
+        _ remote: PhotoUID,
+        of key: PendingSourceKey,
+        generation: Int64,
+        at date: Date
+    ) -> PendingSourceState? {
+        connection.withLock {
+            guard
+                execute(
+                    """
+                    UPDATE source_state
+                    SET needs_remote_trash=1, remote_volume_id=?, remote_link_id=?, remote_trashed=0, listed_in_trash=0,
+                        attempts=0, next_attempt_at=?, updated_at=?
+                    WHERE source_kind=? AND source_id=? AND generation=? AND desired='excluded' AND needs_remote_trash=0
+                      AND remote_op IS NULL AND remote_volume_id IS NULL AND remote_link_id IS NULL;
+                    """,
+                    bind: { stmt in
+                        bindText(stmt, 1, remote.volumeID)
+                        bindText(stmt, 2, remote.nodeID)
+                        sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
+                        sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                        bindKey(stmt, key, from: 5)
+                        sqlite3_bind_int64(stmt, 7, generation)
+                    })
+            else { return nil }
+            return sourceStateLocked(key).state
+        }
+    }
+
     /// Writes desired = included for excluded sources in one transaction and returns the new states.
     /// Sources without a row were never excluded and are skipped.
     public func include(_ keys: [PendingSourceKey], at date: Date) -> [PendingSourceState]? {
