@@ -1147,6 +1147,21 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertTrue(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 1), at: date))
     }
 
+    /// An upload record for a photo whose pending row cannot be read is refused, so a copy that Proton already holds
+    /// changes nothing in the store (#982).
+    func testAHandoffForAPhotoWithAnUnreadableRowIsRefused() throws {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+        try corrupt("desired")
+        let before = try pendingTables()
+
+        let handoff = PendingHandoff(
+            key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote, kind: .deduplicated, createdAt: date)
+        XCTAssertEqual(store.recordHandoff(handoff), .failed)
+
+        XCTAssertEqual(try pendingTables(), before, "every row stays unchanged")
+    }
+
     func testKeepingAPhotoRefusesAHandoffThatCannotBeDecoded() throws {
         let revision = UploadBackupRevision(rawValue: 7)
         let excluded = try XCTUnwrap(
