@@ -17,7 +17,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     struct Link: Sendable {
         let linkID: String
-        let nameHash: String
+        var nameHash: String
         let contentHash: String
         var state: State
         let mainLinkID: String?
@@ -284,6 +284,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
     var readCounts: ReadCounts { lock.withLock { counted } }
     private var counted = ReadCounts()
+    /// The most links that one visibility read asked for.
+    var largestVisibilityRead: Int { lock.withLock { largestVisibility } }
+    private var largestVisibility = 0
 
     /// The album read of this photo answers these albums, as a stale membership cache does.
     func reportStaleAlbums(_ albums: Set<SeriesAlbumReference>, of uid: PhotoUID) {
@@ -542,8 +545,60 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         guard !linkIDs.isEmpty else { return [:] }
         if lock.withLock({ cancelVisibilityCaller }) { withUnsafeCurrentTask { $0?.cancel() } }
-        return try lock.withLock {
+        await passVisibilityGate()
+        let answer = try visibilityAnswer(linkIDs)
+        // The answer is on its way when something changes on the server, as with another device.
+        let after = lock.withLock { () -> (() -> Void)? in
+            defer { afterNextVisibilityRead = nil }
+            return afterNextVisibilityRead
+        }
+        after?()
+        return answer
+    }
+
+    /// Runs once, right after the next visibility read answered.
+    func afterNextVisibilityRead(_ action: @escaping @Sendable () -> Void) {
+        lock.withLock { afterNextVisibilityRead = action }
+    }
+    private var afterNextVisibilityRead: (@Sendable () -> Void)?
+
+    /// Holds every visibility read until `releaseVisibilityReads()`.
+    func holdVisibilityReads() { lock.withLock { visibilityReadsHeld = true } }
+
+    func releaseVisibilityReads() {
+        let waiting = lock.withLock {
+            visibilityReadsHeld = false
+            defer { visibilityReadWaiters = [] }
+            return visibilityReadWaiters
+        }
+        waiting.forEach { $0.resume() }
+    }
+
+    /// The visibility reads that wait for `releaseVisibilityReads()`.
+    var heldVisibilityReads: Int { lock.withLock { visibilityReadWaiters.count } }
+    private var visibilityReadsHeld = false
+    private var visibilityReadWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func passVisibilityGate() async {
+        await withCheckedContinuation { continuation in
+            let passes = lock.withLock {
+                if visibilityReadsHeld { visibilityReadWaiters.append(continuation) }
+                return !visibilityReadsHeld
+            }
+            if passes { continuation.resume() }
+        }
+    }
+
+    /// The next `count` visibility reads fail.
+    func failNextVisibilityReads(_ count: Int) { lock.withLock { armedVisibilityFailures = count } }
+
+    /// Gives `uid` the name `name`, as an upload under that name does.
+    func rename(_ uid: PhotoUID, to name: String) { lock.withLock { table[uid.nodeID]?.nameHash = "nh(\(name))" } }
+
+    private func visibilityAnswer(_ linkIDs: [String]) throws -> [String: RemoteLinkVisibility] {
+        try lock.withLock {
             counted.visibility += 1
+            largestVisibility = max(largestVisibility, linkIDs.count)
             for linkID in linkIDs {
                 if let error = visibilityErrors[linkID] { throw error }
             }
