@@ -50,6 +50,17 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
         if transient != true { failuresAreTransient = false }
     }
 
+    /// Call inside `withLock`. Ends the open transaction. Only a transaction that stays open records a failure: after a
+    /// full disk, an I/O error, an interrupt or no memory, SQLite can roll back on its own, and the explicit rollback
+    /// then fails without harm.
+    public func rollBack() {
+        guard let database else { return }
+        let rollback = sqlite3_exec(database, "ROLLBACK;", nil, nil, nil)
+        if sqlite3_get_autocommit(database) == 0 {
+            markFailed(resultCode: rollback == SQLITE_OK ? nil : sqlite3_extended_errcode(database))
+        }
+    }
+
     /// Records a predicate under `withLock`. A prior failure does not change a later successful predicate.
     /// The shared type deliberately requires `database != nil`; the old helper returned the condition unchanged.
     /// Album/catalog conditions are SQL-derived; audited queue conditions are SQL-derived or literal false.

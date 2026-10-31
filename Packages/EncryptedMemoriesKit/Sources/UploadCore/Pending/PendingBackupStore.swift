@@ -374,7 +374,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             var result: [String: BackupSourceExclusion] = [:]
             // The key is (source_kind, source_id), and a row whose kind does not decode has no usable key: one read
             // for each chunk finds every row of the identifiers, whatever its kind.
-            let unique = Array(Set(identifiers))
+            var seen = Set<String>()
+            let unique = identifiers.filter { seen.insert($0).inserted }
             for start in stride(from: 0, to: unique.count, by: Self.identifierChunkSize) {
                 let chunk = unique[start..<min(start + Self.identifierChunkSize, unique.count)]
                 let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
@@ -1176,30 +1177,21 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             connection.markFailed()
             return false
         }
-        let begin = sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)
-        guard begin == SQLITE_OK else {
-            connection.markFailed(resultCode: begin)
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+            connection.markFailed(resultCode: sqlite3_extended_errcode(db))
             return false
         }
         guard body() else {
-            rollBack()
+            connection.rollBack()
             return false
         }
-        let commit = sqlite3_exec(db, "COMMIT;", nil, nil, nil)
-        guard commit == SQLITE_OK else {
-            rollBack()
+        guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+            let commit = sqlite3_extended_errcode(db)
+            connection.rollBack()
             connection.markFailed(resultCode: commit)
             return false
         }
         return true
-    }
-
-    /// A rollback that fails, or that leaves the transaction open, is a failure of the store.
-    private func rollBack() {
-        let rollback = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-        if rollback != SQLITE_OK || sqlite3_get_autocommit(db) == 0 {
-            connection.markFailed(resultCode: rollback == SQLITE_OK ? nil : rollback)
-        }
     }
 
     private func prepare(_ sql: String, _ stmt: inout OpaquePointer?) -> Bool {
@@ -1207,11 +1199,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             connection.markFailed()
             return false
         }
-        let prepared = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard prepared == SQLITE_OK else {
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            // The extended code tells damaged data from a passing I/O error; read it before finalize resets it.
+            let code = sqlite3_extended_errcode(db)
             sqlite3_finalize(stmt)
             stmt = nil
-            connection.markFailed(resultCode: prepared)
+            connection.markFailed(resultCode: code)
             return false
         }
         return true
@@ -1222,9 +1215,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         guard prepare(sql, &stmt) else { return false }
         defer { sqlite3_finalize(stmt) }
         bind(stmt)
-        let step = sqlite3_step(stmt)
-        guard step == SQLITE_DONE else {
-            connection.markFailed(resultCode: step)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            connection.markFailed(resultCode: sqlite3_extended_errcode(db))
             return false
         }
         return true
@@ -1245,7 +1237,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             step = sqlite3_step(stmt)
         }
         guard step == SQLITE_DONE else {
-            connection.markFailed(resultCode: step)
+            connection.markFailed(resultCode: sqlite3_extended_errcode(db))
             return false
         }
         return true
