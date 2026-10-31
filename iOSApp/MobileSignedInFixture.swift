@@ -324,8 +324,27 @@ import os
                 backupFixture = controller
                 runtime.libraryModel.installIsolatedPendingBackupForTesting(
                     controller, store: store, remote: MobileFixturePendingRemoteEffects())
+                if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesExcludedBackupFixture") {
+                    excludeWaitingPhoto()
+                }
             } catch {
                 assertionFailure("The paused backup fixture could not be installed")
+            }
+        }
+
+        /// The person deleted the waiting photo and removed it from Recently Deleted: the Backup settings list it as
+        /// excluded from the backup.
+        private func excludeWaitingPhoto() {
+            let uid = PhotoUID(localPending: .photoLibrary, identifier: "fixture-paused-photo")
+            let model = runtime.libraryModel
+            Task { @MainActor in
+                // The pending grid starts its coordinator on its own; a delete before it shows the photo does nothing.
+                @MainActor func shows() -> Bool {
+                    model.pendingGrid?.pendingSnapshot.tiles.contains { $0.item.uid == uid } == true
+                }
+                for _ in 0..<200 where !shows() { try? await Task.sleep(for: .milliseconds(50)) }
+                guard await model.pendingGrid?.delete([uid]) == true else { return }
+                _ = await model.pendingGrid?.removeFromTrashList([uid])
             }
         }
 

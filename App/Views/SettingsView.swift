@@ -135,6 +135,9 @@ private struct BackupSettingsTab: View {
     let albumSync: AlbumSyncController?
     let uploadCoordinator: UploadCoordinator?
     let appModel: AppModel
+    /// The pane keeps its state while another tab shows, so it starts from the current count each time it shows.
+    @State private var excludedEntry = PendingExcludedPhotosEntryLatch()
+    @State private var showsExcludedPhotos = false
 
     /// Apple Photos items through PhotoKit, watched-folder files through QuickLook.
     private var excludedThumbnail: @Sendable (PhotoUID) async -> CGImage? {
@@ -155,14 +158,6 @@ private struct BackupSettingsTab: View {
                     PhotoLibraryBackupSection(controller: photoBackup)
                 } header: {
                     Text("settings.photos_backup_section")
-                }
-            }
-            if !appModel.excludedPendingTiles.isEmpty {
-                PendingExcludedPhotosSection(
-                    tiles: appModel.excludedPendingTiles,
-                    thumbnail: excludedThumbnail
-                ) { tile in
-                    await appModel.pendingGrid?.restore([tile.item.uid])
                 }
             }
             if let albumSync {
@@ -222,6 +217,24 @@ private struct BackupSettingsTab: View {
 
             BackupMobileDataSection { photoBackup?.mobileDataSettingDidChange() }
 
+            if excludedEntry.isShown {
+                Section {
+                    Button {
+                        showsExcludedPhotos = true
+                    } label: {
+                        HStack {
+                            PendingExcludedPhotosEntryLabel(count: appModel.excludedPendingTiles.count)
+                            Image(systemName: "chevron.right")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("backup.excludedPhotos")
+                }
+            }
+
             // Show manual-upload status only while it is actionable or contains results.
             if let uploadCoordinator {
                 let manualStatus = BackupStatus(manualUploadCheck: uploadCoordinator.preparationStatus)
@@ -237,6 +250,11 @@ private struct BackupSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { excludedEntry.reset(count: appModel.excludedPendingTiles.count) }
+        .onChange(of: appModel.excludedPendingTiles.count) { _, count in excludedEntry.update(count: count) }
+        .sheet(isPresented: $showsExcludedPhotos) {
+            MacExcludedPhotosSheet(appModel: appModel, thumbnail: excludedThumbnail)
+        }
     }
 
     /// Presents the shared backup status for folder sync.
@@ -804,6 +822,33 @@ private struct PhotoLibraryBackupSection: View {
 /// Native macOS presentation over the same shared failed-item and retry contracts as iOS/iPadOS.
 /// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
 /// Sync now is its retry.
+/// The photos excluded from the backup, in a sheet over the Backup settings.
+private struct MacExcludedPhotosSheet: View {
+    let appModel: AppModel
+    let thumbnail: @Sendable (PhotoUID) async -> CGImage?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(L10n.string("backup.excluded_title"))
+                    .font(.headline)
+                Spacer()
+                Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding()
+
+            Divider()
+
+            PendingExcludedPhotosList(tiles: appModel.excludedPendingTiles, thumbnail: thumbnail) { tile in
+                await appModel.pendingGrid?.restore([tile.item.uid])
+            }
+        }
+        .frame(width: 520, height: 380)
+    }
+}
+
 private struct MacFailedBackupSheet: View {
     enum Source {
         case backup(PhotoLibraryBackupController)

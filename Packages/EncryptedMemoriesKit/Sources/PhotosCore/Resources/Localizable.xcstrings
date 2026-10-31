@@ -295,6 +295,12 @@
         "en": { "stringUnit": { "state": "translated", "value": "No excluded photos" } }
       }
     },
+    "backup.excluded_empty_description": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos, die du vor der Sicherung löschst, erscheinen hier." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Photos you delete before they are backed up appear here." } }
+      }
+    },
     "viewer.local_media_unavailable": {
       "localizations": {
         "de": { "stringUnit": { "state": "translated", "value": "Dieses Foto ist auf diesem Gerät gerade nicht verfügbar." } },
