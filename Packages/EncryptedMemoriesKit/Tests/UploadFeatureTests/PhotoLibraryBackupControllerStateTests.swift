@@ -4174,6 +4174,9 @@ extension PhotoLibraryBackupControllerStateTests {
     @MainActor private final class Restore829Fixture {
         enum Shape: Equatable { case photo, video, live, burst }
         let shape: Shape
+        /// Adds the edit-replacement journal to the pipeline, as the account stack does.
+        let replacesEdits: Bool
+        var journal: EditReplacementJournalFileStore?
         let directory: URL
         let suite: String
         let defaults: UserDefaults
@@ -4190,8 +4193,9 @@ extension PhotoLibraryBackupControllerStateTests {
         var queue: UploadBackupSyncQueueManifestStore { controller.queueStoreForTesting! }
         var key: PendingSourceKey { PendingSourceKey(resolver.candidate.snapshot.source) }
 
-        init(shape: Shape) throws {
+        init(shape: Shape, replacesEdits: Bool = false) throws {
             self.shape = shape
+            self.replacesEdits = replacesEdits
             suite = "restore-829-\(UUID().uuidString)"
             defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
@@ -4206,7 +4210,11 @@ extension PhotoLibraryBackupControllerStateTests {
             identities = try XCTUnwrap(
                 UploadIdentityManifestStore(
                     url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
-            pipeline = UploadDedupePipeline(store: identities, checker: server, now: { [clock] in clock.now })
+            journal =
+                replacesEdits
+                ? try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: directory)) : nil
+            pipeline = UploadDedupePipeline(
+                store: identities, checker: server, replacementJournal: journal, now: { [clock] in clock.now })
             controller = PhotoLibraryBackupController(
                 configuration: .init(
                     accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
@@ -4335,11 +4343,54 @@ extension PhotoLibraryBackupControllerStateTests {
             return (latest, next)
         }
 
+        /// An edit in Photos: a rendered full-size photo and adjustment data join the original. The render becomes the
+        /// main photo and the original travels as a related file, so the replacement may trash the earlier upload.
+        /// The burst member stays missing.
+        func publishPhotosEdit() throws -> (UploadBackupAssetCandidate, Restore829Resolver) {
+            let entry = try XCTUnwrap(catalog.entry(for: key.identifier))
+            var info = PhotoLibraryCatalogMapper.info(for: entry)
+            info.modificationDate = try XCTUnwrap(info.modificationDate).addingTimeInterval(1)
+            info.resources += [
+                .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.HEIC", mimeType: "image/heic"),
+                .init(role: .adjustmentData, originalFilename: "Adjustments.plist", mimeType: "application/xml"),
+            ]
+            XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)]))
+            let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
+            let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
+            XCTAssertEqual(candidate.snapshot.editRevision, .unavailable, "Photos reports a real edit")
+            func descriptor(_ item: PhotoBackupExportPlan.Item, primary: Bool) throws -> UploadResourceDescriptor {
+                let url = directory.appendingPathComponent(item.uploadFilename)
+                // The original keeps its bytes; the render and the adjustment data are new.
+                let bytes = Data(
+                    (item.role == .originalPhoto ? "restore-829-MAIN.HEIC" : "edited-829-\(item.uploadFilename)").utf8)
+                try bytes.write(to: url)
+                return UploadResourceDescriptor(
+                    source: .init(
+                        kind: .photoLibraryAsset, identifier: info.localIdentifier,
+                        resource: primary ? .primary : item.sourceResource), fileURL: url,
+                    filename: item.uploadFilename, fileSize: Int64(bytes.count),
+                    modificationDate: try XCTUnwrap(info.modificationDate),
+                    precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: url))
+            }
+            let edited = Restore829Resolver(
+                candidate: candidate, primary: try descriptor(plan.primary, primary: true),
+                secondaries: try plan.secondaries.filter { $0.role != .burstMember }.map {
+                    BackupSecondaryResource(
+                        descriptor: try descriptor($0, primary: false), mediaType: $0.mimeType ?? "image/heic")
+                },
+                mediaType: plan.primary.mimeType ?? "image/heic")
+            return (candidate, edited)
+        }
+
         /// Drains with a runner that resolves through `resolver` on the same pipeline and uploader.
         func drain(with resolver: Restore829Resolver) async throws {
+            let replacement = journal.map {
+                EditedPhotoReplacement(
+                    remote: server, albums: server, relations: server, identities: identities, journal: $0)
+            }
             let runner = BackupSyncRunner(
                 queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
-                resolver: resolver, identityResolver: pipeline, uploader: server,
+                resolver: resolver, identityResolver: pipeline, uploader: server, editReplacement: replacement,
                 configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
                 events: controller.pendingRecorder, now: { [clock] in clock.now })
             clock.advance(by: 2)
@@ -4369,10 +4420,10 @@ extension PhotoLibraryBackupControllerStateTests {
     }
 
     private func withRestore829Fixture(
-        _ shape: Restore829Fixture.Shape,
+        _ shape: Restore829Fixture.Shape, replacesEdits: Bool = false,
         _ body: @MainActor (Restore829Fixture) async throws -> Void
     ) async throws {
-        let fixture = try Restore829Fixture(shape: shape)
+        let fixture = try Restore829Fixture(shape: shape, replacesEdits: replacesEdits)
         do { try await body(fixture) } catch {
             await fixture.cleanup()
             throw error
@@ -5012,6 +5063,62 @@ extension PhotoLibraryBackupControllerStateTests {
         }
         func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .permanentFailure }
         func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .permanentFailure }
+    }
+
+    func testAnEditThatReplacesTheRestoredPhotoEndsRestoreWithoutCompensation() async throws {
+        try await withRestore829Fixture(.burst, replacesEdits: true) { f in
+            @MainActor func makeCoordinator() throws -> PendingBackupCoordinator {
+                PendingBackupCoordinator(
+                    store: f.pending, queues: [.photoLibraryAsset: f.queue],
+                    metadataProvider: try XCTUnwrap(f.controller.pendingMetadataProvider),
+                    effects: Restore829ControllerEffects(controller: f.controller, server: f.server),
+                    recorder: f.controller.pendingRecorder, replacementJournal: f.journal, relations: f.server,
+                    now: { [clock = f.clock] in clock.now }
+                )
+            }
+            let restored = try await f.initialBackup(omittingSecondary: true)
+            _ = try f.restoredState(restored)
+            let coordinator = try makeCoordinator()
+            do {
+                await coordinator.start()
+                let pending = await coordinator.restoreSources(ofRemote: [restored])
+                guard case .waiting? = pending.outcomes[f.key] else {
+                    await coordinator.close()
+                    return XCTFail("Fixture prerequisite: Restore waits for the missing burst member")
+                }
+                XCTAssertEqual(f.pending.sourceState(for: f.key)?.remote, restored)
+
+                let (latest, edited) = try f.publishPhotosEdit()
+                let engine = UploadBackupSyncEngine(
+                    preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue)
+                _ = try await engine.enqueueBatch([latest])
+                try await f.drain(with: edited)
+                let row = f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
+                let replacing = f.identities.record(for: edited.primary.source)?.remoteLinkID
+                let oldState = f.server.links.first { $0.uid.nodeID == restored.nodeID }?.state
+                let retired: [String] = f.journal?.entry(for: edited.primary.source).retired ?? []
+                guard row?.state.isTerminalSuccess == true, oldState == .trashed, retired == [restored.nodeID],
+                    let replacing, replacing != restored.nodeID
+                else {
+                    await coordinator.close()
+                    return XCTFail("Fixture prerequisite: the edit uploads and the replacement trashes the old main")
+                }
+
+                let due = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                f.clock.advance(by: max(0, due.nextAttemptAt.timeIntervalSince(f.clock.now)) + 1)
+                // An unrelated trigger runs a real reconcile pass, as a timer or another Restore would.
+                _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+                let finalState = f.server.links.first { $0.uid.nodeID == restored.nodeID }?.state
+                XCTAssertEqual(finalState, .trashed, "The photo the edit replaced must stay in the Proton trash")
+                XCTAssertEqual(f.server.links.first { $0.linkID == replacing }?.state, .active)
+                XCTAssertNil(f.pending.sourceState(for: f.key), "The edit ends the Restore duty of the replaced photo")
+                XCTAssertTrue(f.server.steps.allSatisfy(\.violations.isEmpty), "\(f.server.steps.map(\.violations))")
+            } catch {
+                await coordinator.close()
+                throw error
+            }
+            await coordinator.close()
+        }
     }
 
     func testCoordinatorReconstructsAndAcknowledgesOnlyARealCompoundPassAfterRestart() async throws {

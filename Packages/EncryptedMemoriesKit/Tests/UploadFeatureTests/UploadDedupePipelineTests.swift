@@ -2258,6 +2258,18 @@ extension UploadDedupePipelineTests {
         }
     }
 
+    private final class Restore829ReadCount: @unchecked Sendable {
+        private let lock = NSLock()
+        private var reads = 0
+        var count: Int { lock.withLock { reads } }
+        func next() -> Int {
+            lock.withLock {
+                reads += 1
+                return reads
+            }
+        }
+    }
+
     private final class Restore829Validity: @unchecked Sendable {
         private let lock = NSLock()
         private var valid = true
@@ -2269,7 +2281,7 @@ extension UploadDedupePipelineTests {
         confirmed: RemoteLinkVisibility?, destination: RemoteLinkVisibility?, member: RemoteLinkVisibility?,
         underDestination: Bool = false, revisionMismatch: Bool = false,
         invalidateDuringRead: Bool = false, sourceID: String = "restore-source", endDuringRelatedRead: Bool = false,
-        asBurstMember: Bool = false
+        asBurstMember: Bool = false, invalidateDuringSecondRead: Bool = false
     ) async throws -> (UploadDuplicateDecision?, Bool, UploadIdentityRecord?) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -2319,6 +2331,10 @@ extension UploadDedupePipelineTests {
             revision: .init(rawValue: 7), generation: 2, confirmedRemote: .init(volumeID: "vol", nodeID: "confirmed"))
         try await pipeline.prepareRestoredCompound(context, isCurrent: { current.value })
         if invalidateDuringRead { checker.onVisibilityLookup = { current.invalidate() } }
+        let reads = Restore829ReadCount()
+        if invalidateDuringSecondRead {
+            checker.onVisibilityLookup = { if reads.next() == 2 { current.invalidate() } }
+        }
         if endDuringRelatedRead { checker.relatedLookupGate = { await pipeline.endRestoredCompound(context) } }
         var decision: UploadDuplicateDecision?
         var cancelled = false
@@ -2333,6 +2349,9 @@ extension UploadDedupePipelineTests {
         }
         if endDuringRelatedRead {
             XCTAssertFalse(checker.relatedLookups.isEmpty, "The last-read gate must really be reached")
+        }
+        if invalidateDuringSecondRead {
+            XCTAssertGreaterThanOrEqual(reads.count, 2, "The second visibility read must really be reached")
         }
         await pipeline.uploadDidFail(d)
         let after = manifest.record(for: source)
@@ -2375,6 +2394,19 @@ extension UploadDedupePipelineTests {
             XCTAssertEqual(row?.remoteLinkID, "member", label)
             XCTAssertEqual(row?.outcome, UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue, label)
         }
+    }
+
+    func testRestoredMemberDecisionWritesNoRowUnderAuthorityRevokedDuringTheSecondRead() async throws {
+        let main = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+        let (decision, cancelled, row) = try await restore829PipelineCase(
+            confirmed: main, destination: main,
+            member: .init(isActive: true, mainPhotoLinkID: "destination"), underDestination: true,
+            invalidateDuringSecondRead: true)
+        XCTAssertNil(decision)
+        XCTAssertTrue(cancelled, "Authority revoked during the role read cannot decide the copy")
+        XCTAssertEqual(
+            row?.outcome, UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue,
+            "No duplicateActive row may be saved under revoked authority")
     }
 
     func testRestoredMemberUnderDestinationIsAnActiveDuplicate() async throws {
@@ -2485,6 +2517,39 @@ extension UploadDedupePipelineTests {
 }
 
 extension UploadDedupePipelineTests {
+    func testRestoredPhotoOutcomeWaitsForAnActiveMemberUnderAnotherMain() async throws {
+        for parent in ["confirmed", "another-main"] {
+            let checker = FakeChecker()
+            checker.linkVisibilityByID["confirmed"] = .init(isActive: true, mainPhotoLinkID: nil)
+            checker.linkVisibilityByID["member"] = .init(isActive: true, mainPhotoLinkID: parent)
+            let store = FakeIdentityStore()
+            let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "member-parent")
+            let member = UploadSourceIdentity(
+                kind: .photoLibraryAsset, identifier: source.identifier, resource: .burstMember(ordinal: 0))
+            XCTAssertTrue(
+                store.upsert(
+                    UploadIdentityRecord(
+                        source: member, filename: "MEMBER.HEIC", correctedName: "MEMBER.HEIC", fileSize: 1,
+                        modificationDate: Date(timeIntervalSince1970: 1000), sha1Hex: "aa", nameHash: "nh",
+                        contentHash: "ch", hashKeyEpoch: "epoch-1", remoteVolumeID: "vol", remoteLinkID: "member",
+                        outcome: UploadIdentityManifestStore.Outcome.uploaded.rawValue,
+                        updatedAt: Date(timeIntervalSince1970: 1000))))
+            let p = UploadDedupePipeline(store: store, checker: checker)
+            let context = UploadRestoredCompoundContext(
+                source: source, revision: .init(rawValue: 7), generation: 1,
+                confirmedRemote: .init(volumeID: "vol", nodeID: "confirmed"), requiredMembers: [member.resource])
+            try await p.prepareRestoredCompound(context, isCurrent: { true })
+            let result = try await p.restoredPhotoOutcome(context)
+            if parent == "confirmed" {
+                XCTAssertEqual(result, .completed, "Control: the active member sits under the confirmed main")
+            } else {
+                guard case .waiting = result else {
+                    return XCTFail("An active member under another main does not complete the compound")
+                }
+            }
+        }
+    }
+
     func testRestoredPhotoOutcomeRequiresFreshExplicitActiveMainState() async throws {
         for kind in ["missing", "inferred", "inactive", "related", "trashed"] {
             let checker = FakeChecker()

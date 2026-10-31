@@ -4926,6 +4926,56 @@ extension PendingBackupCoordinatorTests {
         XCTAssertTrue(effects.restored.isEmpty)
     }
 
+    func testARestoreCheckTreatsTheTrashOfAPhotoAnEditReplacedAsDone() async throws {
+        for replacement in ["none", "retired", "retire intent"] {
+            await coordinator.close()
+            let id = "edit-replaced-restore-\(replacement.replacingOccurrences(of: " ", with: "-"))"
+            let sourceKey = key(id)
+            let remote = PhotoUID(volumeID: "vol", nodeID: id)
+            enqueue(id, state: .completed)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: sourceKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+                ),
+                .recorded)
+            let excluded = try XCTUnwrap(
+                store.exclude([.init(key: sourceKey, presentation: nil, remote: remote)], at: date)?.first)
+            XCTAssertTrue(
+                store.completeEffect(
+                    .remoteTrash, for: sourceKey, generation: excluded.generation, remoteLinkID: remote.nodeID,
+                    at: date))
+            XCTAssertTrue(store.completeEffect(.queueSync, for: sourceKey, generation: excluded.generation, at: date))
+            // After the Restore the photo is in the Proton trash again.
+            let relations = FakeChecker()
+            relations.linkVisibilityByID[remote.nodeID] = .init(
+                isActive: false, mainPhotoLinkID: nil, trashTime: 1_750_000_001)
+            let journal = try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: directory))
+            let photo = source(id)
+            if replacement != "none" {
+                try journal.addSuperseded(remote, for: photo)
+                try journal.prepareToRetire([remote.nodeID: []], for: photo)
+                if replacement == "retired" {
+                    try journal.settle([remote.nodeID], related: [], trashed: true, for: photo)
+                }
+            }
+            effects = FakePendingEffects()
+            coordinator = makeCoordinator(replacementJournal: journal, relations: relations)
+            await coordinator.start()
+
+            let result = await coordinator.restoreSources(ofRemote: [remote])
+
+            if replacement == "none" {
+                XCTAssertEqual(effects.restored, [[remote]], "Control: a late trash gets its compensation")
+                XCTAssertNotNil(store.sourceState(for: sourceKey))
+                continue
+            }
+            XCTAssertTrue(effects.restored.isEmpty, "\(replacement): the edit's trash of the old photo stands")
+            XCTAssertTrue(effects.returned.isEmpty, "\(replacement): the newer version already backed up")
+            XCTAssertEqual(result.outcomes[sourceKey], .completed, replacement)
+            XCTAssertNil(store.sourceState(for: sourceKey), "\(replacement): the Restore duty is done")
+        }
+    }
+
     private struct LookupArmedRestoreResolver: BackupResourceResolving {
         let resource: BackupResolvedResource
         let arm: @Sendable () async -> Void

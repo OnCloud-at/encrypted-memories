@@ -1431,11 +1431,18 @@ public actor PendingBackupCoordinator {
             restoreRecheckCounts[state.key] = (state.generation, state.remote, count)
             let delay = Self.restoreRecheckDelays[min(count - 1, 2)]
             // A late trash gets its first compensation at once and waits a minute after a refused one. A failed
-            // read waits on the same schedule as an incomplete compound, so an offline device keeps its checks.
+            // read waits on the same schedule as an incomplete compound, so an offline device does not use up its
+            // three checks within minutes. After the third check the source waits for a new launch or Restore.
             let compensated = restoredKeys.contains(state.key)
             func retryNotBefore(_ outcome: PendingBackupReturnOutcome) -> Date? {
                 guard outcome == .remoteTrashed else { return now().addingTimeInterval(delay) }
                 return compensated ? now().addingTimeInterval(60) : nil
+            }
+            // An edit of the source replaced the restored photo after its upload: that trash is the replacement, not a
+            // late trash, and the newer version is the backup.
+            if replacedByEdit(state) {
+                finishRestoredReturn(state, outcome: .completed, retryNotBefore: nil)
+                continue
             }
             let before = await restoredPhotoOutcome(state)
             guard !closed else { return }
@@ -1453,6 +1460,16 @@ public actor PendingBackupCoordinator {
             guard !closed else { return }
             finishRestoredReturn(state, outcome: outcome, retryNotBefore: retryNotBefore(outcome))
         }
+    }
+
+    /// True when the edit replacement retired the restored photo, or intends to and may have trashed it already.
+    private func replacedByEdit(_ state: PendingSourceState) -> Bool {
+        guard state.key.kind == .photoLibraryAsset, let remote = state.remote, let replacementJournal else {
+            return false
+        }
+        let entry = replacementJournal.entry(
+            for: UploadSourceIdentity(kind: state.key.kind, identifier: state.key.identifier))
+        return entry.retired.contains(remote.nodeID) || entry.retireIntent?[remote.nodeID] != nil
     }
 
     /// With a backend reader, neither an omitted link nor a legacy inferred State can settle a restore.
