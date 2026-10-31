@@ -288,6 +288,8 @@
         var itemIndexByUID: [PhotoUID: Int] = [:]
         private var levelOverride: Int?
         private var requestedProfile: GridLevelProfile?
+        /// The level each grid profile last showed, so a window resize or a rotation round trip keeps the density.
+        private var profileLevelMemory = GridProfileLevelMemory()
         /// The user-driven density level set by pinch. Takes precedence over the profile default so pinch survives
         /// item refreshes; cleared when an explicit external `level` arrives. Nil uses the data-driven profile default.
         var interactiveLevel: Int?
@@ -651,6 +653,7 @@
                 cachedEngine = nil
                 committedPhase = nil
                 interactiveLevel = nil
+                profileLevelMemory.reset()
             }
             if fillOrder != self.fillOrder {
                 self.fillOrder = fillOrder
@@ -683,6 +686,7 @@
                 interactiveLevel = nil
                 committedPhase = nil
                 cancelLiveZoomState()
+                profileLevelMemory.reset()
             }
             self.levelOverride = level
             self.displayMode = displayMode
@@ -1415,12 +1419,16 @@
                 let targetEngine = SquareTileGridEngine(
                     sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
                 )
-                interactiveLevel = sourceEngine.closestVisualLevel(
-                    sourceLevel: sourceLevel,
-                    sourceWidth: previousLayoutSize.width,
-                    in: targetEngine,
-                    targetWidth: layoutSize.width
-                )
+                interactiveLevel = profileLevelMemory.level(
+                    leaving: previousProfile.id, at: sourceLevel, entering: profile.id
+                ) {
+                    sourceEngine.closestVisualLevel(
+                        sourceLevel: sourceLevel,
+                        sourceWidth: previousLayoutSize.width,
+                        in: targetEngine,
+                        targetWidth: layoutSize.width
+                    )
+                }
             }
             cachedProfile = profile
             cachedProfileLayoutSize = layoutSize

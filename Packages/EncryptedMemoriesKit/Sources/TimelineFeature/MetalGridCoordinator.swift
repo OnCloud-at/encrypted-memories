@@ -24,6 +24,8 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private var dataSource: MetalGridDataSource
     private let budget: MetalGridBudget
     private(set) var gridProfile: GridLevelProfile
+    /// The level each grid profile last showed, so window resizes across a profile width keep the density.
+    private var profileLevelMemory = GridProfileLevelMemory()
     private var fillOrder: GridFillOrder = .newestBottomTrailing
 
     /// Fired once for each installed data source when a frame draws its first resident visible thumbnail.
@@ -344,6 +346,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         levelMapping: GridProfileRebaseLevelMapping = .closestVisualMatch
     ) -> GridProfileRebaseResult? {
         guard newProfile.id != gridProfile.id else { return nil }
+        // The size match picks the level only when the memory has none; another mapping is the caller's decision.
+        let remembered =
+            levelMapping == .closestVisualMatch
+            ? profileLevelMemory.remembered(leaving: gridProfile.id, at: level, entering: newProfile.id) : nil
+        let mapping = remembered.map { GridProfileRebaseLevelMapping.explicit($0) } ?? levelMapping
         var targetEngine = SquareTileGridEngine(
             sectionCounts: dataSource.sectionCounts, profile: newProfile,
             fillOrder: fillOrder)
@@ -358,8 +365,9 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 sourceCommittedPhase: currentPhase(),
                 targetCommittedPhase: targetCommittedPhase,
                 wasBottomPinned: wasBottomPinned,
-                levelMapping: levelMapping
+                levelMapping: mapping
             ))
+        if levelMapping == .closestVisualMatch { profileLevelMemory.arrived(in: newProfile.id, at: result.targetLevel) }
 
         gridProfile = newProfile
         engine = targetEngine
