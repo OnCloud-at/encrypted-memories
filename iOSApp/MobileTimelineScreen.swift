@@ -152,7 +152,17 @@ struct MobileTimelineScreen: View {
                 .mobileSharePresentation(selection: selection)
                 .mobileSelectionBars(isSelecting: selection.isSelecting)
                 .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: selection.isSelecting)
-                .onChange(of: searchScope) { _, scope in semanticQuery?.setScope(scope) }
+                .onChange(of: searchScope) { _, scope in
+                    semanticQuery?.setScope(scope)
+                    // A suggestion's result set answers only the Smart Search scope. Commit its title again: another
+                    // scope searches it as text, and Smart Search returns to the suggestion. Typed text needs nothing
+                    // here; the semantic coordinator reruns it in the new scope.
+                    if let activeSearchSuggestion, activeSearchSuggestion.matchingUIDs != nil,
+                        activeSearchSuggestion.owns(searchText: searchText)
+                    {
+                        scheduleSearchCommit(searchText)
+                    }
+                }
                 .onChange(of: searchText) { _, value in scheduleSearchCommit(value) }
                 .onChange(of: activeSearchSuggestion) { _, suggestion in
                     // The search tab replaces the selected suggestion with its current version after a library
@@ -736,7 +746,8 @@ struct MobileTimelineScreen: View {
             semanticQueryLifecycle = nil
         }
         if let activeSearchSuggestion, activeSearchSuggestion.matchingUIDs != nil,
-            activeSearchSuggestion.owns(searchText: normalizedValue)
+            activeSearchSuggestion.owns(searchText: normalizedValue),
+            SmartSearchDiscoveryModel.usesSuggestionResults(in: searchScope)
         {
             // A selected suggestion already carries its result set. Commit it in the same update, without the
             // typing debounce, so the grid never shows the full library in between; a semantic query for its

@@ -286,14 +286,22 @@ public final class SmartSearchDiscoveryModel {
         return suggestion.kind != .concept || visualConceptsAvailable(snapshot)
     }
 
+    /// Whether a suggestion's result set answers searches in this scope. It answers the broad Smart Search scope
+    /// only; a narrower scope, such as OCR, runs the text the field shows through that scope.
+    public nonisolated static func usesSuggestionResults(in scope: MLSearchScope) -> Bool {
+        scope == .all
+    }
+
     /// What to do with a search text. The title of a suggestion is run as ordinary text only after a current
     /// refresh has confirmed that no suggestion owns it; text the user typed is never erased.
     public nonisolated static func commitDecision(
         for text: String,
         displayable: [TimelineSearchSuggestion],
         published: [TimelineSearchSuggestion],
-        isCurrent: Bool
+        isCurrent: Bool,
+        scope: MLSearchScope
     ) -> SmartSearchSuggestionCommitDecision {
+        guard usesSuggestionResults(in: scope) else { return .text }
         if let suggestion = displayable.first(where: { $0.owns(searchText: text) }) {
             return .structured(suggestion)
         }
@@ -413,7 +421,8 @@ public final class SmartSearchDiscoveryModel {
     public func commitDecision(
         for text: String,
         content: SmartSearchContentIdentity,
-        snapshot: MLSmartSearchSnapshot?
+        snapshot: MLSmartSearchSnapshot?,
+        scope: MLSearchScope
     ) -> SmartSearchSuggestionCommitDecision {
         // A visual concept cannot work while visual search is unavailable, so its title is ordinary text at once.
         let isCurrent = publishedKind(owning: text).map { kind in
@@ -423,7 +432,8 @@ public final class SmartSearchDiscoveryModel {
             for: text,
             displayable: resolvableSuggestions(content: content, snapshot: snapshot),
             published: lastPublished,
-            isCurrent: isCurrent ?? true
+            isCurrent: isCurrent ?? true,
+            scope: scope
         )
     }
 

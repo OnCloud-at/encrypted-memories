@@ -632,7 +632,10 @@ private struct MobileSearchTabScreen: View {
             break
         case .drop:
             self.activeSuggestion = nil
-            if activeSuggestion.owns(searchText: searchText) {
+            // A scope that searches the title as text keeps it: there, the title is an ordinary search.
+            if activeSuggestion.owns(searchText: searchText),
+                SmartSearchDiscoveryModel.usesSuggestionResults(in: searchScope)
+            {
                 searchText = ""
             }
         }
