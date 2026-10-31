@@ -140,6 +140,82 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.maximumConcurrentRankings, 1)
     }
 
+    /// The screen goes away as SwiftUI ends it: it disappears, and its load task is cancelled.
+    private func leaveScreen(_ model: ExactDuplicatesModel, load: Task<Void, Never>) {
+        model.screenDisappeared()
+        load.cancel()
+    }
+
+    func testReopeningTheScreenResumesItsCheckWhereItStoodWhenCheckedCandidatesWereNoDuplicates() async throws {
+        let candidates = manyGroups(100)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: candidates, coverage: .complete)])
+        finder.reportsNothingWhenCancelled = true
+        // Each copy has its own capture time: every checked candidate is no duplicate and leaves the list.
+        for (index, member) in candidates.flatMap(\.members).enumerated() {
+            finder.fingerprints[member] = ExactDuplicateFingerprint(
+                captureTime: Date(timeIntervalSince1970: Double(index)))
+        }
+        let (model, _) = makeModel(finder)
+        var pages = 0
+        finder.afterRankingPage = {
+            pages += 1
+            if pages == 2 { finder.rankGate.close() }
+        }
+        let firstLoad = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the third page waits after two checked pages")
+        let beforeLeaving = try XCTUnwrap(model.checkingGroupsLine.fraction)
+        XCTAssertEqual(beforeLeaving, 0.48)
+        leaveScreen(model, load: firstLoad)
+        finder.rankGate.open()
+        await firstLoad.value
+
+        var shown: [Double] = []
+        finder.afterRankingPage = { [weak model] in
+            if let fraction = model?.checkingGroupsLine.fraction { shown.append(fraction) }
+        }
+        finder.rankGate.close()
+        let reopened = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the reopened screen checks the remaining candidates")
+        shown.insert(try XCTUnwrap(model.checkingGroupsLine.fraction), at: 0)
+        finder.rankGate.open()
+        await reopened.value
+
+        XCTAssertEqual(shown.first, beforeLeaving, "the check resumes where it stood")
+        XCTAssertEqual(shown, shown.sorted())
+        XCTAssertEqual(shown.last, 1)
+        let resumed = finder.rankedGroups.dropFirst(3).flatMap { $0 }
+        XCTAssertEqual(resumed, candidates.dropFirst(48).map(\.id), "a checked candidate is not read again")
+    }
+
+    func testReopeningTheScreenWhileTheLibraryCheckRunsShowsItsLiveProgress() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(10), coverage: .indexing)])
+        finder.buildProgress = [.init(phase: .indexing, completed: 400, total: 1_000)]
+        finder.buildGate.close()
+        let (model, _) = makeModel(finder)
+        let firstLoad = Task { await model.load(checkAllGroups: true) }
+        await waitUntil(
+            { finder.buildGate.hasWaiters && !model.isCheckingGroups }, "the candidates are checked, the build runs")
+        let beforeLeaving = try XCTUnwrap(model.checkLine)
+        XCTAssertEqual(beforeLeaving.fraction, 0.4)
+        leaveScreen(model, load: firstLoad)
+
+        finder.scanGate.close()
+        let reopened = Task { await model.load(checkAllGroups: true) }
+        await waitUntil({ finder.scanGate.hasWaiters }, "the reopened screen reads the groups")
+        XCTAssertTrue(model.isCheckingGroups)
+        XCTAssertEqual(model.checkingGroupsLine, beforeLeaving, "the screen shows the build that still runs")
+        let joinedBefore = PhotoDiagnostics.shared.counter("duplicates.indexBuildJoined")
+        finder.scanGate.open()
+        await waitUntil(
+            { PhotoDiagnostics.shared.counter("duplicates.indexBuildJoined") > joinedBefore },
+            "the reopened screen waits for the running build")
+        XCTAssertEqual(finder.buildCalls, 1, "the build continued and did not start again")
+        XCTAssertEqual(model.checkLine, beforeLeaving)
+        finder.buildGate.open()
+        await reopened.value
+        await firstLoad.value
+    }
+
     func testScreenDisappearanceRevokesAnEnteredRankingPage() async {
         await assertCancellationDropsAnEnteredPage(.screen)
     }
