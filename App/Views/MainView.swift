@@ -715,7 +715,10 @@ struct MainView: View {
             onClearRecentSearches: clearSearchHistory
         )
         .onSubmit(of: .search) { recordSearchHistory(searchText) }
-        .onChange(of: searchScope) { _, scope in semanticQuery?.setScope(scope) }
+        .onChange(of: searchScope) { _, scope in
+            semanticQuery?.setScope(scope)
+            recommitSuggestionTitle()
+        }
         // Keep the native Liquid Glass toolbar. The real insets keep grid and viewer geometry aligned.
         .environment(\.gridLeadingEventInset, leadingObstructionInset)
         .environment(\.gridTopBarInset, topBarInset)
@@ -1874,7 +1877,7 @@ struct MainView: View {
         }
         clearPendingSuggestionText()
         switch searchDiscovery.commitDecision(
-            for: value, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+            for: value, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot, scope: searchScope)
         {
         case .structured(let suggestion):
             commitSuggestion(suggestion, text: value)
@@ -1911,6 +1914,19 @@ struct MainView: View {
         searchDebounceTask = nil
     }
 
+    /// A suggestion's result set answers only the Smart Search scope. When the scope changes while the field shows
+    /// a suggestion title, the title is committed again: another scope searches it as text, and Smart Search returns
+    /// to the suggestion. Typed text needs nothing here; the semantic coordinator reruns it in the new scope.
+    private func recommitSuggestionTitle() {
+        let decision = searchDiscovery.commitDecision(
+            for: searchText, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot, scope: searchScope)
+        guard activeCommittedSuggestion != nil || decision != .text else { return }
+        // The scope change reran the title as text; a title that a suggestion owns must not run as a Smart Search
+        // query while that suggestion is deferred.
+        if decision != .text { semanticQuery?.clear() }
+        scheduleSearchCommit(searchText)
+    }
+
     private func clearPendingSuggestionText() {
         pendingSuggestionDeadlineTask?.cancel()
         pendingSuggestionDeadlineTask = nil
@@ -1923,7 +1939,7 @@ struct MainView: View {
     private func resolvePendingSuggestionText(force: Bool = false) {
         guard let pending = pendingSuggestionText else { return }
         let decision = searchDiscovery.commitDecision(
-            for: pending, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+            for: pending, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot, scope: searchScope)
         if case .deferUntilRefresh = decision, !force { return }
         clearPendingSuggestionText()
         guard pending == searchText else { return }
