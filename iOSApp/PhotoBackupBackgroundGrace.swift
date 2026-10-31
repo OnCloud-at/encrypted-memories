@@ -31,6 +31,8 @@ final class PhotoBackupBackgroundGrace {
     func protectActiveRun(controller: PhotoLibraryBackupController) {
         guard identifier == .invalid else { return }
         guard let runID = controller.activeExecutionRunID else { return }
+        // A processing window carries this run; the short grace would only hold the app past the window's own end.
+        guard !protection.isProtected(owner: controller, runID: runID) else { return }
         let generation = UUID()
         self.generation = generation
         identifier = beginTask {

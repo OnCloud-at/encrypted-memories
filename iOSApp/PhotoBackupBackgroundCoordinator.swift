@@ -13,6 +13,7 @@ final class PhotoBackupProcessingAttempt {
     /// The work of this window. Expiration cancels it, so a pass that still waits for the first network path ends.
     var work: Task<Void, Never>?
     private let protection: BackgroundBackupRunProtection
+    private let endShortGrace: @MainActor () -> Void
     private weak var controller: PhotoLibraryBackupController?
     private var protectionToken: UUID?
     #if DEBUG
@@ -20,8 +21,12 @@ final class PhotoBackupProcessingAttempt {
         private(set) var cancellationReleaseEndedForTesting = false
     #endif
 
-    init(protection: BackgroundBackupRunProtection = .shared) {
+    init(
+        protection: BackgroundBackupRunProtection = .shared,
+        endShortGrace: @escaping @MainActor () -> Void = { PhotoBackupBackgroundGrace.shared.end() }
+    ) {
         self.protection = protection
+        self.endShortGrace = endShortGrace
     }
 
     func run(controller: PhotoLibraryBackupController) async -> BackgroundCatchUpEnd {
@@ -83,6 +88,8 @@ final class PhotoBackupProcessingAttempt {
     private func holdProtection(controller: PhotoLibraryBackupController, runID: String) {
         guard protectionToken == nil else { return }
         protectionToken = protection.hold(owner: controller, runID: runID)
+        // The window carries the run from now on; a short grace that a pass began before would only warn and hold.
+        endShortGrace()
     }
 
     private func releaseProtection() {
@@ -387,12 +394,12 @@ final class PhotoBackupBackgroundCoordinator {
             }
         }
 
-        task.expirationHandler = { [weak self] in
+        // The window's work submits the next request when it returns, after an expiry too, and the window's start
+        // submitted one already.
+        task.expirationHandler = {
             BackgroundWorkLog.system.expirationReceived(.photoBackup)
             Task { @MainActor in
                 attempt.expire()
-                let controller = PhotoLibraryBackupSharedRef.shared.controller
-                self?.scheduleProcessingCatchUp(controller: controller)
             }
         }
     }
