@@ -577,8 +577,8 @@ private func waitUntil(
     /// The bars are native; the app owns only the filmstrip rows below the media. Both orientations keep a
     /// touch-sized strip, and compact landscape trades height for the shorter window.
     @Test func viewerFilmstripAccessoryKeepsTouchTargetsInBothOrientations() {
-        let regular = MobileViewerBottomLayout.profile(compactLandscape: false)
-        let landscape = MobileViewerBottomLayout.profile(compactLandscape: true)
+        let regular = MobileViewerBottomLayout.profile(compactLandscape: false, sideBySide: false)
+        let landscape = MobileViewerBottomLayout.profile(compactLandscape: true, sideBySide: false)
         #expect(regular == .regular)
         #expect(landscape == .compactLandscape)
         #expect(regular.filmstripHeight >= 44)
