@@ -509,6 +509,14 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private let failsRunnableDateRead: Bool
     private let lock = NSLock()
     private var readFailed = false
+    private var reconciliationHook: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)?
+
+    /// Runs before each receipt reaches the row, after the upload returned its uid. False fails the write as a broken
+    /// store does.
+    var beforeReconciliationMark: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)? {
+        get { lock.withLock { reconciliationHook } }
+        set { lock.withLock { reconciliationHook = newValue } }
+    }
 
     /// With `failsRunnableDateRead`, the read of the next due date fails as a broken SQLite read does: it returns nil
     /// and leaves the store not operational.
@@ -584,6 +592,19 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         inner.removeSources(kind: kind, identifiers: identifiers)
+    }
+
+    func markNeedsRemoteReconciliation(
+        source: UploadSourceIdentity,
+        revision: UploadBackupRevision,
+        reconciliation: UploadRemoteCommitReconciliation,
+        lastError: String?,
+        updatedAt: Date
+    ) -> Bool {
+        guard beforeReconciliationMark?(reconciliation) ?? true else { return false }
+        return inner.markNeedsRemoteReconciliation(
+            source: source, revision: revision, reconciliation: reconciliation,
+            lastError: lastError, updatedAt: updatedAt)
     }
 
     func summary() -> UploadBackupSyncQueueSummary { inner.summary() }
@@ -3850,6 +3871,108 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.sourceMissing, 0)
     }
 
+    // MARK: - A removal during the settlement of a finished upload (#756)
+
+    /// Removes `source` through the runner and holds the calling settlement until the removal returns. The settlement
+    /// runs off the runner actor, so the removal lands after the runner's removed-source check.
+    private static func removeWhileSettling(_ source: UploadSourceIdentity, from runner: BackupSyncRunner) {
+        let removed = DispatchSemaphore(value: 0)
+        Task {
+            _ = await runner.removeSources(kind: source.kind, identifiers: [source.identifier])
+            removed.signal()
+        }
+        removed.wait()
+    }
+
+    func testARemovalDuringTheSettlementOfAFinishedUploadEndsOnlyThatPhoto() async throws {
+        let removed = seedEntry("removed-while-settling.jpg", ageSeconds: 120)
+        let next = seedEntry("next.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let events = SpyBackupItemEvents(queue: queueStore)
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1), events: events)
+        queue.beforeReconciliationMark = { [runner] reconciliation in
+            if reconciliation.source == removed.source { Self.removeWhileSettling(removed.source, from: runner) }
+            return true
+        }
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["removed-while-settling.jpg", "next.jpg"])
+        XCTAssertEqual(state(of: next), .completed, "the removal of one photo must not end the pass")
+        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(progress.failed, 0)
+        // The photo is on Proton. Its handoff stays: for an exclusion it schedules that photo for the Proton trash.
+        XCTAssertTrue(
+            events.events.contains {
+                guard case .handoff(let id, _, .uploaded, _) = $0 else { return false }
+                return id == removed.source.identifier
+            })
+    }
+
+    func testARemovalDuringTheSettlementOfALivePhotoVideoEndsOnlyThatPhoto() async throws {
+        let removed = seedEntry("removed-live.heic", ageSeconds: 120)
+        resolver.setSecondaries(["removed-live.mov"], for: removed.source.identifier)
+        let next = seedEntry("next.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        queue.beforeReconciliationMark = { [runner] reconciliation in
+            if reconciliation.source.identifier == removed.source.identifier,
+                reconciliation.source.resource != .primary
+            {
+                Self.removeWhileSettling(removed.source, from: runner)
+            }
+            return true
+        }
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["removed-live.heic", "removed-live.mov", "next.jpg"])
+        XCTAssertEqual(state(of: next), .completed, "the removal of one Live Photo must not end the pass")
+        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(progress.failed, 0)
+    }
+
+    func testAFailedReceiptWriteForAPhotoThatIsStillQueuedEndsThePass() async throws {
+        let failing = seedEntry("receipt-write-fails.jpg", ageSeconds: 120)
+        let next = seedEntry("next.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        // Only the first write fails, so a runner that kept the pass running finishes instead of retrying forever.
+        queue.beforeReconciliationMark = { [weak queue] reconciliation in
+            guard reconciliation.source == failing.source else { return true }
+            queue?.beforeReconciliationMark = nil
+            return false
+        }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["receipt-write-fails.jpg"], "a failed local store ends the pass")
+        XCTAssertNotNil(queueStore.entry(for: failing.source, revision: failing.revision))
+        XCTAssertEqual(state(of: next), .discovered)
+    }
+
+    func testAFailedHandoffWriteEndsThePassEvenWhenTheSourceWasRemoved() async throws {
+        let removed = seedEntry("handoff-write-fails.jpg", ageSeconds: 120)
+        let next = seedEntry("next.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+        events.handoffOutcome = .failed
+        let runner = makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1), events: events)
+        // Only the removed photo's handoff fails, so a runner that kept the pass running finishes the next photo.
+        events.beforeHandoff = { [runner, weak events] source in
+            if source == removed.source {
+                Self.removeWhileSettling(removed.source, from: runner)
+            } else {
+                events?.handoffOutcome = .recorded
+            }
+        }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["handoff-write-fails.jpg"], "a failed local store ends the pass")
+        XCTAssertNil(queueStore.entry(for: removed.source, revision: removed.revision))
+        XCTAssertEqual(state(of: next), .discovered)
+    }
+
     func testPhotoDeletedDuringItsIdentityPassReleasesItsTempFiles() async throws {
         let entry = seedEntry("deleted-during-download.heic")
         let removing = SourceRemovedDuringResolveResolver(inner: resolver)
@@ -5596,6 +5719,8 @@ private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendabl
     var excluded: Set<String> = []
     var exclusionsUnknown = false
     var handoffOutcome = PendingHandoffOutcome.recorded
+    /// Runs inside the settlement of a committed upload, before its handoff is recorded.
+    var beforeHandoff: (@Sendable (UploadSourceIdentity) -> Void)?
 
     init(queue: UploadBackupSyncQueueManifestStore) {
         self.queue = queue
@@ -5619,6 +5744,7 @@ private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendabl
         remote: PhotoUID,
         kind: PendingHandoffKind
     ) -> PendingHandoffOutcome {
+        beforeHandoff?(source)
         let state = queue.entry(for: source, revision: revision)?.state
         lock.withLock { recorded.append(.handoff(source.identifier, remote, kind, queueState: state)) }
         return handoffOutcome
