@@ -165,28 +165,34 @@ final class MobileVerticalBarsUITests: XCTestCase {
         XCTAssertTrue(report.waitForExistence(timeout: 10), "Done did not return to Settings")
     }
 
-    func testTheViewerExtendsThePhotoBehindAVerticalBar() throws {
+    /// The viewer keeps the area behind a vertical bar black instead of extending the photo into it (#924).
+    func testTheViewerKeepsTheAreaBehindAVerticalBarBlack() throws {
         let column = try requireVerticalTabColumn()
         try app.visiblePhoto(beside: column).tap()
         XCTAssertTrue(app.barButton(titled: "Close").waitForExistence(timeout: 10))
         let window = app.windows.firstMatch.frame
-        let point = CGPoint(
-            x: column.midX > window.midX ? window.maxX - 2 : window.minX + 2, y: window.midY)
+        let barIsTrailing = column.midX > window.midX
+        let edge = CGPoint(x: barIsTrailing ? window.maxX - 2 : window.minX + 2, y: window.midY)
+        let photo = CGPoint(
+            x: barIsTrailing ? (window.minX + column.minX) / 2 : (column.maxX + window.maxX) / 2, y: window.midY)
+        // Check the edge only after the photo shows, so that a black frame before the photo cannot pass.
         var readError: Error?
-        let photoReachesTheEdge = XCTNSPredicateExpectation(
+        let photoShows = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in
                 do {
-                    let pixel = try self.app.screenshotPixel(at: point, in: window)
+                    let pixel = try self.app.screenshotPixel(at: photo, in: window)
                     return pixel.prefix(3).max() ?? 0 > 20
                 } catch {
                     readError = error
                     return false
                 }
             }, object: nil)
-        let result = XCTWaiter.wait(for: [photoReachesTheEdge], timeout: 10)
-        keepGeometryEvidence(named: "Viewer photo behind the vertical bar")
+        let result = XCTWaiter.wait(for: [photoShows], timeout: 10)
+        keepGeometryEvidence(named: "Viewer area behind the vertical bar")
         if let readError { throw readError }
-        XCTAssertEqual(result, .completed, "The vertical bar has black beside the photo")
+        XCTAssertEqual(result, .completed, "SETUP: the viewer shows no photo")
+        let pixel = try app.screenshotPixel(at: edge, in: window)
+        XCTAssertLessThanOrEqual(pixel.prefix(3).max() ?? 255, 20, "The vertical bar shows the photo instead of black")
     }
 
     private var photos: XCUIElementQuery {
