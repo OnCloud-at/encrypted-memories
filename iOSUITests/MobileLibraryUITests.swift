@@ -204,6 +204,56 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(wait(for: album, "exists == false", timeout: 20))
     }
 
+    /// In landscape the album picker keeps a usable width, its Cancel button stays in the bar instead of an overflow
+    /// menu, and the creation form keeps its Create & Add button in the bar. The photo is selected in portrait, where
+    /// the bar helpers know every native tab layout; the selection stays when the device turns.
+    func testAlbumPickerKeepsCancelAndCreateInTheBarInLandscape() throws {
+        // A teardown block also runs after a failed assertion, so later tests never start in landscape.
+        addTeardownBlock { @MainActor in XCUIDevice.shared.orientation = .portrait }
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        let column = try app.verticalTabColumn()
+        app.barButton(titled: "Select").tap()
+        try app.visiblePhoto(beside: column).tap()
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let window = app.windows.firstMatch
+        let turned = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in window.frame.width > window.frame.height }, object: nil)
+        // The window, not the device, decides: a display that keeps its portrait window has no landscape layout.
+        try XCTSkipUnless(XCTWaiter.wait(for: [turned], timeout: 5) == .completed, "The window stays in portrait")
+        let addToAlbum = app.barButton(titled: "Add to Album")
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10))
+        addToAlbum.tap()
+        let newAlbum = app.buttons["New Album"].firstMatch
+        XCTAssertTrue(newAlbum.waitForExistence(timeout: 10), "the album picker did not open")
+        let list = app.collectionViews.containing(.button, identifier: "New Album").firstMatch
+        XCTAssertTrue(list.waitForExistence(timeout: 10))
+        attachScreen(named: "Landscape album picker")
+        print("[Album landscape] window=\(app.windows.firstMatch.frame) list=\(list.frame)")
+        XCTAssertGreaterThanOrEqual(list.frame.width, 300, "The picker must keep a usable width")
+        let cancel = app.barButton(titled: "Cancel")
+        XCTAssertTrue(cancel.exists && cancel.isHittable, "Cancel must stay directly in the bar")
+        let album = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(album.waitForExistence(timeout: 10), "the picker shows no album")
+        XCTAssertTrue(album.isHittable, "The first album must be directly tappable")
+
+        newAlbum.tap()
+        let create = app.barButton(titled: "Create & Add")
+        XCTAssertTrue(create.waitForExistence(timeout: 10), "the creation form did not open")
+        attachScreen(named: "Landscape album creation form")
+        XCTAssertTrue(create.isHittable, "Create & Add must stay directly in the bar")
+    }
+
+    private func attachScreen(named name: String) {
+        let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screenshot.name = name
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "\(name) hierarchy"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
+    }
+
     /// Every fixture photo is an edit with an original. The More menu shows the original, marks it with a badge, and
     /// returns to the edited version.
     func testTheViewerShowsTheOriginalOfAnEditedPhotoAndTheEditAgain() throws {
