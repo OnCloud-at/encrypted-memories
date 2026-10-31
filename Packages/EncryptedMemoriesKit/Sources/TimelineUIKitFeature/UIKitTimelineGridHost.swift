@@ -869,9 +869,24 @@
             var view: UIView? = self
             while let current = view {
                 guard !current.isHidden, current.alpha > 0 else { return false }
+                // A host that a clipping ancestor cuts off completely stays invisible until it moves
+                // back into the clip area, so a bounded layout pass cannot have a visible effect.
+                if isCutOffByClippingAncestor(current) { return false }
                 view = current.superview
             }
             return true
+        }
+
+        /// True when `ancestor` clips this host out of view completely. Cut off means: a positive-area host
+        /// frame whose intersection with the ancestor's bounds is null or has no area. A host without area
+        /// (still zero-size during its first layout) is never cut off, and a host that overlaps the clip
+        /// area by any amount is not cut off.
+        private func isCutOffByClippingAncestor(_ ancestor: UIView) -> Bool {
+            guard ancestor !== self, ancestor.clipsToBounds else { return false }
+            let hostFrame = ancestor.convert(bounds, from: self)
+            guard hostFrame.width > 0, hostFrame.height > 0 else { return false }
+            let overlap = hostFrame.intersection(ancestor.bounds)
+            return overlap.isNull || overlap.isEmpty
         }
 
         /// Tab/surface activation from the SwiftUI host. An inactive grid must not keep the display link alive
