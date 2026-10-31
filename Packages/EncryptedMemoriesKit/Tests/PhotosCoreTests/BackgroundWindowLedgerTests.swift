@@ -20,9 +20,10 @@ final class BackgroundWindowLedgerTests: XCTestCase {
 
     private func makeLedger(
         diagnostics: PhotoDiagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false),
-        isPurgePending: @escaping @Sendable () -> Bool = { false }
+        isPurgePending: @escaping @Sendable () -> Bool = { false },
+        log: BackgroundWorkLog = BackgroundWorkLog { _, _ in }
     ) -> BackgroundWindowLedger {
-        BackgroundWindowLedger(fileURL: fileURL, diagnostics: diagnostics, isPurgePending: isPurgePending)
+        BackgroundWindowLedger(fileURL: fileURL, diagnostics: diagnostics, isPurgePending: isPurgePending, log: log)
     }
 
     /// Minute `index` after a fixed start.
@@ -35,6 +36,27 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         kind: BackgroundWindowKind = .photoBackup, at date: Date
     ) {
         ledger.end(ledger.begin(kind, at: date), with: outcome)
+    }
+
+    // MARK: - The device log
+
+    func testEachWindowLogsItsStartAndItsEndOnce() {
+        let lines = BackgroundLogLines()
+        let ledger = makeLedger(log: BackgroundWorkLog { lines.append("\($0.rawValue) \($1)") })
+        let backup = ledger.begin(.photoBackup, at: minute(0))
+        let search = ledger.begin(.smartSearch, at: minute(0))
+        ledger.end(backup, with: .expired)
+        ledger.end(backup, with: .ran)
+        ledger.end(search, with: .ran)
+
+        XCTAssertEqual(
+            lines.values,
+            [
+                "PhotoBackupBackground window.began kind=photoBackup",
+                "SmartSearchBackground window.began kind=smartSearch",
+                "PhotoBackupBackground window.ended kind=photoBackup outcome=expired",
+                "SmartSearchBackground window.ended kind=smartSearch outcome=ran",
+            ], "a second end of the same window logs nothing")
     }
 
     // MARK: - The record

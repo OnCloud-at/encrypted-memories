@@ -33,8 +33,10 @@ public enum PhotoLibraryRefreshWindow {
     ) async -> BackgroundWindowOutcome {
         scheduleNext()
         guard !isLowPowerModeOn() else { return .notNeeded }
+        let waitStart = ContinuousClock.now
         startAccount()
         let wait = await waitForController(accountLimit)
+        BackgroundWorkLog.system.accountWait(.libraryRefresh, wait, waited: .now - waitStart)
         guard case .ready(let controller) = wait else { return wait.outcomeWithoutService(didExpire: didExpire()) }
         guard !didExpire() else { return .expired }
         guard controller.isEnabled else {

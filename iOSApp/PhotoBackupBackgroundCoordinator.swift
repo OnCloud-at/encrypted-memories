@@ -271,6 +271,8 @@ final class PhotoBackupBackgroundCoordinator {
             blocking: { try scheduler.submit(Self.processingRequest(earliestBeginDate: earliestBeginDate)) },
             offMainThread: Self.offMainSubmission(earliestBeginDate: earliestBeginDate),
             completion: { [weak self] error in
+                BackgroundWorkLog.system.requestSubmitted(
+                    .photoBackup, earliestBegin: earliestBeginDate, errorCode: error.map { ($0 as NSError).code })
                 guard let self else { return }
                 guard let error else {
                     self.processingIssue = nil
@@ -294,6 +296,8 @@ final class PhotoBackupBackgroundCoordinator {
             blocking: { try scheduler.submit(Self.refreshRequest(earliestBeginDate: earliestBeginDate)) },
             offMainThread: Self.offMainRefreshSubmission(earliestBeginDate: earliestBeginDate),
             completion: { [weak self] error in
+                BackgroundWorkLog.system.requestSubmitted(
+                    .libraryRefresh, earliestBegin: earliestBeginDate, errorCode: error.map { ($0 as NSError).code })
                 guard let error else { return }
                 self?.logger.error(
                     "Library-refresh submission failed: \(error.localizedDescription, privacy: .public)")
@@ -348,8 +352,10 @@ final class PhotoBackupBackgroundCoordinator {
                 return
             }
             // A launch without a scene has not started the account yet.
+            let waitStart = ContinuousClock.now
             BackgroundLaunchAccountStart.shared.ensureStarted()
             let wait = await self?.waitForController() ?? .notReady
+            BackgroundWorkLog.system.accountWait(.photoBackup, wait, waited: .now - waitStart)
             guard let self, case .ready(let controller) = wait else {
                 let outcome = wait.outcomeWithoutService(didExpire: attempt.didExpire)
                 await completion.finish(outcome, after: pendingRequests)
@@ -382,6 +388,7 @@ final class PhotoBackupBackgroundCoordinator {
         }
 
         task.expirationHandler = { [weak self] in
+            BackgroundWorkLog.system.expirationReceived(.photoBackup)
             Task { @MainActor in
                 attempt.expire()
                 let controller = PhotoLibraryBackupSharedRef.shared.controller
@@ -415,6 +422,7 @@ final class PhotoBackupBackgroundCoordinator {
             }
         }
         task.expirationHandler = {
+            BackgroundWorkLog.system.expirationReceived(.libraryRefresh)
             Task { @MainActor in
                 attempt.didExpire = true
                 attempt.work?.cancel()

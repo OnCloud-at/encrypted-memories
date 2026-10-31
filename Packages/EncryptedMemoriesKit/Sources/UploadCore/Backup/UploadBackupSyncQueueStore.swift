@@ -1086,6 +1086,42 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    /// The rows per state, and per check reason for the check states, for the background log. It reads the whole
+    /// queue, so it must not run on the main actor. Nil when the store cannot be read.
+    public func queueCounts() -> UploadBackupQueueDiagnostics? {
+        connection.withLock {
+            var counts = UploadBackupQueueDiagnostics()
+            var stmt: OpaquePointer?
+            guard
+                connection.requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        SELECT state, CASE WHEN state IN ('discovered','checking') THEN last_error END, COUNT(*)
+                        FROM backup_sync_queue GROUP BY 1, 2;
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            var stepResult = sqlite3_step(stmt)
+            while stepResult == SQLITE_ROW {
+                guard let raw = columnText(stmt, 0), let state = UploadBackupSyncQueueState(rawValue: raw) else {
+                    return nil
+                }
+                let rows = Int(sqlite3_column_int(stmt, 2))
+                counts.rows[state, default: 0] += rows
+                if state == .discovered || state == .checking {
+                    let reason = UploadBackupQueueDiagnostics.checkReason(lastError: columnText(stmt, 1))
+                    counts.checkReasons[state, default: [:]][reason, default: 0] += rows
+                }
+                stepResult = sqlite3_step(stmt)
+            }
+            guard connection.requireOperational(stepResult == SQLITE_DONE) else { return nil }
+            return counts
+        }
+    }
+
     public func summary() -> UploadBackupSyncQueueSummary {
         connection.withLock {
             var stmt: OpaquePointer?
