@@ -23,6 +23,12 @@ enum MobileTimelineSurface: Equatable {
         case .search: String(localized: "tab.search")
         }
     }
+
+    /// Whether the activity pill is shown. Connectivity messages belong to every surface; the notice that the
+    /// library is updating belongs to the library surface only.
+    func presentsActivityBanner(connectivity: LibraryConnectivityBannerState, libraryIsRefreshing: Bool) -> Bool {
+        connectivity != .hidden || (libraryIsRefreshing && self == .library)
+    }
 }
 
 /// The shared library and search timeline. Each native tab owns only its presentation state; both surfaces
@@ -114,7 +120,8 @@ struct MobileTimelineScreen: View {
         )
     }
     private var libraryBannerIsPresented: Bool {
-        connectivityBannerState != .hidden || backgroundLibraryActivityActive
+        surface.presentsActivityBanner(
+            connectivity: connectivityBannerState, libraryIsRefreshing: backgroundLibraryActivityActive)
     }
     private var libraryBannerMessage: String {
         switch connectivityBannerState {
