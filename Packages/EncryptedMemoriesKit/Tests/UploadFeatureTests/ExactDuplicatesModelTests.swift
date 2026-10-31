@@ -1246,7 +1246,10 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.buildGate.close()
         let (model, _) = makeModel(finder)
         let load = Task { await model.load() }
-        await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+        // The build and the check of the first group run at the same time; the total needs the checked group.
+        await waitUntil(
+            { finder.buildGate.hasWaiters && model.visibleGroups.map(\.id) == ["A"] },
+            "the load builds the index after it checked the first group")
         XCTAssertEqual(model.totalFreedBytes, 200)
         finder.buildGate.open()
         await load.value
