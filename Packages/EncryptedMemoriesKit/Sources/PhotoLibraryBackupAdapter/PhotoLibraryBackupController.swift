@@ -248,6 +248,8 @@ public final class PhotoLibraryBackupController {
     private var passPausedByPolicy = false
     /// A manual Wi-Fi retry stays pending until the resumed pass gets past its policy pause.
     private var manualWiFiRetryPending = false
+    /// The active run is a background window's pass that carries the person's pending Wi-Fi retry.
+    private var activeRunCarriesManualRetry = false
     /// The owner of a foreground or explicit pass that did not start because no network path had arrived yet. The
     /// first path, the setting, or the end of `firstNetworkPathWait` starts it. An explicit action outranks an
     /// automatic foreground start.
@@ -1022,6 +1024,15 @@ public final class PhotoLibraryBackupController {
             // The window may have expired while the scan ended; then it starts no pass.
             guard !Task.isCancelled else { return .done }
         }
+        if runnerStopTask != nil, let stopping = syncTask, let stoppingRunID = activeRunID,
+            runtimeSignals.current().isAppInBackground
+        {
+            // A stop already ends the active pass, for example at the end of its short grace before iOS suspended the
+            // app. The window does not take that pass over: it waits for its end, or for its own expiry, and then
+            // runs its own pass.
+            await waitForAdoptedRun(StartedBackupRun(runID: stoppingRunID, task: stopping))
+            guard !Task.isCancelled else { return .done }
+        }
         var started = startSync(owner: owner, onAdmitted: onRunAdmitted)
         if started == nil, lastStartWasDeferred {
             // The pass waits for the first network path. The window stays open until that pass ends.
@@ -1118,12 +1129,21 @@ public final class PhotoLibraryBackupController {
             // A window that took the automatic pass but started no run gives it back, so the path observer starts it.
             if tookAutomaticDeferral, activeRunID == nil, deferredStartOwner == nil { deferredStartOwner = .foreground }
         }
+        var carriesManualRetry = false
         if !scanOnly, manualWiFiRetryPending, runtimeSignals.current().canEndWiFiWait, owner != .manual {
-            let run = startSync(owner: .manual)
-            // A window cannot own or expire the person's resumed retry.
-            return owner == .foreground ? run : nil
+            if runtimeSignals.current().isAppInBackground {
+                // No scene is in the foreground, so nobody watches the person's retry. Only a background window runs it,
+                // as its own pass that holds the window's time and may skip the remote index backoff; any other start
+                // leaves the retry pending for that window.
+                guard owner != .foreground else { return nil }
+                carriesManualRetry = true
+            } else {
+                let run = startSync(owner: .manual)
+                // In the foreground a window cannot own or expire the person's resumed retry.
+                return owner == .foreground ? run : nil
+            }
         }
-        if !scanOnly, owner != .manual,
+        if !scanOnly, owner != .manual, !carriesManualRetry,
             let retryAt = queueStore.runtimeIssue(for: .remoteIndexPreparation)?.nextAttemptAt,
             retryAt > Date()
         {
@@ -1162,6 +1182,11 @@ public final class PhotoLibraryBackupController {
         activeRunID = runID
         activeRunOwner = owner
         activeRefreshScan = refreshScan
+        if carriesManualRetry {
+            // The intent moves to this run only once the run holds the lock; a declined start keeps it pending.
+            manualWiFiRetryPending = false
+            activeRunCarriesManualRetry = true
+        }
         onAdmitted?(runID)
 
         // Retry previously failed items once per launch.
@@ -1675,6 +1700,9 @@ public final class PhotoLibraryBackupController {
 
         /// A change during the pass armed the restart after it.
         internal var isRestartAfterStopArmedForTesting: Bool { pendingSyncAfterStop }
+
+        /// The person's manual retry waits for Wi-Fi.
+        internal var isManualWiFiRetryPendingForTesting: Bool { manualWiFiRetryPending }
 
         /// The first status projection arrived, so a pass start has counts to compare with.
         internal var hasStatusProjectionForTesting: Bool { hasStatusProjection }
@@ -2450,10 +2478,12 @@ public final class PhotoLibraryBackupController {
             pausedByPolicy: passPausedByPolicy, startedAt: runStartedAt, progressAtStart: progressAtRunStart,
             stopRequestedAt: runnerStopRequestedAt)
         if !isShuttingDown,
-            let lock = lockStore?.currentLock(), lock.runID == runID, lock.owner == .manual
+            let lock = lockStore?.currentLock(), lock.runID == runID,
+            lock.owner == .manual || activeRunCarriesManualRetry
         {
             manualWiFiRetryPending = passPausedByPolicy
         }
+        activeRunCarriesManualRetry = false
         heartbeatTask?.cancel()
         heartbeatTask = nil
         lockStore?.release(runID: runID)

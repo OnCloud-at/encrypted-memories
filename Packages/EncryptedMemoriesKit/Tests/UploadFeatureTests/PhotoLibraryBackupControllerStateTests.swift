@@ -1880,6 +1880,20 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 networkDetermined: true, returnsDuringScan: false, returnsInBackgroundWindow: true)
         }
 
+        /// #983: on a locked phone nobody watches the person's retry, so a window that sees Wi-Fi carries it.
+        func testAWindowCarriesThePendingManualRetryWhileTheAppIsOnlyInTheBackground() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(
+                networkDetermined: true, returnsDuringScan: false, returnsInBackgroundWindow: true,
+                windowInBackground: true)
+        }
+
+        /// The network observer can see Wi-Fi before the window comes; it leaves the retry for the window.
+        func testTheNetworkObserverLeavesThePendingManualRetryForTheWindowInTheBackground() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(
+                networkDetermined: true, returnsDuringScan: false, returnsInBackgroundWindow: true,
+                windowInBackground: true, observerFirst: true)
+        }
+
         func testManualRetryResumesWhenMobileDataAllowsTheExpensivePathWithoutTheIndexBackoff() async throws {
             try await assertManualRetryResumesAfterWiFiWait(
                 networkDetermined: true, returnsDuringScan: false, enablesMobileData: true)
@@ -1887,7 +1901,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
         private func assertManualRetryResumesAfterWiFiWait(
             networkDetermined: Bool, returnsDuringScan: Bool, returnsInBackgroundWindow: Bool = false,
-            enablesMobileData: Bool = false
+            enablesMobileData: Bool = false, windowInBackground: Bool = false, observerFirst: Bool = false
         ) async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: networkDetermined)
             let fixture = try makeWiFiWaitFixture(
@@ -1939,8 +1953,27 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 signals.setWaitsForWiFi(false)
             }
             if returnsInBackgroundWindow {
+                if windowInBackground { signals.setAppInBackground(true) }
+                releaseScan.value = true
+                if observerFirst {
+                    signals.announceChange()
+                    let started = await waitUntil(timeout: .milliseconds(300)) { controller.isSyncing }
+                    XCTAssertFalse(started, "no run that no window can hold starts for the retry")
+                    XCTAssertTrue(controller.isManualWiFiRetryPendingForTesting, "the retry waits for the window")
+                }
                 let windowRuns = PassCounter()
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
+                if windowInBackground {
+                    XCTAssertEqual(windowRuns.count, 1, "the window runs the pass and holds it until it ends")
+                    XCTAssertEqual(
+                        owners.values, [.manual, .iOSBackgroundTask], "the window's own pass carries the retry")
+                    XCTAssertFalse(controller.isSyncing, "the window ends with its pass")
+                    XCTAssertNil(
+                        queue.runtimeIssue(for: .remoteIndexPreparation),
+                        "the window's pass keeps the retry's right to prepare the index before its backoff date")
+                    await controller.shutdown()
+                    return
+                }
                 XCTAssertEqual(windowRuns.count, 0, "A window cannot expire the resumed manual retry")
             } else if enablesMobileData {
                 controller.mobileDataSettingDidChange()
@@ -2584,6 +2617,145 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             controller.stopSync()
             _ = await waitUntil { !controller.isSyncing }
+            await controller.shutdown()
+        }
+
+        /// A carried retry keeps the person's intent through a policy pause, as the retry's own run does.
+        func testACarriedRetryThatEndsWaitingForWiFiKeepsTheIntent() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: true)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-carried-retry-pause", source: signals.source, firstNetworkPathWait: .milliseconds(100))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            let scans = PassCounter()
+            let releaseCarriedScan = LockedFlag(false)
+            controller.replaceScanForTesting {
+                if scans.increment() == 2 {
+                    while !releaseCarriedScan.value, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                }
+            }
+            await controller.retryUserResolvableWork()
+            let waiting = await waitUntil { controller.status.phase == .waitingForWiFi && !controller.isSyncing }
+            XCTAssertTrue(waiting)
+            XCTAssertTrue(controller.isManualWiFiRetryPendingForTesting)
+            signals.setAppInBackground(true)
+            signals.setWaitsForWiFi(false)
+            let window = Task { @MainActor in await controller.backgroundCatchUp(owner: .iOSBackgroundTask) }
+            let carried = await waitUntil { scans.count == 2 }
+            XCTAssertTrue(carried, "the window carries the retry")
+            XCTAssertFalse(controller.isManualWiFiRetryPendingForTesting, "the running pass holds the intent")
+            signals.setWaitsForWiFi(true)
+            releaseCarriedScan.value = true
+            _ = await window.value
+            XCTAssertTrue(
+                controller.isManualWiFiRetryPendingForTesting, "a pass that ends waiting for Wi-Fi keeps the retry")
+            await controller.shutdown()
+        }
+
+        func testAWindowThatCannotTakeTheLockKeepsThePendingManualRetry() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: true)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-carried-retry-busy-lock", source: signals.source,
+                firstNetworkPathWait: .milliseconds(100))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            controller.replaceScanForTesting {}
+            await controller.retryUserResolvableWork()
+            let waiting = await waitUntil { controller.status.phase == .waitingForWiFi && !controller.isSyncing }
+            XCTAssertTrue(waiting)
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
+            signals.setAppInBackground(true)
+            signals.setWaitsForWiFi(false)
+
+            await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+
+            XCTAssertFalse(controller.isSyncing, "another run holds the lock")
+            XCTAssertTrue(controller.isManualWiFiRetryPendingForTesting, "a declined start keeps the person's retry")
+            XCTAssertTrue(lock.release(runID: "other-live-run"))
+            await controller.shutdown()
+        }
+
+        func testAWindowThatExpiresWhileItWaitsForAStoppingPassEndsAtOnce() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .backgroundPermitted
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-window-expires-in-stop", source: .mobileDataOff(runtime))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                try await Task.sleep(for: .seconds(60))
+            }
+            let stopReleased = LockedFlag(false)
+            controller.installRunnerStopOperationForTesting {
+                while !stopReleased.value { try? await Task.sleep(for: .milliseconds(10)) }
+            }
+            controller.syncNow()
+            _ = await waitUntil { scans.count == 1 }
+            controller.stopSync()
+            let windowEnded = LockedFlag(false)
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                windowEnded.value = true
+            }
+            _ = await waitUntil(timeout: .milliseconds(100)) { windowEnded.value }
+            window.cancel()
+            let ended = await waitUntil(timeout: .seconds(1)) { windowEnded.value }
+            XCTAssertTrue(ended, "the expiry ends the window's wait while the stop still runs")
+            XCTAssertEqual(scans.count, 1, "the expired window starts no pass")
+            stopReleased.value = true
+            _ = await waitUntil { !controller.isSyncing }
+            await controller.shutdown()
+        }
+
+        /// The short grace of an automatic pass can end with a stop just before iOS suspends the app; the next window then
+        /// meets that stopping pass. It must wait for the stop and run its own pass, not adopt the ending one.
+        func testAWindowThatMeetsAStoppingPassRunsItsOwnPassAfterTheStop() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .backgroundPermitted
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-window-meets-a-stop", source: .mobileDataOff(runtime))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                _ = scans.increment()
+                try await Task.sleep(for: .seconds(60))
+            }
+            let stopReleased = LockedFlag(false)
+            controller.installRunnerStopOperationForTesting {
+                while !stopReleased.value { try? await Task.sleep(for: .milliseconds(10)) }
+            }
+            controller.syncNow()
+            _ = await waitUntil { scans.count == 1 }
+            controller.stopSync()
+            let windowRuns = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
+            }
+            _ = await waitUntil(timeout: .milliseconds(200)) { windowRuns.count > 0 }
+            stopReleased.value = true
+
+            let ownPass = await waitUntil { scans.count == 2 }
+            XCTAssertTrue(ownPass, "the window starts its own pass once the stop ended")
+            XCTAssertEqual(owners.values, [.foreground, .iOSBackgroundTask])
+            XCTAssertEqual(windowRuns.count, 1, "the window holds only its own pass")
+            controller.stopSync()
+            _ = await window.value
             await controller.shutdown()
         }
 
