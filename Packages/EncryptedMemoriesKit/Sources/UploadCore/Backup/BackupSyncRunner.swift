@@ -898,6 +898,24 @@ public actor BackupSyncRunner {
         if !isSourceRecheck { adjustProgress(from: checkingEntry.state, to: .checking) }
         emitProgress()
 
+        // A photo with a pending row that this build cannot read waits before its file is exported or hashed: a newer
+        // build may have excluded it. A dismissed photo keeps its check, and a saved upload receipt stays. Every
+        // revision of the photo waits like this, without a problem. The check before each transfer stays (#982).
+        if events?.exclusion(of: checkingEntry.source) == .unreadable {
+            if isSourceRecheck {
+                rememberDeferredSource(checkingEntry)
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
+                parkRemoteReconciliation(
+                    checkingEntry, reconciliation: reconciliation, from: persistedState,
+                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
+                        ?? L10n.string("error.upload_cancelled"))
+            } else {
+                retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
+            }
+            return
+        }
+
         // Another revision of this source can already belong to the same claim. Release it without another read.
         if deferredSources[Self.sourceKey(kind: checkingEntry.source.kind, identifier: checkingEntry.source.identifier)]
             != nil
@@ -911,24 +929,6 @@ public actor BackupSyncRunner {
                         ?? L10n.string("error.upload_cancelled"))
             } else {
                 deferInterruptedSource(checkingEntry, from: persistedState)
-            }
-            return
-        }
-
-        // A photo with a pending row that this build cannot read waits before its file is exported or hashed: a newer
-        // build may have excluded it. A dismissed photo keeps its check, and a saved upload receipt stays. The check
-        // before each transfer stays (#982).
-        if events?.exclusion(of: checkingEntry.source) == .unreadable {
-            if isSourceRecheck {
-                rememberDeferredSource(checkingEntry)
-                preserveDismissedSourceRecheck(checkingEntry)
-            } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
-                parkRemoteReconciliation(
-                    checkingEntry, reconciliation: reconciliation, from: persistedState,
-                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
-                        ?? L10n.string("error.upload_cancelled"))
-            } else {
-                retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
             }
             return
         }

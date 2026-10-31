@@ -4149,6 +4149,67 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertGreaterThan(kept.updatedAt, clock.now, "the check waits")
     }
 
+    /// A drain that waits for scheduled retries ends while a dismissed photo waits for its unreadable pending row; it
+    /// does not check that photo again and again (#982).
+    func testADrainThatWaitsForRetriesEndsWhileADismissedPhotoWaitsForItsUnreadableRow() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-recheck-drain.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let entry = seedLibraryEntry("IMG_1.HEIC")
+        let reason = BackupIssueRecord(kind: .sourceMissing, detail: "backup.issue_source_missing").persistedValue
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: reason,
+                updatedAt: clock.now.addingTimeInterval(-60)))
+        try makePendingRowUnreadable(entry.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+        let runner = makeRunner(events: recorder)
+
+        let finished = expectation(description: "the drain ends")
+        let drain = Task {
+            _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 10)
+        await runner.stop()  // Ends a drain that never ends on its own after the failed wait.
+        _ = await drain.value
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 0, "no export")
+        let kept = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(kept.isDismissedSourceRecheck, "the dismissed photo keeps its check")
+    }
+
+    /// Every revision of a photo whose pending row cannot be read waits without a problem; none of them shows under
+    /// Needs attention (#982).
+    func testEveryRevisionOfAPhotoWithAnUnreadableRowWaitsWithoutAProblem() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-revisions.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let first = seedEntry("waiting.jpg", ageSeconds: 120)
+        let second = seedEntry("waiting.jpg", ageSeconds: 60, revisionOffset: 1)
+        try makePendingRowUnreadable(first.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1), events: recorder)
+            .runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+
+        XCTAssertEqual(resolver.resolveCount(for: first.source.identifier), 0, "no export")
+        for entry in [first, second] {
+            let kept = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(kept.state, .discovered)
+            XCTAssertEqual(kept.attempts, entry.attempts)
+            XCTAssertNil(BackupIssueRecord.decode(kept.lastError), "waiting is no problem")
+        }
+        var problems = 0
+        queueStore.forEachProblemEntry { _ in
+            problems += 1
+            return true
+        }
+        XCTAssertEqual(problems, 0, "nothing under Needs attention")
+    }
+
     /// A photo whose pending row becomes unreadable while it is read, and whose copy Proton already holds, waits
     /// without an attempt: the store refuses its upload record and stays unchanged (#982).
     func testARefusedRecordOfAPhotoWithAnUnreadableRowSpendsNoAttempt() async throws {
