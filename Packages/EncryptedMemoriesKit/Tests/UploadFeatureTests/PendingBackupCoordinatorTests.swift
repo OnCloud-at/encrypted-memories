@@ -4998,7 +4998,10 @@ extension PendingBackupCoordinatorTests {
                 continue
             }
             XCTAssertTrue(effects.restored.isEmpty, "\(replacement): the edit's trash of the old photo stands")
-            if replacement != "intent during the final read" {
+            if replacement == "intent during the final read" {
+                XCTAssertEqual(
+                    effects.returned, [[sourceKey]], "The race reached the final read after a complete compound")
+            } else {
                 XCTAssertTrue(effects.returned.isEmpty, "\(replacement): the newer version already backed up")
             }
             XCTAssertEqual(result.outcomes[sourceKey], .completed, replacement)
