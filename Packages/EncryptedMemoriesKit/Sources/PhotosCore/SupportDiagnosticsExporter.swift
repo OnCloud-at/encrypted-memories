@@ -38,6 +38,12 @@ public enum SupportDiagnosticsExporter {
             let pendingGrid: PendingGridSupportSnapshot
         }
 
+        /// The background milestone lines of the device log, oldest first, and the older lines that its bound dropped.
+        struct BackgroundLog: Codable {
+            let lines: [String]
+            let droppedLines: Int
+        }
+
         struct RecentEvents: Codable {
             let events: [SupportEventTrail.ExportedEvent]
             /// Older events that the bounded trail no longer holds.
@@ -52,6 +58,7 @@ public enum SupportDiagnosticsExporter {
         /// Each record has one of the eight outcomes of `BackgroundWindowOutcome`; `unfinished` marks a window whose end
         /// was never recorded.
         let backgroundWindows: BackgroundWindowSupportSnapshot
+        let backgroundLog: BackgroundLog
         let schemaVersion: Int
         let generatedAt: Date
         let appVersion: String
@@ -74,7 +81,8 @@ public enum SupportDiagnosticsExporter {
         bundle: Bundle = .main,
         sources: SupportDiagnosticsSources = .shared,
         trail: SupportEventTrail = .shared,
-        backgroundWindows: BackgroundWindowLedger = .shared
+        backgroundWindows: BackgroundWindowLedger = .shared,
+        backgroundLog: BackgroundWorkLogFile = .shared
     ) async throws -> Data {
         let snapshot = runtimeState.snapshot()
         let metrics = await resourceCoordinator.metrics()
@@ -83,6 +91,7 @@ public enum SupportDiagnosticsExporter {
         let librarySync = await sources.librarySnapshot(now: now)
         // One salt per report: hashes link the events of one report, never two reports.
         let trailExport = trail.export(hashingWith: SupportReportIdentifierHasher())
+        let logExport = backgroundLog.export()
         let report = Report(
             placeCandidates: await sources.placeSnapshot(),
             librarySync: librarySync,
@@ -93,6 +102,7 @@ public enum SupportDiagnosticsExporter {
             ),
             recentEvents: Report.RecentEvents(events: trailExport.events, dropped: trailExport.dropped),
             backgroundWindows: backgroundWindows.supportSnapshot(),
+            backgroundLog: Report.BackgroundLog(lines: logExport.lines, droppedLines: logExport.droppedLines),
             schemaVersion: 4,
             generatedAt: now,
             appVersion: buildInfo.version ?? "unknown",
