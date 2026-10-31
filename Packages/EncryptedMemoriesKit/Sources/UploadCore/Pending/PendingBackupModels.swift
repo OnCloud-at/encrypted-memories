@@ -66,7 +66,7 @@ public struct PendingReplacementHandoff: Sendable, Equatable {
 }
 
 /// How a pending source reached Proton.
-public enum PendingHandoffKind: String, Sendable, Codable {
+public enum PendingHandoffKind: String, Sendable, Codable, CaseIterable {
     /// This app committed the primary resource.
     case uploaded
     /// The duplicate check mapped the source to a photo that already exists in Proton.
@@ -132,7 +132,7 @@ public struct PendingPresentationMetadata: Sendable, Equatable {
     }
 }
 
-public enum PendingDesiredState: String, Sendable, Equatable {
+public enum PendingDesiredState: String, Sendable, Equatable, CaseIterable {
     case excluded
     case included
 }
@@ -307,7 +307,7 @@ public struct PendingExclusionRequest: Sendable, Equatable {
 }
 
 /// The effect a reconciler finished for one source generation.
-public enum PendingSourceEffect: String, Sendable, Equatable {
+public enum PendingSourceEffect: String, Sendable, Equatable, CaseIterable {
     case queueSync
     case remoteTrash
     case remoteRestore

@@ -285,7 +285,8 @@ final class PendingBackupStoreTests: XCTestCase {
                     [PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date.addingTimeInterval(10)
                 ))
         }
-        XCTAssertFalse(store.isOperational(), "an unknown non-null enum must record a decode failure")
+        // A row that does not decode stops nothing else; it stays unreadable and unchanged (#982).
+        XCTAssertTrue(store.isOperational(), "an unknown non-null enum stops only its own row")
         XCTAssertEqual(try pendingTables(), before, "rejection must preserve the interrupted restore row")
         store.close()
         store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
@@ -347,10 +348,8 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertNotNil(
             store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date))
         XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
-        try withRawPendingDatabase {
-            XCTAssertEqual(sqlite3_exec($0, "UPDATE pending_action SET kind='invalid';", nil, nil, nil), SQLITE_OK)
-        }
-        _ = store.actions()
+        // A denied read is no transient failure, so it stays recorded (#982); a row that does not decode records none.
+        try withOneDeniedSourceSelect { _ = store.actions() }
         XCTAssertFalse(store.isOperational())
         XCTAssertEqual(
             store.recordHandoff(
@@ -402,7 +401,8 @@ final class PendingBackupStoreTests: XCTestCase {
             } else {
                 try withOneDeniedSourceSelect { try body(state) }
             }
-            XCTAssertFalse(store.isOperational(), "a real read failure must record failed health")
+            // A failed call that is not transient stays recorded; a row that does not decode stops nothing (#982).
+            XCTAssertEqual(store.isOperational(), corruptRow, "a failed read records failed health, a bad row does not")
             XCTAssertEqual(try pendingTables(), before, "a failed writer must not change any persisted row")
             if corruptRow {
                 try withRawPendingDatabase {
@@ -895,19 +895,176 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertTrue(store.isOperational())
     }
 
-    func testPendingActionDecodeFailureStaysStickyWithoutChangingLaterSQLResults() throws {
+    /// A failed call that is not transient stays recorded, and later calls answer on their own (#982).
+    func testANonTransientFailureStaysStickyWithoutChangingLaterSQLResults() throws {
         XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
-        var handle: OpaquePointer?
-        XCTAssertEqual(sqlite3_open(storeURL.path, &handle), SQLITE_OK)
-        defer { sqlite3_close(handle) }
-        XCTAssertEqual(sqlite3_exec(handle, "UPDATE pending_action SET kind='invalid-kind';", nil, nil, nil), SQLITE_OK)
-        _ = store.actions()
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+        try withOneDeniedSourceSelect { _ = store.actions() }
         XCTAssertFalse(store.isOperational())
         let revision = UploadBackupRevision(rawValue: 10)
         XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
         XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
-        XCTAssertFalse(store.isOperational(), "successful SQL cannot clear recorded failure")
-        XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]))
+        XCTAssertFalse(store.isOperational(), "successful SQL cannot clear a failure that is not transient")
+        XCTAssertEqual(
+            store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier],
+            "an earlier failure does not stop a read that works")
+    }
+
+    /// A favorite intent that a newer build wrote with a kind that this build does not know (#982).
+    func testAPendingActionThatCannotBeDecodedStopsNothingAndStaysUnchanged() throws {
+        XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+        try withRawPendingDatabase {
+            XCTAssertEqual(sqlite3_exec($0, "UPDATE pending_action SET kind='invalid-kind';", nil, nil, nil), SQLITE_OK)
+        }
+        let before = try pendingTables()
+
+        XCTAssertFalse(store.actionsRead().complete, "the read stays incomplete")
+        XCTAssertTrue(store.isOperational())
+        let revision = UploadBackupRevision(rawValue: 10)
+        XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
+
+        XCTAssertEqual(try pendingTables()["pending_action"], before["pending_action"], "the row stays unchanged")
+    }
+
+    // MARK: - A row that does not decode, or one failed call, stops nothing else (#982)
+
+    private let other = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-2")
+
+    /// Excludes `key` and `other` without a remote photo, so both are listed in Recently Deleted.
+    private func excludeBoth() {
+        XCTAssertNotNil(
+            store.exclude(
+                [key, other].map { PendingExclusionRequest(key: $0, presentation: presentation(), remote: nil) },
+                at: date))
+    }
+
+    private func corrupt(_ column: String, of identifier: String = "asset-1") throws {
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    $0, "UPDATE source_state SET \(column)='written-by-a-newer-build' WHERE source_id='\(identifier)';",
+                    nil, nil, nil), SQLITE_OK)
+        }
+    }
+
+    /// A newer build may have excluded the photo: its identifier counts as excluded and the photo waits.
+    func testAnIdentifierWithARowThatCannotBeDecodedCountsAsExcluded() throws {
+        for column in ["source_kind", "desired", "remote_op"] {
+            XCTAssertNotNil(
+                store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+            try corrupt(column)
+            let before = try pendingTables()
+
+            XCTAssertEqual(
+                store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1", "asset-2"]), ["asset-1"], column)
+            XCTAssertTrue(store.isOperational(), column)
+            XCTAssertFalse(store.sourceStatesRead().complete, "the read stays incomplete (\(column))")
+            XCTAssertEqual(try pendingTables(), before, "the row stays unchanged (\(column))")
+
+            try withRawPendingDatabase {
+                XCTAssertEqual(sqlite3_exec($0, "DELETE FROM source_state;", nil, nil, nil), SQLITE_OK)
+            }
+        }
+    }
+
+    func testUnlistingFromTheTrashLeavesARowThatCannotBeDecodedUnchanged() throws {
+        excludeBoth()
+        try corrupt("desired")
+        let corrupted = try XCTUnwrap(try pendingTables()["source_state"]?.first)
+
+        XCTAssertTrue(store.unlistFromTrash([key, other], at: date.addingTimeInterval(5)))
+
+        XCTAssertEqual(try pendingTables()["source_state"]?.first, corrupted, "the row stays unchanged")
+        XCTAssertEqual(store.sourceState(for: other)?.listedInTrash, false, "the other row is unlisted")
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testAHandoffThatCannotBeDecodedIsNeitherReplacedNorPrunedNorIgnored() throws {
+        let revision = UploadBackupRevision(rawValue: 7)
+        let handoff = PendingHandoff(key: key, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+        XCTAssertEqual(store.recordHandoff(handoff), .recorded)
+        XCTAssertTrue(store.acknowledgeHandoffs([(key, revision)]))
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE handoff SET kind='written-by-a-newer-build';", nil, nil, nil), SQLITE_OK)
+        }
+        let before = try pendingTables()
+
+        XCTAssertEqual(store.recordHandoff(handoff), .failed, "a newer handoff of this revision is not replaced")
+        XCTAssertNil(
+            store.exclude(
+                [PendingExclusionRequest(key: key, presentation: nil, remote: nil, revision: revision)],
+                at: date.addingTimeInterval(1)),
+            "an exclusion cannot tell which photo the revision committed")
+        XCTAssertTrue(store.pruneAcknowledgedHandoffs(olderThan: date.addingTimeInterval(3_600)))
+
+        XCTAssertEqual(try pendingTables(), before, "every row stays unchanged")
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testPruningKeepsTheHandoffsOfASourceWithARowThatCannotBeDecoded() throws {
+        excludeBoth()
+        for target in [key, other] {
+            let revision = UploadBackupRevision(rawValue: 7)
+            let handoff = PendingHandoff(
+                key: target, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+            XCTAssertNotEqual(store.recordHandoff(handoff), .failed)
+            XCTAssertTrue(store.acknowledgeHandoffs([(target, revision)]))
+        }
+        XCTAssertNotNil(store.include([key, other], at: date))
+        try corrupt("desired")
+
+        XCTAssertTrue(store.pruneAcknowledgedHandoffs(olderThan: date.addingTimeInterval(3_600)))
+
+        let kept = try XCTUnwrap(try pendingTables()["handoff"])
+        XCTAssertEqual(kept.count, 1, "only the handoff of the unreadable source stays")
+        XCTAssertEqual(kept.first?.first, Data("photoLibraryAsset".utf8))
+        XCTAssertEqual(kept.first?[1], Data("asset-1".utf8))
+    }
+
+    /// Another connection holds the write lock until its busy timeout ends, as a full disk or a busy database does.
+    /// The write fails; once the lock is free, the store works again without a reopen.
+    func testATransientWriteFailureStopsTheStoreOnlyUntilTheDatabaseAnswers() throws {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let blocker = try XCTUnwrap(handle)
+        defer { sqlite3_close(blocker) }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+
+        XCTAssertFalse(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 1), at: date))
+
+        XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        XCTAssertTrue(store.isOperational(), "the database answers again")
+        XCTAssertTrue(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 1), at: date))
+    }
+
+    func testKeepingAPhotoRefusesAHandoffThatCannotBeDecoded() throws {
+        let revision = UploadBackupRevision(rawValue: 7)
+        let excluded = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date)?
+                .first)
+        let handoff = PendingHandoff(key: key, revision: revision, remote: remote, kind: .uploaded, createdAt: date)
+        XCTAssertNotEqual(store.recordHandoff(handoff), .failed)
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE handoff SET kind='written-by-a-newer-build';", nil, nil, nil), SQLITE_OK)
+        }
+        let before = try pendingTables()
+
+        XCTAssertNil(
+            store.keepRemote(
+                remote, of: key, generation: excluded.generation, revision: revision, at: date.addingTimeInterval(2)),
+            "keeping a photo cannot tell which photo the revision committed")
+
+        XCTAssertEqual(try pendingTables(), before, "every row stays unchanged")
+    }
+
+    /// Each read of the exclusions fails closed on its own failure.
+    func testAFailedExclusionReadAnswersNil() throws {
+        try withOneDeniedSourceSelect {
+            XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1"]))
+        }
     }
 
     func testClosedStoreCannotConfirmExclusions() {

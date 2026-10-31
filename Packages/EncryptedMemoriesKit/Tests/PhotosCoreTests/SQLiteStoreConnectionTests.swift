@@ -57,6 +57,74 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         }
     }
 
+    // MARK: - Recovery after a transient failure (#982)
+
+    func testATransientFailureRecoversWhenTheDatabaseAnswers() throws {
+        // Busy, locked, out of memory, interrupted, I/O and full disk, primary and extended codes.
+        let codes: [Int32] = [
+            SQLITE_BUSY, SQLITE_LOCKED, SQLITE_NOMEM, SQLITE_INTERRUPT, SQLITE_IOERR, SQLITE_FULL,
+            SQLITE_BUSY | (2 << 8), SQLITE_IOERR | (10 << 8),
+        ]
+        for code in codes {
+            let connection = try makeConnection()
+            defer { connection.close() }
+            connection.withLock { connection.markFailed(resultCode: code) }
+            XCTAssertFalse(connection.isOperational(probeDatabase: false), "\(code) is recorded")
+
+            XCTAssertTrue(connection.isOperationalAfterRecovery(), "\(code) recovers")
+            connection.withLock { XCTAssertFalse(connection.operationFailed, "\(code) is forgotten") }
+        }
+    }
+
+    func testAFailureThatIsNotTransientStaysRecorded() throws {
+        // A corrupt database, a file that is no database, a read-only file, a schema change, a constraint, a misuse,
+        // a denied statement and an unknown cause.
+        let codes: [Int32?] = [
+            SQLITE_CORRUPT, SQLITE_NOTADB, SQLITE_READONLY, SQLITE_SCHEMA, SQLITE_CONSTRAINT, SQLITE_MISUSE,
+            SQLITE_AUTH, SQLITE_ERROR, nil,
+        ]
+        for code in codes {
+            let connection = try makeConnection()
+            defer { connection.close() }
+            connection.withLock { connection.markFailed(resultCode: code) }
+
+            XCTAssertFalse(connection.isOperationalAfterRecovery(), "\(String(describing: code)) stays recorded")
+            XCTAssertFalse(connection.isOperationalAfterRecovery(), "also at the next check")
+        }
+    }
+
+    func testOneFailureThatIsNotTransientKeepsEarlierTransientFailuresRecorded() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            connection.markFailed(resultCode: SQLITE_BUSY)
+            connection.markFailed(resultCode: SQLITE_CORRUPT)
+            connection.markFailed(resultCode: SQLITE_FULL)
+        }
+        XCTAssertFalse(connection.isOperationalAfterRecovery())
+    }
+
+    func testATransientFailureDoesNotRecoverWhileATransactionIsOpen() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            connection.markFailed(resultCode: SQLITE_BUSY)
+        }
+        XCTAssertFalse(connection.isOperationalAfterRecovery(), "the open transaction can hold a half-done write")
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertTrue(connection.isOperationalAfterRecovery())
+    }
+
+    func testAClosedConnectionNeverRecovers() throws {
+        let connection = try makeConnection()
+        connection.withLock { connection.markFailed(resultCode: SQLITE_BUSY) }
+        connection.close()
+        XCTAssertFalse(connection.isOperationalAfterRecovery())
+    }
+
     func testCloseOptimizesThenReleasesTheHandleOnlyOnce() throws {
         let connection = try makeConnection()
         let trace = Trace()
