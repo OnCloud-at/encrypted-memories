@@ -657,7 +657,7 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         case .incompatible:
             return .incompatible
         case .unavailable, .retryLater:
-            // The store stays as it is: it holds user data, so it is never replaced here.
+            // The check is inconclusive, so the file stays for the next open; only .incompatible is replaced.
             return .failed
         case .empty, .current:
             break
