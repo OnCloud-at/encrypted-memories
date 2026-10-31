@@ -257,6 +257,164 @@ import Testing
         #expect(clock.pendingSleeps == 0)
     }
 
+    /// 30 token changes, one every 5 s, as an own bulk write (Merge All of many groups) causes them. Returns the times
+    /// of the refreshes that the monitor ran while the bulk write lasted.
+    private func refreshTimesDuringABulkWrite(
+        hold: HoldFlag?
+    ) async -> (
+        times: [Duration], clock: TimelineRefreshTestClock, monitor: LibraryChangeMonitor,
+        timeline: MonitorRefreshTimeline, provider: TokenProvider
+    ) {
+        let clock = TimelineRefreshTestClock()
+        let origin = clock.now
+        let provider = TokenProvider("t0")
+        let timeline = MonitorRefreshTimeline()
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(
+            provider: provider, initialToken: "t0",
+            holdRefresh: { await hold?.isHeld ?? false },
+            onChange: {
+                let published = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: published)
+                return .refreshed(token: published)
+            })
+        #expect(await clock.waitForSleepCount(1))
+        for step in 1...30 {
+            await provider.set("t\(step)")
+            clock.advance(by: .seconds(5))
+            #expect(await clock.waitForSleepCount(step + 1))
+        }
+        return (await timeline.times, clock, monitor, timeline, provider)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func withoutAHoldAnOwnBulkWriteRefreshesSeveralTimes() async {
+        let run = await refreshTimesDuringABulkWrite(hold: nil)
+        #expect(run.times.count >= 3, "The monitor refreshes the first change and every burst deadline: \(run.times)")
+        await run.monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aHeldMonitorRefreshesNothingDuringAnOwnBulkWriteAndOnceAfterItEnds() async {
+        let hold = HoldFlag(true)
+        let run = await refreshTimesDuringABulkWrite(hold: hold)
+        #expect(run.times.isEmpty, "No refresh runs while the bulk write holds the monitor: \(run.times)")
+
+        await hold.set(false)
+        run.clock.advance(by: .seconds(5))
+        #expect(await run.clock.waitForSleepCount(32))
+        let afterRelease = await run.timeline.times
+        #expect(afterRelease == [.seconds(155)], "One refresh within one probe of the end")
+        #expect(await run.timeline.tokens == ["t30"], "It carries the newest token")
+        #expect(await run.monitor.testingBaseline() == "t30")
+
+        run.clock.advance(by: .seconds(30))
+        #expect(await run.clock.waitForSleepCount(33))
+        #expect(await run.timeline.times.count == 1, "Nothing refreshes again without a new change")
+        await run.monitor.stop()
+    }
+
+    /// A merge that never ends: the cap lets one refresh run after ten minutes, and the hold applies again.
+    @Test(.timeLimit(.minutes(1)))
+    func aHoldThatLastsLongerThanTheCapRefreshesOncePerCap() async {
+        let clock = TimelineRefreshTestClock()
+        let origin = clock.now
+        let provider = TokenProvider("t0")
+        let timeline = MonitorRefreshTimeline()
+        let hold = HoldFlag(true)
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(
+            provider: provider, initialToken: "t0",
+            holdRefresh: { await hold.isHeld },
+            onChange: {
+                let published = await provider.currentToken()
+                await timeline.record(clock.now - origin, token: published)
+                return .refreshed(token: published)
+            })
+        #expect(await clock.waitForSleepCount(1))
+        let cap = Int(LibraryChangePollingPolicy.foreground.maxHoldInterval.components.seconds)
+        for step in 1...(cap * 5 / 2 / 5) {
+            await provider.set("t\(step)")
+            clock.advance(by: .seconds(5))
+            guard await clock.waitForSleepCount(step + 1) else {
+                Issue.record("the monitor did not reach probe \(step + 1)")
+                break
+            }
+        }
+        let times = (await timeline.times).map { Int($0.components.seconds) }
+        // The first held change is seen at 5 s; the cap runs out at the first probe that is `cap` seconds later.
+        #expect(times == [5 + cap, 10 + 2 * cap], "One refresh per cap, none in between: \(times)")
+        await monitor.stop()
+    }
+
+    /// The cap counts one hold: a token that returns to the baseline ends it, so a later hold gets a full window.
+    @Test(.timeLimit(.minutes(1)))
+    func aTokenThatReturnsToTheBaselineEndsTheHoldWindow() async {
+        let clock = TimelineRefreshTestClock()
+        let provider = TokenProvider("a")
+        let timeline = MonitorRefreshTimeline()
+        let hold = HoldFlag(true)
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.start(
+            provider: provider, initialToken: "a",
+            holdRefresh: { await hold.isHeld },
+            onChange: {
+                await timeline.record(.zero, token: "x")
+                return .refreshed(token: "x")
+            })
+        #expect(await clock.waitForSleepCount(1))
+        await provider.set("b")
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(2))
+        await provider.set("a")
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(3))
+        let cap = Int(LibraryChangePollingPolicy.foreground.maxHoldInterval.components.seconds)
+        // Idle until long after the first window would have run out, then a new change arrives during a new hold.
+        for step in 4...(4 + cap / 5 + 2) {
+            clock.advance(by: .seconds(5))
+            guard await clock.waitForSleepCount(step) else {
+                Issue.record("the monitor did not reach probe \(step)")
+                break
+            }
+        }
+        await provider.set("c")
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(4 + cap / 5 + 3))
+        #expect(await timeline.times.isEmpty, "The new change starts a new hold window instead of using the old one")
+        await monitor.stop()
+    }
+
+    @Test func theHoldCapIsTenMinutes() {
+        #expect(LibraryChangePollingPolicy.foreground.maxHoldInterval == .seconds(600))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aMonitorStartedWithRestartAppliesTheHostHold() async {
+        let clock = TimelineRefreshTestClock()
+        let provider = TokenProvider("a")
+        let timeline = MonitorRefreshTimeline()
+        let hold = HoldFlag(true)
+        let monitor = LibraryChangeMonitor(clock: clock.dependency)
+        await monitor.restart(
+            provider: provider, initialToken: "a",
+            holdRefresh: { await hold.isHeld },
+            onChange: {
+                await timeline.record(.zero, token: "b")
+                return .refreshed(token: "b")
+            })
+        #expect(await clock.waitForSleepCount(1))
+        await provider.set("b")
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(2))
+        #expect(await timeline.times.isEmpty, "A change during the hold does not refresh")
+        await hold.set(false)
+        clock.advance(by: .seconds(5))
+        #expect(await clock.waitForSleepCount(3))
+        #expect(await timeline.times.count == 1, "The first probe after the hold refreshes once")
+        await monitor.stop()
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func continuousForeignChangesCannotResetTheFirstDeferredDeadline() async {
         let clock = TimelineRefreshTestClock()
@@ -1011,6 +1169,12 @@ private actor TokenProvider: LibraryChangeTokenProvider {
         }
         return probeCount >= count
     }
+}
+
+private actor HoldFlag {
+    private(set) var isHeld: Bool
+    init(_ isHeld: Bool) { self.isHeld = isHeld }
+    func set(_ value: Bool) { isHeld = value }
 }
 
 private actor Counter {
