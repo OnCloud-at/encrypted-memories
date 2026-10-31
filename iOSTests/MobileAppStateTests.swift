@@ -50,6 +50,11 @@ private actor MobileRetryLifecycleLatch {
     func hasEntered(_ ownerID: String) -> Bool { entered.contains(ownerID) }
 }
 
+private actor MobileTimelineLoadCount {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
+
 private actor MobileRetryCompletionLatch {
     private var completed = false
 
@@ -1238,6 +1243,45 @@ private func waitUntil(
         #expect(model.backend != nil)
         #expect(model.items == fixture.items)
         model.configure(session: nil, store: SessionKeychainStore())
+    }
+
+    @Test func backupUploadSignalsRefreshOncePerIntervalAndThePassEndPublishesTheRest() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let loads = MobileTimelineLoadCount()
+        let sections = fixture.sections
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: {
+                    await loads.record()
+                    return TimelineLoadSnapshot(sections: sections, validationToken: "fixture")
+                }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        model.settleIsolatedLibraryForTesting()
+        model.setApplicationActive(true)
+
+        for _ in 0..<5 { model.refreshAfterBackupUpload(passIsRunning: true) }
+        try #require(await waitForMobileOwner { await loads.count == 1 })
+        // The interval holds the other four signals back; a wrong route would load again within this window.
+        let loadedAgain = await waitForMobileOwner(timeout: .milliseconds(500)) { await loads.count > 1 }
+        #expect(!loadedAgain)
+        #expect(await loads.count == 1)
+
+        model.backupPassDidEnd()
+        try #require(await waitForMobileOwner { await loads.count == 2 })
+
+        // A manual upload keeps its immediate refresh while backup signals wait.
+        model.refreshAfterBackupUpload(passIsRunning: true)
+        model.refreshAfterLocalUpload()
+        try #require(await waitForMobileOwner { await loads.count == 3 })
+        // Only the manual upload loaded; the backup signal that waits did not add a load of its own.
+        let loadedMore = await waitForMobileOwner(timeout: .milliseconds(500)) { await loads.count > 3 }
+        #expect(!loadedMore)
+        model.configure(session: nil, store: SessionKeychainStore())
+        await fixture.feed.stopPrefetch()
     }
 
     @Test func repeatedTerminalSignalsScheduleOneRecovery() async throws {

@@ -363,6 +363,9 @@ struct MainView: View {
             .onChange(of: model.photoBackupController?.uploadedLibraryMutationRevision) { _, _ in
                 scheduleLibraryRefreshAfterBackupUpload()
             }
+            .onChange(of: model.photoBackupController?.isSyncing ?? false) { wasRunning, isRunning in
+                if wasRunning && !isRunning { libraryRefresh.backupPassDidEnd() }
+            }
             .sheet(isPresented: $uploadCoordinator.isDestinationSheetPresented) {
                 UploadDestinationSheet(coordinator: uploadCoordinator)
             }
@@ -1519,7 +1522,8 @@ struct MainView: View {
     }
 
     private func scheduleLibraryRefreshAfterBackupUpload() {
-        libraryRefresh.scheduleBackupUploadRefresh(host: refreshHost)
+        libraryRefresh.scheduleBackupUploadRefresh(
+            host: refreshHost, passIsRunning: model.photoBackupController?.isSyncing ?? false)
     }
 
     private func refreshLibraryManually() {
