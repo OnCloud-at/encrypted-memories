@@ -179,7 +179,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     /// The latest handoff of each source, or `unreadable` when its query failed or its row did not decode. Unlike the
-    /// list readers, this read leaves the store's failure state unchanged, as before.
+    /// list readers, a decode or step failure leaves the store's failure state unchanged here.
     public func latestHandoffsRead(for keys: [PendingSourceKey]) -> [PendingSourceKey: PendingHandoffRead] {
         guard !keys.isEmpty else { return [:] }
         return connection.withLock {
