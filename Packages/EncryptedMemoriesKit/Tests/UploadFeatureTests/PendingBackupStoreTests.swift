@@ -498,7 +498,7 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(excluded?.needsQueueSync, true)
         XCTAssertEqual(excluded?.needsRemoteTrash, false)
         XCTAssertEqual(excluded?.listedInTrash, true)
-        XCTAssertEqual(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1", "other"]), ["asset-1"])
+        XCTAssertEqual(store.exclusions(kind: .photoLibraryAsset, among: ["asset-1", "other"]), ["asset-1": .excluded])
 
         let included = try XCTUnwrap(store.include([key], at: date)).first
         XCTAssertEqual(included?.desired, .included)
@@ -510,7 +510,7 @@ final class PendingBackupStoreTests: XCTestCase {
 
         XCTAssertTrue(store.completeEffect(.queueSync, for: key, generation: 2, at: date))
         XCTAssertNil(store.sourceState(for: key), "an included source without due effects leaves the store")
-        XCTAssertEqual(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1"]), [])
+        XCTAssertEqual(store.exclusions(kind: .photoLibraryAsset, among: ["asset-1"]), [:])
     }
 
     func testDeleteOfAnUploadedPhotoTrashesItAndShowsOnlyTheProtonTrashEntry() throws {
@@ -882,7 +882,7 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertTrue(store.removeEvidence([(PendingSourceKey, UploadBackupRevision)]()))
         XCTAssertTrue(store.acknowledgeHandoffs([]))
         XCTAssertTrue(store.unlistFromTrash([], at: date))
-        XCTAssertEqual(store.excludedIdentifiers(kind: .photoLibraryAsset, among: []), [])
+        XCTAssertEqual(store.exclusions(kind: .photoLibraryAsset, among: []), [:])
         XCTAssertEqual(store.exclude([], at: date), [])
         XCTAssertEqual(store.include([], at: date), [])
         XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: []), [])
@@ -911,7 +911,7 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
         XCTAssertFalse(store.isOperational(), "successful SQL cannot clear a failure that is not transient")
         XCTAssertNil(
-            store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]),
+            store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]),
             "a lasting failure stops the exclusion read, so no photo uploads while its exclusion is unknown")
     }
 
@@ -923,11 +923,11 @@ final class PendingBackupStoreTests: XCTestCase {
         connection.withLock {
             XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
         }
-        XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]))
+        XCTAssertNil(store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]))
         connection.withLock {
             XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
         }
-        XCTAssertEqual(store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier])
+        XCTAssertEqual(store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier: .excluded])
     }
 
     /// A COMMIT that fails ends the transaction and records the failure with the code of the COMMIT (#982).
@@ -986,8 +986,8 @@ final class PendingBackupStoreTests: XCTestCase {
         }
     }
 
-    /// A newer build may have excluded the photo: its identifier counts as excluded and the photo waits.
-    func testAnIdentifierWithARowThatCannotBeDecodedCountsAsExcluded() throws {
+    /// A newer build may have excluded the photo: its identifier is reported unreadable, never included.
+    func testAnIdentifierWithARowThatCannotBeDecodedIsReportedUnreadable() throws {
         for column in ["source_kind", "desired", "remote_op"] {
             XCTAssertNotNil(
                 store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
@@ -995,7 +995,8 @@ final class PendingBackupStoreTests: XCTestCase {
             let before = try pendingTables()
 
             XCTAssertEqual(
-                store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1", "asset-2"]), ["asset-1"], column)
+                store.exclusions(kind: .photoLibraryAsset, among: ["asset-1", "asset-2"]), ["asset-1": .unreadable],
+                column)
             XCTAssertTrue(store.isOperational(), column)
             XCTAssertFalse(store.sourceStatesRead().complete, "the read stays incomplete (\(column))")
             XCTAssertEqual(try pendingTables(), before, "the row stays unchanged (\(column))")
@@ -1023,6 +1024,43 @@ final class PendingBackupStoreTests: XCTestCase {
             store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
         XCTAssertEqual(
             store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier: .unreadable])
+
+        // The other order: the excluded row comes first, by row and by key, and the unreadable row after it.
+        try withRawPendingDatabase {
+            XCTAssertEqual(sqlite3_exec($0, "DELETE FROM source_state;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: fileKey, presentation: presentation(), remote: nil)], at: date))
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    $0, "UPDATE source_state SET source_kind='zz-newer-kind' WHERE source_kind='fileURL';", nil, nil,
+                    nil), SQLITE_OK)
+        }
+        XCTAssertEqual(
+            store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier: .unreadable])
+    }
+
+    /// The read finds a row of an unknown kind before, between and after the kinds that this build knows (#982).
+    func testARowOfAnUnknownKindIsFoundInEveryGapBetweenTheKnownKinds() throws {
+        for unknownKind in ["a-newer-kind", "m-newer-kind", "zz-newer-kind"] {
+            XCTAssertNotNil(
+                store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+            try withRawPendingDatabase {
+                XCTAssertEqual(
+                    sqlite3_exec($0, "UPDATE source_state SET source_kind='\(unknownKind)';", nil, nil, nil), SQLITE_OK)
+            }
+
+            XCTAssertEqual(
+                store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier: .unreadable],
+                unknownKind)
+
+            try withRawPendingDatabase {
+                XCTAssertEqual(sqlite3_exec($0, "DELETE FROM source_state;", nil, nil, nil), SQLITE_OK)
+            }
+        }
     }
 
     func testUnlistingFromTheTrashLeavesARowThatCannotBeDecodedUnchanged() throws {
@@ -1091,7 +1129,7 @@ final class PendingBackupStoreTests: XCTestCase {
 
         XCTAssertFalse(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 1), at: date))
         XCTAssertEqual(
-            store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]), [],
+            store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [:],
             "a transient failure does not stop the exclusion read")
 
         XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
@@ -1138,7 +1176,8 @@ final class PendingBackupStoreTests: XCTestCase {
 
         XCTAssertEqual(answer, ["asset-1000": .excluded, "asset-999": .unreadable])
         XCTAssertEqual(
-            store.excludedIdentifiers(kind: .photoLibraryAsset, among: identifiers), ["asset-999", "asset-1000"])
+            store.exclusions(kind: .photoLibraryAsset, among: identifiers),
+            ["asset-999": .unreadable, "asset-1000": .excluded])
     }
 
     /// A failed read of a row fails the unlisting; only a row that does not decode is skipped.
@@ -1192,13 +1231,13 @@ final class PendingBackupStoreTests: XCTestCase {
     /// Each read of the exclusions fails closed on its own failure.
     func testAFailedExclusionReadAnswersNil() throws {
         try withOneDeniedSourceSelect {
-            XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1"]))
+            XCTAssertNil(store.exclusions(kind: .photoLibraryAsset, among: ["asset-1"]))
         }
     }
 
     func testClosedStoreCannotConfirmExclusions() {
         store.close()
-        XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1"]))
+        XCTAssertNil(store.exclusions(kind: .photoLibraryAsset, among: ["asset-1"]))
         XCTAssertFalse(store.isOperational())
     }
 
@@ -1409,6 +1448,57 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertFalse(queue.unsettledRows().contains { $0.source.identifier == "later" })
     }
 
+    /// A photo whose pending row this build cannot read is queued like an included photo, so a scan never marks its
+    /// revision seen without a queue row; the runner lets it wait (#982).
+    func testEngineQueuesAPhotoWithAnUnreadablePendingRow() async throws {
+        let exclusions = StubExclusions(excluded: ["excluded"], unreadable: ["waiting"])
+        let engine = UploadBackupSyncEngine(
+            preflight: UploadBackupPreflightIndex(store: EmptyStateStore()), queue: queue, exclusions: exclusions,
+            now: { [date] in date })
+
+        _ = try await engine.enqueueBatch([candidate("kept"), candidate("excluded"), candidate("waiting")])
+
+        XCTAssertEqual(Set(queue.unsettledRows().map(\.source.identifier)), ["kept", "waiting"])
+    }
+
+    /// The repair paths keep a photo whose pending row this build cannot read: the missing-source sweep inserts it,
+    /// and a changed photo whose row was missing is queued again (#982).
+    func testRepairPathsKeepAPhotoWithAnUnreadablePendingRow() async throws {
+        let exclusions = StubExclusions(excluded: ["excluded"], unreadable: ["waiting", "changed"])
+        let engine = UploadBackupSyncEngine(
+            preflight: UploadBackupPreflightIndex(store: EmptyStateStore()), queue: queue, exclusions: exclusions,
+            now: { [date] in date })
+
+        try await engine.enqueueMissingSources([candidate("waiting"), candidate("excluded")])
+        XCTAssertEqual(Set(queue.unsettledRows().map(\.source.identifier)), ["waiting"])
+
+        XCTAssertTrue(queue.upsert(entry("changed", state: .sourceMissing)))
+        try await engine.enqueueChangedMissingSources([candidate("changed")])
+        let changed = candidate("changed").snapshot
+        XCTAssertEqual(queue.entry(for: changed.source, revision: changed.revision)?.state, .discovered)
+    }
+
+    /// A late render reopens a backed-up photo also when its pending row cannot be read; the runner lets it wait
+    /// (#982).
+    func testReopeningKeepsAPhotoWithAnUnreadablePendingRow() async throws {
+        let stateStore = try XCTUnwrap(
+            UploadBackupStateManifestStore(url: directory.appendingPathComponent("backup-state.sqlite")))
+        defer { stateStore.close() }
+        let preflight = UploadBackupPreflightIndex(store: stateStore)
+        let engine = UploadBackupSyncEngine(
+            preflight: preflight, queue: queue, exclusions: StubExclusions(excluded: [], unreadable: ["waiting"]),
+            now: { [date] in date })
+        let waiting = candidate("waiting")
+        try await preflight.markBackedUp(waiting.snapshot)
+        XCTAssertTrue(queue.upsert(entry("waiting", state: .completed)))
+
+        let reopened = try await engine.reopenBackedUpRevisions(
+            [UploadBackupReopening(candidate: waiting, formerMain: nil)], deferringWithoutRemoteProof: false)
+
+        XCTAssertEqual(reopened, [waiting])
+        XCTAssertNil(queue.entry(for: waiting.snapshot.source, revision: waiting.snapshot.revision))
+    }
+
     private func candidate(_ id: String) -> UploadBackupAssetCandidate {
         UploadBackupAssetCandidate(
             snapshot: UploadBackupAssetSnapshot(
@@ -1431,10 +1521,12 @@ private final class LockedChanges: @unchecked Sendable {
 private final class StubExclusions: UploadBackupExclusionFiltering, @unchecked Sendable {
     private let lock = NSLock()
     private let excluded: Set<String>
+    private let unreadable: Set<String>
     private var isAvailable = true
 
-    init(excluded: Set<String>) {
+    init(excluded: Set<String>, unreadable: Set<String> = []) {
         self.excluded = excluded
+        self.unreadable = unreadable
     }
 
     var available: Bool {
@@ -1442,9 +1534,12 @@ private final class StubExclusions: UploadBackupExclusionFiltering, @unchecked S
         set { lock.withLock { isAvailable = newValue } }
     }
 
-    func excludedIdentifiers(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> Set<String>? {
+    func exclusions(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> [String: BackupSourceExclusion]? {
         guard available else { return nil }
-        return excluded.intersection(identifiers)
+        var answers: [String: BackupSourceExclusion] = [:]
+        for identifier in identifiers where excluded.contains(identifier) { answers[identifier] = .excluded }
+        for identifier in identifiers where unreadable.contains(identifier) { answers[identifier] = .unreadable }
+        return answers
     }
 }
 

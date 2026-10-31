@@ -355,17 +355,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
-    /// Identifiers among `identifiers` whose desired state is excluded, or nil when the store cannot answer. The backup
-    /// engine drops these before it writes queue rows. An identifier with a row that this build cannot read counts as
-    /// excluded: a newer build may have excluded it. That photo waits and its row stays; the other photos go on (#982).
+    /// The identifiers among `identifiers` that are excluded or have a row that this build cannot read, or nil when
+    /// the store cannot answer. An identifier that is missing from the result is included. A row that this build cannot
+    /// read may hold a newer build's exclusion: that photo waits and its row stays; the other photos go on (#982).
     /// An earlier transient failure does not stop this read. A lasting failure, an open transaction or a failure of
     /// this read answers nil, so no photo uploads while its exclusion is unknown.
-    public func excludedIdentifiers(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> Set<String>? {
-        exclusions(kind: kind, among: identifiers).map { Set($0.keys) }
-    }
-
-    /// The identifiers among `identifiers` that are excluded or have a row that this build cannot read, or nil when
-    /// the store cannot answer. An identifier that is missing from the result is included.
     public func exclusions(
         kind: UploadSourceIdentity.Kind, among identifiers: [String]
     ) -> [String: BackupSourceExclusion]? {
@@ -375,38 +369,40 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 !connection.operationFailed || connection.failuresAreTransient
             else { return nil }
             var result: [String: BackupSourceExclusion] = [:]
-            // The key is (source_kind, source_id), and a row whose kind does not decode has no usable key: one read
-            // for each chunk finds every row of the identifiers, whatever its kind.
+            // A row whose kind does not decode still belongs to its identifier, whatever its kind: the reads cover the
+            // known kinds and every gap between them.
             var seen = Set<String>()
             let unique = identifiers.filter { seen.insert($0).inserted }
             for start in stride(from: 0, to: unique.count, by: Self.identifierChunkSize) {
                 let chunk = unique[start..<min(start + Self.identifierChunkSize, unique.count)]
                 let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
-                let read = query(
-                    "SELECT source_kind, source_id, desired, remote_op FROM source_state "
-                        + "WHERE source_id IN (\(placeholders));",
-                    bind: { stmt in
-                        for (offset, identifier) in chunk.enumerated() {
-                            self.bindText(stmt, Int32(offset + 1), identifier)
+                for kindFilter in Self.sourceKindFilters {
+                    let read = query(
+                        "SELECT source_kind, source_id, desired, remote_op FROM source_state "
+                            + "WHERE \(kindFilter) AND source_id IN (\(placeholders));",
+                        bind: { stmt in
+                            for (offset, identifier) in chunk.enumerated() {
+                                self.bindText(stmt, Int32(offset + 1), identifier)
+                            }
+                        }
+                    ) { stmt in
+                        guard let identifier = columnText(stmt, 1) else { return }
+                        let rowKind = sourceStateEnumText(stmt, 0).flatMap(UploadSourceIdentity.Kind.init(rawValue:))
+                        let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:))
+                        let operationReadable =
+                            sqlite3_column_type(stmt, 3) == SQLITE_NULL
+                            || sourceStateEnumText(stmt, 3).flatMap(PendingSourceEffect.init(rawValue:)) != nil
+                        guard let rowKind, let desired, operationReadable else {
+                            Self.noteUndecodableRow()
+                            result[identifier] = .unreadable
+                            return
+                        }
+                        if rowKind == kind, desired == .excluded, result[identifier] == nil {
+                            result[identifier] = .excluded
                         }
                     }
-                ) { stmt in
-                    guard let identifier = columnText(stmt, 1) else { return }
-                    let rowKind = sourceStateEnumText(stmt, 0).flatMap(UploadSourceIdentity.Kind.init(rawValue:))
-                    let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:))
-                    let operationReadable =
-                        sqlite3_column_type(stmt, 3) == SQLITE_NULL
-                        || sourceStateEnumText(stmt, 3).flatMap(PendingSourceEffect.init(rawValue:)) != nil
-                    guard let rowKind, let desired, operationReadable else {
-                        Self.noteUndecodableRow()
-                        result[identifier] = .unreadable
-                        return
-                    }
-                    if rowKind == kind, desired == .excluded, result[identifier] == nil {
-                        result[identifier] = .excluded
-                    }
+                    guard read else { return nil }
                 }
-                guard read else { return nil }
             }
             return result
         }
@@ -414,6 +410,18 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     /// Identifiers in one read; far below SQLite's limit of bound parameters.
     private static let identifierChunkSize = 500
+
+    /// The kinds that this build knows, read by key, and the gaps before, between and after them, read as ranges of
+    /// the key. Together they cover every kind, and no read scans the table (#982).
+    private static let sourceKindFilters: [String] = {
+        let known = UploadSourceIdentity.Kind.allCases.map(\.rawValue).sorted()
+        var filters = ["source_kind IN (\(sqlList(UploadSourceIdentity.Kind.self)))", "source_kind < '\(known[0])'"]
+        for (lower, upper) in zip(known, known.dropFirst()) {
+            filters.append("source_kind > '\(lower)' AND source_kind < '\(upper)'")
+        }
+        filters.append("source_kind > '\(known[known.count - 1])'")
+        return filters
+    }()
 
     /// The raw values of `type` as an SQL list, for a statement that must not touch a row this build cannot read.
     private static func sqlList<Value: RawRepresentable & CaseIterable>(_ type: Value.Type) -> String

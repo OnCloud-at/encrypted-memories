@@ -912,6 +912,16 @@ public actor BackupSyncRunner {
             return
         }
 
+        // A photo with a pending row that this build cannot read waits before its file is exported or hashed: a newer
+        // build may have excluded it. A row with a saved upload receipt takes its usual path; the check before each
+        // transfer stays (#982).
+        if !isSourceRecheck, checkingEntry.remoteCommitReconciliation == nil,
+            events?.exclusion(of: checkingEntry.source) == .unreadable
+        {
+            retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
+            return
+        }
+
         let resolved: BackupResolvedResource?
         do {
             let resolvingEntry = checkingEntry

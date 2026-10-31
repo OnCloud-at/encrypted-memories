@@ -40,9 +40,10 @@ public enum BackupSourceExclusion: Sendable, Equatable {
 
 /// Drops candidates of excluded sources before the backup engine writes queue rows.
 public protocol UploadBackupExclusionFiltering: Sendable {
-    /// Nil when the answer is unknown. The engine then refuses to enqueue, because uploading a photo the
-    /// person deleted would break their decision.
-    func excludedIdentifiers(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> Set<String>?
+    /// The excluded and unreadable identifiers among `identifiers`; a missing identifier is included. Nil when the
+    /// answer is unknown. The engine then refuses to enqueue, because uploading a photo the person deleted would
+    /// break their decision.
+    func exclusions(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> [String: BackupSourceExclusion]?
 }
 
 extension PendingBackupManifestStore: UploadBackupExclusionFiltering {}
