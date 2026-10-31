@@ -42,6 +42,8 @@ struct MobilePhotoViewer: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var index: Int
     @State private var chromeVisible = true
+    /// Whether the system put the media and the lower part side by side: the folded layout of a partly open device.
+    @State private var arrangementSideBySide = false
     @State private var burstSelection = BurstSelectionModel()
     @State private var editedOriginal = EditedPhotoOriginalState()
     @State private var editedOriginalLookup = EditedPhotoOriginalLookup()
@@ -207,12 +209,19 @@ struct MobilePhotoViewer: View {
                 }
             }
             // The filmstrip is bottom safe-area content, the Photos-app contract: the media refits when the chrome
-            // toggles, and the native bottom bar stacks below the strip.
-            .safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }
-            .overlay {
+            // toggles, and the native bottom bar stacks below the strip. In the folded layout the system puts the
+            // filmstrip and the details on the other part of the display.
+            .viewerArrangement(
+                showsLowerPart: chromeVisible,
+                stackedLowerPartHeight: chromeLayoutProfile.stackedLowerPartHeight,
+                isSideBySide: $arrangementSideBySide
+            ) {
+                viewerBottomAccessory
+            } notice: {
                 UndoNoticeOverlay(
                     notice: Binding(get: { libraryModel.undoNotice }, set: { libraryModel.undoNotice = $0 }))
             }
+            .background { Color.black.ignoresSafeArea() }
             // The principal item draws both lines. A blank title string would render as quotation marks while
             // a known location resolves, so the reserved line is hidden by opacity instead, as on the Mac.
             .navigationTitle(viewerTitle.reservesLocationLine ? viewerTitle.line2 : viewerTitle.line1)
@@ -330,18 +339,40 @@ struct MobilePhotoViewer: View {
     @ViewBuilder private var viewerBottomAccessory: some View {
         if chromeVisible {
             let profile = chromeLayoutProfile
-            MobileViewerFilmstrip(
-                items: items,
-                selectedUID: currentBaseItem?.uid,
-                feed: libraryModel.thumbnailFeed,
-                itemSide: min(46, profile.filmstripHeight),
-                allowsVisibleDuplicateThumbnails: duplicateGroup != nil,
-                onSelect: selectPage
-            )
-            .frame(height: profile.filmstripHeight)
-            .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
-            .padding(.top, profile.rowSpacing)
-            .padding(.bottom, profile.bottomPadding)
+            VStack(spacing: 0) {
+                MobileViewerFilmstrip(
+                    items: items,
+                    selectedUID: currentBaseItem?.uid,
+                    feed: libraryModel.thumbnailFeed,
+                    itemSide: profile.filmstripItemSide,
+                    allowsVisibleDuplicateThumbnails: duplicateGroup != nil,
+                    onSelect: selectPage
+                )
+                .frame(height: profile.filmstripHeight)
+                .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
+                .padding(.top, profile.rowSpacing)
+                .padding(.bottom, profile.bottomPadding)
+                // The details fill the rest of the lower part and scroll when many albums or a large text size need
+                // more room, so nothing reaches the fold.
+                if profile.showsDetails, let item = currentBaseItem {
+                    ScrollView {
+                        MobileViewerDetailsSummary(
+                            profile: profile,
+                            item: item,
+                            placeName: ViewerInfoLocation(
+                                metadata: metadataLoadState.metadata,
+                                placeName: titleMetadataState.resolution?.placeName,
+                                mapAndPlacesEnabled: mapAndPlacesEnabled
+                            ).placeName,
+                            albumTitles: albumTitles
+                        )
+                        .padding(.horizontal, profile.detailsHorizontalPadding)
+                        .padding(.vertical, profile.detailsVerticalPadding)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .environment(\.colorScheme, .dark)
+                }
+            }
             .frame(maxWidth: .infinity)
             .transition(.opacity)
         }
@@ -349,7 +380,7 @@ struct MobilePhotoViewer: View {
 
     private var isCompactLandscape: Bool { verticalSizeClass == .compact }
     private var chromeLayoutProfile: ViewerChromeLayoutProfile {
-        MobileViewerBottomLayout.profile(compactLandscape: isCompactLandscape)
+        MobileViewerBottomLayout.profile(compactLandscape: isCompactLandscape, sideBySide: arrangementSideBySide)
     }
 
     /// Native bar content. Close leads the navigation bar and the more-actions menu trails it; the per-photo
@@ -459,9 +490,11 @@ struct MobilePhotoViewer: View {
             Text(verbatim: title.line1)
                 .font(.headline)
                 .opacity(title.reservesLocationLine ? 0 : 1)
-            Text(verbatim: title.line2)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            if !title.line2.isEmpty {
+                Text(verbatim: title.line2)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
         }
         .lineLimit(1)
         .multilineTextAlignment(.center)
@@ -481,7 +514,8 @@ struct MobilePhotoViewer: View {
                 && titleMetadataState.shouldReservePlaceNameLine(
                     hasKnownLocation: libraryModel.locationIndex.hasKnownLocation(current.uid)
                 ),
-            filename: metadataLoadState.metadata?.filename
+            filename: metadataLoadState.metadata?.filename,
+            detailsShowDateAndPlace: chromeLayoutProfile.showsDetails
         )
     }
 
@@ -1719,7 +1753,8 @@ private struct MobileVideoPlaybackControls: View {
     private var displayedTime: Double { scrubTime ?? currentTime }
     private var seekRange: ClosedRange<Double> { 0...max(duration, 0.1) }
     private var layoutProfile: ViewerChromeLayoutProfile {
-        MobileViewerBottomLayout.profile(compactLandscape: verticalSizeClass == .compact)
+        // The transport sits on the media and follows the size class only, in every arrangement.
+        MobileViewerBottomLayout.profile(compactLandscape: verticalSizeClass == .compact, sideBySide: false)
     }
 
     var body: some View {

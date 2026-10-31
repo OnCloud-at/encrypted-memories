@@ -17,8 +17,8 @@ enum MobileViewerMotionPolicy {
 enum MobileViewerBottomLayout {
     static let horizontalPadding: CGFloat = 12
 
-    static func profile(compactLandscape: Bool) -> ViewerChromeLayoutProfile {
-        compactLandscape ? .compactLandscape : .regular
+    static func profile(compactLandscape: Bool, sideBySide: Bool) -> ViewerChromeLayoutProfile {
+        ViewerChromeLayoutProfile.resolve(sideBySide: sideBySide, compactLandscape: compactLandscape)
     }
 }
 
