@@ -14,6 +14,14 @@ import simd
 /// It is data-in / data-out. It never retains AppKit/UIKit objects, imports no platform view framework, and
 /// mutates only the injected texture cache (which is itself platform-neutral).
 package enum MetalGridFrameComposer {
+    @MainActor
+    package static func hasProgressingVisibleUploads<ID: Hashable & Sendable>(
+        cache: MetalGridTextureCache<ID>, ramReadyMissing: Int
+    ) -> Bool {
+        ramReadyMissing > 0 && cache.uploadsThisFrame > 0 && cache.deferredUploadsThisFrame > 0
+            && !cache.residencySaturatedThisFrame
+    }
+
     // MARK: - Visible / overscan classification
 
     /// Split render slots into the viewport-visible and overscan-only UID lists (visible first, source order).
@@ -37,8 +45,55 @@ package enum MetalGridFrameComposer {
         return (visible, overscan)
     }
 
-    /// Keep only the slots that actually intersect the viewport - the draw set (overscan feeds streaming/pinning
-    /// only, never a draw). Missing thumbnails draw nothing, so the bottom-most clear surface stays continuous.
+    /// The id drawn by a transition draw when it is visible: opaque enough, inside the viewport, and in range.
+    private static func visibleID<ID>(
+        of draw: GridTransitionDraw, flatUIDs: [ID], viewport: CGRect, inset: CGFloat
+    ) -> ID? {
+        guard draw.alpha > 0, draw.rect.offsetBy(dx: inset, dy: 0).intersects(viewport),
+            flatUIDs.indices.contains(draw.index)
+        else { return nil }
+        return flatUIDs[draw.index]
+    }
+
+    package static func visibleIDs<ID>(
+        draws: [GridTransitionDraw], flatUIDs: [ID], viewportSize: CGSize, inset: CGFloat = 0
+    ) -> [ID] {
+        let viewport = CGRect(origin: .zero, size: viewportSize)
+        return draws.compactMap { visibleID(of: $0, flatUIDs: flatUIDs, viewport: viewport, inset: inset) }
+    }
+
+    /// Counts the visible transition tiles that are still loading, without building a list.
+    package static func visibleLoadingCount<ID>(
+        draws: [GridTransitionDraw], flatUIDs: [ID], viewportSize: CGSize, inset: CGFloat = 0,
+        isLoading: (ID) -> Bool
+    ) -> Int {
+        let viewport = CGRect(origin: .zero, size: viewportSize)
+        var count = 0
+        for draw in draws {
+            if let id = visibleID(of: draw, flatUIDs: flatUIDs, viewport: viewport, inset: inset), isLoading(id) {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// Counts the loading tiles of the visible dissolve layers (a layer with zero opacity does not count).
+    package static func visibleLoadingCount<ID>(
+        source: [GridRenderSlot], target: [GridRenderSlot], targetOpacity: Double,
+        flatUIDs: [ID], viewportSize: CGSize, isLoading: (ID) -> Bool
+    ) -> Int {
+        let viewport = CGRect(origin: .zero, size: viewportSize)
+        func count(_ slots: [GridRenderSlot]) -> Int {
+            var count = 0
+            for slot in slots where flatUIDs.indices.contains(slot.index) && slot.rect.intersects(viewport) {
+                if isLoading(flatUIDs[slot.index]) { count += 1 }
+            }
+            return count
+        }
+        return (targetOpacity < 1 ? count(source) : 0) + (targetOpacity > 0 ? count(target) : 0)
+    }
+
+    /// Keep only the slots that actually intersect the viewport. Overscan feeds streaming, not drawing.
     package static func viewportDrawSlots(_ slots: [GridRenderSlot], viewportSize: CGSize) -> [GridRenderSlot] {
         let viewport = CGRect(origin: .zero, size: viewportSize)
         return slots.filter { $0.rect.intersects(viewport) }
@@ -142,9 +197,7 @@ package enum MetalGridFrameComposer {
     /// settled appearance: rounded thumbnail cover-fit on the uniform bg + optional production decorations).
     /// Pure builder - no eviction, no draw. Returns (groups, resident-texture count).
     ///
-    /// The image group is always the first (back-most) group even when empty (the renderer skips empty groups),
-    /// then, if `decorations` are supplied, the selection outline + badge groups in a fixed order. Missing
-    /// thumbnails draw nothing, so gaps + aspectFit letterbox reveal the same uniform surface.
+    /// Missing known tiles draw behind real images and their decorations.
     @MainActor
     package static func buildGroups<ID: Hashable & Sendable>(
         slots: [GridRenderSlot],
@@ -154,7 +207,9 @@ package enum MetalGridFrameComposer {
         cornerRadius: CGFloat,
         decorations: MetalGridDecorations<ID>?,
         contentTransition: TileContentDisplayTransition? = nil,
-        now: Double = .greatestFiniteMagnitude
+        now: Double = .greatestFiniteMagnitude,
+        placeholderPulse: MetalGridPlaceholderPulse = MetalGridPlaceholderPulse(),
+        canRetryPlaceholder: (ID) -> Bool = { _ in true }
     ) -> (groups: [MetalGridRenderGroup], realCount: Int) {
         buildGroups(
             compositionSlots: slots.map { CompositionSlot(index: $0.index, rect: $0.rect, alpha: 1) },
@@ -164,7 +219,9 @@ package enum MetalGridFrameComposer {
             cornerRadius: cornerRadius,
             decorations: decorations,
             contentTransition: contentTransition,
-            now: now
+            now: now,
+            placeholderPulse: placeholderPulse,
+            canRetryPlaceholder: canRetryPlaceholder
         )
     }
 
@@ -180,7 +237,9 @@ package enum MetalGridFrameComposer {
         cornerRadius: CGFloat,
         decorations: MetalGridDecorations<ID>?,
         rectTransform: (CGRect) -> CGRect = { $0 },
-        now: Double = .greatestFiniteMagnitude
+        now: Double = .greatestFiniteMagnitude,
+        placeholderPulse: MetalGridPlaceholderPulse = MetalGridPlaceholderPulse(),
+        canRetryPlaceholder: (ID) -> Bool = { _ in true }
     ) -> (groups: [MetalGridRenderGroup], realCount: Int) {
         buildGroups(
             compositionSlots: draws.map {
@@ -196,7 +255,9 @@ package enum MetalGridFrameComposer {
             cornerRadius: cornerRadius,
             decorations: decorations,
             contentTransition: nil,
-            now: now
+            now: now,
+            placeholderPulse: placeholderPulse,
+            canRetryPlaceholder: canRetryPlaceholder
         )
     }
 
@@ -209,10 +270,13 @@ package enum MetalGridFrameComposer {
         cornerRadius: CGFloat,
         decorations: MetalGridDecorations<ID>?,
         contentTransition: TileContentDisplayTransition?,
-        now: Double
+        now: Double,
+        placeholderPulse: MetalGridPlaceholderPulse,
+        canRetryPlaceholder: (ID) -> Bool
     ) -> (groups: [MetalGridRenderGroup], realCount: Int) {
         var images: [MetalGridQuad] = []
         var imageTextures: [MTLTexture] = []
+        var placeholders: [MetalGridQuad] = []
         var outlineQuads: [MetalGridQuad] = []
         var favoriteQuads: [MetalGridQuad] = []
         var checkFilledQuads: [MetalGridQuad] = []
@@ -221,6 +285,7 @@ package enum MetalGridFrameComposer {
         var metadataGlyphQuads: [MetalGridQuad] = []
         var metadataGlyphTextures: [MTLTexture] = []
         var realCount = 0
+        let sharedLight = placeholderPulse.lightPosition(now: now)
         for s in compositionSlots where s.index >= 0 && s.index < flatUIDs.count {
             let uid = flatUIDs[s.index]
             let cell = s.rect  // viewport-space, ALWAYS square (engine guarantee)
@@ -260,6 +325,16 @@ package enum MetalGridFrameComposer {
             } else {
                 drawAlpha = s.alpha
             }
+            if !hasThumbnail || drawAlpha < s.alpha {
+                let placeholderAlpha = hasThumbnail ? max(0, s.alpha - drawAlpha) : s.alpha
+                let animate = placeholderPulse.isAnimating && canRetryPlaceholder(uid)
+                placeholders.append(
+                    MetalGridQuad(
+                        rect: cell, radius: r, alpha: placeholderAlpha,
+                        color: SIMD4(1, 1, 1, MetalGridPlaceholderPulse.beamOpacity), mode: .thumbnailPlaceholder,
+                        borderWidth: animate ? sharedLight : MetalGridPlaceholderPulse.staticLight
+                    ))
+            }
             if let decorations {
                 appendDecorations(
                     uid: uid,
@@ -279,9 +354,11 @@ package enum MetalGridFrameComposer {
                 )
             }
         }
-        var groups: [MetalGridRenderGroup] = [
-            MetalGridRenderGroup(source: .perQuadTexture(imageTextures), quads: images)
-        ]
+        var groups: [MetalGridRenderGroup] = []
+        if !placeholders.isEmpty {
+            groups.append(MetalGridRenderGroup(source: .sharedTexture(cache.placeholderTexture), quads: placeholders))
+        }
+        groups.append(MetalGridRenderGroup(source: .perQuadTexture(imageTextures), quads: images))
         if !outlineQuads.isEmpty {
             groups.append(MetalGridRenderGroup(source: .sharedTexture(cache.placeholderTexture), quads: outlineQuads))
         }
