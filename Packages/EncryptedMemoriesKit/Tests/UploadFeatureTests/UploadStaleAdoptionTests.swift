@@ -92,19 +92,112 @@ final class UploadStaleAdoptionTests: XCTestCase {
         XCTAssertEqual(second.decision, .skip(.knownFromManifest, remoteLinkID: copy.nodeID))
     }
 
-    /// A failed state read adopts nothing: the photo goes through the normal check, which fails closed on its own.
+    /// A failed state read of the record adopts nothing and fails nothing: the normal check decides with its own read.
     func testAFailedStateReadOfAnotherPhotosRecordAdoptsNothing() async throws {
         let server = EditScenarioServer()
         let store = FakeIdentityStore()
         let checks = pipeline(server, store: store)
         let copy = server.seedLink(digest: bytes)
         _ = try await checks.resolve(descriptor("first.heic"))
-        server.setVisibilityError(URLError(.timedOut), whenAskingFor: copy.nodeID)
+        server.failNextVisibilityReads(1)
 
-        let second = try? await checks.resolve(descriptor("second.heic"))
+        let second = try await checks.resolve(descriptor("second.heic"))
 
-        XCTAssertNotEqual(second?.decision, .skip(.knownFromManifest, remoteLinkID: copy.nodeID))
-        XCTAssertNil(store.record(for: descriptor("second.heic").source)?.remoteLinkID)
+        XCTAssertEqual(
+            second.decision, .skip(.activeDuplicate, remoteLinkID: copy.nodeID),
+            "the normal check read the copy itself")
+    }
+
+    /// Another device trashes the copy after the record's state was read, for example while this photo waits for
+    /// another upload of its name. The name row is read again before it counts.
+    func testACopyTrashedAfterTheRecordWasReadIsReadAgainForTheNameRow() async throws {
+        let server = EditScenarioServer()
+        let clock = StepClock()
+        let checks = pipeline(server, clock: clock)
+        let (copy, photo) = namedCopy(on: server)
+        // A trashed copy with the same name and bytes keeps the record of the other photo from deciding alone.
+        let earlier = server.seedLink(digest: bytes)
+        server.rename(earlier, to: copy.nodeID)
+        server.personTrash(earlier)
+        _ = try await checks.resolve(descriptor("first.heic"))
+        await checks.prime([photo])
+        clock.advance(by: UploadDedupePipeline.primedStateLifetime + 1)
+        server.afterNextVisibilityRead { server.personTrash(copy) }
+
+        let result = try await checks.resolve(photo)
+
+        XCTAssertNotEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: copy.nodeID))
+        XCTAssertNotEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: copy.nodeID))
+    }
+
+    /// A finished refresh is never reused: a state that has grown old again is read again.
+    func testAStateThatGrewOldAgainIsReadAgain() async throws {
+        let server = EditScenarioServer()
+        let clock = StepClock()
+        let checks = pipeline(server, clock: clock)
+        let (copy, photo) = namedCopy(on: server)
+        await checks.prime([photo])
+        clock.advance(by: UploadDedupePipeline.primedStateLifetime + 1)
+        let first = try await checks.resolve(photo)
+        XCTAssertEqual(first.decision, .skip(.activeDuplicate, remoteLinkID: copy.nodeID))
+        clock.advance(by: UploadDedupePipeline.primedStateLifetime + 1)
+        server.personTrash(copy)
+        let url = URL(fileURLWithPath: "/fixture/other/\(copy.nodeID)")
+        let sameName = UploadResourceDescriptor(
+            source: .file(url), fileURL: url, filename: copy.nodeID, fileSize: 20,
+            modificationDate: Date(timeIntervalSince1970: 1_720_000_000), precomputedSHA1Digest: bytes)
+
+        let second = try await checks.resolve(sameName)
+
+        XCTAssertEqual(second.decision, .skip(.trashedDuplicate, remoteLinkID: copy.nodeID), "the person's deletion")
+    }
+
+    /// Two checks need the same old state at the same time: they share one read.
+    func testChecksThatNeedTheSameOldStateShareOneRead() async throws {
+        let server = EditScenarioServer()
+        let clock = StepClock()
+        let checks = pipeline(server, clock: clock)
+        let digests = [Data(repeating: 2, count: 20), Data(repeating: 3, count: 20)]
+        let copies = server.seedLinks(digests: digests)
+        let photos = zip(copies, digests).map { descriptor($0.nodeID, bytes: $1) }
+        await checks.prime(photos)
+        let primed = server.readCounts.visibility
+        clock.advance(by: UploadDedupePipeline.primedStateLifetime + 1)
+        server.holdVisibilityReads()
+        let joinedBefore = PhotoDiagnostics.shared.counter("upload.stateRefreshJoined")
+
+        let first = Task { try await checks.resolve(photos[0]) }
+        await waitUntil("the first check reads both old states") { server.heldVisibilityReads == 1 }
+        let second = Task { try await checks.resolve(photos[1]) }
+        await waitUntil("the second check waits for that read") {
+            PhotoDiagnostics.shared.counter("upload.stateRefreshJoined") > joinedBefore
+        }
+        server.releaseVisibilityReads()
+
+        let results = [try await first.value, try await second.value]
+        XCTAssertEqual(results.map(\.decision), copies.map { .skip(.activeDuplicate, remoteLinkID: $0.nodeID) })
+        XCTAssertEqual(server.readCounts.visibility - primed, 1, "one read for both checks")
+    }
+
+    private func waitUntil(_ message: String, _ condition: () -> Bool) async {
+        for _ in 0..<2_000 where !condition() { try? await Task.sleep(for: .milliseconds(1)) }
+        XCTAssertTrue(condition(), message)
+    }
+
+    /// A copy in a state that is neither active nor in the trash is unknown: the photo neither uploads nor counts as
+    /// deleted by the person.
+    func testANameRowOfACopyInAnotherInactiveStateIsUnknown() async throws {
+        let server = EditScenarioServer()
+        let clock = StepClock()
+        let checks = pipeline(server, clock: clock)
+        let (copy, photo) = namedCopy(on: server)
+        await checks.prime([photo])
+        clock.advance(by: UploadDedupePipeline.primedStateLifetime + 1)
+        server.setVisibility(RemoteLinkVisibility(isActive: false, mainPhotoLinkID: nil), for: copy.nodeID)
+
+        let result = try await checks.resolve(photo)
+
+        XCTAssertEqual(result.decision, .skip(.inconsistentRemoteState, remoteLinkID: copy.nodeID))
     }
 
     // MARK: - A name row from prime

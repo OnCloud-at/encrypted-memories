@@ -368,6 +368,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             releasePendingContentClaim(contentKey, owner: descriptor)
             throw error
         }
+        // The name claim can wait for another upload of this name; the states read before it are read again.
+        relatedReads = RelatedProofReads()
 
         let remoteItems: [RemotePhotoDuplicate]
         do {
@@ -1129,6 +1131,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         let read: [String: RemoteLinkVisibility]
         if let running = stateRefreshes[linkID] {
+            PhotoDiagnostics.shared.increment("upload.stateRefreshJoined")
             read = try await running.value
         } else {
             var batch = [linkID]
@@ -1182,9 +1185,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     }
 
     /// The decision of the name rows. A name row can outlive its copy like an index row: an active duplicate counts
-    /// only when a current state proves its copy, see `readPrimedState`. Otherwise the row takes the state that the
-    /// read shows, a trashed copy stays a deletion by the person, a copy that the answer leaves out or that is no main
-    /// photo leaves the rows, and the rows decide again.
+    /// only when a current state proves its copy, see `readPrimedState`. Otherwise a copy in the trash stays a
+    /// deletion by the person, a copy in another inactive state becomes unknown, a copy that the answer leaves out or
+    /// that is no main photo leaves the rows, and the rows decide again.
     private func verifiedNameDecision(
         _ items: [RemotePhotoDuplicate], primary: UploadDuplicateDecisionPolicy.Resource, isRoot: Bool,
         requiresStatedRole: Bool, reads: inout RelatedProofReads
@@ -1201,10 +1204,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let state = reads.visibility[linkID]
             items = items.compactMap { item in
                 guard item.linkID == linkID else { return item }
+                // A copy in the trash stays the person's deletion. Another state that is not active is unknown: the
+                // policy then neither uploads nor counts a deletion.
                 guard let state, !state.isActive else { return nil }
                 return RemotePhotoDuplicate(
-                    nameHash: item.nameHash, contentHash: item.contentHash, linkState: .trashed, linkID: item.linkID,
-                    clientUID: item.clientUID)
+                    nameHash: item.nameHash, contentHash: item.contentHash,
+                    linkState: state.trashTime == nil ? nil : .trashed, linkID: item.linkID, clientUID: item.clientUID)
             }
         }
     }
@@ -1612,9 +1617,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             guard generation == cacheGeneration else { return }
             rootVisibilityAsked.formUnion(chunk)
-            rootVisibility.merge(read) { _, new in new }
             if let answeredAt {
-                for linkID in chunk { rootVisibilityReadAt[linkID] = answeredAt }
+                // A complete answer replaces every link of the chunk, also one that the answer leaves out.
+                for linkID in chunk {
+                    rootVisibility[linkID] = read[linkID]
+                    rootVisibilityReadAt[linkID] = answeredAt
+                }
             }
         }
     }
