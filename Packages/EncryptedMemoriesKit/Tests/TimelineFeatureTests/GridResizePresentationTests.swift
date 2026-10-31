@@ -10,7 +10,7 @@ import TimelineCore
 @testable import TimelineFeature
 
 @MainActor
-private final class PresentationTestDataSource: MetalGridDataSource {
+final class PresentationTestDataSource: MetalGridDataSource {
     let label = "presentation-test"
     let sectionCounts: [Int]
     let flatUIDs: [PhotoUID]
