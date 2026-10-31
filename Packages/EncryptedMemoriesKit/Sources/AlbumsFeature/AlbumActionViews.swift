@@ -6,10 +6,14 @@ import SwiftUI
 #if os(iOS)
     /// Presentation facts are captured before opening a sheet or popover.
     public enum AlbumPresentationTraits {
+        /// Whether an album presentation gets the bounded size. Only a compact width with a regular height, an
+        /// iPhone in portrait or a narrow iPad window, shows a sheet across the whole width. Anywhere else the fitted presentation, a popover
+        /// or a sheet in landscape, has no useful width of its own: without the bound it shrinks to its narrowest
+        /// content.
         public static func usesRegularSizing(
             horizontal: UserInterfaceSizeClass?, vertical: UserInterfaceSizeClass?
         ) -> Bool {
-            horizontal == .regular && vertical == .regular
+            horizontal == .regular || vertical == .compact
         }
     }
 #endif
@@ -173,8 +177,8 @@ public struct AlbumDestinationPicker: View {
         }
         .albumActionFailureAlert(coordinator)
         #if os(iOS)
-            // The destination list has no useful fitted popover width on a compact iPhone. Let the native
-            // presentation become a sheet there; regular-width iPad keeps the source-anchored popover.
+            // A compact width turns the popover into the native sheet; a regular width, an iPad or a large iPhone in
+            // landscape, keeps the source-anchored popover. Both get the bounded size except a full-width sheet.
             .presentationCompactAdaptation(.sheet)
         #endif
     }
@@ -250,7 +254,8 @@ public struct AlbumDestinationPicker: View {
 }
 
 #if os(iOS)
-    /// Give fitted regular presentations a bounded ideal size while compact sheets keep their native detents.
+    /// Give fitted presentations a bounded ideal size. Only a full-width sheet, a compact width with a regular
+    /// height, keeps its native detents.
     private struct AlbumRegularPresentationSize: ViewModifier {
         let width: CGFloat
         let height: CGFloat
