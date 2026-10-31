@@ -2385,6 +2385,7 @@ public actor BackupSyncRunner {
         // Not a failure of this photo: this build cannot read its pending row. It waits without an attempt and
         // without a problem; its rows stay (#982).
         if error is PendingSourceUnreadableError {
+            rememberDeferredSource(entry)
             deferSource(entry, from: oldState, until: now().addingTimeInterval(longestRegularRetryWait))
             return
         }

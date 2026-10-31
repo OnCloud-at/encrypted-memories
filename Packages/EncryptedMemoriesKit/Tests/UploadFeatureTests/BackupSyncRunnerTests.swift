@@ -4024,6 +4024,42 @@ final class BackupSyncRunnerTests: XCTestCase {
             parkedBefore.remoteCommitReconciliation, "the parked receipt stays")
     }
 
+    /// A drain that waits for scheduled retries ends while a photo waits for its unreadable pending row; it does not
+    /// check that photo again and again within the drain (#982).
+    func testADrainThatWaitsForRetriesEndsWhileAPhotoWaitsForItsUnreadableRow() async throws {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-drain.sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let waiting = seedEntry("waiting.jpg")
+        let key = PendingSourceKey(waiting.source)
+        XCTAssertNotNil(
+            pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
+        XCTAssertNotNil(pending.include([key], at: clock.now))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(pendingURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
+            SQLITE_OK)
+        sqlite3_close(handle)
+        let recorder = PendingBackupEventRecorder(store: pending)
+        let runner = makeRunner(events: recorder)
+
+        let finished = expectation(description: "the drain ends")
+        let drain = Task {
+            _ = await runner.runUntilDrained(mode: .waitForScheduledRetries)
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 10)
+        await runner.stop()  // Ends a drain that never ends on its own after the failed wait.
+        _ = await drain.value
+        recorder.finish()
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision))
+        XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
+        XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+    }
+
     func testPhotoDeletedDuringItsIdentityPassReleasesItsTempFiles() async throws {
         let entry = seedEntry("deleted-during-download.heic")
         let removing = SourceRemovedDuringResolveResolver(inner: resolver)

@@ -423,10 +423,14 @@ final class PendingBackupStoreTests: XCTestCase {
         var denied = false
     }
 
-    private func withOneDeniedSourceSelect(_ body: () throws -> Void) throws {
-        let connection = try XCTUnwrap(
+    private func pendingConnection() throws -> SQLiteStoreConnection {
+        try XCTUnwrap(
             Mirror(reflecting: store!).children.first(where: { $0.label == "connection" })?.value
                 as? SQLiteStoreConnection)
+    }
+
+    private func withOneDeniedSourceSelect(_ body: () throws -> Void) throws {
+        let connection = try pendingConnection()
         let denial = SelectDenial()
         connection.withLock {
             XCTAssertEqual(
@@ -906,9 +910,43 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
         XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
         XCTAssertFalse(store.isOperational(), "successful SQL cannot clear a failure that is not transient")
-        XCTAssertEqual(
-            store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier],
-            "an earlier failure does not stop a read that works")
+        XCTAssertNil(
+            store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]),
+            "a lasting failure stops the exclusion read, so no photo uploads while its exclusion is unknown")
+    }
+
+    /// A transaction that stays open can hold half a write; the exclusion read does not answer from it (#982).
+    func testAnOpenTransactionStopsTheExclusionRead() throws {
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+        let connection = try pendingConnection()
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]))
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertEqual(store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier])
+    }
+
+    /// A COMMIT that fails ends the transaction and records the failure with the code of the COMMIT (#982).
+    func testAFailedCommitWritesNothingAndStopsTheStore() throws {
+        let connection = try pendingConnection()
+        let before = try pendingTables()
+        connection.withLock { _ = sqlite3_commit_hook(connection.database, { _ in 1 }, nil) }
+
+        XCTAssertNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+
+        connection.withLock {
+            _ = sqlite3_commit_hook(connection.database, nil, nil)
+            XCTAssertNotEqual(sqlite3_get_autocommit(connection.database), 0, "no transaction stays open")
+            XCTAssertTrue(connection.operationFailed)
+            XCTAssertFalse(connection.failuresAreTransient, "a refused commit is not a passing failure")
+        }
+        XCTAssertFalse(store.isOperational())
+        XCTAssertEqual(try pendingTables(), before, "nothing was written")
     }
 
     /// A favorite intent that a newer build wrote with a kind that this build does not know (#982).
@@ -966,6 +1004,25 @@ final class PendingBackupStoreTests: XCTestCase {
                 XCTAssertEqual(sqlite3_exec($0, "DELETE FROM source_state;", nil, nil, nil), SQLITE_OK)
             }
         }
+    }
+
+    /// An excluded row of another kind does not exclude the photo; an unreadable row of the same identifier wins over
+    /// an excluded row, so the photo waits instead of being removed (#982).
+    func testExclusionsCountOnlyTheRequestedKindAndAnUnreadableRowWins() throws {
+        let fileKey = PendingSourceKey(kind: .fileURL, identifier: key.identifier)
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: fileKey, presentation: presentation(), remote: nil)], at: date))
+        XCTAssertEqual(store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [:])
+
+        // The unreadable kind sorts before the excluded row, by row and by key, so the read meets it first.
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE source_state SET source_kind='a-newer-kind';", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+        XCTAssertEqual(
+            store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]), [key.identifier: .unreadable])
     }
 
     func testUnlistingFromTheTrashLeavesARowThatCannotBeDecodedUnchanged() throws {
@@ -1033,6 +1090,9 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
 
         XCTAssertFalse(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 1), at: date))
+        XCTAssertEqual(
+            store.excludedIdentifiers(kind: .photoLibraryAsset, among: [key.identifier]), [],
+            "a transient failure does not stop the exclusion read")
 
         XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
         XCTAssertTrue(store.isOperational(), "the database answers again")

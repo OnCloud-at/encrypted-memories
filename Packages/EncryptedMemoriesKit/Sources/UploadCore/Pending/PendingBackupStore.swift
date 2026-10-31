@@ -358,7 +358,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Identifiers among `identifiers` whose desired state is excluded, or nil when the store cannot answer. The backup
     /// engine drops these before it writes queue rows. An identifier with a row that this build cannot read counts as
     /// excluded: a newer build may have excluded it. That photo waits and its row stays; the other photos go on (#982).
-    /// An earlier failed call does not stop this read; a failure of this read answers nil.
+    /// An earlier transient failure does not stop this read. A lasting failure, an open transaction or a failure of
+    /// this read answers nil, so no photo uploads while its exclusion is unknown.
     public func excludedIdentifiers(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> Set<String>? {
         exclusions(kind: kind, among: identifiers).map { Set($0.keys) }
     }
@@ -370,7 +371,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     ) -> [String: BackupSourceExclusion]? {
         guard !identifiers.isEmpty else { return [:] }
         return connection.withLock {
-            guard db != nil else { return nil }
+            guard db != nil, sqlite3_get_autocommit(db) != 0,
+                !connection.operationFailed || connection.failuresAreTransient
+            else { return nil }
             var result: [String: BackupSourceExclusion] = [:]
             // The key is (source_kind, source_id), and a row whose kind does not decode has no usable key: one read
             // for each chunk finds every row of the identifiers, whatever its kind.
