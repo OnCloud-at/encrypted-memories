@@ -411,6 +411,8 @@ final class MobileLibraryModel {
     /// Resume and abandon work of "Keep Only Favorites". Teardown cancels it, so no journal write survives
     /// the account. The orchestrator's own admission gate joins a write that is already in flight.
     private var seriesDissolutionTask: Task<Void, Never>?
+    /// "Keep Only Favorites" runs that are in progress. Each one changes the library token many times.
+    private var runningSeriesDissolutions = 0
     /// Generation token used to reject off-main snapshot results from superseded loads or teardown.
     private var loadToken = 0
     private let libraryChangeMonitor = LibraryChangeMonitor()
@@ -572,6 +574,8 @@ final class MobileLibraryModel {
         onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void
     ) async throws {
         guard let dissolution = facade?.seriesDissolution else { throw SeriesDissolutionError.notOwnLibrary }
+        runningSeriesDissolutions += 1
+        defer { runningSeriesDissolutions -= 1 }
         try await removeFromVisibleLibrary(Set(seriesUIDs)) {
             try await dissolution.keepOnlyFavorites(
                 seriesMainUID: seriesMainUID,
@@ -1063,6 +1067,12 @@ final class MobileLibraryModel {
     /// refreshed here: each activation already starts one fresh source refresh through `setApplicationActive`.
     func refreshAccountInfo() async {
         try? await facade?.refreshAccountInfo()
+    }
+
+    /// True while this device runs a write that changes the library token many times: a Merge All or a series
+    /// dissolution. The change monitor then waits and refreshes once after the write.
+    private var isRunningOwnBulkLibraryWrite: Bool {
+        duplicates?.isMerging == true || runningSeriesDissolutions > 0
     }
 
     /// Coalesces source discovery with any active refresh. Callers use this after connectivity or
@@ -1835,6 +1845,7 @@ final class MobileLibraryModel {
                 isActive: self.applicationIsActive,
                 resetBaseline: resetBaseline,
                 initialToken: initialToken,
+                holdRefresh: { [weak self] in await self?.isRunningOwnBulkLibraryWrite ?? false },
                 onTerminal: { [weak self] _ in
                     await self?.recoverAfterScopeAccessLoss(
                         expectedSession: recoverySession,

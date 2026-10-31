@@ -1500,6 +1500,11 @@ struct MainView: View {
         libraryRefresh.scheduleUploadRefresh(event, host: refreshHost)
     }
 
+    /// A Merge All changes the library token many times; the change monitor then waits and refreshes once afterwards.
+    @MainActor private func isMergingDuplicates() -> Bool {
+        duplicates?.isMerging == true
+    }
+
     private func startLibraryChangeMonitor() async {
         // Coalesce with the timeline view's startup task, then seed monitoring with the token observed by the
         // shared cache validator. Starting earlier would consume a mutation during launch as a fresh baseline.
@@ -1514,6 +1519,7 @@ struct MainView: View {
         await libraryChangeMonitor.start(
             provider: provider,
             initialToken: timelineModel.initialLibraryChangeToken,
+            holdRefresh: { await isMergingDuplicates() },
             onTerminal: { [model] _ in
                 await model.recoverBackendAfterScopeAccessLoss()
             },
