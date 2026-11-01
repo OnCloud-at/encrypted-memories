@@ -529,8 +529,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try await laterTrashAfterUnreadableHandoff(.decode)
     }
 
-    func testLaterTrashRetriesAfterTheLatestHandoffCannotBePrepared() async throws {
-        try await laterTrashAfterUnreadableHandoff(.prepare)
+    func testLaterTrashRetriesAfterTheLatestHandoffLookupFails() async throws {
+        try await laterTrashAfterUnreadableHandoff(.lookup)
     }
 
     func testLaterTrashRetriesAfterTheLatestHandoffStepIsInterrupted() async throws {
@@ -557,7 +557,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try await laterTrashAfterUnreadableHandoff(.decode, secondEpisode: true)
     }
 
-    private enum LaterHandoffFault { case decode, prepare, step, write, sourceRead }
+    private enum LaterHandoffFault { case decode, lookup, step, write, sourceRead }
 
     private func seedLaterTrash(acknowledgedAt createdAt: Date) throws -> PhotoUID {
         let later = PhotoUID(volumeID: "vol", nodeID: "later-upload")
@@ -599,7 +599,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
         let denial = SourceListFailure(
             table: fault == .write ? "source_state" : "handoff", untilRemoved: true,
-            action: fault == .write ? SQLITE_UPDATE : SQLITE_READ, column: fault == .write ? "remote_link_id" : nil)
+            action: fault == .write ? SQLITE_UPDATE : SQLITE_READ, column: fault == .write ? "remote_link_id" : nil,
+            transient: true)
         let interruption = KeyedReadFailure(
             matching: fault == .sourceRead
                 ? "FROM source_state WHERE source_kind=? AND source_id=?" : Self.latestHandoffRead,
@@ -609,7 +610,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         switch fault {
         case .decode:
             XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later';"))
-        case .prepare: try denial.install(on: store)
+        case .lookup: try denial.install(on: store)
         case .step: try interruption.install(on: store)
         case .write: try denial.install(on: store)
         case .sourceRead: try interruption.install(on: store)
@@ -623,7 +624,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertNil(completed.remoteOperation, "the confirmed request is no longer in flight")
         XCTAssertEqual(completed.remote, earlier)
         XCTAssertEqual(Array(effects.trashed.joined()), [earlier])
-        if fault == .prepare || fault == .write { XCTAssertTrue(denial.denied, "the requested SQL must actually fail") }
+        if fault == .lookup || fault == .write { XCTAssertTrue(denial.denied, "the requested SQL must actually fail") }
         if fault == .step { XCTAssertGreaterThan(interruption.count, 0, "the latest handoff step must actually fail") }
         if fault == .sourceRead {
             XCTAssertEqual(interruption.count, 1, "only the helper's second source read must fail")
@@ -2774,7 +2775,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         while !effects.trashed.joined().contains(where: { $0.nodeID == "link-kept" }), ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
-        let failure = SourceListFailure()
+        let failure = SourceListFailure(transient: true)
         try failure.install(on: store)
         defer { failure.remove(from: store) }
 
@@ -3076,7 +3077,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try await startRejectedWriteClock(clock)
         XCTAssertEqual(clock.waits, [.seconds(5000)])
         let failure = SourceListFailure(
-            table: "pending_action", untilRemoved: true, action: SQLITE_DELETE)
+            table: "pending_action", untilRemoved: true, action: SQLITE_DELETE, transient: true)
         try failure.install(on: store)
         defer { failure.remove(from: store) }
         let stored = await coordinator.setFavorite(
@@ -3204,7 +3205,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         if rejected == .actionRetry { effects.favoriteResult = .retry }
         let failure = SourceListFailure(
             table: rejected.isAction ? "pending_action" : "source_state", untilRemoved: true,
-            action: rejected.deniedAction, column: rejected.deniedColumn)
+            action: rejected.deniedAction, column: rejected.deniedColumn, transient: true)
         try failure.install(on: store)
         return (failure, ResultWriteClock(date), remote)
     }
@@ -3317,10 +3318,11 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             try Task.checkCancellation()
         }
 
-        func advance(by duration: Duration) {
+        func advance(by duration: Duration, wakingTimers: Bool = true) {
             let due = lock.withLock { () -> [OpenGate] in
                 let parts = duration.components
                 value = value.addingTimeInterval(Double(parts.seconds) + Double(parts.attoseconds) / 1e18)
+                guard wakingTimers else { return [] }
                 let due = sleeping.filter { $0.0 <= value }.map(\.1)
                 sleeping.removeAll { $0.0 <= value }
                 return due
@@ -3873,7 +3875,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         includedLater("k")
         let remote = favoriteFixture("k")
         XCTAssertTrue(store.setFavoriteIntent(key("k"), favorite: true, at: date))
-        let failure = SourceListFailure(table: "pending_action", untilRemoved: true)
+        let failure = SourceListFailure(table: "pending_action", untilRemoved: true, transient: true)
         try failure.install(on: store)
         defer { failure.remove(from: store) }
         let delays = DelayLog()
@@ -4456,14 +4458,14 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(failure.count, 0, "the pass reads the due actions once")
     }
 
-    /// The read of the latest handoff cannot even be prepared. The favorite is retried by the backoff.
-    func testAHandoffReadThatCannotBePreparedIsRetried() async throws {
+    /// A transient failure of the latest handoff read retries the favorite through the backoff.
+    func testATransientHandoffReadFailureIsRetried() async throws {
         includedLater("k")
         let remote = favoriteFixture("k")
         let delays = DelayLog()
         let retry = OpenGate()
         await restartWithBackoffLog(delays, firstRetry: retry)
-        let failure = SourceListFailure(table: "handoff", untilRemoved: true)
+        let failure = SourceListFailure(table: "handoff", untilRemoved: true, transient: true)
         try failure.install(on: store)
         defer { failure.remove(from: store) }
 
@@ -4774,8 +4776,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
     }
 
-    /// Denies the next read of `table` on the store's own connection, or every read until `remove` when `untilRemoved`.
-    /// The default is the next full read of the source states.
+    /// Fails the selected SQL operation, once or until removal. Transient recovery tests use SQLITE_INTERRUPT;
+    /// the default SQLITE_AUTH is a lasting failure and never claims that removing the fault recovers the connection.
     private final class SourceListFailure: @unchecked Sendable {
         private let lock = NSLock()
         private var done = false
@@ -4783,21 +4785,38 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         private let untilRemoved: Bool
         private let action: Int32
         private let column: String?
+        private let transient: Bool
+        private var interruptNextOperation = false
         var denied: Bool { lock.withLock { done } }
 
         init(
             table: String = "source_state", untilRemoved: Bool = false,
-            action: Int32 = SQLITE_READ, column: String? = nil
+            action: Int32 = SQLITE_READ, column: String? = nil, transient: Bool = false
         ) {
             self.table = table
             self.untilRemoved = untilRemoved
             self.action = action
             self.column = column
+            self.transient = transient
         }
 
         func install(on store: PendingBackupManifestStore) throws {
             let connection = try KeyedReadFailure.connection(of: store)
             connection.withLock {
+                if transient {
+                    sqlite3_progress_handler(
+                        connection.database, 1,
+                        { context in
+                            guard let context else { return 0 }
+                            let failure = Unmanaged<SourceListFailure>.fromOpaque(context).takeUnretainedValue()
+                            return failure.lock.withLock {
+                                guard failure.interruptNextOperation else { return 0 }
+                                failure.interruptNextOperation = false
+                                failure.done = true
+                                return 1
+                            }
+                        }, Unmanaged.passUnretained(self).toOpaque())
+                }
                 _ = sqlite3_set_authorizer(
                     connection.database,
                     { context, action, table, column, _, _ in
@@ -4808,6 +4827,10 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                         else { return SQLITE_OK }
                         return failure.lock.withLock {
                             guard !failure.done || failure.untilRemoved else { return SQLITE_OK }
+                            if failure.transient {
+                                failure.interruptNextOperation = true
+                                return SQLITE_OK
+                            }
                             failure.done = true
                             return SQLITE_DENY
                         }
@@ -4817,7 +4840,14 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         func remove(from store: PendingBackupManifestStore) {
             guard let connection = try? KeyedReadFailure.connection(of: store) else { return }
-            connection.withLock { _ = sqlite3_set_authorizer(connection.database, nil, nil) }
+            connection.withLock {
+                _ = sqlite3_set_authorizer(connection.database, nil, nil)
+                if transient {
+                    sqlite3_progress_handler(connection.database, 0, nil, nil)
+                    XCTAssertTrue(
+                        connection.failuresAreTransient, "the recovery fixture must not inject lasting errors")
+                }
+            }
         }
     }
 
@@ -5716,5 +5746,108 @@ extension PendingBackupCoordinatorTests {
             XCTAssertTrue(try XCTUnwrap(store.sourceState(for: key(id))).needsQueueSync)
             XCTAssertEqual(store.sourceState(for: key(id))?.remote, remote)
         }
+    }
+}
+
+extension PendingBackupCoordinatorTests {
+    func testPendingReconcileRefusesAnOpenTransaction() async throws {
+        try await pendingReconcileRefuses(.openTransaction)
+    }
+
+    func testPendingReconcileRefusesALastingFailure() async throws {
+        try await pendingReconcileRefuses(.lastingFailure)
+    }
+
+    func testPendingReconcileRefusesAFailedRollback() async throws {
+        try await pendingReconcileRefuses(.failedRollback)
+    }
+
+    private func pendingReconcileRefuses(_ fault: PendingStoreTransactionFault) async throws {
+        await coordinator.close()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: clock.sleep)
+        let id = "unavailable-deletion"
+        let sourceKey = key(id)
+        enqueue(id, state: .uploading)
+        XCTAssertTrue(store.recordUploadEvidence(sourceKey, revision: revision, at: date))
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: sourceKey, presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(store.deferEffects(for: sourceKey, at: date))
+        let backingQueue = try XCTUnwrap(queue)
+        let futureID = id + "-future"
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: key(futureID), presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(
+            Self.setColumns("next_attempt_at=\(date.timeIntervalSince1970 + 61)", of: futureID, at: storeURL))
+        effects.onRemove = {
+            _ = backingQueue.removeSources(kind: .photoLibraryAsset, identifiers: [id])
+        }
+        await coordinator.start()
+        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        XCTAssertTrue(effects.removed.isEmpty)
+        let connection = try fault.install(on: store, key: sourceKey)
+        defer { PendingStoreTransactionFault.remove(from: connection) }
+
+        clock.advance(by: .seconds(60))
+        try await waitUntil { clock.waits.filter { $0 >= .seconds(60) }.count >= 2 }
+
+        XCTAssertTrue(effects.removed.isEmpty, "an unavailable decision must not remove a photo from backup")
+        XCTAssertNotNil(
+            queue.entry(for: source(id), revision: revision), "the real queue row must survive the refused pass")
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertGreaterThanOrEqual(clock.waits.filter { $0 >= .seconds(60) }.count, 2, "refusal must arm a retry")
+        try await settle()
+        XCTAssertEqual(clock.waits, [.seconds(60), .seconds(60)], "one existing backoff, without a short retry loop")
+        if fault == .openTransaction {
+            PendingStoreTransactionFault.remove(from: connection)
+            XCTAssertTrue(store.isOperational())
+            clock.advance(by: .seconds(60))
+            try await waitUntil { backingQueue.entry(for: self.source(id), revision: self.revision) == nil }
+            XCTAssertEqual(
+                effects.removed, [[id, futureID].sorted()], "the next check settles committed deletes after recovery")
+            XCTAssertNil(queue.entry(for: source(id), revision: revision))
+        }
+        await coordinator.close()
+    }
+
+    func testPendingReconcileRefusalInvalidatesEarlierActionEligibility() async throws {
+        await coordinator.close()
+        let clock = ResultWriteClock(date)
+        defer { clock.releaseAll() }
+        coordinator = makeCoordinator(clock: clock, sleep: clock.sleep)
+        let id = "unavailable-delete"
+        let sourceKey = key(id)
+        enqueue(id, state: .uploading)
+        XCTAssertTrue(store.recordUploadEvidence(sourceKey, revision: revision, at: date))
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: sourceKey, presentation: nil, remote: nil)], at: date))
+        XCTAssertTrue(store.deferEffects(for: sourceKey, at: date))
+        let favoriteKey = key("earlier-eligibility")
+        let remote = PhotoUID(volumeID: "vol", nodeID: "favorite-photo")
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: favoriteKey, revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        XCTAssertTrue(store.setFavoriteIntent(favoriteKey, favorite: true, at: date.addingTimeInterval(120)))
+        await coordinator.start()
+        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        let connection = try PendingStoreTransactionFault.openTransaction.install(on: store, key: sourceKey)
+        defer { PendingStoreTransactionFault.remove(from: connection) }
+
+        clock.advance(by: .seconds(60))
+        func refusalWaitCount() -> Int {
+            clock.waits.filter { $0 == .seconds(60) || $0 == .seconds(1) }.count
+        }
+        try await waitUntil { refusalWaitCount() >= 2 }
+        XCTAssertGreaterThanOrEqual(refusalWaitCount(), 2, "the refused reconcile must finish before the event")
+        // The foreground event runs before the already scheduled action timer, so this await observes the whole
+        // dispatch. Waking both at once can return here while another runDueActions call still awaits its effect.
+        clock.advance(by: .seconds(60), wakingTimers: false)
+        await coordinator.noteRemotePresence([favoriteKey])
+
+        XCTAssertTrue(effects.favorites.isEmpty, "an earlier complete read grants no action while the store is unknown")
+        XCTAssertEqual(store.actions().count, 1, "the favorite stays owed until the decision is readable")
+        await coordinator.close()
     }
 }
