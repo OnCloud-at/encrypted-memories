@@ -213,9 +213,8 @@ private struct BackupSettingsTab: View {
                 Text("settings.backup_folders_section")
             }
 
-            BackupMobileDataSection(
-                onChange: { photoBackup?.mobileDataSettingDidChange() },
-                beforeMobileData: {
+            if photoBackup?.isEnabled == true {
+                Section {
                     Button {
                         showsExcludedPhotos = true
                     } label: {
@@ -230,7 +229,12 @@ private struct BackupSettingsTab: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("backup.excludedPhotos")
-                })
+                } footer: {
+                    Text(L10n.string("settings.backup_excluded_footer"))
+                }
+            }
+
+            BackupMobileDataSection(onChange: { photoBackup?.mobileDataSettingDidChange() })
 
             // Show manual-upload status only while it is actionable or contains results.
             if let uploadCoordinator {

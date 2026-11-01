@@ -79,11 +79,30 @@ final class MobilePausedBackupUITests: XCTestCase {
         let excluded = try XCTUnwrap(cells.firstIndex { $0.buttons["backup.excludedPhotos"].exists })
         let cellular = try XCTUnwrap(cells.firstIndex { $0.switches["backup.useMobileData"].exists })
         let turnOff = try XCTUnwrap(cells.firstIndex { $0.buttons["Turn off Photos backup"].exists })
-        XCTAssertEqual(excluded + 1, cellular, "the excluded list must stand directly above Cellular Data")
+        let excludedFooter = try XCTUnwrap(
+            cells.firstIndex {
+                $0.staticTexts["Photos you deleted before they were backed up."].exists
+            })
+        XCTAssertEqual(excluded + 1, excludedFooter, "the excluded group footer must follow its row")
+        XCTAssertEqual(excludedFooter + 1, cellular, "Cellular Data must follow the excluded group footer")
         XCTAssertLessThan(excluded, turnOff, "the excluded list must stand before Turn off Photos backup")
+
+        let footer = app.staticTexts["Photos you deleted before they were backed up."]
+        XCTAssertTrue(footer.waitForExistence(timeout: 5), "the excluded group needs its own footer")
+        let cellularFooter = try XCTUnwrap(
+            cells.firstIndex {
+                $0.staticTexts["Applies to backups, also on Personal Hotspot. Viewing photos is not affected."].exists
+            })
+        let display = try XCTUnwrap(
+            cells.firstIndex {
+                $0.staticTexts["Keep display on during active backup"].exists
+            })
+        XCTAssertLessThan(cellular, cellularFooter)
+        XCTAssertLessThan(cellularFooter, display)
+        XCTAssertLessThan(display, turnOff)
     }
 
-    func testExcludedPhotosRemainAvailableWhenEmptyAndWithBackupOff() {
+    func testExcludedPhotosAreAvailableWhenEmptyAndHiddenWithBackupOff() {
         let settings = app.buttons["Proton Account and Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 60))
         settings.tap()
@@ -104,10 +123,9 @@ final class MobilePausedBackupUITests: XCTestCase {
         XCTAssertTrue(disable.waitForExistence(timeout: 5))
         disable.tap()
         XCTAssertTrue(app.buttons["Enable Photos backup…"].waitForExistence(timeout: 10), "backup must be off")
-        XCTAssertTrue(entry.exists, "turning off backup must not remove the excluded list")
-        XCTAssertEqual(entry.label, "Excluded from Backup")
-        entry.tap()
-        XCTAssertTrue(app.staticTexts["No excluded photos"].waitForExistence(timeout: 10))
+        XCTAssertFalse(entry.exists, "the excluded list must be hidden while photo backup is off")
+        XCTAssertFalse(app.staticTexts["Photos you deleted before they were backed up."].exists)
+        XCTAssertFalse(app.switches["backup.useMobileData"].exists)
     }
 
     func testExcludedPhotosRemainAvailableWithDeniedPhotosAccess() {

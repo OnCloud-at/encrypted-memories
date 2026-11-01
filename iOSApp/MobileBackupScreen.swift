@@ -207,19 +207,22 @@ private struct MobilePhotoBackupSections: View {
             }
         }
 
-        BackupMobileDataSection(
-            showsMobileData: controller.isAvailable && controller.isEnabled,
-            onChange: { controller.mobileDataSettingDidChange() },
-            beforeMobileData: {
+        if controller.isEnabled {
+            Section {
                 NavigationLink {
                     MobileExcludedPhotosScreen()
                 } label: {
                     PendingExcludedPhotosEntryLabel(count: excludedCount)
                 }
                 .accessibilityIdentifier("backup.excludedPhotos")
-            })
+            } footer: {
+                Text(L10n.string("settings.backup_excluded_footer"))
+            }
+        }
 
         if controller.isAvailable && controller.isEnabled {
+            BackupMobileDataSection(onChange: { controller.mobileDataSettingDidChange() })
+
             Section {
                 Toggle(isOn: $keepDisplayAwake) {
                     VStack(alignment: .leading, spacing: 2) {

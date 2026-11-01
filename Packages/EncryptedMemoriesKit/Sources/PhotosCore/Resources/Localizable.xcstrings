@@ -953,6 +953,13 @@
         "de": { "stringUnit": { "state": "translated", "value": "Mobile Daten sind für Sicherungen aus." } }
       }
     },
+    "settings.backup_excluded_footer": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos you deleted before they were backed up." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos, die du vor der Sicherung gelöscht hast." } }
+      }
+    },
     "settings.backup_use_mobile_data": {
       "extractionState": "manual",
       "localizations": {
