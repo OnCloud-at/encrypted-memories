@@ -1,4 +1,4 @@
-/// Diagnostic labels for the two mobile account refresh callers. This scope changes no request behavior.
+/// Identifies automatic mobile account refreshes for request diagnostics and in-flight sharing.
 public enum ProtonAccountInfoRequestCause: Sendable {
     case foregroundActivation
     case visibleSettings
