@@ -19,14 +19,18 @@ package enum MetalGridFrameComposer {
     package static func gridDivisionFrame(
         areas: [ReservedRegionArea], bounds: CGRect, profile: GridLevelProfile
     ) -> CGRect? {
-        guard profile.levels.allSatisfy({ $0.nominalColumns.isMultiple(of: 2) }) else { return nil }
-        return areas.map(\.frame).filter {
-            $0.minX.isFinite && $0.width.isFinite && $0.width >= 0 && $0.height > $0.width
-                && $0.midX > bounds.minX && $0.midX < bounds.maxX
-                && $0.minY < bounds.maxY && $0.maxY > bounds.minY
-        }.min {
-            abs($0.midX - bounds.midX) < abs($1.midX - bounds.midX)
-        }.map { $0.offsetBy(dx: -bounds.minX, dy: -bounds.minY) }
+        var nearest: CGRect?
+        for area in areas {
+            let frame = area.frame
+            let local = frame.offsetBy(dx: -bounds.minX, dy: -bounds.minY)
+            guard frame.minY < bounds.maxY, frame.maxY > bounds.minY,
+                GridVerticalDivision.isUsable(local, width: bounds.width, levels: profile.levels)
+            else { continue }
+            if nearest == nil || abs(local.midX - bounds.width / 2) < abs(nearest!.midX - bounds.width / 2) {
+                nearest = local
+            }
+        }
+        return nearest
     }
 
     @MainActor

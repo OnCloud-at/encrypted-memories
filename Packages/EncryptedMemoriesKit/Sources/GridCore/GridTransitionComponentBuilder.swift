@@ -113,8 +113,10 @@ package enum GridTransitionComponentBuilder {
         guard sections.count == 1 else { return nil }
 
         let divided = source.columnGeometry.isDivided && target.columnGeometry.isDivided
+        let anchorKey = RelativeSlotKey(dr: 0, dc: Int.max)
         func relKey(_ s: GridSlot, _ a: GridSlot, columns: Int) -> RelativeSlotKey {
-            .init(dr: s.row - a.row, dc: s.column - (divided ? columns / 2 : a.column))
+            if divided, s.index == anchorIndex { return anchorKey }
+            return .init(dr: s.row - a.row, dc: s.column - (divided ? columns / 2 : a.column))
         }
         var sourceOcc: [RelativeSlotKey: Int] = [:]
         var targetOcc: [RelativeSlotKey: Int] = [:]
@@ -216,7 +218,8 @@ package enum GridTransitionComponentBuilder {
             func endpoints(_ plan: GridFramePlan, anchor: GridSlot) -> [RelativeSlotKey: CGRect] {
                 Dictionary(
                     uniqueKeysWithValues: keys.map { key in
-                        (
+                        if key == anchorKey { return (key, anchor.viewportRect) }
+                        return (
                             key,
                             CGRect(
                                 x: plan.columnGeometry.origin(of: key.dc + plan.columns / 2),

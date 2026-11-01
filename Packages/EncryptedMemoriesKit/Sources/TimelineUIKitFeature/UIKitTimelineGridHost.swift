@@ -422,8 +422,16 @@
         /// out of them. Read on every layout; a hinge change asks for a layout.
         private(set) var reservedRegionLayout: ReservedRegionLayout = .none
         private var divisionAreas: [ReservedRegionArea] = []
+        private struct DivisionInput: Equatable {
+            let areas: [ReservedRegionArea]
+            let bounds: CGRect
+            let profile: GridLevelProfile
+        }
+        private var cachedDivisionInput: DivisionInput?
+        private var cachedDivisionFrame: CGRect?
         private var lastLaidOutDivisionFrame: CGRect?
         #if DEBUG
+            private(set) var gridDivisionResolutionCount = 0
             var divisionAreasForTesting: [ReservedRegionArea]? {
                 didSet { setNeedsLayout() }
             }
@@ -833,7 +841,7 @@
             let newDivisionAreas = currentDivisionAreas()
             let divisionChanged =
                 cachedProfile.map { profile in
-                    MetalGridFrameComposer.gridDivisionFrame(areas: newDivisionAreas, bounds: bounds, profile: profile)
+                    resolvedDivision(areas: newDivisionAreas, bounds: bounds, profile: profile)
                         != lastLaidOutDivisionFrame
                 } ?? false
             if lastInsetBounds != bounds {
@@ -1554,12 +1562,20 @@
                 previousLayoutSize.width > 0, layoutSize.width > 0
             {
                 let sourceLevel = activeLevel(profile: previousProfile)
-                let sourceEngine = SquareTileGridEngine(
-                    sectionCounts: [items.count], profile: previousProfile, fillOrder: fillOrder
-                )
-                let targetEngine = SquareTileGridEngine(
+                var sourceEngine =
+                    cachedEngine
+                    ?? SquareTileGridEngine(
+                        sectionCounts: [items.count], profile: previousProfile, fillOrder: fillOrder
+                    )
+                if cachedEngine == nil {
+                    sourceEngine.divisionFrame = resolvedDivision(
+                        areas: divisionAreas, bounds: CGRect(origin: .zero, size: previousLayoutSize),
+                        profile: previousProfile)
+                }
+                var targetEngine = SquareTileGridEngine(
                     sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
                 )
+                targetEngine.divisionFrame = resolvedDivision(areas: divisionAreas, bounds: bounds, profile: profile)
                 interactiveLevel = profileLevelMemory.level(
                     leaving: previousProfile.id, at: sourceLevel, entering: profile.id
                 ) {
@@ -1583,8 +1599,7 @@
         /// `scopeBarClearance` participates in the cache key: a scope picker appearing or disappearing rebuilds
         /// so the layout origin shift takes effect.
         func currentEngine(profile: GridLevelProfile) -> SquareTileGridEngine {
-            let division = MetalGridFrameComposer.gridDivisionFrame(
-                areas: divisionAreas, bounds: bounds, profile: profile)
+            let division = resolvedDivision(areas: divisionAreas, bounds: bounds, profile: profile)
             if let cachedEngine, cachedEngineItemCount == items.count, cachedEngineProfileID == profile.id,
                 cachedEngineFillOrder == fillOrder, cachedEngine.topInset == scopeBarClearance,
                 cachedEngine.divisionFrame == division
@@ -1599,6 +1614,20 @@
             cachedEngineProfileID = profile.id
             cachedEngineFillOrder = fillOrder
             return engine
+        }
+
+        private func resolvedDivision(areas: [ReservedRegionArea], bounds: CGRect, profile: GridLevelProfile) -> CGRect?
+        {
+            let input = DivisionInput(areas: areas, bounds: bounds, profile: profile)
+            if cachedDivisionInput == input { return cachedDivisionFrame }
+            #if DEBUG
+                gridDivisionResolutionCount += 1
+            #endif
+            let division = MetalGridFrameComposer.gridDivisionFrame(
+                areas: areas, bounds: bounds, profile: profile)
+            cachedDivisionInput = input
+            cachedDivisionFrame = division
+            return division
         }
 
         // MARK: - Coalesced render loop

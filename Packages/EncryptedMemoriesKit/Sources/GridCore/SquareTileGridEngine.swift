@@ -519,7 +519,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         } else {
             columns = Self.columnsForFixedSide(side: target, gap: g, width: w, maxColumns: maxColumns)
         }
-        let geometry = GridColumnGeometry(columns: columns, gap: g, width: w, division: divisionFrame)
+        let geometry = GridColumnGeometry(columns: columns, gap: g, width: w, division: usableDivision(width: w))
         let side = geometry.side
         let pitch = side + g
         let singleSection = sectionCounts.count == 1
@@ -701,17 +701,11 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// within the ladder it interpolates the bracketing detents; past the largest end it grows with
     /// diminishing return; past the densest end it clamps (never over-shrink below fill).
     public func apparentSlotSide(at x: CGFloat, width: CGFloat) -> CGFloat {
-        let maxIndex = levels.count - 1
-        // Use the settled width-filled side at each detent so a pinch commit does not change slot size.
-        func side(_ i: Int) -> CGFloat {
-            GridColumnGeometry(
-                columns: levels[i].nominalColumns, gap: levels[i].gap, width: width, division: divisionFrame
-            ).side
-        }
-        if x <= 0 { return side(0) * (1 - x * 0.6) }
-        if x >= CGFloat(maxIndex) { return side(maxIndex) }
-        let lo = Int(x)
-        return lerp(side(lo), side(lo + 1), smoothstep(x - CGFloat(lo)))
+        GridApparentMetrics.slotSide(at: x, width: width, levels: levels, division: divisionFrame)
+    }
+
+    package func usableDivision(width: CGFloat) -> CGRect? {
+        divisionFrame.flatMap { GridVerticalDivision.isUsable($0, width: width, levels: levels) ? $0 : nil }
     }
 
     /// The apparent gap for a continuous level position (first-class: scales smoothly through the pinch).
