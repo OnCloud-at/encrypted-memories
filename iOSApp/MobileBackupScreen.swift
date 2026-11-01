@@ -20,15 +20,7 @@ struct MobileBackupScreen: View {
     var body: some View {
         let excludedCount = libraryModel.excludedPendingTiles.count
         List {
-            MobilePhotoBackupSections(controller: controller)
-            Section {
-                NavigationLink {
-                    MobileExcludedPhotosScreen()
-                } label: {
-                    PendingExcludedPhotosEntryLabel(count: excludedCount)
-                }
-                .accessibilityIdentifier("backup.excludedPhotos")
-            }
+            MobilePhotoBackupSections(controller: controller, excludedCount: excludedCount)
             if let uploadCoordinator {
                 MobileManualUploadCheckSection(
                     status: BackupStatus(manualUploadCheck: uploadCoordinator.preparationStatus)
@@ -151,6 +143,7 @@ private struct MobilePhotoBackupSections: View {
     @AppStorage(AppSettingsKey.keepDisplayAwakeDuringForegroundBackup)
     private var keepDisplayAwake = AppSettingsDefault.keepDisplayAwakeDuringForegroundBackup
     @State var controller: PhotoLibraryBackupController
+    let excludedCount: Int
     @State private var rowModel = BackupStatusRowModel()
     @State private var showFailedList = false
 
@@ -212,9 +205,21 @@ private struct MobilePhotoBackupSections: View {
             } footer: {
                 Text(String(localized: "settings.photos_backup_background_note"))
             }
+        }
 
-            BackupMobileDataSection { controller.mobileDataSettingDidChange() }
+        BackupMobileDataSection(
+            showsMobileData: controller.isAvailable && controller.isEnabled,
+            onChange: { controller.mobileDataSettingDidChange() },
+            beforeMobileData: {
+                NavigationLink {
+                    MobileExcludedPhotosScreen()
+                } label: {
+                    PendingExcludedPhotosEntryLabel(count: excludedCount)
+                }
+                .accessibilityIdentifier("backup.excludedPhotos")
+            })
 
+        if controller.isAvailable && controller.isEnabled {
             Section {
                 Toggle(isOn: $keepDisplayAwake) {
                     VStack(alignment: .leading, spacing: 2) {

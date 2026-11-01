@@ -213,24 +213,24 @@ private struct BackupSettingsTab: View {
                 Text("settings.backup_folders_section")
             }
 
-            BackupMobileDataSection { photoBackup?.mobileDataSettingDidChange() }
-
-            Section {
-                Button {
-                    showsExcludedPhotos = true
-                } label: {
-                    HStack {
-                        PendingExcludedPhotosEntryLabel(count: appModel.excludedPendingTiles.count)
-                        Image(systemName: "chevron.right")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .accessibilityHidden(true)
+            BackupMobileDataSection(
+                onChange: { photoBackup?.mobileDataSettingDidChange() },
+                beforeMobileData: {
+                    Button {
+                        showsExcludedPhotos = true
+                    } label: {
+                        HStack {
+                            PendingExcludedPhotosEntryLabel(count: appModel.excludedPendingTiles.count)
+                            Image(systemName: "chevron.right")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                        }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("backup.excludedPhotos")
-            }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("backup.excludedPhotos")
+                })
 
             // Show manual-upload status only while it is actionable or contains results.
             if let uploadCoordinator {

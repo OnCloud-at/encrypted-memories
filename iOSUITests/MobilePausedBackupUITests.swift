@@ -64,6 +64,25 @@ final class MobilePausedBackupUITests: XCTestCase {
         XCTAssertTrue(wait(for: cellular, "value == '0'"))
     }
 
+    func testExcludedPhotosStandImmediatelyBeforeCellularDataAndBeforeTurningBackupOff() throws {
+        let settings = app.buttons["Proton Account and Settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 60))
+        settings.tap()
+        let backup = app.buttons["backup.settings"]
+        XCTAssertTrue(backup.waitForExistence(timeout: 10))
+        backup.tap()
+
+        XCTAssertTrue(app.buttons["backup.excludedPhotos"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.switches["backup.useMobileData"].exists)
+        XCTAssertTrue(app.buttons["Turn off Photos backup"].exists)
+        let cells = app.cells.allElementsBoundByIndex
+        let excluded = try XCTUnwrap(cells.firstIndex { $0.buttons["backup.excludedPhotos"].exists })
+        let cellular = try XCTUnwrap(cells.firstIndex { $0.switches["backup.useMobileData"].exists })
+        let turnOff = try XCTUnwrap(cells.firstIndex { $0.buttons["Turn off Photos backup"].exists })
+        XCTAssertEqual(excluded + 1, cellular, "the excluded list must stand directly above Cellular Data")
+        XCTAssertLessThan(excluded, turnOff, "the excluded list must stand before Turn off Photos backup")
+    }
+
     func testExcludedPhotosRemainAvailableWhenEmptyAndWithBackupOff() {
         let settings = app.buttons["Proton Account and Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 60))
