@@ -153,7 +153,7 @@ public actor AlbumsRepository: AlbumManaging {
         let remote = uniqueUIDs.filter { !$0.isLocalPending }
         if !remote.isEmpty {
             do {
-                let loaded = try await catalogBackend.albumMemberships(for: remote)
+                let loaded = try await catalogBackend.currentAlbumMemberships(for: remote)
                 for uid in remote {
                     cacheMemberships(loaded[uid] ?? [], for: uid)
                 }

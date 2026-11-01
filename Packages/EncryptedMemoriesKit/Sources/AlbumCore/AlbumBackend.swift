@@ -28,6 +28,17 @@ public protocol AlbumCatalogBackend: Sendable {
     func listSharedWithMeAlbums() async throws -> [SharedAlbumSummary]
     func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws
     func albumMemberships(for photoUIDs: [PhotoUID]) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>]
+    /// The memberships from reads that start after this call. A write that depends on them needs this state.
+    func currentAlbumMemberships(for photoUIDs: [PhotoUID]) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>]
+}
+
+extension AlbumCatalogBackend {
+    /// A backend that never shares a read answers both questions with the same read.
+    public func currentAlbumMemberships(
+        for photoUIDs: [PhotoUID]
+    ) async throws -> [PhotoUID: Set<AlbumNodeIdentifier>] {
+        try await albumMemberships(for: photoUIDs)
+    }
 }
 
 /// Direct-HTTP write seam retained only for operations absent from the Swift API of SDK 0.32.1.
