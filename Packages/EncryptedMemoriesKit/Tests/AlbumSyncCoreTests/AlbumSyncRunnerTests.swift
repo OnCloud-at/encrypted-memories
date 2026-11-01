@@ -211,6 +211,77 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
 
     private let album = LocalAlbumSummary(id: "local-1", title: "Urlaub", assetCount: 3)
 
+    @Test func newAlbumProgressCountsOnlyItsNewPhotos() async throws {
+        let (runner, remote, _, store) = makeRunner(
+            contents: ["album": ["a", "b", "c", "d"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c"), "d": link("l-d")])
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 4))
+        let attaching = progress.snapshot().filter { $0.phase == .attaching }
+        let first = try #require(attaching.first)
+        let last = try #require(attaching.last)
+        #expect(attaching.allSatisfy { $0.attachTotal == 4 })
+        #expect(first.localizedDetail == L10n.string("albumsync.detail_attached \(0) \(4)"))
+        #expect(last.localizedDetail == L10n.string("albumsync.detail_attached \(4) \(4)"))
+        #expect(report.attached == 4)
+        #expect(report.alreadyMember == 0)
+        #expect(remote.attachedBatches.flatMap { $0 } == ["l-a", "l-b", "l-c", "l-d"])
+    }
+
+    @Test(arguments: [false, true])
+    func retryProgressIncludesExistingMembers(newPhotoAlreadyAttached: Bool) async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-a", "l-b", "l-c"]
+        if newPhotoAlreadyAttached { remote.alreadyMemberOf = ["l-d"] }
+        let (runner, _, _, store) = makeRunner(
+            contents: ["album": ["a", "b", "c", "d"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c"), "d": link("l-d")],
+            remote: remote)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 4))
+        let attaching = progress.snapshot().filter { $0.phase == .attaching }
+        let first = try #require(attaching.first)
+        #expect(first.attachDone == 0)
+        #expect(first.alreadyMember == 3)
+        #expect(first.attachTotal == 4)
+        #expect(first.localizedDetail == L10n.string("albumsync.detail_attached \(3) \(4)"))
+        #expect(
+            attaching.allSatisfy { $0.attachTotal == 4 },
+            "the total must not grow when Proton reports an existing member")
+        let last = try #require(attaching.last)
+        #expect(last.attachDone + last.alreadyMember == 4)
+        #expect(report.attached == (newPhotoAlreadyAttached ? 0 : 1))
+        #expect(report.alreadyMember == (newPhotoAlreadyAttached ? 4 : 3))
+        #expect(report.isFullySynced)
+        #expect(remote.attachedBatches == [["l-d"]], "only the new photo is sent for attachment")
+    }
+
+    @Test func retryWithoutNewPhotosKeepsExistingMembersInTheProgressTotal() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-a", "l-b", "l-c"]
+        let (runner, _, _, store) = makeRunner(
+            contents: ["album": ["a", "b", "c"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c")], remote: remote)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+        let attaching = try #require(progress.snapshot().first { $0.phase == .attaching })
+        #expect(attaching.attachTotal == 3)
+        #expect(attaching.localizedDetail == L10n.string("albumsync.detail_attached \(3) \(3)"))
+        #expect(report.attached == 0)
+        #expect(report.alreadyMember == 3)
+        #expect(report.isFullySynced)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
     @Test func freshExplicitTrashIsReportedWithoutAnAttach() async throws {
         let remote = FakeRemoteOps()
         remote.deletionStates = ["trash": .trashed]
