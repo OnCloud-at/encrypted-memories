@@ -224,7 +224,6 @@ public actor AlbumSyncRunner {
         progress.alreadyMember = plan.alreadyMember
         progress.unattachable = plan.missingRemote
         progress.trashedSkipped = plan.trashedRemote
-        progress.attachTotal = plan.toAttach.count
         publish()
         try checkStop()
 

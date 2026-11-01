@@ -211,6 +211,90 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
 
     private let album = LocalAlbumSummary(id: "local-1", title: "Urlaub", assetCount: 3)
 
+    private func expectedAddedText(_ count: Int) -> String {
+        if L10n.resourceBundle.preferredLocalizations.first == "de" {
+            return count == 1 ? "1 Foto zum Album hinzugefügt" : "\(count) Fotos zum Album hinzugefügt"
+        }
+        return count == 1 ? "1 photo added to album" : "\(count) photos added to album"
+    }
+
+    @Test(arguments: [0, 1, 3, 4])
+    func newAlbumProgressCountsOnlyItsNewPhotos(count: Int) async throws {
+        let identifiers = Array(["a", "b", "c", "d"].prefix(count))
+        let links = Dictionary(uniqueKeysWithValues: identifiers.map { ($0, link("l-\($0)")) })
+        let (runner, remote, _, store) = makeRunner(
+            contents: ["album": identifiers], links: links)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: count))
+        let attaching = progress.snapshot().filter { $0.phase == .attaching }
+        let first = try #require(attaching.first)
+        let last = try #require(attaching.last)
+        #expect(attaching.allSatisfy { $0.localizedDetail == expectedAddedText($0.attachDone) })
+        #expect(first.attachDone == 0)
+        #expect(first.localizedDetail == expectedAddedText(0))
+        #expect(last.attachDone == count)
+        #expect(last.localizedDetail == expectedAddedText(count))
+        #expect(report.attached == count)
+        #expect(report.alreadyMember == 0)
+        #expect(remote.attachedBatches.flatMap { $0 } == identifiers.map { "l-\($0)" })
+    }
+
+    @Test(arguments: [false, true])
+    func retryProgressCountsOnlyNewPhotosWithExistingMembers(newPhotoAlreadyAttached: Bool) async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-a", "l-b", "l-c"]
+        if newPhotoAlreadyAttached { remote.alreadyMemberOf = ["l-d"] }
+        let (runner, _, _, store) = makeRunner(
+            contents: ["album": ["a", "b", "c", "d"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c"), "d": link("l-d")],
+            remote: remote)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 4))
+        let attaching = progress.snapshot().filter { $0.phase == .attaching }
+        let first = try #require(attaching.first)
+        #expect(first.attachDone == 0)
+        #expect(first.alreadyMember == 3)
+        #expect(first.localizedDetail == expectedAddedText(0))
+        #expect(
+            attaching.allSatisfy { $0.localizedDetail == expectedAddedText($0.attachDone) },
+            "an existing member must not increase the newly added count")
+        let last = try #require(attaching.last)
+        #expect(last.attachDone + last.alreadyMember == 4)
+        #expect(last.attachDone == (newPhotoAlreadyAttached ? 0 : 1))
+        #expect(last.localizedDetail == expectedAddedText(newPhotoAlreadyAttached ? 0 : 1))
+        #expect(report.attached == (newPhotoAlreadyAttached ? 0 : 1))
+        #expect(report.alreadyMember == (newPhotoAlreadyAttached ? 4 : 3))
+        #expect(report.isFullySynced)
+        #expect(remote.attachedBatches == [["l-d"]], "only the new photo is sent for attachment")
+    }
+
+    @Test func retryWithoutNewPhotosReportsZeroNewlyAdded() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-a", "l-b", "l-c"]
+        let (runner, _, _, store) = makeRunner(
+            contents: ["album": ["a", "b", "c"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c")], remote: remote)
+        defer { store.close() }
+        let progress = ProgressBox()
+        await runner.setOnProgress { progress.append($0) }
+
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+        let attaching = try #require(progress.snapshot().first { $0.phase == .attaching })
+        #expect(attaching.attachDone == 0)
+        #expect(attaching.alreadyMember == 3)
+        #expect(attaching.localizedDetail == expectedAddedText(0))
+        #expect(report.attached == 0)
+        #expect(report.alreadyMember == 3)
+        #expect(report.isFullySynced)
+        #expect(remote.attachedBatches.isEmpty)
+    }
+
     @Test func freshExplicitTrashIsReportedWithoutAnAttach() async throws {
         let remote = FakeRemoteOps()
         remote.deletionStates = ["trash": .trashed]
