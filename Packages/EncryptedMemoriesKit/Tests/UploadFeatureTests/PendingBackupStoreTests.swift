@@ -457,6 +457,54 @@ final class PendingBackupStoreTests: XCTestCase {
         return try body(db)
     }
 
+    /// Binds `marker` as text with an explicit byte length, so an embedded NUL reaches the column verbatim.
+    private func bindRawText(_ marker: String, _ update: String) throws {
+        try withRawPendingDatabase { db in
+            var stmt: OpaquePointer?
+            XCTAssertEqual(sqlite3_prepare_v2(db, update, -1, &stmt, nil), SQLITE_OK)
+            defer { sqlite3_finalize(stmt) }
+            marker.withCString {
+                XCTAssertEqual(
+                    sqlite3_bind_text(
+                        stmt, 1, $0, Int32(marker.utf8.count), SQLiteStoreSchemaGate.transientDestructor),
+                    SQLITE_OK)
+            }
+            XCTAssertEqual(sqlite3_step(stmt), SQLITE_DONE)
+        }
+    }
+
+    /// Reads one column's raw bytes from the row of `source`, so a test can prove what the column really holds.
+    private func storedBytes(
+        of column: String, in table: String, kind: UploadSourceIdentity.Kind, identifier: String
+    ) throws -> Data {
+        try withRawPendingDatabase { db in
+            var stmt: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(
+                    db, "SELECT \(column) FROM \(table) WHERE source_kind=? AND source_id=?;", -1, &stmt, nil),
+                SQLITE_OK)
+            let prepared = try XCTUnwrap(stmt)
+            defer { sqlite3_finalize(prepared) }
+            kind.rawValue.utf8CString.withUnsafeBufferPointer { kindBytes in
+                identifier.utf8CString.withUnsafeBufferPointer { identifierBytes in
+                    XCTAssertEqual(
+                        sqlite3_bind_text(
+                            prepared, 1, kindBytes.baseAddress, Int32(kindBytes.count - 1),
+                            SQLiteStoreSchemaGate.transientDestructor), SQLITE_OK)
+                    XCTAssertEqual(
+                        sqlite3_bind_text(
+                            prepared, 2, identifierBytes.baseAddress, Int32(identifierBytes.count - 1),
+                            SQLiteStoreSchemaGate.transientDestructor), SQLITE_OK)
+                }
+            }
+            XCTAssertEqual(sqlite3_step(prepared), SQLITE_ROW)
+            let bytes = sqlite3_column_blob(prepared, 0)
+            let count = Int(sqlite3_column_bytes(prepared, 0))
+            guard count > 0, let bytes else { return Data() }
+            return Data(bytes: bytes, count: count)
+        }
+    }
+
     private func pendingTables() throws -> [String: [[Data?]]] {
         try withRawPendingDatabase { db in
             var result: [String: [[Data?]]] = [:]
@@ -1318,6 +1366,140 @@ final class PendingBackupStoreTests: XCTestCase {
     func testSavedFromAppIdentifiersPersist() {
         XCTAssertTrue(store.recordSavedFromApp(localIdentifier: "saved-1", remote: remote, at: date))
         XCTAssertEqual(store.savedFromAppIdentifiers(), ["saved-1"])
+    }
+
+    // MARK: - Text that does not round-trip
+
+    func testHandoffReadRejectsAnEmbeddedNULRemoteVolumeID() throws {
+        let healthy = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
+        for (source, link) in [(healthy, "link-0"), (key, "link-1")] {
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: source, revision: UploadBackupRevision(rawValue: 7),
+                        remote: PhotoUID(volumeID: "vol", nodeID: link), kind: .uploaded, createdAt: date)),
+                .recorded)
+        }
+        let marker = "vol\u{0}written-by-a-newer-build"
+        try bindRawText(marker, "UPDATE handoff SET remote_volume_id=? WHERE source_id='\(key.identifier)';")
+        let before = try pendingTables()
+        XCTAssertEqual(
+            try storedBytes(of: "remote_volume_id", in: "handoff", kind: key.kind, identifier: key.identifier),
+            Data(marker.utf8))
+
+        let reads = store.latestHandoffsRead(for: [healthy, key])
+
+        XCTAssertEqual(reads[healthy]?.handoff?.remote, PhotoUID(volumeID: "vol", nodeID: "link-0"))
+        XCTAssertEqual(reads[key], .unreadable, "a decoded prefix must not become a shorter volume ID")
+        XCTAssertEqual(store.handoffsRead(forRemoteLinkIDs: [remote.nodeID]), .unreadable)
+        XCTAssertEqual(try pendingTables(), before, "a rejected row must stay as it is")
+    }
+
+    func testReverseHandoffLookupRejectsAnEmbeddedNULSourceID() throws {
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote, kind: .uploaded,
+                    createdAt: date)), .recorded)
+        let marker = "\(key.identifier)\u{0}written-by-a-newer-build"
+        try bindRawText(marker, "UPDATE handoff SET source_id=? WHERE source_id='\(key.identifier)';")
+        let before = try pendingTables()
+        XCTAssertEqual(
+            try storedBytes(of: "source_id", in: "handoff", kind: key.kind, identifier: marker), Data(marker.utf8))
+
+        XCTAssertEqual(store.handoffsRead(forRemoteLinkIDs: [remote.nodeID]), .unreadable)
+        XCTAssertEqual(try pendingTables(), before, "a rejected row must stay as it is")
+    }
+
+    func testHandoffReadRejectsInvalidUTF8RemoteVolumeID() throws {
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote, kind: .uploaded,
+                    createdAt: date)), .recorded)
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE handoff SET remote_volume_id=CAST(x'766F6CFF' AS TEXT);", nil, nil, nil),
+                SQLITE_OK)
+        }
+        let before = try pendingTables()
+        XCTAssertEqual(
+            try storedBytes(of: "remote_volume_id", in: "handoff", kind: key.kind, identifier: key.identifier),
+            Data([0x76, 0x6F, 0x6C, 0xFF]))
+
+        XCTAssertEqual(store.latestHandoffsRead(for: [key])[key], .unreadable, "invalid UTF-8 does not round-trip")
+        XCTAssertEqual(try pendingTables(), before, "a rejected row must stay as it is")
+    }
+
+    func testActionReadRejectsAnEmbeddedNULAlbumID() throws {
+        let healthyFavorite = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
+        let healthyAlbum = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-2")
+        XCTAssertTrue(store.setFavoriteIntent(healthyFavorite, favorite: true, at: date))
+        XCTAssertTrue(store.addAlbumIntent(healthyAlbum, albumID: "album-9", at: date))
+        XCTAssertTrue(store.addAlbumIntent(key, albumID: "album-1", at: date))
+        let marker = "album-1\u{0}written-by-a-newer-build"
+        try bindRawText(marker, "UPDATE pending_action SET album_id=? WHERE source_id='\(key.identifier)';")
+        let before = try pendingTables()
+        XCTAssertEqual(
+            try storedBytes(of: "album_id", in: "pending_action", kind: key.kind, identifier: key.identifier),
+            Data(marker.utf8))
+
+        let read = store.actionsRead()
+
+        XCTAssertEqual(read.complete, false, "a rejected row makes the read incomplete")
+        XCTAssertEqual(
+            Set(read.actions.map(\.key)), [healthyFavorite, healthyAlbum], "a decoded prefix must not pass")
+        XCTAssertEqual(read.actions.first(where: { $0.key == healthyFavorite })?.albumID, "")
+        XCTAssertEqual(read.actions.first(where: { $0.key == healthyAlbum })?.albumID, "album-9")
+        XCTAssertEqual(try pendingTables(), before, "a rejected row must stay as it is")
+    }
+
+    func testActionReadRejectsAnEmbeddedNULSourceID() throws {
+        let healthy = PendingSourceKey(kind: .photoLibraryAsset, identifier: "asset-0")
+        XCTAssertTrue(store.setFavoriteIntent(healthy, favorite: true, at: date))
+        XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+        let marker = "\(key.identifier)\u{0}written-by-a-newer-build"
+        try bindRawText(marker, "UPDATE pending_action SET source_id=? WHERE source_id='\(key.identifier)';")
+        let before = try pendingTables()
+        XCTAssertEqual(
+            try storedBytes(of: "source_id", in: "pending_action", kind: key.kind, identifier: marker),
+            Data(marker.utf8))
+
+        let read = store.actionsRead()
+
+        XCTAssertEqual(read.complete, false, "a rejected row makes the read incomplete")
+        XCTAssertEqual(read.actions.map(\.key), [healthy], "a decoded prefix must not become a shorter source ID")
+        XCTAssertEqual(try pendingTables(), before, "a rejected row must stay as it is")
+    }
+
+    func testAHandoffTextColumnThatDoesNotRoundTripIsCounted() throws {
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote, kind: .uploaded,
+                    createdAt: date)), .recorded)
+        try bindRawText(
+            "vol\u{0}written-by-a-newer-build",
+            "UPDATE handoff SET remote_volume_id=? WHERE source_id='\(key.identifier)';")
+        let counted = PhotoDiagnostics.shared.counter("pending.undecodableRow")
+
+        XCTAssertEqual(store.latestHandoffsRead(for: [key])[key], .unreadable)
+
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("pending.undecodableRow"), counted + 1)
+        XCTAssertTrue(store.isOperational(), "a rejected row is not a store failure")
+    }
+
+    func testAnActionTextColumnThatDoesNotRoundTripIsCounted() throws {
+        XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+        try bindRawText(
+            "favorite\u{0}written-by-a-newer-build",
+            "UPDATE pending_action SET kind=? WHERE source_id='\(key.identifier)';")
+        let counted = PhotoDiagnostics.shared.counter("pending.undecodableRow")
+
+        XCTAssertEqual(store.actionsRead().complete, false)
+
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("pending.undecodableRow"), counted + 1)
+        XCTAssertTrue(store.isOperational(), "a rejected row is not a store failure")
     }
 }
 
