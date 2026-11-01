@@ -19,6 +19,22 @@ struct RecentlyDeletedListingTests {
         return url
     }
 
+    @Test func onlyAListingThatAppliedInThisSessionCountsAsListed() {
+        var stored = RecentlyDeletedIdentities(listing: [Self.item("stored", at: 1)])
+        #expect(!stored.hasAppliedListing, "the stored listing of an earlier launch is no listing of this session")
+        stored.trashed([PhotoUID(volumeID: "volume", nodeID: "photo")], items: [])
+        #expect(!stored.hasAppliedListing)
+
+        let overtaken = stored.beginListing()
+        stored.trashed([PhotoUID(volumeID: "volume", nodeID: "other")], items: [])
+        #expect(stored.received([], ticket: overtaken) == .overtakenByChange)
+        #expect(!stored.hasAppliedListing, "an overtaken listing changes nothing")
+
+        let applied = stored.beginListing()
+        #expect(stored.received([], ticket: applied) == .applied)
+        #expect(stored.hasAppliedListing)
+    }
+
     @Test func theLastListingOpensAfterALaunch() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
