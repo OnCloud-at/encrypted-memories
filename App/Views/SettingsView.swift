@@ -135,6 +135,7 @@ private struct BackupSettingsTab: View {
     let albumSync: AlbumSyncController?
     let uploadCoordinator: UploadCoordinator?
     let appModel: AppModel
+    @State private var showsExcludedPhotos = false
 
     /// Apple Photos items through PhotoKit, watched-folder files through QuickLook.
     private var excludedThumbnail: @Sendable (PhotoUID) async -> CGImage? {
@@ -155,14 +156,6 @@ private struct BackupSettingsTab: View {
                     PhotoLibraryBackupSection(controller: photoBackup)
                 } header: {
                     Text("settings.photos_backup_section")
-                }
-            }
-            if !appModel.excludedPendingTiles.isEmpty {
-                PendingExcludedPhotosSection(
-                    tiles: appModel.excludedPendingTiles,
-                    thumbnail: excludedThumbnail
-                ) { tile in
-                    await appModel.pendingGrid?.restore([tile.item.uid])
                 }
             }
             if let albumSync {
@@ -220,7 +213,28 @@ private struct BackupSettingsTab: View {
                 Text("settings.backup_folders_section")
             }
 
-            BackupMobileDataSection { photoBackup?.mobileDataSettingDidChange() }
+            if photoBackup?.isEnabled == true {
+                Section {
+                    Button {
+                        showsExcludedPhotos = true
+                    } label: {
+                        HStack {
+                            PendingExcludedPhotosEntryLabel(count: appModel.excludedPendingTiles.count)
+                            Image(systemName: "chevron.right")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("backup.excludedPhotos")
+                } footer: {
+                    Text(L10n.string("settings.backup_excluded_footer"))
+                }
+            }
+
+            BackupMobileDataSection(onChange: { photoBackup?.mobileDataSettingDidChange() })
 
             // Show manual-upload status only while it is actionable or contains results.
             if let uploadCoordinator {
@@ -237,6 +251,9 @@ private struct BackupSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $showsExcludedPhotos) {
+            MacExcludedPhotosSheet(appModel: appModel, thumbnail: excludedThumbnail)
+        }
     }
 
     /// Presents the shared backup status for folder sync.
@@ -798,6 +815,33 @@ private struct PhotoLibraryBackupSection: View {
             Image(systemName: "checkmark.shield")
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+/// The photos excluded from the backup, in a sheet over the Backup settings.
+private struct MacExcludedPhotosSheet: View {
+    let appModel: AppModel
+    let thumbnail: @Sendable (PhotoUID) async -> CGImage?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(L10n.string("backup.excluded_title"))
+                    .font(.headline)
+                Spacer()
+                Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding()
+
+            Divider()
+
+            PendingExcludedPhotosList(tiles: appModel.excludedPendingTiles, thumbnail: thumbnail) { tile in
+                await appModel.pendingGrid?.restore([tile.item.uid])
+            }
+        }
+        .frame(width: 520, height: 380)
     }
 }
 

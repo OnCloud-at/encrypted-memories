@@ -311,6 +311,13 @@ source the generator plans two iOS jobs of six points (about 60 planned minutes 
 build (12 minutes) of runner time than one job of twelve points (about 108 planned minutes), and about half the wall-clock
 time. With three sources it plans three iOS jobs of four points (about 132 minutes each) and one macOS job; a fourth source
 makes it plan four iOS jobs. The macOS gate keeps one job as long as it fits.
+Each case ends with `simctl delete` of its simulator. macOS moves that device's data into `Deleting-<uuid>` directories
+of TMPDIR, which a system process empties asynchronously (#1008). The journey keeps nothing in TMPDIR and must not remove
+these directories, because the system owns them. A hosted runner under load emptied them too slowly: in run 41098205915
+a shard grew TMPDIR from 0 to 8.6 GiB and lost 10.9 GiB of free disk over its 24 cases (about 0.5 GiB per case; #498
+measured up to 0.9 GiB per case), starting from 26.0 to 26.5 GiB free after the builds. About 28 cases therefore fill the
+runner disk; the time model stays below that with at most 19, 16, 15 or 12 cases per job for one to four sources. An idle
+local host empties the directories within minutes, so a rehearsal cannot show the hosted growth.
 A failing case keeps the app's system log. The evidence also holds the runner load, the free disk and the size of
 the large build and Simulator directories, and each case's timing and free disk.
 The job summary shows the free disk at the start and the end. The journey step prints only result, timing and disk
