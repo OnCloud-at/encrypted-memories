@@ -1137,10 +1137,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     private func handoffRow(_ stmt: OpaquePointer?) -> PendingHandoff? {
-        guard let key = key(stmt, kindColumn: 0, idColumn: 1),
-            let volume = columnText(stmt, 3),
-            let link = columnText(stmt, 4),
-            let kind = columnText(stmt, 5).flatMap(PendingHandoffKind.init(rawValue:))
+        guard let key = key(stmt, kindColumn: 0, idColumn: 1, roundTrip: true),
+            let volume = columnText(stmt, 3, roundTrip: true),
+            let link = columnText(stmt, 4, roundTrip: true),
+            let kind = columnText(stmt, 5, roundTrip: true).flatMap(PendingHandoffKind.init(rawValue:))
         else { return nil }
         return PendingHandoff(
             key: key,
@@ -1189,8 +1189,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             FROM pending_action
             """ + (condition.map { " WHERE \($0)" } ?? "") + " ORDER BY created_at;"
         let succeeded = query(sql, bind: bind) { stmt in
-            guard let key = key(stmt, kindColumn: 0, idColumn: 1),
-                let kind = columnText(stmt, 2).flatMap(PendingActionKind.init(rawValue:))
+            // A NULL album_id keeps its empty fallback; a stored value that does not round-trip makes the row unreadable.
+            let albumID = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? "" : columnText(stmt, 3, roundTrip: true)
+            guard let key = key(stmt, kindColumn: 0, idColumn: 1, roundTrip: true),
+                let kind = columnText(stmt, 2, roundTrip: true).flatMap(PendingActionKind.init(rawValue:)),
+                let albumID = albumID
             else {
                 Self.noteUndecodableRow()
                 decoded = false
@@ -1200,7 +1203,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 PendingAction(
                     key: key,
                     kind: kind,
-                    albumID: columnText(stmt, 3) ?? "",
+                    albumID: albumID,
                     desired: sqlite3_column_int(stmt, 4) != 0,
                     createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5)),
                     attempts: Int(sqlite3_column_int(stmt, 6)),
@@ -1286,9 +1289,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return true
     }
 
-    private func key(_ stmt: OpaquePointer?, kindColumn: Int32, idColumn: Int32) -> PendingSourceKey? {
-        guard let kind = columnText(stmt, kindColumn).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
-            let identifier = columnText(stmt, idColumn)
+    private func key(
+        _ stmt: OpaquePointer?, kindColumn: Int32, idColumn: Int32, roundTrip: Bool = false
+    ) -> PendingSourceKey? {
+        guard
+            let kind = columnText(stmt, kindColumn, roundTrip: roundTrip).flatMap(
+                UploadSourceIdentity.Kind.init(rawValue:)),
+            let identifier = columnText(stmt, idColumn, roundTrip: roundTrip)
         else { return nil }
         return PendingSourceKey(kind: kind, identifier: identifier)
     }
@@ -1335,9 +1342,21 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         if let value { bindText(stmt, index, value) } else { sqlite3_bind_null(stmt, index) }
     }
 
-    private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
+    /// Reads a text column. With `roundTrip`, reads the full bytes of the column: the writers bind with a C string,
+    /// so a stored value with an embedded NUL or bytes that are not strict UTF-8 cannot have come from this store
+    /// (#1006).
+    private func columnText(_ stmt: OpaquePointer?, _ index: Int32, roundTrip: Bool = false) -> String? {
         guard let text = sqlite3_column_text(stmt, index) else { return nil }
-        return String(cString: text)
+        guard roundTrip else { return String(cString: text) }
+        return roundTrippedText(text, byteCount: sqlite3_column_bytes(stmt, index))
+    }
+
+    private func roundTrippedText(_ text: UnsafePointer<UInt8>, byteCount: Int32) -> String? {
+        guard
+            let value = String(
+                bytes: UnsafeBufferPointer(start: text, count: Int(byteCount)), encoding: .utf8)
+        else { return nil }
+        return value.contains("\0") ? nil : value
     }
 
     // MARK: - Schema
