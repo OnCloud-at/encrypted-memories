@@ -1,31 +1,11 @@
 import CoreGraphics
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 import UploadCore
 
-/// Whether the Backup settings show the "Excluded from Backup" entry. The entry appears as soon as one photo is
-/// excluded and stays while the page shows, so the last "Back Up Again" in the list neither removes the entry nor
-/// closes the list. A page that shows again starts from the current count.
-public struct PendingExcludedPhotosEntryLatch: Equatable, Sendable {
-    public private(set) var isShown: Bool
-
-    public init(count: Int = 0) {
-        isShown = count > 0
-    }
-
-    /// The count changed while the page shows.
-    public mutating func update(count: Int) {
-        if count > 0 { isShown = true }
-    }
-
-    /// The page shows again.
-    public mutating func reset(count: Int) {
-        isShown = count > 0
-    }
-}
-
 /// The label of the "Excluded from Backup" entry in the Backup settings of macOS, iOS and iPadOS, with the number
-/// of excluded photos.
+/// of excluded photos when the list is not empty.
 public struct PendingExcludedPhotosEntryLabel: View {
     private let count: Int
 
@@ -35,8 +15,10 @@ public struct PendingExcludedPhotosEntryLabel: View {
 
     public var body: some View {
         LabeledContent {
-            Text(count.formatted())
-                .monospacedDigit()
+            if count > 0 {
+                Text(count.formatted())
+                    .monospacedDigit()
+            }
         } label: {
             Text(L10n.string("backup.excluded_title"))
         }
@@ -69,8 +51,7 @@ public struct PendingExcludedPhotosList: View {
         .formStyle(.grouped)
         .overlay {
             if tiles.isEmpty {
-                let copy = PhotoFilterEmptyStateCopy.excludedFromBackup
-                ContentUnavailableView(copy.title, systemImage: copy.systemImage, description: Text(copy.description))
+                LibraryEmptyView(copy: .excludedFromBackup)
             }
         }
     }

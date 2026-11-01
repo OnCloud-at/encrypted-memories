@@ -54,14 +54,62 @@ final class MobilePausedBackupUITests: XCTestCase {
 
         let cellular = app.switches["backup.useMobileData"]
         XCTAssertTrue(cellular.waitForExistence(timeout: 10), "the backup settings offer no cellular data switch")
-        XCTAssertFalse(
-            app.buttons["backup.excludedPhotos"].exists, "no excluded photo, no row")
+        XCTAssertTrue(
+            app.buttons["backup.excludedPhotos"].exists, "the empty excluded list remains available")
         XCTAssertEqual(cellular.label, "Use Cellular Data")
         XCTAssertEqual(cellular.value as? String, "0", "the backup waits for Wi-Fi by default")
         cellular.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         XCTAssertTrue(wait(for: cellular, "value == '1'"), "the switch does not turn on")
         cellular.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         XCTAssertTrue(wait(for: cellular, "value == '0'"))
+    }
+
+    func testExcludedPhotosRemainAvailableWhenEmptyAndWithBackupOff() {
+        let settings = app.buttons["Proton Account and Settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 60))
+        settings.tap()
+        let backup = app.buttons["backup.settings"]
+        XCTAssertTrue(backup.waitForExistence(timeout: 10))
+        backup.tap()
+
+        let entry = app.buttons["backup.excludedPhotos"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 10), "the empty excluded list must remain available")
+        XCTAssertEqual(entry.label, "Excluded from Backup", "zero must not appear as a count")
+        entry.tap()
+        XCTAssertTrue(app.staticTexts["No excluded photos"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Photos you delete before they are backed up appear here."].exists)
+        app.backButton(to: "Backup").tap()
+
+        let disable = app.buttons["Turn off Photos backup"]
+        app.swipeUp()
+        XCTAssertTrue(disable.waitForExistence(timeout: 5))
+        disable.tap()
+        XCTAssertTrue(app.buttons["Enable Photos backup…"].waitForExistence(timeout: 10), "backup must be off")
+        XCTAssertTrue(entry.exists, "turning off backup must not remove the excluded list")
+        XCTAssertEqual(entry.label, "Excluded from Backup")
+        entry.tap()
+        XCTAssertTrue(app.staticTexts["No excluded photos"].waitForExistence(timeout: 10))
+    }
+
+    func testExcludedPhotosRemainAvailableWithDeniedPhotosAccess() {
+        app.terminate()
+        // This existing fixture installs an enabled controller whose Photos access is denied.
+        app.launchArguments = [
+            "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesDeletedBackupFixture",
+            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ]
+        app.launch()
+        let settings = app.buttons["Proton Account and Settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 60))
+        settings.tap()
+        let backup = app.buttons["backup.settings"]
+        XCTAssertTrue(backup.waitForExistence(timeout: 10))
+        backup.tap()
+        let entry = app.buttons["backup.excludedPhotos"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 10))
+        XCTAssertEqual(entry.label, "Excluded from Backup")
+        entry.tap()
+        XCTAssertTrue(app.staticTexts["No excluded photos"].waitForExistence(timeout: 10))
     }
 
     private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {

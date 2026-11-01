@@ -50,6 +50,6 @@ final class MobileExcludedBackupUITests: XCTestCase {
 
         app.backButton(to: "Backup").tap()
         XCTAssertTrue(entry.waitForExistence(timeout: 5), "the entry left the open Backup settings")
-        XCTAssertTrue(entry.label.contains("0"), "no photo is excluded anymore: \(entry.label)")
+        XCTAssertEqual(entry.label, "Excluded from Backup", "zero must not appear as a count")
     }
 }

@@ -135,8 +135,6 @@ private struct BackupSettingsTab: View {
     let albumSync: AlbumSyncController?
     let uploadCoordinator: UploadCoordinator?
     let appModel: AppModel
-    /// The pane keeps its state while another tab shows, so it starts from the current count each time it shows.
-    @State private var excludedEntry = PendingExcludedPhotosEntryLatch()
     @State private var showsExcludedPhotos = false
 
     /// Apple Photos items through PhotoKit, watched-folder files through QuickLook.
@@ -217,23 +215,21 @@ private struct BackupSettingsTab: View {
 
             BackupMobileDataSection { photoBackup?.mobileDataSettingDidChange() }
 
-            if excludedEntry.isShown {
-                Section {
-                    Button {
-                        showsExcludedPhotos = true
-                    } label: {
-                        HStack {
-                            PendingExcludedPhotosEntryLabel(count: appModel.excludedPendingTiles.count)
-                            Image(systemName: "chevron.right")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
-                        }
-                        .contentShape(Rectangle())
+            Section {
+                Button {
+                    showsExcludedPhotos = true
+                } label: {
+                    HStack {
+                        PendingExcludedPhotosEntryLabel(count: appModel.excludedPendingTiles.count)
+                        Image(systemName: "chevron.right")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("backup.excludedPhotos")
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("backup.excludedPhotos")
             }
 
             // Show manual-upload status only while it is actionable or contains results.
@@ -251,8 +247,6 @@ private struct BackupSettingsTab: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { excludedEntry.reset(count: appModel.excludedPendingTiles.count) }
-        .onChange(of: appModel.excludedPendingTiles.count) { _, count in excludedEntry.update(count: count) }
         .sheet(isPresented: $showsExcludedPhotos) {
             MacExcludedPhotosSheet(appModel: appModel, thumbnail: excludedThumbnail)
         }

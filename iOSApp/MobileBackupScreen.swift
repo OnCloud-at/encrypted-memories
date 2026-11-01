@@ -16,14 +16,19 @@ struct MobileBackupScreen: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
     let controller: PhotoLibraryBackupController
     let uploadCoordinator: UploadCoordinator?
-    /// The screen's state ends when it closes, so a screen that opens again starts from the current count.
-    @State private var excludedEntry = PendingExcludedPhotosEntryLatch()
 
     var body: some View {
         let excludedCount = libraryModel.excludedPendingTiles.count
         List {
-            MobilePhotoBackupSections(
-                controller: controller, excludedCount: excludedEntry.isShown ? excludedCount : nil)
+            MobilePhotoBackupSections(controller: controller)
+            Section {
+                NavigationLink {
+                    MobileExcludedPhotosScreen()
+                } label: {
+                    PendingExcludedPhotosEntryLabel(count: excludedCount)
+                }
+                .accessibilityIdentifier("backup.excludedPhotos")
+            }
             if let uploadCoordinator {
                 MobileManualUploadCheckSection(
                     status: BackupStatus(manualUploadCheck: uploadCoordinator.preparationStatus)
@@ -31,7 +36,6 @@ struct MobileBackupScreen: View {
             }
         }
         .mobileNavigationTitle(String(localized: "settings.section_backup"))
-        .onChange(of: excludedCount, initial: true) { _, count in excludedEntry.update(count: count) }
     }
 }
 
@@ -147,8 +151,6 @@ private struct MobilePhotoBackupSections: View {
     @AppStorage(AppSettingsKey.keepDisplayAwakeDuringForegroundBackup)
     private var keepDisplayAwake = AppSettingsDefault.keepDisplayAwakeDuringForegroundBackup
     @State var controller: PhotoLibraryBackupController
-    /// The number of excluded photos while the entry to their list shows; nil hides the entry.
-    let excludedCount: Int?
     @State private var rowModel = BackupStatusRowModel()
     @State private var showFailedList = false
 
@@ -212,17 +214,6 @@ private struct MobilePhotoBackupSections: View {
             }
 
             BackupMobileDataSection { controller.mobileDataSettingDidChange() }
-
-            if let excludedCount {
-                Section {
-                    NavigationLink {
-                        MobileExcludedPhotosScreen()
-                    } label: {
-                        PendingExcludedPhotosEntryLabel(count: excludedCount)
-                    }
-                    .accessibilityIdentifier("backup.excludedPhotos")
-                }
-            }
 
             Section {
                 Toggle(isOn: $keepDisplayAwake) {
