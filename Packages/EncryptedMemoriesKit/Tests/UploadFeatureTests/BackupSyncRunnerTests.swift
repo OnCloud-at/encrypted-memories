@@ -4191,8 +4191,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         try makePendingRowUnreadable(first.source, in: pending, at: pendingURL)
         let recorder = PendingBackupEventRecorder(store: pending)
 
-        _ = await makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1), events: recorder)
-            .runUntilDrained(mode: .eligibleOnly)
+        // Two photo slots let one claim return both revisions; the second then follows the first in the same worker.
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
         recorder.finish()
 
         XCTAssertEqual(resolver.resolveCount(for: first.source.identifier), 0, "no export")

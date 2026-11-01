@@ -429,7 +429,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         type.allCases.map { "'\($0.rawValue)'" }.joined(separator: ",")
     }
 
-
     /// Writes desired = excluded for each request in one transaction and returns the new states.
     public func exclude(_ requests: [PendingExclusionRequest], at date: Date) -> [PendingSourceState]? {
         guard !requests.isEmpty else { return [] }

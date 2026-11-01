@@ -1046,7 +1046,8 @@ final class PendingBackupStoreTests: XCTestCase {
         try withRawPendingDatabase {
             XCTAssertEqual(
                 sqlite3_exec(
-                    $0, "UPDATE source_state SET source_kind='fileURL', desired='written-by-a-newer-build' "
+                    $0,
+                    "UPDATE source_state SET source_kind='fileURL', desired='written-by-a-newer-build' "
                         + "WHERE source_kind='zz-newer-kind';", nil, nil, nil), SQLITE_OK)
         }
         XCTAssertEqual(
