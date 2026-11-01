@@ -213,6 +213,12 @@ import TimelineCore
             CGRect(x: 900, y: 0, width: 40, height: 669),
             CGRect(x: 433, y: 0, width: 0, height: 669),
         ]
+        for frame in invalid {
+            #expect(
+                MetalGridFrameComposer.gridDivisionFrame(
+                    areas: [ReservedRegionArea(frame: frame, isActive: false)], bounds: bounds, profile: profile) == nil
+            )
+        }
         for facts in [[farther, nearer], [nearer, farther]] + invalid.map({ [$0, farther] }) {
             let expected = facts.contains(nearer) ? nearer : farther
             #expect(
