@@ -10,10 +10,10 @@ import XCTest
 /// indicator while the viewer prepares the video and asks again.
 final class VideoFailureRetryTests: XCTestCase {
     private let fixedFailures: [VideoPlaybackError] = [
-        .notVideo, .unsupportedCodec, .streamURLUnavailable, .decryptionFailed, .malformedContent,
+        .notVideo, .unsupportedCodec, .streamURLUnavailable, .decryptionFailed, .malformedContent, .authExpired,
     ]
     private let changeableFailures: [VideoPlaybackError] = [
-        .metadataUnavailable, .rangeNotSupported, .networkUnavailable, .authExpired, .quotaOrRateLimited,
+        .metadataUnavailable, .rangeNotSupported, .networkUnavailable, .quotaOrRateLimited,
         .localFileError, .playerItemFailed(detail: nil), .timedOut, .unknown(detail: nil),
     ]
 

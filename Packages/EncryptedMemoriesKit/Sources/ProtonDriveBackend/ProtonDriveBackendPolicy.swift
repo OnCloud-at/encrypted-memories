@@ -129,3 +129,17 @@ public enum ProtonDriveBackendFactory {
         VideoByteRangeCache.shared.clearAll()
     }
 }
+
+/// Classifies a library-open failure that no Retry with the same session can clear.
+public enum LibraryOpenFailurePermanence {
+    /// True only for a confirmed permanent cause: the account has no photos share, the drive scope is terminally
+    /// lost, or the server rejected the session after one refresh attempt already failed to renew it. Every other
+    /// cause — a network failure, a rate limit, or an unclear server answer — can still clear on a new attempt,
+    /// so the caller keeps the Retry button.
+    public static func isPermanent(_ error: Error) -> Bool {
+        if error is DriveBridgeError { return true }
+        if error is any LibraryChangeTerminalError { return true }
+        if case ProtonAuthError.apiError(let code, _) = error { return code == 401 }
+        return false
+    }
+}
