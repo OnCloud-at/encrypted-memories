@@ -101,6 +101,65 @@ final class MobileGridChromeTests: XCTestCase {
         previous?.makeKey()
     }
 
+    @MainActor func testInsetFollowUpSkipsAHostOutsideItsClippingAncestor() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let controller = UIViewController()
+        window.rootViewController = controller
+        window.frame = scene.coordinateSpace.bounds
+        window.makeKeyAndVisible()
+        let clipper = UIView(frame: controller.view.bounds)
+        clipper.clipsToBounds = true
+        controller.view.addSubview(clipper)
+        let gridSize = CGSize(width: 320, height: 400)
+        let grid = UIKitTimelineGridHostView(frame: CGRect(origin: .zero, size: gridSize))
+        clipper.addSubview(grid)
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        #if DEBUG
+            // Completely below the clipper's bounds: no layout pass can have a visible effect.
+            grid.frame = CGRect(x: 0, y: clipper.bounds.maxY + 100, width: gridSize.width, height: gridSize.height)
+            try await Task.sleep(for: .milliseconds(100))
+            let outsideCount = grid.insetFollowUpCount
+            grid.safeAreaInsetsDidChange()
+            XCTAssertFalse(
+                grid.insetFollowUpPending, "A host outside a clipping ancestor must not schedule a follow-up")
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(
+                grid.insetFollowUpCount, outsideCount, "A host outside a clipping ancestor must not run a follow-up")
+
+            // Overlapping the clip area by a bounded amount keeps the host visible, so the follow-up must run.
+            grid.frame = CGRect(x: 0, y: clipper.bounds.maxY - 50, width: gridSize.width, height: gridSize.height)
+            try await Task.sleep(for: .milliseconds(100))
+            let overlappingCount = grid.insetFollowUpCount
+            grid.safeAreaInsetsDidChange()
+            XCTAssertTrue(
+                grid.insetFollowUpPending, "A host that overlaps the clipping ancestor must schedule a follow-up")
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(
+                grid.insetFollowUpCount - overlappingCount, 1,
+                "A host that overlaps the clipping ancestor must run a follow-up")
+
+            // A zero-size host inside the clip area cannot tell yet whether it is visible, so the follow-up
+            // must still run exactly as it did before the clipping check existed.
+            grid.frame = CGRect(x: 0, y: 0, width: 0, height: 0)
+            try await Task.sleep(for: .milliseconds(100))
+            let zeroSizeCount = grid.insetFollowUpCount
+            grid.safeAreaInsetsDidChange()
+            XCTAssertTrue(
+                grid.insetFollowUpPending, "A zero-size host inside the clip area must schedule a follow-up")
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(
+                grid.insetFollowUpCount - zeroSizeCount, 1,
+                "A zero-size host inside the clip area must run a follow-up")
+        #endif
+        grid.setActive(false)
+        window.isHidden = true
+        window.rootViewController = nil
+        previous?.makeKey()
+    }
+
     @MainActor func testTabBarTraversalRespectsNodeAndDepthLimits() {
         let host = UIKitTimelineGridHostView()
         let bounds = CGRect(x: 0, y: 0, width: 400, height: 800)
@@ -393,28 +452,35 @@ final class MobileGridChromeTests: XCTestCase {
                 let tabBar = try XCTUnwrap(tabBars.first)
                 XCTAssertEqual(tabBar.isHidden, isSelecting, "Selection actions and root tabs must alternate")
             }
-            if !isSelecting,
-                let tabBar = tabBars.first(where: {
+            if !isSelecting {
+                let horizontalBar = tabBars.first(where: {
                     let frame = $0.convert($0.bounds, to: window)
                     return !$0.isHidden && frame.width > frame.height
                 })
-            {
-                let safeBottom = grid.safeAreaInsets.bottom
-                if step == 0 { initialHorizontalSafeBottom = safeBottom }
-                let viewport = grid.convert(grid.bounds, to: window)
-                let barFrame = tabBar.convert(tabBar.bounds, to: window)
-                let bottomRegion = CGRect(
-                    x: viewport.minX, y: viewport.maxY - safeBottom,
-                    width: viewport.width, height: safeBottom)
-                print(
-                    "issue921 native-phone step=\(step) safeBottom=\(safeBottom) inset=\(grid.scrollView.contentInset.bottom) viewport=\(viewport) bar=\(barFrame)"
-                )
-                XCTAssertGreaterThan(safeBottom, 0, "Native bottom bar must produce a nonzero safe area")
-                XCTAssertGreaterThan(barFrame.width, barFrame.height, "Native tab bar must be horizontal")
-                XCTAssertTrue(barFrame.intersects(bottomRegion), "Native tab bar must occupy the bottom safe area")
-                XCTAssertEqual(
-                    grid.scrollView.contentInset.bottom, safeBottom, accuracy: 0.5,
-                    "Native bottom tab bar must retain the host's bottom inset")
+                // A phone always presents a horizontal bar. A missing bar means the fixture broke, and
+                // skipping the checks below would let them pass without checking anything.
+                if UIDevice.current.userInterfaceIdiom == .phone {
+                    XCTAssertNotNil(horizontalBar, "The phone fixture must show a horizontal bottom bar")
+                }
+                if let tabBar = horizontalBar {
+                    let safeBottom = grid.safeAreaInsets.bottom
+                    if step == 0 { initialHorizontalSafeBottom = safeBottom }
+                    let viewport = grid.convert(grid.bounds, to: window)
+                    let barFrame = tabBar.convert(tabBar.bounds, to: window)
+                    let bottomRegion = CGRect(
+                        x: viewport.minX, y: viewport.maxY - safeBottom,
+                        width: viewport.width, height: safeBottom)
+                    print(
+                        "issue921 native-phone step=\(step) safeBottom=\(safeBottom) inset=\(grid.scrollView.contentInset.bottom) viewport=\(viewport) bar=\(barFrame)"
+                    )
+                    XCTAssertGreaterThan(safeBottom, 0, "Native bottom bar must produce a nonzero safe area")
+                    XCTAssertGreaterThan(barFrame.width, barFrame.height, "Native tab bar must be horizontal")
+                    XCTAssertTrue(
+                        barFrame.intersects(bottomRegion), "Native tab bar must occupy the bottom safe area")
+                    XCTAssertEqual(
+                        grid.scrollView.contentInset.bottom, safeBottom, accuracy: 0.5,
+                        "Native bottom tab bar must retain the host's bottom inset")
+                }
             }
             if isSelecting, let initialHorizontalSafeBottom {
                 XCTAssertNotEqual(
