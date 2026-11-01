@@ -135,6 +135,12 @@ final class PhotoBackupBackgroundCoordinator {
             logger.error(
                 "Library-refresh submission failed after a cancel: \(error.localizedDescription, privacy: .public)")
         })
+    /// The check of the pending processing request, which a refresh window runs before it submits one.
+    private lazy var processingRequestCheck = PhotoBackupProcessingRequestCheck(
+        pendingIdentifiers: { await BGTaskScheduler.shared.pendingTaskRequests().map(\.identifier) },
+        submit: { [weak self] in
+            self?.scheduleProcessingCatchUp(controller: PhotoLibraryBackupSharedRef.shared.controller)
+        })
     private var didRegister = false
     private var registrationIssue: BackupExecutionOpportunityIssue?
     private var processingIssue: BackupExecutionOpportunityIssue?
@@ -449,22 +455,10 @@ final class PhotoBackupBackgroundCoordinator {
         }
     }
 
-    /// Submits the processing request only when none is pending, so a short window never moves the next long one. When
-    /// the scheduler does not answer within the end-of-window limit, the request is submitted: a moved long window is
-    /// better than none.
+    /// Submits the processing request only when none is pending, so a short window never moves the next long one.
+    /// The wait and the fallback for a scheduler that does not answer live in `PhotoBackupProcessingRequestCheck`.
     private func ensureProcessingRequest() async {
-        let identifier = Self.processingTaskIdentifier
-        let isPending = await BackgroundTaskRequestSubmitter.answer {
-            await BGTaskScheduler.shared.pendingTaskRequests().contains { $0.identifier == identifier }
-        }
-        BackgroundWorkLog.system.notice(
-            .photoBackup, "request.ensured",
-            [
-                (.init("kind"), .name(BackgroundWindowKind.photoBackup)),
-                (.init("pending"), isPending.map { .flag($0) } ?? .word("unknown")),
-            ])
-        guard isPending != true else { return }
-        scheduleProcessingCatchUp(controller: PhotoLibraryBackupSharedRef.shared.controller)
+        await processingRequestCheck.run()
     }
 
     private func waitForController() async -> BackgroundAccountWait<PhotoLibraryBackupController> {
