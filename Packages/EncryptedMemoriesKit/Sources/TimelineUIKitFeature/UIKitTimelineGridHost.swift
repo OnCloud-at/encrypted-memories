@@ -41,6 +41,9 @@
         /// display link and cancels ahead-warm so a hidden grid never competes with menus/transitions on screen;
         /// defaults to true so a grid that is always visible (e.g. a pushed collection detail) behaves as before.
         private let isActive: Bool
+        /// Extra points reserved between the safe-area top and the first row while a search scope picker is
+        /// presented above the grid. Zero on every surface that has no scope picker.
+        private let scopeBarGap: CGFloat
         /// A monotonically-bumped signal from the shell: whenever it changes, the grid scrolls to the newest
         /// photos. Drives the active Fotos-tab retap gesture that jumps to the newest photos without leaking scroll math
         /// out of the host. Compared against a `Coordinator`-remembered last value so a steady stream of identical
@@ -79,6 +82,10 @@
             selectedUIDs: Set<PhotoUID> = [],
             uploadBadges: PendingUploadBadges = .empty,
             isActive: Bool = true,
+            /// Extra points reserved between the safe-area top and the first row while a search scope picker is
+            /// presented above the grid. Pass `SquareTileGridEngine.standardOuterMargin` for the native gap; zero
+            /// (the default) keeps every other surface unchanged.
+            scopeBarGap: CGFloat = 0,
             scrollToLatestSignal: Int = 0,
             scrollToTopSignal: Int = 0,
             proxy: GridProxy<PhotoUID>? = nil,
@@ -108,6 +115,7 @@
             self.selectedUIDs = selectedUIDs
             self.uploadBadges = uploadBadges
             self.isActive = isActive
+            self.scopeBarGap = scopeBarGap
             self.scrollToLatestSignal = scrollToLatestSignal
             self.scrollToTopSignal = scrollToTopSignal
             self.proxy = proxy
@@ -174,6 +182,7 @@
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
                 uploadBadges: uploadBadges)
             view.setActive(isActive)
+            view.setScopeBarGap(scopeBarGap)
             wireProxy(proxy, to: view)
             return view
         }
@@ -207,6 +216,7 @@
                 uiView.completeContentReplacementTransition(prefersReducedMotion: prefersReducedMotion)
             }
             uiView.setActive(isActive)
+            uiView.setScopeBarGap(scopeBarGap)
             wireProxy(proxy, to: uiView)
             // A retap of the active Fotos tab bumps the signal and scrolls to the newest photos. Compare it with the
             // coordinator's last value so this fires once per retap, never on an unrelated update pass.
@@ -264,6 +274,13 @@
         private var lastInsetInputs: InsetInputs?
         private var lastInsetBounds: CGRect?
         private var insetFollowUpScheduled = false
+        /// Extra points reserved between the safe-area top and the first row while a search scope picker is
+        /// presented above this grid. Zero on every surface that has no scope picker.
+        private var scopeBarGap: CGFloat = 0
+        /// Total extra top padding currently baked into the engine's layout origin: the scope bar's measured
+        /// overhang below the safe-area top plus `scopeBarGap`. Unlike the content inset, this one moves the
+        /// rendered rows; see `updateScopeBarClearanceIfNeeded`.
+        private var scopeBarClearance: CGFloat = 0
         #if DEBUG
             var insetFollowUpCount = 0
             var insetFollowUpPending: Bool { insetFollowUpScheduled }
@@ -802,6 +819,7 @@
         }
 
         public override func layoutSubviews() {
+            updateScopeBarClearanceIfNeeded()
             if lastInsetBounds != bounds {
                 lastInsetBounds = bounds
                 scheduleInsetFollowUp()
@@ -908,6 +926,83 @@
                 active: active, hasWindow: window != nil, displayLinkRunning: displayLink.isRunning,
                 warmInFlight: warmInFlight, aheadWarmInFlight: aheadWarmInFlight, items: items.count)
             invalidateAccessibilityElements()
+        }
+
+        /// Reserves `gap` extra points between the search scope picker and the first row while the picker is
+        /// presented above this grid. Acts only on a real change, so the steady stream of `updateUIView` calls
+        /// is free; a change re-runs the layout pipeline (plus its follow-up pass), like a safe-area change
+        /// does. The anchor targets (`scrollToTop` and the initial viewport placement) still key off the safe
+        /// area, so appearing or disappearing never moves them; only the gap opens and closes.
+        public func setScopeBarGap(_ gap: CGFloat) {
+            guard scopeBarGap != gap else { return }
+            scopeBarGap = gap
+            setNeedsLayout()
+            scheduleInsetFollowUp()
+        }
+
+        /// Measures the presented scope bar and folds the result plus `scopeBarGap` into `scopeBarClearance`,
+        /// the extra top padding baked into the engine's layout origin. Runs on every layout pass while a
+        /// picker is present, but only acts on a real change. Because the origin shift moves every rendered
+        /// row, the scroll offset is compensated by the same delta whenever the grid is scrolled below the
+        /// top anchor, keeping the visible rows put; at the top anchor the shift IS the gap, so it stands.
+        /// A picker that cannot be measured (the search field sits outside the top bar) contributes no
+        /// clearance at all, keeping the pre-#944 position.
+        private func updateScopeBarClearanceIfNeeded() {
+            // An unmeasurable scope bar means no bar sits above this grid (the system placed the search
+            // field elsewhere, for example at the bottom). The steady state is no clearance at all: the
+            // pre-#944 position the grid held before any picker existed.
+            guard scopeBarGap > 0, let window else {
+                if scopeBarClearance != 0 { applyScopeBarClearance(0) }
+                return
+            }
+            guard let scopeBarBottom = searchScopeBarBottom(in: window) else {
+                if scopeBarClearance != 0 { applyScopeBarClearance(0) }
+                return
+            }
+            let overhang = max(0, scopeBarBottom - safeAreaInsets.top)
+            let clearance = overhang + scopeBarGap
+            if clearance != scopeBarClearance { applyScopeBarClearance(clearance) }
+        }
+
+        private func applyScopeBarClearance(_ clearance: CGFloat) {
+            let delta = clearance - scopeBarClearance
+            scopeBarClearance = clearance
+            // The cached engine bakes the clearance into its layout; drop it so the next render rebuilds.
+            cachedEngine = nil
+            if delta != 0, scrollView.contentOffset.y > -safeAreaInsets.top + 0.5 {
+                scrollView.contentOffset.y = max(-safeAreaInsets.top, scrollView.contentOffset.y + delta)
+            }
+        }
+
+        /// Bottom edge of a system search scope bar presented above this grid, in window coordinates. The
+        /// scope bar hangs below the navigation bar without extending the safe area, so the safe area alone
+        /// can't describe it. Like `visibleTabBarFrames` measures the real tab bar chrome, this measures the
+        /// scope picker's segmented control instead of hard-coding its height. Only the grid's own subtree
+        /// is skipped; views outside it that start just below the safe-area top and are wider than tall are
+        /// scope-picker segments.
+        private func searchScopeBarBottom(in window: UIWindow) -> CGFloat? {
+            let safeTop = safeAreaInsets.top
+            var result: CGFloat?
+            var views: [(UIView, Int)] = [(window, 0)]
+            var index = 0
+            while index < views.count && index < 400 {
+                let (view, depth) = views[index]
+                index += 1
+                guard depth <= 40, !view.isHidden, view.alpha > 0, view !== self else { continue }
+                if let control = view as? UISegmentedControl {
+                    let frame = control.convert(control.bounds, to: window)
+                    if frame.minY >= safeTop - 1, frame.minY < safeTop + 120,
+                        frame.width > frame.height, frame.height > 8
+                    {
+                        result = max(result ?? 0, frame.maxY)
+                    }
+                }
+                guard depth < 40, views.count < 400 else { continue }
+                for child in view.subviews {
+                    views.append((child, depth + 1))
+                }
+            }
+            return result
         }
 
         /// Stop the render loop and drop all in-flight warm work - used both when the view leaves its window and
@@ -1071,6 +1166,11 @@
         }
 
         /// Keep the newest row clear of a horizontal bottom tab bar, and the first row below the navigation bar.
+        /// The scope-picker gap is deliberately NOT added here: the scope bar hangs below the safe-area top
+        /// without extending it, so a bigger `contentInset.top` never moves the rendered rows (it only moves the
+        /// rubber-band boundary). The gap lives in the engine's layout origin instead - see
+        /// `updateScopeBarClearanceIfNeeded` - while this inset keeps the rest position the min-content-offset,
+        /// exactly as before the picker appeared.
         private func applyContentInsets() {
             let top = safeAreaInsets.top
             let bars = window.map { visibleTabBarFrames(in: $0) } ?? []
@@ -1334,9 +1434,10 @@
             }
 
             let level = activeLevel(profile: profile)
-            let engine = SquareTileGridEngine(
+            var engine = SquareTileGridEngine(
                 sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
             )
+            engine.topInset = scopeBarClearance
             let plan = engine.framePlan(
                 level: level,
                 viewportSize: lastLaidOutViewportSize,
@@ -1454,13 +1555,16 @@
 
         /// The canonical geometry engine for the current item count + profile, rebuilt only when either changes.
         /// A finger-scroll changes neither, so the engine (and its section arrays) is constructed once, not per frame.
+        /// `scopeBarClearance` participates in the cache key: a scope picker appearing or disappearing rebuilds
+        /// so the layout origin shift takes effect.
         func currentEngine(profile: GridLevelProfile) -> SquareTileGridEngine {
             if let cachedEngine, cachedEngineItemCount == items.count, cachedEngineProfileID == profile.id,
-                cachedEngineFillOrder == fillOrder
+                cachedEngineFillOrder == fillOrder, cachedEngine.topInset == scopeBarClearance
             {
                 return cachedEngine
             }
-            let engine = SquareTileGridEngine(sectionCounts: [items.count], profile: profile, fillOrder: fillOrder)
+            var engine = SquareTileGridEngine(sectionCounts: [items.count], profile: profile, fillOrder: fillOrder)
+            engine.topInset = scopeBarClearance
             cachedEngine = engine
             cachedEngineItemCount = items.count
             cachedEngineProfileID = profile.id
