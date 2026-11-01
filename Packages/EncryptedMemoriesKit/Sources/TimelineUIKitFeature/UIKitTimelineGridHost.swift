@@ -401,6 +401,9 @@
         /// placement, or a new item set forgets it.
         private var resizeAnchorItemID: PhotoUID?
         private var lastLaidOutSafeAreaInsets: UIEdgeInsets = .zero
+        /// The active reserved regions (the iPhone Duo fold, a camera) in viewport coordinates; selection marks move
+        /// out of them. Read on every layout; a hinge change asks for a layout.
+        private(set) var reservedRegionLayout: ReservedRegionLayout = .none
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
@@ -817,6 +820,7 @@
             restoreViewportResizePosition(resizePosition)
             lastLaidOutViewportSize = bounds.size
             lastLaidOutSafeAreaInsets = safeAreaInsets
+            reservedRegionLayout = currentReservedRegionLayout()
             requestRender()
             invalidateAccessibilityElements()
         }
@@ -963,6 +967,7 @@
 
             metalView.translatesAutoresizingMaskIntoConstraints = true
             metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            observeHingeForReservedRegions()
             addSubview(metalView)
 
             scrollView.translatesAutoresizingMaskIntoConstraints = true
@@ -2052,8 +2057,41 @@
                 overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) },
                 uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
                     uploadBadgeAnimator.frame(for: uid, target: badge, now: frameTime)
-                }
+                },
+                reservedRegions: reservedRegionLayout
             )
+        }
+
+        /// The Metal view fills the host, so the host's reserved regions are already in viewport coordinates.
+        private func currentReservedRegionLayout() -> ReservedRegionLayout {
+            #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
+                if #available(iOS 27.1, *) {
+                    let regions =
+                        reservedRegions(kind: .division) + reservedRegions(kind: .occlusion)
+                    // Tiles under the bars are not visible, so a mark must not move there.
+                    return ReservedRegionLayout(
+                        areas: regions.map { ReservedRegionArea(frame: $0.frame, isActive: $0.isActive) },
+                        bounds: bounds.inset(by: scrollView.adjustedContentInset))
+                }
+            #endif
+            return .none
+        }
+
+        /// UIKit reports no separate change of reserved regions. Folding or opening iPhone Duo changes the hinge, so
+        /// the hinge update reads the regions again and draws only when they changed. The angle itself decides nothing.
+        private func observeHingeForReservedRegions() {
+            #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
+                if #available(iOS 27.1, *) {
+                    addInteraction(UIHingeInteraction { [weak self] _, _ in self?.refreshReservedRegions() })
+                }
+            #endif
+        }
+
+        private func refreshReservedRegions() {
+            let layout = currentReservedRegionLayout()
+            guard layout != reservedRegionLayout else { return }
+            reservedRegionLayout = layout
+            requestRender()
         }
     }
 

@@ -57,6 +57,149 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         }
     }
 
+    // MARK: - Recovery after a transient failure (#982)
+
+    func testATransientFailureRecoversWhenTheDatabaseAnswers() throws {
+        // Busy, locked, out of memory, interrupted, I/O and full disk, primary and extended codes.
+        let codes: [Int32] = [
+            SQLITE_BUSY, SQLITE_LOCKED, SQLITE_NOMEM, SQLITE_INTERRUPT, SQLITE_IOERR, SQLITE_FULL,
+            SQLITE_BUSY | (2 << 8), SQLITE_IOERR | (10 << 8),
+        ]
+        for code in codes {
+            let connection = try makeConnection()
+            defer { connection.close() }
+            connection.withLock { connection.markFailed(resultCode: code) }
+            XCTAssertFalse(connection.isOperational(probeDatabase: false), "\(code) is recorded")
+
+            XCTAssertTrue(connection.isOperationalAfterRecovery(), "\(code) recovers")
+            connection.withLock { XCTAssertFalse(connection.operationFailed, "\(code) is forgotten") }
+        }
+    }
+
+    func testAFailureThatIsNotTransientStaysRecorded() throws {
+        // A corrupt database, a file that is no database, a read-only file, a schema change, a constraint, a misuse,
+        // a denied statement and an unknown cause.
+        let codes: [Int32?] = [
+            SQLITE_CORRUPT, SQLITE_NOTADB, SQLITE_READONLY, SQLITE_SCHEMA, SQLITE_CONSTRAINT, SQLITE_MISUSE,
+            SQLITE_AUTH, SQLITE_ERROR, nil,
+        ]
+        for code in codes {
+            let connection = try makeConnection()
+            defer { connection.close() }
+            connection.withLock { connection.markFailed(resultCode: code) }
+
+            XCTAssertFalse(connection.isOperationalAfterRecovery(), "\(String(describing: code)) stays recorded")
+            XCTAssertFalse(connection.isOperationalAfterRecovery(), "also at the next check")
+        }
+    }
+
+    func testOneFailureThatIsNotTransientKeepsEarlierTransientFailuresRecorded() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            connection.markFailed(resultCode: SQLITE_BUSY)
+            connection.markFailed(resultCode: SQLITE_CORRUPT)
+            connection.markFailed(resultCode: SQLITE_FULL)
+        }
+        XCTAssertFalse(connection.isOperationalAfterRecovery())
+    }
+
+    func testATransientFailureDoesNotRecoverWhileATransactionIsOpen() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            connection.markFailed(resultCode: SQLITE_BUSY)
+        }
+        XCTAssertFalse(connection.isOperationalAfterRecovery(), "the open transaction can hold a half-done write")
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertTrue(connection.isOperationalAfterRecovery())
+    }
+
+    /// A rollback that failed can leave a transaction open with half a write in it; the store stops (#982).
+    func testAnOpenTransactionStopsTheStoreWithoutARecordedFailure() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertFalse(connection.isOperationalAfterRecovery())
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        }
+        XCTAssertTrue(connection.isOperationalAfterRecovery())
+    }
+
+    /// After a full disk, an I/O error, an interrupt or no memory, SQLite can end the transaction on its own. The
+    /// explicit rollback then fails, but no transaction stays open, and the transient failure still recovers (#982).
+    func testARollbackAfterSQLiteEndedTheTransactionKeepsATransientFailureRecoverable() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            connection.markFailed(resultCode: SQLITE_FULL)
+            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+            connection.rollBack()
+            XCTAssertNotEqual(sqlite3_extended_errcode(connection.database), SQLITE_OK, "the rollback itself failed")
+            XCTAssertTrue(connection.failuresAreTransient)
+        }
+        XCTAssertTrue(connection.isOperationalAfterRecovery())
+    }
+
+    func testARollbackThatEndsTheTransactionRecordsNoFailure() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            connection.rollBack()
+            XCTAssertNotEqual(sqlite3_get_autocommit(connection.database), 0)
+            XCTAssertFalse(connection.operationFailed)
+        }
+        XCTAssertTrue(connection.isOperational(probeDatabase: false))
+    }
+
+    /// A rollback that leaves the transaction open can keep half a write; the store stops for good.
+    func testARollbackThatLeavesTheTransactionOpenStopsTheStore() throws {
+        let connection = try makeConnection()
+        defer {
+            connection.withLock {
+                sqlite3_set_authorizer(connection.database, nil, nil)
+                sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil)
+            }
+            connection.close()
+        }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            sqlite3_set_authorizer(
+                connection.database,
+                { _, action, _, _, _, _ in action == SQLITE_TRANSACTION ? SQLITE_DENY : SQLITE_OK }, nil)
+            connection.rollBack()
+            XCTAssertEqual(sqlite3_get_autocommit(connection.database), 0, "the denied rollback left it open")
+            XCTAssertTrue(connection.operationFailed)
+            XCTAssertFalse(connection.failuresAreTransient)
+        }
+        XCTAssertFalse(connection.isOperationalAfterRecovery())
+    }
+
+    /// I/O codes that report damaged data stay recorded like a corrupt database.
+    func testAnIOErrorThatReportsDamagedDataStaysRecorded() throws {
+        for code in [SQLITE_IOERR | (32 << 8), SQLITE_IOERR | (33 << 8)] {
+            let connection = try makeConnection()
+            defer { connection.close() }
+            connection.withLock { connection.markFailed(resultCode: code) }
+            XCTAssertFalse(connection.isOperationalAfterRecovery(), "\(code) stays recorded")
+        }
+    }
+
+    func testAClosedConnectionNeverRecovers() throws {
+        let connection = try makeConnection()
+        connection.withLock { connection.markFailed(resultCode: SQLITE_BUSY) }
+        connection.close()
+        XCTAssertFalse(connection.isOperationalAfterRecovery())
+    }
+
     func testCloseOptimizesThenReleasesTheHandleOnlyOnce() throws {
         let connection = try makeConnection()
         let trace = Trace()

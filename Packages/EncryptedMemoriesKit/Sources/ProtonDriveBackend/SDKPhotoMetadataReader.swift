@@ -15,21 +15,17 @@ enum SDKPhotoMetadataReader {
     }
 
     /// Reuses the SDK's decrypted sections from the same node read as the Info panel.
+    /// With `sharing`, an overlapping album membership read of the same photo shares the SDK read.
     static func read(
-        for uid: PhotoUID, client: any SDKPhotoCatalogClient, workMeasurements: SupportWorkMeasurements? = nil
+        for uid: PhotoUID, client: any SDKPhotoCatalogClient, sharing: SDKPresentationNodeReads? = nil,
+        workMeasurements: SupportWorkMeasurements? = nil
     ) async throws -> ReadResult {
         try await WorkMeasurementOperation.run(.viewerRead, collector: workMeasurements) { measurement in
             measurement?.record(.nodesRequested)
             measurement?.record(.nodesUnique)
-            let node = try await SDKCancellableOperation.run { token in
-                measurement?.record(.nodeCallsStarted)
-                let value = try await client.getNode(
-                    nodeUid: SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), cancellationToken: token)
-                measurement?.record(.nodeCallsReturned)
-                return value
-            } cancel: { token in
-                try? await client.cancelGetNode(cancellationToken: token)
-            }
+            let node = try await SDKNodeRead.node(
+                SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), client: client, sharing: sharing,
+                measurement: measurement)
             try Task.checkCancellation()
             let result: ReadResult
             switch node {

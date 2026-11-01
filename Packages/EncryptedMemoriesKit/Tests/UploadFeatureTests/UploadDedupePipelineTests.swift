@@ -533,7 +533,7 @@ final class UploadDedupePipelineTests: XCTestCase {
             await localPipeline.uploadDidFail(d)  // Unblock a broken implementation after the assertion.
             let retried = try await retry.value
             XCTAssertEqual(retried.identity, initial.identity)
-            XCTAssertEqual(retried.decision, .skip(.inconsistentRemoteState, remoteLinkID: "trash"))
+            XCTAssertEqual(retried.decision, .skip(.deletedRemotely, remoteLinkID: "trash"))
         }
     }
 
@@ -1416,10 +1416,10 @@ final class UploadDedupePipelineTests: XCTestCase {
         let before = checker.nameLookupAttemptCount
 
         checker.remoteItemsByNameHash[probe.identity.nameHash] = []
-        let uncertain = try await pipeline.resolve(d)
-        XCTAssertEqual(uncertain.decision, .skip(.inconsistentRemoteState, remoteLinkID: "fresh-trash"))
+        let vanished = try await pipeline.resolve(d)
+        XCTAssertEqual(vanished.decision, .skip(.deletedRemotely, remoteLinkID: "fresh-trash"))
         XCTAssertEqual(checker.nameLookupAttemptCount, before + 1, "cached trash is not fresh evidence")
-        XCTAssertFalse(uncertain.decision.uploadsBytes)
+        XCTAssertFalse(vanished.decision.uploadsBytes)
         let retained = try XCTUnwrap(store.record(for: d.source))
         XCTAssertEqual(retained.source, saved.source)
         XCTAssertEqual(retained.sha1Hex, saved.sha1Hex)
@@ -1430,7 +1430,7 @@ final class UploadDedupePipelineTests: XCTestCase {
         XCTAssertEqual(retained.remoteLinkID, saved.remoteLinkID)
     }
 
-    func testVanishedKnownTrashStaysUnknownWithoutUploadAndStillFindsActiveCopies() async throws {
+    func testVanishedKnownTrashStaysDeletedWithoutUploadAndStillFindsActiveCopies() async throws {
         let d = descriptor()
         let probe = try await pipeline.resolve(d)
         await pipeline.uploadDidFail(d)
@@ -1445,8 +1445,8 @@ final class UploadDedupePipelineTests: XCTestCase {
             pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
             for _ in 0..<2 {
                 let vanished = try await pipeline.resolve(d)
-                XCTAssertEqual(vanished.decision, .skip(.inconsistentRemoteState, remoteLinkID: saved.remoteLinkID))
-                XCTAssertFalse(vanished.decision.uploadsBytes, "uncertainty never revokes a known deletion")
+                XCTAssertEqual(vanished.decision, .skip(.deletedRemotely, remoteLinkID: saved.remoteLinkID))
+                XCTAssertFalse(vanished.decision.uploadsBytes, "a vanished trash entry never revokes a known deletion")
                 XCTAssertEqual(store.record(for: d.source)?.outcome, saved.outcome)
                 XCTAssertEqual(store.record(for: d.source)?.remoteLinkID, saved.remoteLinkID)
                 await pipeline.uploadDidFail(d)
@@ -1532,7 +1532,7 @@ final class UploadDedupePipelineTests: XCTestCase {
         let queriesBefore = checker.findCallCount
         pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
         let third = try await pipeline.resolve(d)
-        XCTAssertEqual(third.decision, .skip(.inconsistentRemoteState, remoteLinkID: "link-t"))
+        XCTAssertEqual(third.decision, .skip(.deletedRemotely, remoteLinkID: "link-t"))
         XCTAssertGreaterThan(checker.findCallCount, queriesBefore)
     }
 

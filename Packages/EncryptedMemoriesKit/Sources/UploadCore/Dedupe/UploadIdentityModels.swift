@@ -7,7 +7,7 @@ import PhotosCore
 /// All upload paths use this vocabulary so the dedupe pipeline stays cross-platform.
 public struct UploadSourceIdentity: Sendable, Hashable, Codable {
     /// Which adapter produced the resource - the namespace of `identifier`.
-    public enum Kind: String, Sendable, Codable {
+    public enum Kind: String, Sendable, Codable, CaseIterable {
         /// A file on disk; `identifier` is the absolute file-system path.
         case fileURL
         /// A photo-library asset resource. Prefer a stable provider identifier when available.

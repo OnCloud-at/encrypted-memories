@@ -30,6 +30,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// always describes every running upload.
     private nonisolated let uploadNetworkAdmission = UploadNetworkAdmission()
     private nonisolated let sharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
+    private nonisolated let presentationNodeReads = SDKPresentationNodeReads()
     private nonisolated let rootMaterialResolver = PhotosRootMaterialResolver()
     private var photosRoot: SDKNodeUid?
     private var photosShareID: String?
@@ -393,6 +394,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // Admission is closed and every published operation has settled before this teardown runs.
         // Drain cache-owned SDK tasks now, including flights orphaned by admission cancellation.
         await sharedAlbumSnapshotCache.invalidateAll()
+        await presentationNodeReads.invalidateAndJoin()
 
         let timelineTask = timelineLoadTask?.task
         timelineLoadTask = nil
@@ -1793,6 +1795,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             client: photosClient,
             admission: shutdownGate,
             sharedAlbumSnapshotCache: sharedAlbumSnapshotCache,
+            presentationNodeReads: presentationNodeReads,
             requestCause: requestCause(.albums),
             workMeasurements: workMeasurements
         )
@@ -1976,6 +1979,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func restore(_ uids: [PhotoUID]) async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
             let root = try await bridge.resolvePhotosRoot()
+            try await bridge.listTrashForRelatedPhotos(of: uids)
             _ = try await TrashedRelatedPhotos.restore(
                 uids, candidates: bridge.recentlyDeleted.trashedRelatedPhotos(of: uids),
                 readLinks: { linkIDs in
@@ -1996,6 +2000,23 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             bridge.recentlyDeleted.restored(uids)
             bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
             await bridge.reportRecentlyDeleted()
+        }
+    }
+
+    /// The related photos that a restore takes along are known from a trash listing of this session. A restore that
+    /// runs before any listing, such as the replay of a pending restore after a relaunch, lists the trash once. A failed
+    /// or rate-limited listing never holds the restore back: the main photos come back alone, as before. A cancel ends
+    /// the restore before any photo changes; URLSession reports a cancelled request as `URLError.cancelled`, so the
+    /// task state decides, not the error type.
+    func listTrashForRelatedPhotos(of mains: [PhotoUID]) async throws {
+        guard !recentlyDeleted.hasAppliedListing, recentlyDeleted.trashedRelatedPhotos(of: mains).isEmpty else {
+            return
+        }
+        do {
+            _ = try await listTrash(retryOnRateLimit: false)
+        } catch {
+            try Task.checkCancellation()
+            DebugLog.log("restore: trash listing failed, the main photos come back alone - \(error)")
         }
     }
 
@@ -2023,11 +2044,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     /// Lists the volume trash, stores the listing, and registers its photos for their thumbnails.
-    private func listTrash() async throws -> [PhotoItem] {
+    private func listTrash(retryOnRateLimit: Bool = true) async throws -> [PhotoItem] {
         guard !isShutDown else { throw CancellationError() }
         let ticket = recentlyDeleted.beginListing()
         let root = try await resolvePhotosRoot()
-        let files = try await driveSession.listTrash(volumeID: root.volumeID)
+        let files = try await driveSession.listTrash(volumeID: root.volumeID, retryOnRateLimit: retryOnRateLimit)
             .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
         // Hide related photos (Live Photo videos, series frames), like the timeline; a restore of the main takes them.
         let (links, related) = TrashedRelatedPhotos.split(files, volumeID: root.volumeID)
@@ -2204,7 +2225,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
         let read = try await SDKPhotoMetadataReader.read(
-            for: uid, client: photosClient, workMeasurements: workMeasurements)
+            for: uid, client: photosClient, sharing: presentationNodeReads, workMeasurements: workMeasurements)
         let metadata = read.metadata
         if let timelineOrderStore,
             !timelineOrderStore.recordResolvedMetadata(
