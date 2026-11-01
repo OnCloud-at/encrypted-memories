@@ -26,7 +26,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     public func close() { connection.close() }
 
-    public func isOperational() -> Bool { connection.isOperational(probeDatabase: false) }
+    /// A failed call stops the store only until the database answers again, see
+    /// `SQLiteStoreConnection.isOperationalAfterRecovery()`. A row that does not decode never stops it (#982).
+    public func isOperational() -> Bool { connection.isOperationalAfterRecovery() }
 
     // MARK: - Duplicate-check evidence
 
@@ -97,6 +99,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         connection.withLock {
             var outcome = PendingHandoffOutcome.recorded
             let committed = transaction {
+                // A handoff of this revision that this build cannot read stays as it is (#982).
+                guard case .readable = handoffReadLocked(handoff.key, revision: handoff.revision) else { return false }
                 guard
                     execute(
                         """
@@ -178,8 +182,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         latestHandoffsRead(for: keys).compactMapValues(\.handoff)
     }
 
-    /// The latest handoff of each source, or `unreadable` when its query failed or its row did not decode. Unlike the
-    /// list readers, a decode or step failure leaves the store's failure state unchanged here.
+    /// The latest handoff of each source, or `unreadable` when its query failed or its row did not decode. A failed
+    /// prepare records a failure like every call; a failed step and a row that does not decode record none.
     public func latestHandoffsRead(for keys: [PendingSourceKey]) -> [PendingSourceKey: PendingHandoffRead] {
         guard !keys.isEmpty else { return [:] }
         return connection.withLock {
@@ -206,7 +210,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         bindKey(stmt, key)
         switch sqlite3_step(stmt) {
         case SQLITE_ROW:
-            guard let handoff = handoffRow(stmt) else { return .unreadable }
+            guard let handoff = handoffRow(stmt) else {
+                Self.noteUndecodableRow()
+                return .unreadable
+            }
             return .readable(handoff)
         case SQLITE_DONE: return .readable(nil)
         default: return .unreadable
@@ -240,7 +247,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             transaction {
                 handoffs.allSatisfy { key, revision in
                     execute(
-                        "UPDATE handoff SET acknowledged=1 WHERE source_kind=? AND source_id=? AND revision_us=?;"
+                        "UPDATE handoff SET acknowledged=1 WHERE source_kind=? AND source_id=? AND revision_us=? "
+                            + "AND kind IN (\(Self.sqlList(PendingHandoffKind.self)));"
                     ) { stmt in
                         bindKey(stmt, key)
                         sqlite3_bind_int64(stmt, 3, revision.rawValue)
@@ -260,6 +268,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 """
                 DELETE FROM handoff
                 WHERE acknowledged=1 AND created_at < ?
+                  AND source_kind IN (\(Self.sqlList(UploadSourceIdentity.Kind.self)))
+                  AND kind IN (\(Self.sqlList(PendingHandoffKind.self)))
+                  AND remote_volume_id IS NOT NULL AND remote_link_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM source_state u
+                    WHERE u.source_id=handoff.source_id
+                      AND (u.source_kind NOT IN (\(Self.sqlList(UploadSourceIdentity.Kind.self)))
+                        OR u.desired NOT IN (\(Self.sqlList(PendingDesiredState.self)))
+                        OR (u.remote_op IS NOT NULL AND u.remote_op NOT IN (\(Self.sqlList(PendingSourceEffect.self)))))
+                  )
                   AND NOT EXISTS (
                     SELECT 1 FROM pending_action a
                     WHERE a.source_kind=handoff.source_kind AND a.source_id=handoff.source_id AND a.failed=0
@@ -337,35 +355,78 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
-    /// Identifiers among `identifiers` whose desired state is excluded, or nil when the store cannot answer.
-    /// The backup engine drops these before it writes queue rows.
-    public func excludedIdentifiers(kind: UploadSourceIdentity.Kind, among identifiers: [String]) -> Set<String>? {
-        guard !identifiers.isEmpty else { return [] }
+    /// The identifiers among `identifiers` that are excluded or have a row that this build cannot read, or nil when
+    /// the store cannot answer. An identifier that is missing from the result is included. A row that this build cannot
+    /// read may hold a newer build's exclusion: that photo waits and its row stays; the other photos go on (#982).
+    /// An earlier transient failure does not stop this read. A lasting failure, an open transaction or a failure of
+    /// this read answers nil, so no photo uploads while its exclusion is unknown.
+    public func exclusions(
+        kind: UploadSourceIdentity.Kind, among identifiers: [String]
+    ) -> [String: BackupSourceExclusion]? {
+        guard !identifiers.isEmpty else { return [:] }
         return connection.withLock {
-            guard db != nil, !connection.operationFailed else { return nil }
-            var result = Set<String>()
-            var stmt: OpaquePointer?
-            guard
-                prepare(
-                    "SELECT 1 FROM source_state WHERE source_kind=? AND source_id=? AND desired='excluded';",
-                    &stmt)
+            guard db != nil, sqlite3_get_autocommit(db) != 0,
+                !connection.operationFailed || connection.failuresAreTransient
             else { return nil }
-            defer { sqlite3_finalize(stmt) }
-            for identifier in identifiers {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                bindText(stmt, 1, kind.rawValue)
-                bindText(stmt, 2, identifier)
-                let step = sqlite3_step(stmt)
-                if step == SQLITE_ROW {
-                    result.insert(identifier)
-                } else if step != SQLITE_DONE {
-                    connection.markFailed()
-                    return nil
+            var result: [String: BackupSourceExclusion] = [:]
+            // A row whose kind does not decode still belongs to its identifier, whatever its kind: the reads cover the
+            // known kinds and every gap between them.
+            var seen = Set<String>()
+            let unique = identifiers.filter { seen.insert($0).inserted }
+            for start in stride(from: 0, to: unique.count, by: Self.identifierChunkSize) {
+                let chunk = unique[start..<min(start + Self.identifierChunkSize, unique.count)]
+                let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+                for kindFilter in Self.sourceKindFilters {
+                    let read = query(
+                        "SELECT source_kind, source_id, desired, remote_op FROM source_state "
+                            + "WHERE \(kindFilter) AND source_id IN (\(placeholders));",
+                        bind: { stmt in
+                            for (offset, identifier) in chunk.enumerated() {
+                                self.bindText(stmt, Int32(offset + 1), identifier)
+                            }
+                        }
+                    ) { stmt in
+                        guard let identifier = columnText(stmt, 1) else { return }
+                        let rowKind = sourceStateEnumText(stmt, 0).flatMap(UploadSourceIdentity.Kind.init(rawValue:))
+                        let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:))
+                        let operationReadable =
+                            sqlite3_column_type(stmt, 3) == SQLITE_NULL
+                            || sourceStateEnumText(stmt, 3).flatMap(PendingSourceEffect.init(rawValue:)) != nil
+                        guard let rowKind, let desired, operationReadable else {
+                            Self.noteUndecodableRow()
+                            result[identifier] = .unreadable
+                            return
+                        }
+                        if rowKind == kind, desired == .excluded, result[identifier] == nil {
+                            result[identifier] = .excluded
+                        }
+                    }
+                    guard read else { return nil }
                 }
             }
             return result
         }
+    }
+
+    /// Identifiers in one read; far below SQLite's limit of bound parameters.
+    private static let identifierChunkSize = 500
+
+    /// The kinds that this build knows, read by key, and the gaps before, between and after them, read as ranges of
+    /// the key. Together they cover every kind, and no read scans the table (#982).
+    private static let sourceKindFilters: [String] = {
+        let known = UploadSourceIdentity.Kind.allCases.map(\.rawValue).sorted()
+        var filters = ["source_kind IN (\(sqlList(UploadSourceIdentity.Kind.self)))", "source_kind < '\(known[0])'"]
+        for (lower, upper) in zip(known, known.dropFirst()) {
+            filters.append("source_kind > '\(lower)' AND source_kind < '\(upper)'")
+        }
+        filters.append("source_kind > '\(known[known.count - 1])'")
+        return filters
+    }()
+
+    /// The raw values of `type` as an SQL list, for a statement that must not touch a row this build cannot read.
+    private static func sqlList<Value: RawRepresentable & CaseIterable>(_ type: Value.Type) -> String
+    where Value.RawValue == String {
+        type.allCases.map { "'\($0.rawValue)'" }.joined(separator: ",")
     }
 
     /// Writes desired = excluded for each request in one transaction and returns the new states.
@@ -379,7 +440,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     // A commit of the deleted revision is already durable here, even when its event has not reached
                     // the coordinator yet. The earlier upload that the coordinator sends for an edit goes first: the
                     // completed trash of that photo moves on to the latest handoff, see `completeEffect`.
-                    let durable = request.revision.flatMap { handoffLocked(request.key, revision: $0)?.remote }
+                    var durable: PhotoUID?
+                    if let revision = request.revision {
+                        guard case .readable(let handoff) = handoffReadLocked(request.key, revision: revision) else {
+                            return false
+                        }
+                        durable = handoff?.remote
+                    }
                     // A delete that could not tell its photo names none: the photo that the state still knows can be
                     // another one, and it never goes to the trash on an unknown.
                     let remote = request.remote ?? durable ?? (request.remoteUnknown ? nil : previous?.remote)
@@ -444,7 +511,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         at date: Date
     ) -> PendingSourceState? {
         connection.withLock {
-            let durable = revision.flatMap { handoffLocked(key, revision: $0)?.remote }
+            var durable: PhotoUID?
+            if let revision {
+                guard case .readable(let handoff) = handoffReadLocked(key, revision: revision) else { return nil }
+                durable = handoff?.remote
+            }
             guard
                 execute(
                     """
@@ -683,7 +754,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                             """
                             UPDATE source_state SET remote_op=?
                             WHERE source_kind=? AND source_id=? AND generation=? AND \(condition)
-                              AND remote_link_id=?;
+                              AND remote_link_id=?
+                              AND (remote_op IS NULL OR remote_op IN (\(Self.sqlList(PendingSourceEffect.self))));
                             """,
                             bind: { stmt in
                                 bindText(stmt, 1, effect.rawValue)
@@ -725,7 +797,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return connection.withLock {
             transaction {
                 keys.allSatisfy { key in
-                    execute(
+                    // A row that this build cannot read stays as it is and the other rows go on; a failed read fails
+                    // the write (#982).
+                    let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { self.bindKey($0, key) }
+                    guard read.queried else { return false }
+                    guard read.succeeded, !read.states.isEmpty else { return true }
+                    return execute(
                         "UPDATE source_state SET listed_in_trash=0, updated_at=? WHERE source_kind=? AND source_id=?;"
                     ) { stmt in
                         sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
@@ -904,11 +981,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     // MARK: - Locked helpers
 
-    private func handoffLocked(_ key: PendingSourceKey, revision: UploadBackupRevision) -> PendingHandoff? {
-        handoffsLocked(where: "source_kind=? AND source_id=? AND revision_us=?") { stmt in
+    /// The handoff of `revision`, or `unreadable` when its query failed or its row does not decode.
+    private func handoffReadLocked(_ key: PendingSourceKey, revision: UploadBackupRevision) -> PendingHandoffRead {
+        let read = handoffsReadLocked(where: "source_kind=? AND source_id=? AND revision_us=?") { stmt in
             self.bindKey(stmt, key)
             sqlite3_bind_int64(stmt, 3, revision.rawValue)
-        }.first
+        }
+        return read.complete ? .readable(read.handoffs.first) : .unreadable
     }
 
     private func sourceStateLocked(_ key: PendingSourceKey) -> PendingSourceStateRead {
@@ -926,7 +1005,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     private func sourceStatesLocked(
         where condition: String?,
         bind: ((OpaquePointer?) -> Void)? = nil
-    ) -> (states: [PendingSourceState], succeeded: Bool) {
+    ) -> (states: [PendingSourceState], succeeded: Bool, queried: Bool) {
         var result: [PendingSourceState] = []
         var decoded = true
         let sql =
@@ -940,7 +1019,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:)),
                 remoteOperationIsNull || remoteOperation != nil
             else {
-                connection.markFailed()
+                Self.noteUndecodableRow()
                 decoded = false
                 return
             }
@@ -981,7 +1060,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 19))
                 ))
         }
-        return (result, queried && decoded)
+        return (result, queried && decoded, queried)
+    }
+
+    /// A row that this build cannot decode, for example one that a newer build wrote. The row stays unchanged, its
+    /// read reports it as incomplete, and the other rows keep working (#982).
+    private static func noteUndecodableRow() {
+        PhotoDiagnostics.shared.increment("pending.undecodableRow")
     }
 
     /// Enum raw values must include every persisted byte, including any embedded NUL.
@@ -1012,7 +1097,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 result.append(handoff)
             } else {
                 decoded = false
-                connection.markFailed()
+                Self.noteUndecodableRow()
             }
         }
         return (result, queried && decoded)
@@ -1074,7 +1159,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             guard let key = key(stmt, kindColumn: 0, idColumn: 1),
                 let kind = columnText(stmt, 2).flatMap(PendingActionKind.init(rawValue:))
             else {
-                connection.markFailed()
+                Self.noteUndecodableRow()
                 decoded = false
                 return
             }
@@ -1095,25 +1180,41 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     // MARK: - SQLite plumbing
 
-    /// Runs `body` in one IMMEDIATE transaction. Returns false and rolls back when `body` or the commit fails.
+    /// Runs `body` in one IMMEDIATE transaction. Returns false and rolls back when `body` or the commit fails. A failed
+    /// SQLite call in `body` records its own failure; a writer that refuses a row it cannot read records none (#982).
     private func transaction(_ body: () -> Bool) -> Bool {
-        guard db != nil, sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+        guard db != nil else {
             connection.markFailed()
             return false
         }
-        guard body(), sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            connection.markFailed()
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+            connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+            return false
+        }
+        guard body() else {
+            connection.rollBack()
+            return false
+        }
+        guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+            let commit = sqlite3_extended_errcode(db)
+            connection.rollBack()
+            connection.markFailed(resultCode: commit)
             return false
         }
         return true
     }
 
     private func prepare(_ sql: String, _ stmt: inout OpaquePointer?) -> Bool {
-        guard db != nil, sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+        guard db != nil else {
+            connection.markFailed()
+            return false
+        }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            // The extended code tells damaged data from a passing I/O error; read it before finalize resets it.
+            let code = sqlite3_extended_errcode(db)
             sqlite3_finalize(stmt)
             stmt = nil
-            connection.markFailed()
+            connection.markFailed(resultCode: code)
             return false
         }
         return true
@@ -1125,7 +1226,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         bind(stmt)
         guard sqlite3_step(stmt) == SQLITE_DONE else {
-            connection.markFailed()
+            connection.markFailed(resultCode: sqlite3_extended_errcode(db))
             return false
         }
         return true
@@ -1146,7 +1247,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             step = sqlite3_step(stmt)
         }
         guard step == SQLITE_DONE else {
-            connection.markFailed()
+            connection.markFailed(resultCode: sqlite3_extended_errcode(db))
             return false
         }
         return true

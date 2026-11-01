@@ -37,9 +37,16 @@ final class AlbumSyncDeletedPhotoScenarioTests: XCTestCase {
             let report = try await reinstalled.syncAlbum(
                 ["asset-1"], backup: EditScenarioAlbumBackup(device: reinstalled))
             XCTAssertFalse(report.isFullySynced)
-            XCTAssertFalse(report.problems.contains { $0.issue == .remoteDeletion })
-            XCTAssertFalse(report.problems.isEmpty, "uncertain remote state stays visible")
+            XCTAssertEqual(report.problems.map(\.issue), [.remoteDeletion], "the photo stays deleted in Proton (#984)")
+            XCTAssertFalse(report.problems.isEmpty, "the deletion stays visible")
+            XCTAssertEqual(
+                report.problems.first?.reason, L10n.string("backup.state_skipped_remote_deletion"),
+                "the same words as the Backup list")
+            XCTAssertEqual(report.problems.first?.isRetryable, false, "no Try again")
             XCTAssertEqual(first.server.uploadRequestCount, 1, "ordinary retries and later runs create no consent")
+            let rows = reinstalled.queue.entries(in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
+            XCTAssertEqual(rows.map(\.attempts), [0], "the emptied trash spends no attempt")
+            XCTAssertEqual(reinstalled.queue.summary().failed, 0)
         }
     }
 

@@ -2351,6 +2351,114 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.notice)
     }
 
+    // MARK: - A request that the suspension of the app ended
+
+    /// Merge All with 60 groups. The app goes to the background while the first batch runs; the batch ends with
+    /// `failures` and stays paused until `beforeResume` ran. Returns after the run ended.
+    private func mergeAllAcrossAPause(
+        groups count: Int = 60,
+        failures: @MainActor (ExactDuplicatesModel, FakeDuplicateFinder) -> Void,
+        beforeResume: @MainActor (ExactDuplicatesModel, FakeDuplicateFinder) async -> Void = { model, _ in
+            model.resumeMerging()
+        }
+    ) async -> (ExactDuplicatesModel, FakeDuplicateFinder) {
+        let (model, finder, _) = await loadedModel(groups: count)
+        failures(model, finder)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        model.pauseMerging()
+        finder.mergeGate.open()
+        await model.runningMergeWorkEnded()
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(finder.batches.count, 1, "nothing merges again before the app is active")
+        await beforeResume(model, finder)
+        await merge.value
+        return (model, finder)
+    }
+
+    func testAGroupThatFailedWhileTheAppWasAwayMergesOnceMoreAfterTheReturn() async {
+        // A read through the SDK fails with an error that names no timeout.
+        let errors: [any Error] = [
+            URLError(.timedOut), URLError(.networkConnectionLost), UploadError.backend("SDK read failed"),
+        ]
+        for error in errors {
+            var failed = ""
+            let (model, finder) = await mergeAllAcrossAPause { model, finder in
+                failed = model.groups[3].id
+                finder.nextMergeErrors[failed] = error
+            }
+            XCTAssertEqual(finder.batches.count, 4, "\(error)")
+            XCTAssertEqual(finder.batches.dropFirst().first, [failed], "only the failed group merges again, \(error)")
+            XCTAssertEqual(model.groups.count, 0, "\(error)")
+            XCTAssertNil(model.notice, "no failed merge, \(error)")
+        }
+    }
+
+    func testABatchThatTheSuspensionEndedCompletelyContinuesMergeAll() async {
+        let (model, finder) = await mergeAllAcrossAPause { model, finder in
+            for group in model.groups.prefix(25) { finder.nextMergeErrors[group.id] = URLError(.timedOut) }
+        }
+        XCTAssertEqual(finder.batches.count, 4, "the run does not stop after the interrupted batch")
+        XCTAssertEqual(model.groups.count, 0)
+        XCTAssertNil(model.notice)
+    }
+
+    func testAnInterruptedGroupThatFailsAgainStillReportsTheFailedMerge() async {
+        let (model, finder) = await mergeAllAcrossAPause { model, finder in
+            finder.mergeErrors[model.groups[3].id] = URLError(.timedOut)
+        }
+        XCTAssertEqual(finder.batches.count, 4, "one more try only")
+        XCTAssertEqual(model.groups.count, 1)
+        XCTAssertEqual(model.notice, .failed)
+    }
+
+    func testACancelledGroupDuringThePauseMergesNoSecondTime() async {
+        let (_, finder) = await mergeAllAcrossAPause { model, finder in
+            finder.nextMergeErrors[model.groups[3].id] = CancellationError()
+        }
+        XCTAssertEqual(finder.batches.count, 3, "a cancellation is no failure to try again")
+    }
+
+    func testATimeoutWithoutAPauseMergesNoSecondTime() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        finder.nextMergeErrors[model.groups[3].id] = URLError(.timedOut)
+        await model.mergeAll()
+        XCTAssertEqual(finder.batches.count, 3)
+        XCTAssertEqual(model.groups.count, 1)
+        XCTAssertEqual(model.notice, .failed)
+    }
+
+    func testAStopDuringThePauseMergesNoInterruptedGroupAgain() async {
+        let (model, finder) = await mergeAllAcrossAPause(
+            failures: { model, finder in finder.nextMergeErrors[model.groups[3].id] = URLError(.timedOut) },
+            beforeResume: { model, _ in model.stopMergeAll() })
+        XCTAssertEqual(finder.batches.count, 1)
+        XCTAssertEqual(model.notice, .stopped(merged: 24, total: 60))
+    }
+
+    func testAFailureInALaterBatchAfterThePauseMergesNoSecondTime() async {
+        let (model, finder) = await mergeAllAcrossAPause { model, finder in
+            finder.nextMergeErrors[model.groups[30].id] = URLError(.timedOut)
+        }
+        XCTAssertEqual(finder.batches.count, 3, "only the batch that ran during the pause tries again")
+        XCTAssertEqual(model.notice, .failed)
+    }
+
+    func testCancellingMergeAllDuringThePauseMergesNoInterruptedGroupAgain() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        finder.nextMergeErrors[model.groups[3].id] = URLError(.timedOut)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        model.pauseMerging()
+        finder.mergeGate.open()
+        await model.runningMergeWorkEnded()
+        merge.cancel()
+        await merge.value
+        XCTAssertEqual(finder.batches.count, 1)
+    }
+
     func testCancellingAPausedMergeAllEndsTheRunAndReleasesTheModel() async {
         let finished = expectation(description: "The cancelled merge finishes")
         var loaded: (ExactDuplicatesModel, FakeDuplicateFinder, TrashLog)? = await loadedModel(groups: 60)
@@ -3239,6 +3347,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var ranked: [String: [PhotoUID]] = [:]
     var outcomes: [String: ExactDuplicateMergeOutcome] = [:]
     var mergeErrors: [String: Error] = [:]
+    /// Errors of the next merge of a group only.
+    var nextMergeErrors: [String: Error] = [:]
     var scanError: Error?
     var rankError: Error?
     var beforeRankingPage: (@Sendable (ExactDuplicateRankingPage) async -> Void)?
@@ -3353,7 +3463,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     func merge(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> ExactDuplicateMergeOutcome {
         try lock.withLock {
             _merges.append(Merge(group: group.id, kept: kept))
-            if let error = mergeErrors[group.id] { throw error }
+            if let error = nextMergeErrors.removeValue(forKey: group.id) ?? mergeErrors[group.id] { throw error }
             return outcomes[group.id]
                 ?? .merged(kept: kept, trashed: group.members.filter { $0 != kept }, keptDuplicates: [:])
         }

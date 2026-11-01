@@ -521,13 +521,14 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     decision = nameDecision
                 }
             }
-            // A vanished trash entry does not revoke the person's deletion, but the cached fact cannot prove
-            // the copy is still trashed. Keep upload blocked until fresh proof settles this exact resource.
             if let link = relatedReads.restoredMemberLinkID, relatedReads.restoredMemberIsUnderDestination {
                 decision = .skip(.activeDuplicate, remoteLinkID: link)
             }
+            // A vanished trash entry does not revoke the person's deletion: the trash was emptied, or the copy left
+            // it otherwise. The photo stays deleted in Proton and never uploads; the record keeps the trash fact, so
+            // every later check reads the server again, and an active copy found there still counts (#984).
             if decision.uploadsBytes, preservesKnownDeletion, relatedReads.restoredMemberLinkID == nil {
-                decision = .skip(.inconsistentRemoteState, remoteLinkID: cached?.remoteLinkID)
+                decision = .skip(.deletedRemotely, remoteLinkID: cached?.remoteLinkID)
             }
             if decision.uploadsBytes, !replacement.isEmpty, !provesLive,
                 descriptor.source.kind == .photoLibraryAsset, descriptor.source.resource == .primary,

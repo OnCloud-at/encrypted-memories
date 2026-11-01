@@ -843,6 +843,9 @@ public actor BackupSyncRunner {
             $0.isDismissedSourceRecheck
                 || deferredSources[Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)] != nil
         }
+        // A photo whose pending row this build cannot read waits at its claim; its name goes to Proton only once its
+        // row reads again (#982).
+        if let events { peek.removeAll { events.exclusion(of: $0.source) == .unreadable } }
         guard !peek.isEmpty else { return }
         let descriptors = peek.map { entry in
             UploadResourceDescriptor(
@@ -894,6 +897,24 @@ public actor BackupSyncRunner {
 
         if !isSourceRecheck { adjustProgress(from: checkingEntry.state, to: .checking) }
         emitProgress()
+
+        // A photo with a pending row that this build cannot read waits before its file is exported or hashed: a newer
+        // build may have excluded it. A dismissed photo keeps its check, and a saved upload receipt stays. Every
+        // revision of the photo waits like this, without a problem. The check before each transfer stays (#982).
+        if events?.exclusion(of: checkingEntry.source) == .unreadable {
+            if isSourceRecheck {
+                rememberDeferredSource(checkingEntry)
+                preserveDismissedSourceRecheck(checkingEntry)
+            } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
+                parkRemoteReconciliation(
+                    checkingEntry, reconciliation: reconciliation, from: persistedState,
+                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
+                        ?? L10n.string("error.upload_cancelled"))
+            } else {
+                retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
+            }
+            return
+        }
 
         // Another revision of this source can already belong to the same claim. Release it without another read.
         if deferredSources[Self.sourceKey(kind: checkingEntry.source.kind, identifier: checkingEntry.source.identifier)]
@@ -1107,7 +1128,7 @@ public actor BackupSyncRunner {
                     if await self.stopWasRequested() { throw CancellationError() }
                     switch preflightResult.decision {
                     case .upload, .uploadReplacingDraft:
-                        guard await self.admitsTransfer(for: entry.source) else { throw CancellationError() }
+                        guard try await self.admitsTransfer(for: entry.source) else { throw CancellationError() }
                         await self.recordUploadEvidence(entry)
                         return try await self.performPrimaryUpload(
                             entry,
@@ -1278,20 +1299,26 @@ public actor BackupSyncRunner {
 
     private func stopWasRequested() -> Bool { stopRequested }
 
+    /// A source whose pending row this build cannot read, for example one that a newer build wrote.
+    private struct PendingSourceUnreadableError: Error {}
+
     /// Checked right before every resource transfer, primary and secondary. A source that the person
-    /// excluded is removed like a local deletion. An unknown answer ends the pass without removing anything,
-    /// so no photo uploads while its exclusion cannot be read.
-    private func admitsTransfer(for source: UploadSourceIdentity) async -> Bool {
+    /// excluded is removed like a local deletion. A source with a pending row that this build cannot read waits,
+    /// and its rows stay: `PendingSourceUnreadableError`. An unknown answer ends the pass without removing
+    /// anything, so no photo uploads while its exclusion cannot be read.
+    private func admitsTransfer(for source: UploadSourceIdentity) async throws -> Bool {
         guard !removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier)) else {
             return false
         }
         guard let events else { return true }
-        switch events.isExcluded(source: source) {
-        case false?:
+        switch events.exclusion(of: source) {
+        case .included?:
             return true
-        case true?:
+        case .excluded?:
             await removeSources(kind: source.kind, identifiers: [source.identifier])
             return false
+        case .unreadable?:
+            throw PendingSourceUnreadableError()
         case nil:
             stopRequested = true
             return false
@@ -1335,7 +1362,11 @@ public actor BackupSyncRunner {
                 kind: .deduplicated
             ) == .failed
         else { return true }
-        retryOrPark(entry, from: state, error: UploadError.backend("Pending handoff could not be persisted"))
+        // The store refuses the record of a photo whose pending row it cannot read; that photo waits (#982).
+        let error: Error =
+            events?.exclusion(of: entry.source) == .unreadable
+            ? PendingSourceUnreadableError() : UploadError.backend("Pending handoff could not be persisted")
+        retryOrPark(entry, from: state, error: error)
         return false
     }
 
@@ -1373,7 +1404,7 @@ public actor BackupSyncRunner {
             throw BackupWorkDeferredError()
         }
         // Materialization can take a while; an exclusion saved meanwhile must still stop the transfer.
-        guard await admitsTransfer(for: entry.source) else { throw CancellationError() }
+        guard try await admitsTransfer(for: entry.source) else { throw CancellationError() }
         let network = try transferNetwork()
         let key = Self.key(entry)
         guard transition(entry, from: state, to: .uploading) != nil else {
@@ -2103,7 +2134,7 @@ public actor BackupSyncRunner {
         completedSecondaries: Int,
         totalResourceCount: Int
     ) async throws -> PhotoUID {
-        guard await admitsTransfer(for: descriptor.source) else { throw CancellationError() }
+        guard try await admitsTransfer(for: descriptor.source) else { throw CancellationError() }
         let network = try transferNetwork()
         let token = UUID()
         let tokenKey = "\(entryKey)#\(descriptor.source.resource.rawValue)"
@@ -2376,6 +2407,13 @@ public actor BackupSyncRunner {
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
+        // Not a failure of this photo: this build cannot read its pending row. It waits without an attempt and
+        // without a problem; its rows stay (#982).
+        if error is PendingSourceUnreadableError {
+            rememberDeferredSource(entry)
+            deferSource(entry, from: oldState, until: now().addingTimeInterval(longestRegularRetryWait))
+            return
+        }
         if error is BackupWorkDeferredError || recordCancellation(error, for: entry) {
             revert(entry, from: oldState)
             return
@@ -2848,7 +2886,7 @@ public actor BackupSyncRunner {
         // left Wi-Fi while the backup must wait for it does not start. The reservation has the kind that the setting
         // had before the wait: if the setting changed meanwhile, the transfer would run with the wrong kind of access.
         // In each case the row returns to the queue without an attempt and the next claim reserves again.
-        guard await admitsTransfer(for: source) else { throw CancellationError() }
+        guard try await admitsTransfer(for: source) else { throw CancellationError() }
         let network = try transferNetwork()
         guard network.usesMobileData == request.allowsExpensiveNetwork else { throw BackupWorkDeferredError() }
         var reservedRequest = request

@@ -415,7 +415,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
             return .recorded
         }
 
-        func isExcluded(source: UploadSourceIdentity) -> Bool? { false }
+        func exclusion(of source: UploadSourceIdentity) -> BackupSourceExclusion? { .included }
 
         func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {}
     }
