@@ -569,6 +569,10 @@ import Testing
 
         func availableBackends() async -> Set<MLSearchBackend> { [.recognizedText] }
 
+        func hasIndexedTextEntries() async -> Bool {
+            lock.withLock { !indexedAssets.isEmpty }
+        }
+
         func index(
             assets: [MLPipelineAssetRevision],
             shouldContinue: @escaping @Sendable () -> Bool,
@@ -1953,7 +1957,9 @@ import Testing
         let enable = Task { await harness.lifecycle.enable(with: local.id) }
         #expect(await waitUntil { await factory.started })
         #expect(await waitUntil(timeout: .milliseconds(250)) { phases.saw(.notInstalled(downloadable: false)) })
-        #expect(await harness.lifecycle.availableSearchScopes() == [.all, .text])
+        // The native index has not been created yet, so the OCR scope stays hidden. An empty
+        // scope list means the default scope only; the search interface maps it to that scope.
+        #expect(await harness.lifecycle.availableSearchScopes() == [])
 
         await factory.release()
         await enable.value
@@ -2463,6 +2469,116 @@ import Testing
 
         await harness.lifecycle.shutdown()
         #expect(nativeSearch.shutdownCount == 1)
+    }
+
+    @Test func ocrScopeStaysHiddenWhileTheTextIndexIsEmpty() async throws {
+        let nativeSearch = RecordingNativeSearch(results: [])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [localModelEntry()]),
+            payloads: [:],
+            assets: [],
+            nativeSearch: nativeSearch,
+            advertisedNativeSearchBackends: [.recognizedText, .documentText]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: localModelEntry().id)
+        #expect(await waitUntil { await harness.lifecycle.currentSnapshot().isEnabled })
+        // The device advertises OCR, but the library's text index holds no entry yet. The lifecycle
+        // reports no scope beyond the default one: an empty list means the default scope only,
+        // and the search interface maps an empty list to that scope.
+        #expect(await harness.lifecycle.availableSearchScopes() == [])
+    }
+
+    @Test func ocrScopeAppearsOnceTheTextIndexHoldsAnEntry() async throws {
+        let seeded = uid("seeded")
+        let nativeSearch = RecordingNativeSearch(results: [], initiallyIndexed: [seeded])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [localModelEntry()]),
+            payloads: [:],
+            assets: [seeded],
+            nativeSearch: nativeSearch,
+            advertisedNativeSearchBackends: [.recognizedText, .documentText]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: localModelEntry().id)
+        #expect(
+            await waitUntil { await harness.lifecycle.availableSearchScopes() == [.all, .text] },
+            "the OCR scope must appear as soon as the text index holds one entry")
+    }
+
+    /// A conformer that does not report its text index is treated the same as an unreadable index:
+    /// the OCR scope stays hidden even though the backends are advertised.
+    @Test func ocrScopeStaysHiddenWhenTheNativeIndexReportsNoState() async throws {
+        final class SilentNativeSearch: MLNativeSearchServing, @unchecked Sendable {
+            func availableBackends() async -> Set<MLSearchBackend> { [.recognizedText, .documentText] }
+            func index(
+                assets: [MLPipelineAssetRevision],
+                shouldContinue: @escaping @Sendable () -> Bool,
+                observer: MLDerivedPipelineObserver
+            ) async -> MLDerivedPipelinePassOutcome {
+                await indexQuantum(
+                    assets: assets,
+                    libraryGeneration: 0,
+                    allowsDestructiveReconciliation: false,
+                    maximumAssets: assets.count,
+                    maximumConcurrentAssets: 1,
+                    shouldContinue: shouldContinue,
+                    observer: observer
+                )
+            }
+            func indexQuantum(
+                assets: [MLPipelineAssetRevision],
+                libraryGeneration: UInt64,
+                allowsDestructiveReconciliation: Bool,
+                maximumAssets: Int,
+                maximumConcurrentAssets: Int,
+                shouldContinue: @escaping @Sendable () -> Bool,
+                observer: MLDerivedPipelineObserver
+            ) async -> MLDerivedPipelinePassOutcome {
+                let progress = MLDerivedPipelineProgress(
+                    total: 0,
+                    completed: 0,
+                    skipped: 0,
+                    permanentFailure: 0,
+                    retryPending: 0,
+                    generation: libraryGeneration
+                )
+                observer.report(progress)
+                return .init(reason: .drained, progress: progress)
+            }
+            func search(_ text: String, scope: MLSearchScope, limit: Int) async -> [PhotoUID] { [] }
+            func progress() async -> MLDerivedPipelineProgress {
+                .init(
+                    total: 0,
+                    completed: 0,
+                    skipped: 0,
+                    permanentFailure: 0,
+                    retryPending: 0,
+                    generation: 0)
+            }
+            func purge() async {}
+            func shutdown() async {}
+        }
+
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [localModelEntry()]),
+            payloads: [:],
+            assets: [],
+            nativeSearchFactoryOverride: { SilentNativeSearch() },
+            advertisedNativeSearchBackends: [.recognizedText, .documentText]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: localModelEntry().id)
+        #expect(await waitUntil { await harness.lifecycle.currentSnapshot().isEnabled })
+        // Like an unreadable index, a conformer without an answer yields no scope beyond the
+        // default one; the search interface maps the empty list to the default scope.
+        #expect(await harness.lifecycle.availableSearchScopes() == [])
     }
 
     @Test func centralCoordinatorRunsNativeQuantumBeforeSemanticQuantum() async throws {
