@@ -102,6 +102,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// uploads recorded before that refresh started. The capacity check subtracts the rest from the account quota.
     private var uploadedBytes: Int64 = 0
     private var uploadedBytesInQuota: Int64 = 0
+    /// Automatic callers share only a running refresh for the same uploaded-byte snapshot in this session.
+    nonisolated let accountInfoRefreshes = SharedInFlightOperations<Int64, Void>()
     private var quotaRefresh: Task<Void, Never>?
     private var quotaRefreshWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var lastQuotaRefreshAt: ContinuousClock.Instant?
@@ -395,6 +397,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // Drain cache-owned SDK tasks now, including flights orphaned by admission cancellation.
         await sharedAlbumSnapshotCache.invalidateAll()
         await presentationNodeReads.invalidateAndJoin()
+        await accountInfoRefreshes.invalidateAndJoin()
 
         let timelineTask = timelineLoadTask?.task
         timelineLoadTask = nil
@@ -1835,12 +1838,30 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Refreshes the lightweight account snapshot used by Settings (email and Drive quota). The existing
     /// account-data request also updates the encrypted offline cache; it does not rebuild the signed-in client.
     func refreshAccountInfo() async throws {
-        let recordedBefore = uploadedBytes
         try await withOpenSession(cause: .account) { bridge in
-            _ = try await bridge.driveSession.fetchAccountData()
+            switch ProtonRequestContext.cause {
+            case .accountForeground, .accountSettings:
+                try await bridge.accountInfoRefreshes.run(bridge.uploadedBytes) {
+                    try await bridge.refreshAccountInfoImpl()
+                }
+            default:
+                // An explicit or quota refresh needs a new answer. Later automatic callers must not join
+                // an older automatic operation either; its existing waiters still receive its result.
+                await bridge.accountInfoRefreshes.invalidate()
+                try await bridge.refreshAccountInfoImpl()
+            }
         }
+    }
+
+    private func refreshAccountInfoImpl() async throws {
+        let recordedBefore = uploadedBytes
+        _ = try await driveSession.fetchAccountData()
         // Uploads recorded during the request stay counted; the response may not contain them yet.
         uploadedBytesInQuota = max(uploadedBytesInQuota, recordedBefore)
+    }
+
+    func recordCompletedUpload(bytes: Int64) {
+        uploadedBytes += max(0, bytes)
     }
 
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
@@ -2759,7 +2780,7 @@ extension DriveSDKBridge: PhotoUploading {
                 throw error
             }
             await operation.releaseResources()
-            uploadedBytes += max(0, request.fileSize)
+            recordCompletedUpload(bytes: request.fileSize)
             logging.completed(nodeID: ids.nodeUid.nodeID, filename: request.name)
             let uid = PhotoUID(volumeID: ids.nodeUid.volumeID, nodeID: ids.nodeUid.nodeID)
             if mainPhotoUid == nil {

@@ -15,6 +15,7 @@ struct EncryptedMemoriesApp: App {
     private let metal3Supported: Bool
 
     init() {
+        RequestTraceClock.start()
         let metal3Supported = Metal3RuntimeCapability.supportsDefaultDevice()
         self.metal3Supported = metal3Supported
         if metal3Supported {

@@ -22,6 +22,7 @@ struct EncryptedMemoriesMobileApp: App {
     private let metal3Supported: Bool
 
     init() {
+        RequestTraceClock.start()
         if let domain = Bundle.main.bundleIdentifier {
             BackupLocalDataPurge.prepareRequestedResetForLaunch(persistentDomainName: domain)
         }
