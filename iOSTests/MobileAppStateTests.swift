@@ -1589,6 +1589,55 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         try await verifySignOut(startRetry: false)
     }
 
+    /// A second start cancels the load that closes the pending pair of the first start. The sign-out purge
+    /// still waits until that close ended and the pending store is closed.
+    @MainActor func testSignOutJoinsThePendingPairCloseOfALoadThatANewerStartCancelled() async throws {
+        let model = MobileLibraryModel()
+        let pending = try MobilePendingOwnerFixture(model: model)
+        defer { Task { await pending.close() } }
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("close") } }
+        model.pendingGridCloseHoldForTesting = { await latch.block("close") }
+        // The hosted test owns this synthetic account.
+        let session = ProtonSession(
+            uid: "pending-pair-" + UUID().uuidString, accessToken: "access", refreshToken: "refresh",
+            keyPassword: "key")
+        let leaseBefore = model.locationStoreLeaseForTesting
+        model.configure(session: session, store: SessionKeychainStore())
+        let closing = await waitForMobileOwner { await latch.hasEntered("close") }
+        XCTAssertTrue(closing, "the first start closes the live pending pair")
+        guard closing else { return }
+        let configuredWhileClosing = await waitForMobileOwner(timeout: .milliseconds(300)) {
+            model.locationStoreLeaseForTesting != leaseBefore
+        }
+        XCTAssertFalse(configuredWhileClosing, "the load opens no store before the retired pair is closed")
+        model.configure(session: session, store: SessionKeychainStore())
+
+        let root = try XCTUnwrap(BackupLocalDataPurge.localDataRoots().first)
+        let marker = root.appendingPathComponent("owner-join-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data([1]).write(to: marker)
+        defer {
+            BackupLocalDataPurge.markPurgeCompleted()
+            try? FileManager.default.removeItem(at: marker)
+        }
+        BackupLocalDataPurge.requestPurgeOnSignOut()
+        model.configure(session: nil, store: SessionKeychainStore())
+        XCTAssertTrue(model.isSigningOut)
+        let completedWhileHeld = await waitForMobileOwner(timeout: .seconds(1)) {
+            !model.isSigningOut || model.signOutCleanupFailed
+        }
+        XCTAssertFalse(completedWhileHeld, "the purge waits for the close of the pending pair")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(pending.store.isOperational())
+
+        await latch.release("close")
+        let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
+        XCTAssertTrue(completed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertFalse(pending.store.isOperational(), "the close ends with the pending store closed")
+    }
+
     @MainActor private func verifySignOut(startRetry: Bool) async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }

@@ -174,8 +174,8 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     private var restoredHere: [PhotoUID] = []
     private var restoredListedByLibrary: Set<PhotoUID> = []
     /// Related photos that the last applied listing returned, by main photo. Recently Deleted hides them; a restore of
-    /// the main photo can take them along. Memory only: without a listing in this session the main photo comes back
-    /// alone, as before.
+    /// the main photo can take them along. Memory only: a restore that runs before any listing of this session lists
+    /// the trash first.
     private var trashedRelated: [PhotoUID: [PhotoUID]] = [:]
     /// Photos trashed here, with the moment of the trash, that a library listing may still return. The library
     /// listing lags behind a trash; without this, a refresh would bring them back into the library and into the
@@ -284,6 +284,9 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         needsListing = !trashedHere.isEmpty
         return .applied
     }
+
+    /// True once a listing applied in this session. Related photos are known only after that.
+    var hasAppliedListing: Bool { appliedListingStart > 0 }
 
     mutating func listedRelatedPhotos(_ related: [PhotoUID: [PhotoUID]]) {
         trashedRelated = related

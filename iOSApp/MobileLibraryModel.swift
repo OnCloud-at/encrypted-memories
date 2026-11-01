@@ -35,6 +35,8 @@ import UploadCore
     let scopeRecovery: Task<Void, Never>?
     let photoBackup: PhotoLibraryBackupController?
     let pending: RetiredPendingGrid
+    /// Closes of retired pending grid pairs that still run, also those of a load that a newer load cancelled.
+    let pendingCloses: [Task<Void, Never>]
     let albumSync: AlbumSyncController?
     let feed: UIKitThumbnailFeed?
     let refresh: LibraryRefreshCoalescer
@@ -85,6 +87,7 @@ import UploadCore
                 await scopeRecovery?.value
                 await transition?.value
                 await load?.value
+                for close in pendingCloses { await close.value }
                 await prefetch?.value
                 await favorites?.value
                 await thumbnailShutdown?.value
@@ -396,6 +399,13 @@ final class MobileLibraryModel {
     private var session: ProtonSession?
     private var cacheContext: LocalMediaCacheContext?
     private var loadTask: Task<Void, Never>?
+    /// The close of a retired pending grid pair does not stop when a newer load cancels the load that waits for it.
+    /// The teardown joins every close here before the purge deletes the account directory.
+    @ObservationIgnored private var pendingGridCloses: [UUID: Task<Void, Never>] = [:]
+    #if DEBUG
+        /// Runs in the close of a retired pending grid pair, after its session closed and before its store closes.
+        @ObservationIgnored var pendingGridCloseHoldForTesting: (@MainActor () async -> Void)?
+    #endif
     /// Serializes account replacement: a newly authenticated session never opens SQLite stores
     /// until the previous facade has closed every handle and completed an explicit sign-out purge.
     private var teardownTask: Task<Void, Never>?
@@ -479,6 +489,26 @@ final class MobileLibraryModel {
                 session.setRemote(snapshot)
             }
         )
+    }
+
+    /// Closes `retired` in the teardown order, with `photoBackup` while the store is open, in a task that every
+    /// teardown joins. An empty pair runs nothing.
+    private func closeRetired(
+        _ retired: RetiredPendingGrid, photoBackup: PhotoLibraryBackupController?
+    ) -> Task<Void, Never> {
+        guard !retired.isEmpty else { return Task {} }
+        let id = UUID()
+        let close = Task { @MainActor [weak self] in
+            await retired.close(whileStoreOpen: {
+                #if DEBUG
+                    await self?.pendingGridCloseHoldForTesting?()
+                #endif
+                await photoBackup?.shutdown()
+            })
+            self?.pendingGridCloses[id] = nil
+        }
+        pendingGridCloses[id] = close
+        return close
     }
 
     /// Retires the pending grid (`PendingGridConnection.retire()`) and clears the iOS grid presentation and the
@@ -1274,7 +1304,8 @@ final class MobileLibraryModel {
                     prefetch: prefetchStartTask, favorites: favoriteLoadTask, series: seriesDissolutionTask,
                     retry: signingOut ? retrySequence.current : nil,
                     scopeRecovery: signingOut ? scopeRecoveryCoordinator.task : nil,
-                    photoBackup: photoBackup, pending: retirePendingGrid(), albumSync: albumSync, feed: thumbnailFeed,
+                    photoBackup: photoBackup, pending: retirePendingGrid(),
+                    pendingCloses: Array(pendingGridCloses.values), albumSync: albumSync, feed: thumbnailFeed,
                     refresh: libraryRefreshCoalescer, uploadRefresh: uploadRefreshCoordinator,
                     changeMonitor: libraryChangeMonitor, locationSession: locationCrawl, crawl: locationCrawl.crawl,
                     crawlStarter: locationCrawl.startingTask, locationIndex: locationIndex,
@@ -1499,8 +1530,9 @@ final class MobileLibraryModel {
         UIKitMemoryPressureCoordinator.shared.install()
         UIKitMemoryPressureCoordinator.shared.attachByteCache(cache)
 
+        let retiredPendingGridClose = closeRetired(retiredPendingGrid, photoBackup: previousPhotoBackup)
         loadTask = Task { [weak self] in
-            await retiredPendingGrid.close(whileStoreOpen: { await previousPhotoBackup?.shutdown() })
+            await retiredPendingGridClose.value
             guard let self else { return }
             do {
                 // Suggestions validate locations as part of their content identity. Restore the existing
@@ -1596,7 +1628,7 @@ final class MobileLibraryModel {
                 // No current flow is known to hand back a non-empty pair here. A pair that a replacing start left is
                 // closed here, after every assignment of this block. The guard re-checks the load, as the guard after
                 // the earlier await does.
-                await replacedPendingGrid.close(whileStoreOpen: { await replacedPhotoBackup?.shutdown() })
+                await self.closeRetired(replacedPendingGrid, photoBackup: replacedPhotoBackup).value
                 guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 try await loadInitialTimeline(
                     backend: backend, feed: feed, session: session, loadGeneration: loadGeneration)
@@ -1932,6 +1964,9 @@ final class MobileLibraryModel {
     // MARK: - Isolated fixture (hosted tests only)
 
     extension MobileLibraryModel {
+        /// The session lease of the location store, so a hosted test sees when a load configures the store.
+        var locationStoreLeaseForTesting: PhotoLocationStore.SessionLease? { locationStore.captureSessionLease() }
+
         /// Installs a deterministic, already loaded account into this model without any network or keychain
         /// access. The production composition above it (scene roots, tab shell, timeline screens, grids, viewer)
         /// is untouched; only the account backend and its content are replaced by the given values.

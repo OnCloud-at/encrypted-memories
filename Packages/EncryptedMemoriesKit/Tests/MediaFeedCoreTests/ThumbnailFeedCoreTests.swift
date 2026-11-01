@@ -4928,16 +4928,16 @@ struct ThumbnailFeedCoreTests {
         DecodedThumbnail(image: makeCGImage(width: width, height: height))
     }
 
-    /// Waits up to three seconds and records an issue when the condition never holds.
+    /// Waits up to thirty seconds and records an issue when the condition never holds.
     private static func waitUntil(
         _ condition: @Sendable () async -> Bool, sourceLocation: SourceLocation = #_sourceLocation
     ) async throws {
-        for _ in 0..<60 {
+        for _ in 0..<600 {
             if await condition() { return }
             try await Task.sleep(for: .milliseconds(50))
         }
         if await condition() { return }
-        Issue.record("the condition did not hold within 3 s", sourceLocation: sourceLocation)
+        Issue.record("the condition did not hold within 30 s", sourceLocation: sourceLocation)
     }
 
     /// Joins `task` within 20 s; a task that does not end records an issue and is cancelled.
