@@ -444,7 +444,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             nameDecision = try await verifiedNameDecision(
                 nameCandidates.items,
                 primary: .init(source: descriptor.source, nameHash: nameHash, contentHash: contentHash),
-                isRoot: isRoot, requiresStatedRole: !replacement.isEmpty, reads: &relatedReads)
+                isRoot: isRoot, reads: &relatedReads)
         } catch {
             releasePendingUploadClaims(ownedBy: descriptor)
             throw error
@@ -490,11 +490,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                             // a state read of this check says that the copy is active.
                             if item.linkState == .active, let linkID = item.linkID, !linkID.isEmpty {
                                 try await readInThisCheck([linkID], reads: &relatedReads)
-                                let requiresStatedRole = !replacement.isEmpty || blockedByDraft
                                 guard
-                                    countsAsBackup(
-                                        linkID, isRoot: isRoot, requiresStatedRole: requiresStatedRole,
-                                        reads: relatedReads)
+                                    countsAsBackup(linkID, isRoot: isRoot, reads: relatedReads)
                                 else { continue }
                             }
                             adopted = item
@@ -1026,8 +1023,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         guard guardsRoot else {
             guard let row = rows.first, let linkID = row.remoteLinkID, try await read([linkID]) else { return nil }
-            let proves = countsAsBackup(
-                linkID, isRoot: isRoot, requiresStatedRole: !replacement.isEmpty, reads: reads)
+            let proves = countsAsBackup(linkID, isRoot: isRoot, reads: reads)
             return proves ? row : nil
         }
         // Several sources can name one related link; it is weighed once.
@@ -1044,8 +1040,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             guard !batch.isEmpty else { break }
             guard try await read(batchLinks) else { return nil }
             if let eligible = batch.first(where: { row in
-                row.remoteLinkID.map { countsAsBackup($0, isRoot: true, requiresStatedRole: false, reads: reads) }
-                    ?? false
+                row.remoteLinkID.map { countsAsBackup($0, isRoot: true, reads: reads) } ?? false
             }) {
                 return eligible
             }
@@ -1186,15 +1181,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     /// Whether the read of this check proves that `linkID` backs up this resource. The copy must be active; a copy
     /// that the answer leaves out is no active copy. A root photo is backed up only by a main photo, not by another
-    /// photo's related file, and the read that shows the copy active also decides its role. With
-    /// `requiresStatedRole`, for a draft block or a replacement, only an answer with the photo state counts, like
-    /// their role filters.
-    private func countsAsBackup(
-        _ linkID: String, isRoot: Bool, requiresStatedRole: Bool, reads: RelatedProofReads
-    ) -> Bool {
+    /// photo's related file, and only by an answer that explicitly carries the photo state: an answer without role
+    /// data never proves a root backup (#876).
+    private func countsAsBackup(_ linkID: String, isRoot: Bool, reads: RelatedProofReads) -> Bool {
         guard let state = reads.visibility[linkID], state.isActive else { return false }
         guard isRoot else { return true }
-        return state.isActiveMain && (state.hasExplicitPhotoState || !requiresStatedRole)
+        return state.isActiveMain && state.hasExplicitPhotoState
     }
 
     /// The decision of the name rows. A name row can outlive its copy like an index row: an active duplicate counts
@@ -1203,7 +1195,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// that is no main photo leaves the rows, and the rows decide again.
     private func verifiedNameDecision(
         _ items: [RemotePhotoDuplicate], primary: UploadDuplicateDecisionPolicy.Resource, isRoot: Bool,
-        requiresStatedRole: Bool, reads: inout RelatedProofReads
+        reads: inout RelatedProofReads
     ) async throws -> UploadDuplicateDecision {
         var items = items
         while true {
@@ -1211,7 +1203,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 primary: primary, remoteItems: items, currentClientUID: currentClientUID)
             guard case .skip(.activeDuplicate, let linkID?) = decision else { return decision }
             try await readPrimedState(linkID, reads: &reads)
-            if countsAsBackup(linkID, isRoot: isRoot, requiresStatedRole: requiresStatedRole, reads: reads) {
+            if countsAsBackup(linkID, isRoot: isRoot, reads: reads) {
                 return decision
             }
             let state = reads.visibility[linkID]
