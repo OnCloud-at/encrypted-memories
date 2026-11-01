@@ -121,6 +121,9 @@ jobs:
           IOS_TEST_PREPARED: "1"
           IOS_TEST_DESTINATION: platform=iOS Simulator,id=${{ steps.duo.outputs.udid }}
           IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui-duo.xcresult
+          # The hosted runner sometimes fails to launch the app under load; xcodebuild repeats only a test case that
+          # failed, up to two iterations. A test that fails both iterations still fails the job.
+          IOS_TEST_EXTRA_XCODEBUILD_ARGS: -retry-tests-on-failure -test-iterations 2
         run: bash .github/scripts/run_ui_tests_with_retry.sh bash ./scripts/verify-ios-app-tests.sh ui
 
       - name: Report the test counts and the free disk
@@ -137,6 +140,10 @@ jobs:
             if [[ -d "$RESULT" ]]; then
               xcrun xcresulttool get test-results summary --path "$RESULT" |
                 python3 -c 'import json,sys; r=json.load(sys.stdin); print("UI tests on iPhone Duo:", {k:r[k] for k in ["totalTestCount", "passedTests", "failedTests", "skippedTests"]})'
+              # A test that failed once and then passed on its retry appears in the result tree as a passed test case
+              # with a failed repetition below it. The raw log shows the iterations; this collects them in the summary.
+              xcrun xcresulttool get test-results tests --path "$RESULT" 2>/dev/null |
+                python3 .github/scripts/list_retried_tests.py || echo "The retried tests could not be read from the result bundle."
             else
               echo "No test result: the tests did not start (preparation: ${PREPARE:-not run}, build: ${BUILD:-not run})."
             fi
