@@ -58,6 +58,58 @@ final class BackupTempFileStoreTests: XCTestCase {
         }
     }
 
+    func testExtremeChunkIsRejectedWithoutDisturbingAccounting() throws {
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 10, minimumFreeBytes: 0,
+            availableCapacity: { _ in 100 }, now: Date.init)
+        let partial = try store.reserve(filename: "extreme.mov", expectedBytes: 0)
+        FileManager.default.createFile(atPath: partial.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: partial)
+        defer { try? handle.close() }
+
+        try store.recordWrite(to: partial, byteCount: 1)
+        try handle.write(contentsOf: Data(repeating: 1, count: 1))
+
+        XCTAssertThrowsError(try store.recordWrite(to: partial, byteCount: Int.max)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(store.usedBytes(), 1, "a rejected chunk must not change the written accounting")
+        try store.recordWrite(to: partial, byteCount: 4)
+        try handle.write(contentsOf: Data(repeating: 2, count: 4))
+        XCTAssertEqual(store.usedBytes(), 5, "a valid chunk after the rejection must succeed")
+
+        try store.recordWrite(to: partial, byteCount: 5)
+        try handle.write(contentsOf: Data(repeating: 3, count: 5))
+        XCTAssertEqual(store.usedBytes(), 10, "the exact remaining budget is still writable")
+
+        XCTAssertThrowsError(try store.recordWrite(to: partial, byteCount: 1)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(store.usedBytes(), 10, "a chunk past the budget is rejected")
+
+        try store.recordWrite(to: partial, byteCount: -5)
+        XCTAssertEqual(store.usedBytes(), 10, "a negative chunk stays ignored, as before")
+    }
+
+    func testExtremeChunkInPoolSharedWithAnotherReservationIsRejected() throws {
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 10, minimumFreeBytes: 0,
+            availableCapacity: { _ in 100 }, now: Date.init)
+        _ = try store.reserve(filename: "holder.dat", expectedBytes: 5)
+        let partial = try store.reserve(filename: "extreme-shared.mov", expectedBytes: 0)
+        FileManager.default.createFile(atPath: partial.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: partial)
+        defer { try? handle.close() }
+
+        XCTAssertThrowsError(try store.recordWrite(to: partial, byteCount: Int.max)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(store.usedBytes(), 0, "a rejected chunk must not change the written accounting")
+        try store.recordWrite(to: partial, byteCount: 5)
+        try handle.write(contentsOf: Data(repeating: 1, count: 5))
+        XCTAssertEqual(store.usedBytes(), 5, "a valid chunk after the rejection must succeed")
+    }
+
     func testStagedWritesCannotUseMoreThanHalfThePool() throws {
         let store = BackupTempFileStore(
             directory: directory, maximumBytes: 10, minimumFreeBytes: 0,
