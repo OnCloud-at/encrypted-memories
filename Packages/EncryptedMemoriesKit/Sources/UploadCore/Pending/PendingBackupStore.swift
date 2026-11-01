@@ -35,7 +35,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// The runner decided after the duplicate check that this revision needs an upload.
     @discardableResult
     public func recordUploadEvidence(_ key: PendingSourceKey, revision: UploadBackupRevision, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 INSERT INTO upload_evidence(source_kind, source_id, revision_us, recorded_at)
@@ -261,7 +261,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Acknowledged handoffs are only needed to map a restored Proton photo back to its source.
     @discardableResult
     public func pruneAcknowledgedHandoffs(olderThan cutoff: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             // Unfinished work needs its handoffs. A completed trash also keeps the latest handoff until the source
             // returns to the backup: a restart may still have to discover its later upload.
             execute(
@@ -510,7 +510,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         revision: UploadBackupRevision?,
         at date: Date
     ) -> PendingSourceState? {
-        connection.withLock {
+        standaloneWrite(refusing: nil) {
             var durable: PhotoUID?
             if let revision {
                 guard case .readable(let handoff) = handoffReadLocked(key, revision: revision) else { return nil }
@@ -535,6 +535,39 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         bindKey(stmt, key, from: 6)
                         sqlite3_bind_int64(stmt, 8, generation)
                         bindText(stmt, 9, remote.nodeID)
+                    })
+            else { return nil }
+            return sourceStateLocked(key).state
+        }
+    }
+
+    /// Sends `remote` to the trash for the delete `generation` of an unfinished edit that named no photo, because the
+    /// handoff of the edit could not be read then. Only that same delete, still without a photo and without a remote
+    /// operation, takes it; a restore or a later delete changed the generation, and a commit of the deleted revision
+    /// already named its own photo. Returns the current state, or nil when the write failed.
+    public func trashEarlierUpload(
+        _ remote: PhotoUID,
+        of key: PendingSourceKey,
+        generation: Int64,
+        at date: Date
+    ) -> PendingSourceState? {
+        standaloneWrite(refusing: nil) {
+            guard
+                execute(
+                    """
+                    UPDATE source_state
+                    SET needs_remote_trash=1, remote_volume_id=?, remote_link_id=?, remote_trashed=0, listed_in_trash=0,
+                        attempts=0, next_attempt_at=?, updated_at=?
+                    WHERE source_kind=? AND source_id=? AND generation=? AND desired='excluded' AND needs_remote_trash=0
+                      AND remote_op IS NULL AND remote_volume_id IS NULL AND remote_link_id IS NULL;
+                    """,
+                    bind: { stmt in
+                        bindText(stmt, 1, remote.volumeID)
+                        bindText(stmt, 2, remote.nodeID)
+                        sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
+                        sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                        bindKey(stmt, key, from: 5)
+                        sqlite3_bind_int64(stmt, 7, generation)
                     })
             else { return nil }
             return sourceStateLocked(key).state
@@ -775,7 +808,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Schedules the next attempt of a failed effect with the shared backoff.
     @discardableResult
     public func deferEffects(for key: PendingSourceKey, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             guard case .readable(let current) = sourceStateLocked(key) else { return false }
             guard let state = current else { return true }
             let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: state.attempts))
@@ -866,12 +899,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Stores the desired favorite state of a pending source. A later toggle replaces it.
     @discardableResult
     public func setFavoriteIntent(_ key: PendingSourceKey, favorite: Bool, at date: Date) -> Bool {
-        connection.withLock { upsertActionLocked(key, kind: .favorite, albumID: "", desired: favorite, at: date) }
+        standaloneWrite(refusing: false) {
+            upsertActionLocked(key, kind: .favorite, albumID: "", desired: favorite, at: date)
+        }
     }
 
     @discardableResult
     public func addAlbumIntent(_ key: PendingSourceKey, albumID: String, at date: Date) -> Bool {
-        connection.withLock { upsertActionLocked(key, kind: .addToAlbum, albumID: albumID, desired: true, at: date) }
+        standaloneWrite(refusing: false) {
+            upsertActionLocked(key, kind: .addToAlbum, albumID: albumID, desired: true, at: date)
+        }
     }
 
     /// The rows that decode. Use `actionsRead()` where a missing row must not count as "nothing owed".
@@ -899,7 +936,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     @discardableResult
     public func retryAction(_ action: PendingAction, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: action.attempts))
             // A newer request for the same action replaced this one: leave it untouched.
             return execute(
@@ -918,7 +955,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     @discardableResult
     public func failAction(_ action: PendingAction) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 UPDATE pending_action SET failed=1
@@ -935,7 +972,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Deletes a finished action unless a newer request replaced it meanwhile.
     @discardableResult
     public func completeAction(_ action: PendingAction) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 DELETE FROM pending_action
@@ -953,7 +990,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     @discardableResult
     public func recordSavedFromApp(localIdentifier: String, remote: PhotoUID, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 INSERT INTO saved_from_app(local_id, remote_volume_id, remote_link_id, saved_at) VALUES(?, ?, ?, ?)
@@ -1104,10 +1141,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     private func handoffRow(_ stmt: OpaquePointer?) -> PendingHandoff? {
-        guard let key = key(stmt, kindColumn: 0, idColumn: 1),
-            let volume = columnText(stmt, 3),
-            let link = columnText(stmt, 4),
-            let kind = columnText(stmt, 5).flatMap(PendingHandoffKind.init(rawValue:))
+        guard let key = key(stmt, kindColumn: 0, idColumn: 1, roundTrip: true),
+            let volume = columnText(stmt, 3, roundTrip: true),
+            let link = columnText(stmt, 4, roundTrip: true),
+            let kind = columnText(stmt, 5, roundTrip: true).flatMap(PendingHandoffKind.init(rawValue:))
         else { return nil }
         return PendingHandoff(
             key: key,
@@ -1156,8 +1193,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             FROM pending_action
             """ + (condition.map { " WHERE \($0)" } ?? "") + " ORDER BY created_at;"
         let succeeded = query(sql, bind: bind) { stmt in
-            guard let key = key(stmt, kindColumn: 0, idColumn: 1),
-                let kind = columnText(stmt, 2).flatMap(PendingActionKind.init(rawValue:))
+            // A NULL album_id keeps its empty fallback; a stored value that does not round-trip makes the row unreadable.
+            let albumID = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? "" : columnText(stmt, 3, roundTrip: true)
+            guard let key = key(stmt, kindColumn: 0, idColumn: 1, roundTrip: true),
+                let kind = columnText(stmt, 2, roundTrip: true).flatMap(PendingActionKind.init(rawValue:)),
+                let albumID = albumID
             else {
                 Self.noteUndecodableRow()
                 decoded = false
@@ -1167,7 +1207,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 PendingAction(
                     key: key,
                     kind: kind,
-                    albumID: columnText(stmt, 3) ?? "",
+                    albumID: albumID,
                     desired: sqlite3_column_int(stmt, 4) != 0,
                     createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5)),
                     attempts: Int(sqlite3_column_int(stmt, 6)),
@@ -1179,6 +1219,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     // MARK: - SQLite plumbing
+
+    /// A standalone write must commit itself, never join a transaction that a failed rollback left open. A lasting
+    /// failure refuses it; a transient failure still permits another attempt. Closed handles use the statement checks.
+    private func standaloneWrite<Result>(refusing failure: Result, _ body: () -> Result) -> Result {
+        connection.withLock {
+            if let db, sqlite3_get_autocommit(db) == 0 { return failure }
+            guard !connection.operationFailed || connection.failuresAreTransient else { return failure }
+            return body()
+        }
+    }
 
     /// Runs `body` in one IMMEDIATE transaction. Returns false and rolls back when `body` or the commit fails. A failed
     /// SQLite call in `body` records its own failure; a writer that refuses a row it cannot read records none (#982).
@@ -1253,9 +1303,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return true
     }
 
-    private func key(_ stmt: OpaquePointer?, kindColumn: Int32, idColumn: Int32) -> PendingSourceKey? {
-        guard let kind = columnText(stmt, kindColumn).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
-            let identifier = columnText(stmt, idColumn)
+    private func key(
+        _ stmt: OpaquePointer?, kindColumn: Int32, idColumn: Int32, roundTrip: Bool = false
+    ) -> PendingSourceKey? {
+        guard
+            let kind = columnText(stmt, kindColumn, roundTrip: roundTrip).flatMap(
+                UploadSourceIdentity.Kind.init(rawValue:)),
+            let identifier = columnText(stmt, idColumn, roundTrip: roundTrip)
         else { return nil }
         return PendingSourceKey(kind: kind, identifier: identifier)
     }
@@ -1302,9 +1356,21 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         if let value { bindText(stmt, index, value) } else { sqlite3_bind_null(stmt, index) }
     }
 
-    private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
+    /// Reads a text column. With `roundTrip`, reads the full bytes of the column: the writers bind with a C string,
+    /// so a stored value with an embedded NUL or bytes that are not strict UTF-8 cannot have come from this store
+    /// (#1006).
+    private func columnText(_ stmt: OpaquePointer?, _ index: Int32, roundTrip: Bool = false) -> String? {
         guard let text = sqlite3_column_text(stmt, index) else { return nil }
-        return String(cString: text)
+        guard roundTrip else { return String(cString: text) }
+        return roundTrippedText(text, byteCount: sqlite3_column_bytes(stmt, index))
+    }
+
+    private func roundTrippedText(_ text: UnsafePointer<UInt8>, byteCount: Int32) -> String? {
+        guard
+            let value = String(
+                bytes: UnsafeBufferPointer(start: text, count: Int(byteCount)), encoding: .utf8)
+        else { return nil }
+        return value.contains("\0") ? nil : value
     }
 
     // MARK: - Schema
