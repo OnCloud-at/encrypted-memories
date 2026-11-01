@@ -1844,12 +1844,26 @@
         "de": { "stringUnit": { "state": "translated", "value": "%1$lld von %2$lld gesichert" } }
       }
     },
-    "albumsync.detail_attached %lld %lld": {
+    "albumsync.detail_attached %lld": {
       "extractionState": "manual",
-      "comment": "Album sync attach progress: %1$lld of %2$lld photos are in the Proton album.",
+      "comment": "Album sync attach progress: photos newly added during this run. Existing album members do not count.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "%1$lld of %2$lld added to album" } },
-        "de": { "stringUnit": { "state": "translated", "value": "%1$lld von %2$lld zum Album hinzugefügt" } }
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld photo added to album" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld photos added to album" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto zum Album hinzugefügt" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos zum Album hinzugefügt" } }
+            }
+          }
+        }
       }
     },
     "albumsync.detail_completed %lld": {
