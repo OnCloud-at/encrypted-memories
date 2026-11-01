@@ -479,8 +479,9 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
                     case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
                     }
                     facts[PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)] = fact
-                    measurement?.record(.factsCreated)
                 }
+                // Count the facts the caller receives: a batch that throws midway delivers no facts at all.
+                measurement?.record(.factsCreated, count: facts.count)
                 return facts
             }
         }
