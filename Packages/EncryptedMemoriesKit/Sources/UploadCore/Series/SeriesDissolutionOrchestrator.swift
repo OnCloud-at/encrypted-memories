@@ -235,6 +235,9 @@ public struct SeriesDissolutionProgress: Sendable, Equatable {
         /// Copying favorite `index` (0-based) of `count`.
         case copyingFavorite(index: Int, count: Int)
         case movingSeriesToTrash
+        /// `count` members stay in the library because the server reported no role for them. The operation
+        /// still finishes normally; this step tells the person that those photos stay.
+        case membersStayedWithoutARole(count: Int)
     }
 
     public let step: Step
@@ -421,7 +424,11 @@ public actor SeriesDissolutionOrchestrator {
         }
 
         onProgress(.init(step: .movingSeriesToTrash, fraction: 0.9))
-        let trashed = try await photosToTrash(journal)
+        let plan = try await photosToTrash(journal)
+        if !plan.staying.isEmpty {
+            onProgress(.init(step: .membersStayedWithoutARole(count: plan.staying.count), fraction: 0.9))
+        }
+        let trashed = plan.toTrash
         // A resumed trash step skips photos that an earlier attempt already moved.
         let remaining = try await remote.activeUIDs(among: trashed)
         if !remaining.isEmpty {
@@ -444,17 +451,28 @@ public actor SeriesDissolutionOrchestrator {
     /// with its main photo and brings it back when the person restores that main photo; a related photo trashed on its
     /// own would not come back with the series. Related photos keep their own active state, so only the photos in
     /// this list confirm the step. A member that the server no longer knows is skipped. A member whose role the server
-    /// does not report is skipped as well: it stays in the library untouched, and nothing is shown.
-    private func photosToTrash(_ journal: SeriesDissolutionJournal) async throws -> [PhotoUID] {
+    /// does not report is skipped as well: it stays in the library untouched, and `staying` reports it so the
+    /// person learns that it stays. An unknown role is not proof of ownership, so the member is never trashed
+    /// on its own.
+    private func photosToTrash(
+        _ journal: SeriesDissolutionJournal
+    ) async throws -> (toTrash: [PhotoUID], staying: [PhotoUID]) {
         let mainUID = journal.seriesMainUID
         let members = journal.seriesUIDs.filter { $0 != mainUID }
         let roles = members.isEmpty ? [:] : try await remote.memberRoles(of: members)
         var trashed = [mainUID]
+        var staying: [PhotoUID] = []
         for member in members {
-            guard let link = roles[member], link.hasExplicitPhotoState else { continue }
+            guard let link = roles[member] else { continue }
+            guard link.hasExplicitPhotoState else {
+                // An unknown role is not proof of ownership, so the photo is never trashed on its own. The
+                // person sees every photo that stays active, so only those are reported.
+                if link.isActive { staying.append(member) }
+                continue
+            }
             if link.mainPhotoLinkID == nil { trashed.append(member) }
         }
-        return trashed
+        return (trashed, staying)
     }
 
     /// A retry may carry another selection while no series photo is trashed yet. Confirmed copies of favorites

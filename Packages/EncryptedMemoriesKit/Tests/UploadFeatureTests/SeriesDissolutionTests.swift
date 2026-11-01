@@ -645,6 +645,51 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(try journalStore.pendingJournals(), [], "the confirmation ignores the member")
     }
 
+    func testAMemberWithoutARoleIsReportedThroughProgressSoThePersonLearnsThatItStays() async throws {
+        server.makeStandalone(["m3"])
+        server.withholdPhotoRole(["m3"])
+
+        let progress = ProgressRecorder()
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")],
+            onProgress: { progress.record($0) })
+
+        XCTAssertEqual(
+            progress.stayedWithoutRoleCounts, [1],
+            "the person learns before the end that the member without a role stays in the library")
+    }
+
+    func testAMemberWithoutARoleThatIsAlreadyTrashedIsNotReported() async throws {
+        server.markTrashed(["m3"])
+        server.withholdPhotoRole(["m3"])
+
+        let progress = ProgressRecorder()
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")],
+            onProgress: { progress.record($0) })
+
+        XCTAssertTrue(
+            progress.stayedWithoutRoleCounts.isEmpty,
+            "a member that is already in the trash does not stay in the library")
+    }
+
+    /// Records the progress events of one operation, safely across sendable closures.
+    private final class ProgressRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _steps: [SeriesDissolutionProgress] = []
+
+        func record(_ progress: SeriesDissolutionProgress) { lock.withLock { _steps.append(progress) } }
+
+        var steps: [SeriesDissolutionProgress] { lock.withLock { _steps } }
+
+        var stayedWithoutRoleCounts: [Int] {
+            steps.compactMap {
+                if case .membersStayedWithoutARole(let count) = $0.step { return count }
+                return nil
+            }
+        }
+    }
+
     func testARoleThatIsUnknownInTheTrashStepLeavesTheMemberAndFinishes() async throws {
         server.makeStandalone(["m3"])
         server.failNextTrash()

@@ -47,6 +47,35 @@ final class MobileSeriesFavoritesTests: XCTestCase {
         XCTAssertEqual(model.operation, .idle)
     }
 
+    @MainActor func testAMemberWithoutAKnownRoleTellsThePersonThatItStayedBeforeTheModeCloses() async {
+        let probe = FlowProbe()
+        probe.keptMembersWithoutRole = 1
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[1].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(model.operation, .finishedWithKeptMembers(count: 1))
+        XCTAssertTrue(model.isPresentingKeptMembersNotice)
+        XCTAssertTrue(probe.finished.isEmpty, "the mode stays open until the person read the notice")
+
+        model.finishAfterKeptMembers()
+
+        XCTAssertEqual(model.operation, .idle)
+        XCTAssertEqual(probe.finished, [true], "after the notice the mode closes like a normal success")
+    }
+
+    @MainActor func testTheNoticeCannotBeDismissedTwice() {
+        let probe = FlowProbe()
+        probe.keptMembersWithoutRole = 2
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+
+        model.finishAfterKeptMembers()
+
+        XCTAssertEqual(model.operation, .idle, "without a notice the mode must not close twice")
+        XCTAssertTrue(probe.finished.isEmpty)
+    }
+
     @MainActor func testFailureKeepsTheModeOpenAndRetryResumes() async {
         let probe = FlowProbe()
         probe.failuresBeforeSuccess = 1
@@ -175,6 +204,8 @@ final class MobileSeriesFavoritesTests: XCTestCase {
     var keepOnlyCalls: [[PhotoUID]] = []
     var abandonCalls = 0
     var failuresBeforeSuccess = 0
+    /// Members without a known role that the fake backend reports as staying in the library.
+    var keptMembersWithoutRole = 0
 
     func makeModel(canKeepOnlyFavorites: Bool) -> MobileSeriesFavoritesModel {
         MobileSeriesFavoritesModel(
@@ -183,10 +214,15 @@ final class MobileSeriesFavoritesTests: XCTestCase {
             keepOnlyFavorites: { [self] favoriteUIDs, onProgress in
                 keepOnlyCalls.append(favoriteUIDs)
                 onProgress(.init(step: .copyingFavorite(index: 0, count: favoriteUIDs.count), fraction: 0.4))
+                if keptMembersWithoutRole > 0 {
+                    onProgress(.init(step: .membersStayedWithoutARole(count: keptMembersWithoutRole), fraction: 0.9))
+                }
                 if failuresBeforeSuccess > 0 {
                     failuresBeforeSuccess -= 1
                     throw SeriesDissolutionError.copyNotConfirmed
                 }
+                // The model records each report on the main actor, so let those hops land before this call returns.
+                try? await Task.sleep(for: .milliseconds(50))
             },
             abandonKeepOnlyFavorites: { [self] in abandonCalls += 1 },
             onFinished: { [self] in finished.append($0) }
