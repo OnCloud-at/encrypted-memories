@@ -5,14 +5,14 @@ import SQLite3
 /// Device-local state for pending grid tiles (`pending-backup-v1.sqlite`): desired backup state per source,
 /// duplicate-check evidence, handoffs to Proton photos, deferred actions and photos the app saved itself.
 ///
-/// It is a separate store because every existing store uses an exact-schema gate without migrations, and
-/// the backup queue must never become unreadable. Writes are synchronous so the backup runner can record a
+/// It is a separate store so changes to pending state cannot change the backup queue schema. Only the exact
+/// supported v1 schema migrates to v2; unknown schemas stay untouched. Writes are synchronous so the backup runner can record a
 /// handoff before it clears a commit receipt. An unavailable store fails closed: no pending tile shows,
 /// and the backup engine enqueues no new photos, because it cannot prove that they were not deleted.
 public final class PendingBackupManifestStore: @unchecked Sendable {
     public static let databaseFileName = "pending-backup-v1.sqlite"
 
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
 
@@ -670,6 +670,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             let committed = transaction {
                 guard case .readable(let current) = sourceStateLocked(key) else { return false }
                 guard let state = current else { return true }
+                if effect != .queueSync {
+                    guard let matches = operationMatches(effect, key: key, generation: generation, linkID: remoteLinkID)
+                    else { return false }
+                    guard matches else { return true }
+                }
                 var sql: String
                 switch effect {
                 case .queueSync:
@@ -704,6 +709,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     bindKey(stmt, key, from: 2)
                 }
                 guard updated else { return false }
+                if effect != .queueSync, !clearOperationBinding(for: key) { return false }
                 return execute(
                     """
                     DELETE FROM source_state
@@ -797,12 +803,63 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                                 bindText(stmt, 5, state.remote?.nodeID ?? "")
                             })
                     else { return false }
-                    if sqlite3_changes(db) > 0 { marked.insert(state.key) }
+                    if sqlite3_changes(db) > 0 {
+                        guard
+                            execute(
+                                """
+                                INSERT INTO remote_operation(source_kind, source_id, effect, remote_volume_id, remote_link_id, generation)
+                                VALUES(?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(source_kind, source_id) DO UPDATE SET effect=excluded.effect,
+                                  remote_volume_id=excluded.remote_volume_id, remote_link_id=excluded.remote_link_id,
+                                  generation=excluded.generation;
+                                """,
+                                bind: { stmt in
+                                    bindKey(stmt, state.key)
+                                    bindText(stmt, 3, effect.rawValue)
+                                    bindText(stmt, 4, state.remote?.volumeID ?? "")
+                                    bindText(stmt, 5, state.remote?.nodeID ?? "")
+                                    sqlite3_bind_int64(stmt, 6, state.generation)
+                                })
+                        else { return false }
+                        marked.insert(state.key)
+                    }
                 }
                 return true
             }
             return committed ? marked : nil
         }
+    }
+
+    /// No row is legacy unknown ownership. A read error or malformed binding never means absence.
+    private func operationMatches(
+        _ effect: PendingSourceEffect, key: PendingSourceKey, generation: Int64, linkID: String?
+    ) -> Bool? {
+        var stmt: OpaquePointer?
+        guard
+            prepare(
+                "SELECT effect, remote_volume_id, remote_link_id, generation FROM remote_operation WHERE source_kind=? AND source_id=?;",
+                &stmt)
+        else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        bindKey(stmt, key)
+        switch sqlite3_step(stmt) {
+        case SQLITE_DONE: return true
+        case SQLITE_ROW:
+            guard let storedEffect = columnText(stmt, 0, roundTrip: true).flatMap(PendingSourceEffect.init(rawValue:)),
+                storedEffect != .queueSync,
+                columnText(stmt, 1, roundTrip: true) != nil,
+                let storedLink = columnText(stmt, 2, roundTrip: true),
+                sqlite3_column_type(stmt, 3) == SQLITE_INTEGER
+            else { return nil }
+            return storedEffect == effect && storedLink == linkID && sqlite3_column_int64(stmt, 3) == generation
+        default:
+            connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+            return nil
+        }
+    }
+
+    private func clearOperationBinding(for key: PendingSourceKey) -> Bool {
+        execute("DELETE FROM remote_operation WHERE source_kind=? AND source_id=?;") { bindKey($0, key) }
     }
 
     /// Schedules the next attempt of a failed effect with the shared backoff.
@@ -886,6 +943,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         })
                 else { return false }
                 guard outcome == .completed else { return true }
+                guard clearOperationBinding(for: checked.key) else { return false }
                 return execute(
                     """
                     DELETE FROM source_state WHERE source_kind=? AND source_id=? AND desired='included'
@@ -1375,93 +1433,160 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     // MARK: - Schema
 
-    private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        let schema = """
-            CREATE TABLE IF NOT EXISTS pending_info(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS source_state(
-              source_kind          TEXT NOT NULL,
-              source_id            TEXT NOT NULL,
-              desired              TEXT NOT NULL,
-              generation           INTEGER NOT NULL,
-              needs_queue_sync     INTEGER NOT NULL,
-              needs_remote_trash   INTEGER NOT NULL,
-              needs_remote_restore INTEGER NOT NULL,
-              remote_volume_id     TEXT,
-              remote_link_id       TEXT,
-              remote_trashed       INTEGER NOT NULL,
-              listed_in_trash      INTEGER NOT NULL,
-              excluded_at          REAL,
-              capture_time         REAL,
-              media_type           TEXT,
-              is_live              INTEGER NOT NULL,
-              duration             REAL,
-              display_name         TEXT,
-              attempts             INTEGER NOT NULL,
-              next_attempt_at      REAL NOT NULL,
-              updated_at           REAL NOT NULL,
-              remote_op            TEXT,
-              PRIMARY KEY(source_kind, source_id)
-            );
-            CREATE TABLE IF NOT EXISTS upload_evidence(
-              source_kind TEXT NOT NULL,
-              source_id   TEXT NOT NULL,
-              revision_us INTEGER NOT NULL,
-              recorded_at REAL NOT NULL,
-              PRIMARY KEY(source_kind, source_id, revision_us)
-            );
-            CREATE TABLE IF NOT EXISTS handoff(
-              source_kind      TEXT NOT NULL,
-              source_id        TEXT NOT NULL,
-              revision_us      INTEGER NOT NULL,
-              remote_volume_id TEXT NOT NULL,
-              remote_link_id   TEXT NOT NULL,
-              kind             TEXT NOT NULL,
-              created_at       REAL NOT NULL,
-              acknowledged     INTEGER NOT NULL,
-              PRIMARY KEY(source_kind, source_id, revision_us)
-            );
-            CREATE INDEX IF NOT EXISTS handoff_acknowledged_idx ON handoff(acknowledged, created_at);
-            CREATE INDEX IF NOT EXISTS handoff_remote_idx ON handoff(remote_link_id);
-            CREATE TABLE IF NOT EXISTS pending_action(
-              source_kind     TEXT NOT NULL,
-              source_id       TEXT NOT NULL,
-              kind            TEXT NOT NULL,
-              album_id        TEXT NOT NULL,
-              desired         INTEGER NOT NULL,
-              created_at      REAL NOT NULL,
-              attempts        INTEGER NOT NULL,
-              next_attempt_at REAL NOT NULL,
-              failed          INTEGER NOT NULL,
-              PRIMARY KEY(source_kind, source_id, kind, album_id)
-            );
-            CREATE TABLE IF NOT EXISTS saved_from_app(
-              local_id         TEXT PRIMARY KEY,
-              remote_volume_id TEXT NOT NULL,
-              remote_link_id   TEXT NOT NULL,
-              saved_at         REAL NOT NULL
-            );
-            """
+    private static let legacySchema = """
+        CREATE TABLE IF NOT EXISTS pending_info(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS source_state(
+          source_kind          TEXT NOT NULL,
+          source_id            TEXT NOT NULL,
+          desired              TEXT NOT NULL,
+          generation           INTEGER NOT NULL,
+          needs_queue_sync     INTEGER NOT NULL,
+          needs_remote_trash   INTEGER NOT NULL,
+          needs_remote_restore INTEGER NOT NULL,
+          remote_volume_id     TEXT,
+          remote_link_id       TEXT,
+          remote_trashed       INTEGER NOT NULL,
+          listed_in_trash      INTEGER NOT NULL,
+          excluded_at          REAL,
+          capture_time         REAL,
+          media_type           TEXT,
+          is_live              INTEGER NOT NULL,
+          duration             REAL,
+          display_name         TEXT,
+          attempts             INTEGER NOT NULL,
+          next_attempt_at      REAL NOT NULL,
+          updated_at           REAL NOT NULL,
+          remote_op            TEXT,
+          PRIMARY KEY(source_kind, source_id)
+        );
+        CREATE TABLE IF NOT EXISTS upload_evidence(
+          source_kind TEXT NOT NULL,
+          source_id   TEXT NOT NULL,
+          revision_us INTEGER NOT NULL,
+          recorded_at REAL NOT NULL,
+          PRIMARY KEY(source_kind, source_id, revision_us)
+        );
+        CREATE TABLE IF NOT EXISTS handoff(
+          source_kind      TEXT NOT NULL,
+          source_id        TEXT NOT NULL,
+          revision_us      INTEGER NOT NULL,
+          remote_volume_id TEXT NOT NULL,
+          remote_link_id   TEXT NOT NULL,
+          kind             TEXT NOT NULL,
+          created_at       REAL NOT NULL,
+          acknowledged     INTEGER NOT NULL,
+          PRIMARY KEY(source_kind, source_id, revision_us)
+        );
+        CREATE INDEX IF NOT EXISTS handoff_acknowledged_idx ON handoff(acknowledged, created_at);
+        CREATE INDEX IF NOT EXISTS handoff_remote_idx ON handoff(remote_link_id);
+        CREATE TABLE IF NOT EXISTS pending_action(
+          source_kind     TEXT NOT NULL,
+          source_id       TEXT NOT NULL,
+          kind            TEXT NOT NULL,
+          album_id        TEXT NOT NULL,
+          desired         INTEGER NOT NULL,
+          created_at      REAL NOT NULL,
+          attempts        INTEGER NOT NULL,
+          next_attempt_at REAL NOT NULL,
+          failed          INTEGER NOT NULL,
+          PRIMARY KEY(source_kind, source_id, kind, album_id)
+        );
+        CREATE TABLE IF NOT EXISTS saved_from_app(
+          local_id         TEXT PRIMARY KEY,
+          remote_volume_id TEXT NOT NULL,
+          remote_link_id   TEXT NOT NULL,
+          saved_at         REAL NOT NULL
+        );
+        """
 
-        return SQLiteStoreSchemaGate.openCurrentStore(
-            at: url,
-            schemaSQL: schema,
-            policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
-        )
+    private static let operationSchema = """
+        CREATE TABLE IF NOT EXISTS remote_operation(
+          source_kind      TEXT NOT NULL,
+          source_id        TEXT NOT NULL,
+          effect           TEXT NOT NULL,
+          remote_volume_id TEXT NOT NULL,
+          remote_link_id   TEXT NOT NULL,
+          generation       INTEGER NOT NULL,
+          PRIMARY KEY(source_kind, source_id)
+        );
+        """
+
+    private static var schema: String { legacySchema + "\n" + operationSchema }
+
+    private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
+        if let current = SQLiteStoreSchemaGate.openCurrentStore(
+            at: url, schemaSQL: schema, policy: policy, strictEmptySchema: true,
+            verifyVersion: { verifyVersion($0, expected: schemaVersion) }, stampVersion: stampVersion)
+        {
+            return current
+        }
+        // The fallback opens only a proven v1, never an unknown file or an empty store after a failed create.
+        guard
+            let legacy = SQLiteStoreSchemaGate.openCurrentStore(
+                at: url, schemaSQL: legacySchema, policy: policy, strictEmptySchema: true,
+                verifyVersion: { verifyVersion($0, expected: 1) }, stampVersion: { _ in false })
+        else { return nil }
+        return openMigratedLegacyStore(legacy)
     }
 
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
+    /// Takes ownership of a verified legacy handle. A failed migration never exposes a v1 handle as v2.
+    static func openMigratedLegacyStore(_ handle: OpaquePointer) -> OpaquePointer? {
+        guard migrateLegacyStore(handle) else {
+            sqlite3_close(handle)
+            return nil
+        }
+        return handle
+    }
+
+    /// The locked recheck, table and version commit together. A refused statement or a crash leaves v1 intact.
+    static func migrateLegacyStore(_ handle: OpaquePointer) -> Bool {
+        return SQLiteStoreSchemaGate.withDurableCommits(handle) {
+            guard sqlite3_exec(handle, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
+            var committed = false
+            defer { if !committed { sqlite3_exec(handle, "ROLLBACK;", nil, nil, nil) } }
+            guard verifyVersion(handle, expected: 1),
+                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: legacySchema),
+                sqlite3_exec(handle, operationSchema, nil, nil, nil) == SQLITE_OK,
+                stampVersion(handle),
+                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema),
+                sqlite3_exec(handle, "COMMIT;", nil, nil, nil) == SQLITE_OK
+            else { return false }
+            committed = true
+            return true
+        } ?? false
+    }
+
+    private static func verifyVersion(_ handle: OpaquePointer?, expected: Int) -> Bool {
         var stmt: OpaquePointer?
         guard
             sqlite3_prepare_v2(handle, "SELECT value FROM pending_info WHERE key='schema';", -1, &stmt, nil)
                 == SQLITE_OK
         else { return false }
-        var onDisk: Int?
+        var onDisk: Int64?
         let result = sqlite3_step(stmt)
-        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
+        if result == SQLITE_ROW, sqlite3_column_type(stmt, 0) == SQLITE_INTEGER {
+            onDisk = sqlite3_column_int64(stmt, 0)
+        }
         sqlite3_finalize(stmt)
-        return result == SQLITE_ROW && onDisk == schemaVersion
+        return result == SQLITE_ROW && onDisk == Int64(expected)
+            && hasSupportedObjectInventory(handle, version: expected)
+    }
+
+    /// V1 has six tables and eight indexes; v2 adds one table and its primary-key index. The shared matcher
+    /// excludes SQLite names. Count every schema row here, allowing only the exact optional optimizer table.
+    static func hasSupportedObjectInventory(_ handle: OpaquePointer?, version: Int) -> Bool {
+        let count = version == 1 ? 14 : 16
+        var stmt: OpaquePointer?
+        guard
+            sqlite3_prepare_v2(
+                handle,
+                "SELECT COUNT(*) = \(count) + COALESCE(SUM((type,name,tbl_name,sql) = "
+                    + "('table','sqlite_stat1','sqlite_stat1','CREATE TABLE sqlite_stat1(tbl,idx,stat)')), 0) FROM sqlite_schema;",
+                -1, &stmt, nil) == SQLITE_OK
+        else { return false }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+        return sqlite3_column_int(stmt, 0) == 1
     }
 
     private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
