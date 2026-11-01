@@ -6,6 +6,16 @@ final class MobileExcludedBackupUITests: XCTestCase {
     override func setUp() {
         continueAfterFailure = false
         app = UITestApplication.make()
+        // The fixture backs up with access to Photos. An earlier test can leave that access unanswered; the system then
+        // asks during this test, and the person allows it. A denial hides the settings of an enabled backup.
+        app.resetAuthorizationStatus(for: .photos)
+        addUIInterruptionMonitor(withDescription: "Photos access") { alert in
+            for label in ["Allow Full Access", "Vollen Zugriff erlauben"] where alert.buttons[label].exists {
+                alert.buttons[label].tap()
+                return true
+            }
+            return false
+        }
         app.launchArguments = [
             "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesPausedBackupFixture",
             "-EncryptedMemoriesExcludedBackupFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
