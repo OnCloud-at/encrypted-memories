@@ -44,7 +44,8 @@ import Testing
         let fold = CGRect(x: 185, y: 0, width: 40, height: 680)
         let visible = CGRect(x: 0, y: 0, width: 951, height: 290)
         let label = CGRect(x: 100, y: 200, width: 40, height: 30)
-        #expect(mark([active(fold)], occupied: [label], bounds: visible) == CGRect(x: 158, y: 261, width: 22, height: 22))
+        #expect(
+            mark([active(fold)], occupied: [label], bounds: visible) == CGRect(x: 158, y: 261, width: 22, height: 22))
     }
 
     @Test func theLeadingEdgeIsAFreeSpotWhenTheStepsMissIt() {
