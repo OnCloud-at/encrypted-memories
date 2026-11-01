@@ -248,6 +248,9 @@ if [[ -n "$XCTESTRUN" ]]; then
     -destination "$DESTINATION" \
     -derivedDataPath "$DERIVED_DATA"
 else
+  # An unsigned test host has no Keychain entitlement, so sign-out claim purging fails with
+  # errSecMissingEntitlement. Ad-hoc signing gives the hosted app its entitlement locally, as
+  # scripts/upgrade-test/build_apps.py already does for upgrade builds.
   set -- xcrun xcodebuild \
     -project "$ROOT/EncryptedMemories.xcodeproj" \
     -scheme "$SCHEME" \
@@ -257,7 +260,8 @@ else
     -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
     -disableAutomaticPackageResolution \
     -skipPackagePluginValidation \
-    CODE_SIGNING_ALLOWED=NO
+    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGN_IDENTITY=-
 fi
 if [[ "$ACTION" != "build-for-testing" && "$SCHEME" == "EncryptedMemoriesMobileCI" ]]; then
   set -- "$@" "-only-testing:$TEST_TARGET"
