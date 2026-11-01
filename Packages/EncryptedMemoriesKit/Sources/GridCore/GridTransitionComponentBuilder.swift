@@ -1,10 +1,8 @@
 // GridTransitionComponentBuilder.swift
 //
-// Consumes the engine's settled source/target GridFramePlan (no engine mutation) and derives the
-// single presentation lattice: anchor-relative keys, per-key source/target occupants + rects, and
-// the relocation components (union-find linking each relocating identity's source key to its target key).
-// Only the anchor (0,0) is stable by construction; the rest of the focus row relocates when the column
-// count changes between levels (its keys form a side == .focus relocation component), as do other rows.
+// Builds presentation keys for settled frame plans and joins the source/target positions of relocating
+// identities. Columns are relative to the anchor without a division, or to the division otherwise;
+// rows are relative to the anchor. The schedules own occupant crossfades for each component.
 
 import CoreGraphics
 
@@ -114,20 +112,21 @@ package enum GridTransitionComponentBuilder {
         let sections = Set(source.visibleSlots.map(\.section)).union(target.visibleSlots.map(\.section))
         guard sections.count == 1 else { return nil }
 
-        func relKey(_ s: GridSlot, _ a: GridSlot) -> RelativeSlotKey {
-            .init(dr: s.row - a.row, dc: s.column - a.column)
+        let divided = source.columnGeometry.isDivided && target.columnGeometry.isDivided
+        func relKey(_ s: GridSlot, _ a: GridSlot, columns: Int) -> RelativeSlotKey {
+            .init(dr: s.row - a.row, dc: s.column - (divided ? columns / 2 : a.column))
         }
         var sourceOcc: [RelativeSlotKey: Int] = [:]
         var targetOcc: [RelativeSlotKey: Int] = [:]
         var sourceRect: [RelativeSlotKey: CGRect] = [:]
         var targetRect: [RelativeSlotKey: CGRect] = [:]
         for s in source.visibleSlots {
-            let k = relKey(s, aS)
+            let k = relKey(s, aS, columns: source.columns)
             sourceOcc[k] = s.index
             sourceRect[k] = s.viewportRect
         }
         for s in target.visibleSlots {
-            let k = relKey(s, aT)
+            let k = relKey(s, aT, columns: target.columns)
             targetOcc[k] = s.index
             targetRect[k] = s.viewportRect
         }
@@ -209,13 +208,33 @@ package enum GridTransitionComponentBuilder {
             cid += 1
         }
 
-        // Synthesize endpoints for entries and exits so they move with the grid. Abort if no stable transform
-        // can be fit from keys that exist in both frame plans.
-        guard
-            let transform = GridTransitionPresentationTransform.fit(
-                keys: keys, sourceRect: sourceRect, targetRect: targetRect)
-        else { return nil }
-        let (presSource, presTarget) = transform.endpoints(keys: keys, sourceRect: sourceRect, targetRect: targetRect)
+        let presSource: [RelativeSlotKey: CGRect]
+        let presTarget: [RelativeSlotKey: CGRect]
+        if divided {
+            // Division-relative columns keep every interpolated cell on its physical side. Entries/exits
+            // extend that same lattice outside the viewport; no photo is filtered to manufacture clearance.
+            func endpoints(_ plan: GridFramePlan, anchor: GridSlot) -> [RelativeSlotKey: CGRect] {
+                Dictionary(
+                    uniqueKeysWithValues: keys.map { key in
+                        (
+                            key,
+                            CGRect(
+                                x: plan.columnGeometry.origin(of: key.dc + plan.columns / 2),
+                                y: anchor.viewportRect.minY + CGFloat(key.dr) * plan.pitch,
+                                width: plan.slotSide, height: plan.slotSide)
+                        )
+                    })
+            }
+            presSource = endpoints(source, anchor: aS)
+            presTarget = endpoints(target, anchor: aT)
+        } else {
+            // Without a division, preserve the existing affine presentation for entries and exits.
+            guard
+                let transform = GridTransitionPresentationTransform.fit(
+                    keys: keys, sourceRect: sourceRect, targetRect: targetRect)
+            else { return nil }
+            (presSource, presTarget) = transform.endpoints(keys: keys, sourceRect: sourceRect, targetRect: targetRect)
+        }
 
         return GridTransitionLattice(
             keys: keys, sourceOcc: sourceOcc, targetOcc: targetOcc,

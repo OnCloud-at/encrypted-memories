@@ -421,6 +421,13 @@
         /// The active reserved regions (the iPhone Duo fold, a camera) in viewport coordinates; selection marks move
         /// out of them. Read on every layout; a hinge change asks for a layout.
         private(set) var reservedRegionLayout: ReservedRegionLayout = .none
+        private var divisionAreas: [ReservedRegionArea] = []
+        private var lastLaidOutDivisionFrame: CGRect?
+        #if DEBUG
+            var divisionAreasForTesting: [ReservedRegionArea]? {
+                didSet { setNeedsLayout() }
+            }
+        #endif
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
@@ -823,11 +830,22 @@
 
         public override func layoutSubviews() {
             updateScopeBarClearanceIfNeeded()
+            let newDivisionAreas = currentDivisionAreas()
+            let divisionChanged =
+                cachedProfile.map { profile in
+                    MetalGridFrameComposer.gridDivisionFrame(areas: newDivisionAreas, bounds: bounds, profile: profile)
+                        != lastLaidOutDivisionFrame
+                } ?? false
             if lastInsetBounds != bounds {
                 lastInsetBounds = bounds
                 scheduleInsetFollowUp()
             }
-            let resizePosition = captureViewportResizePositionIfNeeded()
+            let resizePosition = captureViewportResizePositionIfNeeded(divisionChanged: divisionChanged)
+            divisionAreas = newDivisionAreas
+            if divisionChanged {
+                cancelLiveZoomState()
+                cachedEngine = nil
+            }
             super.layoutSubviews()
             metalView.frame = bounds
             scrollView.frame = bounds
@@ -838,6 +856,7 @@
             restoreViewportResizePosition(resizePosition)
             lastLaidOutViewportSize = bounds.size
             lastLaidOutSafeAreaInsets = safeAreaInsets
+            lastLaidOutDivisionFrame = cachedEngine?.divisionFrame
             reservedRegionLayout = currentReservedRegionLayout()
             requestRender()
             invalidateAccessibilityElements()
@@ -1419,13 +1438,13 @@
         /// Capture against the previous layout, not the already-mutated `bounds`: the scroll offset belongs to the
         /// previous column geometry until `refreshContentSize()` resolves the new one. Preserve the newest edge as an
         /// edge; otherwise preserve the first photo below the top bar plus its distance to the bar.
-        private func captureViewportResizePositionIfNeeded() -> ViewportResizePosition? {
+        private func captureViewportResizePositionIfNeeded(divisionChanged: Bool = false) -> ViewportResizePosition? {
             guard lastLaidOutViewportSize.width > 0,
                 lastLaidOutViewportSize.height > 0,
                 !needsInitialViewportPlacement,
                 !itemUIDs.isEmpty,
                 let profile = cachedProfile,
-                viewportGeometryChangedSinceLastLayout
+                viewportGeometryChangedSinceLastLayout || divisionChanged
             else { return nil }
 
             let oldMaximumY = max(
@@ -1443,6 +1462,7 @@
                 sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
             )
             engine.topInset = scopeBarClearance
+            engine.divisionFrame = lastLaidOutDivisionFrame
             let plan = engine.framePlan(
                 level: level,
                 viewportSize: lastLaidOutViewportSize,
@@ -1563,13 +1583,17 @@
         /// `scopeBarClearance` participates in the cache key: a scope picker appearing or disappearing rebuilds
         /// so the layout origin shift takes effect.
         func currentEngine(profile: GridLevelProfile) -> SquareTileGridEngine {
+            let division = MetalGridFrameComposer.gridDivisionFrame(
+                areas: divisionAreas, bounds: bounds, profile: profile)
             if let cachedEngine, cachedEngineItemCount == items.count, cachedEngineProfileID == profile.id,
-                cachedEngineFillOrder == fillOrder, cachedEngine.topInset == scopeBarClearance
+                cachedEngineFillOrder == fillOrder, cachedEngine.topInset == scopeBarClearance,
+                cachedEngine.divisionFrame == division
             {
                 return cachedEngine
             }
             var engine = SquareTileGridEngine(sectionCounts: [items.count], profile: profile, fillOrder: fillOrder)
             engine.topInset = scopeBarClearance
+            engine.divisionFrame = division
             cachedEngine = engine
             cachedEngineItemCount = items.count
             cachedEngineProfileID = profile.id
@@ -2181,6 +2205,21 @@
             return .none
         }
 
+        /// Keep raw divisions separate from active selection exclusions: flat displays retain the alignment gap.
+        private func currentDivisionAreas() -> [ReservedRegionArea] {
+            #if DEBUG
+                if let divisionAreasForTesting { return divisionAreasForTesting }
+            #endif
+            #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
+                if #available(iOS 27.1, *) {
+                    return reservedRegions(kind: .division, options: .includeInactive).map {
+                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive)
+                    }
+                }
+            #endif
+            return []
+        }
+
         /// UIKit reports no separate change of reserved regions. Folding or opening iPhone Duo changes the hinge, so
         /// the hinge update reads the regions again and draws only when they changed. The angle itself decides nothing.
         private func observeHingeForReservedRegions() {
@@ -2193,8 +2232,9 @@
 
         private func refreshReservedRegions() {
             let layout = currentReservedRegionLayout()
-            guard layout != reservedRegionLayout else { return }
+            guard layout != reservedRegionLayout || currentDivisionAreas() != divisionAreas else { return }
             reservedRegionLayout = layout
+            setNeedsLayout()
             requestRender()
         }
     }
