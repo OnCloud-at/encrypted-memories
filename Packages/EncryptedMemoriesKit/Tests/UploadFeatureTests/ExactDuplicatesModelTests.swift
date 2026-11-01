@@ -2305,7 +2305,231 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.batches.count, 2, "no batch follows a batch that failed completely")
         XCTAssertEqual(model.groups.count, 50)
         XCTAssertEqual(log.calls.count, 1)
-        XCTAssertEqual(model.notice, .stopped(merged: 25, total: 75))
+        XCTAssertEqual(model.notice, .partialFailure(failed: 50, total: 75, canRetry: true))
+    }
+
+    func testPartialMergeFailureReportsCountsAndOffersTransientRetry() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        finder.mergeErrors[model.groups[3].id] = URLError(.timedOut)
+        await model.mergeAll()
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 60, canRetry: true))
+        XCTAssertEqual(model.groups.count, 1)
+        XCTAssertEqual(finder.batches.count, 3)
+    }
+
+    func testPartialMergeFailureDoesNotOfferRetryForPermanentOrUnknownErrors() async {
+        let errors: [any Error] = [
+            URLError(.userAuthenticationRequired), URLError(.badURL),
+            UploadError.permissionDenied("fixture"), UploadError.backend("fixture"),
+        ]
+        for error in errors {
+            let (model, finder, _) = await loadedModel(groups: 2)
+            finder.mergeErrors[model.groups[0].id] = error
+            await model.mergeAll()
+            XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 2, canRetry: false))
+        }
+    }
+
+    func testSuccessfulMergeAllHasNoPartialFailureWarning() async {
+        let (model, _, _) = await loadedModel(groups: 3)
+        await model.mergeAll()
+        XCTAssertNil(model.notice)
+    }
+
+    func testPartialMergeFailureRetryUsesOnlyTheRetryableFailedGroups() async {
+        let (model, finder, _) = await loadedModel(groups: 4)
+        let originalIDs = model.groups.map(\.id)
+        let temporary = model.groups[0].id
+        let permanent = model.groups[1].id
+        finder.mergeErrors[temporary] = URLError(.timedOut)
+        finder.mergeErrors[permanent] = UploadError.permissionDenied("fixture")
+        await model.mergeAll()
+        XCTAssertEqual(model.notice, .partialFailure(failed: 2, total: 4, canRetry: true))
+        XCTAssertTrue(model.canRetryFailedMerges)
+        finder.mergeErrors[temporary] = nil
+        // SwiftUI dismisses its alert before the asynchronous button task starts.
+        model.dismissNotice()
+
+        await model.retryFailedMerges()
+
+        XCTAssertEqual(finder.batches, [originalIDs, [temporary]])
+        XCTAssertEqual(model.groups.map(\.id), [permanent])
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 4, canRetry: false))
+        XCTAssertFalse(model.canRetryFailedMerges)
+    }
+
+    func testPartialMergeFailureRecognizesTypedTransientErrors() async {
+        let errors: [any Error] = [
+            URLError(.networkConnectionLost),
+            UploadError.transport(code: URLError.timedOut.rawValue, message: "fixture"),
+            UploadError.retryableBackend(code: 503, message: "fixture"),
+        ]
+        for error in errors {
+            let (model, finder, _) = await loadedModel(groups: 2)
+            finder.mergeErrors[model.groups[0].id] = error
+            await model.mergeAll()
+            XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 2, canRetry: true))
+            XCTAssertTrue(model.canRetryFailedMerges)
+        }
+    }
+
+    func testPartialMergeFailureNeverRetriesPermanentFailuresOrARetiredAccount() async {
+        for retired in [false, true] {
+            let (model, finder, _) = await loadedModel(groups: 2)
+            finder.mergeErrors[model.groups[0].id] =
+                retired
+                ? URLError(.timedOut) : UploadError.permissionDenied("fixture")
+            await model.mergeAll()
+            if retired { model.retire() }
+            XCTAssertFalse(model.canRetryFailedMerges)
+            let batches = finder.batches
+            await model.retryFailedMerges()
+            XCTAssertEqual(finder.batches, batches)
+        }
+    }
+
+    func testPartialMergeFailureDoesNotWarnForCancellation() async {
+        let errors: [any Error] = [CancellationError(), URLError(.cancelled), UploadError.cancelled]
+        for error in errors {
+            let (model, finder, _) = await loadedModel(groups: 2)
+            finder.mergeErrors[model.groups[0].id] = error
+            await model.mergeAll()
+            XCTAssertNil(model.notice)
+            XCTAssertFalse(model.canRetryFailedMerges)
+        }
+    }
+
+    func testPartialMergeFailureRetryCanFinishWithoutAWarning() async {
+        let (model, finder, _) = await loadedModel(groups: 3)
+        let failed = model.groups[0].id
+        finder.mergeErrors[failed] = URLError(.timedOut)
+        await model.mergeAll()
+        finder.mergeErrors[failed] = nil
+        await model.retryFailedMerges()
+        XCTAssertEqual(finder.batches.last, [failed])
+        XCTAssertEqual(model.groups.count, 0)
+        XCTAssertNil(model.notice)
+    }
+
+    func testPartialMergeFailureDismissalHidesTheRetryOffer() async {
+        let (model, finder, _) = await loadedModel(groups: 2)
+        finder.mergeErrors[model.groups[0].id] = URLError(.timedOut)
+        await model.mergeAll()
+        XCTAssertTrue(model.canRetryFailedMerges)
+        model.dismissNotice()
+        XCTAssertNil(model.notice)
+        XCTAssertFalse(model.canRetryFailedMerges)
+    }
+
+    func testPartialMergeFailureDoesNotReplaceTheSingleGroupNotice() async {
+        let (model, finder, _) = await loadedModel(groups: 2)
+        let failed = model.groups[0].id
+        finder.mergeErrors[failed] = URLError(.timedOut)
+        await model.merge(groupID: failed)
+        XCTAssertEqual(model.notice, .failed)
+        XCTAssertFalse(model.canRetryFailedMerges)
+    }
+
+    func testPartialMergeFailureDoesNotCountUnattemptedGroupsAfterOnlyCancellation() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        for group in model.groups.prefix(25) { finder.mergeErrors[group.id] = CancellationError() }
+        await model.mergeAll()
+        XCTAssertEqual(model.notice, .stopped(merged: 0, total: 60))
+        XCTAssertFalse(model.canRetryFailedMerges)
+    }
+
+    func testPartialMergeFailureStopsOnPermanentBatchWithoutOfferingRetry() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        for group in model.groups.prefix(25) { finder.mergeErrors[group.id] = UploadError.permissionDenied("fixture") }
+        await model.mergeAll()
+        XCTAssertEqual(model.notice, .partialFailure(failed: 60, total: 60, canRetry: false))
+        XCTAssertFalse(model.canRetryFailedMerges)
+        XCTAssertEqual(finder.batches.count, 1)
+    }
+
+    func testPartialMergeFailureRetryKeepsPermanentFailuresWhenACopyOrKeeperStays() async {
+        for unreadableKeeper in [false, true] {
+            let (model, finder, _) = await loadedModel(groups: 2)
+            let temporary = model.groups[0]
+            let permanent = model.groups[1].id
+            finder.mergeErrors[temporary.id] = URLError(.timedOut)
+            finder.mergeErrors[permanent] = UploadError.permissionDenied("fixture")
+            await model.mergeAll()
+            finder.mergeErrors[temporary.id] = nil
+            finder.outcomes[temporary.id] =
+                unreadableKeeper
+                ? .skipped(.keptUnreadable)
+                : .merged(
+                    kept: temporary.kept, trashed: [],
+                    keptDuplicates: [temporary.members.last!: .copyFailed])
+
+            await model.retryFailedMerges()
+
+            XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 2, canRetry: false))
+            XCTAssertFalse(model.canRetryFailedMerges)
+            XCTAssertTrue(model.groups.contains { $0.id == permanent })
+        }
+    }
+
+    func testPartialMergeFailureRetryExcludesPermanentPartsOfTheSameContentHash() async throws {
+        let a4 = PhotoUID(volumeID: "v", nodeID: "a4")
+        let four = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: [a1, a2, a3, a4])
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [four], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other, a4: other]
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+        XCTAssertEqual(model.groups.count, 2, "the real ranking splits the content hash by metadata")
+        let temporary = try XCTUnwrap(model.groups.first)
+        let permanent = try XCTUnwrap(model.groups.last)
+        XCTAssertNotEqual(temporary.id, permanent.id)
+        XCTAssertEqual(temporary.scanGroup.contentHash, permanent.scanGroup.contentHash)
+        finder.mergeErrors[temporary.id] = URLError(.timedOut)
+        finder.mergeErrors[permanent.id] = UploadError.permissionDenied("fixture")
+        await model.mergeAll()
+        finder.mergeErrors[temporary.id] = nil
+
+        await model.retryFailedMerges()
+
+        XCTAssertEqual(finder.batches.last, [temporary.id], "the same hash never reselects the permanent failure")
+        XCTAssertEqual(model.groups.map(\.id), [permanent.id])
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 2, canRetry: false))
+    }
+
+    func testPartialMergeFailureUsesOnlyTheStoppingBatchForUnattemptedRetryAdmission() async {
+        let (model, finder, _) = await loadedModel(groups: 75)
+        let ids = model.groups.map(\.id)
+        finder.mergeErrors[ids[0]] = URLError(.timedOut)
+        for id in ids[25..<50] { finder.mergeErrors[id] = UploadError.permissionDenied("fixture") }
+        await model.mergeAll()
+        XCTAssertEqual(model.notice, .partialFailure(failed: 51, total: 75, canRetry: true))
+        finder.mergeErrors[ids[0]] = nil
+
+        await model.retryFailedMerges()
+
+        XCTAssertEqual(finder.batches.last, [ids[0]], "a permanent stopping batch does not admit unattempted groups")
+        XCTAssertEqual(model.groups.count, 50)
+        XCTAssertEqual(model.notice, .partialFailure(failed: 50, total: 75, canRetry: false))
+    }
+
+    func testPartialMergeFailurePreservesSingleGroupTransportCancellationNotice() async {
+        let (model, finder, _) = await loadedModel(groups: 2)
+        let id = model.groups[0].id
+        finder.mergeErrors[id] = URLError(.cancelled)
+        await model.merge(groupID: id)
+        XCTAssertEqual(model.notice, .failed)
+    }
+
+    func testPartialMergeFailureKeepsUserStopAsStopped() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        finder.mergeErrors[model.groups[0].id] = URLError(.timedOut)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the batch runs")
+        model.stopMergeAll()
+        finder.mergeGate.open()
+        await merge.value
+        XCTAssertEqual(model.notice, .stopped(merged: 24, total: 60))
+        XCTAssertFalse(model.canRetryFailedMerges)
     }
 
     func testOneFailedGroupDoesNotStopMergeAll() async {
@@ -2314,7 +2538,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await model.mergeAll()
         XCTAssertEqual(finder.batches.count, 3)
         XCTAssertEqual(model.groups.count, 1)
-        XCTAssertEqual(model.notice, .failed)
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 60, canRetry: true))
     }
 
     func testTheStoppedNoticeCountsTheMergedGroupsOfAllGroups() {
@@ -3049,7 +3273,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await model.load()
         await model.mergeAll()
         XCTAssertEqual(model.groups.map(\.id), ["A"])
-        XCTAssertEqual(model.notice, .failed)
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 2, canRetry: true))
         XCTAssertEqual(log.calls, [[b2]], "the merged group still leaves the library")
     }
 
@@ -3150,7 +3374,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         XCTAssertEqual(finder.merges.map(\.group), ["B"])
         XCTAssertEqual(model.groups.map(\.id), ["A"], "the group stays for a later try")
-        XCTAssertEqual(model.notice, .failed)
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 2, canRetry: false))
     }
 
     func testMergingOneGroupThatSplitsWhileItsMetadataArriveMergesNothing() async {
