@@ -405,8 +405,18 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             if isRoot, !exactMatches.isEmpty {
                 do {
-                    let related = try await relatedLinks(among: Set(exactMatches.map(\.nodeID)))
+                    var fallbackReads = RelatedProofReads()
+                    let related = try await relatedLinks(
+                        among: Set(exactMatches.map(\.nodeID)), requiresActiveMain: false, reads: &fallbackReads)
                     exactMatches.removeAll { related.contains($0.nodeID) }
+                    // An exact match adopts the same proof as a name row: a state read of this check must
+                    // prove the copy, see `countsAsBackup`. An answer without role data never proves a
+                    // root backup (#876), and the skip would be indistinguishable from a proven one once
+                    // it is persisted.
+                    for exact in exactMatches {
+                        try await readPrimedState(exact.nodeID, reads: &fallbackReads)
+                    }
+                    exactMatches.removeAll { !countsAsBackup($0.nodeID, isRoot: true, reads: fallbackReads) }
                 } catch {
                     releasePendingUploadClaims(ownedBy: descriptor)
                     throw error
@@ -1099,7 +1109,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         return linkIDs.filter {
             if requiresActiveMain {
-                return known[$0].map { $0.hasExplicitPhotoState && $0.isActiveMain } != true
+                return known[$0].map(Self.provesActiveMain) != true
             }
             return known[$0]?.mainPhotoLinkID != nil
         }
@@ -1179,6 +1189,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         return age >= 0 && age <= Self.primedStateLifetime
     }
 
+    /// Whether a state answer explicitly proves an active main photo. An answer without the photo role data
+    /// never proves a root backup (#876). See `countsAsBackup`.
+    private static func provesActiveMain(_ state: RemoteLinkVisibility) -> Bool {
+        state.isActiveMain && state.hasExplicitPhotoState
+    }
+
     /// Whether the read of this check proves that `linkID` backs up this resource. The copy must be active; a copy
     /// that the answer leaves out is no active copy. A root photo is backed up only by a main photo, not by another
     /// photo's related file, and only by an answer that explicitly carries the photo state: an answer without role
@@ -1186,7 +1202,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     private func countsAsBackup(_ linkID: String, isRoot: Bool, reads: RelatedProofReads) -> Bool {
         guard let state = reads.visibility[linkID], state.isActive else { return false }
         guard isRoot else { return true }
-        return state.isActiveMain && state.hasExplicitPhotoState
+        return Self.provesActiveMain(state)
     }
 
     /// The decision of the name rows. A name row can outlive its copy like an index row: an active duplicate counts

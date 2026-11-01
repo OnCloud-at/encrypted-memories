@@ -1746,6 +1746,9 @@ final class UploadDedupePipelineTests: XCTestCase {
     func testSDKExactMatchSafelyRecoversDetailedLookupFailure() async throws {
         checker.findError = UploadError.backend("duplicates endpoint down")
         checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "sdk-existing")]
+        // The exact match proves the photo only when the state read names an explicit active main
+        // photo; an answer without role data cannot adopt the skip (#876).
+        checker.linkVisibilityByID["sdk-existing"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
 
         let result = try await pipeline.resolve(descriptor())
 
