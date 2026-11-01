@@ -3,8 +3,8 @@ import PhotosCore
 import SwiftUI
 import UploadCore
 
-/// "Vom Backup ausgenommen" in the Backup settings of macOS, iOS and iPadOS: photos deleted before they were
-/// backed up. Each one can go back into the backup; Apple Photos keeps them either way.
+/// The photos of "Excluded from Backup" on macOS, iOS and iPadOS: photos deleted before they were backed up. Each one
+/// can go back into the backup; Apple Photos keeps them either way. The list or sheet around it shows the title.
 public struct PendingExcludedPhotosSection: View {
     private let tiles: [PendingTile]
     private let thumbnail: @Sendable (PhotoUID) async -> CGImage?
@@ -46,8 +46,6 @@ public struct PendingExcludedPhotosSection: View {
                     .disabled(including.contains(tile.item.uid))
                 }
             }
-        } header: {
-            Text(L10n.string("backup.excluded_title"))
         } footer: {
             Text(L10n.string("backup.excluded_footer"))
         }
