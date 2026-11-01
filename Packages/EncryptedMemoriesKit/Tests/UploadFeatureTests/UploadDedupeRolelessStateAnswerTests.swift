@@ -83,6 +83,38 @@ final class UploadDedupeRolelessStateAnswerTests: XCTestCase {
         await pipeline.uploadDidFail(d)
     }
 
+    func testAFailingDetailedLookupDoesNotAdoptARoleLessExactSDKMatchForARoot() async throws {
+        let d = descriptor()
+        checker.findError = UploadError.backend("duplicates endpoint down")
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "sdk-link")]
+        checker.linkVisibilityByID["sdk-link"] = rolelessActiveAnswer
+
+        do {
+            let result = try await pipeline.resolve(d)
+            XCTFail("expected the detailed lookup error, got \(result.decision)")
+        } catch let error as UploadError {
+            XCTAssertEqual(error, .backend("duplicates endpoint down"))
+        }
+        XCTAssertEqual(checker.exactFindCallCount, 1)
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+        XCTAssertNil(store.record(for: d.source)?.outcome, "a role-less answer must not persist a duplicate row")
+    }
+
+    func testAFailingDetailedLookupDoesNotAdoptAnAbsentExactSDKMatchStateAnswerForARoot() async throws {
+        let d = descriptor()
+        checker.findError = UploadError.backend("duplicates endpoint down")
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "sdk-link")]
+
+        do {
+            let result = try await pipeline.resolve(d)
+            XCTFail("expected the detailed lookup error, got \(result.decision)")
+        } catch let error as UploadError {
+            XCTAssertEqual(error, .backend("duplicates endpoint down"))
+        }
+        XCTAssertEqual(checker.exactFindCallCount, 1)
+        XCTAssertNil(store.record(for: d.source)?.outcome, "an absent state answer must not persist a duplicate row")
+    }
+
     func testARootUploadsWhenAManifestRowAnswersWithoutRoleData() async throws {
         hasher.contentSeeds["/photos/IMG_1.HEIC"] = "shared-bytes"
         hasher.contentSeeds["/photos/IMG_2.HEIC"] = "shared-bytes"
