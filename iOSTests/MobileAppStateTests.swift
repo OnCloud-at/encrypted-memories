@@ -1638,6 +1638,44 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(pending.store.isOperational(), "the close ends with the pending store closed")
     }
 
+    /// A newer start cancels the load that still waits for the close of a retired pending pair. The
+    /// cancelled load must not open the location store when that close ends, because it would revoke
+    /// the newer load's lease.
+    @MainActor func testACancelledLoadOpensNoLocationStoreAfterTheRetiredPairCloseEnds() async throws {
+        let model = MobileLibraryModel()
+        let pending = try MobilePendingOwnerFixture(model: model)
+        defer { Task { await pending.close() } }
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("close") } }
+        model.pendingGridCloseHoldForTesting = { await latch.block("close") }
+        // The hosted test owns this synthetic account.
+        let session = ProtonSession(
+            uid: "cancelled-load-" + UUID().uuidString, accessToken: "access", refreshToken: "refresh",
+            keyPassword: "key")
+        let leaseBefore = model.locationStoreLeaseForTesting
+        model.configure(session: session, store: SessionKeychainStore())
+        let closing = await waitForMobileOwner { await latch.hasEntered("close") }
+        XCTAssertTrue(closing, "the first start closes the live pending pair")
+        guard closing else { return }
+        // The second start cancels the first load. Its own retired pair is empty, so it opens the
+        // store without waiting for the held close.
+        model.configure(session: session, store: SessionKeychainStore())
+        let openedByNewerLoad = await waitForMobileOwner {
+            model.locationStoreLeaseForTesting != leaseBefore
+        }
+        XCTAssertTrue(openedByNewerLoad, "the newer load opens the location store")
+        guard openedByNewerLoad else { return }
+        let newerLease = model.locationStoreLeaseForTesting
+        await latch.release("close")
+        let closed = await waitForMobileOwner { !pending.store.isOperational() }
+        XCTAssertTrue(closed, "the held close of the retired pair ends")
+        guard closed else { return }
+        let reopenedByCancelledLoad = await waitForMobileOwner(timeout: .milliseconds(500)) {
+            model.locationStoreLeaseForTesting != newerLease
+        }
+        XCTAssertFalse(reopenedByCancelledLoad, "the cancelled load opens no location store after the close ends")
+    }
+
     @MainActor private func verifySignOut(startRetry: Bool) async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }
