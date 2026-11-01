@@ -394,6 +394,38 @@ import UploadCore
         await fixture.close()
     }
 
+    /// #998: after the pass it took over, the window runs the person's pending retry as a pass of its own. The window
+    /// carries that run too, so the run begins no short grace that could stop it and use the retry up.
+    @Test func aWindowProtectsTheRetryPassItRunsAfterThePassItTookOver() async throws {
+        let fixture = try Fixture()
+        let protection = BackgroundBackupRunProtection()
+        let system = GraceSystem()
+        let grace = system.makeGrace(protection: protection)
+        fixture.startAutomaticPass()
+        try await fixture.waitUntil { fixture.scan.started }
+        grace.protectActiveRun(controller: fixture.controller)
+        #expect(system.starts == 1, "the automatic pass began its short grace before the window came")
+        fixture.controller.markManualWiFiRetryPendingForTesting()
+
+        let attempt = PhotoBackupProcessingAttempt(protection: protection, endShortGrace: { grace.end() })
+        var runIDs: [String] = []
+        attempt.beforeRunAdmissionForTesting = { runIDs.append($0) }
+        attempt.work = Task { _ = await attempt.run(controller: fixture.controller) }
+        try await fixture.waitUntil { runIDs.count == 1 }
+        // From here the app's hook reports each pass start to the short grace, as in production.
+        fixture.controller.idleTimerHook = { active in
+            if active { grace.protectActiveRun(controller: fixture.controller) } else { grace.end() }
+        }
+        fixture.scan.release()
+        await attempt.work?.value
+
+        #expect(runIDs.count == 2, "the window took the pass over, then ran its own pass for the retry")
+        #expect(runIDs.first != runIDs.last)
+        #expect(system.starts == 1, "the window's retry pass begins no short grace")
+        #expect(!fixture.controller.isManualWiFiRetryPendingForTesting, "the window's pass carried the retry")
+        await fixture.close()
+    }
+
     @Test func anUnprotectedPassStillBeginsItsShortGrace() async throws {
         let fixture = try Fixture()
         let system = GraceSystem()

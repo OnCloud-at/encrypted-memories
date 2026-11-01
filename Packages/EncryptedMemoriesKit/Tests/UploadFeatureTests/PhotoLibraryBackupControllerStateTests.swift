@@ -2683,6 +2683,108 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        /// #998: a window takes over a pass that started in the foreground while the person's retry waited for Wi-Fi.
+        func testAWindowRunsThePendingManualRetryAfterThePassItTookOver() async throws {
+            let takeover = try await runTakeover(
+                prefix: "backup-takeover-carries-retry", retryPending: true, wiFiReturns: true, windowExpires: false)
+            defer { takeover.cleanup() }
+            XCTAssertEqual(
+                takeover.owners.values, [.manual, .foreground, .iOSBackgroundTask],
+                "after the pass it took over, the window runs the retry as its own pass")
+            XCTAssertEqual(takeover.windowRuns.count, 2, "the window holds the pass it took over and its own pass")
+            XCTAssertFalse(
+                takeover.controller.isManualWiFiRetryPendingForTesting, "the window's pass carried the retry")
+            XCTAssertFalse(takeover.controller.isSyncing, "the window ends with its own pass")
+            await takeover.controller.shutdown()
+        }
+
+        /// iOS can expire the window in the same turn in which the pass it took over ends; then no lock is busy any more.
+        func testAWindowThatExpiresAsThePassItTookOverEndsLeavesThePendingManualRetry() async throws {
+            let takeover = try await runTakeover(
+                prefix: "backup-takeover-expires-retry", retryPending: true, wiFiReturns: true, windowExpires: true)
+            defer { takeover.cleanup() }
+            XCTAssertEqual(takeover.owners.values, [.manual, .foreground], "an expired window starts no pass")
+            XCTAssertTrue(takeover.controller.isManualWiFiRetryPendingForTesting, "the retry waits for the next window")
+            await takeover.controller.shutdown()
+        }
+
+        func testAWindowLeavesThePendingManualRetryWhileThePathStillWaitsForWiFi() async throws {
+            let takeover = try await runTakeover(
+                prefix: "backup-takeover-cellular-retry", retryPending: true, wiFiReturns: false, windowExpires: false)
+            defer { takeover.cleanup() }
+            XCTAssertEqual(
+                takeover.owners.values, [.manual, .foreground], "on cellular the window starts no pass for the retry")
+            XCTAssertEqual(takeover.windowRuns.count, 1)
+            XCTAssertTrue(takeover.controller.isManualWiFiRetryPendingForTesting, "the retry still waits for Wi-Fi")
+            await takeover.controller.shutdown()
+        }
+
+        func testAWindowWithoutAPendingManualRetryEndsWithThePassItTookOver() async throws {
+            let takeover = try await runTakeover(
+                prefix: "backup-takeover-no-retry", retryPending: false, wiFiReturns: true, windowExpires: false)
+            defer { takeover.cleanup() }
+            XCTAssertEqual(takeover.owners.values, [.foreground], "without a retry the window starts no pass")
+            XCTAssertEqual(takeover.windowRuns.count, 1)
+            await takeover.controller.shutdown()
+        }
+
+        private struct Takeover {
+            let controller: PhotoLibraryBackupController
+            let owners: OwnerRecorder
+            let windowRuns: PassCounter
+            let cleanup: () -> Void
+        }
+
+        /// The person's retry, if any, waits for Wi-Fi; then an automatic pass starts in the foreground and holds in its
+        /// scan. The app goes to the background, and a window takes that pass over before the pass may end. An expiring
+        /// window is cancelled while the pass ends: after the pass released its lock, before the window continues.
+        private func runTakeover(
+            prefix: String, retryPending: Bool, wiFiReturns: Bool, windowExpires: Bool
+        ) async throws -> Takeover {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: true)
+            let expiry = WindowExpiry()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: prefix, source: signals.source,
+                backgroundLog: BackgroundWorkLog { _, line in
+                    if windowExpires, line.hasPrefix("pass.next") { expiry.expire() }
+                })
+            let controller = fixture.controller
+            let owners = OwnerRecorder()
+            let released = LockedFlag(false)
+            controller.replaceScanForTesting {
+                let owner = await MainActor.run { controller.executionOwnerForTesting }
+                owners.record(owner)
+                guard owner == .foreground else { return }
+                while !released.value, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
+            }
+            if retryPending {
+                await controller.retryUserResolvableWork()
+                let waiting = await waitUntil { controller.status.phase == .waitingForWiFi && !controller.isSyncing }
+                XCTAssertTrue(waiting, "the manual pass reaches the Wi-Fi wait")
+                XCTAssertTrue(controller.isManualWiFiRetryPendingForTesting)
+            }
+            controller.syncNow()
+            let held = await waitUntil { owners.values.last == .foreground && controller.isSyncing }
+            XCTAssertTrue(held, "on cellular the automatic pass starts as its own pass")
+
+            signals.setAppInBackground(true)
+            if wiFiReturns { signals.setWaitsForWiFi(false) }
+            let windowRuns = PassCounter()
+            let window = Task { @MainActor in
+                _ = await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
+            }
+            let tookOver = await waitUntil { windowRuns.count == 1 }
+            XCTAssertTrue(tookOver, "the window takes the running automatic pass over")
+            expiry.arm(window)
+            released.value = true
+            await window.value
+            // A late start would show up here: let the end of the pass settle before the test reads the owners.
+            _ = await waitUntil(timeout: .milliseconds(300)) { owners.values.count > (retryPending ? 3 : 2) }
+            let settled = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(settled)
+            return Takeover(controller: controller, owners: owners, windowRuns: windowRuns, cleanup: fixture.cleanup)
+        }
+
         func testAWindowThatExpiresWhileItWaitsForAStoppingPassEndsAtOnce() async throws {
             let runtime = LibraryRuntimeState.makeProcessState()
             runtime.update {
@@ -4610,6 +4712,16 @@ private final class BackgroundWindowRecord: @unchecked Sendable {
 
     func received(_ runID: String) { lock.withLock { ids.append(runID) } }
     func end(completedScans: Int) { lock.withLock { scansAtEnd = completedScans } }
+}
+
+/// Cancels one window's task from wherever the test decides that iOS expires it.
+private final class WindowExpiry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var window: Task<Void, Never>?
+
+    func arm(_ window: Task<Void, Never>) { lock.withLock { self.window = window } }
+
+    func expire() { lock.withLock { window }?.cancel() }
 }
 
 private final class OwnerRecorder: @unchecked Sendable {
