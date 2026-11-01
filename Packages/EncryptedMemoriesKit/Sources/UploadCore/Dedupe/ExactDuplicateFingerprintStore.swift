@@ -153,6 +153,32 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         }
     }
 
+    /// The details of every member of each group in `groups` whose members all have current details, in one read.
+    /// A group with a missing, corrupt, foreign or stale member is left out whole, so it keeps the ranking path.
+    public func fingerprints(
+        ofGroups groups: [ExactDuplicateGroup], in snapshot: Snapshot
+    ) -> [PhotoUID: ExactDuplicateFingerprint] {
+        transaction(writing: false) { db in
+            guard self.current(db) == snapshot else { return nil }
+            var result: [PhotoUID: ExactDuplicateFingerprint] = [:]
+            for group in groups
+            where group.hashKeyEpoch == snapshot.scope.hashKeyEpoch
+                && group.members.allSatisfy({ $0.volumeID == snapshot.scope.volumeID })
+            {
+                var saved: [PhotoUID: ExactDuplicateFingerprint] = [:]
+                for uid in group.members {
+                    let select = "SELECT payload FROM fingerprint WHERE link_id=?;"
+                    guard let data = self.read(db, select, text: uid.nodeID),
+                        let row = try? JSONDecoder().decode(SavedFingerprint.self, from: data)
+                    else { break }
+                    saved[uid] = row.fingerprint(for: uid)
+                }
+                if saved.count == group.members.count { result.merge(saved) { first, _ in first } }
+            }
+            return result
+        } ?? [:]
+    }
+
     /// Missing or invalid details keep the complete group on the existing ranking path.
     public func prefilter(_ group: ExactDuplicateGroup, in snapshot: Snapshot) -> [ExactDuplicateGroup] {
         guard group.hashKeyEpoch == snapshot.scope.hashKeyEpoch,
