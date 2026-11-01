@@ -193,6 +193,46 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         XCTAssertNil(unknownVersion.fingerprints(for: [second], in: reset))
     }
 
+    func testOneReadReturnsTheDetailsOfEveryCompleteGroupAndLeavesTheOthersOut() throws {
+        let store = try open()
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let third = PhotoUID(volumeID: "volume", nodeID: "third")
+        let fourth = PhotoUID(volumeID: "volume", nodeID: "fourth")
+        let unknown = PhotoUID(volumeID: "volume", nodeID: "unknown")
+        let saved = [first: details(), second: details("different"), third: details(), fourth: details()]
+        XCTAssertTrue(store.store(saved, for: snapshot))
+        let complete = ExactDuplicateGroup(contentHash: "a", hashKeyEpoch: "epoch", members: [first, second])
+        let withUnknownMember = ExactDuplicateGroup(contentHash: "b", hashKeyEpoch: "epoch", members: [third, unknown])
+        let anotherEpoch = ExactDuplicateGroup(contentHash: "c", hashKeyEpoch: "another", members: [third, fourth])
+        let anotherVolume = ExactDuplicateGroup(
+            contentHash: "d", hashKeyEpoch: "epoch", members: [PhotoUID(volumeID: "other", nodeID: "third"), fourth])
+
+        let read = store.fingerprints(
+            ofGroups: [complete, withUnknownMember, anotherEpoch, anotherVolume], in: snapshot)
+
+        XCTAssertEqual(Set(read.keys), [first, second], "only the complete group of this scope is returned")
+        XCTAssertEqual(read[first], details())
+        XCTAssertEqual(read[second], details("different"))
+    }
+
+    func testOneReadReturnsNothingForAStaleSnapshotAndSkipsAGroupWithACorruptRow() throws {
+        let store = try open()
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        XCTAssertTrue(store.store([first: details(), second: details("different")], for: snapshot))
+        let groups = [ExactDuplicateGroup(contentHash: "a", hashKeyEpoch: "epoch", members: [first, second])]
+        let later = try XCTUnwrap(store.advance(from: snapshot, to: "event-2", invalidating: []))
+
+        XCTAssertTrue(store.fingerprints(ofGroups: groups, in: snapshot).isEmpty, "the earlier snapshot is stale")
+        XCTAssertEqual(store.fingerprints(ofGroups: groups, in: later).count, 2)
+        store.close()
+        try changeDatabase("UPDATE fingerprint SET payload=x'00' WHERE link_id='second';")
+        let reopened = try open()
+        defer { reopened.close() }
+        let current = try XCTUnwrap(reopened.prepare(scope: scope, eventID: "event-2"))
+        XCTAssertTrue(
+            reopened.fingerprints(ofGroups: groups, in: current).isEmpty, "a corrupt row leaves its group out")
+    }
+
     func testAFailedInvalidationCannotPublishAPartialSnapshot() throws {
         let store = try open()
         let before = try XCTUnwrap(store.prepare(scope: scope, eventID: "before"))

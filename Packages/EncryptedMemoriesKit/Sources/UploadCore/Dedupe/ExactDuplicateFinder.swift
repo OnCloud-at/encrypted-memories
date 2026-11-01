@@ -282,6 +282,9 @@ public struct ExactDuplicateFinder: Sendable {
     let albums: any SeriesAlbumCarryOver
     /// Receives the duration and the request count of each phase, never an identifier.
     let log: @Sendable (String) -> Void
+    /// The metadata of earlier rankings, valid while the content index stands at the same cursor. Nil: every
+    /// launch reads the nodes of all candidate groups again.
+    let fingerprintCache: ExactDuplicateFingerprintCache?
     /// Re-read before each transfer phase; production shares the backup's existing saved preference.
     var copyNetwork: @Sendable () -> BackupThrottleInputs = {
         BackupThrottleInputs(
@@ -308,6 +311,7 @@ public struct ExactDuplicateFinder: Sendable {
         mergeJournal: any ExactDuplicateMergeJournaling,
         remote: any ExactDuplicateRemote,
         albums: any SeriesAlbumCarryOver,
+        fingerprintCache: ExactDuplicateFingerprintCache? = nil,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.checker = checker
@@ -318,6 +322,7 @@ public struct ExactDuplicateFinder: Sendable {
         self.mergeJournal = mergeJournal
         self.remote = remote
         self.albums = albums
+        self.fingerprintCache = fingerprintCache
         self.log = log
     }
 
@@ -342,6 +347,8 @@ public struct ExactDuplicateFinder: Sendable {
         await resolvePendingMerges()
         let start = ContinuousClock.now
         let epoch = try await checker.hashKeyEpoch()
+        // The cursor of the content index comes before every read of this scan: saved details belong to it.
+        let cursor = index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID
         let coverage = coverage(hashKeyEpoch: epoch)
         // Known related files, such as Live Photo videos and originals, never are members.
         guard let candidates = index.remoteContentDuplicateGroups(hashKeyEpoch: epoch) else {
@@ -349,6 +356,7 @@ public struct ExactDuplicateFinder: Sendable {
         }
         guard !candidates.isEmpty else { return ExactDuplicateScan(groups: [], coverage: coverage) }
         let volumeID = try await remote.ownPhotosVolumeID()
+        fingerprintCache?.begin(volumeID: volumeID, hashKeyEpoch: epoch, eventID: cursor)
         let links = Set(candidates.values.joined()).sorted()
         let (visibility, requests) = try await visibility(of: links, progress: progress)
         log(
@@ -418,6 +426,12 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
+    /// The metadata that earlier rankings read for the members of `groups`, for each group whose members all have
+    /// current details. The screen splits those groups by them before it reads any node.
+    public func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint] {
+        fingerprintCache?.details(of: groups) ?? [:]
+    }
+
     /// The members of each group in an order that needs no request: the earliest capture date that the device knows,
     /// then the smallest link ID. The screens show it until the ranking has read the facts of the group.
     public func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
@@ -454,6 +468,8 @@ public struct ExactDuplicateFinder: Sendable {
     ) async {
         guard !groups.isEmpty else { return }
         let start = ContinuousClock.now
+        // The details of the scan that this ranking belongs to, taken before the first node read.
+        let snapshot = fingerprintCache?.currentSnapshot()
         let members = groups.flatMap(\.members)
         let context: (volumeID: String, favorites: Set<PhotoUID>)
         do {
@@ -503,6 +519,12 @@ public struct ExactDuplicateFinder: Sendable {
                 pageFacts[group.id] = memberFacts
             }
             guard !Task.isCancelled else { return }
+            // Details of a successful read only, and only while the index still stands at the cursor of the scan.
+            if let cache = fingerprintCache, let epoch = page.first?.hashKeyEpoch {
+                cache.record(
+                    fingerprints.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } }, for: snapshot,
+                    currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
+            }
             await ranked(
                 ExactDuplicateRankingPage(
                     members: order, groupCount: page.count, byteSizes: sizes, shared: sharedMembers,

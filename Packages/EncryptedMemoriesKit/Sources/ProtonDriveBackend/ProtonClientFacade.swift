@@ -171,6 +171,10 @@ public final class ProtonClientFacade {
             canSetAlbumCover: albumsRepo.capabilities.canSetCover
         )
 
+        // The metadata of earlier duplicate rankings lives in the account data directory, so sign-out removes it with
+        // the other account stores. Nil when the file cannot open: the ranking then reads every node.
+        let fingerprintCache = ExactDuplicateFingerprintCache.open(
+            accountDirectory: bridge.uploadManifestURL.deletingLastPathComponent(), policy: bridge.uploadManifestPolicy)
         return ProtonClientFacade(
             backend: bridge,
             librarySources: librarySources,
@@ -213,6 +217,7 @@ public final class ProtonClientFacade {
                         accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent()),
                     remote: bridge,
                     albums: albumCarryOver,
+                    fingerprintCache: fingerprintCache,
                     log: { DebugLog.log($0) }
                 )
             }(),
@@ -232,6 +237,7 @@ public final class ProtonClientFacade {
                 // Bridge shutdown closes shared admission and joins backend, album, sync, upload,
                 // and identity work before any account-scoped resolver store is closed.
                 await bridge.shutdown()
+                fingerprintCache?.close()
                 identityComposition.close()
             }
         )

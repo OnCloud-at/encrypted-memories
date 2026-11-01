@@ -54,6 +54,9 @@ public protocol ExactDuplicateMerging: Sendable {
     ) async throws -> Bool
     /// The members of each group in an order that needs no request.
     func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]]
+    /// The metadata that earlier rankings read for the members of `groups`, kept for as long as the content index
+    /// stands at the same cursor. It only splits groups on the screen; a merge reads the server state again.
+    func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint]
     /// The capture dates of `members` that the device already knows, without a request. Unknown photos are left out.
     func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date]
     /// Ranks the members of each group, page by page. A group whose facts cannot be read is not in its page.
@@ -82,6 +85,11 @@ extension ExactDuplicateFinder: ExactDuplicateMerging {}
 extension ExactDuplicateMerging {
     /// Without a local timeline, no date is known.
     public func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] { [:] }
+
+    /// Without saved metadata, every group waits for the ranking.
+    public func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint] {
+        [:]
+    }
 
     /// Mergers without a merge journal leave no merge open.
     public func resolvePendingMerges() async {}
@@ -883,7 +891,10 @@ public final class ExactDuplicatesModel {
             let scan = try await finder.duplicateGroups(progress: report)
             let fallback = await finder.fallbackMembers(of: scan.groups)
             let dates = await finder.captureDates(of: scan.groups.flatMap(\.members))
+            let stored = await finder.storedFingerprints(of: scan.groups)
             guard generation == loadGeneration, !isMerging else { return false }
+            // What this session read is newer than what an earlier launch saved.
+            let known = stored.merging(knownFingerprints) { _, read in read }
             let earlier = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             let earlierByHash = Dictionary(grouping: groups, by: \.scanGroup.contentHash)
             var shown: [Group] = []
@@ -892,7 +903,7 @@ public final class ExactDuplicatesModel {
             var nonDuplicates = 0
             for scanned in scan.groups {
                 let order = fallback[scanned.id] ?? scanned.members
-                let parts = knownParts(of: scanned, earlier: earlier, avoiding: usedIDs)
+                let parts = knownParts(of: scanned, known: known, earlier: earlier, avoiding: usedIDs)
                 if parts.isEmpty { nonDuplicates += 1 }
                 for part in parts {
                     let groupDates = Dictionary(
@@ -950,12 +961,13 @@ public final class ExactDuplicatesModel {
     /// The parts of a scanned group by the metadata that a ranking read already, so a screen that opens again reads
     /// nothing for them. The whole group while the metadata of a member are unknown.
     private func knownParts(
-        of scanned: ExactDuplicateGroup, earlier: [String: Group], avoiding used: Set<String>
+        of scanned: ExactDuplicateGroup, known: [PhotoUID: ExactDuplicateFingerprint], earlier: [String: Group],
+        avoiding used: Set<String>
     ) -> [ExactDuplicateGroup] {
-        guard !knownFingerprints.isEmpty, scanned.members.allSatisfy({ knownFingerprints[$0] != nil }) else {
+        guard !known.isEmpty, scanned.members.allSatisfy({ known[$0] != nil }) else {
             return [scanned]
         }
-        return scanned.split(by: knownFingerprints, keepingIDWith: earlier[scanned.id]?.kept, avoiding: used)
+        return scanned.split(by: known, keepingIDWith: earlier[scanned.id]?.kept, avoiding: used)
     }
 
     /// `group` under `preferred`, else under its own ID, else under an ID from its first member, whichever no group in
