@@ -142,6 +142,15 @@ public actor PendingBackupCoordinator {
     private var startupLaterTrashKeys = Set<PendingSourceKey>()
     private var startupLaterTrashGenerations: [PendingSourceKey: Int64] = [:]
     private var laterTrashRecoveryTask: Task<Void, Never>?
+    /// Deletes of an unfinished edit that named no earlier upload, because the handoff could not be read. The reconcile
+    /// backoff reads each handoff again, see `retryEarlierUpload`. Only this session knows them: after a restart the
+    /// earlier upload stays in Proton.
+    private var earlierUploadRetries: [PendingSourceKey: EarlierUploadRetry] = [:]
+    private struct EarlierUploadRetry {
+        let revision: UploadBackupRevision
+        let generation: Int64
+        let hidden: [PhotoUID]
+    }
     private static let laterTrashBatchSize = 100
     /// The waits after the first, second and third automatic Restore check of one source and generation.
     private static let restoreRecheckDelays: [TimeInterval] = [60, 300, 900]
@@ -332,6 +341,7 @@ public actor PendingBackupCoordinator {
         laterTrashRecoveryTask?.cancel()
         startupLaterTrashKeys.removeAll()
         startupLaterTrashGenerations.removeAll()
+        earlierUploadRetries.removeAll()
         restoreReturnOutcomes.removeAll()
         restoreRecheckCounts.removeAll()
         snapshotContinuation.finish()
@@ -350,6 +360,7 @@ public actor PendingBackupCoordinator {
         let tokens = Dictionary(keys.map { ($0, nextActionToken(for: $0)) }, uniquingKeysWith: { _, last in last })
         var requests: [PendingExclusionRequest] = []
         var earlierLinks: [PendingSourceKey: Set<String>] = [:]
+        var unknownEarlier: [PendingSourceKey: (revision: UploadBackupRevision, hidden: [PhotoUID])] = [:]
         for key in keys {
             let revision = tilesByKey[key]?.revision ?? rows[key]?.revision
             var remote = handoffs[key].flatMap { $0.revision == revision ? $0.remote : nil }
@@ -361,7 +372,9 @@ public actor PendingBackupCoordinator {
                 case .found(let target, let links):
                     remote = target
                     earlierLinks[key] = links
-                case .unknown: remoteUnknown = true
+                case .unknown(let hidden):
+                    remoteUnknown = true
+                    if let revision { unknownEarlier[key] = (revision, hidden) }
                 case .none: break
                 }
             }
@@ -375,18 +388,17 @@ public actor PendingBackupCoordinator {
         guard !requests.isEmpty else { return true }
         let date = now()
         guard var states = store.exclude(requests, at: date) else { return false }
-        // The manifest gives up the earlier upload only after the delete is stored. When it cannot, the photo stays.
         for request in requests {
-            guard let links = earlierLinks[request.key], let target = request.remote,
-                let index = states.firstIndex(where: { $0.key == request.key }),
-                identities?.forgetRemoteLinks(
-                    links, of: UploadSourceIdentity(kind: request.key.kind, identifier: request.key.identifier))
-                    != true,
-                states[index].needsRemoteTrash,
-                let kept = store.keepRemote(
-                    target, of: request.key, generation: states[index].generation, revision: request.revision, at: date)
-            else { continue }
-            states[index] = kept
+            guard let index = states.firstIndex(where: { $0.key == request.key }) else { continue }
+            // Only a stored later delete ends the prior retry; a failed write leaves that deletion in force.
+            earlierUploadRetries[request.key] = nil
+            if let links = earlierLinks[request.key], let target = request.remote {
+                states[index] = forgetEarlierUpload(
+                    target, links: links, state: states[index], revision: request.revision, at: date)
+            } else if let unknown = unknownEarlier[request.key], states[index].remote == nil {
+                earlierUploadRetries[request.key] = EarlierUploadRetry(
+                    revision: unknown.revision, generation: states[index].generation, hidden: unknown.hidden)
+            }
         }
         let excluded = requests.map(\.key)
         for key in excluded { restoreRecheckCounts.removeValue(forKey: key) }
@@ -418,27 +430,44 @@ public actor PendingBackupCoordinator {
         before revision: UploadBackupRevision?
     ) async -> EarlierUpload {
         guard let revision, let tile = tilesByKey[key], tile.revision == revision else { return .none }
-        let hidden = Set(tile.replaces.map(\.nodeID))
+        return await earlierUpload(
+            of: key, revision: revision, hidden: tile.replaces,
+            handoff: { store.latestHandoffsRead(for: [key])[key] ?? .unreadable },
+            stillDeleted: { target in
+                // The tile can change during the lookup; only the photo that it still hides is the person's deletion.
+                guard let current = tilesByKey[key], current.revision == revision else { return false }
+                return current.replaces.contains(where: { $0.nodeID == target.nodeID })
+            })
+    }
+
+    /// The rules of `hiddenEarlierUpload` for the photos `hidden` that the edit `revision` of `key` hides. A delete
+    /// and its later retry both decide here. `stillDeleted` tells after the server lookup whether the person's
+    /// deletion still covers the target.
+    private func earlierUpload(
+        of key: PendingSourceKey,
+        revision: UploadBackupRevision,
+        hidden replaces: [PhotoUID],
+        handoff: () -> PendingHandoffRead,
+        stillDeleted: (PhotoUID) -> Bool
+    ) async -> EarlierUpload {
+        let hidden = Set(replaces.map(\.nodeID))
         guard !hidden.isEmpty, let identities, let relations else { return .none }
         let target: PhotoUID?
         // A stored handoff of this or a later revision is the edit's own commit, whose event has not arrived yet; the
         // journal still names the earlier upload. The store trashes the commit after it.
-        switch store.latestHandoffsRead(for: [key])[key] ?? .unreadable {
+        switch handoff() {
         case .unreadable:
             // The handoff could name another photo than the journal; nothing chosen on an unknown goes to the trash.
-            return .unknown
+            return .unknown(replaces)
         case .readable(let earlier?) where earlier.revision < revision:
             target = earlier.kind == .uploaded && hidden.contains(earlier.remote.nodeID) ? earlier.remote : nil
         case .readable:
-            target = newestEarlierMain(of: key, among: tile.replaces)
+            target = newestEarlierMain(of: key, among: replaces)
         }
         guard let target,
             let related = try? await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
         else { return .none }
-        // The tile can change during the lookup; only the photo that it still hides is the person's deletion.
-        guard let current = tilesByKey[key], current.revision == revision,
-            current.replaces.contains(where: { $0.nodeID == target.nodeID })
-        else { return .none }
+        guard stillDeleted(target) else { return .none }
         let source = UploadSourceIdentity(kind: key.kind, identifier: key.identifier)
         let links = related.union([target.nodeID])
         guard !identities.isNeededElsewhere(links, by: source) else { return .none }
@@ -446,11 +475,68 @@ public actor PendingBackupCoordinator {
     }
 
     /// The earlier upload that the delete of an edit sends to the Proton trash. `unknown`: the handoff could not be
-    /// read, so the delete names no photo at all, not even one that the stored state still knows.
+    /// read, so the delete names no photo at all, not even one that the stored state still knows. It carries the photos
+    /// that the edit hides, for the retry.
     private enum EarlierUpload {
         case found(PhotoUID, Set<String>)
         case none
-        case unknown
+        case unknown([PhotoUID])
+    }
+
+    /// The manifest gives up the earlier upload only after the delete is stored. When it cannot, the photo stays.
+    private func forgetEarlierUpload(
+        _ target: PhotoUID,
+        links: Set<String>,
+        state: PendingSourceState,
+        revision: UploadBackupRevision?,
+        at date: Date
+    ) -> PendingSourceState {
+        guard
+            identities?.forgetRemoteLinks(
+                links, of: UploadSourceIdentity(kind: state.key.kind, identifier: state.key.identifier)) != true,
+            state.needsRemoteTrash,
+            let kept = store.keepRemote(
+                target, of: state.key, generation: state.generation, revision: revision, at: date)
+        else { return state }
+        return kept
+    }
+
+    /// Checks one captured delete after the reconcile backoff reads its handoff. Reconciliation runs due effects
+    /// between these sequential server lookups. A readable handoff ends that read retry; only the same stored
+    /// deletion without a photo may accept a proven earlier upload.
+    private func retryEarlierUpload(
+        _ key: PendingSourceKey, retry: EarlierUploadRetry, read: PendingHandoffRead
+    ) async {
+        guard !closed else { return }
+        // A lookup for another key may have awaited while a restore and later delete registered a new retry.
+        guard earlierUploadRetries[key]?.generation == retry.generation else { return }
+        let current = { [self] in
+            let state = sourceStates[key]
+            return state?.desired == .excluded && state?.generation == retry.generation && state?.remote == nil
+        }
+        // A restore, a later delete or a photo for the trash ended this delete.
+        guard current() else {
+            earlierUploadRetries[key] = nil
+            return
+        }
+        guard read != .unreadable else { return }
+        earlierUploadRetries[key] = nil
+        let earlier = await earlierUpload(
+            of: key, revision: retry.revision, hidden: retry.hidden, handoff: { read },
+            stillDeleted: { _ in current() })
+        guard case .found(let target, let links) = earlier, !closed else { return }
+        let date = now()
+        guard let state = store.trashEarlierUpload(target, of: key, generation: retry.generation, at: date) else {
+            // The write failed; the next backoff reads and decides again.
+            earlierUploadRetries[key] = retry
+            return
+        }
+        sourceStates[key] = state
+        dirty.insert(key)
+        listsDirty = true
+        guard state.remote == target, state.needsRemoteTrash else { return }
+        sourceStates[key] = forgetEarlierUpload(
+            target, links: links, state: state, revision: retry.revision, at: date)
     }
 
     /// Starts a new person action for `key`. A delete that awaits a lookup drops its decision for the source when
@@ -494,6 +580,7 @@ public actor PendingBackupCoordinator {
         for key in keys {
             startupLaterTrashKeys.remove(key)
             startupLaterTrashGenerations.removeValue(forKey: key)
+            earlierUploadRetries[key] = nil
         }
         // Only the person's return starts a new attempt; a queue reload cannot clear the block.
         for key in keys { recorder?.replacementLedger.readmit(key) }
@@ -1307,7 +1394,7 @@ public actor PendingBackupCoordinator {
     /// Order matters. A restore brings the Proton photo back before the source returns to the backup, so
     /// the duplicate check never mistakes the trashed photo for a deliberate remote deletion. A delete
     /// removes queue work before it trashes, so nothing uploads in between.
-    private func reconcile(retryLaterTrash: Bool = true) async {
+    private func reconcile(retryLaterTrash: Bool = true, retryEarlierUploads retryEarlier: Bool = false) async {
         guard !closed else { return }
         guard !reconcileRunning else {
             reconcileAgain = true
@@ -1322,6 +1409,10 @@ public actor PendingBackupCoordinator {
         if !unreadableSourceStates.isEmpty { reloadSourceStates(Array(unreadableSourceStates)) }
         let laterTrashKeys = retryLaterTrash ? Array(unreadableLaterTrashKeys) : []
         retryPendingWrites()
+        let earlierRetries = retryEarlier ? Array(earlierUploadRetries) : []
+        let earlierReads =
+            earlierRetries.isEmpty ? [:] : store.latestHandoffsRead(for: earlierRetries.map(\.key))
+        var earlierIterator = earlierRetries.makeIterator()
         for offset in stride(from: 0, to: laterTrashKeys.count, by: Self.laterTrashBatchSize) {
             guard !closed else { return }
             let batch = Array(laterTrashKeys[offset..<min(offset + Self.laterTrashBatchSize, laterTrashKeys.count)])
@@ -1362,6 +1453,16 @@ public actor PendingBackupCoordinator {
             // A restore can make deferred actions eligible again. Inside the loop, so a request that arrives
             // while an action awaits the network still runs another pass.
             await runDueActions()
+            while let (key, retry) = earlierIterator.next() {
+                let read = earlierReads[key] ?? .unreadable
+                await retryEarlierUpload(key, retry: retry, read: read)
+                // Unreadable entries need no network lookup and keep waiting for the next backoff.
+                if read != .unreadable {
+                    // Every lookup yields to due effects, including a restore requested while it awaited.
+                    reconcileAgain = true
+                    break
+                }
+            }
         } while reconcileAgain && !closed
         scheduleReconcileTimer(advanceBackoff: retryLaterTrash)
     }
@@ -1654,7 +1755,9 @@ public actor PendingBackupCoordinator {
         reconcileTimer = nil
         guard !closed else { return }
         let delay: Duration
-        if sourceStatesDegraded || actionsDegraded || writesDegraded || !unreadableLaterTrashKeys.isEmpty {
+        if sourceStatesDegraded || actionsDegraded || writesDegraded || !unreadableLaterTrashKeys.isEmpty
+            || !earlierUploadRetries.isEmpty
+        {
             // An unreadable row or an unsaved result stays due, so its stored date would retry it every second.
             let limit = configuration.unreadableRetryLimit
             let next =
@@ -1680,7 +1783,7 @@ public actor PendingBackupCoordinator {
         reconcileTimer = Task { [weak self, sleep] in
             try? await sleep(delay)
             guard !Task.isCancelled else { return }
-            await self?.reconcile()
+            await self?.reconcile(retryEarlierUploads: true)
         }
     }
 
@@ -1807,7 +1910,9 @@ public actor PendingBackupCoordinator {
         if !reconcileRunning {
             if actionsDegraded || writesDegraded, unreadableRetry == nil {
                 scheduleReconcileTimer()
-            } else if !actionsDegraded, !sourceStatesDegraded, !writesDegraded, unreadableRetry != nil {
+            } else if !actionsDegraded, !sourceStatesDegraded, !writesDegraded, earlierUploadRetries.isEmpty,
+                unreadableRetry != nil
+            {
                 // Every read is clean again outside a reconcile: the episode ends, and a new failure starts over.
                 scheduleReconcileTimer()
             }
