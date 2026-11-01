@@ -452,17 +452,32 @@ final class MobileGridChromeTests: XCTestCase {
                 let tabBar = try XCTUnwrap(tabBars.first)
                 XCTAssertEqual(tabBar.isHidden, isSelecting, "Selection actions and root tabs must alternate")
             }
+            XCTAssertTrue(state.readVerticalBarEdge, "The fixture must record the shared bar decision")
+            let expectsVerticalBar = state.verticalBarEdge != nil
             if !isSelecting {
                 let horizontalBar = tabBars.first(where: {
                     let frame = $0.convert($0.bounds, to: window)
                     return !$0.isHidden && frame.width > frame.height
                 })
-                // A phone always presents a horizontal bar. A missing bar means the fixture broke, and
-                // skipping the checks below would let them pass without checking anything.
+                let verticalBar = tabBars.first(where: {
+                    let frame = $0.convert($0.bounds, to: window)
+                    return !$0.isHidden && frame.height > frame.width
+                })
+                // The fixture derives the expected bar kind from the same environment value that the
+                // app chrome reads (`verticalBarEdge`); skipping the checks below would let them pass
+                // without checking anything.
                 if UIDevice.current.userInterfaceIdiom == .phone {
-                    XCTAssertNotNil(horizontalBar, "The phone fixture must show a horizontal bottom bar")
+                    if expectsVerticalBar {
+                        XCTAssertNotNil(verticalBar, "The phone fixture must show a vertical side bar")
+                    } else {
+                        XCTAssertNotNil(horizontalBar, "The phone fixture must show a horizontal bottom bar")
+                    }
                 }
-                if let tabBar = horizontalBar {
+                if expectsVerticalBar {
+                    XCTAssertEqual(
+                        grid.scrollView.contentInset.bottom, 0, accuracy: 0.5,
+                        "A vertical side bar must not reserve the host's bottom inset")
+                } else if let tabBar = horizontalBar {
                     let safeBottom = grid.safeAreaInsets.bottom
                     if step == 0 { initialHorizontalSafeBottom = safeBottom }
                     let viewport = grid.convert(grid.bounds, to: window)
@@ -517,6 +532,9 @@ final class MobileGridChromeTests: XCTestCase {
     let selection = MobileGridSelectionController()
     var showsLoadingCover = true
     var showsActivity = true
+    /// The bar decision that the app chrome reads; the fixture records it for the test assertions.
+    var verticalBarEdge: HorizontalEdge?
+    var readVerticalBarEdge = false
     var isSelecting: Bool {
         get { selection.isSelecting }
         set {
@@ -531,6 +549,7 @@ struct ChromeProbeShell: View {
     let items: [PhotoItem]
     let feed: UIKitThumbnailFeed
     let state: ChromeProbeState
+    @Environment(\.verticalBarEdge) private var verticalBarEdge
 
     var body: some View {
         TabView {
@@ -593,6 +612,10 @@ struct ChromeProbeShell: View {
             )
         }
         .libraryActivityTransition(namespace: activityTransition, loadingCoverPresented: state.showsLoadingCover)
+        .onAppear {
+            state.verticalBarEdge = verticalBarEdge
+            state.readVerticalBarEdge = true
+        }
     }
 }
 
