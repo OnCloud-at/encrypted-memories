@@ -1577,6 +1577,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
         XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
+        XCTAssertFalse(model.signOutCleanupFailed)
         XCTAssertEqual(model.scopePresentationRevision, revision &+ 1)
         XCTAssertNil(model.backend)
     }
@@ -1634,6 +1635,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         await latch.release("close")
         let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
         XCTAssertTrue(completed)
+        XCTAssertFalse(model.signOutCleanupFailed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertFalse(pending.store.isOperational(), "the close ends with the pending store closed")
     }
@@ -1701,6 +1703,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
         XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
+        XCTAssertFalse(model.signOutCleanupFailed)
         let loadWasCancelled = await latch.hasEntered("load-cancelled")
         XCTAssertTrue(loadWasCancelled)
         let stillOpen = await pending.session.delete([])
