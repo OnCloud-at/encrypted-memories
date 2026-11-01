@@ -792,6 +792,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         if let lineageStore {
             if !lineageBuildReady || !lineageStore.finishBuild(build, hashKeyEpoch: material.epoch) {
+                measurement?.finish(.partial)
                 DebugLog.log("[Dedupe] lineage index build could not be saved; reads remain incomplete")
             }
         }
@@ -823,6 +824,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 since: eventID
             )
             if page.requiresRefresh {
+                // The refresh rebuild runs inside its own indexRebuild pass: end the event update first, so one
+                // rebuild failure stays one failed pass and the event update duration excludes the rebuild time.
+                measurement?.finish(.partial)
                 try await WorkMeasurementOperation.run(.indexRebuild, collector: workMeasurements) { measurement in
                     try await rebuildRemoteContentIndex(
                         material: material, session: session, crypto: crypto, store: store,
@@ -891,6 +895,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     expectedEventID: eventID, eventID: page.eventID,
                     unresolvedRemoteLinkIDs: rows.lineageRows.unresolvedLinkIDs)
             {
+                // The same incomplete-read failure as a failed lineage repair: the pass ends partial, not success.
+                // A later finish is ignored, and the wrapper's success no longer hides the failed save.
+                measurement?.finish(.partial)
                 DebugLog.log("[Dedupe] lineage index changes could not be saved; reads remain incomplete")
             }
             eventID = page.eventID
