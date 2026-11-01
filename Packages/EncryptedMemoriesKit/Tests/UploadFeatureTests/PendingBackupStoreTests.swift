@@ -623,6 +623,68 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertTrue(next.needsRemoteTrash)
     }
 
+    /// The delete of an edit could not read its handoff and named no photo. A later proof sends the earlier upload to
+    /// the trash only for that same delete while it still names no photo.
+    func testTrashOfAnEarlierUploadNeedsTheSameDeleteWithoutAPhoto() throws {
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "link-earlier")
+        let other = PhotoUID(volumeID: "vol", nodeID: "link-other")
+        let deleted = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date)?
+                .first)
+        XCTAssertNil(deleted.remote)
+
+        let stale = try XCTUnwrap(
+            store.trashEarlierUpload(earlier, of: key, generation: deleted.generation + 1, at: date))
+        XCTAssertNil(stale.remote, "another delete or a restore changed the generation")
+        XCTAssertFalse(stale.needsRemoteTrash)
+
+        let trashed = try XCTUnwrap(
+            store.trashEarlierUpload(earlier, of: key, generation: deleted.generation, at: date))
+        XCTAssertEqual(trashed.remote, earlier)
+        XCTAssertTrue(trashed.needsRemoteTrash)
+        XCTAssertFalse(trashed.listedInTrash, "the Proton trash represents the photo")
+
+        let again = try XCTUnwrap(store.trashEarlierUpload(other, of: key, generation: deleted.generation, at: date))
+        XCTAssertEqual(again.remote, earlier, "a delete that names a photo keeps it")
+
+        let included = try XCTUnwrap(store.include([key], at: date)?.first)
+        let restored = try XCTUnwrap(
+            store.trashEarlierUpload(other, of: key, generation: included.generation, at: date))
+        XCTAssertEqual(restored.desired, .included, "a restored photo never goes to the trash")
+        XCTAssertNotEqual(restored.remote, other)
+
+        let withoutPhoto = PendingSourceKey(kind: .photoLibraryAsset, identifier: "restored-without-photo")
+        XCTAssertNotNil(
+            store.exclude([PendingExclusionRequest(key: withoutPhoto, presentation: nil, remote: nil)], at: date))
+        let includedWithoutPhoto = try XCTUnwrap(store.include([withoutPhoto], at: date)?.first)
+        let unchanged = try XCTUnwrap(
+            store.trashEarlierUpload(other, of: withoutPhoto, generation: includedWithoutPhoto.generation, at: date))
+        XCTAssertNil(unchanged.remote, "the same generation cannot authorize trash after a restore")
+        XCTAssertFalse(unchanged.needsRemoteTrash)
+    }
+
+    func testEarlierUploadWaitsForAnInFlightOperationEvenWithoutARemoteTarget() throws {
+        let first = try XCTUnwrap(
+            store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date)?
+                .first)
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [first]), [key])
+        let deleted = try XCTUnwrap(
+            store.exclude(
+                [PendingExclusionRequest(key: key, presentation: presentation(), remote: nil, remoteUnknown: true)],
+                at: date)?.first)
+        XCTAssertNil(deleted.remote)
+        XCTAssertFalse(deleted.needsRemoteTrash)
+        XCTAssertEqual(deleted.remoteOperation, .remoteTrash)
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier-after-operation")
+
+        let unchanged = try XCTUnwrap(
+            store.trashEarlierUpload(earlier, of: key, generation: deleted.generation, at: date))
+
+        XCTAssertNil(unchanged.remote, "an in-flight operation alone blocks a new target")
+        XCTAssertFalse(unchanged.needsRemoteTrash)
+        XCTAssertEqual(unchanged.remoteOperation, .remoteTrash)
+    }
+
     // Mutation: drop the early return for a pending trash in `recordHandoff`; the earlier upload is never trashed.
     // Mutation: drop the `needs_remote_trash` condition in `pruneAcknowledgedHandoffs`; the edit is never trashed.
     func testEditThatCommitsBeforeTheEarlierTrashIsSentKeepsBothTrashesDue() throws {
