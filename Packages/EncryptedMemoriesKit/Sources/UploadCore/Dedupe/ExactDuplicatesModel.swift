@@ -446,6 +446,8 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var mergeRun: ExactDuplicateMergeRun?
     /// A batch of a merge is with the finder.
     @ObservationIgnored private var isMergeBatchRunning = false
+    /// The app went to the background while the current batch of Merge All ran.
+    @ObservationIgnored private var batchOverlappedPause = false
     /// They wait until the running batch finished.
     @ObservationIgnored private var batchWaiters: [CheckedContinuation<Void, Never>] = []
     /// The ranking that Merge All waits for. Stop and a pause cancel it.
@@ -1276,6 +1278,7 @@ public final class ExactDuplicatesModel {
     public func pauseMerging() {
         guard isMergingAll else { return }
         isMergePaused = true
+        if isMergeBatchRunning { batchOverlappedPause = true }
         if let mergeRanking {
             mergeRankingInterrupted = true
             rankingPublication.cancel(mergeRanking, token: mergeRankingToken)
@@ -1387,16 +1390,11 @@ public final class ExactDuplicatesModel {
             }
             let batch = selected[handled..<min(handled + Self.mergeBatchSize, selected.count)]
             handled += batch.count
-            isMergeBatchRunning = true
-            let results = await finder.merge(
-                batch.map {
-                    ExactDuplicateMergeRequest(
-                        group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
-                }, in: run)
-            isMergeBatchRunning = false
-            let waiters = batchWaiters
-            batchWaiters = []
-            waiters.forEach { $0.resume() }
+            batchOverlappedPause = false
+            var results = await mergeBatch(Array(batch), in: run)
+            if all, batchOverlappedPause {
+                results = await retryInterruptedGroups(of: Array(batch), results: results, in: run)
+            }
             // The outcome of every group of the batch is one change of the screen.
             var updated = groups
             var trashed: [PhotoUID] = []
@@ -1476,6 +1474,45 @@ public final class ExactDuplicatesModel {
             checkInterrupted = false
             Task { await self.buildAndRescan(generation: generation) }
         }
+    }
+
+    /// Runs one batch through the finder and wakes the platform that waits for its end.
+    private func mergeBatch(
+        _ batch: [Group], in run: ExactDuplicateMergeRun
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        isMergeBatchRunning = true
+        let results = await finder.merge(
+            batch.map {
+                ExactDuplicateMergeRequest(group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
+            }, in: run)
+        isMergeBatchRunning = false
+        let waiters = batchWaiters
+        batchWaiters = []
+        waiters.forEach { $0.resume() }
+        return results
+    }
+
+    /// The app went to the background while `batch` ran. A request that was still open when the system suspended the
+    /// app fails when the app returns, although the connection works. Its error does not always tell: a read through
+    /// the SDK fails with an SDK error. So after the pause, every failed group of the batch merges once more, through
+    /// the same finder merge: it checks the open merges of the journal first and reads the server state of each group
+    /// again, so a group that the first try merged after all skips, and no trash repeats blindly. A second failure
+    /// counts. A cancelled group, a stop, or the end of the account tries nothing again.
+    private func retryInterruptedGroups(
+        of batch: [Group], results: [Result<ExactDuplicateMergeOutcome, any Error>], in run: ExactDuplicateMergeRun
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        let interrupted = zip(batch.indices, results).compactMap { index, result -> Int? in
+            guard case .failure(let error) = result, !(error is CancellationError) else { return nil }
+            return index
+        }
+        guard !interrupted.isEmpty else { return results }
+        await waitWhileMergePaused()
+        // The end of the account stops Merge All, too.
+        guard !isStoppingMergeAll, !Task.isCancelled else { return results }
+        let retried = await mergeBatch(interrupted.map { batch[$0] }, in: run)
+        var updated = results
+        for (index, result) in zip(interrupted, retried) { updated[index] = result }
+        return updated
     }
 
     /// Ranks `unranked` for a merge. A pause cancels the ranking; after the pause, the groups that it did not rank

@@ -4072,6 +4072,53 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(violations, [])
     }
 
+    /// The trash of the first try moved the duplicate, but its answer and every check afterwards failed, as when the
+    /// system suspends the app during the request. Merge All tries the group once more after the return: the finder
+    /// reads the group again and trashes nothing twice.
+    @MainActor
+    func testMergeAllTriesAGroupAgainAfterTheAppWasAwayWithoutASecondTrash() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        for uid in [kept, duplicate] { server.setFingerprint(described, of: uid) }
+        indexServer()
+        var finder = finder()
+        finder.keptReadRetryDelay = .zero
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        try await waitFor("the group is ranked") { model.groups.first?.isRanked == true }
+        server.applyNextTrashThenFail()
+        server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
+        server.holdVisibilityReads()
+
+        let merge = Task { await model.mergeAll() }
+        try await waitFor("the batch reads the group") { server.heldVisibilityReads > 0 }
+        model.pauseMerging()
+        server.releaseVisibilityReads()
+        await model.runningMergeWorkEnded()
+        XCTAssertEqual(state(of: duplicate), .trashed, "the first try moved the duplicate")
+        model.resumeMerging()
+        await merge.value
+
+        XCTAssertEqual(trashCalls.count, 1, "the second try trashes nothing again")
+        XCTAssertEqual(state(of: duplicate), .trashed)
+        XCTAssertEqual(state(of: kept), .active, "one copy stays")
+        XCTAssertNil(model.notice, "no failed merge")
+        XCTAssertEqual(violations, [])
+    }
+
+    /// Waits up to ten seconds for `condition`.
+    @MainActor
+    private func waitFor(_ label: String, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Timed out: \(label)")
+                throw CancellationError()
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     // MARK: - Metadata
 
     private var described: ExactDuplicateFingerprint {
