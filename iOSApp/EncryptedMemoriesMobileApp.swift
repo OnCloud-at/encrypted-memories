@@ -1,6 +1,7 @@
 import DesignSystemCore
 import DesignSystemUIKitAdapter
 import Foundation
+import GridCore
 import LibraryRuntimeAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import MLSearchCore
@@ -507,6 +508,8 @@ private struct MobileSearchTabScreen: View {
         MobileTimelineScreen(
             surface: .search,
             isActive: isActive,
+            // Issue #944: one shared margin below the scope picker, the grid's standard outer margin.
+            scopeBarGap: SquareTileGridEngine.standardOuterMargin,
             searchText: $searchText,
             searchScope: $searchScope,
             searchLanding: MobileSearchLandingContent(
