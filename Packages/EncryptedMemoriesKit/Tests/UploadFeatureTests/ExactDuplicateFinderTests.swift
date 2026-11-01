@@ -4368,12 +4368,33 @@ final class ExactDuplicateFinderTests: XCTestCase {
     func testSoleKeeperVisibilityReadFailureUsesTheExistingFailedResultWithoutClearingTheGroup() async throws {
         let result = try await memberCompoundRace(.freshReadError)
         XCTAssertEqual(result.first.groups.map(\.id), [hash("compound-race")])
-        XCTAssertEqual(result.first.notice, .failed)
+        XCTAssertEqual(result.first.notice, .partialFailure(failed: 1, total: 1, canRetry: true))
         XCTAssertEqual(state(of: result.source), .active)
         XCTAssertEqual(state(of: result.kept), .active)
         XCTAssertEqual(result.checker.freshVisibilityReads, 1)
         XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash ") })
         XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+    }
+
+    @MainActor
+    func testSoleKeeperTransientReadFailureCanRecoverThroughTheOfferedRetry() async throws {
+        let result = try await memberCompoundRace(.freshReadError)
+        XCTAssertEqual(result.first.notice, .partialFailure(failed: 1, total: 1, canRetry: true))
+        XCTAssertEqual(state(of: result.source), .active)
+        XCTAssertEqual(state(of: result.kept), .active)
+        let readsBeforeRetry = result.checker.freshVisibilityReads
+        result.checker.recoverTransientFailure()
+
+        await result.first.retryFailedMerges()
+
+        XCTAssertGreaterThan(result.checker.freshVisibilityReads, readsBeforeRetry)
+        XCTAssertEqual(result.first.groups.map(\.id), [])
+        XCTAssertNil(result.first.notice)
+        XCTAssertEqual(state(of: result.source), .trashed)
+        XCTAssertEqual(state(of: result.kept), .active)
+        XCTAssertEqual(server.steps.filter { $0.action.hasPrefix("duplicate trash ") }.count, 1)
+        XCTAssertEqual(server.relatedFileTransferCallCount, 0)
+        XCTAssertEqual(violations, [])
     }
 
     @MainActor
@@ -5493,6 +5514,7 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
     private var readHeld = false
     private var sawActive = false
     private var freshReads = 0
+    private var recovered = false
 
     init(
         base: EditScenarioServer, kept: PhotoUID, source: PhotoUID, mode: Mode, gate: MemberCompoundReadGate,
@@ -5507,6 +5529,7 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
     }
     var freshVisibilityReads: Int { lock.withLock { freshReads } }
     func arm() { lock.withLock { armed = true } }
+    func recoverTransientFailure() { lock.withLock { recovered = true } }
     var sawPositiveActiveRead: Bool { lock.withLock { sawActive } }
     var didReadHeldCompound: Bool { lock.withLock { readHeld } }
 
@@ -5527,7 +5550,9 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
         if mode == .unknownOriginalMember, lock.withLock({ armed }), let uncertain {
             visibility[uncertain.nodeID] = nil
         }
-        if afterFailure, mode == .freshReadError { throw URLError(.networkConnectionLost) }
+        if afterFailure, mode == .freshReadError, !lock.withLock({ recovered }) {
+            throw URLError(.networkConnectionLost)
+        }
         if afterFailure, mode == .freshReadCancellation { throw CancellationError() }
         if afterFailure, mode == .keeperUnknown, var keeper = visibility[kept.nodeID] {
             keeper.hasExplicitPhotoState = false
@@ -5557,7 +5582,7 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
         if shouldHold { await gate.pass() }
         let actual = try await base.compound(ofMainLink: linkID)
         let intercept = lock.withLock {
-            guard armed, linkID == source.nodeID else { return false }
+            guard armed, !recovered, linkID == source.nodeID else { return false }
             readHeld = true
             return true
         }
