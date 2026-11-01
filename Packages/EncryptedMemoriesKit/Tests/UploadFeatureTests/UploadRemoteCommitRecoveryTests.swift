@@ -767,7 +767,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         }
         XCTAssertTrue(identities.records.isEmpty)
         XCTAssertTrue(recorder.replacementLedger.replacementHandoffs().isEmpty)
-        XCTAssertFalse(pending.isOperational())
+        XCTAssertTrue(pending.isOperational(), "an unreadable row stops only its own photo (#982)")
         XCTAssertTrue(pending.unacknowledgedHandoffs().isEmpty, "the handoff insert must roll back")
         XCTAssertEqual(
             queue.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation,

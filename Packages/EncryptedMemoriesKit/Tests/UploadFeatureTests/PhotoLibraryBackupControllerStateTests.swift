@@ -5097,6 +5097,96 @@ extension PhotoLibraryBackupControllerStateTests {
         }
     }
 
+    // MARK: - One pending row or one failed call never stops the backup (#982)
+
+    /// Runs `sql` on the pending store through a second connection, as a newer build or a full disk leaves it.
+    private func executeOnPendingStore(_ f: Restore829Fixture, _ sql: String) throws {
+        var handle: OpaquePointer?
+        let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
+    }
+
+    /// Every byte of the pending row of `identifier`.
+    private func rawPendingRow(_ f: Restore829Fixture, _ identifier: String) throws -> [Data?] {
+        var handle: OpaquePointer?
+        let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(db, "SELECT * FROM source_state WHERE source_id='\(identifier)';", -1, &stmt, nil),
+            SQLITE_OK)
+        defer { sqlite3_finalize(stmt) }
+        XCTAssertEqual(sqlite3_step(stmt), SQLITE_ROW)
+        return (0..<sqlite3_column_count(stmt)).map { column in
+            guard let bytes = sqlite3_column_blob(stmt, column) else { return nil }
+            return Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, column)))
+        }
+    }
+
+    /// Queues the fixture photo through the engine that reads the exclusions of the pending store, and drains it.
+    private func backUpWithExclusions(_ f: Restore829Fixture) async throws -> UploadBackupSyncQueueEntry {
+        let engine = UploadBackupSyncEngine(
+            preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue, exclusions: f.pending)
+        _ = try await engine.enqueueBatch([f.resolver.candidate])
+        await f.drain()
+        return try XCTUnwrap(
+            f.queue.entry(for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
+    }
+
+    /// A newer build wrote a value that this build does not know, into each of the three enum columns in turn. The
+    /// read reports the row, the row stays unchanged, and every other photo keeps backing up.
+    func testAPendingRowThatCannotBeDecodedKeepsTheBackupOfOtherPhotos() async throws {
+        for column in ["source_kind", "desired", "remote_op"] {
+            try await withRestore829Fixture(.photo) { f in
+                XCTAssertTrue(f.controller.isAvailable)
+                let other = PendingSourceKey(kind: .photoLibraryAsset, identifier: "other-asset")
+                XCTAssertNotNil(
+                    f.pending.exclude(
+                        [PendingExclusionRequest(key: other, presentation: nil, remote: nil)], at: f.clock.now))
+                try self.executeOnPendingStore(
+                    f, "UPDATE source_state SET \(column)='written-by-a-newer-build' WHERE source_id='other-asset';")
+                let before = try self.rawPendingRow(f, "other-asset")
+
+                XCTAssertFalse(f.pending.sourceStatesRead().complete, "the read reports the row (\(column))")
+                XCTAssertTrue(f.controller.isAvailable, "one row stops nothing (\(column))")
+                let entry = try await self.backUpWithExclusions(f)
+
+                XCTAssertTrue(entry.state.isTerminalSuccess, "the other photo backs up (\(column))")
+                XCTAssertTrue(f.controller.isAvailable)
+                XCTAssertEqual(try self.rawPendingRow(f, "other-asset"), before, "the row stays unchanged (\(column))")
+            }
+        }
+    }
+
+    /// Another connection holds the write lock of the pending store until the busy timeout ends, so the write of the
+    /// upload's handoff fails, as on a busy or full disk. Once the lock is free, the backup goes on without a relaunch.
+    func testATransientPendingStoreFailureStopsTheBackupOnlyUntilTheStoreAnswersAgain() async throws {
+        try await withRestore829Fixture(.photo) { f in
+            var handle: OpaquePointer?
+            let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+            XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+            let blocker = try XCTUnwrap(handle)
+            defer { sqlite3_close(blocker) }
+            XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            let stopped = try await self.backUpWithExclusions(f)
+            XCTAssertFalse(stopped.state.isTerminalSuccess, "the upload could not be recorded")
+
+            XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+
+            XCTAssertTrue(f.controller.isAvailable, "the backup is available again without a relaunch")
+            await f.drain()
+            let entry = try XCTUnwrap(
+                f.queue.entry(
+                    for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
+            XCTAssertTrue(entry.state.isTerminalSuccess, "the photo backs up")
+        }
+    }
+
     private func withRestore829Fixture(
         _ shape: Restore829Fixture.Shape, replacesEdits: Bool = false,
         _ body: @MainActor (Restore829Fixture) async throws -> Void

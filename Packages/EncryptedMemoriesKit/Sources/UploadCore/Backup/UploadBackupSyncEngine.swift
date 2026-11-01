@@ -475,16 +475,18 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         _ candidates: [UploadBackupAssetCandidate]
     ) throws -> [UploadBackupAssetCandidate] {
         guard let exclusions, !candidates.isEmpty else { return candidates }
-        var excluded: [UploadSourceIdentity.Kind: Set<String>] = [:]
+        var answers: [UploadSourceIdentity.Kind: [String: BackupSourceExclusion]] = [:]
         for kind in Set(candidates.map(\.snapshot.source.kind)) {
             let identifiers = candidates.filter { $0.snapshot.source.kind == kind }.map(\.snapshot.source.identifier)
-            guard let kindExclusions = exclusions.excludedIdentifiers(kind: kind, among: identifiers) else {
+            guard let kindAnswers = exclusions.exclusions(kind: kind, among: identifiers) else {
                 throw UploadError.backend("Backup exclusions are unavailable")
             }
-            excluded[kind] = kindExclusions
+            answers[kind] = kindAnswers
         }
+        // A photo whose pending row this build cannot read is queued like an included one; the runner lets it wait
+        // before its file is read, so no scan, reopening or repair loses it (#982).
         return candidates.filter { candidate in
-            excluded[candidate.snapshot.source.kind]?.contains(candidate.snapshot.source.identifier) != true
+            answers[candidate.snapshot.source.kind]?[candidate.snapshot.source.identifier] != .excluded
         }
     }
 
