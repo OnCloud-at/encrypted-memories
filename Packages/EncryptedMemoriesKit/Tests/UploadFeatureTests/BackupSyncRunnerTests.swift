@@ -5435,6 +5435,27 @@ final class BackupSyncRunnerTests: XCTestCase {
             ))
     }
 
+    /// A foreign draft blocks the name, and the content lookup of the check times out. The photo waits like after any
+    /// passing network failure, without an attempt; it is not parked as blocked by the draft (#877).
+    func testATimeoutWhileADraftBlocksTheNameSpendsNoAttempt() async throws {
+        let entry = seedEntry("drafted.jpg")
+        let hashes = expectedHashes(id: "drafted.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: "other-content", linkState: .draft, linkID: "foreign-draft",
+                clientUID: "other-client")
+        ]
+        checker.contentFindError = UploadError.transport(code: NSURLErrorTimedOut, message: "timed out")
+
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.attempts, 0, "a passing network failure spends no attempt")
+        XCTAssertNotEqual(row.state, .blockedByDraft)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.kind, .network)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
     func testDraftSecondaryParksLivePhotoInsteadOfClaimingSuccess() async throws {
         let entry = seedEntry("live.heic")
         resolver.setSecondaries(["live.mov"], for: entry.source.identifier)

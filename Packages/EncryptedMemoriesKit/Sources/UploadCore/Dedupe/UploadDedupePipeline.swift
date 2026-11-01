@@ -513,6 +513,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 } catch {
                     guard blockedByDraft else { throw error }
                     if UploadError.isCancellation(error) { throw error }
+                    // Transient network and retryable service failures follow the normal check's retry without an
+                    // attempt. Other failures leave the draft protected (#877).
+                    if case UploadError.retryableBackend = error { throw error }
+                    if BackupSyncRunner.isTransientNetwork(error) { throw error }
                     try Task.checkCancellation()
                     decision = nameDecision
                 }
@@ -1066,7 +1070,15 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         among linkIDs: Set<String>, requiresActiveMain: Bool, reads: inout RelatedProofReads
     ) async throws -> Set<String> {
         var known = rootVisibility
-        let unasked = linkIDs.subtracting(rootVisibilityAsked)
+        // A blocked name needs a positive answer of this check: a copy that an earlier check saw inactive, or that the
+        // server did not name, can be back. Such a copy is read again once in this check (#877).
+        let staleNegatives =
+            requiresActiveMain
+            ? linkIDs.filter { linkID in
+                rootVisibilityAsked.contains(linkID) && !reads.askedLinks.contains(linkID)
+                    && rootVisibility[linkID].map { $0.hasExplicitPhotoState && $0.isActiveMain } != true
+            } : []
+        let unasked = linkIDs.subtracting(rootVisibilityAsked).union(staleNegatives)
         if !unasked.isEmpty {
             let generation = cacheGeneration
             var read: [String: RemoteLinkVisibility] = [:]
