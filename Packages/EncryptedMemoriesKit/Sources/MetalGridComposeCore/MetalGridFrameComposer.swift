@@ -451,11 +451,11 @@ package enum MetalGridFrameComposer {
                 ))
         }
 
+        let overlay = decorations.overlay(uid)
         let bottomTrailingInset =
             decorations.selectionMode || decorations.favorites.contains(uid)
             ? badge + pad
             : 0
-        let overlay = decorations.overlay(uid)
         let overlayLayouts =
             hasThumbnail
             ? GridThumbnailOverlayPolicy.layouts(
@@ -464,6 +464,14 @@ package enum MetalGridFrameComposer {
                 bottomTrailingInset: bottomTrailingInset
             )
             : []
+        // The selection mark leaves the bottom-trailing corner when an active reserved region (the iPhone Duo fold)
+        // covers it, for the nearest free position of the tile; the labels keep their place.
+        let homeMark = ReservedRegionLayout.homeMarkRect(in: displayed, side: badge, inset: pad)
+        let selectionMark =
+            decorations.selectionMode && !decorations.reservedRegions.isEmpty
+            ? decorations.reservedRegions.selectionMarkRect(
+                in: displayed, side: badge, inset: pad, avoiding: overlayLayouts.map(\.backgroundRect))
+            : homeMark
         // A photo on its way to Proton shows its upload state top-trailing; selection mode owns the corners.
         let badgeFrame =
             decorations.uploadBadgeFrame.map { $0(uid, overlay.uploadBadge) }
@@ -531,22 +539,17 @@ package enum MetalGridFrameComposer {
             }
         }
 
-        let bottomRight = CGRect(
-            x: displayed.maxX - badge - pad,
-            y: displayed.maxY - badge - pad,
-            width: badge,
-            height: badge
-        )
         // Reserve the bottom-trailing badge area when placing a duration label.
         if decorations.favorites.contains(uid), !decorations.selectionMode {
-            favorite.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+            favorite.append(MetalGridQuad(rect: homeMark, radius: 0, alpha: drawAlpha))
         }
         if decorations.selectionMode {
-            // Checkmark badge, bottom-right (filled+accent when selected, empty circle otherwise).
+            // Checkmark badge, bottom-right unless a reserved region covers it (filled+accent when selected, empty
+            // circle otherwise).
             if isSelected {
-                checkFilled.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+                checkFilled.append(MetalGridQuad(rect: selectionMark, radius: 0, alpha: drawAlpha))
             } else {
-                checkEmpty.append(MetalGridQuad(rect: bottomRight, radius: 0, alpha: drawAlpha))
+                checkEmpty.append(MetalGridQuad(rect: selectionMark, radius: 0, alpha: drawAlpha))
             }
         }
     }
@@ -565,6 +568,8 @@ package struct MetalGridDecorations<ID: Hashable> {
     package var overlay: @MainActor (ID) -> GridThumbnailOverlay
     /// The animated upload badge for a photo and the badge the backup reports; nil draws the badge as is.
     package var uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)?
+    /// The active reserved regions of the viewport (the iPhone Duo fold); selection marks move out of them.
+    package var reservedRegions: ReservedRegionLayout
 
     package init(
         accent: SIMD4<Float>,
@@ -573,7 +578,8 @@ package struct MetalGridDecorations<ID: Hashable> {
         selected: Set<ID>,
         favorites: Set<ID>,
         overlay: @escaping @MainActor (ID) -> GridThumbnailOverlay,
-        uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil
+        uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil,
+        reservedRegions: ReservedRegionLayout = .none
     ) {
         self.accent = accent
         self.accentGlyphColor = accentGlyphColor
@@ -582,6 +588,7 @@ package struct MetalGridDecorations<ID: Hashable> {
         self.favorites = favorites
         self.overlay = overlay
         self.uploadBadgeFrame = uploadBadgeFrame
+        self.reservedRegions = reservedRegions
     }
 }
 
