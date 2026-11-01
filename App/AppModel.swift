@@ -90,7 +90,9 @@ final class AppModel {
         case idle
         case preparing(String)
         case ready(any PhotosBackend)
-        case failed(String)
+        /// `isRetryable` is false only for a confirmed permanent open failure; an unclear cause keeps it true,
+        /// so the Retry button never disappears while another attempt could still succeed.
+        case failed(String, isRetryable: Bool)
     }
 
     /// Native Settings navigation; no persisted preference or account behavior.
@@ -400,7 +402,8 @@ final class AppModel {
             let report = await coordinator.teardown()
             guard report.succeeded else {
                 DebugLog.log("scope recovery: ordered teardown or purge failed")
-                self.backend = .failed(String(localized: "error.library_open_failed"))
+                // The cause of the failed teardown is not classified, so the Retry button stays.
+                self.backend = .failed(String(localized: "error.library_open_failed"), isRetryable: true)
                 return
             }
             guard !Task.isCancelled,
@@ -597,7 +600,9 @@ final class AppModel {
             } catch {
                 guard !Task.isCancelled, authController.currentSession == session else { return }
                 DebugLog.log("backend prepare FAILED: \(error)")
-                backend = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                backend = .failed(
+                    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription,
+                    isRetryable: !LibraryOpenFailurePermanence.isPermanent(error))
             }
         }
     }
