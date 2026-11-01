@@ -200,7 +200,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(
             warning.staticTexts.matching(
                 NSPredicate(
-                    format: "label CONTAINS %@", "These groups could not be merged safely.")
+                    format: "label CONTAINS %@", "These groups could not be merged.")
             ).firstMatch.exists)
         keepScreenshot("duplicates-partial-permanent")
         warning.buttons["OK"].firstMatch.tap()

@@ -2634,7 +2634,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         }
         XCTAssertEqual(finder.batches.count, 4, "one more try only")
         XCTAssertEqual(model.groups.count, 1)
-        XCTAssertEqual(model.notice, .failed)
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 60, canRetry: true))
     }
 
     func testACancelledGroupDuringThePauseMergesNoSecondTime() async {
@@ -2650,7 +2650,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await model.mergeAll()
         XCTAssertEqual(finder.batches.count, 3)
         XCTAssertEqual(model.groups.count, 1)
-        XCTAssertEqual(model.notice, .failed)
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 60, canRetry: true))
     }
 
     func testAStopDuringThePauseMergesNoInterruptedGroupAgain() async {
@@ -2666,7 +2666,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
             finder.nextMergeErrors[model.groups[30].id] = URLError(.timedOut)
         }
         XCTAssertEqual(finder.batches.count, 3, "only the batch that ran during the pause tries again")
-        XCTAssertEqual(model.notice, .failed)
+        XCTAssertEqual(model.notice, .partialFailure(failed: 1, total: 60, canRetry: true))
     }
 
     func testCancellingMergeAllDuringThePauseMergesNoInterruptedGroupAgain() async {
