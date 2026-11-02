@@ -67,6 +67,7 @@ public enum SQLiteStoreSchemaGate {
         schemaSQL: String,
         policy: LibraryDatabasePolicy,
         includeMemoryTuning: Bool = true,
+        strictEmptySchema: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool
     ) -> OpaquePointer? {
@@ -76,6 +77,7 @@ public enum SQLiteStoreSchemaGate {
                 schemaSQL: schemaSQL,
                 policy: policy,
                 includeMemoryTuning: includeMemoryTuning,
+                strictEmptySchema: strictEmptySchema,
                 verifyVersion: verifyVersion,
                 stampVersion: stampVersion
             )
@@ -178,6 +180,7 @@ public enum SQLiteStoreSchemaGate {
         policy: LibraryDatabasePolicy,
         includeMemoryTuning: Bool = true,
         enforceForeignKeys: Bool = false,
+        strictEmptySchema: Bool = false,
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
@@ -189,6 +192,7 @@ public enum SQLiteStoreSchemaGate {
             at: url,
             schemaSQL: schemaSQL,
             busyTimeoutMs: policy.busyTimeoutMs,
+            strictEmptySchema: strictEmptySchema,
             versionIsCurrent: verifyVersion,
             copyItem: copyItem,
             createDirectory: createDirectory,
@@ -217,6 +221,7 @@ public enum SQLiteStoreSchemaGate {
                 initializeCurrentSchema(
                     handle,
                     schemaSQL: schemaSQL,
+                    strictEmptySchema: strictEmptySchema,
                     stamp: { stampVersion(handle) }
                 )
             else {
@@ -250,6 +255,7 @@ public enum SQLiteStoreSchemaGate {
         at url: URL,
         schemaSQL: String,
         busyTimeoutMs: Int = 5_000,
+        strictEmptySchema: Bool = false,
         versionIsCurrent: (OpaquePointer?) -> Bool,
         copyItem: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) },
         createDirectory: ((URL) throws -> Void)? = nil,
@@ -274,7 +280,7 @@ public enum SQLiteStoreSchemaGate {
         // A failure that says nothing about the file, such as a full disk, ends the inspection the same way. SQLite
         // keeps the failure only until the next call, so each check below reads it right after the failed read.
         func keepsFile() -> Bool { busy.gaveUp || probe.keepsFile(after: inspection, step: .inspection) }
-        switch state(of: inspection) {
+        switch state(of: inspection, strictEmptySchema: strictEmptySchema) {
         case .empty:
             guard let version = userVersion(of: inspection) else { return busy.gaveUp ? .retryLater : .unavailable }
             if busy.gaveUp { return .retryLater }
@@ -469,8 +475,12 @@ public enum SQLiteStoreSchemaGate {
         return String(cString: value)
     }
 
-    public static func state(of db: OpaquePointer?) -> SQLiteStoreSchemaState {
-        guard let objects = schemaObjects(in: db) else { return .unavailable }
+    /// With strictEmptySchema, every row in sqlite_schema counts, including SQLite-owned objects.
+    /// The default preserves existing callers' application-schema classification.
+    public static func state(of db: OpaquePointer?, strictEmptySchema: Bool = false) -> SQLiteStoreSchemaState {
+        guard let objects = schemaObjects(in: db, includeInternalObjects: strictEmptySchema) else {
+            return .unavailable
+        }
         return objects.isEmpty ? .empty : .populated
     }
 
@@ -513,9 +523,10 @@ public enum SQLiteStoreSchemaGate {
     public static func initializeCurrentSchema(
         _ db: OpaquePointer?,
         schemaSQL: String,
+        strictEmptySchema: Bool = false,
         stamp: () -> Bool
     ) -> Bool {
-        guard state(of: db) == .empty,
+        guard state(of: db, strictEmptySchema: strictEmptySchema) == .empty,
             sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
         else { return false }
 
@@ -591,14 +602,16 @@ public enum SQLiteStoreSchemaGate {
         let match: String
     }
 
-    private static func schemaObjects(in db: OpaquePointer?) -> [SchemaObject]? {
+    private static func schemaObjects(in db: OpaquePointer?, includeInternalObjects: Bool = false) -> [SchemaObject]? {
+        let filter =
+            includeInternalObjects
+            ? "" : "WHERE type IN ('table','index','view','trigger') AND name NOT LIKE 'sqlite_%' "
         var statement: OpaquePointer?
         guard
             sqlite3_prepare_v2(
                 db,
                 "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-                    + "WHERE type IN ('table','index','view','trigger') AND name NOT LIKE 'sqlite_%' "
-                    + "ORDER BY type, name, tbl_name;",
+                    + filter + "ORDER BY type, name, tbl_name;",
                 -1,
                 &statement,
                 nil
