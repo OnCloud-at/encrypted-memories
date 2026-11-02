@@ -100,6 +100,21 @@ import Testing
         }
         #expect(result == 42)
     }
+
+    @Test(
+        "a late cancel flag keeps a built result and only turns a failure into cancelled",
+        arguments: [
+            (SupportMeasurementOutcome.success, true, SupportMeasurementOutcome.success),
+            (SupportMeasurementOutcome.partial, true, SupportMeasurementOutcome.partial),
+            (SupportMeasurementOutcome.failure, true, SupportMeasurementOutcome.cancelled),
+            (SupportMeasurementOutcome.failure, false, SupportMeasurementOutcome.failure),
+        ]
+    ) func lateCancellationKeepsBuiltResults(
+        recorded: SupportMeasurementOutcome, taskCancelled: Bool, resolved: SupportMeasurementOutcome
+    ) {
+        #expect(
+            WorkMeasurementOperation.resolveOutcome(recorded: recorded, taskCancelled: taskCancelled) == resolved)
+    }
 }
 
 private enum MeasurementProbeError: Error, Equatable { case rejected }

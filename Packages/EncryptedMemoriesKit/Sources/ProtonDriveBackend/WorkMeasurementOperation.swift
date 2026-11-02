@@ -27,4 +27,17 @@ enum WorkMeasurementOperation {
             throw error
         }
     }
+
+    /// Resolves a pass outcome when the task cancel flag may have landed after the work already
+    /// completed: a pass that built a full or partial result keeps it, while a failure becomes
+    /// cancelled because no usable result exists.
+    static func resolveOutcome(
+        recorded: SupportMeasurementOutcome, taskCancelled: Bool
+    ) -> SupportMeasurementOutcome {
+        guard taskCancelled else { return recorded }
+        switch recorded {
+        case .success, .partial: return recorded
+        case .failure, .cancelled: return .cancelled
+        }
+    }
 }
