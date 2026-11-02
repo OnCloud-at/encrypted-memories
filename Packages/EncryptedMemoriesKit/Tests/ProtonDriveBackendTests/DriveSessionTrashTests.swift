@@ -548,17 +548,17 @@ extension DriveSessionStubSuite {
             #"{"LinkID":"photo","FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}}"#,
         ])
         func blockedContentRejectsIncompleteDecodedPhotoState(link: String) async throws {
-            try await assertDecodedContentDecision(link: link, acceptsBlocked: false)
+            try await assertDecodedContentDecision(link: link, stateProvesActiveMain: false)
         }
 
         @Test func blockedContentAcceptsCompleteDecodedMainPhoto() async throws {
             try await assertDecodedContentDecision(
                 link:
                     #"{"LinkID":"photo","State":1,"FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}}"#,
-                acceptsBlocked: true)
+                stateProvesActiveMain: true)
         }
 
-        private func assertDecodedContentDecision(link: String, acceptsBlocked: Bool) async throws {
+        private func assertDecodedContentDecision(link: String, stateProvesActiveMain: Bool) async throws {
             StubURLProtocol.reset()
             StubURLProtocol.route(
                 "POST /drive/shares/share1/links/fetch_metadata", json: "{\"Code\":1000,\"Links\":[\(link)]}")
@@ -583,12 +583,14 @@ extension DriveSessionStubSuite {
                     store: store, checker: DecodedVisibilityChecker(session: session, blocked: blocked),
                     currentClientUID: "this-uploader")
                 let result = try await pipeline.resolve(descriptor)
-                let accepts = !blocked || acceptsBlocked
+                let accepts = stateProvesActiveMain
+                // Without the state proof, an incomplete decoded answer never adopts the photo (#876):
+                // a foreign draft still settles as a draft skip, and an open lookup uploads again.
                 #expect(
                     result.decision
                         == (accepts
                             ? .skip(.activeDuplicate, remoteLinkID: "photo")
-                            : .skip(.draftExists, remoteLinkID: "draft")))
+                            : (blocked ? .skip(.draftExists, remoteLinkID: "draft") : .upload)))
                 #expect(store.record(for: descriptor.source)?.remoteLinkID == (accepts ? "photo" : nil))
                 #expect(store.record(for: descriptor.source)?.outcome == (accepts ? "duplicateActive" : nil))
             }
