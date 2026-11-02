@@ -1168,7 +1168,10 @@ final class PendingBackupStoreTests: XCTestCase {
             XCTAssertEqual(try pendingTables(), before, "the row stays unchanged (\(column))")
 
             try withRawPendingDatabase {
-                XCTAssertEqual(sqlite3_exec($0, "DELETE FROM source_state;", nil, nil, nil), SQLITE_OK)
+                XCTAssertEqual(
+                    sqlite3_exec(
+                        $0, "DELETE FROM source_state; DELETE FROM pending_info WHERE key GLOB 'pending-trash:*';", nil,
+                        nil, nil), SQLITE_OK)
             }
         }
     }
@@ -1193,7 +1196,10 @@ final class PendingBackupStoreTests: XCTestCase {
 
         // The other order: the excluded row comes first, by row and by key, and the unreadable row after it.
         try withRawPendingDatabase {
-            XCTAssertEqual(sqlite3_exec($0, "DELETE FROM source_state;", nil, nil, nil), SQLITE_OK)
+            XCTAssertEqual(
+                sqlite3_exec(
+                    $0, "DELETE FROM source_state; DELETE FROM pending_info WHERE key GLOB 'pending-trash:*';", nil,
+                    nil, nil), SQLITE_OK)
         }
         XCTAssertNotNil(
             store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
@@ -1235,7 +1241,10 @@ final class PendingBackupStoreTests: XCTestCase {
                 unknownKind)
 
             try withRawPendingDatabase {
-                XCTAssertEqual(sqlite3_exec($0, "DELETE FROM source_state;", nil, nil, nil), SQLITE_OK)
+                XCTAssertEqual(
+                    sqlite3_exec(
+                        $0, "DELETE FROM source_state; DELETE FROM pending_info WHERE key GLOB 'pending-trash:*';", nil,
+                        nil, nil), SQLITE_OK)
             }
         }
     }
