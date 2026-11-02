@@ -518,8 +518,8 @@ private struct MobilePhotoBackupSections: View {
 /// Tapping "N nicht gesichert" opens this: a plain-language list of exactly which files failed and
 /// why. Deleted-from-device files are marked permanent (retrying can't help and no retry is offered
 /// for them); everything else can be retried here and is also auto-retried on the next app launch.
-/// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
-/// Sync now is its retry.
+/// An album row opens the same sheet with its last-run photos and restores a trashed copy through the shared
+/// controller. Sync now on the album row retries the album.
 struct MobileFailedBackupSheet: View {
     enum Source {
         case backup(PhotoLibraryBackupController)
@@ -588,6 +588,11 @@ struct MobileFailedBackupSheet: View {
                     }
                 case .list:
                     List {
+                        if case .album(let albumSync, _) = source, let message = albumSync.lastMessage {
+                            Text(message)
+                                .foregroundStyle(.red)
+                                .accessibilityIdentifier("albumsync.restoreError")
+                        }
                         BackupProblemSections(items: items) { item in
                             BackupProblemRow(item: item, previews: previews)
                                 .contentShape(Rectangle())
@@ -647,7 +652,8 @@ struct MobileFailedBackupSheet: View {
             }
         }
         .confirmationDialog(
-            L10n.string("backup.issue_deleted_elsewhere"),
+            deletionItem?.issue == .remoteDeletion
+                ? L10n.string("contextmenu.restore") : L10n.string("backup.issue_deleted_elsewhere"),
             isPresented: Binding(
                 get: { deletionItem != nil }, set: { if !$0 { deletionItem = nil } }),
             titleVisibility: .visible
@@ -666,9 +672,11 @@ struct MobileFailedBackupSheet: View {
         .onDisappear { personReadTask?.cancel() }
     }
 
-    /// Only the backup list offers the deleted-elsewhere decision; the album list is read-only.
     private func offersDecision(_ item: BackupFailedItem) -> Bool {
-        controller != nil && item.issue == .deletedElsewhere
+        switch source {
+        case .backup: item.issue == .deletedElsewhere
+        case .album: item.issue == .remoteDeletion
+        }
     }
 
     @ViewBuilder
@@ -686,6 +694,13 @@ struct MobileFailedBackupSheet: View {
                 refreshAfterDecision(item, controller: controller)
             }
             .accessibilityIdentifier("backup.backUpAgain.\(place)")
+        } else if case .album(let albumSync, let albumID) = source {
+            Button(L10n.string("contextmenu.restore")) {
+                deletionItem = nil
+                personReadTask?.cancel()
+                personReadTask = Task { await albumSync.restorePhotoFromProblemList(item, albumID: albumID) }
+            }
+            .accessibilityIdentifier("albumsync.restore.\(place)")
         }
     }
 

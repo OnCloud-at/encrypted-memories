@@ -403,6 +403,17 @@ public final class AlbumSyncController {
         }
     }
 
+    /// The album problem list restores the existing copy, then uses the normal sync to add it to the album.
+    public func restorePhotoFromProblemList(_ item: BackupFailedItem, albumID: String) async {
+        do {
+            _ = try await restorePhoto(item, albumID: albumID)
+            syncNow(albumID: albumID)
+        } catch {
+            guard !UploadError.isCancellation(error) else { return }
+            setMessage(L10n.string("albumsync.error_restore_photo"))
+        }
+    }
+
     private func invalidateRecovery() {
         recoveryGeneration = UUID()
         recoveryTask?.cancel()
@@ -744,7 +755,7 @@ public final class AlbumSyncController {
         /// UI-test account. It uses the real mapping store and last-run file, without PhotoKit or a network.
         public func installNotInAlbumFixtureForTesting(albumID: String, title: String) -> Bool {
             guard let mappingStore, mappingStore.isOperational() else { return false }
-            let items = AlbumSyncProblemList.items(
+            var items = AlbumSyncProblemList.items(
                 missingIdentifiers: ["fixture-network"],
                 attachFailedIdentifiers: ["fixture-attach"],
                 backup: AlbumSyncBackupReport(
@@ -755,6 +766,13 @@ public final class AlbumSyncController {
                             reason: L10n.string("backup.issue_network"), isPermanent: false, issue: .network)
                     ],
                     filenames: ["fixture-attach": "attach fixture.heic"]))
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncRestoreFixture") {
+                items = AlbumSyncProblemList.items(
+                    missingIdentifiers: [], attachFailedIdentifiers: [], trashedIdentifiers: ["fixture-trashed"],
+                    backup: AlbumSyncBackupReport(
+                        total: 1, backedUp: 0, failed: 0, sourceMissing: 0, skippedRemoteDeletion: 1,
+                        filenames: ["fixture-trashed": "trashed fixture.heic"]))
+            }
             let now = Date()
             guard
                 mappingStore.addSelection(AlbumSyncSelection(localAlbumID: albumID, title: title, addedAt: now)),
