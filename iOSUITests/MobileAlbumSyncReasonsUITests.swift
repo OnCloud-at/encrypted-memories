@@ -59,15 +59,15 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
         XCTAssertTrue(attach.label.contains("Konnte nicht zum Proton-Album hinzugefügt werden."))
     }
 
-    func testDeletedAlbumPhotoOffersRestoreAndRetainsTheRowWhenUnavailable() {
-        assertRestoreAction(language: "en")
+    func testDeletedAlbumPhotoOffersRestoreAndRetainsTheRowWhenUnavailable() throws {
+        try assertRestoreAction(language: "en")
     }
 
-    func testGermanDeletedAlbumPhotoOffersRestoreAndRetainsTheRowWhenUnavailable() {
-        assertRestoreAction(language: "de")
+    func testGermanDeletedAlbumPhotoOffersRestoreAndRetainsTheRowWhenUnavailable() throws {
+        try assertRestoreAction(language: "de")
     }
 
-    private func assertRestoreAction(language: String) {
+    private func assertRestoreAction(language: String) throws {
         openAlbumSync(language: language, restoreFixture: true)
         let status = app.buttons["albumsync.notInAlbum.fixture-album-sync"]
         XCTAssertTrue(status.waitForExistence(timeout: 10))
@@ -77,11 +77,12 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
         let reason = language == "de" ? "Übersprungen: in Proton Drive gelöscht" : "Skipped: deleted in Proton Drive"
         XCTAssertTrue(photo.label.contains(reason))
         photo.tap()
-        let restore = app.buttons["albumsync.restore.dialog"]
+        let restore = app.buttons["albumsync.restore.dialog"].firstMatch
         XCTAssertTrue(restore.waitForExistence(timeout: 5), "The deleted photo must offer the Restore action")
-        XCTAssertEqual(restore.label, language == "de" ? "Wiederherstellen" : "Restore")
+        let action = try app.hittableDialogButton("albumsync.restore.dialog")
+        XCTAssertEqual(action.label, language == "de" ? "Wiederherstellen" : "Restore")
         XCTAssertFalse(app.buttons["backup.backUpAgain.dialog"].exists)
-        restore.tap()
+        try app.tapDialogButton("albumsync.restore.dialog")
         let error = app.staticTexts["albumsync.restoreError"]
         XCTAssertTrue(error.waitForExistence(timeout: 5))
         XCTAssertEqual(
