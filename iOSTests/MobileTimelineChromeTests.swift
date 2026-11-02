@@ -106,6 +106,7 @@ final class MobileTimelineChromeTests: XCTestCase {
             CGSize(width: 678, height: 466), CGSize(width: 669, height: 951), originalSize,
         ]
         var viewportSizes: Set<String> = []
+        var expectedCentre = centre
         for size in sizes {
             let widthClass: UIUserInterfaceSizeClass = size.width > 820 ? .regular : .compact
             window.traitOverrides.horizontalSizeClass = widthClass
@@ -122,15 +123,41 @@ final class MobileTimelineChromeTests: XCTestCase {
             viewportSizes.insert("\(viewport.bounds.size)")
             XCTAssertEqual(router.presentation?.items[2].uid, uid)
             XCTAssertEqual(viewport.zoomScale / viewport.minimumZoomScale, zoom, accuracy: 0.01)
+            let scaledImage = CGSize(
+                width: image.bounds.width * viewport.zoomScale, height: image.bounds.height * viewport.zoomScale)
+            let mediaSize = try XCTUnwrap(image.image).size
+            let fitScale = min(viewport.bounds.width / mediaSize.width, viewport.bounds.height / mediaSize.height)
+            let expectedImage = CGSize(
+                width: mediaSize.width * fitScale * viewport.zoomScale,
+                height: mediaSize.height * fitScale * viewport.zoomScale)
+            XCTAssertTrue(expectedImage.width.isFinite && expectedImage.height.isFinite)
+            XCTAssertGreaterThan(expectedImage.width, 0)
+            XCTAssertGreaterThan(expectedImage.height, 0)
+            XCTAssertEqual(scaledImage.width, expectedImage.width, accuracy: 1)
+            XCTAssertEqual(scaledImage.height, expectedImage.height, accuracy: 1)
+            let minX = min(0.5, viewport.bounds.width / (2 * expectedImage.width))
+            let maxX = max(0.5, 1 - viewport.bounds.width / (2 * expectedImage.width))
+            let minY = min(0.5, viewport.bounds.height / (2 * expectedImage.height))
+            let maxY = max(0.5, 1 - viewport.bounds.height / (2 * expectedImage.height))
+            let previousCentre = expectedCentre
+            expectedCentre = CGPoint(
+                x: min(max(previousCentre.x, minX), maxX), y: min(max(previousCentre.y, minY), maxY))
             let restored = normalizedCentre()
-            XCTAssertEqual(restored.x, centre.x, accuracy: 0.01, "The same horizontal image feature stays centred")
-            XCTAssertEqual(restored.y, centre.y, accuracy: 0.01, "The same vertical image feature stays centred")
+            XCTAssertEqual(
+                restored.x, expectedCentre.x, accuracy: 0.01,
+                "The same horizontal image feature stays centred within the actual pan bounds")
+            XCTAssertEqual(
+                restored.y, expectedCentre.y, accuracy: 0.01,
+                "The same vertical image feature stays centred within the actual pan bounds")
             XCTAssertTrue(
                 viewer.presentedViewController != nil || viewer.view.bounds.width - pager.view.bounds.width >= 200,
                 "Info stays open as a sheet or a column")
-            report.append(
-                "viewer size=\(size) viewport=\(viewport.bounds.size) uid=\(uid.nodeID) zoom=\(viewport.zoomScale) centre=\(restored)"
-            )
+            let measurement =
+                "viewer size=\(size) viewport=\(viewport.bounds.size) scaledImage=\(scaledImage) zoom=\(viewport.zoomScale)"
+                + " rangeX=\(minX)...\(maxX) rangeY=\(minY)...\(maxY) previous=\(previousCentre)"
+                + " expected=\(expectedCentre) actual=\(restored)"
+            print(measurement)
+            report.append(measurement)
         }
         XCTAssertGreaterThanOrEqual(viewportSizes.count, 3, "SETUP: the media viewport must actually resize")
         withTransaction(transaction) { router.presentation = nil }
