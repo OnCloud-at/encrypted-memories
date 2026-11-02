@@ -134,7 +134,12 @@ import os
                         scanDelay: ProcessInfo.processInfo.arguments.contains(
                             "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil,
                         invalidatingMergeReloadFails: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesReloadFailure")))
+                            "-EncryptedMemoriesDuplicatesReloadFailure"),
+                        mergeFailure: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesPermanentMergeFailure")
+                            ? .userAuthenticationRequired
+                            : ProcessInfo.processInfo.arguments.contains(
+                                "-EncryptedMemoriesDuplicatesMergeFailure") ? .timedOut : nil))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesWideFixture") {
                 // One group with more copies than fit on the screen, and one whose two copies fit.
                 let wide = Array(sections[0].items.prefix(12))
@@ -442,13 +447,15 @@ import os
         private let buildInterruptions: Int
         private var buildCalls = 0
         private var indexComplete = false
+        /// One failed group on the first merge, so the real alert can retry it.
+        private var mergeFailure: URLError.Code?
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
             rescanDropsLastGroup: Bool = false, scanDelay: Duration? = nil, rankDelay: Duration? = nil,
             mergeDelay: Duration? = nil,
             confirmsNoPendingMerges: Bool = true, invalidatingMergeReloadFails: Bool = false,
-            buildInterruptions: Int = 0
+            buildInterruptions: Int = 0, mergeFailure: URLError.Code? = nil
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -462,6 +469,7 @@ import os
             self.confirmsNoPendingMerges = confirmsNoPendingMerges
             self.invalidatingMergeReloadFails = invalidatingMergeReloadFails
             self.buildInterruptions = buildInterruptions
+            self.mergeFailure = mergeFailure
         }
 
         func confirmNoPendingMerges() async -> Bool { confirmsNoPendingMerges }
@@ -550,9 +558,20 @@ import os
                 lock.withLock { reloadMustFail = true }
                 return requests.map { _ in .success(.skipped(.preselectionChanged)) }
             }
-            lock.withLock { groups.removeAll { group in requests.contains { $0.group.id == group.id } } }
+            let failure = lock.withLock {
+                let failure = mergeFailure
+                mergeFailure = nil
+                let failedID = failure == nil ? nil : requests.first?.group.id
+                groups.removeAll { group in
+                    group.id != failedID && requests.contains { $0.group.id == group.id }
+                }
+                return failure
+            }
             return requests.map { request in
-                .success(
+                if let failure, request.group.id == requests.first?.group.id {
+                    return .failure(URLError(failure))
+                }
+                return .success(
                     .merged(
                         kept: request.kept, trashed: request.group.members.filter { $0 != request.kept },
                         keptDuplicates: [:]))

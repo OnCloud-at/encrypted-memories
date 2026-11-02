@@ -92,6 +92,39 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    func testPartialMergeFailureCountUsesTotalForPluralSelection() throws {
+        let expected: [(language: String, failed: Int, total: Int, text: String)] = [
+            ("en", 1, 1, "1 of 1 group could not be merged."),
+            ("en", 1, 2, "1 of 2 groups could not be merged."),
+            ("en", 2, 2, "2 of 2 groups could not be merged."),
+            ("de", 1, 1, "1 von 1 Gruppe konnte nicht zusammengeführt werden."),
+            ("de", 1, 2, "1 von 2 Gruppen konnten nicht zusammengeführt werden."),
+            ("de", 2, 2, "2 von 2 Gruppen konnten nicht zusammengeführt werden."),
+        ]
+        for (language, failed, total, text) in expected {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            let translated = String(
+                localized: "duplicates.partial_failure_message \(failed) \(total)", bundle: bundle,
+                locale: Locale(identifier: language))
+            XCTAssertEqual(translated, text, "\(language) \(failed)/\(total)")
+        }
+    }
+
+    func testPartialMergeFailureReasonIsEnglishAndGerman() throws {
+        for (language, text) in [
+            ("en", "These groups could not be merged."),
+            ("de", "Diese Gruppen konnten nicht zusammengeführt werden."),
+        ] {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            XCTAssertEqual(
+                String(
+                    localized: "duplicates.merge_unavailable_reason", bundle: bundle,
+                    locale: Locale(identifier: language)), text)
+        }
+    }
+
     func testDuplicateThumbnailUnavailableLabelIsEnglishAndGerman() throws {
         let key = "duplicates.thumbnail_unavailable"
         XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), "Thumbnail unavailable")
