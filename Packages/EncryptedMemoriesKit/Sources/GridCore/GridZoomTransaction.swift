@@ -5,8 +5,9 @@ import CoreGraphics
 // A settled frame plan cannot drive live zoom directly. Re-resolving it can change the column count and rewrap
 // flat indices, which moves the row under the cursor.
 //
-// The transaction is captured once at gesture start. It pins the anchor under the cursor and lays out nearby
-// indices relative to that anchor, so the focus row remains contiguous while the gesture changes level.
+// The transaction is captured once at gesture start. It lays out nearby indices relative to the anchor,
+// so the focus row remains contiguous while the gesture changes level. A division fixes the physical
+// columns around its gap; the anchor keeps its vertical point and chooses the nearest cursor column.
 //
 // The settled target grid remains row-major. This type owns identity and position continuity until commit.
 //
@@ -49,21 +50,21 @@ public struct GridZoomTransactionFrame: Equatable, Sendable {
 
 public struct GridZoomTransaction: Equatable, Sendable {
     public let totalItems: Int
-    /// The anchor's identity: the item under the cursor at gesture start. The transaction pins this item
-    /// under the cursor throughout the gesture.
+    /// The anchor's identity: the item under the cursor at gesture start.
     public let anchorGlobalIndex: Int
-    /// Where the anchor's local point is held fixed (the cursor, viewport coords).
+    /// The gesture point in viewport coordinates. A division fixes columns while preserving the vertical point.
     public let anchorViewportPoint: CGPoint
-    /// The cursor's unit position inside the anchor slot (kept invariant so the cursor stays pinned).
+    /// The gesture's unit position inside the anchor slot; its vertical fraction stays pinned.
     public let anchorLocalFraction: CGPoint
     /// The density ladder (for apparent-metric interpolation across the gesture).
     public let levels: [GridLevelMetrics]
     /// The level the gesture started on (the snap-back / commit reference).
     public let sourceLevel: Int
+    public let divisionFrame: CGRect?
 
     public init(
         totalItems: Int, anchorGlobalIndex: Int, anchorViewportPoint: CGPoint,
-        anchorLocalFraction: CGPoint, levels: [GridLevelMetrics], sourceLevel: Int
+        anchorLocalFraction: CGPoint, levels: [GridLevelMetrics], sourceLevel: Int, divisionFrame: CGRect? = nil
     ) {
         self.totalItems = totalItems
         self.anchorGlobalIndex = anchorGlobalIndex
@@ -72,6 +73,7 @@ public struct GridZoomTransaction: Equatable, Sendable {
         precondition(!levels.isEmpty, "GridZoomTransaction requires at least one grid level")
         self.levels = levels
         self.sourceLevel = sourceLevel
+        self.divisionFrame = divisionFrame
     }
 
     /// The anchor-relative lattice at a continuous level: apparent metrics + the origin/anchor-column that pin
@@ -79,10 +81,66 @@ public struct GridZoomTransaction: Equatable, Sendable {
     struct Lattice {
         let columns: Int, side: CGFloat, gap: CGFloat, pitch: CGFloat, anchorColumn: Int
         let gridOriginX: CGFloat, gridOriginY: CGFloat
+        var dividedGeometry: GridColumnGeometry? = nil
+        var anchorPaneOffset: CGFloat = 0
+
+        func origin(of column: Int) -> CGFloat {
+            guard let dividedGeometry else { return gridOriginX + CGFloat(column) * pitch }
+            let samePane = (column < columns / 2) == (anchorColumn < columns / 2)
+            return dividedGeometry.origin(of: column) + (samePane ? anchorPaneOffset : 0)
+        }
     }
 
     func lattice(continuousLevel x: CGFloat, width rawWidth: CGFloat) -> Lattice {
         let width = max(rawWidth, 1)
+        if let divisionFrame, GridVerticalDivision.isUsable(divisionFrame, width: width, levels: levels) {
+            let gap = apparentGap(at: x)
+            let base = GridColumnGeometry(
+                columns: levels[0].nominalColumns, gap: gap, width: width, division: divisionFrame)
+            if base.isDivided {
+                let target = apparentSlotSide(at: x, width: width)
+                let columns: Int
+                let nearest = x.rounded()
+                let isSettled = x >= 0 && abs(x - nearest) < 1e-6 && Int(nearest) < levels.count
+                if x < 0 {
+                    columns = levels[0].nominalColumns
+                } else if abs(x - nearest) < 1e-6, Int(nearest) < levels.count {
+                    columns = levels[Int(nearest)].nominalColumns
+                } else {
+                    columns = max(2, Int(((base.fittingWidth + gap) / (target + gap) / 2).rounded()) * 2)
+                }
+                let geometry = GridColumnGeometry(
+                    columns: columns, gap: gap, width: width, division: divisionFrame,
+                    targetSide: isSettled ? nil : target)
+                let anchorColumn: Int
+                let anchorX: CGFloat
+                if x < 0 {
+                    let unscaled = GridColumnGeometry(
+                        columns: levels[0].nominalColumns, gap: levels[0].gap, width: width, division: divisionFrame)
+                    anchorColumn = unscaled.column(at: anchorViewportPoint.x)
+                    anchorX = geometry.origin(of: anchorColumn)
+                } else if isSettled {
+                    anchorColumn = geometry.column(at: anchorViewportPoint.x)
+                    anchorX = geometry.origin(of: anchorColumn)
+                } else {
+                    let lo = min(Int(x), levels.count - 1)
+                    let hi = min(lo + 1, levels.count - 1)
+                    func endpoint(_ i: Int) -> CGFloat {
+                        let endpoint = GridColumnGeometry(
+                            columns: levels[i].nominalColumns, gap: levels[i].gap, width: width, division: divisionFrame
+                        )
+                        return endpoint.origin(of: endpoint.column(at: anchorViewportPoint.x))
+                    }
+                    anchorX = lerp(endpoint(lo), endpoint(hi), smoothstep(x - CGFloat(lo)))
+                    anchorColumn = geometry.interpolatedAnchorColumn(at: anchorX)
+                }
+                return Lattice(
+                    columns: columns, side: target, gap: gap, pitch: target + gap,
+                    anchorColumn: anchorColumn, gridOriginX: 0,
+                    gridOriginY: anchorViewportPoint.y - anchorLocalFraction.y * target, dividedGeometry: geometry,
+                    anchorPaneOffset: anchorX - geometry.origin(of: anchorColumn))
+            }
+        }
         // Past the largest detent, scale the level-zero grid around the cursor while keeping its columns fixed.
         // Cell, gap, and pitch use the same scale factor. Column changes happen only when the gesture commits.
         if x < 0 {
@@ -139,7 +197,7 @@ public struct GridZoomTransaction: Equatable, Sendable {
         let row = Int(floor(Double(m) / Double(l.columns)))
         let col = m - row * l.columns
         return CGRect(
-            x: l.gridOriginX + CGFloat(col) * l.pitch,
+            x: l.origin(of: col),
             y: l.gridOriginY + CGFloat(row) * l.pitch, width: l.side, height: l.side)
     }
 
@@ -151,7 +209,6 @@ public struct GridZoomTransaction: Equatable, Sendable {
         let gap = l.gap
         let pitch = l.pitch
         let cA = l.anchorColumn
-        let gridOriginX = l.gridOriginX
         let gridOriginY = l.gridOriginY
 
         let firstRow = Int(((-overscan - gridOriginY) / pitch).rounded(.down))
@@ -172,7 +229,7 @@ public struct GridZoomTransaction: Equatable, Sendable {
                 let g = anchorGlobalIndex + delta
                 guard g >= 0, g < totalItems else { continue }
                 let cell = CGRect(
-                    x: gridOriginX + CGFloat(col) * pitch,
+                    x: l.origin(of: col),
                     y: gridOriginY + CGFloat(row) * pitch, width: side, height: side)
                 guard cell.maxY > -overscan, cell.minY < viewportSize.height + overscan,
                     cell.maxX > 0, cell.minX < viewportSize.width
@@ -187,17 +244,9 @@ public struct GridZoomTransaction: Equatable, Sendable {
             anchorColumn: cA, focusRow: focusRow, visibleSlots: slots)
     }
 
-    // Apparent-metric interpolation (mirrors SquareTileGridEngine, with the soft rubber-band past the ends).
+    // Apparent metrics use the same interpolation as the settled engine.
     public func apparentSlotSide(at x: CGFloat, width: CGFloat) -> CGFloat {
-        let maxIndex = levels.count - 1
-        // Use the same width-filled side as the settled resolver at integer detents.
-        func side(_ i: Int) -> CGFloat {
-            SquareTileGridEngine.nominalSlotSide(columns: levels[i].nominalColumns, gap: levels[i].gap, width: width)
-        }
-        if x <= 0 { return side(0) * (1 - x * 0.6) }
-        if x >= CGFloat(maxIndex) { return side(maxIndex) }
-        let lo = Int(x)
-        return lerp(side(lo), side(lo + 1), smoothstep(x - CGFloat(lo)))
+        GridApparentMetrics.slotSide(at: x, width: width, levels: levels, division: divisionFrame)
     }
     public func apparentGap(at x: CGFloat) -> CGFloat {
         let maxIndex = levels.count - 1
@@ -233,6 +282,6 @@ public extension SquareTileGridEngine {
         return GridZoomTransaction(
             totalItems: totalItems, anchorGlobalIndex: a.flatIndex,
             anchorViewportPoint: viewportPoint, anchorLocalFraction: a.localFraction,
-            levels: levels, sourceLevel: clampLevel(level))
+            levels: levels, sourceLevel: clampLevel(level), divisionFrame: usableDivision(width: width))
     }
 }

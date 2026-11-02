@@ -116,6 +116,30 @@ struct SDKAlbumCatalogBackendTests {
         #expect(!exported.contains(".jpg"))
     }
 
+    @Test func diagnosticNodeFactsCountsNoFactsForABatchThatThrows() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photos = (0..<16).map { photoNode(id: "fact-photo-\($0)", albumIDs: []) }
+        let nodes = Dictionary(
+            uniqueKeysWithValues: photos.map { ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0)) })
+        await client.configureNodes(nodes)
+        let requested =
+            photos.map {
+                PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID)
+            } + [PhotoUID(volumeID: "volume", nodeID: "fact-photo-missing")]
+        let measurements = SupportWorkMeasurements()
+        await #expect(throws: (any Error).self) {
+            _ = try await SDKAlbumCatalogBackend(client: client, workMeasurements: measurements)
+                .nodeFacts(of: requested)
+        }
+        let state = measurements.workMeasurementSupportSnapshot().passes[
+            SupportMeasurementKind.nodeFactsBatch.rawValue]
+        #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+        #expect(state.counters[SupportMeasurementCounter.nodesRequested.rawValue] == 17)
+        #expect(state.counters[SupportMeasurementCounter.nodesUnique.rawValue] == 17)
+        #expect(state.counters[SupportMeasurementCounter.factsCreated.rawValue] == 0)
+        #expect(state.samples.last?.outcome == 2)
+    }
+
     @Test func diagnosticViewerReadsDistinguishNilFromProducedMetadata() async throws {
         let client = FakeSDKPhotoCatalogClient()
         let photo = photoNode(id: "private-photo", albumIDs: [])
