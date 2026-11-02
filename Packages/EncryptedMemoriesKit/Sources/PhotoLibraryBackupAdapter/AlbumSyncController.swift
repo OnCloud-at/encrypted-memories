@@ -176,7 +176,8 @@ public final class AlbumSyncController {
         configuration: Configuration,
         identityResolver: (any UploadIdentityResolving)?,
         uploader: any PhotoUploading,
-        remoteOps: any AlbumSyncRemoteAlbumOps
+        remoteOps: any AlbumSyncRemoteAlbumOps,
+        tagAdder: (any PhotoTagAdding)? = nil
     ) {
         self.remoteOps = remoteOps
         self.identityResolver = identityResolver
@@ -214,7 +215,8 @@ public final class AlbumSyncController {
                     accountDataDirectory: directory,
                     databasePolicy: configuration.databasePolicy,
                     identityResolver: identityResolver,
-                    uploader: uploader
+                    uploader: uploader,
+                    tagAdder: tagAdder
                 )
             backupExecutor = executor
             runner = AlbumSyncRunner(

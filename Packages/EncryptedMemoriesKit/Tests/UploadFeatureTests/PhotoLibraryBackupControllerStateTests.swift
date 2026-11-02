@@ -5177,6 +5177,7 @@ extension PhotoLibraryBackupControllerStateTests {
             runner = BackupSyncRunner(
                 queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
                 resolver: resolver, identityResolver: pipeline, uploader: server,
+                tagAdder: SpyTagAdder(),
                 configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
                 events: controller.pendingRecorder, now: { [clock] in clock.now })
         }
@@ -5297,7 +5298,8 @@ extension PhotoLibraryBackupControllerStateTests {
             }
             let runner = BackupSyncRunner(
                 queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
-                resolver: resolver, identityResolver: pipeline, uploader: server, editReplacement: replacement,
+                resolver: resolver, identityResolver: pipeline, uploader: server, tagAdder: SpyTagAdder(),
+                editReplacement: replacement,
                 configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
                 events: controller.pendingRecorder, now: { [clock] in clock.now })
             clock.advance(by: 2)
@@ -5591,6 +5593,7 @@ extension PhotoLibraryBackupControllerStateTests {
                 queue: f.queue,
                 preflight: UploadBackupPreflightIndex(store: f.state, now: { [clock = f.clock] in clock.now }),
                 resolver: f.resolver, identityResolver: f.pipeline, uploader: uploader,
+                tagAdder: SpyTagAdder(),
                 configuration: .init(throttle: .init(baseConcurrency: 1)), clock: f.clock,
                 events: f.controller.pendingRecorder, now: { [clock = f.clock] in clock.now })
             var drain: Task<BackupSyncProgress, Never>?
