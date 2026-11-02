@@ -110,7 +110,7 @@ public actor PendingBackupCoordinator {
     /// Results that must be saved before the same effect or action can be dispatched again.
     private enum PendingEffectWrite {
         case complete(PendingSourceEffect, generation: Int64, remoteLinkID: String?)
-        case deferAttempt
+        case deferAttempt(generation: Int64)
     }
 
     /// The same identity that the store checks before changing or deleting an action.
@@ -1642,7 +1642,7 @@ public actor PendingBackupCoordinator {
         let volume = await effects.photosVolumeID()
         guard !closed else { return }
         guard let volume else {
-            for state in states { writeEffect(.deferAttempt, for: state.key, at: date) }
+            for state in states { writeEffect(.deferAttempt(generation: state.generation), for: state.key, at: date) }
             reloadSourceStates(states.map(\.key))
             return
         }
@@ -1699,7 +1699,7 @@ public actor PendingBackupCoordinator {
                     .complete(effect, generation: state.generation, remoteLinkID: state.remote?.nodeID),
                     for: state.key, at: date)
             } else {
-                writeEffect(.deferAttempt, for: state.key, at: date)
+                writeEffect(.deferAttempt(generation: state.generation), for: state.key, at: date)
             }
         }
         reloadSourceStates(states.map(\.key))
@@ -1736,8 +1736,8 @@ public actor PendingBackupCoordinator {
             } else if saved, effect == .remoteTrash {
                 unreadableLaterTrashKeys.remove(key)
             }
-        case .deferAttempt:
-            saved = store.deferEffects(for: key, at: date)
+        case .deferAttempt(let generation):
+            saved = store.deferEffects(for: key, at: date, generation: generation)
         }
         if saved {
             pendingEffectWrites.removeValue(forKey: key)
@@ -1799,12 +1799,22 @@ public actor PendingBackupCoordinator {
     }
 
     /// The next future retry of a readable source with an owed effect, from the last known states.
+    /// A source whose result write stayed unsaved keeps its real stored date, so a due source never
+    /// spins the timer: only future dates qualify. Keys with a pending effect write are hidden
+    /// (their row will be removed on success, so the stored date is stale). Keys with a pending
+    /// action write remain visible: their source_state persists and the stored date is meaningful.
+    /// When due dates are included, hide all pending writes to prevent a stale due date from firing.
     private func readableNextEffectDate(includingDue: Bool = false) -> Date? {
         let current = now()
-        let pendingKeys = Set(pendingEffectWrites.keys).union(pendingActionWrites.keys.map(\.key))
-            .union(beginFailedKeys)
+        let hiddenKeys: Set<PendingSourceKey>
+        if includingDue {
+            hiddenKeys =
+                Set(pendingEffectWrites.keys).union(pendingActionWrites.keys.map(\.key)).union(beginFailedKeys)
+        } else {
+            hiddenKeys = Set(pendingEffectWrites.keys)
+        }
         return sourceStates.values.filter { state in
-            !unreadableSourceStates.contains(state.key) && (includingDue || !pendingKeys.contains(state.key))
+            !unreadableSourceStates.contains(state.key) && !hiddenKeys.contains(state.key)
                 && !restoreRecheckIsPaused(state)
                 && (state.needsQueueSync || state.needsRemoteTrash || state.needsRemoteRestore)
                 && (includingDue || state.nextAttemptAt > current)
