@@ -66,6 +66,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// work across awaits; without this, foreground lifecycle, upload refresh and a second Mac window can all
     /// enumerate the same 20k-item library concurrently.
     private var timelineLoadTask: (generation: UInt64, task: Task<TimelineLoadSnapshot, any Error>)?
+    private let timelineLoadWaiters = SharedInFlightOperations<UInt64, TimelineLoadSnapshot>()
+    private var timelineProvisionalObservers:
+        [UUID: (generation: UInt64, continuation: AsyncStream<ProvisionalTimelineSnapshot>.Continuation)] = [:]
+    private var timelineProvisionalSnapshot: (generation: UInt64, value: ProvisionalTimelineSnapshot)?
     /// What the last persisted load was built from. A later load for the same server cursor whose local revisions
     /// differ is rebuilt from the local store instead of a listing (`TimelineLocalRebuild`).
     private var timelineLoadBasis: TimelineLoadBasis?
@@ -409,6 +413,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         trashTask?.cancel()
 
         _ = await timelineTask?.result
+        await timelineLoadWaiters.invalidateAndJoin()
         await metadataReconciliation.waitForCurrentPass()
         await trashTask?.value
         // A cancelled waiter no longer waits for the remote index build; end the build before the identity stores
@@ -439,23 +444,107 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
+    func loadTimelineSnapshot(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot {
+        try await withOpenSession(cause: .timelineFull) { bridge in
+            try await bridge.loadTimelineSnapshotImpl(onProvisional: onProvisional)
+        }
+    }
+
+    private func loadTimelineSnapshotImpl(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot {
+        try Task.checkCancellation()
+        let generation = timelineLoadTask?.generation ?? (timelineLoadGeneration &+ 1)
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<ProvisionalTimelineSnapshot>.makeStream(
+            bufferingPolicy: .bufferingNewest(1))
+        timelineProvisionalObservers[id] = (generation, continuation)
+        if let current = timelineProvisionalSnapshot, current.generation == generation {
+            continuation.yield(current.value)
+        }
+        let delivery = Task {
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await onProvisional(snapshot)
+            }
+        }
+        return try await withTaskCancellationHandler {
+            do {
+                let completed = try await loadTimelineSnapshotImpl()
+                timelineProvisionalObservers[id] = nil
+                continuation.finish()
+                await delivery.value
+                try Task.checkCancellation()
+                return completed
+            } catch {
+                timelineProvisionalObservers[id] = nil
+                continuation.finish()
+                delivery.cancel()
+                await delivery.value
+                throw error
+            }
+        } onCancel: {
+            continuation.finish()
+            delivery.cancel()
+        }
+    }
+
     private func loadTimelineSnapshotImpl() async throws -> TimelineLoadSnapshot {
         guard !isShutDown else { throw CancellationError() }
         if let timelineLoadTask {
-            return try await timelineLoadTask.task.value
+            return try await timelineLoadWaiters.run(timelineLoadTask.generation) {
+                try await timelineLoadTask.task.value
+            }
         }
 
         timelineLoadGeneration &+= 1
         let generation = timelineLoadGeneration
-        let task = Task { try await self.performTimelineLoad(generation: generation) }
+        timelineProvisionalSnapshot = nil
+        let task = Task {
+            do {
+                let snapshot = try await self.performTimelineLoad(generation: generation)
+                self.finishTimelineLoad(generation: generation)
+                return snapshot
+            } catch {
+                self.finishTimelineLoad(generation: generation)
+                throw error
+            }
+        }
         timelineLoadTask = (generation, task)
-        do {
-            let snapshot = try await task.value
-            if timelineLoadTask?.generation == generation { timelineLoadTask = nil }
-            return snapshot
-        } catch {
-            if timelineLoadTask?.generation == generation { timelineLoadTask = nil }
-            throw error
+        return try await timelineLoadWaiters.run(generation) { try await task.value }
+    }
+
+    private func finishTimelineLoad(generation: UInt64) {
+        guard timelineLoadTask?.generation == generation else { return }
+        timelineLoadTask = nil
+        timelineProvisionalSnapshot = nil
+    }
+
+    private func publishProvisionalTimeline(
+        _ entries: [PhotosListEntry], volumeID: String, mediaTypeEvidence: [String: String],
+        remoteChanges: TimelineRemoteEventChanges?, readAt: Date, generation: UInt64
+    ) throws {
+        try checkTimelineLoad(generation: generation)
+        let removed = remoteChanges?.removed ?? []
+        var seen = Set<String>()
+        var known = entries.filter { !removed.contains($0.linkID) && seen.insert($0.linkID).inserted }
+        if recentlyDeleted.hasPhotosAwaitingLibrary {
+            let listing = LibraryListingRead(
+                listed: Set(known.map { PhotoUID(volumeID: volumeID, nodeID: $0.linkID) }),
+                restoredElsewhere: Set(
+                    (remoteChanges?.active ?? []).map { PhotoUID(volumeID: volumeID, nodeID: $0) }),
+                readAt: readAt)
+            let lagging = recentlyDeleted.lagging(in: listing, now: Date())
+            known.removeAll { lagging.contains(PhotoUID(volumeID: volumeID, nodeID: $0.linkID)) }
+        }
+        guard !known.isEmpty else { return }
+        let provisional = ProvisionalTimelineSnapshot(
+            sections: Self.group(known, volumeID: volumeID, mediaTypeOverrides: mediaTypeEvidence, sectionID: "all"))
+        timelineProvisionalSnapshot = (generation, provisional)
+        for observer in timelineProvisionalObservers.values where observer.generation == generation {
+            observer.continuation.yield(provisional)
         }
     }
 
@@ -605,7 +694,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         try await driveSession.fetchPhotosList(volumeID: root.volumeID)
                     }
                 } else {
-                    entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID)
+                    entries = []
+                    try await driveSession.forEachPhotosListPage(volumeID: root.volumeID) { [self] page in
+                        entries.append(contentsOf: page)
+                        try publishProvisionalTimeline(
+                            entries, volumeID: root.volumeID, mediaTypeEvidence: mediaTypeEvidence,
+                            remoteChanges: remoteChanges, readAt: listingReadAt, generation: generation)
+                    }
                 }
                 librarySupport.listedPhotoCount = entries.count
                 if recentlyDeleted.hasPhotosAwaitingLibrary {

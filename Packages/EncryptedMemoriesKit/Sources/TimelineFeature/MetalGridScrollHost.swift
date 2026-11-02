@@ -337,13 +337,20 @@ final class MetalGridScrollHost: NSView {
 
     @objc private func userWillScroll() {
         stickToBottom = false
+        coordinator.beginPlaceholderScroll()
         liveScrollInputActive = true
         updateFeedInteractionState()
     }
 
     @objc private func userDidEndScroll() {
         liveScrollInputActive = false
+        endPlaceholderScroll()
         updateFeedInteractionState()
+    }
+
+    private func endPlaceholderScroll() {
+        coordinator.endPlaceholderScroll(
+            isVisible: framePump.isActive && window?.occlusionState.contains(.visible) == true)
     }
 
     /// A user-initiated live resize detaches the bottom pin so viewport anchoring can rebase the camera.
@@ -1468,9 +1475,11 @@ final class MetalGridScrollHost: NSView {
     /// Scroll to the newest (bottom) and re-arm the bottom pin. Resets the camera to the canonical bottom-right
     /// phase so the newest view always has the newest item in the corner (no trailing black at the bottom-right).
     func scrollToBottom() {
+        coordinator.beginPlaceholderScroll()
         stickToBottom = true
         coordinator.resetCommittedPhase()
         applyContentSize(coordinator.contentSize())  // resize for the canonical phase, then pin to bottom
+        endPlaceholderScroll()
     }
 
     /// Scroll a specific photo to vertical center (detaches the bottom pin - the user navigated to it).
@@ -1480,8 +1489,10 @@ final class MetalGridScrollHost: NSView {
         let clipH = scrollView.contentView.bounds.height
         let maxY = max(0, spacer.frame.height - clipH)
         let targetY = min(max(0, rect.midY - clipH / 2), maxY)
+        coordinator.beginPlaceholderScroll()
         scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        endPlaceholderScroll()
         requestFrame()
     }
 
@@ -1493,8 +1504,10 @@ final class MetalGridScrollHost: NSView {
         let clipH = scrollView.contentView.bounds.height
         let maxY = max(0, spacer.frame.height - clipH)
         let targetY = min(max(0, rect.minY - 24), maxY)
+        coordinator.beginPlaceholderScroll()
         scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        endPlaceholderScroll()
         requestFrame()
         onViewportChanged?()
     }

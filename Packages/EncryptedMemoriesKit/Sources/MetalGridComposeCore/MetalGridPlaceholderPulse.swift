@@ -12,7 +12,7 @@ package struct MetalGridPlaceholderPulse {
     /// The light position of a tile that does not animate.
     package static var staticLight: Float { -2 }
     private var sweepStartedAt: Double?
-    private var reduceMotion: Bool
+    package private(set) var reduceMotion: Bool
     package private(set) var isAnimating = false
     /// The animating state flipped during the latest update, so frozen layers draw once more.
     package private(set) var changed = false

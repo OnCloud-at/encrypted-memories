@@ -81,6 +81,11 @@ public final class TimelineViewModel {
     /// backend. The host reads this after the coalesced initial load completes.
     public private(set) var initialLoadFailureReason: TimelineRefreshFailureReason?
     @ObservationIgnored private var initialAuthoritativeAddedUIDs: [PhotoUID] = []
+    private var provisionalProjection: TimelineContentProjection?
+    private var provisionalRevision: UInt64 = 0
+    @ObservationIgnored private var provisionalGeneration: UInt64 = 0
+
+    public var isProvisionalPresentation: Bool { filter == .all && provisionalProjection != nil }
     /// Flat, chronological items of the currently active route (whole library for `.all`, else the
     /// filtered tag/album/trash set) - backs selection and the upload-found lookup, not viewer paging.
     public private(set) var allItems: [PhotoItem] = [] {
@@ -112,6 +117,7 @@ public final class TimelineViewModel {
     /// timeline (4n) or a filtered route (4n + 1).
     public var gridSourceRevision: UInt64 {
         switch filter {
+        case .all where isProvisionalPresentation: provisionalRevision &* 4 &+ 3
         case .all where showsPendingPhotos: pendingPresentation.membershipRevision &* 4 &+ 2
         case .all: wholeLibraryRevision &* 4
         default: contentRevision &* 4 &+ 1
@@ -148,6 +154,7 @@ public final class TimelineViewModel {
     /// The route state the grid shows. A library without Proton photos still shows its pending photos, and an
     /// empty Proton trash still shows photos deleted before upload.
     public var gridState: State {
+        if isProvisionalPresentation, let provisionalProjection { return .loaded(provisionalProjection.sections) }
         if filter == .all, case .empty = state,
             !LibraryEmptyPolicy.isCompletelyEmpty(
                 knownItemCount: allRouteSnapshot == nil ? nil : wholeLibrarySnapshot.count,
@@ -168,11 +175,13 @@ public final class TimelineViewModel {
 
     /// Sections of the grid; see `gridState`.
     public var gridSections: [TimelineSection] {
-        showsPendingPhotos || showsPendingTrash ? pendingSections : currentSections
+        if isProvisionalPresentation, let provisionalProjection { return provisionalProjection.sections }
+        return showsPendingPhotos || showsPendingTrash ? pendingSections : currentSections
     }
 
     /// Grid and viewer items; see `gridState`.
     public var gridItems: [PhotoItem] {
+        if isProvisionalPresentation, let provisionalProjection { return provisionalProjection.snapshot.items }
         if showsPendingPhotos { return pendingPresentation.items }
         if showsPendingTrash { return pendingTrash.merged(intoNewestFirst: presentationItems) }
         return presentationItems
@@ -180,6 +189,7 @@ public final class TimelineViewModel {
 
     /// The grid items with these identities, pending photos included, for actions on a selection.
     public func gridItems(matching uids: Set<PhotoUID>) -> [PhotoItem] {
+        guard !isProvisionalPresentation else { return [] }
         switch filter {
         case .all:
             return showsPendingPhotos
@@ -386,7 +396,14 @@ public final class TimelineViewModel {
 
     /// Re-runs the selected filter for the error-state Retry action. It does not fall back to `.all`.
     public func retry() async {
-        if filter == .all { await loadAll(force: true) } else { await loadFiltered(filter) }
+        if filter == .all {
+            if allRouteSnapshot == nil, initialLibraryLoadState.failure != nil {
+                applyInitialLoad(.reset)
+            }
+            await loadAll(force: true)
+        } else {
+            await loadFiltered(filter)
+        }
     }
 
     /// Loads a tag/album/trash filter, showing the `.loading` animation while it fetches (so a route switch never
@@ -754,8 +771,31 @@ public final class TimelineViewModel {
         }
 
         let publishedBeforeLoad = wholeLibraryPublication
+        provisionalGeneration &+= 1
+        let progressGeneration = provisionalGeneration
+        let access = hadInventoryBaseline ? nil : await feed.beginProvisionalThumbnailAccess()
+        await loadInitialInventorySnapshot(
+            hadInventoryBaseline: hadInventoryBaseline, progressGeneration: progressGeneration,
+            publishedBeforeLoad: publishedBeforeLoad, thumbnailAccess: access)
+        clearProvisionalTimeline(generation: progressGeneration)
+        if let access { await feed.endProvisionalThumbnailAccess(access) }
+    }
+
+    private func loadInitialInventorySnapshot(
+        hadInventoryBaseline: Bool, progressGeneration: UInt64, publishedBeforeLoad: [UInt64],
+        thumbnailAccess: UUID?
+    ) async {
         do {
-            let refreshed = try await repository.loadTimelineSnapshot()
+            let refreshed: TimelineLoadSnapshot
+            if hadInventoryBaseline {
+                refreshed = try await repository.loadTimelineSnapshot()
+            } else {
+                refreshed = try await repository.loadTimelineSnapshot { [weak self] page in
+                    await self?.applyProvisionalTimeline(
+                        page, generation: progressGeneration, publishedBeforeLoad: publishedBeforeLoad,
+                        thumbnailAccess: thumbnailAccess)
+                }
+            }
             let projection = await normalizeOffMain(refreshed.sections, for: .all)
             // A cancellation or a newer publication of the whole library during the read supersedes this older listing.
             // Another route's grid does not: it leaves the whole library unchanged.
@@ -789,6 +829,34 @@ public final class TimelineViewModel {
             // nothing to show. The reducer's verdict - not this site - decides the Retry affordance.
             if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
         }
+    }
+
+    private func applyProvisionalTimeline(
+        _ page: ProvisionalTimelineSnapshot, generation: UInt64, publishedBeforeLoad: [UInt64], thumbnailAccess: UUID?
+    ) async {
+        guard !Task.isCancelled, filter == .all, allRouteSnapshot == nil,
+            generation == provisionalGeneration, publishedBeforeLoad == wholeLibraryPublication
+        else { return }
+        let projection = await normalizeOffMain(page.sections, for: .all)
+        guard !Task.isCancelled, filter == .all, allRouteSnapshot == nil,
+            generation == provisionalGeneration, publishedBeforeLoad == wholeLibraryPublication,
+            !projection.snapshot.items.isEmpty
+        else { return }
+        if let thumbnailAccess {
+            await feed.updateProvisionalThumbnailAccess(projection.uids, using: thumbnailAccess)
+            guard !Task.isCancelled, filter == .all, allRouteSnapshot == nil,
+                generation == provisionalGeneration, publishedBeforeLoad == wholeLibraryPublication
+            else { return }
+        }
+        provisionalProjection = projection
+        provisionalRevision &+= 1
+        applyInitialLoad(.provisionalInventoryResolved(count: projection.snapshot.count))
+    }
+
+    private func clearProvisionalTimeline(generation: UInt64) {
+        guard generation == provisionalGeneration else { return }
+        provisionalProjection = nil
+        if Task.isCancelled, case .provisionalContent = initialLibraryLoadState { applyInitialLoad(.reset) }
     }
 
     private func applyInitialLoad(_ event: LibraryLoadEvent) {

@@ -137,6 +137,97 @@ struct MetalGridWindowVisibilityTests {
         #expect(!coordinator.hasActiveAnimation(in: ids, now: 5.9))
     }
 
+    @Test func nativeScrollNotificationsRestartOnlyForNewLoadingTiles() throws {
+        let fixture = try Fixture(count: 180)
+        defer { fixture.detach() }
+        fixture.window.testOcclusionState = [.visible]
+        fixture.notifyVisibility()
+        fixture.host.layoutSubtreeIfNeeded()
+        let coordinator = fixture.host.coordinator
+        let clip = try #require(coordinator.clipView)
+        let scrollView = try #require(clip.enclosingScrollView)
+        let document = try #require(clip.documentView)
+        let travel = document.bounds.height - clip.bounds.height
+        try #require(travel > 0, "SETUP: the grid must have scrollable photos")
+        func visible() -> [PhotoUID] {
+            coordinator.visibleCells().map { fixture.source.flatUIDs[$0.flatIndex] }
+        }
+        func update(_ time: Double) {
+            coordinator.updatePlaceholderPulse(visibleUIDs: visible(), now: time)
+        }
+        clip.scroll(to: .zero)
+        let initial = Set(visible())
+        try #require(!initial.isEmpty)
+        coordinator.setPlaceholderReduceMotion(false)
+        update(0)
+        update(5)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 5))
+        NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
+        clip.scroll(to: CGPoint(x: 0, y: travel / 3))
+        try #require(!Set(visible()).subtracting(initial).isEmpty)
+        update(10)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 10), "A moving scroll does not restart the sweep")
+        NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
+        update(10)
+        #expect(coordinator.hasActiveAnimation(in: visible(), now: 10), "Native scroll-end starts one new sweep")
+        update(15)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 15))
+        NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
+        update(16)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 16))
+        NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
+        NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
+        update(17)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 17), "The same tiles stay static")
+        coordinator.setPlaceholderReduceMotion(true)
+        let previous = Set(visible())
+        NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
+        clip.scroll(to: CGPoint(x: 0, y: 2 * travel / 3))
+        try #require(!Set(visible()).subtracting(previous).isEmpty)
+        NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
+        update(18)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 18), "Reduce Motion stays static")
+        coordinator.setPlaceholderReduceMotion(false)
+        let beforeJump = Set(visible())
+        fixture.host.scrollToBottom()
+        try #require(!Set(visible()).subtracting(beforeJump).isEmpty)
+        update(19)
+        #expect(coordinator.hasActiveAnimation(in: visible(), now: 19), "An explicit jump starts one bounded sweep")
+        update(24)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 24))
+    }
+
+    @Test func newlyVisibleFailedTilesDoNotRestartTheOlderLoadingTiles() throws {
+        let fixture = try Fixture(count: 180)
+        defer { fixture.detach() }
+        fixture.window.testOcclusionState = [.visible]
+        fixture.notifyVisibility()
+        fixture.host.layoutSubtreeIfNeeded()
+        let coordinator = fixture.host.coordinator
+        let clip = try #require(coordinator.clipView)
+        let scrollView = try #require(clip.enclosingScrollView)
+        func visible() -> [PhotoUID] {
+            coordinator.visibleCells().map { fixture.source.flatUIDs[$0.flatIndex] }
+        }
+        clip.scroll(to: .zero)
+        let initial = Set(visible())
+        try #require(!initial.isEmpty)
+        coordinator.setPlaceholderReduceMotion(false)
+        coordinator.updatePlaceholderPulse(visibleUIDs: visible(), now: 0)
+        coordinator.updatePlaceholderPulse(visibleUIDs: visible(), now: 5)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 5))
+        NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
+        clip.scroll(to: CGPoint(x: 0, y: 200))
+        let final = Set(visible())
+        let new = final.subtracting(initial)
+        try #require(!new.isEmpty)
+        try #require(!final.intersection(initial).isEmpty, "SETUP: an older loading tile remains visible")
+        fixture.source.unavailableUIDs = new
+        NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
+        coordinator.updatePlaceholderPulse(visibleUIDs: visible(), now: 10)
+        #expect(!coordinator.hasActiveAnimation(in: visible(), now: 10), "Failed new tiles cannot restart older tiles")
+    }
+
     @Test func theSweepRestartsWhenTheWindowBecomesVisibleAgain() throws {
         let fixture = try Fixture()
         defer { fixture.detach() }
@@ -216,6 +307,31 @@ struct MetalGridWindowVisibilityTests {
                 fixture.detach()
             }
         }
+    }
+
+    @Test func provisionalKnownPlaceholdersReportReadyWithoutChangingOrdinaryReadiness() throws {
+        let fixture = try Fixture(count: 2)
+        defer { fixture.detach() }
+        let coordinator = fixture.host.coordinator
+        let ids = fixture.source.flatUIDs
+        var readyCount = 0
+        coordinator.onContentReady = { readyCount += 1 }
+        coordinator.allowsPlaceholderContentReady = true
+        coordinator.didRenderVisible([])
+        coordinator.didRenderVisible([PhotoUID(volumeID: "other", nodeID: "unknown")])
+        #expect(readyCount == 0, "Only real known visible photos may acknowledge a placeholder frame")
+        coordinator.didRenderVisible(ids)
+        coordinator.didRenderVisible(ids)
+        #expect(readyCount == 1, "A provisional known-photo frame reports once before any thumbnail")
+        #expect(fixture.source.imageReads == 0)
+        #expect(ids.allSatisfy { !coordinator.cache.isResident($0) })
+        coordinator.presentationSuspended()
+        coordinator.allowsPlaceholderContentReady = false
+        coordinator.didRenderVisible(ids)
+        #expect(readyCount == 1, "Ordinary readiness still requires a resident thumbnail")
+        loadThumbnail(ids[0], into: coordinator, source: fixture.source)
+        coordinator.didRenderVisible(ids)
+        #expect(readyCount == 2)
     }
 
     @Test func placeholderOnlyFramesNeverReportReadyAndTheFirstLoadedThumbnailReportsOnce() throws {
@@ -304,6 +420,7 @@ private final class ReadyGridDataSource: MetalGridDataSource {
     private let thumbnail: CGImage
     private(set) var imageReads = 0
     var retryable = true
+    var unavailableUIDs: Set<PhotoUID> = []
     var onImagesAvailable: (() -> Void)?
 
     init(count: Int = 1) throws {
@@ -321,7 +438,7 @@ private final class ReadyGridDataSource: MetalGridDataSource {
     }
 
     func hasImage(for uid: PhotoUID) -> Bool { true }
-    func canRetryThumbnail(for uid: PhotoUID) -> Bool { retryable }
+    func canRetryThumbnail(for uid: PhotoUID) -> Bool { retryable && !unavailableUIDs.contains(uid) }
     func image(for uid: PhotoUID) -> CGImage? {
         imageReads += 1
         return thumbnail

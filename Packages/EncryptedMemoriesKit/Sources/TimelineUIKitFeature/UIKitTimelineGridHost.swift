@@ -59,6 +59,9 @@
         /// instead of making filtered items pop into their new topology during unrelated SwiftUI updates.
         private let contentTransitionSignal: Int
         private let prefersReducedMotion: Bool
+        private let allowsPhotoActions: Bool
+        private let isProvisionalPresentation: Bool
+        private let allowsPlaceholderContentReady: Bool
         private let onFirstContentReady: (() -> Void)?
         private let onOpenPhoto: ((PhotoItem) -> Void)?
         private let onToggleSelection: ((PhotoItem) -> Void)?
@@ -93,6 +96,9 @@
             restoreScrollSignal: Int = 0,
             contentTransitionSignal: Int = 0,
             prefersReducedMotion: Bool = false,
+            allowsPhotoActions: Bool = true,
+            isProvisionalPresentation: Bool = false,
+            allowsPlaceholderContentReady: Bool = false,
             onFirstContentReady: (() -> Void)? = nil,
             onOpenPhoto: ((PhotoItem) -> Void)? = nil,
             onToggleSelection: ((PhotoItem) -> Void)? = nil,
@@ -123,6 +129,9 @@
             self.restoreScrollSignal = restoreScrollSignal
             self.contentTransitionSignal = contentTransitionSignal
             self.prefersReducedMotion = prefersReducedMotion
+            self.allowsPhotoActions = allowsPhotoActions
+            self.isProvisionalPresentation = isProvisionalPresentation
+            self.allowsPlaceholderContentReady = allowsPlaceholderContentReady
             self.onFirstContentReady = onFirstContentReady
             self.onOpenPhoto = onOpenPhoto
             self.onToggleSelection = onToggleSelection
@@ -162,17 +171,23 @@
         }
 
         @MainActor
+        private func configurePhotoActions(_ view: UIKitTimelineGridHostView) {
+            view.onOpenPhoto = allowsPhotoActions ? onOpenPhoto : nil
+            view.onToggleSelection = allowsPhotoActions ? onToggleSelection : nil
+            view.onSelectionChanged = allowsPhotoActions ? onSelectionChanged : nil
+            view.dragOutProvider = allowsPhotoActions ? dragOutProvider : nil
+            view.onDragOutFailed = onDragOutFailed
+            view.contextMenuActions = allowsPhotoActions ? contextMenuActions : nil
+            view.onContextMenuAction = allowsPhotoActions ? onContextMenuAction : nil
+        }
+
+        @MainActor
         public func makeUIView(context: Context) -> UIKitTimelineGridHostView {
             let view = UIKitTimelineGridHostView()
             view.setPlaceholderReduceMotion(prefersReducedMotion || accessibilityReduceMotion)
             view.onFirstContentReady = onFirstContentReady
-            view.onOpenPhoto = onOpenPhoto
-            view.onToggleSelection = onToggleSelection
-            view.onSelectionChanged = onSelectionChanged
-            view.dragOutProvider = dragOutProvider
-            view.onDragOutFailed = onDragOutFailed
-            view.contextMenuActions = contextMenuActions
-            view.onContextMenuAction = onContextMenuAction
+            view.allowsPlaceholderContentReady = allowsPlaceholderContentReady
+            configurePhotoActions(view)
             view.configure(
                 items: items, contentRevision: contentRevision,
                 thumbnailFeed: thumbnailFeed, metadataProvider: metadataProvider,
@@ -180,7 +195,7 @@
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
-                uploadBadges: uploadBadges)
+                isProvisionalPresentation: isProvisionalPresentation, uploadBadges: uploadBadges)
             view.setActive(isActive)
             view.setScopeBarGap(scopeBarGap)
             wireProxy(proxy, to: view)
@@ -192,13 +207,8 @@
             uiView.setNeedsLayout()
             uiView.setPlaceholderReduceMotion(prefersReducedMotion || accessibilityReduceMotion)
             uiView.onFirstContentReady = onFirstContentReady
-            uiView.onOpenPhoto = onOpenPhoto
-            uiView.onToggleSelection = onToggleSelection
-            uiView.onSelectionChanged = onSelectionChanged
-            uiView.dragOutProvider = dragOutProvider
-            uiView.onDragOutFailed = onDragOutFailed
-            uiView.contextMenuActions = contextMenuActions
-            uiView.onContextMenuAction = onContextMenuAction
+            uiView.allowsPlaceholderContentReady = allowsPlaceholderContentReady
+            configurePhotoActions(uiView)
             let shouldDissolveContent = contentTransitionSignal != context.coordinator.lastContentTransitionSignal
             if shouldDissolveContent {
                 context.coordinator.lastContentTransitionSignal = contentTransitionSignal
@@ -211,7 +221,7 @@
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
-                uploadBadges: uploadBadges)
+                isProvisionalPresentation: isProvisionalPresentation, uploadBadges: uploadBadges)
             if shouldDissolveContent {
                 uiView.completeContentReplacementTransition(prefersReducedMotion: prefersReducedMotion)
             }
@@ -298,7 +308,8 @@
         var thumbnailFeed: UIKitThumbnailFeed?
         private var items: [PhotoItem] = []
         private var configuredContentRevision: UInt64?
-        private var deferredOrderUpdate: (items: [PhotoItem], revision: UInt64?)?
+        private var isProvisionalPresentation = false
+        private var deferredOrderUpdate: (items: [PhotoItem], revision: UInt64?, preservesVisibleAnchor: Bool)?
         private var hasConfiguredContent = false
         /// Flat UID order for the current items, cached so the per-frame composer input never re-maps the library.
         var itemUIDs: [PhotoUID] = []
@@ -440,15 +451,20 @@
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
         var isApplyingProgrammaticScroll = false
-        /// One-shot after the first settled frame that encodes a resident visible thumbnail.
+        /// One-shot after a settled frame encodes presentable known photos.
         private var firstContentReported = false
         private var firstContentPending = false
+        public var allowsPlaceholderContentReady = false {
+            didSet { if oldValue != allowsPlaceholderContentReady { requestRender() } }
+        }
 
         func reportFirstRenderedContent(
             visibleUIDs: [PhotoUID], isResident: (PhotoUID) -> Bool, frameEncoded: Bool
         ) {
             guard frameEncoded, !firstContentReported, !firstContentPending,
-                visibleUIDs.contains(where: isResident),
+                MetalGridFrameComposer.hasPresentableFirstContent(
+                    visibleIDs: visibleUIDs, allowsPlaceholders: allowsPlaceholderContentReady,
+                    isKnown: { self.itemIndexByUID[$0] != nil }, isResident: isResident),
                 window != nil, framePump.isActive, !sceneIsBackgrounded
             else { return }
             firstContentPending = true
@@ -467,6 +483,7 @@
             firstContentPending = false
         }
         private var placeholderPulse = MetalGridPlaceholderPulse(reduceMotion: UIAccessibility.isReduceMotionEnabled)
+        private var placeholderScroll = MetalGridPlaceholderScrollTracker<PhotoUID>()
 
         func setPlaceholderReduceMotion(_ enabled: Bool) {
             if placeholderPulse.setReduceMotion(enabled) { requestRender() }
@@ -486,6 +503,23 @@
             placeholderPulse.update(visible: visibleUIDs, now: now) { isLoadingPlaceholder($0, isResident: isResident) }
         }
 
+        private func visiblePlaceholderUIDs() -> [PhotoUID] {
+            accessibilityFramePlan()?.visibleSlots.compactMap { slot in
+                itemUIDs.indices.contains(slot.index) ? itemUIDs[slot.index] : nil
+            } ?? []
+        }
+
+        private func finishPlaceholderScroll() {
+            placeholderScroll.ended(
+                visibleIDs: visiblePlaceholderUIDs(),
+                isVisible: window != nil && framePump.isActive && !sceneIsBackgrounded,
+                reduceMotion: placeholderPulse.reduceMotion,
+                isLoading: {
+                    self.isLoadingPlaceholder($0, isResident: { self.textureCache?.isResident($0) ?? false })
+                },
+                pulse: &placeholderPulse)
+        }
+
         /// Guards the deferred main-queue readiness callback. A cached frame may finish on the same runloop turn
         /// that authoritative UIDs replace it; only the generation that actually rendered may acknowledge itself.
         private var contentGeneration: UInt64 = 0
@@ -500,6 +534,9 @@
         private var perf = RenderPerfWindow()
         /// Display-link ticks this host has run (diagnostics and hosted tests: a suspended grid must not tick).
         private(set) var renderTickCount: UInt64 = 0
+        #if DEBUG
+            private(set) var drawnFrameCount: UInt64 = 0
+        #endif
         private let presentationTiming = PresentationTimingAccumulator()
         private var activeDisplayFrame: UIKitTimelineDisplayFrame?
         /// True while the window scene that hosts this grid is in the background (or the whole app is). Set per
@@ -611,8 +648,11 @@
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
             selectedUIDs: Set<PhotoUID> = [],
+            isProvisionalPresentation: Bool = false,
             uploadBadges: PendingUploadBadges = .empty
         ) {
+            let provisionalUpdate = isProvisionalPresentation || self.isProvisionalPresentation
+            self.isProvisionalPresentation = isProvisionalPresentation
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
             // Upload badges change with progress; they never rebuild the item overlays.
@@ -629,6 +669,7 @@
             }
             swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
+            if feedChanged { placeholderScroll.reset() }
             var contentChanged: Bool
             if let contentRevision {
                 contentChanged =
@@ -652,10 +693,11 @@
                     let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
                     let decision = TimelineOrderRefinementPolicy.decision(
                         incoming: items, previousCount: self.items.count, visibleIndices: visible,
+                        preservingVisibleAnchor: provisionalUpdate,
                         previous: { uid in self.itemIndexByUID[uid].map { ($0, self.items[$0]) } })
                     isOrderCorrection = decision != .ordinaryUpdate
                     if decision == .deferVisibleCorrection || (isOrderCorrection && !canRefineOrder) {
-                        deferredOrderUpdate = (items, contentRevision)
+                        deferredOrderUpdate = (items, contentRevision, provisionalUpdate)
                         contentChanged = false
                     } else {
                         deferredOrderUpdate = nil
@@ -765,16 +807,20 @@
             guard let pending = deferredOrderUpdate, canRefineOrder, let thumbnailFeed else { return }
             let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
             guard
-                !TimelineOrderRefinementPolicy.movesVisiblePhoto(
-                    incoming: pending.items, visibleIndices: visible, previousUID: { self.itemUIDs[$0] })
+                pending.preservesVisibleAnchor
+                    || !TimelineOrderRefinementPolicy.movesVisiblePhoto(
+                        incoming: pending.items, visibleIndices: visible, previousUID: { self.itemUIDs[$0] })
             else { return }
             deferredOrderUpdate = nil
+            let currentPresentation = isProvisionalPresentation
+            if pending.preservesVisibleAnchor { isProvisionalPresentation = true }
             configure(
                 items: pending.items, contentRevision: pending.revision,
                 thumbnailFeed: thumbnailFeed, metadataProvider: metadataProvider,
                 level: levelOverride, gridProfile: requestedProfile, fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
-                selectionMode: selectionMode, selectedUIDs: selectedUIDs, uploadBadges: uploadBadges)
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs,
+                isProvisionalPresentation: currentPresentation, uploadBadges: uploadBadges)
         }
 
         /// Captures the currently presented Metal surface before a projection replacement.
@@ -1040,6 +1086,7 @@
         /// when the tab deactivates. Visible cache/textures stay resident, so returning redraws immediately.
         private func suspendRenderLoop() {
             if firstContentPending { invalidateFirstContentForSource() }
+            placeholderScroll.reset()
             placeholderPulse.restart()
             displayLink.pause()
             perf.noteLoopPaused(reason: "suspended")
@@ -1331,9 +1378,11 @@
             guard window != nil, bounds.height > 0, !itemUIDs.isEmpty else { return }
             let target = maxContentOffsetY
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
+            placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
             isApplyingProgrammaticScroll = true
             scrollView.setContentOffset(CGPoint(x: 0, y: target), animated: animated)
             isApplyingProgrammaticScroll = false
+            if !animated { finishPlaceholderScroll() }
             requestRender()
         }
 
@@ -1345,9 +1394,11 @@
             resizeAnchorItemID = nil
             let target = -safeAreaInsets.top
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
+            placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
             isApplyingProgrammaticScroll = true
             scrollView.setContentOffset(CGPoint(x: 0, y: target), animated: animated)
             isApplyingProgrammaticScroll = false
+            if !animated { finishPlaceholderScroll() }
             needsInitialViewportPlacement = false
             userHasScrolledTimeline = false
             requestRender()
@@ -1670,7 +1721,12 @@
             var drawableFailed = false
             if case .noDrawable = outcome { drawableFailed = true }
             var drew = false
-            if case .drawn = outcome { drew = true }
+            if case .drawn = outcome {
+                drew = true
+                #if DEBUG
+                    drawnFrameCount &+= 1
+                #endif
+            }
             let completedAt = CACurrentMediaTime()
             perf.noteTick(
                 frame: frame,
@@ -2270,6 +2326,7 @@
 
     extension UIKitTimelineGridHostView: UIScrollViewDelegate {
         public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
             scrollInputActive = true
             updateFeedInteractionState()
         }
@@ -2310,6 +2367,7 @@
         public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
             if !decelerate {
                 scrollInputActive = false
+                finishPlaceholderScroll()
                 updateFeedInteractionState()
                 requestRender()
             }
@@ -2317,11 +2375,13 @@
 
         public func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
             scrollInputActive = false
+            finishPlaceholderScroll()
             updateFeedInteractionState()
             requestRender()
         }
 
         public func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+            finishPlaceholderScroll()
             requestRender()
         }
     }
