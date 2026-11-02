@@ -1396,6 +1396,17 @@ public actor PendingBackupCoordinator {
     /// removes queue work before it trashes, so nothing uploads in between.
     private func reconcile(retryLaterTrash: Bool = true, retryEarlierUploads retryEarlier: Bool = false) async {
         guard !closed else { return }
+        guard store.isOperational() else {
+            // No cached decision grants work while the whole store is unknown. Its future dates cannot shorten the
+            // existing unreadable backoff either; keyed reads recover these sources after the connection recovers.
+            sourceStatesIncomplete = true
+            loadDecodedKeys.removeAll()
+            dueStatesIncomplete = true
+            dueDecodedKeys.removeAll()
+            unreadableSourceStates.formUnion(sourceStates.keys)
+            scheduleReconcileTimer()
+            return
+        }
         guard !reconcileRunning else {
             reconcileAgain = true
             return
