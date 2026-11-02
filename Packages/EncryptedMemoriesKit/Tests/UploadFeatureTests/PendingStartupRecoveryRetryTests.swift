@@ -636,7 +636,9 @@ final class PendingStartupRecoveryRetryTests: XCTestCase {
         let result = await coordinator.removeFromTrashList([
             PhotoUID(localPending: .photoLibrary, identifier: "t")
         ])
-        XCTAssertTrue(result, "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
+        XCTAssertTrue(
+            result,
+            "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
         XCTAssertGreaterThanOrEqual(failure.count, 1, "the reload keyed read after the unlist must be interrupted")
         XCTAssertTrue(
             failure.interruptedSQL.allSatisfy { $0.contains("FROM source_state WHERE source_kind=? AND source_id=?") },
