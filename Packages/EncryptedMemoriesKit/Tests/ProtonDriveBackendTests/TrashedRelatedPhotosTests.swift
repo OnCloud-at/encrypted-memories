@@ -125,13 +125,13 @@ struct TrashedRelatedPhotosTests {
         #expect(await server.calls == [.restore(["main"])])
     }
 
-    @Test func aFailedReadRestoresTheMainPhotoAlone() async throws {
+    @Test func aFailedReadFailsRestoreAndLeavesTheMainPhotoInTrash() async throws {
         let server = TrashServer(trashTimes: ["main": 1000, "f1": 1000], failingRead: true)
 
-        let frames = try await server.restore([main], candidates: [main: [Self.uid("f1")]])
-
-        #expect(frames.isEmpty)
-        #expect(await server.inTrash == ["f1"])
+        await #expect(throws: (any Error).self) {
+            try await server.restore([main], candidates: [main: [Self.uid("f1")]])
+        }
+        #expect(await server.inTrash == ["f1", "main"])
     }
 
     @Test func aCancelDuringTheReadRestoresNothing() async throws {

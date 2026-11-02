@@ -79,6 +79,7 @@ public enum ProtonDriveBackendFactory {
             }
         #endif
         let bridge = try await DriveSDKBridge(session: session, store: store, policy: policy)
+        await bridge.startTrashedSeriesRestoreReplay()
         let accountDataDirectory = bridge.uploadManifestURL.deletingLastPathComponent()
         let sourceInventoryStore = LibrarySourceInventoryStore(
             directory: accountDataDirectory,

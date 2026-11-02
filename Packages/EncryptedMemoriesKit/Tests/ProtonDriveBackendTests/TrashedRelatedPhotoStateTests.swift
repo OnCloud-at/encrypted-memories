@@ -43,9 +43,12 @@ extension DriveSessionStubSuite {
                    "FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"main"}}}}
                 ]}
                 """#
+            let frameJSON =
+                #"{"LinkID":"frame","Type":2,"State":2,"Trashed":1001,"FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"main"}}}}"#
+            let after = [mainJSON, frameJSON].filter { !$0.isEmpty }.joined(separator: ",")
             StubURLProtocol.routeSequence(
                 "POST /drive/shares/share/links/fetch_metadata",
-                responses: [(200, before), (200, #"{"Code":1000,"Links":[\#(mainJSON)]}"#)])
+                responses: [(200, before), (200, #"{"Code":1000,"Links":[\#(after)]}"#)])
             StubURLProtocol.fail(
                 "PUT /drive/v2/volumes/own-volume/trash/restore_multiple", code: NSURLErrorNetworkConnectionLost)
 
@@ -54,7 +57,9 @@ extension DriveSessionStubSuite {
             }
 
             #expect(error?.code == .networkConnectionLost, "the original restore error stays visible")
-            #expect(fixture.metadataReads() == 2, "the decision uses the decoded error re-read")
+            #expect(
+                fixture.metadataReads() == (expectedRestores.count == 2 ? 3 : 2),
+                "fresh main/frame proof and ambiguous frame response reconciliation")
             #expect(try fixture.restoredLinkIDs() == expectedRestores)
         }
     }
