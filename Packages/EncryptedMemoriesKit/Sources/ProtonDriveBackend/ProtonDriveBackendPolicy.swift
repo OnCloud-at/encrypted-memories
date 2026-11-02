@@ -19,33 +19,30 @@ public typealias PhotosBackend = PhotosRepository
     & LibraryStatsProvider
     & PhotoDimensionRecording
 
+/// The video-block cache budget is not part of this policy. `DiskCacheBudgetPolicy.videoBudget` is the
+/// single source, and `VideoByteRangeCache` applies it.
 public struct ProtonDriveBackendPolicy: Sendable, Equatable {
     public let sdkCacheDirectory: URL
     public let libraryDatabaseBaseDirectory: URL
     public let libraryDatabasePolicy: LibraryDatabasePolicy
-    public let videoCacheBudgetBytes: Int
 
     public init(
         sdkCacheDirectory: URL,
         libraryDatabaseBaseDirectory: URL = LibraryDatabaseLocation.defaultBaseDirectory(),
-        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative,
-        videoCacheBudgetBytes: Int = 512 * 1024 * 1024
+        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative
     ) {
         self.sdkCacheDirectory = sdkCacheDirectory
         self.libraryDatabaseBaseDirectory = libraryDatabaseBaseDirectory
         self.libraryDatabasePolicy = libraryDatabasePolicy
-        self.videoCacheBudgetBytes = videoCacheBudgetBytes
     }
 
     public static func standard(
-        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative,
-        videoCacheBudgetBytes: Int = 512 * 1024 * 1024
+        libraryDatabasePolicy: LibraryDatabasePolicy = .conservative
     ) -> Self {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return Self(
             sdkCacheDirectory: caches.appendingPathComponent("EncryptedMemories/sdk", isDirectory: true),
-            libraryDatabasePolicy: libraryDatabasePolicy,
-            videoCacheBudgetBytes: videoCacheBudgetBytes
+            libraryDatabasePolicy: libraryDatabasePolicy
         )
     }
 
