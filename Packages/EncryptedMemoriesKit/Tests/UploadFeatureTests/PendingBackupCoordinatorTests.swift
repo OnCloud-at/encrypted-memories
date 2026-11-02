@@ -732,23 +732,20 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         for index in 0..<count {
             let id = "batch-\(index)"
             let before = PhotoUID(volumeID: "vol", nodeID: "a-\(index)")
+            let later = PhotoUID(volumeID: "vol", nodeID: "b-\(index)")
+            let revision = UploadBackupRevision(rawValue: 9)
             XCTAssertNotNil(
                 store.exclude([PendingExclusionRequest(key: key(id), presentation: nil, remote: before)], at: date))
             XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: 1, at: date))
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(key: key(id), revision: revision, remote: later, kind: .uploaded, createdAt: date)),
+                .excludedRemoteNeedsTrash)
+            XCTAssertTrue(store.acknowledgeHandoffs([(key(id), revision)]))
+            // Save A's completion while its next read fails, then repair B before startup without emitting an event.
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='\(id)';"))
             XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
-        }
-        // These acknowledged commits arrived before the process ended; no event remains to wake the new coordinator.
-        let connection = try KeyedReadFailure.connection(of: store)
-        connection.withLock {
-            for index in 0..<count {
-                XCTAssertEqual(
-                    sqlite3_exec(
-                        connection.database,
-                        """
-                        INSERT INTO handoff VALUES('photoLibraryAsset', 'batch-\(index)', 9, 'vol', 'b-\(index)',
-                          'uploaded', \(date.timeIntervalSince1970), 1);
-                        """, nil, nil, nil), SQLITE_OK)
-            }
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='\(id)';"))
         }
     }
 
@@ -787,6 +784,15 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 [PendingExclusionRequest(key: key("batch-0"), presentation: nil, remote: earlier)], at: date)?.first)
         XCTAssertEqual(excluded.generation, returnFirst ? first.generation : first.generation + 1)
         XCTAssertTrue(store.completeEffect(.queueSync, for: excluded.key, generation: excluded.generation, at: date))
+        // This generation needs its own recorded proof; the prior delete's duties ended at the new decision.
+        XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: excluded.key, revision: UploadBackupRevision(rawValue: 9), remote: target, kind: .uploaded,
+                    createdAt: date)),
+            .excludedRemoteNeedsTrash)
+        XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='batch-0';"))
         XCTAssertTrue(
             store.completeEffect(
                 .remoteTrash, for: excluded.key, generation: excluded.generation, remoteLinkID: earlier.nodeID, at: date

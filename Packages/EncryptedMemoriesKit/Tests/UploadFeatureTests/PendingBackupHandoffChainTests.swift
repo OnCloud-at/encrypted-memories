@@ -193,10 +193,16 @@ final class PendingBackupHandoffChainTests: XCTestCase {
     }
 
     func testMetadataOfAnotherSourceCannotRefuseThisSourcesHandoffOrRestore() throws {
-        let fixture = try PersistentHandoffChain()
+        let fixture = try PersistentHandoffChain(identifier: "case-source-aa@")
+        let otherPrefix =
+            "pending-trash:" + Data(fixture.key.kind.rawValue.utf8).base64EncodedString() + ":"
+            + Data("case-source-aaZ".utf8).base64EncodedString() + ":"
+        XCTAssertNotEqual(fixture.metadataPrefix, otherPrefix)
+        XCTAssertEqual(
+            fixture.metadataPrefix.lowercased(), otherPrefix.lowercased(),
+            "the fixture isolates case-sensitive source identity")
         try fixture.raw { db in
-            let sql =
-                "INSERT INTO pending_info(key,value) VALUES('\(fixture.metadataPrefix.dropLast())A:v2:generation',999);"
+            let sql = "INSERT INTO pending_info(key,value) VALUES('\(otherPrefix)v2:generation',999);"
             XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
         }
         try fixture.record(fixture.middle, revision: 2)
@@ -278,13 +284,18 @@ final class PendingBackupHandoffChainTests: XCTestCase {
             fixture.store.exclude(
                 [PendingExclusionRequest(key: fixture.key, presentation: nil, remote: fixture.original)],
                 at: fixture.date))
+        try fixture.record(fixture.original, revision: 4)
+        let before = try fixture.metadataRows().map { $0.0 + "=" + $0.1 }
         XCTAssertTrue(
             fixture.store.completeEffect(
                 .remoteTrash, for: fixture.key, generation: fixture.generation, remoteLinkID: fixture.original.nodeID,
                 at: fixture.date))
-        XCTAssertTrue(
-            try fixture.metadataRows().allSatisfy { $0.0.hasSuffix(":generation") },
+        XCTAssertEqual(
+            try fixture.metadataRows().map { $0.0 + "=" + $0.1 }, before,
             "the old callback cannot add a receipt to the later delete")
+        XCTAssertFalse(
+            try XCTUnwrap(fixture.state).needsRemoteTrash,
+            "a saved trash must not schedule its own UID again without a current-generation receipt")
     }
 
     func testNonTrashCompletionsDoNotWriteTrashReceipts() throws {
@@ -396,7 +407,7 @@ private final class PersistentHandoffChain {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
         "persistent-handoff-chain-\(UUID().uuidString)", isDirectory: true)
     let date = Date(timeIntervalSince1970: 1_750_000_000)
-    let key = PendingSourceKey(kind: .photoLibraryAsset, identifier: "persistent-asset")
+    let key: PendingSourceKey
     let original = PhotoUID(volumeID: "vol", nodeID: "upload-A")
     let middle = PhotoUID(volumeID: "vol", nodeID: "upload-B")
     let latest = PhotoUID(volumeID: "vol", nodeID: "upload-C")
@@ -405,7 +416,8 @@ private final class PersistentHandoffChain {
     var state: PendingSourceState? { store.sourceStateRead(for: key).state }
     var url: URL { directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName) }
 
-    init(beginOperation: Bool = true) throws {
+    init(identifier: String = "persistent-asset", beginOperation: Bool = true) throws {
+        key = PendingSourceKey(kind: .photoLibraryAsset, identifier: identifier)
         store = try XCTUnwrap(
             PendingBackupManifestStore(
                 url: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
