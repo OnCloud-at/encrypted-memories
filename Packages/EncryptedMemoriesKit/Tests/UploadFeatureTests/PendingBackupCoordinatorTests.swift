@@ -3227,7 +3227,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             repeatedWaits
             ? [
                 .seconds(60), .seconds(120), .seconds(240), .seconds(480), .seconds(960), .seconds(1800),
-                .seconds(1800),
+                // An unsaved action result keeps its source_state, so the key's real next effect date stays
+                // visible (#909): the fixture parks it at +5000, and the ladder above consumed 3660 of that.
+                rejected == .actionCompletion ? .seconds(1340) : .seconds(1800),
             ]
             : [.seconds(60)]
         for (index, delay) in expected.enumerated() {
