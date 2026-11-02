@@ -162,18 +162,22 @@ public struct RemoteLinkVisibility: Equatable, Sendable {
     public var isActive: Bool
     /// Nil for a main photo or unavailable role data.
     public var mainPhotoLinkID: String?
+    /// Whether the answer explicitly includes the link's State (present even when the role Photo object is omitted).
+    public var hasExplicitState: Bool
     /// Whether the answer explicitly includes the state and revision Photo role data.
     public var hasExplicitPhotoState: Bool
     /// The server time of the move to the trash, in seconds. Nil for a link that is not in the trash.
     public var trashTime: Int64?
 
     public init(
-        isActive: Bool, mainPhotoLinkID: String?, trashTime: Int64? = nil, hasExplicitPhotoState: Bool = true
+        isActive: Bool, mainPhotoLinkID: String?, hasExplicitState: Bool = true, hasExplicitPhotoState: Bool = true,
+        trashTime: Int64? = nil
     ) {
         self.isActive = isActive
         self.mainPhotoLinkID = mainPhotoLinkID
-        self.trashTime = trashTime
+        self.hasExplicitState = hasExplicitState
         self.hasExplicitPhotoState = hasExplicitPhotoState
+        self.trashTime = trashTime
     }
 }
 

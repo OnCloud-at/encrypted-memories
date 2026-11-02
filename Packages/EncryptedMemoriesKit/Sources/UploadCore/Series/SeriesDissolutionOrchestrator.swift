@@ -254,7 +254,8 @@ public struct SeriesDissolutionProgress: Sendable, Equatable {
 /// in the library without being trashed. The count is derived from the UIDs.
 public struct SeriesDissolutionOutcome: Sendable {
     public let copyUIDs: [PhotoUID]
-    /// UIDs of members that were neither trashed nor ignored. They stay active in the library.
+    /// UIDs of members that the server reported with an explicit active state but without role data. They stay
+    /// active in the library (issue #988: role unknown, not deleted).
     public let keptWithoutReportedRoleUIDs: [PhotoUID]
     /// Members that stay in the library (computed from the UIDs).
     public var keptWithoutReportedRoleCount: Int { keptWithoutReportedRoleUIDs.count }
@@ -471,10 +472,14 @@ public actor SeriesDissolutionOrchestrator {
     /// with the series. Related photos keep their own active state, so only the photos in this list confirm
     /// the step. A member that the server no longer knows is skipped. A member whose state the server does not
     /// report is skipped as well: an unknown role is not proof of ownership, so the member is never trashed and
-    /// is not reported (the safe default is no notice). `staying` reports a member only when the server reports
-    /// it as an active related photo of a main photo that stays out of the trash: that main photo keeps the
-    /// member visible in the library, so the person must learn that it stays. A related photo of a main photo
-    /// in this list follows that main photo into the trash and is not reported.
+    /// is not reported (the safe default is no notice).
+    ///
+    /// The photos that stay reported: the server reports an explicit state, the member is active, and the answer
+    /// carries no role data (the #988 pattern: "role unknown, not deleted"). The trash list never holds such a
+    /// member, so the person must learn in plain words that it stays. A member whose role data the server did
+    /// report is not reported: a main without a role moves to the trash, and a related photo keeps its behavior
+    /// (it stays visible with its main photo when that main photo stays out of the trash). The main photo of a
+    /// related photo is therefore not fetched (issue #988, option 1).
     private func photosToTrash(
         _ journal: SeriesDissolutionJournal
     ) async throws -> (toTrash: [PhotoUID], staying: [PhotoUID]) {
@@ -482,19 +487,16 @@ public actor SeriesDissolutionOrchestrator {
         let members = journal.seriesUIDs.filter { $0 != mainUID }
         let roles = members.isEmpty ? [:] : try await remote.memberRoles(of: members)
         var trashed = [mainUID]
-        var trashedNodeIDs = Set([mainUID.nodeID])
         for member in members {
             guard let link = roles[member], link.hasExplicitPhotoState, link.mainPhotoLinkID == nil else {
                 continue
             }
             trashed.append(member)
-            trashedNodeIDs.insert(member.nodeID)
         }
         var staying: [PhotoUID] = []
         for member in members {
-            guard let link = roles[member], link.hasExplicitPhotoState else { continue }
-            guard let mainLinkID = link.mainPhotoLinkID, link.isActive else { continue }
-            guard !trashedNodeIDs.contains(mainLinkID) else { continue }
+            guard let link = roles[member] else { continue }
+            guard link.hasExplicitState, link.isActive, !link.hasExplicitPhotoState else { continue }
             staying.append(member)
         }
         return (trashed, staying)

@@ -637,14 +637,40 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(try journalStore.pendingJournals(), [])
     }
 
+    func testAMixOfReportedRelatedStatelessAndRolelessMembersReportsOnlyTheRolelessOne() async throws {
+        server.addRemoteRow(name: "m5.HEIC", contentOf: "m3", state: .active, linkID: "m5", clientUID: nil)
+        server.relate(["m3"], toMain: "outside")
+        server.omitPhotoState(["m4"])
+        server.withholdPhotoRole(["m5"])
+
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series + [member("m5")], favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleUIDs, [member("m5")],
+            "a role-reported related photo and a stateless member are not reported")
+        XCTAssertEqual(outcome.keptWithoutReportedRoleCount, 1)
+        XCTAssertEqual(
+            server.trashCalls, [[main]],
+            "the main photo alone moves to the trash; the unreported members stay untouched")
+    }
+
     func testAChainedSeriesTrashesEachMainPhotoAndNoRelatedPhoto() async throws {
         server.makeStandalone(["m3"])
         server.relate(["m4"], toMain: "m3")
 
-        _ = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+        let progress = ProgressRecorder()
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")],
+            onProgress: { progress.record($0) })
 
         XCTAssertEqual(server.trashCalls, [[main, member("m3")]])
+        XCTAssertTrue(
+            progress.stayedWithoutRoleCounts.isEmpty,
+            "a related photo of a member that moves to the trash in the same run is not reported")
+        XCTAssertTrue(
+            outcome.keptWithoutReportedRoleUIDs.isEmpty,
+            "a related photo of a trashed main is not kept: it follows its main into the trash")
         server.restoreFromTrash("m1")
         server.restoreFromTrash("m3")
         XCTAssertEqual(server.activeRelatedNodeIDs(ofMain: "m1"), ["m2"])
@@ -668,7 +694,7 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testAMemberWithoutARoleIsReportedThroughProgressSoThePersonLearnsThatItStays() async throws {
-        server.relate(["m3"], toMain: "outside")
+        server.withholdPhotoRole(["m3"])
 
         let progress = ProgressRecorder()
         _ = try await makeOrchestrator().keepOnlyFavorites(
@@ -695,14 +721,14 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testTheInteractiveCompletionResultCarriesTheCountOfMembersThatStayedWithoutARole() async throws {
-        server.relate(["m3", "m4"], toMain: "outside")
+        server.withholdPhotoRole(["m3", "m4"])
 
         let outcome = try await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
 
         XCTAssertEqual(
             outcome.keptWithoutReportedRoleCount, 2,
-            "the interactive path reports the members that stay visible through an outside main photo")
+            "the interactive path reports the members that stay because the server reports no role")
         XCTAssertEqual(
             outcome.keptWithoutReportedRoleUIDs, [member("m3"), member("m4")],
             "the interactive path reports the UIDs of the staying members")
@@ -710,7 +736,7 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testTheResumedCompletionResultCarriesTheCountOfMembersThatStayedWithoutARole() async throws {
-        server.relate(["m3", "m4"], toMain: "outside")
+        server.withholdPhotoRole(["m3", "m4"])
         server.failNextTrash()
         _ = try? await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
@@ -720,7 +746,7 @@ final class SeriesDissolutionTests: XCTestCase {
         let outcome = try XCTUnwrap(try outcomes.first?.result.get())
         XCTAssertEqual(
             outcome.keptWithoutReportedRoleCount, 2,
-            "the resumed trash step reports the members that stay visible through an outside main photo")
+            "the resumed trash step reports the members that stay because the server reports no role")
         XCTAssertEqual(
             outcome.keptWithoutReportedRoleUIDs, [member("m3"), member("m4")],
             "the resumed path reports the UIDs of the staying members")
@@ -742,8 +768,7 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testTheInteractiveCompletionResultDoesNotReportAMemberWithoutExplicitState() async throws {
-        server.makeStandalone(["m3"])
-        server.withholdPhotoRole(["m3"])
+        server.omitPhotoState(["m3"])
 
         let outcome = try await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
@@ -755,9 +780,9 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testTheCompletionResultReportsTheStayingMemberInAMixedSeries() async throws {
-        // m2 is a related photo of a main photo outside the series: it stays visible. m3 is a related photo of
-        // the series main photo: it follows the main photo into the trash. m4 carries no explicit state: it is
-        // neither trashed nor reported.
+        // m2 is a related photo of a main photo outside the series: it keeps its behavior and is not reported.
+        // m3 is a related photo of the series main photo: it follows the main photo into the trash. m4 carries
+        // an explicit state but no role data: it is the member that #988 reports.
         server.relate(["m2"], toMain: "outside")
         server.withholdPhotoRole(["m4"])
 
@@ -765,8 +790,8 @@ final class SeriesDissolutionTests: XCTestCase {
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
 
         XCTAssertEqual(
-            outcome.keptWithoutReportedRoleUIDs, [member("m2")],
-            "only the member whose main photo stays out of the trash is reported")
+            outcome.keptWithoutReportedRoleUIDs, [member("m4")],
+            "only the member whose role data the server omits is reported")
         XCTAssertEqual(
             outcome.keptWithoutReportedRoleCount, 1,
             "the count is derived from the staying UIDs")
@@ -783,7 +808,7 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testTheCompletionResultReportsZeroWhenTheStayingMemberIsAlreadyTrashed() async throws {
-        server.relate(["m3"], toMain: "outside")
+        server.withholdPhotoRole(["m3"])
         server.markTrashed(["m3"])
 
         let outcome = try await makeOrchestrator().keepOnlyFavorites(
@@ -1427,6 +1452,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
                 visibility[id] = RemoteLinkVisibility(
                     isActive: stateless || node.state == .active,
                     mainPhotoLinkID: withheld ? nil : node.mainNodeID,
+                    hasExplicitState: !stateless,
                     hasExplicitPhotoState: !withheld && !stateless)
             }
             return visibility
