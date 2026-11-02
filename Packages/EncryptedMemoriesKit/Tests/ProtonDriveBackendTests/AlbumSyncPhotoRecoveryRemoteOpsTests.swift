@@ -272,14 +272,16 @@ extension DriveSessionStubSuite {
                 "GET /drive/shares",
                 json: #"{"Code":1000,"Shares":[{"ShareID":"share","VolumeID":"own-volume","LinkID":"root","State":1}]}"#
             )
-            StubURLProtocol.route(
-                "POST /drive/shares/share/links/fetch_metadata",
-                json: #"""
-                    {"Code":1000,"Links":[
-                      {"LinkID":"trash","State":2,"Trashed":1000,"FileProperties":{"ActiveRevision":{"Photo":{}}}},
-                      {"LinkID":"frame","State":2,"Trashed":1001,"FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"trash"}}}}
-                    ]}
-                    """#)
+            let before = #"""
+                {"Code":1000,"Links":[
+                  {"LinkID":"trash","State":2,"Trashed":1000,"FileProperties":{"ActiveRevision":{"Photo":{}}}},
+                  {"LinkID":"frame","State":2,"Trashed":1001,"FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"trash"}}}}
+                ]}
+                """#
+            let after = before.replacingOccurrences(
+                of: "\"LinkID\":\"trash\",\"State\":2", with: "\"LinkID\":\"trash\",\"State\":1")
+            StubURLProtocol.routeSequence(
+                "POST /drive/shares/share/links/fetch_metadata", responses: [(200, before), (200, after)])
             StubURLProtocol.routeSequence(
                 "PUT /drive/v2/volumes/own-volume/trash/restore_multiple",
                 responses: [
@@ -319,7 +321,8 @@ extension DriveSessionStubSuite {
                         directory: directory, accountUID: "fixture", keyPassword: ""),
                     photoNames: nil, recentlyDeleted: deleted,
                     uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
-                    uploadManifestPolicy: .conservative))
+                    uploadManifestPolicy: .conservative),
+                checkedSeriesRestoreCandidates: [main: [.init(volumeID: "own-volume", nodeID: "frame")]])
             let service = ProtonAlbumWriteService(session: session, crypto: crypto) {
                 try await bridge.photosShareContext()
             }

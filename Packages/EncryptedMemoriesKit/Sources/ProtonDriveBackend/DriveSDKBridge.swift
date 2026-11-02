@@ -117,6 +117,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// (same directory, same purge coverage).
     let uploadManifestURL: URL
     let uploadManifestPolicy: LibraryDatabasePolicy
+    private nonisolated let seriesRestoreReplay: TrashedSeriesRestoreReplay
+    private nonisolated let seriesRestoreFlights = SharedInFlightOperations<Set<PhotoUID>, Void>()
+    /// Only complete Restore discovery grants this cache authority. Display listings never populate it.
+    private var checkedSeriesRestoreCandidates: [PhotoUID: [PhotoUID]]?
 
     /// Full sign-out / master-reset: erase the SDK metadata SQLite stores for `uid` (security
     /// follow-up #2 - non-secret node metadata that must not survive sign-out) AND the app-owned
@@ -213,7 +217,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         static let sdk = Self()
     }
 
-    init(prepared: PreparedSession, relatedFileOperations: RelatedFileOperations = .sdk) {
+    init(
+        prepared: PreparedSession, relatedFileOperations: RelatedFileOperations = .sdk,
+        seriesRestoreRetry: BackupRetryPolicy = .init(baseDelay: 60, maxDelay: 900),
+        checkedSeriesRestoreCandidates: [PhotoUID: [PhotoUID]]? = nil
+    ) {
         self.photosClient = prepared.photosClient
         self.uploadClientUID = prepared.uploadClientUID
         self.driveSession = prepared.driveSession
@@ -232,6 +240,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         self.uploadManifestURL = prepared.uploadManifestURL
         self.uploadManifestPolicy = prepared.uploadManifestPolicy
         self.relatedFileOperations = relatedFileOperations
+        self.checkedSeriesRestoreCandidates = checkedSeriesRestoreCandidates
+        self.seriesRestoreReplay = TrashedSeriesRestoreReplay(
+            url: prepared.uploadManifestURL.deletingLastPathComponent()
+                .appendingPathComponent(TrashedSeriesRestoreJournal.fileName),
+            policy: prepared.uploadManifestPolicy, retry: seriesRestoreRetry)
     }
 
     init(
@@ -397,6 +410,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func performShutdown() async {
+        await seriesRestoreFlights.invalidateAndJoin()
+        await seriesRestoreReplay.shutdown()
         // Admission is closed and every published operation has settled before this teardown runs.
         // Drain cache-owned SDK tasks now, including flights orphaned by admission cancellation.
         await sharedAlbumSnapshotCache.invalidateAll()
@@ -2066,90 +2081,196 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func moveToTrash(_ uids: [PhotoUID]) async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
+            try await bridge.seriesRestoreReplay.exclusive {
+                try await bridge.moveToTrashImpl(uids)
+            }
+        }
+    }
+
+    private func moveToTrashImpl(_ uids: [PhotoUID]) async throws {
+        checkedSeriesRestoreCandidates = nil
+        try await seriesRestoreReplay.forget(Set(uids))
+        let root = try await resolvePhotosRoot()
+        try await driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
+        // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted. They
+        // join the stored listing at once, so a relaunch before the next listing keeps them too.
+        let known = (timelineStore?.items(for: uids) ?? []).map {
+            RecentlyDeletedItem.make(
+                volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, captureTime: $0.captureTime, isVideo: $0.isVideo)
+        }
+        recentlyDeleted.trashed(uids, items: known)
+        recentlyDeletedStore.save(recentlyDeleted.persisted)
+        // The launch shows the stored timeline before the next listing; it must not show these photos.
+        timelineStore?.remove(uids)
+        await reportRecentlyDeleted()
+        // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
+        // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
+        // stayed empty). Costs one extra listing round-trip, only when the debug log is on.
+        if DebugLog.isEnabled {
+            let trashed = Set(
+                (try? await driveSession.listTrash(volumeID: root.volumeID))?.compactMap(\.linkID) ?? []
+            )
+            let missing = uids.map(\.nodeID).filter { !trashed.contains($0) }
+            DebugLog.log(
+                "trash-verify: \(uids.count - missing.count)/\(uids.count) moved links visible in trash listing"
+                    + (missing.isEmpty
+                        ? "" : " MISSING=\(missing.map { $0.prefix(8) + "…" }.joined(separator: ","))"))
+        }
+    }
+
+    /// Account startup resumes saved frame duties without restoring any still-trashed main photo.
+    func startTrashedSeriesRestoreReplay() async {
+        guard !isShutDown else { return }
+        await seriesRestoreReplay.start(
+            read: { [weak self] uids in
+                guard let self else { throw CancellationError() }
+                return try await self.readSeriesRestoreStates(uids)
+            },
+            restore: { [weak self] uids in
+                guard let self else { throw CancellationError() }
+                try await self.restoreSeriesFrames(uids)
+            })
+    }
+
+    private func readSeriesRestoreStates(_ uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
+        try await withOpenSession(cause: .trashWrite) { bridge in
+            let context = try await bridge.photosShareContextImpl()
+            guard uids.allSatisfy({ $0.volumeID == context.volumeID }) else { throw DriveBridgeError.noPhotosShare }
+            let links = try await TrashedRelatedPhotos.checkedVisibility(
+                session: bridge.driveSession, shareID: context.shareID, ids: uids.map(\.nodeID), retryOnRateLimit: true)
+            return Dictionary(
+                uniqueKeysWithValues: links.map { (PhotoUID(volumeID: context.volumeID, nodeID: $0.key), $0.value) })
+        }
+    }
+
+    private func restoreSeriesFrames(_ uids: [PhotoUID]) async throws {
+        try await withOpenSession(cause: .trashWrite) { bridge in
             let root = try await bridge.resolvePhotosRoot()
-            try await bridge.driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
-            // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted. They
-            // join the stored listing at once, so a relaunch before the next listing keeps them too.
-            let known = (bridge.timelineStore?.items(for: uids) ?? []).map {
-                RecentlyDeletedItem.make(
-                    volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, captureTime: $0.captureTime, isVideo: $0.isVideo)
-            }
-            bridge.recentlyDeleted.trashed(uids, items: known)
-            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
-            // The launch shows the stored timeline before the next listing; it must not show these photos.
-            bridge.timelineStore?.remove(uids)
-            await bridge.reportRecentlyDeleted()
-            // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
-            // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
-            // stayed empty). Costs one extra listing round-trip, only when the debug log is on.
-            if DebugLog.isEnabled {
-                let trashed = Set(
-                    (try? await bridge.driveSession.listTrash(volumeID: root.volumeID))?.compactMap(\.linkID) ?? []
-                )
-                let missing = uids.map(\.nodeID).filter { !trashed.contains($0) }
-                DebugLog.log(
-                    "trash-verify: \(uids.count - missing.count)/\(uids.count) moved links visible in trash listing"
-                        + (missing.isEmpty
-                            ? "" : " MISSING=\(missing.map { $0.prefix(8) + "…" }.joined(separator: ","))"))
-            }
+            guard uids.allSatisfy({ $0.volumeID == root.volumeID }) else { throw DriveBridgeError.noPhotosShare }
+            try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
         }
     }
 
     func restore(_ uids: [PhotoUID]) async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
-            let root = try await bridge.resolvePhotosRoot()
-            try await bridge.listTrashForRelatedPhotos(of: uids)
-            _ = try await TrashedRelatedPhotos.restore(
-                uids, candidates: bridge.recentlyDeleted.trashedRelatedPhotos(of: uids),
-                readLinks: { linkIDs in
-                    let context = try await bridge.photosShareContextImpl()
-                    // A rate limit must not hold back the restore of the main photo; it comes back alone then.
-                    return try await bridge.driveSession.fetchLinkVisibility(
-                        shareID: context.shareID, linkIDs: linkIDs, retryOnRateLimit: false)
-                },
-                rereadLinks: { linkIDs in
-                    let context = try await bridge.photosShareContextImpl()
-                    return try await bridge.driveSession.fetchLinkVisibility(shareID: context.shareID, linkIDs: linkIDs)
-                },
-                restore: { photos in
-                    try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: photos.map(\.nodeID))
-                })
-            // A listing can drop these photos before the library lists them again; their thumbnails stay. Their related
-            // photos come back inside them and never showed in Recently Deleted.
-            bridge.recentlyDeleted.restored(uids)
-            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
-            await bridge.reportRecentlyDeleted()
+            try await bridge.seriesRestoreFlights.run(Set(uids)) {
+                try await bridge.seriesRestoreReplay.exclusive {
+                    try await bridge.restoreSeriesImpl(uids)
+                }
+            }
         }
     }
 
-    /// The related photos that a restore takes along are known from a trash listing of this session. A restore that
-    /// runs before any listing, such as the replay of a pending restore after a relaunch, lists the trash once. A failed
-    /// or rate-limited listing never holds the restore back: the main photos come back alone, as before. A cancel ends
-    /// the restore before any photo changes; URLSession reports a cancelled request as `URLError.cancelled`, so the
-    /// task state decides, not the error type.
-    func listTrashForRelatedPhotos(of mains: [PhotoUID]) async throws {
-        guard !recentlyDeleted.hasAppliedListing, recentlyDeleted.trashedRelatedPhotos(of: mains).isEmpty else {
-            return
+    private func restoreSeriesImpl(_ uids: [PhotoUID]) async throws {
+        let root = try await resolvePhotosRoot()
+        guard uids.allSatisfy({ $0.volumeID == root.volumeID }) else { throw DriveBridgeError.noPhotosShare }
+        try await listTrashForRelatedPhotos(of: uids)
+        var candidates = checkedSeriesRestoreCandidates ?? [:]
+        if let journal = seriesRestoreReplay.journal {
+            for record in try journal.records() where uids.contains(record.main) {
+                candidates[record.main] = Array(Set((candidates[record.main] ?? []) + record.frames.map(\.uid)))
+            }
         }
+        var duties: [TrashedSeriesRestoreRecord] = []
         do {
-            _ = try await listTrash(retryOnRateLimit: false)
+            _ = try await TrashedRelatedPhotos.restore(
+                uids, candidates: candidates,
+                readLinks: { linkIDs in
+                    let context = try await self.photosShareContextImpl()
+                    // A foreground rate limit fails Restore before the main changes.
+                    return try await TrashedRelatedPhotos.checkedVisibility(
+                        session: self.driveSession, shareID: context.shareID, ids: linkIDs, retryOnRateLimit: false)
+                },
+                rereadLinks: { linkIDs in
+                    let context = try await self.photosShareContextImpl()
+                    return try await TrashedRelatedPhotos.checkedVisibility(
+                        session: self.driveSession, shareID: context.shareID, ids: linkIDs, retryOnRateLimit: true)
+                },
+                restore: { photos in
+                    try await self.driveSession.restore(volumeID: root.volumeID, linkIDs: photos.map(\.nodeID))
+                },
+                beforeMainRestore: { links, frames in
+                    guard let journal = self.seriesRestoreReplay.journal else {
+                        throw TrashedSeriesRestoreJournal.unavailable
+                    }
+                    duties = try uids.compactMap { main in
+                        let owned = frames.filter { links[$0.nodeID]?.mainPhotoLinkID == main.nodeID }
+                        guard !owned.isEmpty, let mainTrash = links[main.nodeID]?.trashTime else { return nil }
+                        return TrashedSeriesRestoreRecord(
+                            generation: UUID(), main: main, mainTrashTime: mainTrash,
+                            frames: try owned.map { uid in
+                                guard let trashTime = links[uid.nodeID]?.trashTime else {
+                                    throw TrashedSeriesRestoreJournal.unavailable
+                                }
+                                return .init(uid: uid, mainPhotoLinkID: main.nodeID, trashTime: trashTime)
+                            },
+                            retryAt: Date().addingTimeInterval(self.seriesRestoreReplay.retry.delay(afterAttempts: 1)))
+                    }
+                    let mainTrashTimes = Dictionary(
+                        uniqueKeysWithValues: uids.compactMap { uid in
+                            links[uid.nodeID]?.trashTime.map { (uid, $0) }
+                        })
+                    try journal.record(duties, mainTrashTimes: mainTrashTimes)
+                },
+                resumeFrames: { mains in
+                    await self.seriesRestoreReplay.resume(
+                        duties.filter { mains.contains($0.main) },
+                        read: { try await self.readSeriesRestoreStates($0) },
+                        restore: { try await self.restoreSeriesFrames($0) })
+                })
+        } catch {
+            await startTrashedSeriesRestoreReplay()
+            throw error
+        }
+        recentlyDeleted.restored(uids)
+        recentlyDeletedStore.save(recentlyDeleted.persisted)
+        await reportRecentlyDeleted()
+        await startTrashedSeriesRestoreReplay()
+    }
+
+    /// A failed or rate-limited discovery fails Restore before any photo changes.
+    /// A cancelled URLSession request can throw URLError, so task cancellation remains authoritative.
+    func listTrashForRelatedPhotos(of mains: [PhotoUID]) async throws {
+        guard checkedSeriesRestoreCandidates == nil else { return }
+        do {
+            let root = try await resolvePhotosRoot()
+            let files = try await TrashedRelatedPhotos.checkedTrash(
+                session: driveSession, volumeID: root.volumeID, retryOnRateLimit: false)
+            try Task.checkCancellation()
+            checkedSeriesRestoreCandidates = TrashedRelatedPhotos.split(files, volumeID: root.volumeID).related
         } catch {
             try Task.checkCancellation()
-            DebugLog.log("restore: trash listing failed, the main photos come back alone - \(error)")
+            throw error
         }
     }
 
     func emptyTrash() async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
-            _ = try await bridge.resolvePhotosRoot()
-            try await SDKCancellableOperation.run { [photosClient = bridge.photosClient] cancellationToken in
-                try await photosClient.emptyTrash(cancellationToken: cancellationToken)
-            } cancel: { [photosClient = bridge.photosClient] cancellationToken in
-                try? await photosClient.cancelEmptyTrash(cancellationToken: cancellationToken)
+            try await bridge.seriesRestoreReplay.exclusive {
+                try await bridge.emptySeriesTrashImpl()
             }
-            bridge.recentlyDeleted.emptied()
-            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
-            await bridge.reportRecentlyDeleted()
+        }
+    }
+
+    private func emptySeriesTrashImpl() async throws {
+        _ = try await resolvePhotosRoot()
+        try await SDKCancellableOperation.run { [photosClient = photosClient] cancellationToken in
+            try await photosClient.emptyTrash(cancellationToken: cancellationToken)
+        } cancel: { [photosClient = photosClient] cancellationToken in
+            try? await photosClient.cancelEmptyTrash(cancellationToken: cancellationToken)
+        }
+        checkedSeriesRestoreCandidates = [:]
+        recentlyDeleted.emptied()
+        recentlyDeletedStore.save(recentlyDeleted.persisted)
+        await reportRecentlyDeleted()
+        // A successful Empty Trash permanently deletes every unresolved trashed frame of these generations.
+        if let journal = seriesRestoreReplay.journal {
+            do {
+                for var record in try journal.records() {
+                    record.frames = []
+                    try journal.update(record)
+                }
+            } catch { DebugLog.log("restore: Empty Trash settlement deferred") }
         }
     }
 
@@ -2188,6 +2309,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let stored = recentlyDeleted.persisted
         switch recentlyDeleted.received(photos, ticket: ticket) {
         case .applied:
+            checkedSeriesRestoreCandidates = nil
             recentlyDeleted.listedRelatedPhotos(related)
         case .overtakenByChange:
             // Photos that left the library meanwhile may still lack a listing. A background listing follows; when
