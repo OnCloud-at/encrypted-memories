@@ -993,6 +993,128 @@ extension DriveSessionStubSuite {
                 ])
         }
 
+        @Test func lineageSaveFailureMarksTheEventUpdatePassAsPartial() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            var db: OpaquePointer?
+            #expect(
+                sqlite3_open(directory.appendingPathComponent("lineage.sqlite").path, &db) == SQLITE_OK)
+            defer { sqlite3_close(db) }
+            #expect(
+                sqlite3_exec(
+                    db,
+                    """
+                    CREATE TRIGGER reject_checkpoint BEFORE INSERT ON lineage_checkpoint
+                    BEGIN SELECT RAISE(ABORT, 'test write failure'); END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let collector = SupportWorkMeasurements()
+            try await refresh(content: content, lineage: lineage, workMeasurements: collector)
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 1)
+        }
+
+        @Test func lineageFinishBuildFailureMarksTheIndexRebuildPassAsPartial() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            let keys = try LineageKeys()
+            let photo = try keys.activePhoto(
+                "main",
+                attributes: #"{"iOS.photos":{"ICloudID":"cloud"},"#
+                    + #""EncryptedMemories.lineage":{"V":1,"Reason":"edit","Replaces":["old"]}}"#)
+            var db: OpaquePointer?
+            #expect(sqlite3_open(directory.appendingPathComponent("lineage.sqlite").path, &db) == SQLITE_OK)
+            defer { sqlite3_close(db) }
+            #expect(
+                sqlite3_exec(
+                    db,
+                    """
+                    CREATE TRIGGER reject_remote_lineage BEFORE INSERT ON remote_lineage
+                    BEGIN SELECT RAISE(ABORT, 'test write failure'); END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"one"}"#)
+            let listing = try JSONSerialization.data(
+                withJSONObject: [
+                    "Code": 1000,
+                    "Photos": [["LinkID": "main", "CaptureTime": 1, "Tags": [], "RelatedPhotos": []]],
+                ]
+            )
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos", json: String(decoding: listing, as: UTF8.self))
+            try routeMetadata([photo])
+            let collector = SupportWorkMeasurements()
+            try await refresh(
+                content: content, lineage: lineage, rootKey: keys.root, workMeasurements: collector)
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")) == .incomplete)
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.indexRebuild.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 1)
+        }
+
+        @Test func refreshRequiredEventEndsTheEventUpdatePassBeforeTheNestedRebuild() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            StubURLProtocol.reset()
+            // Refresh:1 starts a nested rebuild; its events/latest fetch stays unrouted and fails.
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json: #"{"Code":1000,"EventID":"two","More":0,"Refresh":1,"Events":[]}"#)
+            let collector = SupportWorkMeasurements()
+            await #expect(throws: (any Error).self) {
+                try await refresh(content: content, lineage: lineage, workMeasurements: collector)
+            }
+            let snapshot = collector.workMeasurementSupportSnapshot()
+            let events = snapshot.passes[SupportMeasurementKind.eventUpdate.rawValue]
+            let rebuild = snapshot.passes[SupportMeasurementKind.indexRebuild.rawValue]
+            #expect(events.started == 1 && events.completed == 1 && events.inProgress == 0)
+            #expect(events.samples.last?.outcome == 1)
+            #expect(rebuild.started == 1 && rebuild.completed == 1 && rebuild.inProgress == 0)
+            #expect(rebuild.samples.last?.outcome == 2)
+        }
+
         @Test func missingLineageStagingDoesNotRestartAResumedContentBuild() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1793,21 +1915,24 @@ extension DriveSessionStubSuite {
 
         private func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
-            rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: "")
+            rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
+            workMeasurements: SupportWorkMeasurements? = nil
         ) async throws {
             try await Self.refresh(
-                content: content, lineage: lineage, rebuildsMissingLineage: rebuildsMissingLineage, rootKey: rootKey)
+                content: content, lineage: lineage, rebuildsMissingLineage: rebuildsMissingLineage, rootKey: rootKey,
+                workMeasurements: workMeasurements)
         }
 
         fileprivate static func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
-            rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: "")
+            rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
+            workMeasurements: SupportWorkMeasurements? = nil
         ) async throws {
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
                 material: material(rootKey: rootKey), session: makeSession(),
                 crypto: DriveCrypto(addressKeys: [], signers: []),
                 store: content, lineageStore: lineage, rebuildsMissingLineage: rebuildsMissingLineage,
-                progress: { _ in })
+                progress: { _ in }, workMeasurements: workMeasurements)
         }
     }
 }
