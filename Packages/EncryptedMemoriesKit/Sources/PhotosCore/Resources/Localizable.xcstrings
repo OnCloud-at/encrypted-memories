@@ -1032,15 +1032,15 @@
     "backup.issue_remote_draft": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "An earlier upload of this photo is still finishing." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Ein früherer Upload dieses Fotos wird noch abgeschlossen." } }
+        "en": { "stringUnit": { "state": "translated", "value": "An unfinished upload with the same file name is blocking this photo." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein unvollständiger Upload mit demselben Dateinamen blockiert dieses Foto." } }
       }
     },
     "backup.issue_remote_draft_stale": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "An earlier upload of this photo stayed unfinished." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Ein früherer Upload dieses Fotos blieb unvollständig." } }
+        "en": { "stringUnit": { "state": "translated", "value": "An unfinished upload with the same file name is still blocking this photo." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein unvollständiger Upload mit demselben Dateinamen blockiert dieses Foto weiterhin." } }
       }
     },
     "backup.issue_permission": {
