@@ -5,6 +5,62 @@ import XCTest
 
 @testable import UploadCore
 
+/// Uses the store's real connection, including a refused rollback that leaves its transaction open.
+enum PendingStoreTransactionFault: Equatable {
+    case openTransaction, lastingFailure, failedRollback
+
+    func install(on store: PendingBackupManifestStore, key: PendingSourceKey) throws -> SQLiteStoreConnection {
+        let connection = try XCTUnwrap(
+            Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value
+                as? SQLiteStoreConnection)
+        switch self {
+        case .openTransaction:
+            connection.withLock {
+                XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            }
+        case .lastingFailure:
+            connection.withLock {
+                XCTAssertEqual(
+                    sqlite3_set_authorizer(
+                        connection.database,
+                        { _, action, _, _, _, _ in
+                            action == SQLITE_SELECT ? SQLITE_DENY : SQLITE_OK
+                        }, nil), SQLITE_OK)
+            }
+            XCTAssertFalse(store.sourceStatesRead().complete)
+        case .failedRollback:
+            connection.withLock {
+                XCTAssertEqual(
+                    sqlite3_set_authorizer(
+                        connection.database,
+                        { _, action, name, _, _, _ in
+                            if action == SQLITE_DELETE { return SQLITE_DENY }
+                            if action == SQLITE_TRANSACTION, name.map({ String(cString: $0) }) == "ROLLBACK" {
+                                return SQLITE_DENY
+                            }
+                            return SQLITE_OK
+                        }, nil), SQLITE_OK)
+            }
+            XCTAssertFalse(store.removeEvidence(for: [key]))
+        }
+        connection.withLock {
+            sqlite3_set_authorizer(connection.database, nil, nil)
+            XCTAssertEqual(sqlite3_get_autocommit(connection.database) == 0, self != .lastingFailure)
+        }
+        XCTAssertFalse(store.isOperational())
+        return connection
+    }
+
+    static func remove(from connection: SQLiteStoreConnection) {
+        connection.withLock {
+            sqlite3_set_authorizer(connection.database, nil, nil)
+            if sqlite3_get_autocommit(connection.database) == 0 {
+                XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+            }
+        }
+    }
+}
+
 final class PendingBackupStoreTests: XCTestCase {
     private var directory: URL!
     private var store: PendingBackupManifestStore!
@@ -357,7 +413,7 @@ final class PendingBackupStoreTests: XCTestCase {
                     key: key, revision: UploadBackupRevision(rawValue: 7), remote: remote,
                     kind: .uploaded, createdAt: date)), .excludedRemoteNeedsTrash)
         let included = try XCTUnwrap(try XCTUnwrap(store.include([key], at: date)).first)
-        XCTAssertTrue(store.deferEffects(for: key, at: date))
+        XCTAssertFalse(store.deferEffects(for: key, at: date), "a lasting failure refuses a standalone retry write")
         XCTAssertTrue(store.completeEffect(.queueSync, for: key, generation: included.generation, at: date))
         XCTAssertNotNil(store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: date))
         XCTAssertFalse(store.isOperational(), "successful reads must not clear sticky health")
@@ -1009,16 +1065,16 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertTrue(store.isOperational())
     }
 
-    /// A failed call that is not transient stays recorded, and later calls answer on their own (#982).
-    func testANonTransientFailureStaysStickyWithoutChangingLaterSQLResults() throws {
+    /// A lasting failure refuses further standalone writes; successful reads cannot clear it (#1005).
+    func testANonTransientFailureStaysStickyAndRefusesFurtherWrites() throws {
         XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
         XCTAssertNotNil(
             store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
         try withOneDeniedSourceSelect { _ = store.actions() }
         XCTAssertFalse(store.isOperational())
         let revision = UploadBackupRevision(rawValue: 10)
-        XCTAssertTrue(store.recordUploadEvidence(key, revision: revision, at: date))
-        XCTAssertEqual(store.evidenceRevisions(), [key: [revision]])
+        XCTAssertFalse(store.recordUploadEvidence(key, revision: revision, at: date))
+        XCTAssertTrue(store.evidenceRevisions().isEmpty)
         XCTAssertFalse(store.isOperational(), "successful SQL cannot clear a failure that is not transient")
         XCTAssertNil(
             store.exclusions(kind: .photoLibraryAsset, among: [key.identifier]),
@@ -1895,6 +1951,110 @@ extension PendingBackupStoreTests {
             let kept = try XCTUnwrap(local.sourceState(for: key), "Completion cannot delete an owed remote action")
             XCTAssertEqual(kept.remote, remote)
             XCTAssertTrue(owed == "needs_remote_restore" ? kept.needsRemoteRestore : kept.needsRemoteTrash)
+        }
+    }
+}
+
+extension PendingBackupStoreTests {
+    func testStandalonePendingWritesRefuseAnOpenTransaction() throws {
+        try checkStandaloneWrites(under: .openTransaction)
+    }
+
+    func testStandalonePendingWritesRefuseALastingFailure() throws {
+        try checkStandaloneWrites(under: .lastingFailure)
+    }
+
+    func testStandalonePendingWritesRefuseAFailedRollback() throws {
+        try checkStandaloneWrites(under: .failedRollback)
+    }
+
+    func testStandalonePendingWritesCommitWhenHealthy() throws {
+        try checkStandaloneWrites(under: nil)
+    }
+
+    private func checkStandaloneWrites(under fault: PendingStoreTransactionFault?) throws {
+        let keepKey = PendingSourceKey(kind: .photoLibraryAsset, identifier: "kept")
+        let writers: [(String, () throws -> Bool)] = [
+            (
+                "upload evidence",
+                {
+                    self.store.recordUploadEvidence(
+                        self.key, revision: UploadBackupRevision(rawValue: 2), at: self.date)
+                }
+            ),
+            ("handoff pruning", { self.store.pruneAcknowledgedHandoffs(olderThan: self.date) }),
+            ("effect retry", { self.store.deferEffects(for: self.key, at: self.date.addingTimeInterval(100)) }),
+            (
+                "keep remote",
+                {
+                    self.store.keepRemote(
+                        self.remote, of: keepKey, generation: 1, revision: nil, at: self.date) != nil
+                }
+            ),
+            (
+                "earlier upload trash",
+                {
+                    self.store.trashEarlierUpload(self.remote, of: self.key, generation: 1, at: self.date) != nil
+                }
+            ),
+            ("favorite intent", { self.store.setFavoriteIntent(self.key, favorite: false, at: self.date) }),
+            ("album intent", { self.store.addAlbumIntent(self.key, albumID: "album", at: self.date) }),
+            (
+                "action retry",
+                {
+                    self.store.retryAction(try XCTUnwrap(self.store.actions().first), at: self.date)
+                }
+            ),
+            ("action failure", { self.store.failAction(try XCTUnwrap(self.store.actions().first)) }),
+            ("action completion", { self.store.completeAction(try XCTUnwrap(self.store.actions().first)) }),
+            (
+                "saved photo",
+                {
+                    self.store.recordSavedFromApp(localIdentifier: "saved", remote: self.remote, at: self.date)
+                }
+            ),
+        ]
+        let originalStore = store
+        let originalDirectory = try XCTUnwrap(directory)
+        defer {
+            store.close()
+            store = originalStore
+            directory = originalDirectory
+        }
+        for (name, write) in writers {
+            store.close()
+            directory = originalDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+            XCTAssertTrue(store.recordUploadEvidence(key, revision: UploadBackupRevision(rawValue: 1), at: date))
+            XCTAssertNotNil(
+                store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
+            XCTAssertNotNil(
+                store.exclude([PendingExclusionRequest(key: keepKey, presentation: nil, remote: remote)], at: date))
+            XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+            let oldKey = PendingSourceKey(kind: .photoLibraryAsset, identifier: "prunable")
+            let oldRevision = UploadBackupRevision(rawValue: 1)
+            XCTAssertEqual(
+                store.recordHandoff(
+                    PendingHandoff(
+                        key: oldKey, revision: oldRevision, remote: remote, kind: .uploaded,
+                        createdAt: date.addingTimeInterval(-100))), .recorded)
+            XCTAssertTrue(store.acknowledgeHandoffs([(oldKey, oldRevision)]))
+            let before = try pendingTables()
+            if let fault {
+                let connection = try fault.install(on: store, key: key)
+                XCTAssertFalse(try write(), "\(fault): \(name) must report refusal")
+
+                // Commit through the fixture connection: false must not hide a write in the open transaction.
+                connection.withLock {
+                    if sqlite3_get_autocommit(connection.database) == 0 {
+                        XCTAssertEqual(sqlite3_exec(connection.database, "COMMIT;", nil, nil, nil), SQLITE_OK)
+                    }
+                }
+                XCTAssertEqual(try pendingTables(), before, "\(fault): \(name) must preserve every durable row")
+            } else {
+                XCTAssertTrue(try write(), "\(name) must still succeed while healthy")
+                XCTAssertNotEqual(try pendingTables(), before, "the healthy \(name) fixture must change a row")
+            }
         }
     }
 }

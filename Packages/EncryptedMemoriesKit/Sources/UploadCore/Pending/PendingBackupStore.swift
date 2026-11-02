@@ -35,7 +35,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// The runner decided after the duplicate check that this revision needs an upload.
     @discardableResult
     public func recordUploadEvidence(_ key: PendingSourceKey, revision: UploadBackupRevision, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 INSERT INTO upload_evidence(source_kind, source_id, revision_us, recorded_at)
@@ -261,7 +261,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Acknowledged handoffs are only needed to map a restored Proton photo back to its source.
     @discardableResult
     public func pruneAcknowledgedHandoffs(olderThan cutoff: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             // Unfinished work needs its handoffs. A completed trash also keeps the latest handoff until the source
             // returns to the backup: a restart may still have to discover its later upload.
             execute(
@@ -510,7 +510,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         revision: UploadBackupRevision?,
         at date: Date
     ) -> PendingSourceState? {
-        connection.withLock {
+        standaloneWrite(refusing: nil) {
             var durable: PhotoUID?
             if let revision {
                 guard case .readable(let handoff) = handoffReadLocked(key, revision: revision) else { return nil }
@@ -551,7 +551,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         generation: Int64,
         at date: Date
     ) -> PendingSourceState? {
-        connection.withLock {
+        standaloneWrite(refusing: nil) {
             guard
                 execute(
                     """
@@ -808,7 +808,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Schedules the next attempt of a failed effect with the shared backoff.
     @discardableResult
     public func deferEffects(for key: PendingSourceKey, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             guard case .readable(let current) = sourceStateLocked(key) else { return false }
             guard let state = current else { return true }
             let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: state.attempts))
@@ -899,12 +899,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Stores the desired favorite state of a pending source. A later toggle replaces it.
     @discardableResult
     public func setFavoriteIntent(_ key: PendingSourceKey, favorite: Bool, at date: Date) -> Bool {
-        connection.withLock { upsertActionLocked(key, kind: .favorite, albumID: "", desired: favorite, at: date) }
+        standaloneWrite(refusing: false) {
+            upsertActionLocked(key, kind: .favorite, albumID: "", desired: favorite, at: date)
+        }
     }
 
     @discardableResult
     public func addAlbumIntent(_ key: PendingSourceKey, albumID: String, at date: Date) -> Bool {
-        connection.withLock { upsertActionLocked(key, kind: .addToAlbum, albumID: albumID, desired: true, at: date) }
+        standaloneWrite(refusing: false) {
+            upsertActionLocked(key, kind: .addToAlbum, albumID: albumID, desired: true, at: date)
+        }
     }
 
     /// The rows that decode. Use `actionsRead()` where a missing row must not count as "nothing owed".
@@ -932,7 +936,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     @discardableResult
     public func retryAction(_ action: PendingAction, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: action.attempts))
             // A newer request for the same action replaced this one: leave it untouched.
             return execute(
@@ -951,7 +955,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     @discardableResult
     public func failAction(_ action: PendingAction) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 UPDATE pending_action SET failed=1
@@ -968,7 +972,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Deletes a finished action unless a newer request replaced it meanwhile.
     @discardableResult
     public func completeAction(_ action: PendingAction) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 DELETE FROM pending_action
@@ -986,7 +990,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     @discardableResult
     public func recordSavedFromApp(localIdentifier: String, remote: PhotoUID, at date: Date) -> Bool {
-        connection.withLock {
+        standaloneWrite(refusing: false) {
             execute(
                 """
                 INSERT INTO saved_from_app(local_id, remote_volume_id, remote_link_id, saved_at) VALUES(?, ?, ?, ?)
@@ -1215,6 +1219,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     // MARK: - SQLite plumbing
+
+    /// A standalone write must commit itself, never join a transaction that a failed rollback left open. A lasting
+    /// failure refuses it; a transient failure still permits another attempt. Closed handles use the statement checks.
+    private func standaloneWrite<Result>(refusing failure: Result, _ body: () -> Result) -> Result {
+        connection.withLock {
+            if let db, sqlite3_get_autocommit(db) == 0 { return failure }
+            guard !connection.operationFailed || connection.failuresAreTransient else { return failure }
+            return body()
+        }
+    }
 
     /// Runs `body` in one IMMEDIATE transaction. Returns false and rolls back when `body` or the commit fails. A failed
     /// SQLite call in `body` records its own failure; a writer that refuses a row it cannot read records none (#982).
