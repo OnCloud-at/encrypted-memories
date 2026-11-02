@@ -83,12 +83,14 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
     }
 
     /// Whether a "Retry" can work. Only a cause that is confirmed permanent hides it: a codec the player cannot decode,
-    /// a file that is not a video, a host without a stream provider, a typed crypto failure and a self-contradicting
-    /// description of the video. An HTTP answer such as
-    /// 404, 410 or 416 does not prove that a new attempt fails (an expired stream reference is renewed), so it keeps Retry.
+    /// a file that is not a video, a host without a stream provider, a typed crypto failure, a self-contradicting
+    /// description of the video and an unauthorized answer (401), which asks the person to sign in again. An HTTP
+    /// answer such as 404, 410 or 416 does not prove that a new attempt fails (an expired stream reference is
+    /// renewed), so it keeps Retry.
     public var isRetryable: Bool {
         switch self {
-        case .unsupportedCodec, .notVideo, .streamURLUnavailable, .decryptionFailed, .malformedContent: return false
+        case .unsupportedCodec, .notVideo, .streamURLUnavailable, .decryptionFailed, .malformedContent, .authExpired:
+            return false
         default: return true
         }
     }

@@ -183,7 +183,10 @@ public final class BackupTempFileStore: @unchecked Sendable {
             }
             let increment = Int64(byteCount)
             let previousAllocation = max(reservation.expectedBytes, reservation.writtenBytes)
-            let nextWritten = reservation.writtenBytes + increment
+            let (nextWritten, sumOverflowed) = reservation.writtenBytes.addingReportingOverflow(increment)
+            guard !sumOverflowed else {
+                throw BackupTempFileError.diskBudgetExceeded
+            }
             let nextAllocation = max(reservation.expectedBytes, nextWritten)
             if reservation.isOversized {
                 // The identity pass supplied an exact size. If PhotoKit now produces more bytes,
@@ -194,10 +197,10 @@ public final class BackupTempFileStore: @unchecked Sendable {
             } else {
                 // All files created by this store have reservations. Avoid enumerating the temp
                 // directory for every PhotoKit chunk; the filesystem scan belongs on reserve only.
-                let normalAllocation =
-                    normalReservedBytesLocked()
-                    - previousAllocation
-                    + nextAllocation
+                let normalAllocation = addingClamped(
+                    normalReservedBytesLocked() - previousAllocation,
+                    nextAllocation
+                )
                 guard normalAllocation <= maximumBytes else {
                     throw BackupTempFileError.diskBudgetExceeded
                 }

@@ -293,6 +293,9 @@ import Testing
 
         func availableBackends() -> Set<MLSearchBackend> { [.recognizedText] }
 
+        /// The double simulates a restored library whose OCR index already holds one entry.
+        func hasIndexedTextEntries() -> Bool { true }
+
         func index(
             assets: [MLPipelineAssetRevision],
             shouldContinue: @escaping @Sendable () -> Bool,
@@ -380,7 +383,8 @@ import Testing
         #expect(await waitUntil { await factory.started })
         #expect(await waitUntilMainActor { controller.snapshot.isEnabled })
         #expect(controller.presentation.statusText != L10n.string("mlsearch.status_disabled"))
-        #expect(controller.availableSearchScopes == [.all, .text])
+        // The native index has not been created yet, so the OCR scope stays hidden.
+        #expect(controller.availableSearchScopes == [.all])
 
         await factory.release()
         await lifecycle.shutdown()
