@@ -49,6 +49,7 @@ struct VideoByteRangeCacheTests {
         let cache = VideoByteRangeCache(rootDirectory: root)
         #expect(policy.videoBudget == .bytes(512 * 1024 * 1024))
         #expect(cache.budgetBytes == 512 * 1024 * 1024)
+        #expect(VideoByteRangeCache.shared.budgetBytes == 512 * 1024 * 1024)
         let override = VideoByteRangeCache(budgetBytes: 23, rootDirectory: root, policyBudget: { _ in 10 })
         #expect(override.budgetBytes == 23)
         #expect(VideoByteRangeCache.byteLimit(for: .unlimited) == Int.max)

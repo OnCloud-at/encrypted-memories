@@ -925,8 +925,7 @@ final class MobileLibraryModel {
         let locationStore = locationStore
         let locationIndex = locationIndex
         let policy = ProtonDriveBackendPolicy.standard(
-            libraryDatabasePolicy: ProtonDriveBackendPolicy.mobileLibraryDatabasePolicy,
-            videoCacheBudgetBytes: 128 * 1024 * 1024
+            libraryDatabasePolicy: ProtonDriveBackendPolicy.mobileLibraryDatabasePolicy
         )
 
         let driver = MobileScopeRecoveryDriver(
@@ -1555,8 +1554,7 @@ final class MobileLibraryModel {
                     session: session,
                     store: store,
                     policy: .standard(
-                        libraryDatabasePolicy: ProtonDriveBackendPolicy.mobileLibraryDatabasePolicy,
-                        videoCacheBudgetBytes: 128 * 1024 * 1024
+                        libraryDatabasePolicy: ProtonDriveBackendPolicy.mobileLibraryDatabasePolicy
                     )
                 )
                 guard !Task.isCancelled,
