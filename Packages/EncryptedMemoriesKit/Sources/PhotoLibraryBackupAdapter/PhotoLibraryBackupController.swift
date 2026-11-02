@@ -1850,6 +1850,18 @@ public final class PhotoLibraryBackupController {
         internal func waitForInstantWorkRetirementForTesting() async {
             await instantWorkRetirementTask?.value
         }
+
+        /// Delays each status-projector stream event before ingestion: simulates a starved consumer.
+        internal func holdStatusProjectionIngestionForTesting(_ gate: @escaping @Sendable () async -> Void) async {
+            await statusProjector?.setIngestionGateForTesting(gate)
+        }
+
+        /// Signals that a status-projector stream event fully settled: used with the gate above.
+        internal func observeStatusProjectionIngestionForTesting(
+            _ observer: @escaping @Sendable () async -> Void
+        ) async {
+            await statusProjector?.setIngestionObserverForTesting(observer)
+        }
     #endif
 
     /// Stops every account-scoped worker, awaits its final callback, then closes all SQLite owners.
@@ -2544,6 +2556,10 @@ public final class PhotoLibraryBackupController {
             logNext(.shutdown)
             return
         }
+        // Every runner event this pass already submitted must settle in the projector before the
+        // decision projection below runs. A starved stream consumer could otherwise deliver one
+        // last stale runner snapshot after that projection, re-stamping `nextAutomaticAttemptAt`.
+        await statusProjector?.drainSubmittedEvents()
         let request = nextStatusProjectionRequest()
         let finalProjection = await statusProjector?.projectNow(
             context: request.context,

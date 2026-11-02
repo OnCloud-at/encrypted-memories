@@ -2145,6 +2145,35 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             try await assertManualRetrySurvivesOffline(retryWhileOffline: true, wiFiReturnsDuringScan: true)
         }
 
+        /// A starved projector consumer must not re-stamp `nextAutomaticAttemptAt` after a pass decided
+        /// its wake plan. This replays the hosted merge-queue failure: the runner's last callback lands
+        /// after `completeSyncRun` finished its final projection, carrying a stale issue and a date one
+        /// hour in the future. The host could heal the date but never the planted one: the timer and
+        /// the background request would both arm. Keeping it stopped is the projector's job.
+        func testALateRunnerSnapshotCannotRestampTheAutomaticAttemptDate() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-late-snapshot-retry", source: signals.source)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            controller.replaceScanForTesting {}
+            let latch = StatusIngestionLatch()
+            await controller.holdStatusProjectionIngestionForTesting { await latch.waitUntilOpen() }
+            await controller.observeStatusProjectionIngestionForTesting { await latch.noteConsumed() }
+            await controller.retryUserResolvableWork()
+            let passEnded = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(passEnded, "The Wi-Fi pass must finish its work")
+            await latch.openGate()
+            await latch.waitUntilConsumed()
+            await controller.waitForSyncRunCompletionForTesting()
+            XCTAssertFalse(controller.isAutoResumeScheduledForTesting, "A late snapshot must not arm the resume")
+            XCTAssertFalse(
+                (controller.nextAutomaticAttemptAt ?? .distantPast) > Date(),
+                "A late snapshot must not plant a future automatic attempt date")
+            XCTAssertEqual(controller.status.phase, .waitingForWiFi)
+            await controller.shutdown()
+        }
+
         private func assertManualRetrySurvivesOffline(
             retryWhileOffline: Bool, wiFiReturnsDuringScan: Bool = false
         ) async throws {
@@ -4709,6 +4738,46 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             suite: suite,
             directory: directory
         )
+    }
+
+    /// Controls the projector's stream consumer timing for the straggler-regression test: holds
+    /// each event until a gate opens, then notifies waiters after each consumed event.
+    private actor StatusIngestionLatch {
+        private var open = false
+        private var consumedCount = 0
+        private var gateWaiters: [CheckedContinuation<Void, Never>] = []
+        private var consumedWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func openGate() {
+            guard !open else { return }
+            open = true
+            let waiters = gateWaiters
+            gateWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+
+        func waitUntilOpen() async {
+            if open { return }
+            await withCheckedContinuation { continuation in
+                gateWaiters.append(continuation)
+            }
+        }
+
+        func noteConsumed() {
+            consumedCount += 1
+            let waiters = consumedWaiters
+            consumedWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+
+        func waitUntilConsumed() async {
+            guard consumedCount > 0 else {
+                await withCheckedContinuation { continuation in
+                    consumedWaiters.append(continuation)
+                }
+                return
+            }
+        }
     }
 
     private actor NonCooperativeWriterLatch {
