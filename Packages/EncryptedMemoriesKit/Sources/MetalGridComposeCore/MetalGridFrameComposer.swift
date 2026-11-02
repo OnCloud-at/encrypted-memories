@@ -14,6 +14,25 @@ import simd
 /// It is data-in / data-out. It never retains AppKit/UIKit objects, imports no platform view framework, and
 /// mutates only the injected texture cache (which is itself platform-neutral).
 package enum MetalGridFrameComposer {
+    /// Only the even-column profile uses division alignment. Compact and pointer ladders keep their geometry.
+    /// Activity does not filter divisions: the same physical gap stays in place when the display becomes flat.
+    package static func gridDivisionFrame(
+        areas: [ReservedRegionArea], bounds: CGRect, profile: GridLevelProfile
+    ) -> CGRect? {
+        var nearest: CGRect?
+        for area in areas {
+            let frame = area.frame
+            let local = frame.offsetBy(dx: -bounds.minX, dy: -bounds.minY)
+            guard frame.minY < bounds.maxY, frame.maxY > bounds.minY,
+                GridVerticalDivision.isUsable(local, width: bounds.width, levels: profile.levels)
+            else { continue }
+            if nearest == nil || abs(local.midX - bounds.width / 2) < abs(nearest!.midX - bounds.width / 2) {
+                nearest = local
+            }
+        }
+        return nearest
+    }
+
     @MainActor
     package static func hasProgressingVisibleUploads<ID: Hashable & Sendable>(
         cache: MetalGridTextureCache<ID>, ramReadyMissing: Int
