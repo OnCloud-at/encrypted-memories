@@ -170,7 +170,7 @@ public struct RemoteLinkVisibility: Equatable, Sendable {
     public var trashTime: Int64?
 
     public init(
-        isActive: Bool, mainPhotoLinkID: String?, hasExplicitState: Bool = true, hasExplicitPhotoState: Bool = true,
+        isActive: Bool, mainPhotoLinkID: String?, hasExplicitState: Bool = false, hasExplicitPhotoState: Bool = true,
         trashTime: Int64? = nil
     ) {
         self.isActive = isActive
