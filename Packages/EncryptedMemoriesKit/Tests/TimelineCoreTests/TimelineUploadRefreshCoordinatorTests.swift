@@ -517,6 +517,93 @@ import Testing
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func aSignalThatArrivesDuringAnUnchangedLoadKeepsItsUsualAdmission() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        let held = AsyncGate()
+        await scenario.submitBackupSignal(0, passIsRunning: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        scenario.clock.advance(by: .seconds(3))
+        // A load that finds no change starts at t=3 and is held open.
+        scenario.coordinator.submitBackupUpload(
+            passIsRunning: false,
+            refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 1)
+                await held.wait()
+                return .unchanged
+            })
+        await scenario.coordinator.testingDrainSubmissions()
+        #expect(await scenario.timeline.waitForCount(2))
+        // Signals 2...5 arrive while that unchanged load is still running.
+        for signal in 2...5 { await scenario.submitBackupSignal(signal, passIsRunning: true) }
+        await held.open()
+        // The unchanged load completed while signal 5 was already pending, so the next tick is not skipped:
+        // the follow-up load keeps the usual admission, one interval after the previous admission.
+        #expect(await scenario.clock.waitForSleepCount(1), "The follow-up admission is scheduled")
+        if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
+        #expect(await scenario.timeline.waitForCount(3))
+        let times = await scenario.timeline.times
+        #expect(times == [.zero, .seconds(3), .seconds(33)], "The usual admission is kept, saw \(times)")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aSignalThatArrivesAfterAnUnchangedLoadWaitsForTheMovedTick() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        await scenario.requestSignal(0, unchanged: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        #expect(await scenario.waitForQuiescence())
+        // The unchanged load ended with no newer signal pending, so the skip moved the next tick from 30 s to 60 s.
+        // A signal that arrives after that completion carries content this load could not have seen, yet the design
+        // of #516 accepts one interval of delay for it: the load waits for the moved tick.
+        scenario.clock.advance(by: .seconds(31))
+        await scenario.submitBackupSignal(1, passIsRunning: true)
+        #expect(await scenario.clock.waitForSleepCount(1), "The follow-up admission is scheduled")
+        if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
+        #expect(await scenario.timeline.waitForCount(2))
+        let times = await scenario.timeline.times
+        #expect(
+            times == [.zero, .seconds(60)], "A signal after an unchanged load waits for the moved tick, saw \(times)")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aCancelledAutomaticResultDoesNotMoveTheNextTick() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        await scenario.coordinator.requestAutomaticUpload(
+            refresh: { _ in
+                await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 0)
+                return .cancelled
+            },
+            observer: { _ in await scenario.timeline.noteTerminalObservation() })
+        #expect(await scenario.timeline.waitForCount(1))
+        #expect(await scenario.waitForQuiescence())
+        // A cancelled automatic result is not an unchanged load, so the next tick stays at the usual 30 s.
+        scenario.clock.advance(by: .seconds(31))
+        await scenario.submitBackupSignal(1, passIsRunning: true)
+        #expect(await scenario.timeline.waitForCount(2))
+        let times = await scenario.timeline.times
+        #expect(
+            times == [.zero, .seconds(31)], "A cancelled result does not defer the next automatic cycle, saw \(times)")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aManualRefreshNeverWaitsForASkippedTick() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        await scenario.requestSignal(0, unchanged: true)
+        #expect(await scenario.timeline.waitForCount(1))
+        #expect(await scenario.waitForQuiescence())
+        scenario.clock.advance(by: .seconds(5))
+        await scenario.coordinator.request(refresh: { _ in
+            await scenario.timeline.record(scenario.clock.now - scenario.origin, content: 99)
+            return nil
+        })
+        #expect(await scenario.timeline.waitForCount(2))
+        #expect(await scenario.timeline.times == [.zero, .seconds(5)], "A manual refresh ignores the skipped tick")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func aBackupSignalAfterThePassEndedRefreshesWithoutWaitingForTheInterval() async {
         let scenario = AutomaticUploadScenario()
         await scenario.submitBackupSignal(0, passIsRunning: true)
@@ -589,6 +676,46 @@ import Testing
         )
         #expect(observedTimes.count <= 11)
         #expect(observedContents.last == 99)
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func oneHundredAutomaticSignalsUnderProductionBackupUploadsPolicyStayWithinTheIssueBound() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        // Signals 0...98 back up photos that were already visible as local tiles, so their loads find no change.
+        // Signal 99 carries the last new content and must be visible without waiting behind a skipped tick.
+        for signal in 0..<100 {
+            if signal > 0 {
+                scenario.clock.advance(by: .seconds(6))
+                #expect(await scenario.waitForQuiescence(), "A tick load must settle before submitting the next signal")
+            }
+            await scenario.requestSignal(signal, unchanged: signal != 99)
+            #expect(await scenario.waitForQuiescence(), "The coordinator must be ready for the next signal")
+        }
+        scenario.clock.advance(by: .seconds(6))
+        #expect(await scenario.flush())
+        let observedTimes = await scenario.timeline.times
+        let observedContents = await scenario.timeline.contents
+        let summary = "loads=\(observedTimes.count), latest=\(observedContents.last ?? -1)"
+        print("Backup upload workload: \(summary), times=\(observedTimes)")
+        #expect(observedTimes.count <= 11, "The production backupUploads policy must keep 100 signals within 11 loads")
+        #expect(observedContents.last == 99, "The production backupUploads policy must publish the newest signal")
+        await scenario.coordinator.cancel()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aLoadThatFoundNewContentKeepsTheUsualInterval() async {
+        let scenario = AutomaticUploadScenario(policy: .backupUploads)
+        await scenario.requestSignal(0, unchanged: false)
+        #expect(await scenario.timeline.waitForCount(1))
+        #expect(await scenario.waitForQuiescence())
+        scenario.clock.advance(by: .seconds(6))
+        await scenario.requestSignal(1, unchanged: false)
+        #expect(await scenario.clock.waitForSleepCount(1), "The follow-up admission is scheduled")
+        if scenario.clock.pendingSleeps > 0 { scenario.clock.advanceToNextSleep() }
+        #expect(await scenario.timeline.waitForCount(2))
+        let times = await scenario.timeline.times
+        #expect(times == [.zero, .seconds(30)], "A load with new content keeps the 30 s interval")
         await scenario.coordinator.cancel()
     }
 
@@ -1303,10 +1430,35 @@ private actor CoordinatorRaceRecorder {
 private actor UploadRefreshTimeline {
     private(set) var times: [Duration] = []
     private(set) var contents: [Int] = []
+    /// One note per observer call, so a load that is still running is `times.count > terminalObservations`.
+    private(set) var terminalObservations = 0
 
     func record(_ time: Duration, content: Int? = nil) {
         times.append(time)
         if let content { contents.append(content) }
+    }
+
+    func noteTerminalObservation() { terminalObservations += 1 }
+
+    /// True when the coordinator holds no load in flight and either waits for its interval or has retired its worker.
+    /// A signal submitted in this state cannot be superseded by a load that is already running, so the test sees the
+    /// same cadence on every run.
+    func isQuiescent(clock: TimelineRefreshTestClock, coordinator: TimelineUploadRefreshCoordinator) async -> Bool {
+        guard times.count == terminalObservations else { return false }
+        if clock.pendingSleeps > 0 { return true }
+        return await !coordinator.testingAutomaticState().workerActive
+    }
+
+    func waitForQuiescence(
+        clock: TimelineRefreshTestClock,
+        coordinator: TimelineUploadRefreshCoordinator
+    ) async -> Bool {
+        let timeout = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < timeout {
+            if await isQuiescent(clock: clock, coordinator: coordinator) { return true }
+            await Task.yield()
+        }
+        return false
     }
 
     func waitForNewLoadOrSleep(after count: Int, clock: TimelineRefreshTestClock) async -> Bool {
@@ -1434,10 +1586,27 @@ private struct AutomaticUploadScenario: Sendable {
     }
 
     func requestSignal(_ content: Int) async {
-        await coordinator.requestAutomaticUpload(refresh: { _ in
-            await timeline.record(clock.now - origin, content: content)
-            return nil
-        })
+        await requestSignal(content, unchanged: false)
+    }
+
+    /// `unchanged` marks a load that succeeded without new content, so the coordinator may skip the next interval tick.
+    func requestSignal(_ content: Int, unchanged: Bool) async {
+        await coordinator.requestAutomaticUpload(
+            refresh: { [unchanged] _ in
+                await timeline.record(clock.now - origin, content: content)
+                return unchanged ? .unchanged : nil
+            },
+            observer: { _ in await timeline.noteTerminalObservation() }
+        )
+    }
+
+    /// True when the scenario can take another signal without meeting a load that is already running.
+    func isQuiescent() async -> Bool {
+        await timeline.isQuiescent(clock: clock, coordinator: coordinator)
+    }
+
+    func waitForQuiescence() async -> Bool {
+        await timeline.waitForQuiescence(clock: clock, coordinator: coordinator)
     }
 
     func flush() async -> Bool {

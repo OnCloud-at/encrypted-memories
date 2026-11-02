@@ -23,7 +23,9 @@ public struct TimelineUploadRefreshAttempt: Sendable, Equatable {
 ///   the next retry of the automatic cycle. A newer explicit request replaces an older one that has not started.
 /// - The interval of the policy (60 seconds by default) gates new automatic cycles only. A newer automatic request
 ///   inside a running cycle adds no load of its own: the next retry of that cycle uses its closure. Retries follow
-///   the convergence schedule.
+///   the convergence schedule. A cycle that succeeded without content change skips the next interval tick.
+///   A newer automatic request that arrived during that cycle keeps its usual admission. A newer automatic request
+///   that arrives after the cycle waits for the moved tick. A forced end and an explicit request never wait for it.
 /// - A flush ends the wait for the interval. It keeps a pending convergence delay: a retry before the library has
 ///   caught up cannot find the upload sooner. A cancelled flush stops waiting; the automatic work goes on.
 public actor TimelineUploadRefreshCoordinator {
@@ -236,6 +238,7 @@ public actor TimelineUploadRefreshCoordinator {
                     automaticCycle = cycle
                 } else {
                     complete(cycle.request)
+                    deferNextAutomaticCycleAfterUnchangedLoad(observation, of: cycle.request)
                     automaticCycle = nil
                 }
                 continue
@@ -311,6 +314,22 @@ public actor TimelineUploadRefreshCoordinator {
                 break
             }
         }
+    }
+
+    /// A cycle that succeeded without new content, whose next wait is the interval, skips the next interval tick:
+    /// an unchanged library gains nothing from repeating that load. A newer automatic signal that has not completed
+    /// carries content this load could not have seen, so it must load at its usual admission. A forced end or an
+    /// explicit request cancels the interval wait anyway and never waits for the moved tick.
+    private func deferNextAutomaticCycleAfterUnchangedLoad(
+        _ observation: TimelineUploadRefreshAttempt,
+        of request: Request
+    ) {
+        guard case .automatic = request.cause,
+            observation.failureReason == .unchanged,
+            let scheduled = nextAutomaticCycleAt
+        else { return }
+        guard request.generation == latestAutomaticRequest?.generation else { return }
+        nextAutomaticCycleAt = scheduled + policy.automaticInterval
     }
 
     private func runCycle(_ request: Request, workerID: UInt64) async -> Bool {

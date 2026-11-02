@@ -114,7 +114,7 @@ final class MacLibraryRefreshController {
         OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
         logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
-        return result.failureReason
+        return result.contentUnchanged ? .unchanged : result.failureReason
     }
 
     private func applyBackupUploadRefresh(_ state: TimelineUploadRefreshAttempt) {
