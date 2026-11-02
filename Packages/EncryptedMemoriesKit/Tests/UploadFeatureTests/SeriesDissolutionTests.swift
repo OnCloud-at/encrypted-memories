@@ -51,7 +51,8 @@ final class SeriesDissolutionTests: XCTestCase {
 
     func testFavoritesBecomeStandalonePhotosBeforeTheWholeSeriesMovesToTrash() async throws {
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         XCTAssertEqual(server.uploads.map(\.name), ["m2.HEIC", "m4.HEIC"], "the copies keep the original filenames")
         XCTAssertEqual(
@@ -121,7 +122,8 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertTrue(server.trashCalls.isEmpty)
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.uploads.count, 1, "the retry finds the committed copy and uploads nothing")
         XCTAssertEqual(Set(copies), server.activeCopyUIDs)
@@ -142,7 +144,7 @@ final class SeriesDissolutionTests: XCTestCase {
         let outcomes = try await makeOrchestrator().resumePending()
 
         XCTAssertEqual(outcomes.map(\.seriesUIDs), [series], "the host learns which series left the library")
-        XCTAssertEqual(try outcomes.first?.result.get().count, 1)
+        XCTAssertEqual(try outcomes.first?.result.get().copyUIDs.count, 1)
         XCTAssertEqual(server.uploads.count, 1)
         XCTAssertEqual(server.trashCalls, [], "the resumed trash step skips a main photo that is already in the trash")
         XCTAssertEqual(try journalStore.pendingJournals(), [])
@@ -200,7 +202,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.markTrashed([confirmed.nodeID])  // the user deleted the first copy in the meantime
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")]
+        ).copyUIDs
 
         XCTAssertFalse(copies.contains(confirmed))
         XCTAssertEqual(Set(copies), server.activeCopyUIDs, "both favorites exist as active standalone photos")
@@ -213,7 +216,8 @@ final class SeriesDissolutionTests: XCTestCase {
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         XCTAssertEqual(server.uploads.map(\.name), ["m2.HEIC", "m3.HEIC", "m4.HEIC"], "m2 keeps its confirmed copy")
         XCTAssertEqual(copies.count, 2)
@@ -227,7 +231,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.addAlbum("album-shared", volumeID: "shared-volume", members: ["m1"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         XCTAssertEqual(
             server.favoriteNodeIDs, expected(["m1"], copies), "every copy keeps the favorite state")
@@ -243,7 +248,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.markFavoriteNodeIDs(["m2"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         let copyOfM2 = try XCTUnwrap(copies.first)
         XCTAssertEqual(server.favoriteNodeIDs, ["m2", copyOfM2.nodeID])
@@ -255,7 +261,8 @@ final class SeriesDissolutionTests: XCTestCase {
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series,
-            favoriteUIDs: [member("m2"), member("m3"), member("m4"), main])
+            favoriteUIDs: [member("m2"), member("m3"), member("m4"), main]
+        ).copyUIDs
 
         guard copies.count == 4 else { return XCTFail("all four copies must exist") }
         XCTAssertEqual(
@@ -274,7 +281,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.markFavoriteNodeIDs(["m1"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.favoriteNodeIDs, expected(["m1"], copies))
         XCTAssertEqual(server.trashCalls, [[main]])
@@ -294,7 +302,8 @@ final class SeriesDissolutionTests: XCTestCase {
         try journalStore.save(oldJournal)
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")]
+        ).copyUIDs
 
         XCTAssertEqual(copies, [member("old-copy"), member("pending-copy")])
         XCTAssertEqual(
@@ -312,7 +321,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.addAlbum("new", volumeID: "own", members: ["m1", "m2"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         XCTAssertEqual(server.albumMembers("new"), expected(["m1", "m2"], copies))
         XCTAssertEqual(server.albumMembers("old"), [], "the copies must not join the album the photos left")
@@ -338,7 +348,8 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(server.freshAlbumReads, [[main]])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         XCTAssertEqual(server.freshAlbumReads, [[main], [main]], "each attempt makes one batched fresh read")
         XCTAssertTrue(server.cachedAlbumReads.isEmpty)
@@ -355,7 +366,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.addAlbum("album-of-m4", volumeID: "own", members: ["m4"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         let copyOfM2 = try XCTUnwrap(copies.first)
         let copyOfM4 = try XCTUnwrap(copies.last)
@@ -388,7 +400,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.addAlbum("album-of-m3", volumeID: "own", members: ["m3"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m4")]
+        ).copyUIDs
 
         XCTAssertEqual(server.albumMembers("album-of-m3"), expected(["m3"], copies))
         XCTAssertEqual(server.albumMembers("album-of-main"), ["m1"])
@@ -400,7 +413,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.albumMembers("album-of-main"), expected(["m1"], copies))
     }
@@ -425,7 +439,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [main])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [main]
+        ).copyUIDs
 
         XCTAssertEqual(server.albumMembers("album-of-main"), expected(["m1"], copies))
     }
@@ -446,7 +461,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.addAlbum("album-of-main", volumeID: "own", members: ["m1"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.albumMembers("album-of-outside"), expected(["outside"], copies))
         XCTAssertEqual(server.albumMembers("album-of-main"), ["m1"])
@@ -506,7 +522,8 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.uploads.count, 1, "the confirmed copy is reused instead of uploaded again")
         XCTAssertEqual(server.albumMembers("album-own"), expected(["m1"], copies))
@@ -526,7 +543,8 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(journal.phase, .copyingFavorites)
         XCTAssertTrue(journal.favorites.allSatisfy { $0.addedAlbumIDs.isEmpty })
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m3")]
+        ).copyUIDs
         XCTAssertEqual(server.albumMembers("album-own"), expected(["m1"], copies))
         XCTAssertEqual(server.uploads.count, 2, "the retry reuses both confirmed copies")
         XCTAssertEqual(server.trashCalls, [[main]])
@@ -546,7 +564,8 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.albumMembers("album-a"), expected(["m1"], copies))
         XCTAssertEqual(server.albumMembers("album-b"), expected(["m1"], copies))
@@ -570,7 +589,8 @@ final class SeriesDissolutionTests: XCTestCase {
 
     func testOnlyTheMainPhotoMovesToTheTrashSoARestoreBringsTheWholeSeriesBack() async throws {
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")]
+        ).copyUIDs
 
         XCTAssertEqual(server.trashCalls, [[main]], "the frames stay linked to the main photo")
         XCTAssertEqual(Set(copies), server.activeCopyUIDs)
@@ -607,7 +627,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.makeStandalone(["m2", "m3", "m4"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.trashCalls.map { $0.map(\.nodeID).sorted() }, [["m1", "m2", "m3", "m4"]])
         XCTAssertEqual(
@@ -635,7 +656,8 @@ final class SeriesDissolutionTests: XCTestCase {
         server.withholdPhotoRole(["m3"])
 
         let copies = try await makeOrchestrator().keepOnlyFavorites(
-            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")]
+        ).copyUIDs
 
         XCTAssertEqual(server.trashCalls, [[main]], "a member without role data is no trash target")
         let active = try await server.activeUIDs(among: [member("m3")])
@@ -646,8 +668,7 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testAMemberWithoutARoleIsReportedThroughProgressSoThePersonLearnsThatItStays() async throws {
-        server.makeStandalone(["m3"])
-        server.withholdPhotoRole(["m3"])
+        server.relate(["m3"], toMain: "outside")
 
         let progress = ProgressRecorder()
         _ = try await makeOrchestrator().keepOnlyFavorites(
@@ -671,6 +692,122 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertTrue(
             progress.stayedWithoutRoleCounts.isEmpty,
             "a member that is already in the trash does not stay in the library")
+    }
+
+    func testTheInteractiveCompletionResultCarriesTheCountOfMembersThatStayedWithoutARole() async throws {
+        server.relate(["m3", "m4"], toMain: "outside")
+
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 2,
+            "the interactive path reports the members that stay visible through an outside main photo")
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleUIDs, [member("m3"), member("m4")],
+            "the interactive path reports the UIDs of the staying members")
+        XCTAssertEqual(outcome.copyUIDs.count, 1, "the standalone copy is still returned")
+    }
+
+    func testTheResumedCompletionResultCarriesTheCountOfMembersThatStayedWithoutARole() async throws {
+        server.relate(["m3", "m4"], toMain: "outside")
+        server.failNextTrash()
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        let outcome = try XCTUnwrap(try outcomes.first?.result.get())
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 2,
+            "the resumed trash step reports the members that stay visible through an outside main photo")
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleUIDs, [member("m3"), member("m4")],
+            "the resumed path reports the UIDs of the staying members")
+        XCTAssertEqual(outcome.copyUIDs.count, 1, "the standalone copy is still returned")
+    }
+
+    func testTheCompletionResultDoesNotReportAMainPhotoMemberWhoseRoleTheServerReported() async throws {
+        // A standalone member is a main photo of its own: the server reports its role, so it moves to the
+        // trash with the series instead of being counted as a staying member.
+        server.makeStandalone(["m3"])
+
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 0,
+            "a member with a reported main-photo role is trashed, not counted as staying")
+        XCTAssertEqual(server.trashCalls, [[main, member("m3")]], "the standalone member is trashed with the series")
+    }
+
+    func testTheInteractiveCompletionResultDoesNotReportAMemberWithoutExplicitState() async throws {
+        server.makeStandalone(["m3"])
+        server.withholdPhotoRole(["m3"])
+
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 0,
+            "a member whose state the server does not report is not counted: the safe default is no notice")
+        XCTAssertEqual(server.trashCalls, [[main]], "the stateless member is never trashed on its own")
+    }
+
+    func testTheCompletionResultReportsTheStayingMemberInAMixedSeries() async throws {
+        // m2 is a related photo of a main photo outside the series: it stays visible. m3 is a related photo of
+        // the series main photo: it follows the main photo into the trash. m4 carries no explicit state: it is
+        // neither trashed nor reported.
+        server.relate(["m2"], toMain: "outside")
+        server.withholdPhotoRole(["m4"])
+
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleUIDs, [member("m2")],
+            "only the member whose main photo stays out of the trash is reported")
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 1,
+            "the count is derived from the staying UIDs")
+        XCTAssertEqual(server.trashCalls, [[main]], "only the series main photo moves to the trash")
+    }
+
+    func testTheCompletionResultReportsZeroWhenEveryMemberHasARole() async throws {
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 0,
+            "no member stays without a role in a fully reported series")
+    }
+
+    func testTheCompletionResultReportsZeroWhenTheStayingMemberIsAlreadyTrashed() async throws {
+        server.relate(["m3"], toMain: "outside")
+        server.markTrashed(["m3"])
+
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 0,
+            "a member that is already in the trash does not stay in the library")
+        XCTAssertEqual(server.trashCalls, [[main]], "the already-trashed member is not trashed again")
+    }
+
+    func testTheCompletionResultDoesNotReportAMemberWhoseStateTheServerDidNotReport() async throws {
+        // The answer names the outside main photo but carries no State. `isActive` keeps its client default
+        // (true) for such a link, and that default is not a report from the server.
+        server.relate(["m2"], toMain: "outside")
+        server.omitPhotoState(["m2"])
+
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m3")])
+
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 0,
+            "a member whose state the server did not report is not counted: the safe default is no notice")
+        XCTAssertEqual(server.trashCalls, [[main]], "the member is never trashed on an unreported state")
     }
 
     /// Records the progress events of one operation, safely across sendable closures.
@@ -738,11 +875,14 @@ final class SeriesDissolutionTests: XCTestCase {
         server.makeStandalone(["m4"])
         server.deleteForGood("m4")
 
-        _ = try await makeOrchestrator().keepOnlyFavorites(
+        let outcome = try await makeOrchestrator().keepOnlyFavorites(
             seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
 
         XCTAssertEqual(server.trashCalls, [[main]])
         XCTAssertEqual(try journalStore.pendingJournals(), [])
+        XCTAssertEqual(
+            outcome.keptWithoutReportedRoleCount, 0,
+            "a member that the server no longer knows does not stay in the library")
     }
 
     // MARK: Server-side membership and the trash confirmation
@@ -984,6 +1124,9 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var _cachedAlbumReads: [[PhotoUID]] = []
     /// Links whose state answer carries no Photo role data.
     private var _withheldRoles = Set<String>()
+    /// Links whose answer carries no State at all: the role data still names a main photo, but the server did
+    /// not report the state, so `RemoteLinkVisibility.isActive` keeps its client default (true).
+    private var _omittedStates = Set<String>()
     private var _trashRemainsActive = false
 
     private let seriesMainNodeID: String?
@@ -1032,6 +1175,8 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     }
     /// The state answer of these links carries no Photo role data.
     func withholdPhotoRole(_ ids: [String]) { lock.withLock { _withheldRoles = Set(ids) } }
+    /// The state answer of these links carries no State: the role data still names a main photo.
+    func omitPhotoState(_ ids: [String]) { lock.withLock { _omittedStates = Set(ids) } }
     /// The person deleted the photo for good; the server no longer knows it.
     func deleteForGood(_ id: String) { lock.withLock { nodes[id] = nil } }
 
@@ -1277,9 +1422,12 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
             for id in linkIDs {
                 guard let node = nodes[id] else { continue }
                 let withheld = _withheldRoles.contains(id)
+                // An answer without State keeps the role data: `isActive` falls back to its client default.
+                let stateless = _omittedStates.contains(id)
                 visibility[id] = RemoteLinkVisibility(
-                    isActive: node.state == .active, mainPhotoLinkID: withheld ? nil : node.mainNodeID,
-                    hasExplicitPhotoState: !withheld)
+                    isActive: stateless || node.state == .active,
+                    mainPhotoLinkID: withheld ? nil : node.mainNodeID,
+                    hasExplicitPhotoState: !withheld && !stateless)
             }
             return visibility
         }
