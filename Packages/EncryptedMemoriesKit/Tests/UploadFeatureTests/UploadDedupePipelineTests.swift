@@ -896,6 +896,81 @@ final class UploadDedupePipelineTests: XCTestCase {
         }
     }
 
+    /// A foreign draft blocks the name. An earlier check saw the copy with these bytes in the trash, and the person
+    /// restored it since. The next check reads its state again instead of the cached answer and adopts the copy (#877).
+    func testADraftBlockedCheckReadsACachedInactiveCopyAgain() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            .init(
+                nameHash: "nh(IMG_1.HEIC)", contentHash: "other-content", linkState: .draft,
+                linkID: "foreign-draft", clientUID: "other-client")
+        ]
+        checker.remoteItemsByContentHash[contentHash] = RemotePhotoDuplicate(
+            nameHash: "nh(old-name.HEIC)", contentHash: contentHash, linkState: .active, linkID: "restored")
+        checker.linkVisibilityByID["restored"] = RemoteLinkVisibility(isActive: false, mainPhotoLinkID: nil)
+        let blocked = try await pipeline.resolve(d)
+        XCTAssertEqual(blocked.decision, .skip(.draftExists, remoteLinkID: "foreign-draft"))
+
+        checker.linkVisibilityByID["restored"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+        let reads = checker.linkVisibilityCallCount
+        let settled = try await pipeline.resolve(d)
+
+        XCTAssertEqual(settled.decision, .skip(.activeDuplicate, remoteLinkID: "restored"))
+        XCTAssertEqual(checker.linkVisibilityCallCount, reads + 1, "one read of the copy in this check")
+    }
+
+    /// A passing network failure while a draft blocks the name ends the check like in any other check: the error goes
+    /// to the runner, which retries without an attempt. Another failure still leaves the draft protected (#877).
+    func testATransientNetworkFailureOfADraftBlockedCheckIsNotTakenForTheDraft() async throws {
+        let failures: [any Error] = [
+            UploadError.transport(code: NSURLErrorTimedOut, message: "timed out"), URLError(.networkConnectionLost),
+        ]
+        for failure in failures {
+            let localStore = FakeIdentityStore()
+            let localChecker = FakeChecker()
+            let localPipeline = UploadDedupePipeline(store: localStore, checker: localChecker)
+            let d = descriptor(digest: Data(repeating: 7, count: 20))
+            localChecker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+                .init(
+                    nameHash: "nh(IMG_1.HEIC)", contentHash: "other-content", linkState: .draft,
+                    linkID: "foreign-draft", clientUID: "other-client")
+            ]
+            localChecker.contentFindError = failure
+            do {
+                let result = try await localPipeline.resolve(d)
+                XCTFail("a passing network failure must not become the draft decision: \(result.decision)")
+            } catch {
+                XCTAssertTrue(BackupSyncRunner.isTransientNetwork(error), "\(error)")
+            }
+            XCTAssertNotEqual(localStore.record(for: d.source)?.provesUpload, true)
+        }
+    }
+
+    func testARetryableServiceFailureOfADraftBlockedCheckIsNotTakenForTheDraft() async throws {
+        let d = descriptor(digest: Data(repeating: 7, count: 20))
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            .init(
+                nameHash: "nh(IMG_1.HEIC)", contentHash: "other-content", linkState: .draft,
+                linkID: "foreign-draft", clientUID: "other-client")
+        ]
+        for code in [429, 503] {
+            checker.contentFindError = UploadError.retryableBackend(code: code, message: "service unavailable")
+            do {
+                let result = try await pipeline.resolve(d)
+                XCTFail("a retryable service failure must not become the draft decision: \(result.decision)")
+            } catch {
+                guard case UploadError.retryableBackend(let actualCode, let message) = error else {
+                    XCTFail("expected the original retryable service failure, got \(error)")
+                    continue
+                }
+                XCTAssertEqual(actualCode, code)
+                XCTAssertEqual(message, "service unavailable")
+            }
+            XCTAssertNotEqual(store.record(for: d.source)?.provesUpload, true)
+        }
+    }
+
     func testExplicitTrashDefersCachedAdoptionToTheNormalSameNameDecision() async throws {
         let digest = Data(repeating: 7, count: 20)
         let active = descriptor(path: "/other/active.HEIC", digest: digest)

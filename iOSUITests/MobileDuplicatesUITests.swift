@@ -148,6 +148,65 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertFalse(retry.exists)
     }
 
+    func testRetryMergesOnlyTheFailedGroupAfterPartialFailure() {
+        for language in ["en", "de"] {
+            openDuplicates(
+                fixture: "-EncryptedMemoriesDuplicatesFixture",
+                extra: ["-EncryptedMemoriesDuplicatesMergeFailure"], language: language)
+            XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+            app.buttons["duplicates.mergeAll"].tap()
+            let confirmation = app.alerts.firstMatch
+            XCTAssertTrue(confirmation.waitForExistence(timeout: 10))
+            let confirm = confirmation.buttons["duplicates.mergeAll.dialog"].firstMatch
+            XCTAssertTrue(confirm.isHittable)
+            confirm.tap()
+            let title =
+                language == "de"
+                ? "Einige Duplikate wurden nicht zusammengeführt" : "Some duplicates were not merged"
+            let warning = app.alerts[title]
+            XCTAssertTrue(warning.waitForExistence(timeout: 15))
+            let message =
+                language == "de"
+                ? "1 von 2 Gruppen konnten nicht zusammengeführt werden."
+                : "1 of 2 groups could not be merged."
+            XCTAssertTrue(warning.staticTexts[message].exists)
+            let retry = warning.buttons["duplicates.retryMerge"].firstMatch
+            XCTAssertTrue(retry.exists)
+            XCTAssertEqual(retry.label, language == "de" ? "Erneut versuchen" : "Try Again")
+            keepScreenshot("duplicates-partial-retry-\(language)")
+            retry.tap()
+            XCTAssertTrue(
+                app.staticTexts[language == "de" ? "Keine Duplikate" : "No Duplicates"]
+                    .waitForExistence(timeout: 15))
+            XCTAssertFalse(warning.exists)
+            app.terminate()
+        }
+    }
+
+    func testPermanentPartialFailureHasAReasonAndOnlyOK() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture",
+            extra: ["-EncryptedMemoriesDuplicatesPermanentMergeFailure"])
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+        app.buttons["duplicates.mergeAll"].tap()
+        let confirmation = app.alerts.firstMatch
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 10))
+        let confirm = confirmation.buttons["duplicates.mergeAll.dialog"].firstMatch
+        XCTAssertTrue(confirm.isHittable)
+        confirm.tap()
+        let warning = app.alerts["Some duplicates were not merged"]
+        XCTAssertTrue(warning.waitForExistence(timeout: 15))
+        XCTAssertFalse(warning.buttons["duplicates.retryMerge"].exists)
+        XCTAssertTrue(
+            warning.staticTexts.matching(
+                NSPredicate(
+                    format: "label CONTAINS %@", "These groups could not be merged.")
+            ).firstMatch.exists)
+        keepScreenshot("duplicates-partial-permanent")
+        warning.buttons["OK"].firstMatch.tap()
+        XCTAssertTrue(group(0).waitForExistence(timeout: 5))
+    }
+
     func testMergeRemovesTheGroupFromDuplicates() {
         openDuplicates()
         let merge = app.buttons["duplicates.merge.0"]
