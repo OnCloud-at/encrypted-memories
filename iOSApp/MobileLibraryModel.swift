@@ -1534,6 +1534,7 @@ final class MobileLibraryModel {
         loadTask = Task { [weak self] in
             await retiredPendingGridClose.value
             guard let self else { return }
+            guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
             do {
                 // Suggestions validate locations as part of their content identity. Restore the existing
                 // encrypted store before publishing settled inventory, even if Map is never opened.

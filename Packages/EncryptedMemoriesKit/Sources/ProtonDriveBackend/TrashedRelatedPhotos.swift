@@ -91,7 +91,9 @@ enum TrashedRelatedPhotos {
             // be back. Their related photos follow; the error stays.
             guard !frames.isEmpty, !Task.isCancelled else { throw error }
             if let now = try? await rereadLinks(mains.map(\.nodeID)) {
-                let back = mains.filter { now[$0.nodeID]?.isActive == true }
+                let back = mains.filter {
+                    now[$0.nodeID]?.isActive == true && now[$0.nodeID]?.hasExplicitPhotoState == true
+                }
                 _ = await restoreFrames(restoredWith(back, candidates: candidates, links: links), restore: restore)
             }
             throw error

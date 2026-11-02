@@ -838,7 +838,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
     /// The constant outer gutter (points) for the normal photo levels - see `gridHorizontalMargin` for why it must
     /// not vary by level.
-    static let standardOuterMargin: CGFloat = 12
+    static let standardOuterMargin = SquareTileGridEngine.standardOuterMargin
     /// Render/layout bounds for one level. The source of the insets stays adapter-owned; the mapping itself is a
     /// pure GridCore value so overview boundaries can resolve source and target independently.
     func renderBounds(forLevel lvl: Int) -> GridRenderBounds {

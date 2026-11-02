@@ -324,6 +324,11 @@ public struct SquareTileGridEngine: Equatable, Sendable {
             defaultContentMode: .squareFillCrop, transitionKindToNext: nil, monthLabels: true),
     ]
 
+    /// The constant outer gutter (points) for the normal photo levels. It stays the same across those levels so a
+    /// transition does not change layout width while computing its anchor. It also sizes the breathing room reserved
+    /// below transient chrome above the grid (the iOS search scope picker), so all sides keep one visual rhythm.
+    public static let standardOuterMargin: CGFloat = 12
+
     /// The width-filling square side for a column count + gap - the resolution-independent slot size. Levels
     /// are defined by columns; this derives the pixel side at the current width: `(width − gap·(cols−1))/cols`.
     /// Feeding this back into the column-from-side resolve returns exactly `columns`, so the live-zoom lattice
