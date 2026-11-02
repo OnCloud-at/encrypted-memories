@@ -63,6 +63,167 @@ final class PendingBackupHandoffChainTests: XCTestCase {
             remaining.states.filter { $0.key == key && $0.needsRemoteTrash }.compactMap(\.remote),
             [middle], "B must still be scheduled after A and C complete; B has never completed trash")
     }
+    func testALaterRevisionCommittedBeforeAnOlderTileDeleteRemainsOwed() throws {
+        let fixture = try PersistentHandoffChain(deleted: false)
+        XCTAssertEqual(fixture.store.recordHandoff(fixture.handoff(fixture.middle, revision: 4)), .recorded)
+        XCTAssertEqual(fixture.store.recordHandoff(fixture.handoff(fixture.latest, revision: 5)), .recorded)
+        XCTAssertNotNil(
+            fixture.store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: fixture.key, presentation: nil, remote: fixture.original,
+                        revision: UploadBackupRevision(rawValue: 4))
+                ], at: fixture.date))
+        try fixture.complete(fixture.original)
+        XCTAssertEqual(fixture.state?.remote, fixture.latest, "the later commit follows the hidden earlier upload")
+        XCTAssertTrue(try XCTUnwrap(fixture.state).needsRemoteTrash)
+        guard fixture.state?.remote == fixture.latest else { return }
+        try fixture.complete(fixture.latest)
+        XCTAssertEqual(fixture.state?.remote, fixture.middle, "the exact revision remains owed too")
+        try fixture.complete(fixture.middle)
+        XCTAssertFalse(try XCTUnwrap(fixture.state).needsRemoteTrash)
+    }
+
+    func testAnEarlierHistoricalRevisionIsNotInheritedByARevisionDelete() throws {
+        let fixture = try PersistentHandoffChain(deleted: false)
+        XCTAssertEqual(fixture.store.recordHandoff(fixture.handoff(fixture.middle, revision: 3)), .recorded)
+        XCTAssertNotNil(
+            fixture.store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: fixture.key, presentation: nil, remote: fixture.original,
+                        revision: UploadBackupRevision(rawValue: 4))
+                ], at: fixture.date))
+        try fixture.complete(fixture.original)
+        XCTAssertEqual(fixture.state?.remote, fixture.original)
+        XCTAssertFalse(
+            try XCTUnwrap(fixture.state).needsRemoteTrash, "a prior historical revision gains no new trash authority")
+    }
+
+    func testAnUnreadableLaterCommitRefusesTheRevisionDeleteWithoutRetiringMetadata() throws {
+        let fixture = try PersistentHandoffChain(deleted: false)
+        XCTAssertEqual(fixture.store.recordHandoff(fixture.handoff(fixture.latest, revision: 5)), .recorded)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(db, "UPDATE handoff SET kind='future-kind' WHERE revision_us=5;", nil, nil, nil), SQLITE_OK
+            )
+        }
+        let before = fixture.state
+        let metadata = try fixture.metadataRows().map { $0.0 + "=" + $0.1 }
+        XCTAssertNil(
+            fixture.store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: fixture.key, presentation: nil, remote: fixture.original,
+                        revision: UploadBackupRevision(rawValue: 4))
+                ], at: fixture.date))
+        XCTAssertEqual(fixture.state, before)
+        XCTAssertEqual(try fixture.metadataRows().map { $0.0 + "=" + $0.1 }, metadata)
+    }
+
+    func testAnUnknownLatestReadDoesNotRefuseAKnownExactCommit() throws {
+        let fixture = try PersistentHandoffChain(deleted: false)
+        XCTAssertEqual(fixture.store.recordHandoff(fixture.handoff(fixture.middle, revision: 4)), .recorded)
+        XCTAssertEqual(fixture.store.recordHandoff(fixture.handoff(fixture.latest, revision: 5)), .recorded)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(db, "UPDATE handoff SET kind='future-kind' WHERE revision_us=5;", nil, nil, nil), SQLITE_OK
+            )
+        }
+        let states = fixture.store.exclude(
+            [
+                PendingExclusionRequest(
+                    key: fixture.key, presentation: nil, remote: nil, revision: UploadBackupRevision(rawValue: 4),
+                    remoteUnknown: true)
+            ], at: fixture.date)
+        XCTAssertNotNil(states, "the exact readable commit does not make the unknown latest lookup mandatory")
+        guard let deleted = states?.first else { return }
+        XCTAssertEqual(deleted.remote, fixture.middle)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(db, "UPDATE handoff SET kind='uploaded' WHERE revision_us=5;", nil, nil, nil), SQLITE_OK)
+        }
+        try fixture.complete(fixture.middle)
+        XCTAssertEqual(fixture.state?.remote, fixture.latest)
+        XCTAssertTrue(try XCTUnwrap(fixture.state).needsRemoteTrash)
+    }
+
+    func testAnUnknownHandoffDeleteKeepsItsLatestRecoveryAfterEarlierProof() throws {
+        let fixture = try PersistentHandoffChain(deleted: false)
+        XCTAssertEqual(fixture.store.recordHandoff(fixture.handoff(fixture.latest, revision: 5)), .recorded)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(db, "UPDATE handoff SET kind='future-kind' WHERE revision_us=5;", nil, nil, nil), SQLITE_OK
+            )
+        }
+        let states = fixture.store.exclude(
+            [
+                PendingExclusionRequest(
+                    key: fixture.key, presentation: nil, remote: nil, revision: UploadBackupRevision(rawValue: 4),
+                    remoteUnknown: true)
+            ], at: fixture.date)
+        XCTAssertNotNil(states, "an unreadable handoff still permits storing the exclusion without a trash target")
+        guard let deleted = states?.first else { return }
+        XCTAssertNil(deleted.remote)
+        XCTAssertFalse(deleted.needsRemoteTrash)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(db, "UPDATE handoff SET kind='uploaded' WHERE revision_us=5;", nil, nil, nil), SQLITE_OK)
+        }
+        let proven = fixture.store.trashEarlierUpload(
+            fixture.original, of: fixture.key, generation: deleted.generation, at: fixture.date)
+        XCTAssertEqual(proven?.remote, fixture.original)
+        try fixture.complete(fixture.original)
+        XCTAssertEqual(fixture.state?.remote, fixture.latest)
+        XCTAssertTrue(try XCTUnwrap(fixture.state).needsRemoteTrash)
+    }
+
+    func testLegacySavedTrashWithTheSameLatestPhotoDoesNotRearmIt() throws {
+        let fixture = try PersistentHandoffChain()
+        try fixture.complete(fixture.original)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(db, "DELETE FROM pending_info WHERE key GLOB 'pending-trash:*';", nil, nil, nil), SQLITE_OK
+            )
+        }
+        let before = fixture.state
+        XCTAssertEqual(fixture.store.resumeLaterTrash(for: fixture.key, at: fixture.date), .unchanged)
+        XCTAssertEqual(fixture.state, before)
+        XCTAssertFalse(try XCTUnwrap(fixture.state).needsRemoteTrash)
+    }
+
+    func testAnOlderGenerationMarkerDoesNotDisableLegacyLatestRecovery() throws {
+        let fixture = try PersistentHandoffChain()
+        try fixture.record(fixture.latest, revision: 3)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(
+                    db,
+                    "DELETE FROM pending_info WHERE key GLOB 'pending-trash:*' AND key NOT GLOB '*:generation'; UPDATE pending_info SET value=0 WHERE key GLOB 'pending-trash:*:generation';",
+                    nil, nil, nil), SQLITE_OK)
+        }
+        try fixture.complete(fixture.original)
+        XCTAssertEqual(fixture.state?.remote, fixture.latest)
+        XCTAssertTrue(try XCTUnwrap(fixture.state).needsRemoteTrash)
+    }
+
+    func testFutureMetadataWithoutASourceCannotBeRetiredByANewDelete() throws {
+        let fixture = try PersistentHandoffChain(deleted: false)
+        try fixture.raw { db in
+            XCTAssertEqual(
+                sqlite3_exec(
+                    db, "INSERT INTO pending_info VALUES('\(fixture.metadataPrefix)v1:generation',9);", nil, nil, nil),
+                SQLITE_OK)
+        }
+        let before = try fixture.metadataRows().map { $0.0 + "=" + $0.1 }
+        XCTAssertNil(
+            fixture.store.exclude(
+                [PendingExclusionRequest(key: fixture.key, presentation: nil, remote: fixture.original)],
+                at: fixture.date))
+        XCTAssertNil(fixture.state)
+        XCTAssertEqual(try fixture.metadataRows().map { $0.0 + "=" + $0.1 }, before)
+    }
+
     func testCompletedDutiesSurviveReopenWithoutCyclingBackToEarlierPhotos() throws {
         let fixture = try PersistentHandoffChain()
         try fixture.record(fixture.middle, revision: 2)
@@ -416,7 +577,7 @@ private final class PersistentHandoffChain {
     var state: PendingSourceState? { store.sourceStateRead(for: key).state }
     var url: URL { directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName) }
 
-    init(identifier: String = "persistent-asset", beginOperation: Bool = true) throws {
+    init(identifier: String = "persistent-asset", beginOperation: Bool = true, deleted: Bool = true) throws {
         key = PendingSourceKey(kind: .photoLibraryAsset, identifier: identifier)
         store = try XCTUnwrap(
             PendingBackupManifestStore(
@@ -426,6 +587,10 @@ private final class PersistentHandoffChain {
                 PendingHandoff(
                     key: key, revision: UploadBackupRevision(rawValue: 1), remote: original, kind: .uploaded,
                     createdAt: date.addingTimeInterval(-20))), .recorded)
+        if !deleted {
+            generation = 0
+            return
+        }
         let excluded = try XCTUnwrap(
             store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: original)], at: date)?.first)
         generation = excluded.generation

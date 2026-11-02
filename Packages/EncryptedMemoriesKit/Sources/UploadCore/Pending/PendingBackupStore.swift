@@ -498,12 +498,20 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     else { return false }
                     guard
                         resetTrashDuties(
-                            for: request.key, generation: previous?.generation ?? 0, nextGeneration: state.generation)
+                            for: request.key, generation: previous?.generation ?? 0,
+                            nextGeneration: request.remoteUnknown ? nil : state.generation)
                     else { return false }
-                    if let durable {
+                    var owedCommits = Set<PhotoUID>(durable.map { [$0] } ?? [])
+                    // An unknown handoff must not reject the stored delete or claim its initial inventory is complete.
+                    // Its existing earlier-upload retry keeps the legacy latest-handoff recovery after proof arrives.
+                    if let revision = request.revision, remote != nil, !request.remoteUnknown {
+                        guard case .readable(let latest) = latestHandoffLocked(request.key) else { return false }
+                        if let latest, latest.revision >= revision { owedCommits.insert(latest.remote) }
+                    }
+                    for commit in owedCommits {
                         guard
                             writeTrashMetadata(
-                                for: request.key, remote: durable, completed: false, generation: state.generation)
+                                for: request.key, remote: commit, completed: false, generation: state.generation)
                         else { return false }
                     }
                     states.append(state)
@@ -805,8 +813,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return committed ? result : .unreadable
     }
 
-    /// Versioned integer metadata adds no schema objects. A generation marker means this delete records every late
-    /// duty; a legacy delete without that marker keeps its former latest-handoff fallback.
+    /// Versioned integer metadata adds no schema objects. A generation marker means its initial
+    /// handoff selection is known. A legacy or unreadable-handoff delete keeps its former latest-handoff recovery.
     private struct TrashDuties {
         var generationKnown = false
         var owed = Set<PhotoUID>()
@@ -833,45 +841,47 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             bind: { stmt in
                 // Base64 and the fixed prefix contain no GLOB metacharacters. GLOB keeps case-sensitive source identity.
                 self.bindText(stmt, 1, prefix + "*")
-            }
-        ) { stmt in
-            guard let encoded = columnText(stmt, 0, roundTrip: true), sqlite3_column_type(stmt, 1) == SQLITE_INTEGER
-            else {
-                decoded = false
-                return
-            }
-            let storedGeneration = sqlite3_column_int64(stmt, 1)
-            guard storedGeneration >= 0, storedGeneration <= generation else {
-                decoded = false
-                return
-            }
-            let versioned = String(encoded.dropFirst(prefix.count))
-            guard versioned.hasPrefix("v1:") else {
-                decoded = false
-                return
-            }
-            let suffix = String(versioned.dropFirst(3))
-            if suffix == "generation" {
-                result.generationKnown = storedGeneration == generation
-                return
-            }
-            let fields = suffix.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-            guard fields.count == 3, let volumeBytes = Data(base64Encoded: fields[0]),
-                let linkBytes = Data(base64Encoded: fields[1]), let volume = String(data: volumeBytes, encoding: .utf8),
-                let link = String(data: linkBytes, encoding: .utf8), !link.isEmpty,
-                fields[2] == "owed" || fields[2] == "completed"
-            else {
-                decoded = false
-                return
-            }
-            let remote = PhotoUID(volumeID: volume, nodeID: link)
-            guard encoded == Self.trashMetadataKey(for: key, remote: remote, completed: fields[2] == "completed") else {
-                decoded = false
-                return
-            }
-            guard storedGeneration == generation else { return }
-            if fields[2] == "completed" { result.completed.insert(remote) } else { result.owed.insert(remote) }
-        }
+            },
+            row: { stmt in
+                guard let encoded = columnText(stmt, 0, roundTrip: true), sqlite3_column_type(stmt, 1) == SQLITE_INTEGER
+                else {
+                    decoded = false
+                    return
+                }
+                let storedGeneration = sqlite3_column_int64(stmt, 1)
+                guard storedGeneration >= 0, storedGeneration <= generation else {
+                    decoded = false
+                    return
+                }
+                let versioned = String(encoded.dropFirst(prefix.count))
+                guard versioned.hasPrefix("v1:") else {
+                    decoded = false
+                    return
+                }
+                let suffix = String(versioned.dropFirst(3))
+                if suffix == "generation" {
+                    result.generationKnown = storedGeneration == generation
+                    return
+                }
+                let fields = suffix.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+                guard fields.count == 3, let volumeBytes = Data(base64Encoded: fields[0]),
+                    let linkBytes = Data(base64Encoded: fields[1]),
+                    let volume = String(data: volumeBytes, encoding: .utf8),
+                    let link = String(data: linkBytes, encoding: .utf8), !link.isEmpty,
+                    fields[2] == "owed" || fields[2] == "completed"
+                else {
+                    decoded = false
+                    return
+                }
+                let remote = PhotoUID(volumeID: volume, nodeID: link)
+                guard encoded == Self.trashMetadataKey(for: key, remote: remote, completed: fields[2] == "completed")
+                else {
+                    decoded = false
+                    return
+                }
+                guard storedGeneration == generation else { return }
+                if fields[2] == "completed" { result.completed.insert(remote) } else { result.owed.insert(remote) }
+            })
         guard succeeded, decoded else { return nil }
         result.owed.subtract(result.completed)
         return result
