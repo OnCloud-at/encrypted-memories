@@ -1800,10 +1800,9 @@ public actor PendingBackupCoordinator {
 
     /// The next future retry of a readable source with an owed effect, from the last known states.
     /// A source whose result write stayed unsaved keeps its real stored date, so a due source never
-    /// spins the timer: only future dates qualify. Keys with a pending effect write are hidden
-    /// (their row will be removed on success, so the stored date is stale). Keys with a pending
-    /// action write remain visible: their source_state persists and the stored date is meaningful.
-    /// When due dates are included, hide all pending writes to prevent a stale due date from firing.
+    /// spins the timer: only future dates qualify. Keys with a pending effect write are hidden,
+    /// because the pending write will replace or remove the cached date. Keys with a pending
+    /// action write remain visible: the action row is separate, so the stored date stays meaningful.
     private func readableNextEffectDate(includingDue: Bool = false) -> Date? {
         let current = now()
         let hiddenKeys: Set<PendingSourceKey>
