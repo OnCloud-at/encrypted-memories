@@ -4,6 +4,7 @@ import LibraryRuntimeAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import Observation
 import PhotosCore
+import ProtonDriveBackend
 import TimelineCore
 import UIKit
 
@@ -127,7 +128,11 @@ final class MobileAccountRuntime {
             DuplicatesMergeBackgroundGrace.shared.applicationDidBecomeActive(model: libraryModel.duplicates)
             // Foregrounding reopens the background-indexing gate promptly.
             libraryModel.smartSearch?.noteConditionsChanged()
-            Task { await libraryModel.refreshAccountInfo() }
+            Task {
+                await ProtonAccountInfoRequestCause.foregroundActivation.run {
+                    await libraryModel.refreshAccountInfo()
+                }
+            }
         case .foregroundInactive:
             break
         }

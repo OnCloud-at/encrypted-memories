@@ -71,8 +71,9 @@ final class DriveSession: @unchecked Sendable {
 
     // MARK: - Authenticated JSON
 
-    func getJSON<T: Decodable>(_ path: String, as type: T.Type) async throws -> T {
-        let data = try await authedData(path: path, method: "GET", retryOn429: true)
+    /// `retryOnRateLimit` false answers a rate limit with an error at once, for a read that has a cheaper fallback.
+    func getJSON<T: Decodable>(_ path: String, as type: T.Type, retryOnRateLimit: Bool = true) async throws -> T {
+        let data = try await authedData(path: path, method: "GET", retryOn429: retryOnRateLimit)
         return try JSONDecoder().decode(T.self, from: data)
     }
 
@@ -610,7 +611,10 @@ extension DriveSession {
     /// Pagination integrity: a full page that contributes zero new (shareID, linkID) identities is
     /// an infinite loop signal; it must fail with `DrivePaginationError.trashPageWithoutNewIDs`
     /// instead of repeating forever or returning an incomplete list.
-    func listTrash(volumeID: String, pageSize: Int = 150) async throws -> [TrashLink] {
+    ///
+    /// `retryOnRateLimit` false answers a rate limit with an error at once, for a listing that a restore reads only to
+    /// find the related photos and that must not hold the restore back.
+    func listTrash(volumeID: String, pageSize: Int = 150, retryOnRateLimit: Bool = true) async throws -> [TrashLink] {
         guard pageSize > 0 else { throw DrivePaginationError.invalidPageSize(pageSize) }
         var idsByShare: [String: [String]] = [:]
         var seenByShare: [String: Set<String>] = [:]
@@ -618,7 +622,8 @@ extension DriveSession {
         while true {
             try Task.checkCancellation()
             let r = try await getJSON(
-                "/drive/volumes/\(volumeID)/trash?Page=\(pageIndex)&PageSize=\(pageSize)", as: VolumeTrashResponse.self)
+                "/drive/volumes/\(volumeID)/trash?Page=\(pageIndex)&PageSize=\(pageSize)", as: VolumeTrashResponse.self,
+                retryOnRateLimit: retryOnRateLimit)
             try Task.checkCancellation()
             var rawCount = 0
             var newCount = 0
@@ -645,7 +650,7 @@ extension DriveSession {
                     "/drive/shares/\(shareID)/links/fetch_metadata",
                     method: "POST",
                     body: ["LinkIDs": chunk],
-                    retryOnRateLimit: true
+                    retryOnRateLimit: retryOnRateLimit
                 )
                 let decoded = try JSONDecoder().decode(LinkMetaBatchResponse.self, from: data)
                 all.append(contentsOf: decoded.links ?? [])

@@ -20,8 +20,9 @@ public enum PhotoLibraryRefreshWindow {
     /// Runs the window and returns how it ended. `scheduleNext` submits the next refresh request; it runs first. In Low
     /// Power Mode the window does nothing else. Then the account gets `accountLimit`. Backup off or paused ends the window
     /// through `backupStopped` or `backupPaused`, as the long window does. Then the scan runs until it ends or the
-    /// window's end stops it. A scan that started calls `ensureLongWindowRequest` unless the window expired, so the next
-    /// long window uploads what it queued; the short window keeps no timer of its own.
+    /// window's end stops it. A visit's pass waiting for its first network path does not prevent this scan and stays
+    /// waiting; the scan never starts its uploads. A scan that started calls `ensureLongWindowRequest` unless the window
+    /// expired, so the next long window uploads what it queued; the short window keeps no timer of its own.
     public static func run(
         scheduleNext: () -> Void,
         isLowPowerModeOn: () -> Bool,

@@ -15,6 +15,7 @@ struct EncryptedMemoriesApp: App {
     private let metal3Supported: Bool
 
     init() {
+        RequestTraceClock.start()
         let metal3Supported = Metal3RuntimeCapability.supportsDefaultDevice()
         self.metal3Supported = metal3Supported
         if metal3Supported {
@@ -520,8 +521,12 @@ struct RootView: View {
             } else {
                 ProtonLoadingView(caption: String(localized: "loading.building_library"))
             }
-        case .failed(let message):
-            BackendErrorView(message: message, retry: { model.retryBackend() }, signOut: { model.signOut() })
+        case .failed(let message, let isRetryable):
+            BackendErrorView(
+                message: message,
+                isRetryable: isRetryable,
+                retry: { model.retryBackend() },
+                signOut: { model.signOut() })
         case .preparing, .idle:
             ProtonLoadingView(caption: String(localized: "loading.building_library"))
         }
@@ -542,6 +547,9 @@ private struct SignOutFailureView: View {
 
 private struct BackendErrorView: View {
     let message: String
+    /// False only when the open failure is confirmed permanent; the Retry button stays hidden then,
+    /// because another attempt with the same session cannot succeed.
+    let isRetryable: Bool
     let retry: () -> Void
     let signOut: () -> Void
     @State private var confirmSignOut = false
@@ -560,7 +568,9 @@ private struct BackendErrorView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
             HStack(spacing: 10) {
-                RetryButton(.prominent, action: retry).frame(minWidth: 120)
+                if isRetryable {
+                    RetryButton(.prominent, action: retry).frame(minWidth: 120)
+                }
                 Button(L10n.string("action.sign_out")) { confirmSignOut = true }
                     .buttonStyle(.plain)
                     .foregroundStyle(ProtonColor.textHint)

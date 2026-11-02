@@ -2975,15 +2975,15 @@ public actor BackupSyncRunner {
             }
             throw error
         // The upload can return its uid after a timeout or cancellation decided the race: Proton has the file then, and
-        // the normal settlement records it. A source that a deletion or exclusion removed keeps the cancellation.
+        // the normal settlement records it before a removed queue row ends settlement as cancelled.
         case .timedOut:
-            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
+            if let uid = await join.cancelAndJoin() { return uid }
             throw UploadError.transport(
                 code: NSURLErrorTimedOut,
                 message: URLError(.timedOut).localizedDescription
             )
         case .cancelled:
-            if let uid = await join.cancelAndJoin(), !sourceWasRemoved(source) { return uid }
+            if let uid = await join.cancelAndJoin() { return uid }
             if policyCancelledTransfers.contains(request.cancellationToken) { throw BackupWorkDeferredError() }
             throw CancellationError()
         }

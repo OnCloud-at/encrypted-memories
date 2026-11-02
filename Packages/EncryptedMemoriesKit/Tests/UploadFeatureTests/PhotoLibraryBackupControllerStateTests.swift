@@ -3850,26 +3850,91 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
-        /// A pass that waits for the first network path keeps its start: the refresh scan does not take the lock it
-        /// would need when the path arrives.
-        func testARefreshScanStartsNothingWhileAPassWaitsForTheFirstNetworkPath() async throws {
-            let runtime = LibraryRuntimeState.makeProcessState()
-            let fixture = try makeRefreshFixture(
-                prefix: "refresh-scan-deferred", networkKnown: false, inForeground: true, runtime: runtime)
+        func testARefreshWindowQueuesNewPhotosWhileTheFirstPathDeferralWaits() async throws {
+            try await assertRefreshWindowQueuesNewPhotos(deferred: true)
+        }
+
+        func testARefreshWindowWithoutADeferralQueuesNewPhotosAsBefore() async throws {
+            try await assertRefreshWindowQueuesNewPhotos(deferred: false)
+        }
+
+        private func assertRefreshWindowQueuesNewPhotos(deferred: Bool) async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: false, networkDetermined: false)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "refresh-window-first-path", source: signals.source, firstNetworkPathWait: .seconds(60))
             defer { fixture.cleanup() }
             let controller = fixture.controller
-            let scans = PassCounter()
-            controller.replaceScanForTesting { _ = scans.increment() }
-            // In the background only a window starts a pass (#832), so the pass waits from the person's visit.
+            if deferred { controller.syncNow() }
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, deferred ? .foreground : nil)
+            signals.setAppInBackground(true)
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            let state = try XCTUnwrap(
+                UploadBackupStateManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.stateDatabaseFileName)))
+            defer {
+                queue.close()
+                state.close()
+            }
+            let engine = UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue)
+            let photo = UploadBackupAssetCandidate(
+                snapshot: .init(
+                    source: .init(kind: .photoLibraryAsset, identifier: "new-photo"),
+                    revision: .init(rawValue: 1), resourceCount: 1), originalFilename: "new-photo.heic")
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                _ = try await engine.enqueueBatch([photo])
+            }
+            let events = WindowEvents()
+
+            let outcome = await runRefreshWindow(events: events, wait: .ready(controller))
+
+            XCTAssertEqual(outcome, .ran)
+            XCTAssertEqual(owners.values, [.iOSRefreshTask])
+            XCTAssertEqual(
+                queue.entry(for: photo.snapshot.source, revision: photo.snapshot.revision)?.state, .discovered)
+            XCTAssertEqual(queue.summary().waiting, 2, "the existing photo and the new photo both wait")
+            XCTAssertEqual(controller.reconcileStartsForTesting, 0, "the refresh window never starts an upload drain")
+            XCTAssertFalse(controller.isAutoResumeScheduledForTesting, "the background scan plans no upload pass")
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, deferred ? .foreground : nil)
+            XCTAssertEqual(
+                controller.deferredStartWaiterCountForTesting, 0, "the refresh scan never waits for the path")
+            XCTAssertEqual(events.values, ["next", "account", "wait", "long window"])
+            await controller.shutdown()
+        }
+
+        func testARefreshWindowStartsNoUploadWhenTheDeferredFirstPathArrivesDuringItsScan() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: false, networkDetermined: false)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "refresh-window-path-arrives", source: signals.source, firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
             controller.syncNow()
-            XCTAssertFalse(controller.isSyncing, "the pass waits for the first path")
             XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground)
-            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            signals.setAppInBackground(true)
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                await MainActor.run {
+                    owners.record(controller.executionOwnerForTesting)
+                    signals.setNetworkDetermined(true)
+                    controller.mobileDataSettingDidChange()
+                    XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground)
+                    XCTAssertEqual(controller.reconcileStartsForTesting, 0)
+                }
+            }
+            let before = try queueSummary(fixture)
+            let events = WindowEvents()
 
-            let end = await controller.backgroundRefreshScan()
+            let outcome = await runRefreshWindow(events: events, wait: .ready(controller))
 
-            XCTAssertEqual(end, .notNeeded)
-            XCTAssertEqual(scans.count, 0)
+            XCTAssertEqual(outcome, .ran)
+            XCTAssertEqual(owners.values, [.iOSRefreshTask])
+            XCTAssertEqual(controller.reconcileStartsForTesting, 0, "the arriving path starts no upload")
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground, "the full pass stays pending")
+            XCTAssertEqual(try queueSummary(fixture), before)
+            XCTAssertFalse(controller.isAutoResumeScheduledForTesting)
             await controller.shutdown()
         }
 
@@ -3891,6 +3956,170 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             window.cancel()
             _ = await window.value
             await controller.shutdown()
+        }
+
+        /// #1013: the automatic pass of the person's visit waited for the first network path; the path is known now,
+        /// but in the background only a window starts that pass. A refresh window still scans, and the pass stays.
+        func testARefreshScanRunsWhileThePersonsPassWaitsForALongWindow() async throws {
+            let parked = try makeParkedVisitPass(prefix: "refresh-scan-parked")
+            defer { parked.fixture.cleanup() }
+            let controller = parked.fixture.controller
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .scanned, "the refresh window scans")
+            XCTAssertEqual(owners.values, [.iOSRefreshTask])
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .foreground, "the person's pass still waits")
+            XCTAssertFalse(controller.isSyncing)
+            await controller.shutdown()
+        }
+
+        func testARefreshScanWhileThePersonsPassWaitsUploadsNothing() async throws {
+            let parked = try makeParkedVisitPass(prefix: "refresh-scan-parked-no-upload")
+            defer { parked.fixture.cleanup() }
+            let controller = parked.fixture.controller
+            controller.replaceScanForTesting {}
+            let before = try queueSummary(parked.fixture)
+            XCTAssertEqual(before.waiting, 1, "one photo waits for its upload")
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .scanned)
+            XCTAssertEqual(controller.reconcileStartsForTesting, 0, "the runner never drains, so nothing uploads")
+            XCTAssertEqual(try queueSummary(parked.fixture), before, "the photo still waits")
+            await controller.shutdown()
+        }
+
+        /// A long window during the scan makes the scan yield, then runs the person's pass that waited for it.
+        func testALongWindowDuringTheRefreshScanRunsThePersonsWaitingPass() async throws {
+            let parked = try makeParkedVisitPass(prefix: "refresh-scan-parked-long-window")
+            defer { parked.fixture.cleanup() }
+            let controller = parked.fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                if scans.increment() == 1 {
+                    while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                    throw CancellationError()
+                }
+            }
+            let refresh = Task { @MainActor in await controller.backgroundRefreshScan() }
+            let scanning = await waitUntil { scans.count == 1 }
+            XCTAssertTrue(scanning)
+
+            // A long window that does not stop the scan would wait for it forever; the watchdog bounds the test.
+            let watchdogFired = LockedFlag(false)
+            let watchdog = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { return }
+                watchdogFired.value = true
+                controller.stopSync()
+            }
+            let catchUp = await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+            watchdog.cancel()
+
+            XCTAssertFalse(watchdogFired.value, "the long window stopped the scan itself")
+            XCTAssertEqual(catchUp, .done)
+            XCTAssertEqual(owners.values, [.iOSRefreshTask, .iOSBackgroundTask], "the long window's pass scanned")
+            XCTAssertEqual(controller.reconcileStartsForTesting, 1, "the long window's pass drained the queue")
+            XCTAssertNil(controller.deferredStartOwnerForTesting, "the long window took the person's pass")
+            let refreshEnd = await refresh.value
+            XCTAssertEqual(refreshEnd, .yielded, "the refresh scan yielded to the long window")
+            await controller.shutdown()
+        }
+
+        /// The person opens the app during the scan; the pass of their visit starts when the scan ends.
+        func testTheForegroundDuringTheRefreshScanStartsThePersonsWaitingPassAfterIt() async throws {
+            let parked = try makeParkedVisitPass(prefix: "refresh-scan-parked-foreground")
+            defer { parked.fixture.cleanup() }
+            let controller = parked.fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            let release = LockedFlag(false)
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                if scans.increment() == 1 {
+                    while !release.value, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                }
+            }
+            let refresh = Task { @MainActor in await controller.backgroundRefreshScan() }
+            let scanning = await waitUntil { scans.count == 1 }
+            XCTAssertTrue(scanning)
+
+            parked.runtime.update { $0.executionOpportunity = .foregroundActive }
+            release.value = true
+            let refreshEnd = await refresh.value
+            XCTAssertEqual(refreshEnd, .scanned)
+
+            let started = await waitUntil { controller.reconcileStartsForTesting == 1 && !controller.isSyncing }
+            XCTAssertTrue(started, "the person's pass runs after the scan")
+            XCTAssertEqual(owners.values, [.iOSRefreshTask, .foreground])
+            XCTAssertNil(controller.deferredStartOwnerForTesting)
+            await controller.shutdown()
+        }
+
+        /// The person's retry waits as well once the path is known, for example behind another run's lock. It can start
+        /// in the background, so the refresh window leaves the lock free for it.
+        func testARefreshScanStartsNothingWhileThePersonsRetryWaitsWithTheKnownPath() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: false, networkDetermined: false)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "refresh-scan-parked-manual", source: signals.source, firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            let lock = try XCTUnwrap(
+                BackupExecutionLockManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.lockDatabaseFileName)))
+            defer { lock.close() }
+            XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
+            await controller.retryUserResolvableWork()
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .manual, "the retry waits for the first path")
+            // The path becomes known while the other run still holds the lock; the retry keeps waiting.
+            signals.setAppInBackground(true)
+            signals.setNetworkDetermined(true)
+            controller.mobileDataSettingDidChange()
+            XCTAssertEqual(controller.deferredStartOwnerForTesting, .manual)
+            XCTAssertFalse(controller.isSyncing)
+            XCTAssertTrue(lock.release(runID: "other-live-run"))
+
+            let end = await controller.backgroundRefreshScan()
+
+            XCTAssertEqual(end, .notNeeded, "the refresh window keeps the lock free for the person's retry")
+            XCTAssertEqual(owners.values, [])
+            // The next network update starts the retry in the background.
+            signals.announceChange()
+            let started = await waitUntil { owners.values == [.manual] && !controller.isSyncing }
+            XCTAssertTrue(started, "the person's retry runs")
+            await controller.shutdown()
+        }
+
+        /// The person's visit starts the automatic pass before the first network path; the app then leaves the
+        /// foreground, and the path arrives. In the background the pass waits for a long window or the foreground.
+        private struct ParkedVisitPass {
+            let fixture: ControllerFixture
+            let runtime: LibraryRuntimeState
+        }
+
+        private func makeParkedVisitPass(prefix: String) throws -> ParkedVisitPass {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeRefreshFixture(
+                prefix: prefix, networkKnown: false, inForeground: true, runtime: runtime)
+            fixture.controller.syncNow()
+            XCTAssertFalse(fixture.controller.isSyncing, "the pass waits for the first path")
+            XCTAssertEqual(fixture.controller.deferredStartOwnerForTesting, .foreground)
+            runtime.update {
+                $0.executionOpportunity = .backgroundPermitted
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            return ParkedVisitPass(fixture: fixture, runtime: runtime)
         }
 
         /// A long window arrives while a refresh scan runs. The scan yields its lock, and the long window's pass scans and

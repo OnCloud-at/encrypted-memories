@@ -102,6 +102,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// uploads recorded before that refresh started. The capacity check subtracts the rest from the account quota.
     private var uploadedBytes: Int64 = 0
     private var uploadedBytesInQuota: Int64 = 0
+    /// Automatic callers share only a running refresh for the same uploaded-byte snapshot in this session.
+    nonisolated let accountInfoRefreshes = SharedInFlightOperations<Int64, Void>()
     private var quotaRefresh: Task<Void, Never>?
     private var quotaRefreshWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var lastQuotaRefreshAt: ContinuousClock.Instant?
@@ -395,6 +397,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // Drain cache-owned SDK tasks now, including flights orphaned by admission cancellation.
         await sharedAlbumSnapshotCache.invalidateAll()
         await presentationNodeReads.invalidateAndJoin()
+        await accountInfoRefreshes.invalidateAndJoin()
 
         let timelineTask = timelineLoadTask?.task
         timelineLoadTask = nil
@@ -1835,12 +1838,30 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Refreshes the lightweight account snapshot used by Settings (email and Drive quota). The existing
     /// account-data request also updates the encrypted offline cache; it does not rebuild the signed-in client.
     func refreshAccountInfo() async throws {
-        let recordedBefore = uploadedBytes
         try await withOpenSession(cause: .account) { bridge in
-            _ = try await bridge.driveSession.fetchAccountData()
+            switch ProtonRequestContext.cause {
+            case .accountForeground, .accountSettings:
+                try await bridge.accountInfoRefreshes.run(bridge.uploadedBytes) {
+                    try await bridge.refreshAccountInfoImpl()
+                }
+            default:
+                // An explicit or quota refresh needs a new answer. Later automatic callers must not join
+                // an older automatic operation either; its existing waiters still receive its result.
+                await bridge.accountInfoRefreshes.invalidate()
+                try await bridge.refreshAccountInfoImpl()
+            }
         }
+    }
+
+    private func refreshAccountInfoImpl() async throws {
+        let recordedBefore = uploadedBytes
+        _ = try await driveSession.fetchAccountData()
         // Uploads recorded during the request stay counted; the response may not contain them yet.
         uploadedBytesInQuota = max(uploadedBytesInQuota, recordedBefore)
+    }
+
+    func recordCompletedUpload(bytes: Int64) {
+        uploadedBytes += max(0, bytes)
     }
 
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
@@ -1979,6 +2000,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func restore(_ uids: [PhotoUID]) async throws {
         try await withOpenSession(cause: .trashWrite) { bridge in
             let root = try await bridge.resolvePhotosRoot()
+            try await bridge.listTrashForRelatedPhotos(of: uids)
             _ = try await TrashedRelatedPhotos.restore(
                 uids, candidates: bridge.recentlyDeleted.trashedRelatedPhotos(of: uids),
                 readLinks: { linkIDs in
@@ -1999,6 +2021,23 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             bridge.recentlyDeleted.restored(uids)
             bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
             await bridge.reportRecentlyDeleted()
+        }
+    }
+
+    /// The related photos that a restore takes along are known from a trash listing of this session. A restore that
+    /// runs before any listing, such as the replay of a pending restore after a relaunch, lists the trash once. A failed
+    /// or rate-limited listing never holds the restore back: the main photos come back alone, as before. A cancel ends
+    /// the restore before any photo changes; URLSession reports a cancelled request as `URLError.cancelled`, so the
+    /// task state decides, not the error type.
+    func listTrashForRelatedPhotos(of mains: [PhotoUID]) async throws {
+        guard !recentlyDeleted.hasAppliedListing, recentlyDeleted.trashedRelatedPhotos(of: mains).isEmpty else {
+            return
+        }
+        do {
+            _ = try await listTrash(retryOnRateLimit: false)
+        } catch {
+            try Task.checkCancellation()
+            DebugLog.log("restore: trash listing failed, the main photos come back alone - \(error)")
         }
     }
 
@@ -2026,11 +2065,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     /// Lists the volume trash, stores the listing, and registers its photos for their thumbnails.
-    private func listTrash() async throws -> [PhotoItem] {
+    private func listTrash(retryOnRateLimit: Bool = true) async throws -> [PhotoItem] {
         guard !isShutDown else { throw CancellationError() }
         let ticket = recentlyDeleted.beginListing()
         let root = try await resolvePhotosRoot()
-        let files = try await driveSession.listTrash(volumeID: root.volumeID)
+        let files = try await driveSession.listTrash(volumeID: root.volumeID, retryOnRateLimit: retryOnRateLimit)
             .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
         // Hide related photos (Live Photo videos, series frames), like the timeline; a restore of the main takes them.
         let (links, related) = TrashedRelatedPhotos.split(files, volumeID: root.volumeID)
@@ -2741,7 +2780,7 @@ extension DriveSDKBridge: PhotoUploading {
                 throw error
             }
             await operation.releaseResources()
-            uploadedBytes += max(0, request.fileSize)
+            recordCompletedUpload(bytes: request.fileSize)
             logging.completed(nodeID: ids.nodeUid.nodeID, filename: request.name)
             let uid = PhotoUID(volumeID: ids.nodeUid.volumeID, nodeID: ids.nodeUid.nodeID)
             if mainPhotoUid == nil {

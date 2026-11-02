@@ -1577,6 +1577,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
         XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
+        XCTAssertFalse(model.signOutCleanupFailed)
         XCTAssertEqual(model.scopePresentationRevision, revision &+ 1)
         XCTAssertNil(model.backend)
     }
@@ -1587,6 +1588,94 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
 
     @MainActor func testSignOutClosesPendingSessionBeforePurging() async throws {
         try await verifySignOut(startRetry: false)
+    }
+
+    /// A second start cancels the load that closes the pending pair of the first start. The sign-out purge
+    /// still waits until that close ended and the pending store is closed.
+    @MainActor func testSignOutJoinsThePendingPairCloseOfALoadThatANewerStartCancelled() async throws {
+        let model = MobileLibraryModel()
+        let pending = try MobilePendingOwnerFixture(model: model)
+        defer { Task { await pending.close() } }
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("close") } }
+        model.pendingGridCloseHoldForTesting = { await latch.block("close") }
+        // The hosted test owns this synthetic account.
+        let session = ProtonSession(
+            uid: "pending-pair-" + UUID().uuidString, accessToken: "access", refreshToken: "refresh",
+            keyPassword: "key")
+        let leaseBefore = model.locationStoreLeaseForTesting
+        model.configure(session: session, store: SessionKeychainStore())
+        let closing = await waitForMobileOwner { await latch.hasEntered("close") }
+        XCTAssertTrue(closing, "the first start closes the live pending pair")
+        guard closing else { return }
+        let configuredWhileClosing = await waitForMobileOwner(timeout: .milliseconds(300)) {
+            model.locationStoreLeaseForTesting != leaseBefore
+        }
+        XCTAssertFalse(configuredWhileClosing, "the load opens no store before the retired pair is closed")
+        model.configure(session: session, store: SessionKeychainStore())
+
+        let root = try XCTUnwrap(BackupLocalDataPurge.localDataRoots().first)
+        let marker = root.appendingPathComponent("owner-join-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data([1]).write(to: marker)
+        defer {
+            BackupLocalDataPurge.markPurgeCompleted()
+            try? FileManager.default.removeItem(at: marker)
+        }
+        BackupLocalDataPurge.requestPurgeOnSignOut()
+        model.configure(session: nil, store: SessionKeychainStore())
+        XCTAssertTrue(model.isSigningOut)
+        let completedWhileHeld = await waitForMobileOwner(timeout: .seconds(1)) {
+            !model.isSigningOut || model.signOutCleanupFailed
+        }
+        XCTAssertFalse(completedWhileHeld, "the purge waits for the close of the pending pair")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(pending.store.isOperational())
+
+        await latch.release("close")
+        let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
+        XCTAssertTrue(completed)
+        XCTAssertFalse(model.signOutCleanupFailed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertFalse(pending.store.isOperational(), "the close ends with the pending store closed")
+    }
+
+    /// A newer start cancels the load that still waits for the close of a retired pending pair. The
+    /// cancelled load must not open the location store when that close ends, because it would revoke
+    /// the newer load's lease.
+    @MainActor func testACancelledLoadOpensNoLocationStoreAfterTheRetiredPairCloseEnds() async throws {
+        let model = MobileLibraryModel()
+        let pending = try MobilePendingOwnerFixture(model: model)
+        defer { Task { await pending.close() } }
+        let latch = MobileRetryLifecycleLatch()
+        defer { Task { await latch.release("close") } }
+        model.pendingGridCloseHoldForTesting = { await latch.block("close") }
+        // The hosted test owns this synthetic account.
+        let session = ProtonSession(
+            uid: "cancelled-load-" + UUID().uuidString, accessToken: "access", refreshToken: "refresh",
+            keyPassword: "key")
+        let leaseBefore = model.locationStoreLeaseForTesting
+        model.configure(session: session, store: SessionKeychainStore())
+        let closing = await waitForMobileOwner { await latch.hasEntered("close") }
+        XCTAssertTrue(closing, "the first start closes the live pending pair")
+        guard closing else { return }
+        // The second start cancels the first load. Its own retired pair is empty, so it opens the
+        // store without waiting for the held close.
+        model.configure(session: session, store: SessionKeychainStore())
+        let openedByNewerLoad = await waitForMobileOwner {
+            model.locationStoreLeaseForTesting != leaseBefore
+        }
+        XCTAssertTrue(openedByNewerLoad, "the newer load opens the location store")
+        guard openedByNewerLoad else { return }
+        let newerLease = model.locationStoreLeaseForTesting
+        await latch.release("close")
+        let closed = await waitForMobileOwner { !pending.store.isOperational() }
+        XCTAssertTrue(closed, "the held close of the retired pair ends")
+        guard closed else { return }
+        let reopenedByCancelledLoad = await waitForMobileOwner(timeout: .milliseconds(500)) {
+            model.locationStoreLeaseForTesting != newerLease
+        }
+        XCTAssertFalse(reopenedByCancelledLoad, "the cancelled load opens no location store after the close ends")
     }
 
     @MainActor private func verifySignOut(startRetry: Bool) async throws {
@@ -1652,6 +1741,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
         XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
+        XCTAssertFalse(model.signOutCleanupFailed)
         let loadWasCancelled = await latch.hasEntered("load-cancelled")
         XCTAssertTrue(loadWasCancelled)
         let stillOpen = await pending.session.delete([])

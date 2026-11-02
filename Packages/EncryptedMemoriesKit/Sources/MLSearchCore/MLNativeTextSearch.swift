@@ -240,6 +240,7 @@ public enum MLNativeSearchConfigurationError: Error, Equatable {
 public protocol MLNativeSearchServing: Sendable {
     func availableBackends() async -> Set<MLSearchBackend>
     func maximumConcurrentAssets() async -> Int
+    func hasIndexedTextEntries() async -> Bool
     func index(
         assets: [MLPipelineAssetRevision],
         shouldContinue: @escaping @Sendable () -> Bool,
@@ -273,6 +274,10 @@ public protocol MLNativeSearchServing: Sendable {
 
 public extension MLNativeSearchServing {
     func maximumConcurrentAssets() async -> Int { 1 }
+
+    /// Conservative default: a conformer that does not report its text index is treated as having
+    /// none, so the OCR scope stays hidden instead of offering a scope that cannot answer.
+    func hasIndexedTextEntries() async -> Bool { false }
 
     func indexQuantum(
         assets: [MLPipelineAssetRevision],
@@ -495,6 +500,13 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
         guard let key = configuration.key(for: scope) else { return [] }
         let tokens = MLTextIndexNormalizer.tokens(in: text, limit: 16)
         return store.search(normalizedTokens: tokens, in: key, limit: limit).map(\.uid)
+    }
+
+    /// The OCR scope is offered only when the current library's text index holds at least one
+    /// committed entry. A missing text configuration or an unreadable store both report `false`.
+    public func hasIndexedTextEntries() -> Bool {
+        guard let key = configuration.key(for: .text) else { return false }
+        return store.hasIndexedEntries(for: key)
     }
 
     public func progress() -> MLDerivedPipelineProgress {

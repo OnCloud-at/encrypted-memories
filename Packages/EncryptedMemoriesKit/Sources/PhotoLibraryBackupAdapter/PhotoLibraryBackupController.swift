@@ -1073,13 +1073,16 @@ public final class PhotoLibraryBackupController {
     }
 
     /// The scan of a refresh window: it puts new and changed photos into the queue and uploads nothing. It does not wait
-    /// for a network path. It starts nothing while another pass runs or waits to start; the window checks first that
-    /// backup is on and not paused.
+    /// for a network path. The automatic pass of the person's visit can still wait for that path or a long window; the
+    /// scan leaves it waiting. A running pass, a waiting long window, or the person's own retry keeps its priority.
     public func backgroundRefreshScan(
         onRunStarted: (@MainActor (String) -> Void)? = nil
     ) async -> BackgroundRefreshScanEnd {
-        // A pass that waits for the first network path needs the lock when the path arrives.
-        guard !isSyncing, deferredStartOwner == nil, deferredBackgroundOwner == nil else { return .notNeeded }
+        // A refresh scan needs no network. It may scan next to the automatic deferral without taking it over. A long
+        // window and the person's own retry can upload in the background, so the scan keeps the lock free for them.
+        guard !isSyncing, deferredStartOwner == nil || deferredStartOwner == .foreground,
+            deferredBackgroundOwner == nil
+        else { return .notNeeded }
         let result = RefreshScanResult()
         guard let run = startSync(owner: .iOSRefreshTask, refreshScan: result) else {
             return result.lockWasBusy ? .notNeeded : .couldNotStart
@@ -1128,7 +1131,9 @@ public final class PhotoLibraryBackupController {
             return nil
         }
         var tookAutomaticDeferral = false
-        if deferredStartOwner == .foreground, owner != .foreground, owner != .manual,
+        if scanOnly {
+            // A refresh scan uploads nothing, so it never takes a deferred pass over and never starts it.
+        } else if deferredStartOwner == .foreground, owner != .foreground, owner != .manual,
             runtimeSignals.current().isAppInBackground
         {
             // The snapshot arrived before its observer, and no scene is in the foreground: this window runs the

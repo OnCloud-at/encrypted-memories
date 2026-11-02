@@ -42,6 +42,10 @@ struct MobileTimelineScreen: View {
     /// Whether the Photos tab is the active surface. Threaded into the grid so a hidden grid stops its
     /// render loop; defaults to true so previews/other embeds keep the grid live.
     var isActive: Bool = true
+    /// Extra points reserved between the safe-area top and the first grid row while the search scope
+    /// picker is presented (issue #944). Passed straight through to `UIKitTimelineGrid.scopeBarGap`;
+    /// zero on every surface without a scope picker.
+    var scopeBarGap: CGFloat = 0
     /// Bumped when the active library tab is retapped. The grid observes it and performs the scroll.
     var scrollToLatestSignal: Int = 0
     @Binding private var searchText: String
@@ -91,6 +95,7 @@ struct MobileTimelineScreen: View {
     init(
         surface: MobileTimelineSurface = .library,
         isActive: Bool = true,
+        scopeBarGap: CGFloat = 0,
         scrollToLatestSignal: Int = 0,
         searchText: Binding<String> = .constant(""),
         searchScope: Binding<MLSearchScope> = .constant(.all),
@@ -99,6 +104,7 @@ struct MobileTimelineScreen: View {
     ) {
         self.surface = surface
         self.isActive = isActive
+        self.scopeBarGap = scopeBarGap
         self.scrollToLatestSignal = scrollToLatestSignal
         _searchText = searchText
         _searchScope = searchScope
@@ -464,6 +470,14 @@ struct MobileTimelineScreen: View {
         surface == .search && searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Whether the system scope picker is presented above this grid. Mirrors `SmartSearchScopesModifier`:
+    /// the picker lists scopes only when more than one is available and activates on text entry.
+    private var showsSearchScopePicker: Bool {
+        surface == .search
+            && (model.smartSearch?.availableSearchScopes.count ?? 1) > 1
+            && !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     @ViewBuilder private var content: some View {
         let visibleItems = self.visibleItems
         ZStack(alignment: .topLeading) {
@@ -482,6 +496,7 @@ struct MobileTimelineScreen: View {
                     selectedUIDs: selection.selected,
                     uploadBadges: hasProjectionCriteria ? .empty : model.pendingPresentation.uploadBadges,
                     isActive: isActive && !showsSearchLanding,
+                    scopeBarGap: showsSearchScopePicker ? scopeBarGap : 0,
                     scrollToLatestSignal: scrollToLatestSignal,
                     scrollToTopSignal: refinementTopPlacementSignal,
                     proxy: gridProxy,
