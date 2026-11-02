@@ -6189,4 +6189,67 @@ extension PendingBackupCoordinatorTests {
         await coordinator.close()
         clock.releaseAll()
     }
+
+    /// Review round 2 of #913: the `!reconcileRunning` leg of the degraded-retry guard. While a
+    /// reconcile pass awaits the remote trash dispatch of another source, a `removeFromTrashList`
+    /// whose keyed reload fails must not arm the degraded countdown itself; the pass-end
+    /// `scheduleReconcileTimer` arms it once. Arming mid-pass would restart that countdown when the
+    /// pass ends and so double the wait.
+    func testRemoveFromTrashListDuringReconcilePassDoesNotDoubleDegradedWait() async throws {
+        // "d" owes the remote trash of a newer handoff, so the recovery pass awaits its dispatch.
+        try excludedAndRemoteTracked("d")
+        // "t" is only shown in the trash list; the keyed reload after its unlist is the one that fails.
+        try excludedAndRemoteTracked("t", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        // Holds the remote trash of "d", so the reconcile pass stays suspended mid-flight and
+        // `reconcileRunning` stays true for the whole unlist below.
+        let trashGate = LookupGate()
+        effects.trashGate = trashGate
+        defer { trashGate.open() }
+
+        await coordinator.start()
+        let reached = await trashGate.entered(within: .seconds(5))
+        XCTAssertTrue(
+            reached,
+            "the reconcile pass must reach and hold the remote trash dispatch of \"d\"")
+
+        // Arms after the unlist UPDATE, so the keyed read before that write stays readable (#982).
+        let failure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t")
+        ])
+        XCTAssertTrue(
+            result,
+            "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
+        XCTAssertEqual(failure.count, 1, "the reload keyed read after the unlist must be interrupted")
+
+        // Mid-pass, no countdown may be armed: the running pass owns the end-of-pass scheduling.
+        try await settle()
+        XCTAssertFalse(
+            clock.waits.contains { $0 >= .seconds(30) && $0 <= .seconds(130) },
+            "while the pass runs, the failed unlist must not arm the degraded countdown itself")
+
+        // Releasing the trash ends the pass; its end-of-pass scheduling arms the countdown once.
+        trashGate.open()
+        try await waitUntil { !effects.trashed.isEmpty }
+        XCTAssertEqual(
+            effects.trashed, [[PhotoUID(volumeID: "vol", nodeID: "new-d")]],
+            "the held pass must finish its remote trash dispatch")
+        try await waitUntil { clock.waits.contains(Duration.seconds(60)) }
+        XCTAssertEqual(
+            clock.waits.filter { $0 == Duration.seconds(60) }.count, 1,
+            "the pass-end scheduling must arm exactly one degraded 60 s countdown")
+        XCTAssertFalse(
+            clock.waits.contains { $0 > Duration.seconds(60) && $0 <= .seconds(130) },
+            "no doubled degraded wait may follow the pass-end countdown")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
 }
