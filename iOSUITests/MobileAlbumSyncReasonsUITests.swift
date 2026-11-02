@@ -84,7 +84,8 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
         restore.tap()
         let error = app.staticTexts["albumsync.restoreError"]
         XCTAssertTrue(error.waitForExistence(timeout: 5))
-        XCTAssertEqual(error.label, language == "de" ? "Wiederherstellen nicht möglich." : "Couldn't restore this photo.")
+        XCTAssertEqual(
+            error.label, language == "de" ? "Wiederherstellen nicht möglich." : "Couldn't restore this photo.")
         XCTAssertTrue(photo.exists, "An unavailable restore must retain the problem row")
         XCTAssertTrue(photo.label.contains(reason))
         XCTAssertFalse(app.buttons["backup.backUpAgain.dialog"].exists)
