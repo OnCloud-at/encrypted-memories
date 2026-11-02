@@ -588,7 +588,9 @@ struct MobileFailedBackupSheet: View {
                     }
                 case .list:
                     List {
-                        if case .album(let albumSync, _) = source, let message = albumSync.lastMessage {
+                        if case .album(let albumSync, _) = source, let message = albumSync.lastMessage,
+                            message == L10n.string("albumsync.error_restore_photo")
+                        {
                             Text(message)
                                 .foregroundStyle(.red)
                                 .accessibilityIdentifier("albumsync.restoreError")
