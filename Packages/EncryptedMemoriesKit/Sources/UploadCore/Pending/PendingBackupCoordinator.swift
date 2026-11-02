@@ -87,10 +87,12 @@ public actor PendingBackupCoordinator {
     }
     /// Sources whose last state read failed. Their owed work waits; it never counts as "nothing owed".
     private var unreadableSourceStates = Set<PendingSourceKey>()
-    /// The last load of every source state was incomplete, so a source without a cached state is unknown.
+    /// The last load of every source state was incomplete, so cached absence alone grants no action.
     private var sourceStatesIncomplete = false
-    /// The sources that incomplete load decoded. Only they may run actions until a complete load.
+    /// The sources that incomplete load decoded. Known pending sources need this proof before running actions.
     private var loadDecodedKeys = Set<PendingSourceKey>()
+    /// Keys observed with a pending state. A later keyed absence cannot hide damaged key bytes.
+    private var knownSourceStateKeys = Set<PendingSourceKey>()
     /// The current reconcile pass could not read every due source state. Set before the pass awaits any effect.
     private var dueStatesIncomplete = false
     /// The sources whose state the due reads of that pass decoded. Only they may run actions until a complete read.
@@ -966,11 +968,13 @@ public actor PendingBackupCoordinator {
         let decoded = Dictionary(uniqueKeysWithValues: read.states.map { ($0.key, $0) })
         if read.complete {
             sourceStates = decoded
+            knownSourceStateKeys = Set(decoded.keys)
             loadDecodedKeys = []
         } else {
             // A source missing from an incomplete list keeps its last known state for timing and restores, but that
-            // state may be stale, so only the sources this load decoded may run actions.
+            // state may be stale, so known pending sources need this load to decode them before running actions.
             sourceStates.merge(decoded) { _, current in current }
+            knownSourceStateKeys.formUnion(decoded.keys)
             loadDecodedKeys = Set(decoded.keys)
         }
         sourceStatesIncomplete = !read.complete
@@ -985,6 +989,7 @@ public actor PendingBackupCoordinator {
         for key in keys {
             switch store.sourceStateRead(for: key) {
             case .readable(let state):
+                if state != nil || sourceStates[key] != nil { knownSourceStateKeys.insert(key) }
                 sourceStates[key] = state
                 unreadableSourceStates.remove(key)
                 if state?.desired != .excluded {
@@ -1439,6 +1444,7 @@ public actor PendingBackupCoordinator {
                 let read = store.dueSourceStatesRead(by: now())
                 if !read.complete { incomplete = true }
                 decoded.formUnion(read.states.map(\.key))
+                knownSourceStateKeys.formUnion(read.states.map(\.key))
                 // Published before the effects of this pass await, so an action that runs meanwhile never uses the
                 // permission of an earlier pass.
                 dueStatesIncomplete = incomplete
@@ -1892,12 +1898,21 @@ public actor PendingBackupCoordinator {
     private func actionIsEligible(_ key: PendingSourceKey) -> Bool {
         // An unreadable state is no "not excluded": the action waits for a successful read.
         guard !unreadableSourceStates.contains(key) else { return false }
+        // A photo never seen with a pending state can prove its own absence despite another damaged row.
+        // Known pending keys keep the inventory guards: a damaged key can also make a keyed read look absent.
+        if sourceStatesIncomplete || dueStatesIncomplete,
+            sourceStates[key] == nil, !knownSourceStateKeys.contains(key)
+        {
+            guard store.isOperational() else { return false }
+            guard case .readable(nil) = store.sourceStateRead(for: key) else { return false }
+            return true
+        }
         // An incomplete due read may have left out this source's current state.
         guard !dueStatesIncomplete || dueDecodedKeys.contains(key) else { return false }
         // After an incomplete load, a last known state of a source that this load did not decode may be stale.
         guard !sourceStatesIncomplete || loadDecodedKeys.contains(key) else { return false }
-        // A source without a state here was read as absent. A keyed read cannot find a row whose key no longer
-        // decodes, so absence counts only while no load and no due read of the current states is incomplete.
+        // A known pending source can disappear from a keyed read when its key no longer decodes. Its absence
+        // counts only while no load and no due read of the current states is incomplete.
         guard let state = sourceStates[key] else { return !sourceStatesIncomplete && !dueStatesIncomplete }
         return state.desired == .included && !state.needsRemoteRestore
     }
