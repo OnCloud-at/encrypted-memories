@@ -670,10 +670,12 @@ public actor PendingBackupCoordinator {
         let keys = uids.compactMap(PendingSourceKey.init(localUID:))
         guard store.unlistFromTrash(keys, at: now()) else { return false }
         reloadSourceStates(keys)
-        if keys.contains(where: { unreadableSourceStates.contains($0) }) {
+        if !reconcileRunning, unreadableRetry == nil,
+            keys.contains(where: { unreadableSourceStates.contains($0) })
+        {
             // The reload failed, so the shown list keeps its stale tile until a read succeeds. Arm the
-            // degraded retry, as startup recovery does (#913). Without advancing the backoff: this pass
-            // just failed one read, and an earlier degraded source keeps its own countdown.
+            // degraded retry, as startup recovery does (#913). A degraded wait that is already set keeps
+            // its delay, as `queueLaterTrashRecovery` does: `scheduleReconcileTimer` restarts the countdown.
             scheduleReconcileTimer(advanceBackoff: false)
         }
         listsDirty = true

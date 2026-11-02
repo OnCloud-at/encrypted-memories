@@ -5877,3 +5877,316 @@ extension PendingBackupCoordinatorTests {
         await coordinator.close()
     }
 }
+
+extension PendingBackupCoordinatorTests {
+    // MARK: - Degraded retry after a failed keyed reload (#913)
+
+    private static let trashTilePresentation = PendingPresentationMetadata(
+        captureTime: Date(timeIntervalSince1970: 1_750_000_000),
+        mediaType: "photo",
+        displayName: "Deleted photo"
+    )
+
+    /// Reads the first column of the first row as text, on its own read-only connection.
+    private func sqlScalar(_ sql: String) -> String? {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db = handle
+        else {
+            sqlite3_close(handle)
+            return nil
+        }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            sqlite3_finalize(statement)
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
+            return nil
+        }
+        return String(cString: text)
+    }
+
+    /// An excluded source whose remote trash is complete. `newerHandoff` inserts a handoff with a newer
+    /// remote node ID than the state, so startup recovery reschedules the remote trash (`.scheduled`)
+    /// and reconciles; a matching handoff keeps recovery at `.unchanged`. `tile` also lists the source
+    /// in "Zuletzt gelöscht" and provides its presentation metadata, so it appears as a trash tile.
+    private func excludedAndRemoteTracked(_ id: String, tile: Bool = false, newerHandoff: Bool = true) throws {
+        let stateRemote = PhotoUID(volumeID: "vol", nodeID: "old-\(id)")
+        XCTAssertNotNil(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key(id), presentation: tile ? Self.trashTilePresentation : nil, remote: stateRemote)
+                ],
+                at: date))
+        XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: 1, at: date))
+        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+        if tile {
+            XCTAssertTrue(Self.setColumns("listed_in_trash=1", of: id, at: storeURL))
+            metadata.set(key(id), Self.trashTilePresentation)
+        }
+        let handoffRemote = PhotoUID(volumeID: "vol", nodeID: "\(newerHandoff ? "new" : "old")-\(id)")
+        // The handoff row is inserted last: completing the remote trash reads the latest handoff
+        // and would otherwise reschedule the source before the fixture is ready.
+        let connection = try KeyedReadFailure.connection(of: store)
+        connection.withLock {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    connection.database,
+                    """
+                    INSERT INTO handoff VALUES('photoLibraryAsset', '\(id)', 9, 'vol', '\(handoffRemote.nodeID)',
+                      'uploaded', \(date.timeIntervalSince1970), 1);
+                    """, nil, nil, nil), SQLITE_OK)
+        }
+    }
+
+    /// Startup recovery rescheduled the remote trash of a newer handoff (`.scheduled`), then the keyed
+    /// reload of that source failed. The safe baseline for issue #913: the degraded regime schedules the
+    /// 60 s backoff, and firing that timer retries the interrupted keyed read. While the read stays
+    /// unreadable no remote trash dispatch runs, and the readable wait of the control source is also
+    /// scheduled; the single reconcile timer alternates between that long wait and the backoff.
+    func testStartupRecoveryInterruptedReloadSchedulesDegradedRetry() async throws {
+        try excludedAndRemoteTracked("k")
+        includedLater("ctrl")
+
+        // Arms after the reschedule UPDATE of `resumeLaterTrash`, so that read itself stays readable and
+        // only the recovery reload afterwards is interrupted.
+        let failure = KeyedReadFailure(limit: 5, armAfter: "needs_remote_trash=1")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        try await waitUntil { failure.count >= 1 }
+        XCTAssertGreaterThanOrEqual(failure.count, 1, "the reload keyed read must be genuinely interrupted")
+
+        // The safe baseline: the degraded 60 s backoff is scheduled, no action runs while the read fails,
+        // and the control source keeps its readable long wait in the schedule alongside the backoff.
+        let backoffDelay = Duration.seconds(60)
+        try await waitUntil { clock.waits.contains(backoffDelay) }
+        XCTAssertTrue(
+            effects.trashed.isEmpty,
+            "while the keyed read fails, no remote trash dispatch may run; the handoff stays unconsumed")
+        XCTAssertTrue(
+            clock.waits.contains(backoffDelay),
+            "issue #913 safety baseline: after the failed keyed reload, startup recovery schedules the "
+                + "degraded 60 s backoff")
+        XCTAssertTrue(
+            clock.waits.contains { $0 > Duration.seconds(4000) && $0 < Duration.seconds(5500) },
+            "the readable ~5000 s wait of the control source is also recorded; the backoff does not erase it")
+
+        // The retry is real: firing the fake clock by the backoff makes the coordinator re-attempt the
+        // interrupted keyed read (a fresh interrupt beyond the settled startup count).
+        let settledCount = failure.count
+        clock.advance(by: .seconds(60))
+        try await waitUntil { failure.count > settledCount }
+        XCTAssertGreaterThan(
+            failure.count, settledCount,
+            "the 60 s backoff timer must fire and retry the interrupted keyed read")
+
+        // The interrupts never corrupted the durable decision: the handoff row stays as written.
+        XCTAssertEqual(
+            sqlScalar("SELECT remote_link_id FROM handoff WHERE source_id='k' AND revision_us=9;"),
+            "new-k",
+            "the interrupted reads must not change the handoff row")
+
+        failure.remove(from: store)
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The same recovery scenario with healthy reads: the remote trash of the newer handoff is dispatched,
+    /// the readable schedule (~5000 s) carries the timer, and no degraded backoff is ever scheduled.
+    func testStartupRecoveryHealthyReadControlSchedulesReadableWait() async throws {
+        try excludedAndRemoteTracked("k")
+        includedLater("ctrl")
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+
+        let resumedRemote = PhotoUID(volumeID: "vol", nodeID: "new-k")
+        try await waitUntil { effects.trashed.count >= 1 }
+        XCTAssertEqual(effects.trashed, [[resumedRemote]], "healthy reads must dispatch the rescheduled remote trash")
+
+        try await waitUntil {
+            clock.waits.contains { $0 > Duration.seconds(4000) && $0 < Duration.seconds(5500) }
+        }
+        XCTAssertTrue(
+            clock.waits.contains { $0 > Duration.seconds(4000) && $0 < Duration.seconds(5500) },
+            "the healthy path must schedule the long readable wait of the included source")
+        XCTAssertFalse(
+            clock.waits.contains(Duration.seconds(60)),
+            "the healthy path must not schedule the degraded backoff wait")
+        XCTAssertEqual(
+            clock.waits.filter { $0 < Duration.seconds(130) }, [],
+            "the healthy path must not record any degraded backoff wait")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The `removeFromTrashList` failure route for issue #913: the unlist commits, the keyed reload
+    /// after it fails, and the last known state is stale, so the tile stays in the trash list. The
+    /// degraded 60 s retry must be scheduled, as startup recovery does, and firing it must repair
+    /// the stale tile once the read answers again.
+    func testRemoveFromTrashListFailedReloadSchedulesDegradedRetry() async throws {
+        try excludedAndRemoteTracked("t", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let trashKey = self.key("t")
+        _ = await waitForSnapshot("the fixture must first show the source in the trash list") {
+            $0.trashTiles.contains { $0.key == trashKey }
+        }
+
+        // Arms after the unlist UPDATE, so the keyed read inside `unlistFromTrash` itself stays readable.
+        let failure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        try failure.install(on: store)
+        defer { failure.remove(from: store) }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t")
+        ])
+        XCTAssertTrue(
+            result,
+            "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
+        XCTAssertGreaterThanOrEqual(failure.count, 1, "the reload keyed read after the unlist must be interrupted")
+        XCTAssertEqual(
+            sqlScalar("SELECT listed_in_trash FROM source_state WHERE source_id='t';"), "0",
+            "the unlist must be committed in the store")
+
+        // The observable symptom: the last known state is stale, so the tile stays in the trash list.
+        try await settle()
+        let staleSnapshot = await coordinator.currentSnapshot()
+        XCTAssertTrue(
+            staleSnapshot.trashTiles.contains { $0.key == key("t") },
+            "the failed reload must leave the stale trash tile until a read succeeds")
+
+        // The repair (#913): the degraded 60 s retry is scheduled, as startup recovery does in the same
+        // situation, so the stale tile repairs itself instead of staying until another trigger.
+        let backoffDelay = Duration.seconds(60)
+        try await waitUntil { clock.waits.contains(backoffDelay) }
+        XCTAssertTrue(
+            clock.waits.contains(backoffDelay),
+            "issue #913: removeFromTrashList must schedule the degraded 60 s retry after its reload failed, "
+                + "as startup recovery does")
+
+        // Firing the retry repairs the tile: the interrupt budget is spent, the keyed read answers
+        // again, and the trash list drops the stale tile.
+        clock.advance(by: .seconds(60))
+
+        // The membership interval is zero, so publishing does not sleep on the fake clock. A further
+        // advance is harmless and releases any remaining timer that still sleeps.
+        clock.advance(by: .seconds(2))
+        let repairedSnapshot = await waitForSnapshot("the fired 60 s retry must repair the stale trash tile") {
+            $0.trashTiles.allSatisfy { $0.key != trashKey }
+        }
+        XCTAssertTrue(
+            repairedSnapshot.excludedTiles.contains { $0.key == key("t") },
+            "the source stays excluded and keeps its settings tile after the repair")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The healthy control of the same route: without the read failure, the tile leaves the trash list
+    /// and stays in the excluded list, and no degraded backoff is ever scheduled.
+    func testRemoveFromTrashListHealthyReadControlRemovesTile() async throws {
+        try excludedAndRemoteTracked("t", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let trashKey = self.key("t")
+        _ = await waitForSnapshot("the fixture must first show the source in the trash list") {
+            $0.trashTiles.contains { $0.key == trashKey }
+        }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t")
+        ])
+        XCTAssertTrue(result, "removeFromTrashList must succeed with healthy reads")
+        XCTAssertEqual(
+            sqlScalar("SELECT listed_in_trash FROM source_state WHERE source_id='t';"), "0",
+            "the unlist must be committed in the store")
+
+        let removedSnapshot = await waitForSnapshot("the tile must leave the trash list") {
+            $0.trashTiles.allSatisfy { $0.key != trashKey }
+        }
+        XCTAssertTrue(
+            removedSnapshot.excludedTiles.contains { $0.key == key("t") },
+            "the source stays excluded and keeps its settings tile")
+        XCTAssertFalse(
+            clock.waits.contains(Duration.seconds(60)),
+            "the healthy route must not schedule the degraded backoff wait")
+        XCTAssertEqual(
+            clock.waits.filter { $0 < Duration.seconds(130) }, [],
+            "the healthy route must not record any degraded backoff wait")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// The second failed unlist of the same degraded episode must keep the first countdown (#913, review
+    /// round 1): `scheduleReconcileTimer` restarts its timer, so re-arming after a later failed reload
+    /// would delay the pending retry by another full wait. A second 60 s wait must never be recorded.
+    func testRemoveFromTrashListKeepsAnExistingDegradedCountdown() async throws {
+        try excludedAndRemoteTracked("t1", tile: true, newerHandoff: false)
+        try excludedAndRemoteTracked("t2", tile: true, newerHandoff: false)
+
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let firstKey = self.key("t1")
+        let secondKey = self.key("t2")
+        _ = await waitForSnapshot("both sources must first appear in the trash list") {
+            $0.trashTiles.contains { $0.key == firstKey }
+                && $0.trashTiles.contains { $0.key == secondKey }
+        }
+
+        // Two separate fault episodes: the first failure interrupts the reload after the first unlist.
+        // The second failure stays unarmed until the second unlist UPDATE commits, so the read before
+        // that write passes (#982) and only the reload after it fails.
+        let firstFailure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        try firstFailure.install(on: store)
+
+        let first = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t1")
+        ])
+        XCTAssertTrue(first, "the first unlist must commit and arm the degraded countdown")
+        try await waitUntil { clock.waits.contains(Duration.seconds(60)) }
+        XCTAssertEqual(firstFailure.count, 1, "the first failed reload must be interrupted")
+        firstFailure.remove(from: store)
+
+        let secondFailure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        try secondFailure.install(on: store)
+        defer { secondFailure.remove(from: store) }
+
+        let second = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "t2")
+        ])
+        XCTAssertTrue(second, "the second unlist must commit too")
+        try await waitUntil { secondFailure.count == 1 }
+        XCTAssertEqual(
+            secondFailure.count, 1,
+            "the second reload must fail as well, entering the same degraded episode")
+
+        try await settle()
+        XCTAssertEqual(
+            clock.waits.filter { $0 == Duration.seconds(60) }.count, 1,
+            "a later failed unlist must not restart the already pending degraded countdown")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+}
