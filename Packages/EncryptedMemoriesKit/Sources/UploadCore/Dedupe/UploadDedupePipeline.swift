@@ -387,9 +387,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
             let detailedLookupError = error
             // The detailed endpoint is normally faster because `prime` batches large libraries.
-            // The SDK gives us a safe exact fallback: a positive result proves the bytes are
-            // already active; an empty/failed result cannot authorize an upload, so fail closed
-            // with the original detailed-lookup error.
+            // The SDK gives us an exact fallback: a positive match names a candidate copy, which
+            // `countsAsBackup` must still prove below; an empty/failed result cannot authorize
+            // an upload, so fail closed with the original detailed-lookup error.
             var exactMatches: [PhotoUID] = []
             do {
                 if !isBurstMember && !requiresRelatedMatch && replacement.isEmpty {
@@ -403,20 +403,22 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 if UploadError.isCancellation(error) { throw error }
                 throw detailedLookupError
             }
-            if isRoot, !exactMatches.isEmpty {
+            if !exactMatches.isEmpty {
                 do {
                     var fallbackReads = RelatedProofReads()
-                    let related = try await relatedLinks(
-                        among: Set(exactMatches.map(\.nodeID)), requiresActiveMain: false, reads: &fallbackReads)
-                    exactMatches.removeAll { related.contains($0.nodeID) }
+                    if isRoot {
+                        let related = try await relatedLinks(
+                            among: Set(exactMatches.map(\.nodeID)), requiresActiveMain: false, reads: &fallbackReads)
+                        exactMatches.removeAll { related.contains($0.nodeID) }
+                    }
                     // An exact match adopts the same proof as a name row: a state read of this check must
-                    // prove the copy, see `countsAsBackup`. An answer without role data never proves a
-                    // root backup (#876), and the skip would be indistinguishable from a proven one once
-                    // it is persisted.
+                    // prove the copy, see `countsAsBackup`. For a root, an answer without role data never proves
+                    // the backup (#876). A non-root accepts any active match, because its legitimate copy is
+                    // a related file (documented in `countsAsBackup`).
                     for exact in exactMatches {
                         try await readPrimedState(exact.nodeID, reads: &fallbackReads)
                     }
-                    exactMatches.removeAll { !countsAsBackup($0.nodeID, isRoot: true, reads: fallbackReads) }
+                    exactMatches.removeAll { !countsAsBackup($0.nodeID, isRoot: isRoot, reads: fallbackReads) }
                 } catch {
                     releasePendingUploadClaims(ownedBy: descriptor)
                     throw error
@@ -1082,7 +1084,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             requiresActiveMain
             ? linkIDs.filter { linkID in
                 rootVisibilityAsked.contains(linkID) && !reads.askedLinks.contains(linkID)
-                    && rootVisibility[linkID].map { $0.hasExplicitPhotoState && $0.isActiveMain } != true
+                    && rootVisibility[linkID].map(Self.provesActiveMain) != true
             } : []
         let unasked = linkIDs.subtracting(rootVisibilityAsked).union(staleNegatives)
         if !unasked.isEmpty {
@@ -1198,7 +1200,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// Whether the read of this check proves that `linkID` backs up this resource. The copy must be active; a copy
     /// that the answer leaves out is no active copy. A root photo is backed up only by a main photo, not by another
     /// photo's related file, and only by an answer that explicitly carries the photo state: an answer without role
-    /// data never proves a root backup (#876).
+    /// data never proves a root backup (#876). A non-root, such as a paired video, has no role of its own to carry:
+    /// its legitimate copy is another photo's related file, so any active answer proves it.
     private func countsAsBackup(_ linkID: String, isRoot: Bool, reads: RelatedProofReads) -> Bool {
         guard let state = reads.visibility[linkID], state.isActive else { return false }
         guard isRoot else { return true }
@@ -1294,7 +1297,14 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             )
             try Task.checkCancellation()
             if let active = exactMatches.first {
-                return .skip(.activeDuplicate, remoteLinkID: active.nodeID)
+                // The exact SDK row carries no role data. A state read of this check must prove an
+                // active main photo (#876) before this read-only path may skip. An unproven match is
+                // not adopted; revalidation falls through to the name-row and content evidence.
+                var fallbackReads = RelatedProofReads()
+                try await readPrimedState(active.nodeID, reads: &fallbackReads)
+                if countsAsBackup(active.nodeID, isRoot: true, reads: fallbackReads) {
+                    return .skip(.activeDuplicate, remoteLinkID: active.nodeID)
+                }
             }
         }
 
