@@ -176,8 +176,8 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(harness.state(of: on), .completed)
         XCTAssertEqual(harness.server.links.first { $0.uid == still.main.uid }?.state, .trashed)
         let liveAgain = try compound(of: try harness.liveMain())
-        XCTAssertEqual(liveAgain.main.tags, liveTag)
-        XCTAssertEqual(liveAgain.video.tags, liveTag)
+        XCTAssertEqual(liveAgain.main.tags, liveTag, "the still receives tag 3 after settlement")
+        XCTAssertEqual(liveAgain.video.tags, [], "the paired video never carries the Live Photo tag")
         harness.assertCurrentManifest()
     }
 

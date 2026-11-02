@@ -604,6 +604,9 @@ public enum UploadError: LocalizedError, Equatable {
     /// The account's remaining Proton storage cannot hold the file. The item waits; freeing space or a larger plan
     /// and Back Up Now take it up again.
     case accountStorageFull(String, requiredBytes: Int64, availableBytes: Int64)
+    /// A tag adder was required to confirm settlement but was not provided. The row fails visibly instead of
+    /// uploading without the required Live Photo indicator.
+    case tagAdderUnavailable
 
     /// Cancellation can cross the transport boundary without cancelling the enclosing Swift task.
     public static func isCancellation(_ error: any Error) -> Bool {
@@ -628,6 +631,7 @@ public enum UploadError: LocalizedError, Equatable {
         case .cancelled: L10n.string("error.upload_cancelled")
         case .sourceNotReady(let name, _): L10n.string("error.upload_source_not_ready \(name)")
         case .sourceUnavailable, .sourceReportedMissing: L10n.string("backup.issue_source_unavailable")
+        case .tagAdderUnavailable: L10n.string("backup.error_local_state_unavailable")
         case .accountStorageFull(let name, let required, let available):
             L10n.string(
                 "error.upload_account_storage_full \(name) \(L10n.fileSize(required)) \(L10n.fileSize(available))")

@@ -334,6 +334,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         lock.withLock { table[uid.nodeID]?.tags = tags }
     }
 
+    /// Adds tags to a link without clearing the tags it already carries, like a backend tag update.
+    func addTags(_ tags: Set<Int>, to uid: PhotoUID) {
+        lock.withLock { table[uid.nodeID]?.tags.formUnion(tags) }
+    }
+
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {

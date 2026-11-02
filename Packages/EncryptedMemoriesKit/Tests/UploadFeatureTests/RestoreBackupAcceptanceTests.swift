@@ -224,6 +224,7 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
         let catalog: PhotoLibraryCatalogManifestStore
         let controller: PhotoLibraryBackupController
         let runner: BackupSyncRunner
+        let tagAdder = SpyTagAdder()
         let resolver: Resolver
         let clock: BackupTestClock
         var session: PendingGridSession!
@@ -256,6 +257,7 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             configuration.currentAccessState = { .full }
             controller = PhotoLibraryBackupController(
                 configuration: configuration, identityResolver: pipeline, uploader: server,
+                tagAdder: tagAdder,
                 editReplacement: replacement, pendingStore: pending, requiresPendingStore: true)
             state = try XCTUnwrap(
                 UploadBackupStateManifestStore(
@@ -303,7 +305,8 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             runner = BackupSyncRunner(
                 queue: controller.queueStoreForTesting!,
                 preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }), resolver: resolver,
-                identityResolver: pipeline, uploader: server, configuration: .init(throttle: .init(baseConcurrency: 1)),
+                identityResolver: pipeline, uploader: server, tagAdder: tagAdder,
+                configuration: .init(throttle: .init(baseConcurrency: 1)),
                 clock: clock, events: controller.pendingRecorder, now: { [clock] in clock.now })
         }
 

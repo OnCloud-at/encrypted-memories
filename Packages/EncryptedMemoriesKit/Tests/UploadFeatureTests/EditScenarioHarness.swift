@@ -8,6 +8,15 @@ import XCTest
 @testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
+/// Adds tags to the scenario server after both parts of a Live Photo settle, like the app's backend adapter.
+struct HarnessTagAdder: PhotoTagAdding {
+    let server: EditScenarioServer
+
+    func addTags(_ tags: [Int], to uid: PhotoUID) async throws {
+        server.addTags(Set(tags), to: uid)
+    }
+}
+
 /// A mutable library resolves the current revision, even when the queue contains an earlier scan.
 final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnumerator, @unchecked Sendable {
     struct Asset: Sendable {
@@ -569,7 +578,7 @@ final class EditScenarioHarness {
         runner = BackupSyncRunner(
             queue: queue, preflight: preflight,
             resolver: EditScenarioResolver(library: library, clock: clock), identityResolver: pipeline,
-            uploader: deviceRemote, editReplacement: replacement,
+            uploader: deviceRemote, tagAdder: HarnessTagAdder(server: server), editReplacement: replacement,
             resourceCoordinator: coordinator,
             configuration: .init(
                 retry: .init(baseDelay: 1, maxDelay: 8, maxAttempts: 4),
