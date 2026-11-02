@@ -670,6 +670,12 @@ public actor PendingBackupCoordinator {
         let keys = uids.compactMap(PendingSourceKey.init(localUID:))
         guard store.unlistFromTrash(keys, at: now()) else { return false }
         reloadSourceStates(keys)
+        if keys.contains(where: { unreadableSourceStates.contains($0) }) {
+            // The reload failed, so the shown list keeps its stale tile until a read succeeds. Arm the
+            // degraded retry, as startup recovery does (#913). Without advancing the backoff: this pass
+            // just failed one read, and an earlier degraded source keeps its own countdown.
+            scheduleReconcileTimer(advanceBackoff: false)
+        }
         listsDirty = true
         publishMembership(force: true)
         return true
@@ -1422,7 +1428,17 @@ public actor PendingBackupCoordinator {
             loadSourceStates()
             queueLaterTrashRecovery()
         }
-        if !unreadableSourceStates.isEmpty { reloadSourceStates(Array(unreadableSourceStates)) }
+        if !unreadableSourceStates.isEmpty {
+            let degradedBefore = unreadableSourceStates
+            reloadSourceStates(Array(degradedBefore))
+            if degradedBefore.contains(where: { !unreadableSourceStates.contains($0) }) {
+                // A recovered read can change the shown lists: the stale trash tile of a failed
+                // `removeFromTrashList` reload (issue #913) leaves only when this publish runs, so
+                // the repair does not wait for the next membership event. Same pattern as `finish`.
+                listsDirty = true
+                scheduleMembershipPublish()
+            }
+        }
         let laterTrashKeys = retryLaterTrash ? Array(unreadableLaterTrashKeys) : []
         retryPendingWrites()
         let earlierRetries = retryEarlier ? Array(earlierUploadRetries) : []
