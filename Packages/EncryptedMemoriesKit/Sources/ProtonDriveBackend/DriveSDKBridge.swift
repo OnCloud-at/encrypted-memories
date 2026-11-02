@@ -462,7 +462,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private func performTimelineLoad(generation: UInt64) async throws -> TimelineLoadSnapshot {
         let measurement = workMeasurements.begin(.timelineLoad)
         var measurementOutcome = SupportMeasurementOutcome.failure
-        defer { measurement?.finish(Task.isCancelled ? .cancelled : measurementOutcome) }
+        defer {
+            measurement?.finish(
+                WorkMeasurementOperation.resolveOutcome(recorded: measurementOutcome, taskCancelled: Task.isCancelled))
+        }
         var supportSource = LibrarySyncSupportSnapshot.SourcePath.preparation
         do {
             try checkTimelineLoad(generation: generation)
