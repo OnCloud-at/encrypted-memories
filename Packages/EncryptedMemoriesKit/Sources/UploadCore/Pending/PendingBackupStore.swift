@@ -135,6 +135,15 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 guard case .readable(let current) = sourceStateLocked(handoff.key) else { return false }
                 guard let state = current, state.desired == .excluded else { return true }
                 outcome = .excludedRemoteNeedsTrash
+                guard !handoff.remote.nodeID.isEmpty,
+                    let duties = trashDutiesLocked(for: handoff.key, generation: state.generation)
+                else { return false }
+                // Receipt replay must not re-arm a photo this delete already trashed.
+                if duties.completed.contains(handoff.remote) { return true }
+                guard
+                    writeTrashMetadata(
+                        for: handoff.key, remote: handoff.remote, completed: false, generation: state.generation)
+                else { return false }
                 // The delete of an unfinished edit still owes the trash of the earlier upload. That photo stays the
                 // state's photo; its completed trash moves on to this handoff, see `completeEffect`.
                 if state.needsRemoteTrash, let pending = state.remote, pending.nodeID != handoff.remote.nodeID {
@@ -262,7 +271,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     @discardableResult
     public func pruneAcknowledgedHandoffs(olderThan cutoff: Date) -> Bool {
         standaloneWrite(refusing: false) {
-            // Unfinished work needs its handoffs. A completed trash also keeps the latest handoff until the source
+            // Unfinished work needs its handoffs. A completed trash also keeps its handoffs until the source
             // returns to the backup: a restart may still have to discover its later upload.
             execute(
                 """
@@ -287,11 +296,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     WHERE s.source_kind=handoff.source_kind AND s.source_id=handoff.source_id
                       AND (s.needs_remote_trash=1 OR (
                         s.desired='excluded' AND s.remote_trashed=1
-                        AND handoff.rowid=(
-                          SELECT h.rowid FROM handoff h
-                          WHERE h.source_kind=handoff.source_kind AND h.source_id=handoff.source_id
-                          ORDER BY h.created_at DESC, h.revision_us DESC LIMIT 1
-                        )
                       ))
                   );
                 """
@@ -492,6 +496,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                             }),
                         let state = sourceStateLocked(request.key).state
                     else { return false }
+                    guard
+                        resetTrashDuties(
+                            for: request.key, generation: previous?.generation ?? 0, nextGeneration: state.generation)
+                    else { return false }
+                    if let durable {
+                        guard
+                            writeTrashMetadata(
+                                for: request.key, remote: durable, completed: false, generation: state.generation)
+                        else { return false }
+                    }
                     states.append(state)
                 }
                 return true
@@ -602,6 +616,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         continue
                     }
                     let restoredInProton = previous.remote.map { confirmedLinkIDs.contains($0.nodeID) } == true
+                    guard resetTrashDuties(for: key, generation: previous.generation, nextGeneration: nil) else {
+                        return false
+                    }
                     guard
                         execute(
                             """
@@ -639,7 +656,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// finishes after a new delete schedules the trash again. Stale generations therefore never undo a newer
     /// decision. An included source without due effects is deleted. `remoteLinkID` names the photo that the
     /// effect handled; a trash of a photo that a later commit replaced leaves the trash of the new photo due.
-    /// A finished trash of an excluded source moves on to its latest handoff when that names another photo: the
+    /// A finished trash of an excluded source moves on to every recorded duty; legacy state keeps its latest handoff: the
     /// edit of a deleted photo can commit before the trash of the earlier upload is sent.
     @discardableResult
     public func completeEffect(
@@ -703,6 +720,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                           attempts=0, updated_at=?
                         """
                 }
+                if movesOn, state.desired == .excluded, state.generation == generation, let remote = state.remote {
+                    guard trashDutiesLocked(for: key, generation: generation) != nil,
+                        writeTrashMetadata(for: key, remote: remote, completed: true, generation: generation)
+                    else { return false }
+                }
                 sql += " WHERE source_kind=? AND source_id=?;"
                 let updated = execute(sql) { stmt in
                     sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
@@ -743,34 +765,146 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 !state.needsRemoteTrash, !state.needsRemoteRestore, state.remoteOperation == nil,
                 let previous = state.remote
             else { return true }
-            switch latestHandoffLocked(key) {
-            case .unreadable:
+            guard case .readable(let latest) = latestHandoffLocked(key),
+                let duties = trashDutiesLocked(for: key, generation: state.generation)
+            else {
                 result = .unreadable
                 return true
-            case .readable(let latest?):
-                guard latest.remote.nodeID != previous.nodeID else { return true }
-                guard
-                    execute(
-                        """
-                        UPDATE source_state
-                        SET needs_remote_trash=1, needs_remote_restore=0, remote_volume_id=?, remote_link_id=?,
-                            remote_trashed=0, listed_in_trash=0, attempts=0, next_attempt_at=?, updated_at=?
-                        WHERE source_kind=? AND source_id=? AND desired='excluded';
-                        """,
-                        bind: { stmt in
-                            bindText(stmt, 1, latest.remote.volumeID)
-                            bindText(stmt, 2, latest.remote.nodeID)
-                            sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
-                            sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
-                            bindKey(stmt, key, from: 5)
-                        })
-                else { return false }
-                result = .scheduled
-                return true
-            case .readable(nil): return true
             }
+            let target: PhotoUID?
+            if let latest, latest.remote != previous, !duties.completed.contains(latest.remote),
+                duties.owed.contains(latest.remote) || !duties.generationKnown
+            {
+                target = latest.remote
+            } else {
+                target =
+                    duties.owed.filter { $0 != previous }.sorted {
+                        ($0.volumeID, $0.nodeID) < ($1.volumeID, $1.nodeID)
+                    }.first
+            }
+            guard let target else { return true }
+            guard
+                execute(
+                    """
+                    UPDATE source_state
+                    SET needs_remote_trash=1, needs_remote_restore=0, remote_volume_id=?, remote_link_id=?,
+                        remote_trashed=0, listed_in_trash=0, attempts=0, next_attempt_at=?, updated_at=?
+                    WHERE source_kind=? AND source_id=? AND desired='excluded';
+                    """,
+                    bind: { stmt in
+                        bindText(stmt, 1, target.volumeID)
+                        bindText(stmt, 2, target.nodeID)
+                        sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
+                        sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                        bindKey(stmt, key, from: 5)
+                    })
+            else { return false }
+            result = .scheduled
+            return true
         }
         return committed ? result : .unreadable
+    }
+
+    /// Versioned integer metadata adds no schema objects. A generation marker means this delete records every late
+    /// duty; a legacy delete without that marker keeps its former latest-handoff fallback.
+    private struct TrashDuties {
+        var generationKnown = false
+        var owed = Set<PhotoUID>()
+        var completed = Set<PhotoUID>()
+    }
+
+    private static func trashMetadataPrefix(for key: PendingSourceKey) -> String {
+        "pending-trash:" + Data(key.kind.rawValue.utf8).base64EncodedString() + ":"
+            + Data(key.identifier.utf8).base64EncodedString() + ":"
+    }
+
+    private static func trashMetadataKey(for key: PendingSourceKey, remote: PhotoUID, completed: Bool) -> String {
+        trashMetadataPrefix(for: key) + "v1:" + Data(remote.volumeID.utf8).base64EncodedString() + ":"
+            + Data(remote.nodeID.utf8).base64EncodedString() + (completed ? ":completed" : ":owed")
+    }
+
+    private func trashDutiesLocked(for key: PendingSourceKey, generation: Int64) -> TrashDuties? {
+        guard generation >= 0 else { return nil }
+        let prefix = Self.trashMetadataPrefix(for: key)
+        var result = TrashDuties()
+        var decoded = true
+        let succeeded = query(
+            "SELECT key, value FROM pending_info WHERE key GLOB ?;",
+            bind: { stmt in
+                // Base64 and the fixed prefix contain no GLOB metacharacters. GLOB keeps case-sensitive source identity.
+                self.bindText(stmt, 1, prefix + "*")
+            }
+        ) { stmt in
+            guard let encoded = columnText(stmt, 0, roundTrip: true), sqlite3_column_type(stmt, 1) == SQLITE_INTEGER
+            else {
+                decoded = false
+                return
+            }
+            let storedGeneration = sqlite3_column_int64(stmt, 1)
+            guard storedGeneration >= 0, storedGeneration <= generation else {
+                decoded = false
+                return
+            }
+            let versioned = String(encoded.dropFirst(prefix.count))
+            guard versioned.hasPrefix("v1:") else {
+                decoded = false
+                return
+            }
+            let suffix = String(versioned.dropFirst(3))
+            if suffix == "generation" {
+                result.generationKnown = storedGeneration == generation
+                return
+            }
+            let fields = suffix.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            guard fields.count == 3, let volumeBytes = Data(base64Encoded: fields[0]),
+                let linkBytes = Data(base64Encoded: fields[1]), let volume = String(data: volumeBytes, encoding: .utf8),
+                let link = String(data: linkBytes, encoding: .utf8), !link.isEmpty,
+                fields[2] == "owed" || fields[2] == "completed"
+            else {
+                decoded = false
+                return
+            }
+            let remote = PhotoUID(volumeID: volume, nodeID: link)
+            guard encoded == Self.trashMetadataKey(for: key, remote: remote, completed: fields[2] == "completed") else {
+                decoded = false
+                return
+            }
+            guard storedGeneration == generation else { return }
+            if fields[2] == "completed" { result.completed.insert(remote) } else { result.owed.insert(remote) }
+        }
+        guard succeeded, decoded else { return nil }
+        result.owed.subtract(result.completed)
+        return result
+    }
+
+    private func writeTrashMetadata(
+        for key: PendingSourceKey, remote: PhotoUID, completed: Bool, generation: Int64
+    ) -> Bool {
+        writeTrashMetadata(
+            key: Self.trashMetadataKey(for: key, remote: remote, completed: completed), generation: generation)
+    }
+
+    private func writeTrashMetadata(key: String, generation: Int64) -> Bool {
+        execute(
+            "INSERT INTO pending_info(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+        ) { stmt in
+            bindText(stmt, 1, key)
+            sqlite3_bind_int64(stmt, 2, generation)
+        }
+    }
+
+    /// A stored restore or new delete ends the prior generation. Refuse unknown metadata before removing any row.
+    private func resetTrashDuties(for key: PendingSourceKey, generation: Int64, nextGeneration: Int64?) -> Bool {
+        guard trashDutiesLocked(for: key, generation: generation) != nil else { return false }
+        guard
+            execute(
+                "DELETE FROM pending_info WHERE key GLOB ?;",
+                bind: { stmt in
+                    bindText(stmt, 1, Self.trashMetadataPrefix(for: key) + "*")
+                })
+        else { return false }
+        guard let nextGeneration else { return true }
+        return writeTrashMetadata(key: Self.trashMetadataPrefix(for: key) + "v1:generation", generation: nextGeneration)
     }
 
     /// Marks a trash or restore request as sent, right before the reconciler dispatches it. Only states that
