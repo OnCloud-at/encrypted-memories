@@ -220,6 +220,7 @@ final class MobileViewerInspectorTests: XCTestCase {
             ])
         writer.add(input)
         XCTAssertTrue(writer.startWriting())
+        defer { if writer.status == .writing { writer.cancelWriting() } }
         writer.startSession(atSourceTime: .zero)
         let pool = try XCTUnwrap(adaptor.pixelBufferPool)
         var buffer: CVPixelBuffer?
@@ -231,9 +232,14 @@ final class MobileViewerInspectorTests: XCTestCase {
         }
         CVPixelBufferUnlockBaseAddress(frame, [])
         for index in 0..<frameCount {
-            for _ in 0..<100 where !input.isReadyForMoreMediaData {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while !input.isReadyForMoreMediaData, writer.status == .writing, ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
+            _ = try XCTUnwrap(
+                input.isReadyForMoreMediaData ? true : nil,
+                "SETUP: frame \(index) was not accepted before the deadline; status=\(writer.status) error=\(String(describing: writer.error))"
+            )
             XCTAssertTrue(adaptor.append(frame, withPresentationTime: CMTime(value: Int64(index), timescale: 1)))
         }
         input.markAsFinished()
