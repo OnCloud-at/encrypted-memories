@@ -183,6 +183,10 @@ public protocol PhotosRepository: Sendable {
     /// Loads one authoritative inventory and its paired server revision as a single result. Repositories that
     /// cannot expose a revision may use the default nil token; cache validation will then fail closed.
     func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot
+    /// Reports known photos while loading, without granting the authority of a completed snapshot.
+    func loadTimelineSnapshot(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot
     /// Last-known timeline persisted to disk, for instant startup (nil if none). `loadTimeline()`
     /// then refreshes in the background - stale-while-revalidate, so there's no spinner on relaunch.
     func cachedTimeline() async -> [TimelineSection]?
@@ -196,6 +200,12 @@ public protocol PhotosRepository: Sendable {
 }
 
 public extension PhotosRepository {
+    func loadTimelineSnapshot(
+        onProvisional: @escaping @Sendable (ProvisionalTimelineSnapshot) async -> Void
+    ) async throws -> TimelineLoadSnapshot {
+        try await loadTimelineSnapshot()
+    }
+
     func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
         TimelineLoadSnapshot(sections: try await loadTimeline(), validationToken: nil)
     }
@@ -295,6 +305,13 @@ public protocol PriorityThumbnailBatchLoader: ThumbnailBatchLoader {
         priority: ThumbnailPriority,
         onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult
+}
+
+/// Temporary thumbnail access for a presentation that cannot certify inventory completeness.
+public protocol ProvisionalThumbnailAuthorizing: Sendable {
+    func beginProvisionalThumbnailAccess() async -> UUID?
+    func updateProvisionalThumbnailAccess(_ uids: [PhotoUID], using lease: UUID) async
+    func endProvisionalThumbnailAccess(_ lease: UUID) async
 }
 
 /// Loads full-resolution original bytes without creating an app-owned plaintext cache file.
