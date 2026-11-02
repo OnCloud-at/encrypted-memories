@@ -1032,6 +1032,281 @@ extension DriveSessionStubSuite {
             #expect(state.samples.last?.outcome == 1)
         }
 
+        /// The store, the lineage store and the failing-checkpoint trigger that an early lineage save failure needs.
+        private func failingLineageSaveFixture() throws -> (
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore, directory: URL
+        ) {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            var db: OpaquePointer?
+            #expect(
+                sqlite3_open(directory.appendingPathComponent("lineage.sqlite").path, &db) == SQLITE_OK)
+            defer { sqlite3_close(db) }
+            #expect(
+                sqlite3_exec(
+                    db,
+                    """
+                    CREATE TRIGGER reject_checkpoint BEFORE INSERT ON lineage_checkpoint
+                    BEGIN SELECT RAISE(ABORT, 'test write failure'); END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            // Clear requests from earlier passes, including a control pass in the same test.
+            StubURLProtocol.reset()
+            return (content, lineage, directory)
+        }
+
+        /// The events of a first page whose lineage save fails, with one more page after it.
+        private func routeFirstPageWithFailedLineageSave() {
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json: #"{"Code":1000,"EventID":"two","More":1,"Refresh":0,"Events":[]}"#)
+        }
+
+        /// The requests that reached the held second events page, so a test can see when a pass reached it.
+        private func heldSecondPageReads() -> Int {
+            StubURLProtocol.requests().filter {
+                $0.path.hasPrefix("/drive/volumes/vol1/events/two")
+            }.count
+        }
+
+        @Test func laterPagesStillCountAfterAnEarlyLineageSaveFailure() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            let keys = try LineageKeys()
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/two",
+                json:
+                    #"{"Code":1000,"EventID":"three","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"event-photo","Type":2,"State":1}}]}"#
+            )
+            try routeMetadata([
+                try keys.activePhoto("event-photo", attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            ])
+            let collector = SupportWorkMeasurements()
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: keys.root,
+                workMeasurements: collector)
+            #expect(
+                fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "three")
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.counters[SupportMeasurementCounter.unlockSucceeded.rawValue] == 1)
+            #expect(state.counters[SupportMeasurementCounter.decryptSucceeded.rawValue] == 1)
+            #expect(state.samples.last?.outcome == 1)
+        }
+
+        @Test func earlyLineageSaveFailureAndALaterPageFailureMarkThePassFailed() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            // The second events page stays unrouted: its fetch fails after the lineage save failed.
+            let collector = SupportWorkMeasurements()
+            await #expect(throws: (any Error).self) {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            #expect(
+                fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            // The trigger aborted the lineage save of the first page and disabled the store. The pass
+            // saw this failure before the second page's fetch failed: only that failed write sets
+            // writesDisabled while the store stays open.
+            #expect(!fixture.lineage.acceptsWrites)
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 2)
+        }
+
+        @Test func earlyLineageSaveFailureAndALaterPageCancellationMarkThePassCancelled() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            // The second page hangs instead of failing with a stubbed URLError.cancelled: only the
+            // caller's real task cancellation ends the pass, so the outcome proves the classification
+            // of the cancellation that URLSession reports for a cancelled request.
+            StubURLProtocol.hang("GET /drive/volumes/vol1/events/two")
+            let collector = SupportWorkMeasurements()
+            let refreshPass = Task {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            // Cancel and join before fixture cleanup on every path. The join reports a failure
+            // if the pass does not terminate within its safety limit.
+            do {
+                try await waitUntil { heldSecondPageReads() > 0 }
+                try #require(heldSecondPageReads() > 0, "the pass reached the held second page")
+                // The first page completed while the second one hangs: its content checkpoint moved, and
+                // the aborted lineage save of that page disabled the lineage store before the cancellation.
+                #expect(
+                    fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+                #expect(!fixture.lineage.acceptsWrites)
+                refreshPass.cancel()
+                try await join(refreshPass, "the cancelled pass ends instead of hanging on the held page")
+            } catch {
+                refreshPass.cancel()
+                // The join records its own failure and its wait never throws, so it cannot mask
+                // the original error that this block rethrows.
+                try? await join(refreshPass, "a failed step still ends the pass before the cleanup closes the stores")
+                throw error
+            }
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 3)
+        }
+
+        /// The duration class of an event update includes the time of its later pages: the injected clock
+        /// only crosses the highest bound while the second page hangs after the first page's lineage
+        /// save failed. A control pass through the same early-failure code, with both pages answered,
+        /// stays in class 0 when the clock never moves. No wall-clock time passes in either pass.
+        @Test func eventUpdateDurationIncludesTheTimeOfLaterPages() async throws {
+            let clock = ManualDurationClock()
+
+            // Control: the same first page whose lineage save fails, with the second page answered.
+            // The clock never moves, so the finished pass stays in duration class 0.
+            let controlFixture = try failingLineageSaveFixture()
+            defer {
+                controlFixture.content.close()
+                controlFixture.lineage.close()
+                try? FileManager.default.removeItem(at: controlFixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/two",
+                json: #"{"Code":1000,"EventID":"three","More":0,"Refresh":0,"Events":[]}"#)
+            let controlCollector = SupportWorkMeasurements(now: { clock.value })
+            try await refresh(
+                content: controlFixture.content, lineage: controlFixture.lineage,
+                workMeasurements: controlCollector)
+            #expect(!controlFixture.lineage.acceptsWrites, "the control reaches the same failed save")
+            let control = controlCollector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(control.started == 1 && control.completed == 1 && control.inProgress == 0)
+            #expect(control.samples.last?.outcome == 1)
+            #expect(control.samples.last?.totalClass == 0, "a clock that never moves stays in class 0")
+
+            // Held pass: the same fixture shape, with the second page held instead of answered.
+            let fixture = try failingLineageSaveFixture()
+            #expect(heldSecondPageReads() == 0, "the fixture clears the control pass requests")
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.hang("GET /drive/volumes/vol1/events/two")
+            let collector = SupportWorkMeasurements(now: { clock.value })
+            let refreshPass = Task {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            // Cancel and join before fixture cleanup on every path. The join reports a failure
+            // if the pass does not terminate within its safety limit.
+            do {
+                try await waitUntil { heldSecondPageReads() > 0 }
+                try #require(heldSecondPageReads() > 0, "the pass reached the held second page")
+                // The pass already finished the first page: its lineage save failed before the held page,
+                // and the measurement of the pass is still open instead of frozen at the first page.
+                #expect(!fixture.lineage.acceptsWrites)
+                #expect(
+                    fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two",
+                    "the first page completed before the clock moves")
+                // Only now, with the pass held on its second page, the measured time crosses the top
+                // duration bound. The total must include this page: a total that stopped at the first page
+                // would still read the class the control showed.
+                clock.advance(.seconds(121))
+                refreshPass.cancel()
+                try await join(refreshPass, "the cancelled pass ends instead of hanging on the held page")
+            } catch {
+                refreshPass.cancel()
+                // The join records its own failure and its wait never throws, so it cannot mask
+                // the original error that this block rethrows.
+                try? await join(refreshPass, "a failed step still ends the pass before the cleanup closes the stores")
+                throw error
+            }
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 3)
+            #expect(state.samples.last?.totalClass == 6)
+        }
+
+        /// A normally completing partial pass includes the time up to its second page.
+        /// The clock moves only once the stub records that page, without wall-clock sleeping.
+        @Test func aNormalPartialPassCountsTheElapsedClockTime() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/two",
+                json: #"{"Code":1000,"EventID":"three","More":0,"Refresh":0,"Events":[]}"#)
+            let collector = SupportWorkMeasurements(now: {
+                self.heldSecondPageReads() > 0 ? .seconds(121) : .zero
+            })
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            #expect(!fixture.lineage.acceptsWrites, "the pass reaches the same early failed save")
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 1)
+            #expect(state.samples.last?.totalClass == 6)
+        }
+
+        /// A cancellation that URLSession reports for a request of a later page classifies the pass as
+        /// cancelled. This is the transport-level counterpart of the caller-side task cancellation
+        /// above: it needs no hanging request, only the stubbed transport error.
+        @Test func laterPageURLErrorCancelledClassifiesThePassAsCancelled() async throws {
+            let fixture = try failingLineageSaveFixture()
+            defer {
+                fixture.content.close()
+                fixture.lineage.close()
+                try? FileManager.default.removeItem(at: fixture.directory)
+            }
+            routeFirstPageWithFailedLineageSave()
+            StubURLProtocol.fail("GET /drive/volumes/vol1/events/two")
+            let collector = SupportWorkMeasurements()
+            await #expect(throws: (any Error).self) {
+                try await refresh(
+                    content: fixture.content, lineage: fixture.lineage, workMeasurements: collector)
+            }
+            // The first page completed, and its lineage save failed before the transport cancelled.
+            #expect(
+                fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            #expect(!fixture.lineage.acceptsWrites)
+            let state = collector.workMeasurementSupportSnapshot().passes[
+                SupportMeasurementKind.eventUpdate.rawValue]
+            #expect(state.started == 1 && state.completed == 1 && state.inProgress == 0)
+            #expect(state.samples.last?.outcome == 3)
+        }
+
         @Test func lineageFinishBuildFailureMarksTheIndexRebuildPassAsPartial() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1935,6 +2210,15 @@ extension DriveSessionStubSuite {
                 progress: { _ in }, workMeasurements: workMeasurements)
         }
     }
+}
+
+/// The injectable clock for SupportWorkMeasurements: the pass under test reads `value`, and only the
+/// test itself moves time with `advance`. Nothing reads a wall clock while a test holds a pass.
+private final class ManualDurationClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = Duration.zero
+    var value: Duration { lock.withLock { current } }
+    func advance(_ amount: Duration) { lock.withLock { current += amount } }
 }
 
 /// One outcome that a test reads while the code under test still runs: nil until it is set.
