@@ -675,7 +675,7 @@ public actor PendingBackupCoordinator {
         {
             // The reload failed, so the shown list keeps its stale tile until a read succeeds. Arm the
             // degraded retry, as startup recovery does (#913). A degraded wait that is already set keeps
-            // its delay, as `queueLaterTrashRecovery` does: `scheduleReconcileTimer` restarts the countdown.
+            // its delay, as the degraded action-timer guard does: `scheduleReconcileTimer` restarts the countdown.
             scheduleReconcileTimer(advanceBackoff: false)
         }
         listsDirty = true
