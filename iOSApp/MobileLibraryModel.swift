@@ -145,6 +145,9 @@ struct MobileScopeRecoveryIdentity: Equatable, Sendable {
 private struct MobileLibraryRefreshResult: Sendable {
     let outcome: LibraryChangeRefreshOutcome
     let failureReason: TimelineRefreshFailureReason?
+    /// True when the refresh succeeded and the loaded content equals the content that was already shown. Only the
+    /// upload-refresh work reads it; the change monitor consumes `outcome` and ignores it.
+    var contentUnchanged = false
 }
 
 /// Owns the single terminal-recovery task. Scheduling is synchronous on the main actor, so retry, sign-out, and
@@ -1085,7 +1088,8 @@ final class MobileLibraryModel {
         return (
             refresh: { [weak self] _ in
                 guard let self else { return .cancelled }
-                return await self.performLibraryRefresh(lease: refreshLease).failureReason
+                let result = await self.performLibraryRefresh(lease: refreshLease)
+                return result.contentUnchanged ? .unchanged : result.failureReason
             },
             observer: { [weak self] attempt in
                 guard attempt.failureReason == .scopeAccessLost else { return }
@@ -2010,7 +2014,11 @@ final class MobileLibraryModel {
             // Another device's favorite change moves the same token, so refreshLibrarySources reads them again.
             favoriteState.observeLibraryToken(refreshed.validationToken)
             refreshLibrarySources()
-            return .init(outcome: .refreshed(token: refreshed.validationToken), failureReason: nil)
+            return .init(
+                outcome: .refreshed(token: refreshed.validationToken),
+                failureReason: nil,
+                contentUnchanged: !change.contentChanged
+            )
         } catch is CancellationError {
             return .init(outcome: .retry, failureReason: .cancelled)
         } catch is any LibraryChangeTerminalError {

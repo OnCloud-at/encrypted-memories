@@ -18,6 +18,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
     public let publishedLibraryChangeToken: String?
     /// False when the refresh loaded a filtered route, which can never confirm a whole-library revision.
     public let coversWholeLibrary: Bool
+    /// True when the refresh succeeded and the loaded content equals the content that was already shown.
+    public let contentUnchanged: Bool
 
     public var found: Bool { foundItem != nil }
 
@@ -32,7 +34,8 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         failureReason: TimelineRefreshFailureReason? = nil,
         addedUIDs: [PhotoUID] = [],
         publishedLibraryChangeToken: String? = nil,
-        coversWholeLibrary: Bool = true
+        coversWholeLibrary: Bool = true,
+        contentUnchanged: Bool = false
     ) {
         self.uploadedUID = uploadedUID
         self.foundItem = foundItem
@@ -45,6 +48,7 @@ public struct TimelineRefreshResult: Sendable, Equatable {
         self.addedUIDs = addedUIDs
         self.publishedLibraryChangeToken = publishedLibraryChangeToken
         self.coversWholeLibrary = coversWholeLibrary
+        self.contentUnchanged = contentUnchanged
     }
 
     /// The change monitor's outcome for a refresh that succeeded.
@@ -971,7 +975,8 @@ public final class TimelineViewModel {
                     filterDescription: Self.describe(filter),
                     elapsedMs: elapsedMilliseconds(since: start),
                     publishedLibraryChangeToken: loaded.validationToken,
-                    coversWholeLibrary: f == .all
+                    coversWholeLibrary: f == .all,
+                    contentUnchanged: true
                 )
             }
             let items = sections.flatMap(\.items)
