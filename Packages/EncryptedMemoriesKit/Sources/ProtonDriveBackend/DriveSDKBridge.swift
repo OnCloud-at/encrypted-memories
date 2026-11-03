@@ -2844,14 +2844,24 @@ extension DriveSDKBridge: PhotoUploading {
                 identityStore: nil,
                 contentIndex: nil,
                 replacementJournal: nil,
+                fingerprintCache: nil,
                 close: {}
             )
         }
         // Nil when the journal file cannot be read: edits then keep their earlier uploads.
         let replacementJournal = EditReplacementJournalFileStore.shared(
             accountDataDirectory: uploadManifestURL.deletingLastPathComponent())
+        let accountDirectory = uploadManifestURL.deletingLastPathComponent()
+        // One cache for the whole account: the duplicate service invalidates it per link, the finder reads it.
+        // Nil when the store cannot open: the ranking then reads every node as before.
+        let fingerprintCache = ExactDuplicateFingerprintCache.open(
+            accountDirectory: accountDirectory, policy: uploadManifestPolicy)
+        if fingerprintCache == nil {
+            DebugLog.log("[Dedupe] fingerprint store unavailable; rankings read every node")
+        }
         let lineageStore = UploadRemoteLineageIndexStore(
-            url: uploadManifestURL.deletingLastPathComponent()
+            url:
+                accountDirectory
                 .appendingPathComponent(UploadRemoteLineageIndexStore.databaseFileName),
             policy: uploadManifestPolicy)
         if lineageStore == nil {
@@ -2865,7 +2875,8 @@ extension DriveSDKBridge: PhotoUploading {
             contentIndexStore: store,
             lineageIndexStore: lineageStore,
             firstBuildGate: firstIndexBuildGate,
-            workMeasurements: workMeasurements
+            workMeasurements: workMeasurements,
+            fingerprintCache: fingerprintCache
         ) { [self] in
             try await photosShareContext()
         }
@@ -2883,8 +2894,10 @@ extension DriveSDKBridge: PhotoUploading {
             identityStore: store,
             contentIndex: store,
             replacementJournal: replacementJournal,
+            fingerprintCache: fingerprintCache,
             close: {
                 lineageStore?.close()
+                fingerprintCache?.close()
                 store.close()
             }
         )

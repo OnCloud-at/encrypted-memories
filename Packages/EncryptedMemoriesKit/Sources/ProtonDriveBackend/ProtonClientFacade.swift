@@ -15,6 +15,8 @@ struct UploadIdentityResolverComposition: Sendable {
     /// Earlier uploads of edited photos that the backup replaces. Nil when the upload manifest or the journal is
     /// unavailable.
     let replacementJournal: (any EditReplacementJournaling)?
+    /// The fingerprint cache for the content index. Nil when the manifest cannot open.
+    let fingerprintCache: ExactDuplicateFingerprintCache?
     let close: @Sendable () -> Void
 }
 
@@ -172,9 +174,9 @@ public final class ProtonClientFacade {
         )
 
         // The metadata of earlier duplicate rankings lives in the account data directory, so sign-out removes it with
-        // the other account stores. Nil when the file cannot open: the ranking then reads every node.
-        let fingerprintCache = ExactDuplicateFingerprintCache.open(
-            accountDirectory: bridge.uploadManifestURL.deletingLastPathComponent(), policy: bridge.uploadManifestPolicy)
+        // the other account stores. One cache serves the whole account: the duplicate service invalidates it, the
+        // finder reads it. Nil when the file cannot open: the ranking then reads every node.
+        let fingerprintCache = identityComposition.fingerprintCache
         return ProtonClientFacade(
             backend: bridge,
             librarySources: librarySources,
@@ -235,9 +237,9 @@ public final class ProtonClientFacade {
                 await librarySources.shutdown()
                 await manager.shutdown()
                 // Bridge shutdown closes shared admission and joins backend, album, sync, upload,
-                // and identity work before any account-scoped resolver store is closed.
+                // and identity work before any account-scoped resolver store is closed. The
+                // composition closes the shared fingerprint cache with the other account stores.
                 await bridge.shutdown()
-                fingerprintCache?.close()
                 identityComposition.close()
             }
         )

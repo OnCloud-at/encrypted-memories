@@ -64,4 +64,39 @@ public final class ExactDuplicateFingerprintCache: @unchecked Sendable {
         guard let snapshot, currentEventID == snapshot.eventID, !fingerprints.isEmpty else { return }
         store.store(fingerprints, for: snapshot)
     }
+
+    /// Advances the saved details to a new cursor of the content index, dropping the details of the given links.
+    ///
+    /// The event page named `linkIDs` as changed, so their details must not survive. When the cache has no in-memory
+    /// cursor, it recovers the persisted snapshot at `fromEventID` to preserve surgical invalidation across launches;
+    /// a scope change (another volume or key epoch), a store that cannot serve the surgical advance, or an unreadable
+    /// store falls back to a full reset: a stale detail must never reach a ranking.
+    public func advance(
+        volumeID: String, hashKeyEpoch: String, from fromEventID: String, to toEventID: String,
+        invalidating linkIDs: Set<String>
+    ) {
+        lock.withLock {
+            let scope = ExactDuplicateFingerprintStore.Scope(
+                accountID: accountID, volumeID: volumeID, hashKeyEpoch: hashKeyEpoch)
+            // Recover the persisted snapshot when this launch has no in-memory cursor yet.
+            let current = snapshot ?? store.prepare(scope: scope, eventID: fromEventID)
+            if let current, current.scope == scope,
+                let next = store.advance(from: current, to: toEventID, invalidating: linkIDs)
+            {
+                self.snapshot = next
+                return
+            }
+            // A different volume or key epoch, or a store that lost the context: discard everything and start fresh.
+            snapshot = store.prepare(scope: scope, eventID: toEventID)
+        }
+    }
+
+    /// Discards every saved detail for a full rebuild. A rebuilt index never serves the details of an earlier cursor.
+    public func reset(volumeID: String, hashKeyEpoch: String, to eventID: String) {
+        lock.withLock {
+            let scope = ExactDuplicateFingerprintStore.Scope(
+                accountID: accountID, volumeID: volumeID, hashKeyEpoch: hashKeyEpoch)
+            snapshot = store.prepare(scope: scope, eventID: eventID)
+        }
+    }
 }
