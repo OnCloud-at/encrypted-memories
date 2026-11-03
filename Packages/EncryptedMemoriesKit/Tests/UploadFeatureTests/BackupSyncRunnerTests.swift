@@ -3129,7 +3129,9 @@ final class BackupSyncRunnerTests: XCTestCase {
 
     private func makeRunner(
         uploader: (any PhotoUploading)? = nil,
-        tagAdder: (any PhotoTagAdding)? = nil,
+        // Production always wires a tag adder; the default spy mirrors that. Tests that
+        // need the nil path pass an explicit `tagAdder: nil`.
+        tagAdder: (any PhotoTagAdding)? = SpyTagAdder(),
         identityResolver: (any UploadIdentityResolving)? = nil,
         editReplacement: EditedPhotoReplacement? = nil,
         resolver: (any BackupResourceResolving)? = nil,
@@ -5086,8 +5088,9 @@ final class BackupSyncRunnerTests: XCTestCase {
     func testLivePhotoCompoundUploadsPairedVideoWithPrimaryReference() async throws {
         let entry = seedEntry("live.heic")
         resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        let tagAdder = SpyTagAdder()
 
-        let runner = makeRunner()
+        let runner = makeRunner(tagAdder: tagAdder)
         let progress = await runner.runUntilDrained()
 
         XCTAssertEqual(
@@ -5096,9 +5099,12 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(
             uploader.requests.map(\.tags),
             [
-                [PhotoTag.livePhotos.rawValue],
-                [PhotoTag.livePhotos.rawValue],
-            ], "both resources must carry Proton's Live Photo classification")
+                [],
+                [],
+            ], "neither part carries the Live Photo tag at upload; the tag is added after settlement")
+        XCTAssertEqual(tagAdder.calls.map(\.tags), [[PhotoTag.livePhotos.rawValue]])
+        XCTAssertEqual(tagAdder.calls.first?.uid.nodeID, testUID("live.heic").nodeID)
+        XCTAssertEqual(tagAdder.calls.count, 1, "the still earns the Live Photo tag once, after both parts settle")
         let pairedRequest = try XCTUnwrap(uploader.requests.last)
         XCTAssertEqual(
             pairedRequest.mainPhotoUID, testUID("live.heic"),

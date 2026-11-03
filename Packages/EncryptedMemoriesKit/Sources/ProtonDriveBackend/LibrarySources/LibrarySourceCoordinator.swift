@@ -30,7 +30,7 @@ public enum PrimaryInventoryAdmission: Sendable, Equatable {
 /// The coordinator owns one graph. Platform hosts consume immutable changes and never infer source
 /// membership from UI state. The main projection remains the primary inventory; additional inventories
 /// participate only in explicitly authorized derived-data work.
-public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
+public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader, ProvisionalThumbnailAuthorizing {
     public typealias ChangeHandler = @Sendable (LibrarySourceChange) async -> Void
 
     private static let primarySourceID = SourceID("primary")
@@ -61,6 +61,8 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
     private var closed = false
     /// Sequence of the last applied Recently Deleted report.
     private var identitiesOutsideInventorySequence: UInt64 = 0
+    private var listedIdentitiesOutsideInventory: [PhotoUID] = []
+    private var provisionalThumbnailIdentities: [UUID: [PhotoUID]] = [:]
 
     init(
         remote: any LibrarySourceRemoteBackend,
@@ -195,6 +197,34 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
     public func setIdentitiesOutsideInventory(_ uids: [PhotoUID], sequence: UInt64) async {
         guard !closed, sequence > identitiesOutsideInventorySequence else { return }
         identitiesOutsideInventorySequence = sequence
+        listedIdentitiesOutsideInventory = uids
+        await publishIdentitiesOutsideInventory()
+    }
+
+    /// A presentation owns only its temporary byte registration, never primary inventory membership.
+    public func beginProvisionalThumbnailAccess() -> UUID? {
+        guard prepared, !closed else { return nil }
+        let lease = UUID()
+        provisionalThumbnailIdentities[lease] = []
+        return lease
+    }
+
+    public func updateProvisionalThumbnailAccess(_ uids: [PhotoUID], using lease: UUID) async {
+        guard !closed, provisionalThumbnailIdentities[lease] != nil else { return }
+        provisionalThumbnailIdentities[lease] = uids
+        await publishIdentitiesOutsideInventory()
+    }
+
+    public func endProvisionalThumbnailAccess(_ lease: UUID) async {
+        guard !closed, provisionalThumbnailIdentities.removeValue(forKey: lease) != nil else { return }
+        await publishIdentitiesOutsideInventory()
+    }
+
+    private func publishIdentitiesOutsideInventory() async {
+        var uids = listedIdentitiesOutsideInventory
+        for lease in provisionalThumbnailIdentities.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+            uids.append(contentsOf: provisionalThumbnailIdentities[lease] ?? [])
+        }
         if let change = graph.setIdentitiesOutsideInventory(uids) { await publish(change) }
     }
 
@@ -572,6 +602,7 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
     public func shutdown() async {
         guard !closed else { return }
         closed = true
+        provisionalThumbnailIdentities.removeAll(keepingCapacity: false)
         await cancelRefresh()
         await waitForRevocationDrain()
         changeHandler = nil

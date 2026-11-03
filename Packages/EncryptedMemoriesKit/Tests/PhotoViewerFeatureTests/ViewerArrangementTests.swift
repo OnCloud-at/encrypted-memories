@@ -1,4 +1,5 @@
 import PhotoViewerCore
+import PhotosCore
 import XCTest
 
 /// The viewer reads the system's folded layout only from the z-index the overlay arrangement gives its two parts.
@@ -32,5 +33,69 @@ final class ViewerArrangementTests: XCTestCase {
         // The stacked lower part keeps today's filmstrip rows: 8 + 54 + 8 and 6 + 46 + 4.
         XCTAssertEqual(ViewerChromeLayoutProfile.regular.stackedLowerPartHeight, 70)
         XCTAssertEqual(ViewerChromeLayoutProfile.compactLandscape.stackedLowerPartHeight, 56)
+    }
+
+    func testTransportPlacementKeepsFlatDesignAndRequiresChromeAndAnAttachedVideo() {
+        for divided in [false, true] {
+            XCTAssertEqual(
+                ViewerArrangement.videoTransportPlacement(isDivided: divided, showsChrome: true, isAvailable: true),
+                divided ? .lowerPart : .media)
+            for available in [false, true] {
+                XCTAssertEqual(
+                    ViewerArrangement.videoTransportPlacement(
+                        isDivided: divided, showsChrome: false, isAvailable: available), .hidden)
+            }
+            XCTAssertEqual(
+                ViewerArrangement.videoTransportPlacement(isDivided: divided, showsChrome: true, isAvailable: false),
+                .hidden)
+        }
+    }
+
+    @MainActor func testTransportForwardsCommandsAndRejectsAFormerPagesUpdatesAndCleanup() {
+        let transport = ViewerVideoTransport()
+        XCTAssertFalse(transport.isAttached(to: nil), "An empty viewer has no transport")
+        let firstUID = PhotoUID(volumeID: "transport-volume", nodeID: "first-video")
+        let secondUID = PhotoUID(volumeID: "transport-volume", nodeID: "second-video")
+        let firstPlayer = NSObject()
+        let firstItem = NSObject()
+        let secondPlayer = NSObject()
+        let secondItem = NSObject()
+        let first = VideoPlaybackAttachmentIdentity(generation: 1, player: firstPlayer, item: firstItem)
+        let second = VideoPlaybackAttachmentIdentity(generation: 1, player: secondPlayer, item: secondItem)
+        var firstToggles = 0
+        var secondToggles = 0
+        var seeks: [Double] = []
+        transport.attach(
+            uid: firstUID, attachment: first, snapshot: .init(currentTime: 8, duration: 60),
+            onTogglePlayback: { firstToggles += 1 }, onSeekTo: { seeks.append($0) })
+        XCTAssertTrue(transport.isAttached(to: firstUID))
+        XCTAssertFalse(transport.isAttached(to: secondUID))
+        XCTAssertEqual(transport.snapshot.currentTime, 8)
+        transport.togglePlayback()
+        transport.seek(to: 12)
+        XCTAssertEqual(firstToggles, 1)
+        XCTAssertEqual(seeks, [12])
+        let current = ViewerVideoTransport.Snapshot(currentTime: 20, duration: 90, isPlaying: true)
+        transport.attach(
+            uid: secondUID, attachment: second, snapshot: current,
+            onTogglePlayback: { secondToggles += 1 }, onSeekTo: { seeks.append($0) })
+        transport.update(.init(currentTime: 99), attachment: first)
+        XCTAssertEqual(transport.snapshot, current, "A former page cannot publish over the current page")
+        transport.detach(attachment: first)
+        XCTAssertTrue(transport.isAttached(to: secondUID), "A former page cannot detach the current page")
+        XCTAssertFalse(transport.isAttached(to: firstUID))
+        transport.togglePlayback()
+        XCTAssertEqual(secondToggles, 1)
+        XCTAssertEqual(firstToggles, 1)
+        let updated = ViewerVideoTransport.Snapshot(currentTime: 24, duration: 90, isLoading: true)
+        transport.update(updated, attachment: second)
+        XCTAssertEqual(transport.snapshot, updated)
+        transport.detach(attachment: second)
+        XCTAssertNil(transport.uid)
+        XCTAssertEqual(transport.snapshot, .init())
+        transport.togglePlayback()
+        transport.seek(to: 30)
+        XCTAssertEqual(secondToggles, 1, "Detach removes commands to the old owner")
+        XCTAssertEqual(seeks, [12])
     }
 }

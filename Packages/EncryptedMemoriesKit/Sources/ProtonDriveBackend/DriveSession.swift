@@ -491,8 +491,8 @@ extension DriveSession {
                     isActive: link.state == nil || link.state == 1,
                     mainPhotoLinkID: link.fileProperties?.activeRevision?.photo?.mainPhotoLinkID,
                     hasExplicitState: link.state != nil,
-                    hasExplicitPhotoState: link.state != nil && link.fileProperties?.activeRevision?.photo != nil,
-                    trashTime: link.trashed)
+                    trashTime: link.trashed,
+                    hasExplicitPhotoState: link.state != nil && link.fileProperties?.activeRevision?.photo != nil)
             }
         }
         return result

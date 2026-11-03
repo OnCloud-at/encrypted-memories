@@ -8,6 +8,89 @@ import Testing
 
 @Suite("Library source coordinator")
 struct LibrarySourceCoordinatorTests {
+    @Test func provisionalThumbnailsNeverBecomeInventoryAndDoNotReplaceTheTrashRegistration() async throws {
+        let uid = PhotoUID(volumeID: "primary-volume", nodeID: "provisional")
+        let trashUID = PhotoUID(volumeID: "primary-volume", nodeID: "in-trash")
+        let backend = ControlledLibrarySourceBackend()
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        await coordinator.setIdentitiesOutsideInventory([trashUID], sequence: 1)
+        let before = await coordinator.snapshot()
+        let lease = try #require(await coordinator.beginProvisionalThumbnailAccess())
+        await coordinator.updateProvisionalThumbnailAccess([uid], using: lease)
+        let delivered = ThumbnailDeliveryRecorder()
+        let result = await coordinator.loadThumbnails(for: [uid, trashUID], priority: .visibleNow) { uid, data in
+            delivered.store(data, for: uid)
+        }
+        #expect(delivered.data(for: uid) != nil, "A known provisional photo must load its thumbnail")
+        #expect(result.itemErrors[uid] == nil)
+        #expect(delivered.data(for: trashUID) != nil)
+        let during = await coordinator.snapshot()
+        #expect(during.selectedProjection.timeline.uids == before.selectedProjection.timeline.uids)
+        #expect(during.retentionProjection.timeline.uids == before.retentionProjection.timeline.uids)
+        #expect(during.selectedScope.uids == before.selectedScope.uids)
+        #expect(during.analysisScope.uids == before.analysisScope.uids)
+        #expect(during.retentionScope.uids == before.retentionScope.uids)
+        #expect(!during.retentionScope.isAuthoritative)
+        #expect(during.orphanedUIDs.isEmpty, "A provisional page cannot orphan inventory")
+        await coordinator.endProvisionalThumbnailAccess(lease)
+        await coordinator.updateProvisionalThumbnailAccess([uid], using: lease)
+        let withdrawn = await coordinator.loadThumbnails(for: [uid, trashUID], priority: .visibleNow) { _, _ in }
+        #expect(withdrawn.itemErrors[uid] == "source unavailable", "A retired presentation cannot authorize bytes")
+        #expect(withdrawn.itemErrors[trashUID] == nil, "Its closure must preserve Recently Deleted")
+        let after = await coordinator.snapshot()
+        #expect(after.analysisScope.uids == before.analysisScope.uids)
+        #expect(after.retentionScope.uids == before.retentionScope.uids)
+        #expect(!after.retentionScope.isAuthoritative)
+        #expect(after.orphanedUIDs.isEmpty)
+        await coordinator.shutdown()
+    }
+
+    @Test func closingOneProvisionalPresentationKeepsTheOtherAndRecentlyDeletedAuthorized() async throws {
+        let first = PhotoUID(volumeID: "primary-volume", nodeID: "first-page")
+        let second = PhotoUID(volumeID: "primary-volume", nodeID: "second-page")
+        let shared = PhotoUID(volumeID: "primary-volume", nodeID: "shared-photo")
+        let trash = PhotoUID(volumeID: "primary-volume", nodeID: "in-trash")
+        let backend = ControlledLibrarySourceBackend()
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        await coordinator.setIdentitiesOutsideInventory([trash], sequence: 1)
+        let before = await coordinator.snapshot()
+        let firstLease = try #require(await coordinator.beginProvisionalThumbnailAccess())
+        let secondLease = try #require(await coordinator.beginProvisionalThumbnailAccess())
+        await coordinator.updateProvisionalThumbnailAccess([first, shared], using: firstLease)
+        await coordinator.updateProvisionalThumbnailAccess([second, shared], using: secondLease)
+        await coordinator.endProvisionalThumbnailAccess(firstLease)
+        await coordinator.updateProvisionalThumbnailAccess([first], using: firstLease)
+        let delivered = ThumbnailDeliveryRecorder()
+        let result = await coordinator.loadThumbnails(for: [first, second, shared, trash], priority: .visibleNow) {
+            uid, data in
+            delivered.store(data, for: uid)
+        }
+        #expect(result.itemErrors[first] == "source unavailable")
+        for uid in [second, shared, trash] {
+            #expect(result.itemErrors[uid] == nil)
+            #expect(delivered.data(for: uid) != nil)
+        }
+        #expect(delivered.data(for: first) == nil)
+        let during = await coordinator.snapshot()
+        #expect(during.selectedScope.uids == before.selectedScope.uids)
+        #expect(during.analysisScope.uids == before.analysisScope.uids)
+        #expect(during.retentionScope.uids == before.retentionScope.uids)
+        #expect(!during.retentionScope.isAuthoritative)
+        #expect(during.orphanedUIDs.isEmpty)
+        await coordinator.endProvisionalThumbnailAccess(secondLease)
+        let ended = await coordinator.loadThumbnails(for: [second, shared, trash], priority: .visibleNow) { _, _ in }
+        #expect(ended.itemErrors[second] == "source unavailable")
+        #expect(ended.itemErrors[shared] == "source unavailable")
+        #expect(ended.itemErrors[trash] == nil)
+        await coordinator.shutdown()
+        #expect(await coordinator.beginProvisionalThumbnailAccess() == nil)
+        await coordinator.updateProvisionalThumbnailAccess([first, second], using: secondLease)
+        let closed = await coordinator.loadThumbnails(for: [first, second], priority: .visibleNow) { _, _ in }
+        #expect(closed.batchError == "source runtime closed")
+    }
+
     @Test func additionalInventoryParticipatesInAnalysisButNotThePrimaryProjection() async throws {
         let remoteUID = PhotoUID(volumeID: "remote-volume", nodeID: "remote-photo")
         let backend = ControlledLibrarySourceBackend()

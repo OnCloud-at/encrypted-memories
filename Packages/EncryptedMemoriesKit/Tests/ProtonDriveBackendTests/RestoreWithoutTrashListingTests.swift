@@ -84,22 +84,22 @@ extension DriveSessionStubSuite {
 
         // MARK: When the listing fails
 
-        @Test func aFailedListingRestoresTheMainPhotoAloneAndTheRestoreSucceeds() async throws {
+        @Test func aFailedListingFailsTheRestoreBeforeAnyPhotoChanges() async throws {
             let fixture = try await Fixture(frameTrashTime: 1001, listingStatus: 500)
             defer { fixture.close() }
             let result = await fixture.effects.restore([main])
-            #expect(result == .done)
-            #expect(try fixture.restoredLinkIDs() == [["main"]])
+            #expect(result != .done)
+            #expect(try fixture.restoredLinkIDs().isEmpty)
             #expect(fixture.listings() == 1)
         }
 
         @Test(arguments: [Fixture.RateLimited.listPage, .metadata])
-        func aRateLimitedListingIsNotRetriedAndTheRestoreGoesOn(limited: Fixture.RateLimited) async throws {
+        func aRateLimitedPreflightIsNotRetriedAndRestoresNothing(limited: Fixture.RateLimited) async throws {
             let fixture = try await Fixture(frameTrashTime: 1001, rateLimited: limited)
             defer { fixture.close() }
             let result = await fixture.effects.restore([main])
-            #expect(result == .done)
-            #expect(try fixture.restoredLinkIDs() == [["main"]], "no retry; the main photo came back alone")
+            #expect(result != .done)
+            #expect(try fixture.restoredLinkIDs().isEmpty, "no retry; the main photo stays in trash")
             #expect(fixture.listings() == 1, "the listing page was asked for once")
             #expect(fixture.metadataReads() == (limited == .metadata ? 1 : 0))
         }
@@ -156,11 +156,13 @@ extension DriveSessionStubSuite {
 
             let bridge: DriveSDKBridge
             let effects: ProtonPendingRemoteEffects
-            private let directory: URL
+            let directory: URL
+            private let removesDirectoryOnClose: Bool
 
             init(
                 frameTrashTime: Int64, deleted: RecentlyDeletedIdentities = RecentlyDeletedIdentities(listing: nil),
-                listingStatus: Int = 200, rateLimited: RateLimited? = nil, hangListing: Bool = false
+                listingStatus: Int = 200, rateLimited: RateLimited? = nil, hangListing: Bool = false,
+                ownedDirectory: URL? = nil, seriesRestoreRetry: BackupRetryPolicy = .init(baseDelay: 60, maxDelay: 900)
             ) async throws {
                 StubURLProtocol.reset()
                 let share = #"{"ShareID":"share","VolumeID":"own-volume","LinkID":"root","State":1}"#
@@ -182,17 +184,27 @@ extension DriveSessionStubSuite {
                        "FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"main"}}}}
                     ]}
                     """
+                let activeMetadata = metadata.replacingOccurrences(
+                    of: "\"LinkID\":\"main\",\"Type\":2,\"State\":2", with: "\"LinkID\":\"main\",\"Type\":2,\"State\":1"
+                )
+                let preflightReads =
+                    deleted.hasAppliedListing
+                        || !deleted.trashedRelatedPhotos(of: [PhotoUID(volumeID: "own-volume", nodeID: "main")]).isEmpty
+                    ? 1 : 2
                 StubURLProtocol.routeSequence(
                     RestoreWithoutTrashListingTests.metadataRoute,
                     responses: rateLimited == .metadata
-                        ? [(429, #"{"Code":429}"#), (200, metadata)] : [(200, metadata)])
+                        ? [(429, #"{"Code":429}"#), (200, metadata)]
+                        : Array(repeating: (200, metadata), count: preflightReads) + [(200, activeMetadata)])
                 StubURLProtocol.routeSequence(
                     RestoreWithoutTrashListingTests.restoreRoute,
                     responses: [
                         (200, #"{"Code":1000,"Responses":[{"LinkID":"main","Response":{"Code":1000}}]}"#),
                         (200, #"{"Code":1000,"Responses":[{"LinkID":"frame","Response":{"Code":1000}}]}"#),
                     ])
-                directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                directory =
+                    ownedDirectory ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                removesDirectoryOnClose = ownedDirectory == nil
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let governor = ProtonRequestGovernor()
                 let session = DriveSession(
@@ -222,7 +234,9 @@ extension DriveSessionStubSuite {
                             directory: directory, accountUID: "fixture", keyPassword: ""),
                         photoNames: nil, recentlyDeleted: deleted,
                         uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
-                        uploadManifestPolicy: .conservative))
+                        uploadManifestPolicy: .conservative), seriesRestoreRetry: seriesRestoreRetry,
+                    checkedSeriesRestoreCandidates: preflightReads == 1
+                        ? deleted.trashedRelatedPhotos(of: [PhotoUID(volumeID: "own-volume", nodeID: "main")]) : nil)
                 let albums = NoAlbumBackend()
                 effects = ProtonPendingRemoteEffects(
                     trashProvider: bridge, favorites: nil,
@@ -230,7 +244,13 @@ extension DriveSessionStubSuite {
             }
 
             func close() {
-                try? FileManager.default.removeItem(at: directory)
+                let directory = directory
+                let removesDirectory = removesDirectoryOnClose
+                let bridge = bridge
+                Task {
+                    await bridge.shutdown()
+                    if removesDirectory { try? FileManager.default.removeItem(at: directory) }
+                }
             }
 
             func listings() -> Int {

@@ -526,6 +526,7 @@ final class LivePhotoVideoProofRunnerTests: XCTestCase {
             identityResolver: UploadDedupePipeline(
                 store: identityStore, hasher: hasher, checker: checker, now: { [clock] in clock!.now }),
             uploader: uploader,
+            tagAdder: SpyTagAdder(),
             configuration: BackupSyncRunner.Configuration(
                 uploadStallTimeout: 180, uploadStallPollInterval: 5,
                 retry: BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 4),

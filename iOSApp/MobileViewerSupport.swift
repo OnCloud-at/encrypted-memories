@@ -52,3 +52,26 @@ struct MobileLivePhotoMotionTaskID: Equatable {
     let item: PhotoItem
     let isCurrent: Bool
 }
+
+#if DEBUG
+    private struct MobileViewerDividedTestKey: EnvironmentKey {
+        static let defaultValue: Bool? = nil
+    }
+
+    private struct MobileViewerTransportChromeTestKey: EnvironmentKey {
+        static let defaultValue: Bool? = nil
+    }
+
+    extension EnvironmentValues {
+        var mobileViewerTransportChromeForTesting: Bool? {
+            get { self[MobileViewerTransportChromeTestKey.self] }
+            set { self[MobileViewerTransportChromeTestKey.self] = newValue }
+        }
+
+        /// Injects the system arrangement fact for hosted tests; it does not simulate a native fold.
+        var mobileViewerIsDividedForTesting: Bool? {
+            get { self[MobileViewerDividedTestKey.self] }
+            set { self[MobileViewerDividedTestKey.self] = newValue }
+        }
+    }
+#endif

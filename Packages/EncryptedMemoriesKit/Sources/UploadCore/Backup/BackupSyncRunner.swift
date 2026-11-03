@@ -1786,6 +1786,23 @@ public actor BackupSyncRunner {
                     return
                 }
             }
+            // A Live Photo earns tag 3 only when its video is proven backed up. Both parts upload untagged;
+            // if the video never settles, the still shows no indicator. A failed tag add retries the whole
+            // row - the parts are already remote, so only the tag call repeats - until the tag is confirmed.
+            if resolved.secondaries.contains(where: { $0.descriptor.source.resource == .livePairedVideo }) {
+                // Without a tag adder the tag can never be confirmed, so the row fails visibly instead of
+                // silently uploading the pair without the Live Photo indicator.
+                guard let tagAdder else {
+                    retryOrPark(entry, from: persistedState, error: UploadError.tagAdderUnavailable)
+                    return
+                }
+                do {
+                    try await tagAdder.addTags([PhotoTag.livePhotos.rawValue], to: primaryUID)
+                } catch {
+                    retryOrPark(entry, from: persistedState, error: error)
+                    return
+                }
+            }
         }
         if let editReplacement, let primaryUID {
             do {
@@ -2097,12 +2114,10 @@ public actor BackupSyncRunner {
             )
     }
 
-    /// Proton tags of a compound's main photo. A Live Photo needs tag 3 and a series needs tag 7 at creation.
+    /// Proton tags of a compound's main photo at creation time. A series needs tag 7.
+    /// Live Photos do NOT carry tag 3 at creation; the tag is added only after both parts settle.
     static func primaryTags(for secondaries: [BackupSecondaryResource]) -> [Int] {
         var tags: [Int] = []
-        if secondaries.contains(where: { $0.descriptor.source.resource == .livePairedVideo }) {
-            tags.append(PhotoTag.livePhotos.rawValue)
-        }
         if secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember }) {
             tags.append(PhotoTag.bursts.rawValue)
         }
@@ -2110,7 +2125,6 @@ public actor BackupSyncRunner {
     }
 
     static func secondaryTags(for resource: UploadSourceIdentity.Resource) -> [Int] {
-        if resource == .livePairedVideo { return [PhotoTag.livePhotos.rawValue] }
         if resource.isBurstMember { return [PhotoTag.bursts.rawValue] }
         return []
     }
@@ -2816,6 +2830,8 @@ public actor BackupSyncRunner {
             return .network
         case UploadError.retryableBackend, UploadError.backend, UploadError.albumStep:
             return .remoteService
+        case UploadError.tagAdderUnavailable:
+            return .localState
         case UploadError.accountStorageFull:
             return .accountStorage
         default:

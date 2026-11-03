@@ -296,6 +296,19 @@ private final class VisibleThumbnailLifetime: @unchecked Sendable {
 /// adaptive download concurrency, decoded `CGImage` residency, and diagnostics. Platform targets adapt
 /// `DecodedThumbnail` to their presentation image type outside this module.
 public actor ThumbnailFeedCore {
+    /// Registers a presentation with a source-fenced loader. Direct loaders need no separate registration.
+    public nonisolated func beginProvisionalThumbnailAccess() async -> UUID? {
+        await (loader as? any ProvisionalThumbnailAuthorizing)?.beginProvisionalThumbnailAccess()
+    }
+
+    public nonisolated func updateProvisionalThumbnailAccess(_ uids: [PhotoUID], using lease: UUID) async {
+        await (loader as? any ProvisionalThumbnailAuthorizing)?.updateProvisionalThumbnailAccess(uids, using: lease)
+    }
+
+    public nonisolated func endProvisionalThumbnailAccess(_ lease: UUID) async {
+        await (loader as? any ProvisionalThumbnailAuthorizing)?.endProvisionalThumbnailAccess(lease)
+    }
+
     private struct PriorityReservation: Sendable {
         let uid: PhotoUID
         var priority: ThumbnailPriority
