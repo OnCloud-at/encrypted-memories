@@ -37,8 +37,10 @@ public final class AlbumActionCoordinator {
     public private(set) var hasCompletedInitialSharedAlbumLoad = false
     public private(set) var isWorking = false
     public private(set) var leavingSharedAlbumIDs: Set<AlbumNodeIdentifier> = []
-    public private(set) var loadErrorMessage: String?
-    public private(set) var sharedLoadErrorMessage: String?
+    public private(set) var loadFailure: AlbumFailurePresentation?
+    public private(set) var sharedLoadFailure: AlbumFailurePresentation?
+    public var loadErrorMessage: String? { loadFailure?.message }
+    public var sharedLoadErrorMessage: String? { sharedLoadFailure?.message }
     public var actionFailure: AlbumActionFailure?
 
     public var canCreate: Bool { repository.capabilities.canCreate }
@@ -70,6 +72,8 @@ public final class AlbumActionCoordinator {
     /// Whether the last finished load failed. The error message clears when a retry starts; this does not.
     private var lastAlbumLoadFailed = false
     private var lastSharedAlbumLoadFailed = false
+    @ObservationIgnored private var albumReadWaiters: [CheckedContinuation<Bool, Never>] = []
+    @ObservationIgnored private var sharedAlbumReadWaiters: [CheckedContinuation<Bool, Never>] = []
     private var membershipSelection: [PhotoUID] = []
     private var membershipsByPhoto: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
     private var membershipSelectionIsCovered = false
@@ -79,36 +83,84 @@ public final class AlbumActionCoordinator {
     }
 
     public func refresh() async {
-        guard !isLoading else { return }
+        await refreshOwned(allowReplacement: true)
+    }
+
+    private func refreshOwned(allowReplacement: Bool) async {
+        guard !Task.isCancelled else { return }
+        if isLoading {
+            let replaceCancelledRead = await withCheckedContinuation { albumReadWaiters.append($0) }
+            if replaceCancelledRead {
+                await refreshOwned(allowReplacement: false)
+            }
+            return
+        }
+        let previous = (loadFailure, lastAlbumLoadFailed, hasCompletedInitialAlbumLoad)
+        var wasCancelled = false
         isLoading = true
-        loadErrorMessage = nil
+        loadFailure = nil
         defer {
             isLoading = false
-            hasCompletedInitialAlbumLoad = true
+            let waiters = albumReadWaiters
+            albumReadWaiters.removeAll()
+            for waiter in waiters { waiter.resume(returning: wasCancelled && allowReplacement) }
         }
         do {
-            albums = try await repository.listAlbums()
+            let loaded = try await repository.listAlbums()
+            try Task.checkCancellation()
+            albums = loaded
             lastAlbumLoadFailed = false
+            hasCompletedInitialAlbumLoad = true
         } catch {
-            loadErrorMessage = Self.message(for: error)
-            lastAlbumLoadFailed = true
+            if let failure = AlbumFailurePresentation.read(error) {
+                loadFailure = failure
+                lastAlbumLoadFailed = true
+                hasCompletedInitialAlbumLoad = true
+            } else {
+                wasCancelled = true
+                (loadFailure, lastAlbumLoadFailed, hasCompletedInitialAlbumLoad) = previous
+            }
         }
     }
 
     public func refreshSharedAlbums() async {
-        guard canListSharedWithMe, !isLoadingShared else { return }
+        await refreshShared(allowReplacement: true)
+    }
+
+    private func refreshShared(allowReplacement: Bool) async {
+        guard canListSharedWithMe, !Task.isCancelled else { return }
+        if isLoadingShared {
+            let replaceCancelledRead = await withCheckedContinuation { sharedAlbumReadWaiters.append($0) }
+            if replaceCancelledRead {
+                await refreshShared(allowReplacement: false)
+            }
+            return
+        }
+        let previous = (sharedLoadFailure, lastSharedAlbumLoadFailed, hasCompletedInitialSharedAlbumLoad)
+        var wasCancelled = false
         isLoadingShared = true
-        sharedLoadErrorMessage = nil
+        sharedLoadFailure = nil
         defer {
             isLoadingShared = false
-            hasCompletedInitialSharedAlbumLoad = true
+            let waiters = sharedAlbumReadWaiters
+            sharedAlbumReadWaiters.removeAll()
+            for waiter in waiters { waiter.resume(returning: wasCancelled && allowReplacement) }
         }
         do {
-            sharedAlbums = try await repository.listSharedWithMeAlbums()
+            let loaded = try await repository.listSharedWithMeAlbums()
+            try Task.checkCancellation()
+            sharedAlbums = loaded
             lastSharedAlbumLoadFailed = false
+            hasCompletedInitialSharedAlbumLoad = true
         } catch {
-            sharedLoadErrorMessage = Self.message(for: error)
-            lastSharedAlbumLoadFailed = true
+            if let failure = AlbumFailurePresentation.read(error) {
+                sharedLoadFailure = failure
+                lastSharedAlbumLoadFailed = true
+                hasCompletedInitialSharedAlbumLoad = true
+            } else {
+                wasCancelled = true
+                (sharedLoadFailure, lastSharedAlbumLoadFailed, hasCompletedInitialSharedAlbumLoad) = previous
+            }
         }
     }
 
@@ -228,14 +280,16 @@ public final class AlbumActionCoordinator {
 
     private func reloadAfterMutation() async {
         do {
-            albums = try await repository.listAlbums()
-            loadErrorMessage = nil
+            let loaded = try await repository.listAlbums()
+            try Task.checkCancellation()
+            albums = loaded
+            loadFailure = nil
             lastAlbumLoadFailed = false
         } catch {
             // The write already succeeded. Keep the old list and let the owning screen's revision
             // refresh retry later instead of turning a successful mutation into a false failure.
-            loadErrorMessage = Self.message(for: error)
-            lastAlbumLoadFailed = true
+            loadFailure = AlbumFailurePresentation.read(error)
+            lastAlbumLoadFailed = loadFailure != nil
         }
     }
 

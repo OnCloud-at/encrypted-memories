@@ -198,7 +198,9 @@ public struct AlbumDestinationPicker: View {
         } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text(message).font(.caption).foregroundStyle(.secondary)
-                RetryButton(.compact) { Task { await coordinator.refresh() } }
+                if coordinator.loadFailure?.canRetry == true {
+                    RetryButton(.compact) { Task { await coordinator.refresh() } }
+                }
             }
         } else if coordinator.albums.isEmpty {
             VStack(spacing: 8) {
