@@ -1476,7 +1476,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             XCTAssertEqual(
                 try catalogTranslation(of: key, language: "de"),
-                "Das Backup kann auf diesem Gerät gerade nicht weitermachen. Bitte starte die App neu.")
+                "Das Backup kann nicht fortgesetzt werden; starte die App neu.")
         }
 
         func testCancelledScanShowsNoMessage() async throws {
