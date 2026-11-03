@@ -5922,23 +5922,31 @@ extension PendingBackupCoordinatorTests {
                 ],
                 at: date))
         XCTAssertTrue(store.completeEffect(.queueSync, for: key(id), generation: 1, at: date))
-        XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+        // The commit of a newer revision arrived before the process ended, after the old photo was
+        // chosen for the trash: `recordHandoff` registers the durable duty, and the acknowledged row
+        // leaves no event for the new coordinator.
+        let handoffRemote = PhotoUID(volumeID: "vol", nodeID: "\(newerHandoff ? "new" : "old")-\(id)")
+        let revision = UploadBackupRevision(rawValue: 9)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key(id), revision: revision, remote: handoffRemote, kind: .uploaded, createdAt: date)),
+            .excludedRemoteNeedsTrash)
+        XCTAssertTrue(store.acknowledgeHandoffs([(key(id), revision)]))
+        if newerHandoff {
+            // The newer handoff stays unreadable while the old photo's trash completes, so the
+            // completion's move-on cannot reschedule the newer duty at seed time: startup recovery
+            // resumes it instead, as after a crash between the completion and the reschedule.
+            XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='\(id)';"))
+            XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+            XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='\(id)';"))
+        } else {
+            // The record repeats the trashed photo, so it is a receipt replay that must not re-arm a duty.
+            XCTAssertTrue(store.completeEffect(.remoteTrash, for: key(id), generation: 1, at: date))
+        }
         if tile {
             XCTAssertTrue(Self.setColumns("listed_in_trash=1", of: id, at: storeURL))
             metadata.set(key(id), Self.trashTilePresentation)
-        }
-        let handoffRemote = PhotoUID(volumeID: "vol", nodeID: "\(newerHandoff ? "new" : "old")-\(id)")
-        // The handoff row is inserted last: completing the remote trash reads the latest handoff
-        // and would otherwise reschedule the source before the fixture is ready.
-        let connection = try KeyedReadFailure.connection(of: store)
-        connection.withLock {
-            XCTAssertEqual(
-                sqlite3_exec(
-                    connection.database,
-                    """
-                    INSERT INTO handoff VALUES('photoLibraryAsset', '\(id)', 9, 'vol', '\(handoffRemote.nodeID)',
-                      'uploaded', \(date.timeIntervalSince1970), 1);
-                    """, nil, nil, nil), SQLITE_OK)
         }
     }
 
