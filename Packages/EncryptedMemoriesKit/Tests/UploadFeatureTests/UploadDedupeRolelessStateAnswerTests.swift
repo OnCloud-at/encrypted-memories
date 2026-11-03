@@ -137,4 +137,106 @@ final class UploadDedupeRolelessStateAnswerTests: XCTestCase {
             "an active state answer without photo role data does not prove a main photo")
         await pipeline.uploadDidFail(renamed)
     }
+
+    // MARK: Issue 1062 - the two remaining role-less paths
+
+    private func nonRootDescriptor() -> UploadResourceDescriptor {
+        // A secondary of a main photo that does not pin a main link and does not require a related
+        // match: not a root (`isRoot` needs `.primary`), but it still reaches the exact-match
+        // fallback after a failed detailed name lookup.
+        UploadResourceDescriptor(
+            source: .file(
+                URL(fileURLWithPath: "/photos/IMG_1.HEIC"), resource: .livePairedVideo),
+            fileURL: URL(fileURLWithPath: "/photos/IMG_1.HEIC#IMG_1.MOV"),
+            filename: "IMG_1.MOV",
+            fileSize: 1000,
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+            precomputedSHA1Digest: nil
+        )
+    }
+
+    func testAFailingDetailedLookupDoesNotAdoptAnInactiveExactSDKMatchForANonRoot() async throws {
+        let d = nonRootDescriptor()
+        checker.findError = UploadError.backend("duplicates endpoint down")
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "sdk-link")]
+        // A non-root's legitimate copy is a related file, so a state answer needs no role data for it
+        // (see `countsAsBackup`). An inactive copy is what must not authorize a skip.
+        checker.linkVisibilityByID["sdk-link"] = RemoteLinkVisibility(
+            isActive: false, mainPhotoLinkID: nil, hasExplicitPhotoState: false)
+
+        do {
+            let result = try await pipeline.resolve(d)
+            XCTFail("expected the detailed lookup error, got \(result.decision)")
+        } catch let error as UploadError {
+            XCTAssertEqual(error, .backend("duplicates endpoint down"))
+        }
+        XCTAssertEqual(checker.exactFindCallCount, 1)
+        XCTAssertEqual(
+            checker.linkVisibilityCallCount, 1,
+            "the fallback must read state before skipping on an SDK match")
+        XCTAssertNil(
+            store.record(for: d.source)?.outcome,
+            "an inactive match must not persist a duplicate row")
+    }
+
+    func testAFailingDetailedLookupSkipsANonRootOnAProvenActiveExactSDKMatch() async throws {
+        let d = nonRootDescriptor()
+        checker.findError = UploadError.backend("duplicates endpoint down")
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "sdk-link")]
+        checker.linkVisibilityByID["sdk-link"] = rolelessActiveAnswer
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "sdk-link"))
+        XCTAssertEqual(
+            checker.linkVisibilityCallCount, 1,
+            "the fallback proves the copy with a state read before it skips")
+    }
+
+    func testRevalidationDoesNotAdoptARoleLessExactSDKMatch() async throws {
+        let d = descriptor()
+        let first = try await pipeline.resolve(d)
+        XCTAssertEqual(first.decision, .upload)
+        try await pipeline.recordUploaded(
+            d, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "uploaded-link")
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "uploaded-link")]
+        checker.linkVisibilityByID["uploaded-link"] = rolelessActiveAnswer
+        // The recorded upload would give the fall-through content index an active row of the same
+        // content. Remove it, so the SDK exact match is the only duplicate evidence in this check.
+        checker.remoteItemsByContentHash[first.identity.contentHash] = nil
+        let nameBatchesBeforeFallThrough = checker.findCallCount
+
+        let decision = try await pipeline.revalidateKnownRemote(d)
+
+        XCTAssertEqual(
+            decision, nil,
+            "an exact SDK match whose state answer carries no photo role data does not prove an active duplicate")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1, "revalidation must read state before adopting an SDK match")
+        XCTAssertEqual(
+            checker.findCallCount, nameBatchesBeforeFallThrough + 1,
+            "when unproven, revalidation falls through to the name/content evidence chain")
+    }
+
+    func testRevalidationFallsThroughToATrashedKnownLinkWhenTheSDKMatchIsUnproven() async throws {
+        let d = descriptor()
+        let first = try await pipeline.resolve(d)
+        XCTAssertEqual(first.decision, .upload)
+        try await pipeline.recordUploaded(
+            d, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "uploaded-link")
+        // Unproven exact SDK match X ≠ knownLinkID; known-link state is trashed
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "sdk-link")]
+        checker.linkVisibilityByID["sdk-link"] = rolelessActiveAnswer
+        // The recorded upload would give the fall-through content index an active row of the same
+        // content. Remove it, so the deletion evidence is the only remaining evidence in this check.
+        checker.remoteItemsByContentHash[first.identity.contentHash] = nil
+        checker.deletionMetadata = .init(states: ["uploaded-link": 2], complete: true)
+
+        let decision = try await pipeline.revalidateKnownRemote(d)
+
+        XCTAssertEqual(
+            decision, .skip(.trashedDuplicate, remoteLinkID: "uploaded-link"),
+            "when the SDK match is unproven, revalidation continues to the deletion-evidence chain")
+        XCTAssertEqual(
+            checker.linkVisibilityCallCount, 1, "revalidation must read state before falling through")
+    }
 }
