@@ -151,6 +151,8 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
     /// Set when the file uploaded to the library but a later step (album add / cover) failed - the
     /// photo is not lost. Retry only the album step to recover from the failure.
     public var partialSuccess: Bool
+    /// True when the manager holds a terminal manual-settlement record.
+    public var hasTerminalSettlement: Bool
 
     public init(
         id: UploadQueueItemID,
@@ -161,7 +163,8 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
         byteCount: Int64,
         state: UploadItemState = .queued,
         uploadedUID: PhotoUID? = nil,
-        partialSuccess: Bool = false
+        partialSuccess: Bool = false,
+        hasTerminalSettlement: Bool = false
     ) {
         self.id = id
         self.ordinal = ordinal
@@ -172,6 +175,7 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
         self.state = state
         self.uploadedUID = uploadedUID
         self.partialSuccess = partialSuccess
+        self.hasTerminalSettlement = hasTerminalSettlement
     }
 }
 
@@ -316,6 +320,8 @@ public enum UploadQueuePresentation {
         for item: UploadItem, capabilities: UploadBackendCapabilities
     ) -> [UploadQueueRowAction] {
         switch item.state {
+        case .failed where item.hasTerminalSettlement:
+            return []
         case .failed where item.uploadedUID == nil && !SupportedMedia.isSupported(item.fileURL):
             return []
         case .failed, .cancelled:
