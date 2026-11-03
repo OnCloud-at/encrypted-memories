@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import PhotosCore
+import SQLite3
 import Testing
 import UploadCore
 
@@ -19,21 +20,95 @@ import UploadCore
         try await assertFileReturnDuty(adapterResult: true)
     }
 
-    private func assertFileReturnDuty(adapterResult: Bool?) async throws {
+    @Test func partialFileInventoryKeepsTheRestoreDuty() async throws {
+        try await assertUnavailableFileInventory(holdTransaction: false)
+    }
+
+    @Test func openFileTransactionKeepsTheRestoreDuty() async throws {
+        try await assertUnavailableFileInventory(holdTransaction: true)
+    }
+
+    private func assertUnavailableFileInventory(holdTransaction: Bool) async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let key = PendingSourceKey(
             kind: .fileURL, identifier: fixture.directory.appendingPathComponent("photo.heic").path)
+        let remote = PhotoUID(volumeID: "volume", nodeID: "remote")
+        _ = try #require(fixture.store.exclude([.init(key: key, presentation: nil, remote: remote)], at: Date()))
+        let queue = try #require(
+            UploadBackupSyncQueueManifestStore(url: fixture.directory.appendingPathComponent("files.sqlite")))
+        for revision in 1...3 {
+            #expect(
+                queue.upsert(
+                    .init(
+                        source: .init(kind: .fileURL, identifier: key.identifier),
+                        revision: .init(rawValue: Int64(revision)), originalFilename: "photo.heic", state: .completed,
+                        updatedAt: Date(timeIntervalSince1970: 1_000))))
+        }
+        let connection = try #require(
+            Mirror(reflecting: queue).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
+        let calls = ChangeCounter()
+        let files = PendingFileSource(
+            queue: queue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true },
+            returnToBackup: { _ in
+                if holdTransaction {
+                    return connection.withLock {
+                        sqlite3_exec(connection.database, "BEGIN;", nil, nil, nil) == SQLITE_OK
+                    }
+                }
+                do {
+                    calls.readFault = try SQLiteReadInterrupt(
+                        in: queue,
+                        matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
+                    return true
+                } catch {
+                    Issue.record(error)
+                    return false
+                }
+            })
+        let session = try #require(
+            PendingGridSession(
+                store: fixture.store, photoBackup: fixture.controller,
+                remote: NoRemoteEffects(), files: files))
+        #expect(await session.restore([key.localUID]))
+        if holdTransaction {
+            #expect(queue.isOperational(), "A passing legacy health check must not certify an open transaction")
+            #expect(connection.withLock { sqlite3_get_autocommit(connection.database) } == 0)
+        } else {
+            #expect(try #require(calls.readFault).fired)
+            #expect(!queue.isOperational(), "Recovery stays off; the existing health guard also rejects this fault")
+        }
+        #expect(fixture.store.sourceState(for: key)?.needsQueueSync == true)
+        calls.readFault?.stop()
+        if holdTransaction { connection.withLock { connection.rollBack() } }
+        await session.close()
+        await fixture.controller.shutdown()
+        fixture.store.close()
+        queue.close()
+    }
+
+    @Test func mixedBatchWithoutFileAdapterKeepsBothQueueDuties() async throws {
+        try await assertFileReturnDuty(adapterResult: nil, mixed: true)
+    }
+
+    private func assertFileReturnDuty(adapterResult: Bool?, mixed: Bool = false) async throws {
+        let fixture = try Fixture(withPhotoEngine: mixed)
+        defer { fixture.remove() }
+        let key = PendingSourceKey(
+            kind: .fileURL, identifier: fixture.directory.appendingPathComponent("photo.heic").path)
         let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let keys = mixed ? [key, PendingSourceKey(kind: .photoLibraryAsset, identifier: "mixed-photo")] : [key]
         let excluded = try #require(
             fixture.store.exclude(
-                [
+                keys.map {
                     .init(
-                        key: key,
+                        key: $0,
                         presentation: .init(captureTime: date, mediaType: "image/heic", displayName: "photo.heic"),
                         remote: nil, revision: .init(rawValue: 1))
-                ], at: date)?.first)
-        #expect(fixture.store.completeEffect(.queueSync, for: key, generation: excluded.generation, at: date))
+                }, at: date))
+        for state in excluded {
+            #expect(fixture.store.completeEffect(.queueSync, for: state.key, generation: state.generation, at: date))
+        }
         let queue = try #require(
             UploadBackupSyncQueueManifestStore(url: fixture.directory.appendingPathComponent("files.sqlite")))
         let calls = ChangeCounter()
@@ -49,16 +124,19 @@ import UploadCore
             PendingGridSession(
                 store: fixture.store, photoBackup: fixture.controller, remote: NoRemoteEffects(), files: files))
 
-        #expect(await session.restore([key.localUID]))
+        #expect(await session.restore(keys.map(\.localUID)))
 
-        let after = fixture.store.sourceState(for: key)
-        if adapterResult == true {
-            #expect(after == nil, "A successful file callback can acknowledge the included source's queue duty")
-        } else {
-            #expect(after?.desired == .included)
-            #expect(
-                after?.needsQueueSync == true,
-                "Without a successful file adapter, performQueueSync must retain the duty")
+        for returnedKey in keys {
+            let after = fixture.store.sourceState(for: returnedKey)
+            if adapterResult == true {
+                #expect(after == nil, "A successful file callback can acknowledge the included source's queue duty")
+            } else {
+                #expect(after?.desired == .included)
+                #expect(
+                    after?.needsQueueSync == true,
+                    "Without a successful file adapter, performQueueSync must retain every duty, including mixed photo keys"
+                )
+            }
         }
         #expect(calls.count == (adapterResult == nil ? 0 : 1))
         #expect(fixture.store.isOperational())
@@ -743,6 +821,7 @@ import UploadCore
 }
 
 private final class ChangeCounter: @unchecked Sendable {
+    var readFault: SQLiteReadInterrupt?
     var count = 0
 }
 
@@ -759,14 +838,14 @@ private struct Fixture {
     let store: PendingBackupManifestStore
     let controller: PhotoLibraryBackupController
 
-    init(pendingStoreInController: Bool = true) throws {
+    init(pendingStoreInController: Bool = true, withPhotoEngine: Bool = false) throws {
         defaults = try #require(UserDefaults(suiteName: suite))
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         store = try #require(PendingGridSession.openStore(accountDataDirectory: directory, policy: .conservative))
         controller = PhotoLibraryBackupController(
             configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: nil,
+            identityResolver: withPhotoEngine ? FakeIdentityResolver() : nil,
             uploader: MockUploader(),
             pendingStore: pendingStoreInController ? store : nil,
             requiresPendingStore: pendingStoreInController

@@ -435,8 +435,9 @@ private struct SessionEffects: PendingBackupEffects {
             guard let files, let queue = files.queue as? UploadBackupSyncQueueManifestStore, queue.isOperational(),
                 await files.returnToBackup([state.key.identifier]), queue.isOperational()
             else { continue }
-            let rows = queue.rows(kind: .fileURL, identifiers: [state.key.identifier])
-            guard queue.isOperational(), !rows.isEmpty else { continue }
+            guard let rows = try? queue.decisionRows(kind: .fileURL, identifiers: [state.key.identifier]),
+                queue.isOperational(), !rows.isEmpty
+            else { continue }
             outcomes[state.key] =
                 rows.allSatisfy { $0.state.isTerminalSuccess }
                 ? .completed : .waiting(until: Date().addingTimeInterval(30))

@@ -62,6 +62,8 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         private let lock = NSLock()
         private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
         private var writes = 0
+        private let onWrite: @Sendable (UploadBackupAssetRecord) -> Void
+        init(onWrite: @escaping @Sendable (UploadBackupAssetRecord) -> Void = { _ in }) { self.onWrite = onWrite }
         var upsertCount: Int { lock.withLock { writes } }
 
         func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
@@ -77,6 +79,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 writes += 1
                 rows[record.source, default: [:]][record.revision] = record
             }
+            onWrite(record)
             return true
         }
 
@@ -125,6 +128,157 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             originalFilename: "IMG_\(id).HEIC",
             byteCount: 1024
         )
+    }
+
+    func testB1UnknownEngineReadsStopBeforeQueueAndPreflightChanges() async throws {
+        for route in ["presence", "candidate", "restore", "changed", "late-main"] {
+            let url = tempDir.appendingPathComponent("unknown-\(route).sqlite")
+            let inner = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+            defer { inner.close() }
+            let observer = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+            defer { observer.close() }
+            let photo = candidate(id: route, revision: 42)
+            let state = MemoryBackupStore()
+            let index = UploadBackupPreflightIndex(store: state)
+            if route == "restore" || route == "late-main" { try await index.markBackedUp(photo.snapshot) }
+            let previous = state.record(for: photo.snapshot.source, revision: photo.snapshot.revision)
+            let writes = state.upsertCount
+            let rowState: UploadBackupSyncQueueState =
+                route == "restore" || route == "late-main"
+                ? .completed
+                : route == "changed" ? .sourceMissing : .dismissedFailure
+            let row = UploadBackupSyncQueueEntry(
+                source: photo.snapshot.source, revision: photo.snapshot.revision,
+                originalFilename: photo.originalFilename, state: rowState, lastError: "kept reason",
+                updatedAt: Date(timeIntervalSince1970: 1_000))
+            XCTAssertTrue(inner.upsert(row))
+            let events = BackupEventLog()
+            let queue = SpyQueueStore(inner: inner, log: events)
+            let engine = UploadBackupSyncEngine(preflight: index, queue: queue)
+            let fault = try SQLiteReadInterrupt(
+                in: inner,
+                matching:
+                    route == "presence"
+                    ? "SELECT 1 FROM backup_sync_queue WHERE state IN"
+                    : "SELECT original_filename, byte_count, state")
+            defer { fault.stop() }
+
+            var needsChangedRetry = false
+            do {
+                switch route {
+                case "presence", "candidate": _ = try await engine.enqueueBatch([photo])
+                case "restore": _ = try await engine.reopenRestoredCompound(photo, isCurrent: { true })
+                case "changed": try await engine.enqueueChangedMissingSources([photo])
+                default: _ = try await engine.reopenBackedUpRevisions([.init(candidate: photo, formerMain: nil)])
+                }
+                XCTFail("\(route): an unknown read must stop the decision")
+            } catch {
+                needsChangedRetry = route == "changed"
+                XCTAssertEqual(
+                    error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")), route)
+            }
+
+            XCTAssertTrue(fault.fired, route)
+            XCTAssertTrue(queue.isOperational(), "The read-specific error must survive a healthy later probe: \(route)")
+            XCTAssertEqual(try observer.entry(for: row.source, revision: row.revision), row, route)
+            XCTAssertEqual(state.record(for: photo.snapshot.source, revision: photo.snapshot.revision), previous, route)
+            XCTAssertEqual(state.upsertCount, writes, route)
+            XCTAssertTrue(events.events.isEmpty, route)
+            if route == "changed" {
+                fault.stop()
+                if needsChangedRetry { try await engine.enqueueChangedMissingSources([photo]) }
+                XCTAssertEqual(
+                    try observer.entry(for: row.source, revision: row.revision)?.state, .discovered,
+                    "A propagated failure permits retrying the same changed missing source; it must not be silently omitted"
+                )
+            }
+        }
+    }
+
+    func testLateMainReopeningCertifiesTheRowAgainAfterPreflight() async throws {
+        for change in ["removed", "changed", "unknown", "decode"] {
+            let url = tempDir.appendingPathComponent("late-main-\(change).sqlite")
+            let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+            defer { queue.close() }
+            let observer = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+            defer { observer.close() }
+            let photo = candidate(id: change, revision: 42)
+            let row = UploadBackupSyncQueueEntry(
+                source: photo.snapshot.source, revision: photo.snapshot.revision,
+                originalFilename: photo.originalFilename, state: .completed,
+                updatedAt: Date(timeIntervalSince1970: 1_000))
+            let state = MemoryBackupStore { record in
+                guard !record.isComplete else { return }
+                if change == "removed" {
+                    XCTAssertTrue(queue.remove(source: row.source, revision: row.revision))
+                } else if change == "decode" {
+                    guard
+                        let connection = Mirror(reflecting: queue).children.first(where: { $0.label == "connection" })?
+                            .value as? SQLiteStoreConnection
+                    else {
+                        return XCTFail("The concrete queue connection must be available")
+                    }
+                    connection.withLock {
+                        XCTAssertEqual(
+                            sqlite3_exec(
+                                connection.database,
+                                "UPDATE backup_sync_queue SET remote_commit_reconciliation='not-json';", nil, nil, nil),
+                            SQLITE_OK)
+                    }
+                } else if change == "changed" {
+                    XCTAssertTrue(
+                        queue.updateState(
+                            source: row.source, revision: row.revision, state: .failedPermanent,
+                            attempts: nil, lastError: "new reason", updatedAt: row.updatedAt))
+                }
+            }
+            let index = UploadBackupPreflightIndex(store: state)
+            try await index.markBackedUp(photo.snapshot)
+            XCTAssertTrue(queue.upsert(row))
+            let decisionQueue: any UploadBackupSyncQueueStore =
+                change == "decode" ? queue : SpyQueueStore(inner: queue, log: BackupEventLog())
+            let engine = UploadBackupSyncEngine(preflight: index, queue: decisionQueue)
+            let fault =
+                change == "unknown"
+                ? try SQLiteReadInterrupt(
+                    in: queue,
+                    matching: "SELECT original_filename, byte_count, state", occurrence: 2) : nil
+            defer { fault?.stop() }
+            do {
+                _ = try await engine.reopenBackedUpRevisions([.init(candidate: photo, formerMain: nil)])
+                if change == "unknown" || change == "decode" {
+                    XCTFail("The second unknown read must stop removal: \(change)")
+                }
+            } catch {
+                if change == "unknown" || change == "decode" {
+                    XCTAssertEqual(error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")))
+                } else {
+                    XCTFail("A changed or removed row must not fail reopening: \(error)")
+                }
+            }
+            if change == "decode" {
+                XCTAssertEqual(
+                    observer.rows(kind: row.source.kind, identifiers: [row.source.identifier]).map(\.state),
+                    [.completed])
+                XCTAssertEqual(observer.count(), 1)
+                continue
+            }
+            let kept = try observer.entry(for: row.source, revision: row.revision)
+            if change == "removed" {
+                XCTAssertNil(kept)
+            } else if change == "changed" {
+                XCTAssertEqual(kept?.state, .failedPermanent, "The stale completed row must not authorize removal")
+                XCTAssertEqual(kept?.lastError, "new reason")
+            } else {
+                XCTAssertTrue(try XCTUnwrap(fault).fired)
+                XCTAssertEqual(kept, row, "Unknown after preflight must leave the queue row unchanged")
+                fault?.stop()
+                _ = try await engine.reopenBackedUpRevisions([.init(candidate: photo, formerMain: nil)])
+                XCTAssertNil(
+                    try observer.entry(for: row.source, revision: row.revision),
+                    "A complete retry must finish reopening")
+            }
+        }
     }
 
     func testLateMainReopeningRejectsATrashedManifestMainAsUploadProof() async throws {

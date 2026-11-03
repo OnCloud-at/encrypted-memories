@@ -364,7 +364,8 @@ public actor BackupSyncRunner {
 
         // The last known index health stays visible until this pass reads it again.
         let previousIndexHealth = progress.remoteContentIndexHealth
-        progress = BackupSyncProgress(summary: (queue.summary() ?? UploadBackupSyncQueueSummary()), isRunning: true)
+        guard let summary = queue.summary() else { return progress }
+        progress = BackupSyncProgress(summary: summary, isRunning: true)
         progress.remoteContentIndexHealth = previousIndexHealth
         progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
@@ -377,7 +378,7 @@ public actor BackupSyncRunner {
                 // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
                 progress.isRunning = false
                 progress.leavesNoUploadWork =
-                    !((try? queue.containsAny(in: [.blockedByDraft])) ?? false) && queue.isOperational()
+                    (try? queue.containsAny(in: [.blockedByDraft])) == false && queue.isOperational()
                 return progress
             }
             guard nextRunnableDate <= now() else {
@@ -563,12 +564,12 @@ public actor BackupSyncRunner {
 
         // Truth re-sync from the store: incremental counters were exact (single writer), but the
         // final snapshot should come from the durable state regardless.
-        if queue.isOperational() {
+        if queue.isOperational(), let summary = queue.summary() {
             let wasPausedByPolicy = progress.isPausedByPolicy
             let wasWaitingForWiFi = progress.isWaitingForWiFi
             let indexHealth = progress.remoteContentIndexHealth
             progress = BackupSyncProgress(
-                summary: (queue.summary() ?? UploadBackupSyncQueueSummary()), isRunning: false)
+                summary: summary, isRunning: false)
             progress.isPausedByPolicy = wasPausedByPolicy
             progress.isWaitingForWiFi = wasWaitingForWiFi
             progress.remoteContentIndexHealth = indexHealth
@@ -1146,7 +1147,7 @@ public actor BackupSyncRunner {
                 }
             )
         } catch is BackupWorkDeferredError {
-            let current = (try? queue.entry(for: entry.source, revision: entry.revision))?.state ?? persistedState
+            guard let current = currentState(of: entry, fallback: persistedState) else { return }
             revert(entry, from: current)
             return
         } catch let settlement as UploadRemoteCommitSettlementError {
@@ -1162,7 +1163,7 @@ public actor BackupSyncRunner {
             }
             return
         } catch {
-            let current = (try? queue.entry(for: entry.source, revision: entry.revision))?.state ?? persistedState
+            guard let current = currentState(of: entry, fallback: persistedState) else { return }
             if recordCancellation(error, for: entry) || stopRequested || failedWhileWaitingForWiFi() {
                 revert(entry, from: current)
             } else {
@@ -1619,10 +1620,23 @@ public actor BackupSyncRunner {
 
     // MARK: - Compound settlement (secondaries after the primary)
 
+    private final class QueueReadFailure: @unchecked Sendable {
+        private let lock = NSLock()
+        private var failed = false
+        var occurred: Bool { lock.withLock { failed } }
+        func read<Value>(_ operation: () throws -> Value) rethrows -> Value {
+            do { return try operation() } catch {
+                lock.withLock { failed = true }
+                throw error
+            }
+        }
+    }
+
     private enum SecondaryOutcome {
         case allSettled
         case failed(remaining: Int, error: any Error)
         case reconciliationPending
+        case storeUnavailable
         case blockedByDraft
         case skippedRemoteDeletion
         case cancelled
@@ -1698,7 +1712,7 @@ public actor BackupSyncRunner {
                 // consume the compound's permanent retry budget.
                 retryOrPark(entry, from: persistedState, error: error)
                 return
-            case .reconciliationPending:
+            case .reconciliationPending, .storeUnavailable:
                 return
             case .blockedByDraft:
                 do {
@@ -1966,6 +1980,7 @@ public actor BackupSyncRunner {
         let totalResourceCount = 1 + secondaries.count
         for secondary in secondaries {
             if stopRequested { return .cancelled }
+            let queueReadFailure = QueueReadFailure()
             do {
                 let outcome: SecondaryScopedOutcome = try await identityResolver.withUploadDecision(
                     secondary.descriptor.withWorkIntent(workIntent).withBackupRevision(uploadedRevision).relatedTo(
@@ -1992,7 +2007,9 @@ public actor BackupSyncRunner {
                             )
                         else {
                             // The row is gone, for example after a deletion or an exclusion.
-                            if (try? queue.entry(for: entry.source, revision: entry.revision)) == nil {
+                            if try queueReadFailure.read({
+                                try queue.entry(for: entry.source, revision: entry.revision)
+                            }) == nil {
                                 throw CancellationError()
                             }
                             throw UploadError.backend("Secondary reconciliation could not be persisted")
@@ -2061,7 +2078,7 @@ public actor BackupSyncRunner {
                 )
                 switch outcome {
                 case .settled:
-                    if (try? queue.entry(for: entry.source, revision: entry.revision))?.state
+                    if try queue.entry(for: entry.source, revision: entry.revision)?.state
                         == .needsRemoteReconciliation
                     {
                         guard
@@ -2090,6 +2107,9 @@ public actor BackupSyncRunner {
                         error: UploadError.backend(L10n.string("upload.error_remote_inconsistent"))
                     )
                 }
+            } catch is SQLiteStoreUnknownReadError {
+                stopRequested = true
+                return .storeUnavailable
             } catch is SecondarySourceChangedError {
                 return .sourceChanged
             } catch let settlement as UploadRemoteCommitSettlementError {
@@ -2097,6 +2117,10 @@ public actor BackupSyncRunner {
                 if settlement.reconciliationPersisted {
                     parkPersistedRemoteCommit(entry, from: .uploading, message: settlement.settlementMessage)
                     return .reconciliationPending
+                }
+                if queueReadFailure.occurred {
+                    stopRequested = true
+                    return .storeUnavailable
                 }
                 if settlement.cancellation == nil || !sourceWasRemoved(entry) { stopRequested = true }
                 return .cancelled
@@ -2691,7 +2715,9 @@ public actor BackupSyncRunner {
         // write keeps the earlier behavior too.
         if sourceIsUnavailable { _ = markSourceUnavailable?(entry.source) }
         guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
-            if (try? queue.entry(for: entry.source, revision: entry.revision)) != nil {
+            do {
+                if try queue.entry(for: entry.source, revision: entry.revision) != nil { stopRequested = true }
+            } catch {
                 stopRequested = true
             }
             return
@@ -2709,10 +2735,22 @@ public actor BackupSyncRunner {
         removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier))
     }
 
+    private func currentState(
+        of entry: UploadBackupSyncQueueEntry, fallback: UploadBackupSyncQueueState
+    ) -> UploadBackupSyncQueueState? {
+        do {
+            return try queue.entry(for: entry.source, revision: entry.revision)?.state ?? fallback
+        } catch {
+            stopRequested = true
+            return nil
+        }
+    }
+
     private func refreshProgressFromQueue() {
+        guard let summary = queue.summary() else { return }
         let previous = progress
         progress = BackupSyncProgress(
-            summary: (queue.summary() ?? UploadBackupSyncQueueSummary()),
+            summary: summary,
             currentItemName: previous.currentItemName,
             isRunning: previous.isRunning
         )

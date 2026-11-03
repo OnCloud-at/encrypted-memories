@@ -522,6 +522,172 @@ final class DeletedPhotoTests: XCTestCase {
         queue.close()
     }
 
+    func testB1ReplayReadFaultsPreserveTheIncompleteMarkerAndRows() async throws {
+        for route in ["queue-count", "catalog-count", "marker", "page"] {
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent("\(route)-queue.sqlite")))
+            let catalog = try XCTUnwrap(
+                PhotoLibraryCatalogManifestStore(url: directory.appendingPathComponent("\(route)-catalog.sqlite")))
+            let state = try XCTUnwrap(
+                UploadBackupStateManifestStore(url: directory.appendingPathComponent("\(route)-state.sqlite")))
+            defer {
+                queue.close()
+                catalog.close()
+                state.close()
+            }
+            let info = PhotoBackupAssetInfo(
+                localIdentifier: "kept", creationDate: nil, modificationDate: date,
+                pixelWidth: 10, pixelHeight: 10, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: [.init(role: .originalPhoto, originalFilename: "photo.jpg", mimeType: "image/jpeg")])
+            XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)]))
+            XCTAssertTrue(queue.setCatalogReplayState(.inProgress))
+            let sql =
+                route == "queue-count"
+                ? "SELECT COUNT(*) FROM backup_sync_queue;"
+                : route == "catalog-count"
+                    ? "SELECT is_removed, COUNT(*)"
+                    : route == "marker"
+                        ? "SELECT value FROM backup_sync_queue_info"
+                        : "SELECT local_id, cloud_id, creation_date"
+            let fault = try SQLiteReadInterrupt(
+                in: route == "catalog-count" || route == "page" ? catalog as Any : queue as Any,
+                matching: sql)
+            defer { fault.stop() }
+            let engine = UploadBackupSyncEngine(preflight: .init(store: state), queue: queue)
+            do {
+                try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
+                    catalogStore: catalog, queueStore: queue, engine: engine)
+                XCTFail("An unknown \(route) must stop replay")
+            } catch {
+                XCTAssertEqual(error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")))
+            }
+            XCTAssertTrue(fault.fired, route)
+            XCTAssertEqual(queue.catalogReplayState(), .inProgress, route)
+            XCTAssertEqual(queue.count(), 0, route)
+        }
+    }
+
+    @MainActor
+    func testB1UnknownDismissalReasonKeepsTheDecisionRow() async throws {
+        let suite = "dismissal-unknown-reason-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+        let queue = try XCTUnwrap(controller.queueStoreForTesting)
+        let row = UploadBackupSyncQueueEntry(
+            source: source, revision: UploadBackupRevision(date: date), originalFilename: "photo.heic",
+            state: .failedPermanent,
+            lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+            updatedAt: date)
+        XCTAssertTrue(queue.upsert(row))
+        let stale = BackupFailedItem(
+            id: "stale", filename: "photo.heic", reason: "stale", isPermanent: true,
+            issue: .remoteDraftStale, source: source, revision: row.revision)
+        let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
+        defer { fault.stop() }
+        controller.dismissFailedItem(stale)
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(
+            try queue.entry(for: row.source, revision: row.revision), row,
+            "An unknown reason must not dismiss a deletion decision")
+        await controller.shutdown()
+    }
+
+    @MainActor
+    func testB1PartialRevisionReadStopsRemoteDeletionDecision() async throws {
+        try await assertRemoteDecisionReadFailure(
+            matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
+    }
+
+    @MainActor
+    func testB1UnknownRevisionReasonStopsRemoteDeletionDecision() async throws {
+        try await assertRemoteDecisionReadFailure(
+            matching: "SELECT original_filename, byte_count, state", occurrence: 4)
+    }
+
+    @MainActor
+    private func assertRemoteDecisionReadFailure(
+        matching: String, occurrence: Int = 1, afterRows: Int = 0
+    ) async throws {
+        let suite = "deletion-partial-revisions-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+        let queue = try XCTUnwrap(
+            Mirror(reflecting: controller).children.first(where: { $0.label == "queueStore" })?.value
+                as? UploadBackupSyncQueueManifestStore)
+        let observer = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        defer { observer.close() }
+        let rows = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map { timestamp in
+            UploadBackupSyncQueueEntry(
+                source: source, revision: UploadBackupRevision(date: timestamp), originalFilename: "photo.heic",
+                state: .failedPermanent,
+                lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                updatedAt: date)
+        }
+        for row in rows { XCTAssertTrue(queue.upsert(row)) }
+        let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision })
+        let beforeJournal = journal.entry(for: source)
+        let fault = try SQLiteReadInterrupt(
+            in: queue, matching: matching, occurrence: occurrence, afterRows: afterRows)
+        defer { fault.stop() }
+
+        controller.backUpAgain(olderItem)
+
+        XCTAssertTrue(fault.fired, "The bulk statement must actually be interrupted")
+        XCTAssertEqual(fault.tracedRows, afterRows, "The requested SQL fault must fire before any decision effects")
+        XCTAssertFalse(queue.isOperational(), "B1 must leave recovery activation OFF")
+        XCTAssertEqual(
+            journal.entry(for: source), beforeJournal,
+            "An incomplete inventory must not choose the clicked older revision")
+        for row in rows {
+            XCTAssertEqual(
+                try observer.entry(for: row.source, revision: row.revision), row,
+                "An incomplete revision read must preserve the queue row and its existing reason")
+        }
+        await controller.shutdown()
+    }
+
+    func testB1BulkFaultControlsProveLegacyPrefixAndStrictUnknown() throws {
+        for strict in [false, true] {
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: directory.appendingPathComponent("bulk-control-\(strict).sqlite")))
+            defer { queue.close() }
+            let revisions = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map {
+                UploadBackupRevision(date: $0)
+            }
+            for revision in revisions {
+                XCTAssertTrue(
+                    queue.upsert(
+                        .init(
+                            source: source, revision: revision, originalFilename: "photo.heic", state: .failedPermanent,
+                            lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                            updatedAt: date)))
+            }
+            let fault = try SQLiteReadInterrupt(
+                in: queue, matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
+            defer { fault.stop() }
+            if strict {
+                XCTAssertThrowsError(try queue.decisionRows(kind: source.kind, identifiers: [source.identifier])) {
+                    XCTAssertTrue($0 is SQLiteStoreUnknownReadError)
+                }
+            } else {
+                let prefix = queue.rows(kind: source.kind, identifiers: [source.identifier])
+                XCTAssertEqual(prefix.map(\.revision), [revisions[0]], "The legacy API returns the older prefix")
+            }
+            XCTAssertTrue(fault.fired)
+            XCTAssertEqual(fault.tracedRows, 2)
+            XCTAssertFalse(queue.isOperational(), "The injected SQL failure must remain sticky")
+        }
+    }
+
     @MainActor
     func testOneChoiceSettlesEveryParkedRevisionOfThePhoto() async throws {
         let suite = "deletion-revisions-\(UUID().uuidString)"

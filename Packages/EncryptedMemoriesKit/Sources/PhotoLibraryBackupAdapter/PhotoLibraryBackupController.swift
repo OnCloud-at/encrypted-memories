@@ -496,7 +496,8 @@ public final class PhotoLibraryBackupController {
     /// is on. Photos no longer in the library need nothing and count as done.
     public func returnToBackup(identifiers: [String]) async -> Bool {
         guard let engine, let catalogStore, catalogStore.isOperational() else { return false }
-        let candidates = (catalogStore.presentEntries(for: identifiers) ?? [:]).values.compactMap {
+        guard let entries = catalogStore.presentEntries(for: identifiers) else { return false }
+        let candidates = entries.values.compactMap {
             PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
         }
         guard catalogStore.isOperational() else { return false }
@@ -579,7 +580,7 @@ public final class PhotoLibraryBackupController {
                     outcomes[state.key] = remoteOutcome
                     continue
                 }
-                let row = (try? queueStore.entry(for: context.source, revision: context.revision))
+                let row = try queueStore.entry(for: context.source, revision: context.revision)
                 guard queueStore.isOperational() else { continue }
                 if admittedRestoreRechecks.contains(state.key), let row, row.state.isTerminalSuccess,
                     row.remoteCommitReconciliation == nil
@@ -895,10 +896,10 @@ public final class PhotoLibraryBackupController {
     public func dismissFailedItem(_ item: BackupFailedItem) {
         guard item.isPermanent, item.issue != .deletedElsewhere,
             let source = item.source,
-            let revision = item.revision,
-            BackupIssueRecord.decode((try? queueStore?.entry(for: source, revision: revision))?.lastError)?.kind
-                != .deletedElsewhere,
-            queueStore?.dismissPermanentFailure(
+            let revision = item.revision, let queueStore,
+            let current = try? queueStore.entry(for: source, revision: revision),
+            BackupIssueRecord.decode(current.lastError)?.kind != .deletedElsewhere,
+            queueStore.dismissPermanentFailure(
                 source: source,
                 revision: revision,
                 updatedAt: Date()
@@ -930,16 +931,16 @@ public final class PhotoLibraryBackupController {
             BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
         else { return false }
         // The choice is about the photo, so it settles every revision of it that waits for the same question.
-        let parked = PhotoPerformanceSignposts.database.interval("BackupDecisionRows") {
-            queueStore.rows(kind: source.kind, identifiers: [source.identifier]).filter {
-                $0.source == source && $0.state == .failedPermanent
-                    && BackupIssueRecord.decode((try? queueStore.entry(for: source, revision: $0.revision))?.lastError)?
-                        .kind
-                        == .deletedElsewhere
-            }.map(\.revision)
-        }
-        let newest = parked.max() ?? revision
         do {
+            let parked = try PhotoPerformanceSignposts.database.interval("BackupDecisionRows") {
+                try queueStore.decisionRows(kind: source.kind, identifiers: [source.identifier]).filter {
+                    guard $0.source == source, $0.state == .failedPermanent else { return false }
+                    return BackupIssueRecord.decode(
+                        (try queueStore.entry(for: source, revision: $0.revision))?.lastError)?
+                        .kind == .deletedElsewhere
+                }.map(\.revision)
+            }
+            let newest = parked.max() ?? revision
             try PhotoPerformanceSignposts.database.interval("BackupDecisionJournal") {
                 if keepDeleted {
                     try journal.keepDeleted(for: source)
@@ -1372,16 +1373,14 @@ public final class PhotoLibraryBackupController {
         queueStore: UploadBackupSyncQueueManifestStore,
         engine: UploadBackupSyncEngine
     ) async throws {
-        let queueCount = (queueStore.count() ?? 0)
-        guard queueStore.isOperational(), catalogStore.isOperational() else {
+        guard let queueCount = queueStore.count(), queueStore.isOperational(), catalogStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
-        let catalogCount = (catalogStore.snapshot() ?? PhotoLibraryCatalogSnapshot()).present
-        guard catalogStore.isOperational() else {
+        guard let catalogSnapshot = catalogStore.snapshot(), catalogStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
-        let replayState = (queueStore.catalogReplayState() ?? .notStarted)
-        guard queueStore.isOperational() else {
+        let catalogCount = catalogSnapshot.present
+        guard let replayState = queueStore.catalogReplayState(), queueStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
         switch BackupCatalogReplayPolicy.action(
@@ -1408,8 +1407,9 @@ public final class PhotoLibraryBackupController {
         var cursor: String?
         while true {
             try Task.checkCancellation()
-            let entries = (catalogStore.presentEntries(afterLocalIdentifier: cursor, limit: 500) ?? [])
-            guard catalogStore.isOperational() else {
+            guard let entries = catalogStore.presentEntries(afterLocalIdentifier: cursor, limit: 500),
+                catalogStore.isOperational()
+            else {
                 throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
             }
             guard !entries.isEmpty else {
