@@ -316,6 +316,8 @@ public enum UploadQueuePresentation {
         for item: UploadItem, capabilities: UploadBackendCapabilities
     ) -> [UploadQueueRowAction] {
         switch item.state {
+        case .failed where item.uploadedUID == nil && !SupportedMedia.isSupported(item.fileURL):
+            return []
         case .failed, .cancelled:
             return [.retry]
         case .queued, .preparing, .hashing, .uploading:
