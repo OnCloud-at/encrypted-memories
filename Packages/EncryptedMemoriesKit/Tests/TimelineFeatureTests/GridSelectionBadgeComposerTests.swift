@@ -481,4 +481,154 @@ import TimelineCore
             }
         }
     }
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func realComposerContinuedReversalKeepsEveryReleasedCircleHome() throws {
+        try verifyContinuedReversal(jumping: false)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func realComposerOneFrameCrossingStartsTheNextEntryFromTheCorrectEdge() throws {
+        try verifyContinuedReversal(jumping: true)
+    }
+
+    private func verifyContinuedReversal(jumping: Bool) throws {
+        let cache = try cache(sizes: Array(repeating: CGSize(width: 64, height: 64), count: 40))
+        let profile = TimelineGridProfileConfiguration.production.resolver.profile(
+            for: TimelineGridViewport(layoutWidth: viewport.width, inputAffinity: .touch))
+        let engine = SquareTileGridEngine(sectionCounts: [4_000], profile: profile, fillOrder: .newestBottomTrailing)
+        for level in profile.levels.indices {
+            let metrics = engine.resolvedMetrics(level: level, width: viewport.width)
+            let initial = engine.framePlan(level: level, viewportSize: viewport, scrollOffset: .zero, overscan: 0)
+            let row = try #require(initial.visibleSlots.first { $0.column == 0 && $0.row > 0 })
+            let rowSlots = initial.visibleSlots.filter { $0.row == row.row }
+            try #require(rowSlots.count == metrics.columns)
+            for selected in [false, true] {
+                var motions: [Int: GridSelectionBadgeMotion] = [:]
+                var homes: [Int: CGRect] = [:]
+                let layout = GridSelectionBadgeLayout()
+                var time = 0.0
+                func step(y: CGFloat, alternate: Bool, crossingSide: Bool = true) {
+                    var offset = row.slotRect.minY - y
+                    // Keep the inclusive switch sample across the line after viewport-coordinate rounding.
+                    let belowSwitchLine = band.maxY - metrics.slotSide * 0.4
+                    if y == belowSwitchLine { offset = crossingSide ? offset.nextUp : offset.nextDown }
+                    if y == band.minY - metrics.slotSide + metrics.slotSide * 0.4 { offset = offset.nextDown }
+                    let plan = engine.framePlan(
+                        level: level, viewportSize: viewport,
+                        scrollOffset: CGPoint(x: 0, y: offset), overscan: 0)
+                    let slots = plan.visibleSlots.filter { $0.row == row.row }.map {
+                        GridRenderSlot(index: $0.index, column: $0.column, row: $0.row, rect: $0.viewportRect)
+                    }
+                    #expect(slots.count == metrics.columns)
+                    #expect(slots.allSatisfy { abs($0.rect.minY - y) < 0.000_000_001 })
+                    if y == belowSwitchLine {
+                        #expect(slots.allSatisfy { crossingSide ? $0.rect.minY <= y : $0.rect.minY > y })
+                    }
+                    _ = MetalGridFrameComposer.buildGroups(
+                        slots: slots, flatUIDs: Array(0..<4_000), cache: cache, displayMode: .squareFillCrop,
+                        cornerRadius: 11,
+                        decorations: MetalGridDecorations(
+                            accent: SIMD4(0, 0, 1, 1), accentGlyphColor: .white, selectionMode: true,
+                            selected: selected ? Set(rowSlots.map(\.index)) : [], favorites: [],
+                            overlay: { _ in .empty },
+                            reservedRegions: regions, selectionBadgeLayout: layout,
+                            selectionBadgeFrame: { uid, tile, side, inset, regions, occupied, neighbors, row, layout in
+                                homes[uid] = ReservedRegionLayout.homeMarkRect(in: tile, side: side, inset: inset)
+                                var motion = motions[uid] ?? GridSelectionBadgeMotion()
+                                let rect = motion.frame(
+                                    tile: tile, side: side, inset: inset, regions: regions, avoiding: occupied,
+                                    neighboringTiles: neighbors, row: row, layout: layout, now: time, reduceMotion: true
+                                )
+                                motions[uid] = motion
+                                return rect
+                            }))
+                    time += 1
+                    #expect(motions.count == metrics.columns)
+                    #expect(
+                        motions.values.allSatisfy { $0.usesAlternate == alternate },
+                        "level=\(level), y=\(y), jumping=\(jumping), selected=\(selected)")
+                    if !alternate {
+                        #expect(
+                            motions.allSatisfy { homes[$0.key] == $0.value.target },
+                            "A released row must keep every full circle in its normal slot")
+                    }
+                }
+                let above = band.minY - metrics.slotSide - 20
+                let below = band.maxY + 20
+                if jumping {
+                    step(y: above, alternate: false)
+                    step(y: band.minY - metrics.slotSide + metrics.slotSide * 0.001, alternate: false)
+                    step(y: below, alternate: false)
+                    step(y: band.maxY - metrics.slotSide * 0.399, alternate: false)
+                    if metrics.columns == 7 {
+                        step(y: band.maxY - metrics.slotSide * 0.4, alternate: false, crossingSide: false)
+                    }
+                    step(y: band.maxY - metrics.slotSide * 0.4, alternate: true)
+                    step(y: above, alternate: false)
+                    step(y: band.minY - metrics.slotSide + metrics.slotSide * 0.001, alternate: false)
+                    step(y: band.minY - metrics.slotSide + metrics.slotSide * 0.4, alternate: true)
+                } else {
+                    step(y: below, alternate: false)
+                    if metrics.columns == 7 {
+                        step(y: band.maxY - metrics.slotSide * 0.4, alternate: false, crossingSide: false)
+                    }
+                    step(y: band.maxY - metrics.slotSide * 0.4, alternate: true)
+                    let release = 0.4 - max(0.1, 4 / metrics.slotSide) - 0.001
+                    for share in [release, release - 0.01, release - 0.02, 0.1, 0.05, 0, -0.01] {
+                        step(y: band.maxY - metrics.slotSide * share, alternate: false)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func aSubQuantumRowHeightChangeKeepsHysteresisAndThePreparedCache() throws {
+        let cache = try cache(sizes: Array(repeating: CGSize(width: 64, height: 64), count: 40))
+        let profile = TimelineGridProfileConfiguration.production.resolver.profile(
+            for: TimelineGridViewport(layoutWidth: viewport.width, inputAffinity: .touch))
+        let engine = SquareTileGridEngine(sectionCounts: [3_600], profile: profile, fillOrder: .newestBottomTrailing)
+        let plan = engine.framePlan(level: 3, viewportSize: viewport, scrollOffset: .zero, overscan: 0)
+        let first = try #require(plan.visibleSlots.first { $0.column == 0 && $0.row > 0 })
+        let row = plan.visibleSlots.filter { $0.row == first.row }
+        try #require(row.count == 7)
+        let layout = GridSelectionBadgeLayout()
+        var motions: [Int: GridSelectionBadgeMotion] = [:]
+        var time = 0.0
+        func step(share: CGFloat, heightChange: CGFloat = 0, alternate: Bool) {
+            let slots = row.map { slot in
+                GridRenderSlot(
+                    index: slot.index, column: slot.column, row: slot.row,
+                    rect: CGRect(
+                        x: slot.viewportRect.minX, y: band.maxY - first.slotRect.height * share,
+                        width: slot.viewportRect.width, height: slot.viewportRect.height + heightChange))
+            }
+            _ = MetalGridFrameComposer.buildGroups(
+                slots: slots, flatUIDs: Array(0..<3_600), cache: cache, displayMode: .squareFillCrop,
+                cornerRadius: 11,
+                decorations: MetalGridDecorations(
+                    accent: SIMD4(0, 0, 1, 1), accentGlyphColor: .white, selectionMode: true,
+                    selected: [], favorites: [], overlay: { _ in .empty }, reservedRegions: regions,
+                    selectionBadgeLayout: layout,
+                    selectionBadgeFrame: { uid, tile, side, inset, regions, occupied, neighbors, row, layout in
+                        var motion = motions[uid] ?? GridSelectionBadgeMotion()
+                        _ = motion.frame(
+                            tile: tile, side: side, inset: inset, regions: regions, avoiding: occupied,
+                            neighboringTiles: neighbors, row: row, layout: layout, now: time, reduceMotion: true)
+                        motions[uid] = motion
+                        return motion.target
+                    }))
+            time += 1
+            #expect(motions.count == 7)
+            #expect(motions.values.allSatisfy { $0.usesAlternate == alternate })
+        }
+        step(share: -0.05, alternate: false)
+        step(share: 0.41, alternate: true)
+        step(share: 0.35, alternate: true)
+        let preparations = layout.preparationCount
+        for change in [0.000_000_1, 0.000_000_2, 0, 0.000_000_1, 0] {
+            step(share: 0.35, heightChange: change, alternate: true)
+            #expect(layout.preparationCount == preparations)
+        }
+    }
 }

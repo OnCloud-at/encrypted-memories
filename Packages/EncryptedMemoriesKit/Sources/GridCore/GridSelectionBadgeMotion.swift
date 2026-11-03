@@ -148,7 +148,10 @@ struct GridSelectionBadgeDecision {
         let active = regions.exclusions.first {
             regions.isCrossingBand($0) && ($0.intersects(tile) || $0.intersects(home))
         }
-        if let band, !regions.exclusions.contains(band) {
+        if let band,
+            !regions.exclusions.contains(band)
+                || (!usesAlternate && !band.intersects(tile) && !band.intersects(home))
+        {
             self.band = nil
             usesAlternate = false
         }
@@ -166,14 +169,18 @@ struct GridSelectionBadgeDecision {
             let rowFrame = tile
             let normalMarks = home
             let extent = horizontal ? rowFrame.height : rowFrame.width
-            let progress =
+            let start = horizontal ? rowFrame.minY : rowFrame.minX
+            let entry =
                 entersBefore
-                ? ((horizontal ? rowFrame.maxY - current.minY : rowFrame.maxX - current.minX) / extent)
-                : ((horizontal ? current.maxY - rowFrame.minY : current.maxX - rowFrame.minX) / extent)
+                ? (horizontal ? current.minY : current.minX) - extent
+                : (horizontal ? current.maxY : current.maxX)
+            let direction: CGFloat = entersBefore ? 1 : -1
+            let switchLine = entry + direction * extent * GridSelectionBadgeMotion.switchShare
+            let crossedSwitch = entersBefore ? start >= switchLine : start <= switchLine
             let safeShare = max(0.10, 4 / extent)
             let rowIsClear = !current.intersects(normalMarks)
             if !usesAlternate
-                && (progress >= GridSelectionBadgeMotion.switchShare || !rowIsClear || !regions.isClear(home))
+                && (crossedSwitch || !rowIsClear || !regions.isClear(home))
             {
                 usesAlternate = true
                 let normalEntry =
@@ -186,9 +193,11 @@ struct GridSelectionBadgeDecision {
                     entersBefore
                     ? (horizontal ? rowFrame.minY > current.maxY : rowFrame.minX > current.maxX)
                     : (horizontal ? rowFrame.maxY < current.minY : rowFrame.maxX < current.minX)
-                if rowIsClear, regions.isClear(home), progress < triggerShare - safeShare || passed {
+                let releaseLine = entry + direction * extent * (triggerShare - safeShare)
+                let crossedRelease = entersBefore ? start < releaseLine : start > releaseLine
+                if rowIsClear, regions.isClear(home), crossedRelease || passed {
                     usesAlternate = false
-                    band = nil
+                    if passed { band = nil }
                 }
             }
         } else {

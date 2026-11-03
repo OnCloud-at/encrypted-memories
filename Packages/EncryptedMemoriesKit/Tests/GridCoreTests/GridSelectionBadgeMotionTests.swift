@@ -292,4 +292,53 @@ import Testing
             tile: tile(456), side: 11, inset: 3, regions: movedBand, now: 3, reduceMotion: true)
         #expect(!motion.usesAlternate)
     }
+    @Test func continuedReversalKeepsTheReleasedHomeSlotUntilTheRowLeavesTheBand() {
+        for (extent, badge, inset, release): (CGFloat, CGFloat, CGFloat, CGFloat) in [
+            (32.5, 11, 3, 0.26), (221, 22, 7, 0.299), (333, 22, 7, 0.299),
+        ] {
+            var motion = GridSelectionBadgeMotion()
+            var time = 0.0
+            func step(_ share: CGFloat, alternate: Bool) {
+                let frame = tile(band.maxY - share * extent, side: extent)
+                let rect = motion.frame(
+                    tile: frame, side: badge, inset: inset, regions: regions,
+                    now: time, reduceMotion: true)
+                time += 1
+                #expect(motion.usesAlternate == alternate, "extent=\(extent), share=\(share)")
+                if !alternate {
+                    #expect(rect == ReservedRegionLayout.homeMarkRect(in: frame, side: badge, inset: inset))
+                }
+            }
+            step(-0.05, alternate: false)
+            step(0.4, alternate: true)
+            for share in [release, release - 0.01, release - 0.02, 0.1, 0.05, 0, -0.01] {
+                step(share, alternate: false)
+            }
+        }
+    }
+
+    @Test func oneFrameCrossingClearsThePreviousBandDirection() {
+        for (extent, badge, inset): (CGFloat, CGFloat, CGFloat) in [(32.5, 11, 3), (221, 22, 7), (333, 22, 7)] {
+            var motion = GridSelectionBadgeMotion()
+            var time = 0.0
+            func step(y: CGFloat, alternate: Bool) {
+                let frame = tile(y, side: extent)
+                _ = motion.frame(
+                    tile: frame, side: badge, inset: inset, regions: regions,
+                    now: time, reduceMotion: true)
+                time += 1
+                #expect(motion.usesAlternate == alternate, "extent=\(extent), y=\(y)")
+            }
+            let above = band.minY - extent - 20
+            let below = band.maxY + 20
+            step(y: above, alternate: false)
+            step(y: band.minY - extent + extent * 0.001, alternate: false)
+            step(y: below, alternate: false)
+            step(y: band.maxY - extent * 0.399, alternate: false)
+            step(y: band.maxY - extent * 0.4, alternate: true)
+            step(y: above, alternate: false)
+            step(y: band.minY - extent + extent * 0.001, alternate: false)
+            step(y: band.minY - extent + extent * 0.4, alternate: true)
+        }
+    }
 }

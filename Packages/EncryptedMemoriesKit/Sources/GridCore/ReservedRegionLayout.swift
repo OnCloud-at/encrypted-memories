@@ -266,24 +266,30 @@ public final class GridSelectionBadgeLayout {
             }
             horizontalIntervals = horizontalIntervals.mapValues(Self.merged)
             verticalIntervals = verticalIntervals.mapValues(Self.merged)
-            var rowFacts: [RowKey: GridSelectionBadgeRow] = [:]
             var identities: [RowKey: Int] = [:]
             let rowKeys = next.slots.enumerated().map { index, slot in
                 let key = RowKey(y: slot.minY, height: slot.height)
-                let mark = next.marks.indices.contains(index) ? next.marks[index] : slot
                 identities[key] = min(identities[key] ?? next.indices[index], next.indices[index])
-                if let previous = rowFacts[key] {
-                    rowFacts[key] = GridSelectionBadgeRow(
-                        frame: previous.frame.union(slot),
-                        normalMarks: previous.normalMarks.union(mark))
-                } else {
-                    rowFacts[key] = GridSelectionBadgeRow(frame: slot, normalMarks: mark)
-                }
                 return key
             }
-            rows = rowKeys.compactMap { rowFacts[$0] }
             rowIDs = rowKeys.compactMap { identities[$0] }
         }
+        var rowFacts: [Int: GridSelectionBadgeRow] = [:]
+        for (index, slot) in slots.enumerated() {
+            let identity = rowIDs[index]
+            let mark = normalMarks.indices.contains(index) ? normalMarks[index] : slot
+            if let previous = rowFacts[identity] {
+                let leading = min(previous.frame.minX, slot.minX)
+                rowFacts[identity] = GridSelectionBadgeRow(
+                    frame: CGRect(
+                        x: leading, y: slot.minY, width: max(previous.frame.maxX, slot.maxX) - leading,
+                        height: slot.height),
+                    normalMarks: previous.normalMarks.union(mark))
+            } else {
+                rowFacts[identity] = GridSelectionBadgeRow(frame: slot, normalMarks: mark)
+            }
+        }
+        rows = rowIDs.compactMap { rowFacts[$0] }
         updateRowDecisions(regions: regions)
     }
 
@@ -295,10 +301,14 @@ public final class GridSelectionBadgeLayout {
         for (index, row) in rows.enumerated() {
             let identity = rowIDs[index]
             guard next[identity] == nil else { continue }
-            let frame = row.frame.offsetBy(dx: offset.x, dy: offset.y)
-            let marks = row.normalMarks.offsetBy(dx: offset.x, dy: offset.y)
+            let frame = row.frame
+            let marks = row.normalMarks
             var state = rowStates[identity] ?? RowState()
-            if let previous = state.frame, previous.size != frame.size { state = RowState() }
+            if let previous = state.frame,
+                Self.key(previous.width) != Self.key(frame.width) || Self.key(previous.height) != Self.key(frame.height)
+            {
+                state = RowState()
+            }
             let delta = state.frame.map { CGPoint(x: frame.minX - $0.minX, y: frame.minY - $0.minY) } ?? .zero
             state.decision.update(tile: frame, home: marks, regions: horizontal, delta: delta)
             state.frame = frame
@@ -312,8 +322,7 @@ public final class GridSelectionBadgeLayout {
         let row = rows[index]
         let decision = rowStates[rowIDs[index]]?.decision
         return GridSelectionBadgeRow(
-            frame: row.frame.offsetBy(dx: offset.x, dy: offset.y),
-            normalMarks: row.normalMarks.offsetBy(dx: offset.x, dy: offset.y),
+            frame: row.frame, normalMarks: row.normalMarks,
             usesAlternate: decision?.band == nil ? nil : decision?.usesAlternate, band: decision?.band)
     }
 
