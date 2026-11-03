@@ -835,7 +835,9 @@ extension DriveSessionStubSuite {
             StubURLProtocol.reset()
             StubURLProtocol.route(
                 "GET /drive/shares",
-                json: #"{"Code":1000,"Shares":[{"ShareID":"share1","VolumeID":"own-volume","LinkID":"root","State":1}]}"#
+                json: #"""
+                    {"Code":1000,"Shares":[{"ShareID":"share1","VolumeID":"own-volume","LinkID":"root","State":1}]}
+                    """#
             )
             StubURLProtocol.route(
                 "POST /drive/shares/share1/links/fetch_metadata",
