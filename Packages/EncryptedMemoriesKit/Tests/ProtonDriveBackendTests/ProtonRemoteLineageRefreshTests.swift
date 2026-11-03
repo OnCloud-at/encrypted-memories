@@ -6,10 +6,10 @@ import ProtonCoreCryptoPatchedGoImplementation
 import ProtonDriveSDK
 import SQLite3
 import Testing
-import UploadCore
 
 @testable import PhotosCore
 @testable import ProtonDriveBackend
+@testable import UploadCore
 
 /// The gopenpgp implementation is process-global and injected once (the apps do the same at startup).
 private let lineageCryptoReady: Void = {
@@ -2069,10 +2069,12 @@ extension DriveSessionStubSuite {
             Self.material(rootKey: .init(armored: "", passphrase: ""))
         }
 
-        private static func material(rootKey: UnlockableKey) -> ProtonUploadDedupeService.Material {
+        private static func material(
+            rootKey: UnlockableKey, hashKeyEpoch: String = "epoch"
+        ) -> ProtonUploadDedupeService.Material {
             .init(
                 context: .init(volumeID: "vol1", shareID: "share1", rootLinkID: "root1"),
-                rootKey: rootKey, hashKey: Data(), epoch: "epoch")
+                rootKey: rootKey, hashKey: Data(), epoch: hashKeyEpoch)
         }
 
         private func makeSession() -> DriveSession { Self.makeSession() }
@@ -2087,6 +2089,183 @@ extension DriveSessionStubSuite {
 
         private func checkpoint(_ eventID: String) -> UploadRemoteContentIndexCheckpoint {
             .init(eventID: eventID, refreshedAt: Date())
+        }
+
+        /// A changed link never keeps its old fingerprint, because a duplicate merge reads these fingerprints to rank.
+        /// This run keeps the fingerprint of a link that the event page did not name.
+        @Test func anEventInvalidatesOnlyTheFingerprintOfTheLinkItNamed() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
+            #expect(
+                cache.store.fingerprints(for: [photo("photo-b")], in: snapshot)
+                    == [photo("photo-b"): fingerprint("camera-b")])
+        }
+
+        /// An edited file loses its old fingerprint: an edit names the link as active, so the fingerprint of the
+        /// earlier revision must not serve the new revision.
+        @Test func anEditEventDropsTheFingerprintOfTheEditedLink() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"photo-a","Type":2,"State":1}}]}"#
+            )
+            try routeMetadata([
+                fixture.keys.activePhoto("photo-a", attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+            ])
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
+            #expect(
+                cache.store.fingerprints(for: [photo("photo-b")], in: snapshot)
+                    == [photo("photo-b"): fingerprint("camera-b")])
+        }
+
+        /// A changed hash key starts a fresh index, so no fingerprint of the old key epoch survives it.
+        @Test func aKeyEpochChangeEmptiesEveryFingerprint() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            #expect(fingerprintRowCount(fixture.directory) == 2)
+            // The new key epoch has no checkpoint, so the refresh rebuilds the index from scratch.
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache, hashKeyEpoch: "epoch-two")
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.scope.hashKeyEpoch == "epoch-two")
+            #expect(snapshot.eventID == "two")
+            // The rebuild discards every saved detail of the old key epoch.
+            #expect(fingerprintRowCount(fixture.directory) == 0)
+        }
+
+        /// A failed surgical advance falls back to the safe full reset. The store moved its cursor past the cache
+        /// (a lost write or another component advanced it), so the cache must not keep serving at the stale cursor.
+        @Test func aDesynchronizedStoreFallsBackToTheFullReset() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let cache = try seededFingerprintCache(fixture)
+            // Move the persisted context ahead without the cache, which a lost in-memory state can do.
+            _ = cache.store.prepare(
+                scope: .init(
+                    accountID: fixture.directory.lastPathComponent, volumeID: "vol1", hashKeyEpoch: "epoch"),
+                eventID: "later")
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(fingerprintRowCount(fixture.directory) == 0)
+            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
+            #expect(cache.store.fingerprints(for: [photo("photo-b")], in: snapshot) == nil)
+        }
+
+        /// A launch without a fingerprint store (unreadable or absent) keeps the refresh working unchanged.
+        @Test func anEventRefreshWithoutAFingerprintCacheAdvancesTheIndex() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root)
+            #expect(fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+        }
+
+        /// A new launch has no in-memory cursor, so the invalidation recovers the persisted snapshot at the cursor
+        /// the index left. The unnamed link keeps its detail; the named link loses it.
+        @Test func aRelaunchedCacheRecoversThePersistedCursorAndKeepsUnnamedLinks() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let seeding = try seededFingerprintCache(fixture)
+            seeding.close()
+            // A relaunch opens the store without the earlier in-memory cursor.
+            let cache = try #require(ExactDuplicateFingerprintCache.open(accountDirectory: fixture.directory))
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":0,"Link":{"LinkID":"photo-a"}}]}"#
+            )
+            try await refresh(
+                content: fixture.content, lineage: fixture.lineage, rootKey: fixture.keys.root,
+                fingerprintCache: cache)
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(snapshot.eventID == "two")
+            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
+            #expect(
+                cache.store.fingerprints(for: [photo("photo-b")], in: snapshot)
+                    == [photo("photo-b"): fingerprint("camera-b")])
+        }
+
+        /// Counts the saved detail rows without touching the store, so an assertion cannot destroy its own evidence.
+        private func fingerprintRowCount(_ directory: URL) -> Int64 {
+            var db: OpaquePointer?
+            guard
+                sqlite3_open_v2(
+                    directory.appendingPathComponent(ExactDuplicateFingerprintStore.databaseFileName).path,
+                    &db, SQLITE_OPEN_READONLY, nil
+                ) == SQLITE_OK
+            else { return -1 }
+            defer { sqlite3_close(db) }
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM fingerprint;", -1, &statement, nil) == SQLITE_OK
+            else { return -1 }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else { return -1 }
+            return sqlite3_column_int64(statement, 0)
+        }
+
+        /// One event page between two cursors, so a test names the link that the page changed. The page JSON names
+        /// the cursor it produces.
+        private func routeEventPage(from: String, json: String) {
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/\(from)", json: json)
+        }
+
+        private func photo(_ linkID: String) -> PhotoUID { PhotoUID(volumeID: "vol1", nodeID: linkID) }
+
+        private func fingerprint(_ device: String) -> ExactDuplicateFingerprint {
+            ExactDuplicateFingerprint(
+                captureTime: Date(timeIntervalSince1970: 1_700_000_000.125), latitude: 12.25, longitude: -34.5,
+                device: device, pixelWidth: 1920, pixelHeight: 1080, durationSeconds: 1.125, mimeType: "image/heic")
+        }
+
+        /// A cache with the details of two links at the checkpoint "one" that the fixture seeds.
+        private func seededFingerprintCache(_ fixture: RepairFixture) throws -> ExactDuplicateFingerprintCache {
+            let cache = try #require(ExactDuplicateFingerprintCache.open(accountDirectory: fixture.directory))
+            cache.begin(volumeID: "vol1", hashKeyEpoch: "epoch", eventID: "one")
+            let snapshot = try #require(cache.currentSnapshot())
+            #expect(
+                cache.store.store(
+                    [
+                        photo("photo-a"): fingerprint("camera-a"),
+                        photo("photo-b"): fingerprint("camera-b"),
+                    ], for: snapshot))
+            return cache
         }
 
         private func routeEmptyEvents(from: String, to: String) {
@@ -2191,22 +2370,25 @@ extension DriveSessionStubSuite {
         private func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
             rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
-            workMeasurements: SupportWorkMeasurements? = nil
+            workMeasurements: SupportWorkMeasurements? = nil,
+            fingerprintCache: ExactDuplicateFingerprintCache? = nil, hashKeyEpoch: String = "epoch"
         ) async throws {
             try await Self.refresh(
                 content: content, lineage: lineage, rebuildsMissingLineage: rebuildsMissingLineage, rootKey: rootKey,
-                workMeasurements: workMeasurements)
+                workMeasurements: workMeasurements, fingerprintCache: fingerprintCache, hashKeyEpoch: hashKeyEpoch)
         }
 
         fileprivate static func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
             rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: ""),
-            workMeasurements: SupportWorkMeasurements? = nil
+            workMeasurements: SupportWorkMeasurements? = nil,
+            fingerprintCache: ExactDuplicateFingerprintCache? = nil, hashKeyEpoch: String = "epoch"
         ) async throws {
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
-                material: material(rootKey: rootKey), session: makeSession(),
+                material: material(rootKey: rootKey, hashKeyEpoch: hashKeyEpoch), session: makeSession(),
                 crypto: DriveCrypto(addressKeys: [], signers: []),
-                store: content, lineageStore: lineage, rebuildsMissingLineage: rebuildsMissingLineage,
+                store: content, lineageStore: lineage, fingerprintCache: fingerprintCache,
+                rebuildsMissingLineage: rebuildsMissingLineage,
                 progress: { _ in }, workMeasurements: workMeasurements)
         }
     }

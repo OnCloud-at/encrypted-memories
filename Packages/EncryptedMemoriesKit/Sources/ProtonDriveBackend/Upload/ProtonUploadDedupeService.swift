@@ -54,6 +54,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private let contextProvider: @Sendable () async throws -> PhotosShareContext
     private let firstBuildGate: TimelineMetadataStartGate?
     private let workMeasurements: SupportWorkMeasurements?
+    /// Splits the duplicate ranking on the screen. Invalidated per link, so a changed file never keeps a stale
+    /// fingerprint. Nil when the account has no usable fingerprint store.
+    private let fingerprintCache: ExactDuplicateFingerprintCache?
 
     struct Material: Sendable {
         let context: PhotosShareContext
@@ -107,6 +110,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         material: Material? = nil,
         firstBuildGate: TimelineMetadataStartGate? = nil,
         workMeasurements: SupportWorkMeasurements? = nil,
+        fingerprintCache: ExactDuplicateFingerprintCache? = nil,
         contextProvider: @Sendable @escaping () async throws -> PhotosShareContext
     ) {
         self.firstBuildGate = firstBuildGate
@@ -120,6 +124,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         self.contentIndexStore = contentIndexStore
         self.lineageIndexStore = lineageIndexStore
         self.contextProvider = contextProvider
+        self.fingerprintCache = fingerprintCache
         // Only the launch that created the lineage index runs the first full build; any other launch opens at once.
         if lineageIndexStore?.acceptsWrites != true || lineageIndexStore?.createdFile != true {
             firstBuildGate?.open()
@@ -584,6 +589,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let store = self.contentIndexStore
         let lineageStore = self.lineageIndexStore
         let workMeasurements = self.workMeasurements
+        let fingerprintCache = self.fingerprintCache
         let generation = remoteContentIndexGeneration
         let leftAtStart = remoteMainsChangedCount
         let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] value in
@@ -597,7 +603,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             do {
                 try await Self.refreshRemoteContentIndex(
                     material: material, session: session, crypto: crypto, store: store,
-                    lineageStore: lineageStore, rebuildsMissingLineage: rebuildsMissingLineage, progress: report,
+                    lineageStore: lineageStore, fingerprintCache: fingerprintCache,
+                    rebuildsMissingLineage: rebuildsMissingLineage, progress: report,
                     workMeasurements: workMeasurements)
                 await self?.finishRemoteContentIndexBuild(
                     build, material: material, rebuiltLineage: rebuildsMissingLineage, generation: generation,
@@ -649,6 +656,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         crypto: DriveCrypto,
         store: any UploadRemoteContentIndexStore,
         lineageStore: UploadRemoteLineageIndexStore?,
+        fingerprintCache: ExactDuplicateFingerprintCache? = nil,
         rebuildsMissingLineage: Bool = false,
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void,
         workMeasurements: SupportWorkMeasurements? = nil
@@ -664,13 +672,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 try await applyRemoteEvents(
                     from: checkpoint, material: material, session: session, crypto: crypto,
                     store: store, lineageStore: lineageStore, progress: progress,
-                    measurement: measurement, workMeasurements: workMeasurements)
+                    measurement: measurement, workMeasurements: workMeasurements, fingerprintCache: fingerprintCache)
             }
         } else {
             try await WorkMeasurementOperation.run(.indexRebuild, collector: workMeasurements) { measurement in
                 try await rebuildRemoteContentIndex(
                     material: material, session: session, crypto: crypto,
-                    store: store, lineageStore: lineageStore, progress: progress, measurement: measurement)
+                    store: store, lineageStore: lineageStore, progress: progress, measurement: measurement,
+                    fingerprintCache: fingerprintCache)
             }
         }
     }
@@ -682,7 +691,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         store: any UploadRemoteContentIndexStore,
         lineageStore: UploadRemoteLineageIndexStore?,
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void,
-        measurement: SupportWorkMeasurementPass?
+        measurement: SupportWorkMeasurementPass?,
+        fingerprintCache: ExactDuplicateFingerprintCache? = nil
     ) async throws {
         await progress(.init(phase: .loading))
         let eventID = try await session.latestVolumeEventID(volumeID: material.context.volumeID)
@@ -796,6 +806,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 DebugLog.log("[Dedupe] lineage index build could not be saved; reads remain incomplete")
             }
         }
+        // A rebuild replaces the whole index: the details of the old cursor, and of another key epoch, never stand
+        // at the rebuilt cursor. Reset empties the whole store (scope mismatch wipes on epoch change).
+        fingerprintCache?.reset(
+            volumeID: material.context.volumeID, hashKeyEpoch: material.epoch, to: eventID)
         DebugLog.log(
             "[Dedupe] remote content index rebuilt links=\(ids.count)"
         )
@@ -810,7 +824,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         lineageStore: UploadRemoteLineageIndexStore?,
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { _ in },
         measurement: SupportWorkMeasurementPass?,
-        workMeasurements: SupportWorkMeasurements?
+        workMeasurements: SupportWorkMeasurements?,
+        fingerprintCache: ExactDuplicateFingerprintCache? = nil
     ) async throws {
         await progress(.init(phase: .applyingChanges))
         var eventID = checkpoint.eventID
@@ -831,7 +846,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 try await WorkMeasurementOperation.run(.indexRebuild, collector: workMeasurements) { measurement in
                     try await rebuildRemoteContentIndex(
                         material: material, session: session, crypto: crypto, store: store,
-                        lineageStore: lineageStore, progress: progress, measurement: measurement)
+                        lineageStore: lineageStore, progress: progress, measurement: measurement,
+                        fingerprintCache: fingerprintCache)
                 }
                 return
             }
@@ -876,6 +892,11 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 crypto: crypto
             )
             let next = UploadRemoteContentIndexCheckpoint(eventID: page.eventID, refreshedAt: Date())
+            // Drop the fingerprints of every link this page changed before the index commits the new cursor, so a
+            // ranking that starts at the new cursor never reads the stale details of a changed link.
+            fingerprintCache?.advance(
+                volumeID: material.context.volumeID, hashKeyEpoch: material.epoch,
+                from: eventID, to: page.eventID, invalidating: activeFileIDs.union(removedIDs))
             guard
                 store.applyRemoteContentIndexChanges(
                     upserting: rows.records,
