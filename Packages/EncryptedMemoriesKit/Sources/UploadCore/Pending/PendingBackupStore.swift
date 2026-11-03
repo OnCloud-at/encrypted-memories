@@ -1007,11 +1007,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     /// Schedules the next attempt of a failed effect with the shared backoff.
+    /// If a generation is supplied and it does not match the row, the write belongs to an obsolete
+    /// decision; return true without updating the row so the pending write is dropped.
     @discardableResult
-    public func deferEffects(for key: PendingSourceKey, at date: Date) -> Bool {
+    public func deferEffects(
+        for key: PendingSourceKey, at date: Date, generation: Int64? = nil
+    ) -> Bool {
         standaloneWrite(refusing: false) {
             guard case .readable(let current) = sourceStateLocked(key) else { return false }
             guard let state = current else { return true }
+            if let generation = generation, state.generation != generation { return true }
             let next = date.addingTimeInterval(PendingRetrySchedule.delay(afterAttempts: state.attempts))
             return execute(
                 "UPDATE source_state SET attempts=attempts+1, next_attempt_at=?, updated_at=? WHERE source_kind=? AND source_id=?;"
