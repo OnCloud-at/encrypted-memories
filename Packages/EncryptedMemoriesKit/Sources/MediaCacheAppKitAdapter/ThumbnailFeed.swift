@@ -109,10 +109,6 @@ public actor ThumbnailFeed {
         core.applyDecodedMemoryPressure(scale: scale, purge: purge)
     }
 
-    static func decodedCost(_ image: NSImage) -> Int {
-        MacThumbnailImageDecoder.decodedCost(image)
-    }
-
     public func cachedImage(for uid: PhotoUID) async -> NSImage? {
         let ticket = imageWrappers.captureTicket()
         guard await core.cachedDecoded(for: uid) != nil else { return nil }
