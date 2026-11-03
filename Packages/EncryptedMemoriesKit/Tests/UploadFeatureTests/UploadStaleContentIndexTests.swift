@@ -229,7 +229,7 @@ final class UploadStaleContentIndexTests: XCTestCase {
 
             await harness.pass()
 
-            let waiting = harness.queue.entry(for: entry.source, revision: entry.revision)
+            let waiting = try harness.queue.entry(for: entry.source, revision: entry.revision)
             XCTAssertEqual(waiting?.state, .discovered, "\(failure)")
             XCTAssertEqual(waiting?.attempts, entry.attempts, "\(failure)")
             XCTAssertNil(harness.identities.record(for: entry.source)?.outcome, "\(failure)")
@@ -262,7 +262,7 @@ final class UploadStaleContentIndexTests: XCTestCase {
         }
 
         XCTAssertEqual(harness.state(of: entry), .failed)
-        XCTAssertEqual(harness.queue.entry(for: entry.source, revision: entry.revision)?.attempts, 4)
+        XCTAssertEqual(try harness.queue.entry(for: entry.source, revision: entry.revision)?.attempts, 4)
         XCTAssertNil(harness.identities.record(for: entry.source)?.outcome)
         XCTAssertEqual(harness.server.uploadRequestCount, 0)
     }

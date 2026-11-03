@@ -264,7 +264,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
 
         XCTAssertEqual(settled, 1)
         XCTAssertEqual(resolver.callCount, 0)
-        XCTAssertNil(reopened.entry(for: entry.source, revision: entry.revision))
+        XCTAssertNil(try reopened.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(identityRecorder.records.first?.descriptor, UploadResourceDescriptorSnapshot(descriptor))
         XCTAssertEqual(identityRecorder.records.first?.linkID, "remote-primary")
     }
@@ -377,7 +377,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
                 )
             }
             XCTAssertTrue(recorder.records.isEmpty)
-            XCTAssertNotNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         }
     }
 
@@ -416,7 +416,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             } catch let error as UploadRemoteCommitRecoveryError {
                 XCTAssertEqual(error, .invalidReceipt(entry.source, entry.revision))
             }
-            XCTAssertNotNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         }
 
         let opaqueSource = source("opaque-positive")
@@ -505,7 +505,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertEqual(settledCount, 1)
         XCTAssertEqual(identityResolver.records.count, 1)
         XCTAssertEqual(uploader.requests.count, 1, "settlement replay must not call the uploader again")
-        XCTAssertNil(reopened.entry(for: source, revision: entry.revision))
+        XCTAssertNil(try reopened.entry(for: source, revision: entry.revision))
     }
 
     func testPersistedSecondaryRepairsExactRemoteLinkWithoutResolvingOrSchedulingSibling() async throws {
@@ -565,7 +565,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
 
         XCTAssertEqual(settled, 1)
         XCTAssertEqual(recorder.records.map(\.descriptor.source), [secondary])
-        XCTAssertNil(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertNil(try store.entry(for: entry.source, revision: entry.revision))
     }
 
     func testLegacyMatchedSecondaryWithChangedDigestFailsClosed() async throws {
@@ -605,7 +605,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         } catch let error as UploadRemoteCommitRecoveryError {
             XCTAssertEqual(error, .descriptorMismatch(entry.source, entry.revision))
         }
-        XCTAssertNotNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     func testUnavailableManifestResolverPreservesReceiptAndSurfacesExistingBackendError() async throws {
@@ -632,7 +632,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             }
             XCTAssertEqual(message, "manifest unavailable")
         }
-        XCTAssertNotNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     func testLegacyReceiptUsesOnlyMatchingCurrentDescriptorAndJoinsCleanup() async throws {
@@ -660,7 +660,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
 
         XCTAssertTrue(cleanup.isSignaled)
         XCTAssertEqual(recorder.records.map(\.descriptor.source), [source])
-        XCTAssertNil(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertNil(try store.entry(for: entry.source, revision: entry.revision))
     }
 
     func testLegacyMissingOrChangedDescriptorFailsClosedAndPreservesReceipt() async throws {
@@ -692,7 +692,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             } catch {
                 XCTAssertTrue(error is UploadRemoteCommitRecoveryError)
             }
-            XCTAssertNotNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+            XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         }
     }
 
@@ -712,7 +712,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             ).settleAll()
             XCTFail("injected manifest failure must surface")
         } catch {}
-        XCTAssertNotNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
 
         let blocker = BlockingRecoveryIdentityRecorder()
         let recovery = Task {
@@ -732,10 +732,10 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         } catch is CancellationError {}
 
         XCTAssertEqual(blocker.writeCount, 1)
-        XCTAssertNotNil(store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         store.close()
         let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
-        XCTAssertNotNil(reopened.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotNil(try reopened.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     func testUnreadablePendingStatePreservesReceiptBeforeIdentitySettlement() async throws {
@@ -770,7 +770,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertTrue(pending.isOperational(), "an unreadable row stops only its own photo (#982)")
         XCTAssertTrue(pending.unacknowledgedHandoffs().isEmpty, "the handoff insert must roll back")
         XCTAssertEqual(
-            queue.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation,
+            try queue.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation,
             entry.remoteCommitReconciliation)
         recorder.finish()
         var events: [PendingRuntimeEvent] = []
@@ -785,14 +785,15 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertEqual(reopenedPending.sourceStates(), states)
         let reopenedQueue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL()))
         defer { reopenedQueue.close() }
-        XCTAssertNotNil(reopenedQueue.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotNil(
+            try reopenedQueue.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
         let retryRecorder = PendingBackupEventRecorder(store: reopenedPending)
         defer { retryRecorder.finish() }
         let settled = try await UploadRemoteCommitRecovery(
             queue: reopenedQueue, resolver: resolver, identityResolver: identities, events: retryRecorder
         ).settleAll()
         XCTAssertEqual(settled, 1)
-        XCTAssertNil(reopenedQueue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertNil(try reopenedQueue.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(identities.records.count, 1)
         XCTAssertTrue(reopenedPending.sourceState(for: key)?.needsRemoteTrash ?? false)
         XCTAssertEqual(reopenedPending.sourceState(for: key)?.remote?.nodeID, "remote-primary")
@@ -1063,7 +1064,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertEqual(members, [original.nodeID])
         let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
         defer { reopened.close() }
-        XCTAssertEqual(reopened.entry(for: settled.source, revision: settled.revision), settled)
+        XCTAssertEqual(try reopened.entry(for: settled.source, revision: settled.revision), settled)
         XCTAssertNil(deviceB.identities.record(for: candidate.snapshot.source))
         XCTAssertEqual(deviceB.library.resolutions.count, resolutions)
         XCTAssertEqual(deviceB.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
@@ -1297,7 +1298,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         } catch is CancellationError {}
 
         let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: albumQueueURL()))
-        XCTAssertNotNil(reopened.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertNotNil(try reopened.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
     func testStopFenceRejectsAdmissionAfterOperationJoinsUntilStopReturns() async throws {

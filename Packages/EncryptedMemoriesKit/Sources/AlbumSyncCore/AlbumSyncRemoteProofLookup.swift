@@ -19,7 +19,7 @@ public enum AlbumSyncRemoteProofLookup {
             guard snapshot.source.kind == .photoLibraryAsset, snapshot.source.resource == .primary,
                 requested.contains(snapshot.source.identifier), snapshot.externalIdentity != nil
             else { continue }
-            let row = queue.entry(for: snapshot.source, revision: snapshot.revision)
+            let row = (try? queue.entry(for: snapshot.source, revision: snapshot.revision))
             guard queue.isOperational() else { throw AlbumSyncError.mappingStoreUnavailable }
             guard row?.state == .alreadyBackedUp else { continue }
             batch.append(snapshot)

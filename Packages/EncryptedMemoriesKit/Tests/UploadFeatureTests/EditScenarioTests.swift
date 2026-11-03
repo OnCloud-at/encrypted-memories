@@ -964,7 +964,7 @@ final class EditScenarioTests: XCTestCase {
         await harness.pass()
         harness.assertSafety()
         XCTAssertEqual(harness.state(of: restored), .completed)
-        XCTAssertNil(harness.queue.entry(for: next.source, revision: next.revision))
+        XCTAssertNil(try harness.queue.entry(for: next.source, revision: next.revision))
         XCTAssertNil(harness.journal.entry(for: entry.source).keptDeleted)
         XCTAssertNil(harness.journal.entry(for: entry.source).deletionCheckStartedAt)
     }
@@ -984,7 +984,7 @@ final class EditScenarioTests: XCTestCase {
         harness.clock.advance(by: 5)
         await harness.pass()
         XCTAssertEqual(harness.state(of: later), .completed)
-        XCTAssertNil(harness.queue.entry(for: parked.source, revision: parked.revision), "nothing asks about it")
+        XCTAssertNil(try harness.queue.entry(for: parked.source, revision: parked.revision), "nothing asks about it")
     }
 
     func testRestoreDuringDeletionWaitSettlesWithoutParking() async throws {

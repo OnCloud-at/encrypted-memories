@@ -57,6 +57,35 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         }
     }
 
+    func testRecordingPredicateRetainsItsSQLiteFailureAfterLaterSuccess() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        connection.withLock {
+            sqlite3_set_authorizer(
+                connection.database,
+                { _, action, _, _, _, _ in action == SQLITE_SELECT ? SQLITE_DENY : SQLITE_OK }, nil)
+            XCTAssertFalse(connection.requireOperationalRecordingSQLiteError(query(connection.database)))
+            XCTAssertTrue(connection.operationFailed)
+            XCTAssertFalse(connection.failuresAreTransient)
+            sqlite3_set_authorizer(connection.database, nil, nil)
+            XCTAssertTrue(connection.requireOperationalRecordingSQLiteError(query(connection.database)))
+            XCTAssertTrue(connection.operationFailed)
+        }
+        XCTAssertFalse(connection.isOperational())
+    }
+
+    func testRecordingPredicatePreservesTheConditionAfterClose() throws {
+        let connection = try makeConnection()
+        connection.close()
+        connection.withLock {
+            XCTAssertTrue(connection.requireOperationalRecordingSQLiteError(true))
+            XCTAssertFalse(connection.operationFailed)
+            XCTAssertFalse(connection.requireOperationalRecordingSQLiteError(false))
+            XCTAssertTrue(connection.operationFailed)
+        }
+        XCTAssertFalse(connection.isOperational())
+    }
+
     // MARK: - Recovery after a transient failure (#982)
 
     func testATransientFailureRecoversWhenTheDatabaseAnswers() throws {

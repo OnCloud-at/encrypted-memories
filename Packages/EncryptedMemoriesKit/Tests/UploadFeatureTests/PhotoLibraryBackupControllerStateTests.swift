@@ -76,10 +76,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         let unsupported = try XCTUnwrap(fixture.controller.failedItems().first { $0.issue == .unsupported })
         fixture.controller.dismissFailedItem(unsupported)
         XCTAssertEqual(
-            queue.entry(for: try XCTUnwrap(unsupported.source), revision: try XCTUnwrap(unsupported.revision))?.state,
+            try queue.entry(for: try XCTUnwrap(unsupported.source), revision: try XCTUnwrap(unsupported.revision))?
+                .state,
             .dismissedFailure)
         XCTAssertFalse(fixture.controller.failedItems().contains { $0.id == unsupported.id })
-        XCTAssertEqual(queue.summary().resolved, 0, "dismissal is not a successful backup")
+        XCTAssertEqual(queue.summary()!.resolved, 0, "dismissal is not a successful backup")
         await fixture.controller.shutdown()
     }
 
@@ -804,15 +805,15 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 source: seen.source, revision: seen.revision, state: .uploading, attempts: 8,
                 lastError: seen.lastError, updatedAt: Date()))
         XCTAssertFalse(queue.reopenForUserRetry(seen, attempts: 0, updatedAt: Date()))
-        XCTAssertEqual(queue.entry(for: seen.source, revision: seen.revision)?.state, .uploading)
+        XCTAssertEqual(try queue.entry(for: seen.source, revision: seen.revision)?.state, .uploading)
         XCTAssertTrue(
             queue.updateState(
                 source: seen.source, revision: seen.revision, state: .failed, attempts: 8,
                 lastError: seen.lastError, updatedAt: Date()))
         let current = try XCTUnwrap(queue.entry(for: seen.source, revision: seen.revision))
         XCTAssertTrue(queue.reopenForUserRetry(current, attempts: 0, updatedAt: Date()))
-        XCTAssertEqual(queue.entry(for: seen.source, revision: seen.revision)?.state, .discovered)
-        XCTAssertEqual(queue.entry(for: seen.source, revision: seen.revision)?.lastError, seen.lastError)
+        XCTAssertEqual(try queue.entry(for: seen.source, revision: seen.revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: seen.source, revision: seen.revision)?.lastError, seen.lastError)
     }
 
     func testAFailedRowOfAnAutomaticCauseNeedsThePerson() throws {
@@ -1939,7 +1940,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(scans.count, 1)
             XCTAssertEqual(owners.values, [.manual])
             XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue, "The wait preserves the issue")
-            XCTAssertEqual(queue.summary().resolved, 0, "An expensive path uploads nothing with mobile data off")
+            XCTAssertEqual(queue.summary()!.resolved, 0, "An expensive path uploads nothing with mobile data off")
 
             if !returnsDuringScan {
                 await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
@@ -2102,7 +2103,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(offlineFinished)
             XCTAssertEqual(owners.values, [.manual])
             XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
-            XCTAssertEqual(queue.summary().resolved, 0, "The offline pass performs no upload")
+            XCTAssertEqual(queue.summary()!.resolved, 0, "The offline pass performs no upload")
 
             let lock = try XCTUnwrap(
                 BackupExecutionLockManifestStore(
@@ -3787,7 +3788,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 UploadBackupSyncQueueManifestStore(
                     url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
             defer { queue.close() }
-            return queue.summary()
+            return queue.summary()!
         }
 
         func testARefreshScanScansUnderItsOwnOwnerAndUploadsNothing() async throws {
@@ -3923,8 +3924,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(outcome, .ran)
             XCTAssertEqual(owners.values, [.iOSRefreshTask])
             XCTAssertEqual(
-                queue.entry(for: photo.snapshot.source, revision: photo.snapshot.revision)?.state, .discovered)
-            XCTAssertEqual(queue.summary().waiting, 2, "the existing photo and the new photo both wait")
+                try queue.entry(for: photo.snapshot.source, revision: photo.snapshot.revision)?.state, .discovered)
+            XCTAssertEqual(queue.summary()!.waiting, 2, "the existing photo and the new photo both wait")
             XCTAssertEqual(controller.reconcileStartsForTesting, 0, "the refresh window never starts an upload drain")
             XCTAssertFalse(controller.isAutoResumeScheduledForTesting, "the background scan plans no upload pass")
             XCTAssertEqual(controller.deferredStartOwnerForTesting, deferred ? .foreground : nil)
@@ -4505,7 +4506,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let queue = try XCTUnwrap(
                 UploadBackupSyncQueueManifestStore(
                     url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
-            XCTAssertEqual(queue.summary().total, 0)
+            XCTAssertEqual(queue.summary()!.total, 0)
             queue.close()
             let scans = PassCounter()
             controller.replaceScanForTesting {
@@ -5110,7 +5111,7 @@ extension PhotoLibraryBackupControllerStateTests {
             }
             XCTAssertEqual(state.upsertCount, 0)
             XCTAssertTrue(log.events.isEmpty)
-            XCTAssertEqual(inner.entry(for: row.source, revision: row.revision), row)
+            XCTAssertEqual(try inner.entry(for: row.source, revision: row.revision), row)
             XCTAssertTrue(inner.isOperational())
         }
     }
@@ -5221,7 +5222,7 @@ extension PhotoLibraryBackupControllerStateTests {
                 isLivePhoto: shape == .live, isVideo: shape == .video, resources: resources)
             let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
             let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
-            if catalog.entry(for: info.localIdentifier) == nil {
+            if try catalog.entry(for: info.localIdentifier) == nil {
                 XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)]))
             }
             func descriptor(_ item: PhotoBackupExportPlan.Item, primary: Bool) throws -> UploadResourceDescriptor {
@@ -5258,7 +5259,7 @@ extension PhotoLibraryBackupControllerStateTests {
             await drain()
             XCTAssertTrue(
                 try XCTUnwrap(
-                    queue.entry(
+                    try queue.entry(
                         for: resolver.candidate.snapshot.source,
                         revision: resolver.candidate.snapshot.revision)
                 ).state.isTerminalSuccess, "Initial completion must come from the real runner")
@@ -5435,7 +5436,8 @@ extension PhotoLibraryBackupControllerStateTests {
         _ = try await engine.enqueueBatch([f.resolver.candidate])
         await f.drain()
         return try XCTUnwrap(
-            f.queue.entry(for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
+            try f.queue.entry(
+                for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
     }
 
     /// A newer build wrote a value that this build does not know, into each of the three enum columns in turn. The
@@ -5481,7 +5483,7 @@ extension PhotoLibraryBackupControllerStateTests {
             XCTAssertTrue(f.controller.isAvailable, "the backup is available again without a relaunch")
             await f.drain()
             let entry = try XCTUnwrap(
-                f.queue.entry(
+                try f.queue.entry(
                     for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
             XCTAssertTrue(entry.state.isTerminalSuccess, "the photo backs up")
         }
@@ -5650,7 +5652,7 @@ extension PhotoLibraryBackupControllerStateTests {
             else { throw Restore829StopFixtureError.invalid("initial backup/restore fixture") }
             let admission = await f.controller.returnToBackup([checked])
             guard case .waiting? = admission[f.key],
-                let admitted = f.queue.entry(
+                let admitted = try f.queue.entry(
                     for: f.resolver.candidate.snapshot.source,
                     revision: f.resolver.candidate.snapshot.revision),
                 !admitted.state.isTerminalSuccess, admitted.remoteCommitReconciliation == nil
@@ -5688,7 +5690,7 @@ extension PhotoLibraryBackupControllerStateTests {
                     f.resolver.resolveCount > resolutionsBefore, f.queue.isOperational(),
                     f.pending.isOperational(), f.catalog.isOperational(),
                     f.identities.record(for: admitted.source)?.remoteLinkID == main.nodeID,
-                    let active = f.queue.entry(for: admitted.source, revision: admitted.revision),
+                    let active = try f.queue.entry(for: admitted.source, revision: admitted.revision),
                     active.state == .uploading, active.remoteCommitReconciliation == nil,
                     case .readable(let owed?) = f.pending.sourceStateRead(for: f.key),
                     owed.generation == checked.generation, owed.remote == main, owed.needsQueueSync,
@@ -5883,7 +5885,7 @@ extension PhotoLibraryBackupControllerStateTests {
                 _ = try await engine.enqueueBatch([latest])
                 try await f.drain(with: resolver)
 
-                let row = f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
+                let row = try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
                 XCTAssertEqual(resolver.resolveCount, 1, "The edit really reached the duplicate check")
                 XCTAssertEqual(row?.state, .completed, "The newer edit backs up while the older Restore waits")
                 XCTAssertEqual(f.server.uploadRequestCount, uploadsBefore + 1, "Exactly the edited main uploads")
@@ -6035,11 +6037,11 @@ extension PhotoLibraryBackupControllerStateTests {
                 defer { sqlite3_close(handle) }
                 XCTAssertEqual(sqlite3_exec(handle, "UPDATE source_state SET \(change);", nil, nil, nil), SQLITE_OK)
                 let before = try XCTUnwrap(
-                    f.queue.entry(
+                    try f.queue.entry(
                         for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
                 let outcome = await f.controller.returnToBackup([checked])
                 XCTAssertEqual(outcome[f.key], .unreadable)
-                XCTAssertEqual(f.queue.entry(for: before.source, revision: before.revision), before)
+                XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
             }
         }
         try await withRestore829Fixture(.photo) { f in
@@ -6049,15 +6051,15 @@ extension PhotoLibraryBackupControllerStateTests {
             entry.modificationDate = try XCTUnwrap(entry.modificationDate).addingTimeInterval(1)
             XCTAssertTrue(f.catalog.upsertBatch([entry]))
             let before = try XCTUnwrap(
-                f.queue.entry(
+                try f.queue.entry(
                     for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
             let outcome = await f.controller.returnToBackup([checked])
             guard case .waiting? = outcome[f.key] else { return XCTFail("A later local revision owes a fresh recheck") }
             let latest = try XCTUnwrap(
                 PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
             XCTAssertNotEqual(latest.snapshot.revision, before.revision)
-            XCTAssertNotNil(f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision))
-            XCTAssertEqual(f.queue.entry(for: before.source, revision: before.revision), before)
+            XCTAssertNotNil(try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision))
+            XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
         }
     }
 
@@ -6068,11 +6070,11 @@ extension PhotoLibraryBackupControllerStateTests {
             f.server.personTrash(main)
             let uploads = f.server.uploadRequestCount
             let before = try XCTUnwrap(
-                f.queue.entry(
+                try f.queue.entry(
                     for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
             let outcome = await f.controller.returnToBackup([checked])
             XCTAssertEqual(outcome[f.key], .remoteTrashed)
-            XCTAssertEqual(f.queue.entry(for: before.source, revision: before.revision), before)
+            XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
             XCTAssertTrue(
                 f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
             let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
@@ -6162,7 +6164,7 @@ extension PhotoLibraryBackupControllerStateTests {
                     preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue)
                 _ = try await engine.enqueueBatch([latest])
                 try await f.drain(with: edited)
-                let row = f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
+                let row = try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
                 let replacing = f.identities.record(for: edited.primary.source)?.remoteLinkID
                 let oldState = f.server.links.first { $0.uid.nodeID == restored.nodeID }?.state
                 let retired: [String] = f.journal?.entry(for: edited.primary.source).retired ?? []

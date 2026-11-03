@@ -78,7 +78,7 @@ final class PendingBackupRunnerHandoffReachabilityTests: XCTestCase {
             ChainResolver.candidate(source: source, revision: 3),
         ])
         for revision in [Int64(2), 3] {
-            XCTAssertNotNil(queue.entry(for: source, revision: UploadBackupRevision(rawValue: revision)))
+            XCTAssertNotNil(try queue.entry(for: source, revision: UploadBackupRevision(rawValue: revision)))
         }
         // C represents a persisted retry that becomes eligible after the already queued B.
         XCTAssertTrue(
@@ -91,7 +91,7 @@ final class PendingBackupRunnerHandoffReachabilityTests: XCTestCase {
         XCTAssertFalse(excluded.needsQueueSync, "queue removal completed before the stale enqueue wrote B and C")
         XCTAssertEqual(excluded.remoteOperation, .remoteTrash)
         _ = try await engine.enqueue(ChainResolver.candidate(source: source, revision: 4))
-        XCTAssertNil(queue.entry(for: source, revision: UploadBackupRevision(rawValue: 4)))
+        XCTAssertNil(try queue.entry(for: source, revision: UploadBackupRevision(rawValue: 4)))
 
         clock.advance(by: 1)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
@@ -113,7 +113,8 @@ final class PendingBackupRunnerHandoffReachabilityTests: XCTestCase {
         XCTAssertEqual(waiting.remoteOperation, .remoteTrash)
         for revision in [Int64(2), 3] {
             XCTAssertEqual(
-                queue.entry(for: source, revision: UploadBackupRevision(rawValue: revision))?.state, .alreadyBackedUp)
+                try queue.entry(for: source, revision: UploadBackupRevision(rawValue: revision))?.state,
+                .alreadyBackedUp)
         }
 
         XCTAssertTrue(

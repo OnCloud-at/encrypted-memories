@@ -53,11 +53,11 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
                 fixture.server.uploadRequestCount, uploads, "The real duplicate check must reuse Proton data")
             XCTAssertEqual(fixture.remote.compensations, 0, "A confirmed Restore must not send another remote Restore")
 
-            let completed = fixture.queue.entry(for: fixture.source, revision: fixture.revision)
+            let completed = try fixture.queue.entry(for: fixture.source, revision: fixture.revision)
             let repeated = try await fixture.restore(main)
             XCTAssertTrue(repeated.isReadable)
             await fixture.drain()
-            XCTAssertEqual(fixture.queue.entry(for: fixture.source, revision: fixture.revision), completed)
+            XCTAssertEqual(try fixture.queue.entry(for: fixture.source, revision: fixture.revision), completed)
             XCTAssertEqual(fixture.resolver.readCount, reads + 1)
             XCTAssertEqual(fixture.server.uploadRequestCount, uploads)
             XCTAssertEqual(fixture.remote.compensations, 0)
@@ -76,7 +76,7 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             try fixture.execute("UPDATE source_state SET desired='future-state';")
             XCTAssertEqual(fixture.pending.sourceStateRead(for: fixture.key), .unreadable)
             let saved = try fixture.rawSourceRow()
-            let queue = fixture.queue.entry(for: fixture.source, revision: fixture.revision)
+            let queue = try fixture.queue.entry(for: fixture.source, revision: fixture.revision)
             let uploads = fixture.server.uploadRequestCount
             let reads = fixture.resolver.readCount
 
@@ -86,7 +86,7 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             XCTAssertEqual(result.outcomes[fixture.key], .unreadable)
             XCTAssertEqual(fixture.session.excludedTiles.map(\.key), [fixture.key])
             XCTAssertEqual(try fixture.rawSourceRow(), saved, "Unreadable state must remain byte-for-byte intact")
-            XCTAssertEqual(fixture.queue.entry(for: fixture.source, revision: fixture.revision), queue)
+            XCTAssertEqual(try fixture.queue.entry(for: fixture.source, revision: fixture.revision), queue)
             XCTAssertEqual(fixture.resolver.readCount, reads)
             XCTAssertEqual(fixture.server.uploadRequestCount, uploads)
             XCTAssertEqual(fixture.remote.trashes, 0)
@@ -118,7 +118,8 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             XCTAssertEqual(fixture.server.uploadRequestCount, uploads)
             // Reconcile can admit the real queue after compensation. Wait for that admission before draining it.
             await assertEventually {
-                fixture.queue.entry(for: fixture.source, revision: fixture.revision)?.state.isTerminalSuccess == false
+                queueEntryForTesting(in: fixture.queue, source: fixture.source, revision: fixture.revision)?.state
+                    .isTerminalSuccess == false
             }
             await fixture.drain()
             XCTAssertEqual(fixture.resolver.readCount, reads + 1)

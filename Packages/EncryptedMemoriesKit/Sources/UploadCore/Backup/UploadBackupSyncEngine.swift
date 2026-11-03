@@ -187,12 +187,12 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         guard !included.isEmpty else { return UploadBackupSyncScanResult() }
         var candidates: [UploadBackupAssetCandidate] = []
         var result = UploadBackupSyncScanResult()
-        let mayHaveDismissals = queue.containsAny(in: [.dismissedFailure, .discovered, .checking])
+        let mayHaveDismissals = ((try? queue.containsAny(in: [.dismissedFailure, .discovered, .checking])) ?? false)
         guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
         for candidate in included {
             try Task.checkCancellation()
             if mayHaveDismissals {
-                let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+                let row = (try? queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
                 guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
                 if let row, row.isDismissedSourceRecheck || row.state == .dismissedFailure {
                     result.scanned += 1
@@ -287,7 +287,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     ) async throws -> Bool {
         try Task.checkCancellation()
         guard isCurrent() else { return false }
-        guard let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision) else {
+        guard let row = (try? queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)) else {
             guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             try await preflight.markPending(candidate.snapshot)
             return isCurrent()
@@ -315,7 +315,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         var missing: [UploadBackupAssetCandidate] = []
         for candidate in candidates {
             try Task.checkCancellation()
-            let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+            let row = (try? queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
             guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             if row?.state == .sourceMissing || row?.state == .dismissedFailure { missing.append(candidate) }
         }
@@ -363,7 +363,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             guard try await preflight.reopen(snapshot) else { continue }
             pending.append(reopening.candidate)
             try Task.checkCancellation()
-            let row = queue.entry(for: snapshot.source, revision: snapshot.revision)
+            let row = (try? queue.entry(for: snapshot.source, revision: snapshot.revision))
             guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             guard let row, row.state == .completed || row.state == .alreadyBackedUp else { continue }
             guard queue.remove(source: snapshot.source, revision: snapshot.revision) else {
@@ -516,7 +516,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     }
 
     public func summary() -> UploadBackupSyncQueueSummary {
-        queue.summary()
+        (queue.summary() ?? UploadBackupSyncQueueSummary())
     }
 
     private func entry(

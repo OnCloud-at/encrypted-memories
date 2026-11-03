@@ -614,7 +614,7 @@ final class LivePhotoVideoProofRunnerTests: XCTestCase {
     }
 
     private func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {
-        queueStore.entry(for: entry.source, revision: entry.revision)?.state
+        queueEntryForTesting(in: queueStore, source: entry.source, revision: entry.revision)?.state
     }
 
     func testAnUnrelatedMainFileDoesNotMakeTheLivePhotoCountAsSaved() async throws {

@@ -193,10 +193,13 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// False after a persistence failure or close. Empty read results are trustworthy only while
     /// this remains true; scanners must stop rather than advance a cursor on a failed read.
     func isOperational() -> Bool
-    func entry(for localIdentifier: String) -> PhotoLibraryCatalogEntry?
+    /// Reads one row. Throws `SQLiteStoreUnknownReadError` when the read could not run, so a caller never mistakes
+    /// a failed read for a real absence (#1004).
+    func entry(for localIdentifier: String) throws -> PhotoLibraryCatalogEntry?
     /// Stable keyset page of present inventory rows. Used to rebuild or enrich the durable backup
     /// queue without touching PhotoKit bytes when the queue is incomplete after an app upgrade.
-    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry]
+    /// Nil means the page is unknown, not empty; a caller must not treat it as the end of the catalog (#1004).
+    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry]?
     /// Read-only classification of an observation against the stored row, without writing. The sync
     /// driver uses this to decide whether to enqueue a backup candidate before it advances the
     /// catalog, so the durable queue row is always written first.
@@ -218,8 +221,8 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// Marks removed every present row not touched since `cutoff` (full-scan mark-and-sweep).
     @discardableResult
     func sweepRemoved(notSeenAfter cutoff: Date, removedAt: Date) -> PhotoLibraryCatalogMutationResult
-    func snapshot() -> PhotoLibraryCatalogSnapshot
-    func count() -> Int
+    func snapshot() -> PhotoLibraryCatalogSnapshot?
+    func count() -> Int?
 
     // MARK: Resumable full-scan state
     /// True once a full-library scan has completed at least once. An incremental (change-token) scan
@@ -279,7 +282,8 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     @discardableResult
     func finishFullScanSnapshot() -> Bool
     func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String]
-    func fullScanSnapshotCount() -> Int
+    /// A nil count is an unknown read, not an empty snapshot (#1004).
+    func fullScanSnapshotCount() -> Int?
 }
 
 public extension PhotoLibraryCatalogStore {
@@ -290,7 +294,8 @@ public extension PhotoLibraryCatalogStore {
 
     func isOperational() -> Bool { true }
 
-    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry] { [] }
+    /// An unimplemented page reader cannot prove the catalog empty; nil reports unknown, not absence (#1004).
+    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry]? { nil }
 
     func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] {
         entries.map(classify)

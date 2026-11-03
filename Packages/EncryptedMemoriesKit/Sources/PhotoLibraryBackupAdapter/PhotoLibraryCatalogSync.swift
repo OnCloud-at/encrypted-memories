@@ -326,7 +326,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         let snapshotIsDurable = await synchronizeQueueThenCatalog(engine: engine)
         if snapshotIsDurable { onSnapshotReady() }
         let epochStart = resume.epochStart
-        let total = store.fullScanSnapshotCount()
+        let total = (store.fullScanSnapshotCount() ?? 0)
         guard store.isOperational() else {
             throw UploadError.backend("Photo library scan snapshot could not be read")
         }
@@ -410,7 +410,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         var cursor = store.lateRenderSweepResumePoint()
         while true {
             try Task.checkCancellation()
-            let page = store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize)
+            let page = (store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize) ?? [])
             guard store.isOperational() else {
                 throw UploadError.backend("Photo library catalog could not be read")
             }
@@ -463,7 +463,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         }
         while true {
             try Task.checkCancellation()
-            let page = store.presentEntries(afterLocalIdentifier: sweep.afterLocalIdentifier, limit: chunkSize)
+            let page = (store.presentEntries(afterLocalIdentifier: sweep.afterLocalIdentifier, limit: chunkSize) ?? [])
             guard store.isOperational() else { throw UploadError.backend("Photo library catalog could not be read") }
             guard let last = page.last else { break }
             let candidates = page.compactMap {
@@ -537,7 +537,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
     /// An edit whose rendered file Photos lists only now. When Photos leaves the dates alone, its revision can
     /// equal one that an earlier build recorded as complete with the original as main photo.
     private func rendersLate(_ info: PhotoBackupAssetInfo) -> Bool {
-        guard PhotoBackupAssetPlanner.listsRender(info), let stored = store.entry(for: info.localIdentifier) else {
+        guard PhotoBackupAssetPlanner.listsRender(info), let stored = (try? store.entry(for: info.localIdentifier))
+        else {
             return false
         }
         return !PhotoBackupAssetPlanner.listsRender(PhotoLibraryCatalogMapper.info(for: stored))

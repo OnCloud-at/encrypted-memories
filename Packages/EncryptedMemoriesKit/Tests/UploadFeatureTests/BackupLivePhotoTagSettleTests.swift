@@ -89,7 +89,7 @@ final class BackupLivePhotoTagSettleTests: XCTestCase {
     }
 
     private func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {
-        queueStore.entry(for: entry.source, revision: entry.revision)?.state
+        queueEntryForTesting(in: queueStore, source: entry.source, revision: entry.revision)?.state
     }
 
     private func expectedHashes(id: String) -> (nameHash: String, contentHash: String) {
@@ -234,7 +234,7 @@ final class BackupLivePhotoTagSettleTests: XCTestCase {
             "nil tagAdder fails visibly instead of faking settlement")
         XCTAssertEqual(progress.uploaded, 0)
         XCTAssertEqual(progress.failed, 1)
-        let parkedRow = queueStore.entry(for: entry.source, revision: entry.revision)
+        let parkedRow = try queueStore.entry(for: entry.source, revision: entry.revision)
         let parkedIssue = BackupIssueRecord.decode(parkedRow?.lastError)
         XCTAssertEqual(
             parkedIssue?.kind, .localState,

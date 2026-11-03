@@ -53,6 +53,8 @@ public protocol UploadBackupSyncQueueObserving: Sendable {
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision]
     /// Every row of the given sources, for an incremental update after a change notification.
     func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState]
+    /// Complete rows for a decision. Throws when a read fails or cannot return a complete result.
+    func decisionRows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) throws -> [UploadBackupQueueRowState]
 }
 
 public extension UploadBackupSyncQueueObserving {

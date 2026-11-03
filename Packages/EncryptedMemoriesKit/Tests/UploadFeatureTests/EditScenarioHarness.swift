@@ -398,7 +398,7 @@ final class EditScenarioHarness {
                 let record = try XCTUnwrap(backupState.record(for: asset.source, revision: revision))
                 XCTAssertTrue(record.isComplete)
                 XCTAssertEqual(record.pendingResourceCount, 0)
-                XCTAssertEqual(catalog.entry(for: asset.identifier)?.metadataRevision, revision.rawValue)
+                XCTAssertEqual(try catalog.entry(for: asset.identifier)?.metadataRevision, revision.rawValue)
                 XCTAssertTrue(journal.entry(for: asset.source).isEmpty)
             }
             XCTAssertFalse(journalFileExists)
@@ -449,7 +449,7 @@ final class EditScenarioHarness {
             }
         }
         try openBackupStores()
-        XCTAssertEqual(queue.summary().total, 0)
+        XCTAssertEqual(queue.summary()!.total, 0)
         XCTAssertEqual(backupState.count(), 0)
     }
 
@@ -673,7 +673,7 @@ final class EditScenarioHarness {
     }
 
     func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {
-        queue.entry(for: entry.source, revision: entry.revision)?.state
+        queueEntryForTesting(in: queue, source: entry.source, revision: entry.revision)?.state
     }
 
     func primaryDecision(for entry: UploadBackupSyncQueueEntry) async throws -> UploadDuplicateDecision {
@@ -804,7 +804,7 @@ final class EditScenarioHarness {
     }
 
     func assertQuiescent(file: StaticString = #filePath, line: UInt = #line) {
-        let summary = queue.summary()
+        let summary = queue.summary()!
         check(
             summary.waiting + summary.active + summary.blocked + summary.failed == 0, "the queue must drain",
             file: file, line: line)

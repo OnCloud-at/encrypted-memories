@@ -322,7 +322,7 @@ public actor BackupStatusProjector {
 
     private func publishNow() async -> BackupStatusProjection? {
         guard queue.isOperational() else { return nil }
-        let summary = queue.summary()
+        let summary = (queue.summary() ?? UploadBackupSyncQueueSummary())
         guard queue.isOperational() else { return nil }
 
         var progress = latestRunnerProgress ?? BackupSyncProgress()
