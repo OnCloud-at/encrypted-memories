@@ -153,9 +153,10 @@ struct MobileCollectionsScreen: View {
                 }
             } else if let message = coordinator.loadErrorMessage, coordinator.albums.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("albums.load_failed").foregroundStyle(ProtonColor.textNorm)
-                    Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    RetryButton(.compact) { Task { await loadAlbums() } }
+                    Text(message).foregroundStyle(ProtonColor.textNorm)
+                    if coordinator.loadFailure?.canRetry == true {
+                        RetryButton(.compact) { Task { await loadAlbums() } }
+                    }
                 }
             } else if coordinator.albums.isEmpty {
                 Text("collections.empty_albums").foregroundStyle(ProtonColor.textWeak)
@@ -181,9 +182,10 @@ struct MobileCollectionsScreen: View {
                 }
             } else if let message = coordinator.sharedLoadErrorMessage, coordinator.sharedAlbums.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(L10n.string("albums.shared_load_failed"))
-                    Text(message).font(.caption).foregroundStyle(ProtonColor.textWeak)
-                    RetryButton(.compact) { Task { await coordinator.refreshSharedAlbums() } }
+                    Text(message).foregroundStyle(ProtonColor.textNorm)
+                    if coordinator.sharedLoadFailure?.canRetry == true {
+                        RetryButton(.compact) { Task { await coordinator.refreshSharedAlbums() } }
+                    }
                 }
             } else if coordinator.sharedAlbums.isEmpty {
                 Text(L10n.string("collections.empty_shared_albums"))
