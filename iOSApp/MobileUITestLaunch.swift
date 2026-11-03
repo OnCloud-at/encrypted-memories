@@ -20,6 +20,12 @@ import SwiftUI
             isRequested && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesLargeGridFixture")
         }
 
+        /// Exercise retention at the last production density without navigating repeated zoom menus.
+        nonisolated static var denseGridSmokeLevel: Int? {
+            usesLargeGridFixture && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDenseGridSmoke")
+                ? Int.max : nil
+        }
+
         static var libraryLoadScenario: String? {
             let arguments = ProcessInfo.processInfo.arguments
             guard let index = arguments.firstIndex(of: "-EncryptedMemoriesLibraryLoadFixture"),

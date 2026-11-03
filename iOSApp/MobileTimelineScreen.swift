@@ -478,6 +478,14 @@ struct MobileTimelineScreen: View {
             && !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var fixtureGridLevel: Int? {
+        #if DEBUG
+            return MobileUITestLaunch.denseGridSmokeLevel
+        #else
+            return nil
+        #endif
+    }
+
     @ViewBuilder private var content: some View {
         let visibleItems = self.visibleItems
         ZStack(alignment: .topLeading) {
@@ -489,6 +497,7 @@ struct MobileTimelineScreen: View {
                     contentRevision: visibleContentRevision,
                     thumbnailFeed: feed,
                     metadataProvider: model.backend,
+                    level: fixtureGridLevel,
                     fillOrder: usesTopLeadingProjection ? .topLeading : .newestBottomTrailing,
                     initialViewportPlacement: usesTopLeadingProjection ? .oldest : .automatic,
                     displayMode: displayMode,

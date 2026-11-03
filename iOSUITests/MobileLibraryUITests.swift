@@ -14,6 +14,9 @@ final class MobileLibraryUITests: XCTestCase {
             "-AppleLanguages", "(en)",
             "-AppleLocale", "en_US",
         ]
+        if name.contains("testLargeGridFixtureRetainsSelectionWhileDenseRowScrolls") {
+            app.launchArguments += ["-EncryptedMemoriesLargeGridFixture", "-EncryptedMemoriesDenseGridSmoke"]
+        }
         app.launch()
     }
 
@@ -23,55 +26,39 @@ final class MobileLibraryUITests: XCTestCase {
 
     /// Device Hub sets the native pose manually; this test verifies the long library and real dense scrolling.
     func testLargeGridFixtureRetainsSelectionWhileDenseRowScrolls() throws {
-        app.terminate()
-        app.launchArguments.append("-EncryptedMemoriesLargeGridFixture")
-        app.launch()
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 90))
         let firstPosition = firstPhoto.value as? String ?? ""
         let positionDigits = firstPosition.filter(\.isNumber)
         XCTAssertTrue(
             positionDigits.hasSuffix("3601"),
             "Six sections contain 3,600 photos and the existing video; position=\(firstPosition)")
-        for _ in 0..<5 {
-            app.buttons["Library Options"].tap()
-            let viewOptions = app.buttons["View Options"]
-            XCTAssertTrue(viewOptions.waitForExistence(timeout: 5))
-            let zoomOut = app.buttons["Zoom Out"]
-            // Repeat only an unacknowledged submenu tap; retain the original five-second existence wait.
-            for _ in 0..<3 {
-                viewOptions.tap()
-                if zoomOut.waitForExistence(timeout: 5) { break }
-                if !viewOptions.exists { break }
-            }
-            XCTAssertTrue(zoomOut.exists, "The View Options submenu must acknowledge its tap")
-            if !zoomOut.isEnabled {
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5)).tap()
-                break
-            }
-            zoomOut.tap()
-        }
-        if app.buttons["Zoom Out"].exists {
-            app.staticTexts["Library"].firstMatch.tap()
-        }
         app.buttons["Select"].tap()
-        let photos = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
         let window = app.windows.firstMatch
+        let windowSnapshot = try window.snapshot()
+        func photoSnapshots(in node: any XCUIElementSnapshot) -> [any XCUIElementSnapshot] {
+            let own: [any XCUIElementSnapshot] =
+                node.elementType == .button && node.label.hasPrefix("Photo, ") ? [node] : []
+            return own + node.children.flatMap { photoSnapshots(in: $0) }
+        }
+        let photos = photoSnapshots(in: windowSnapshot)
         XCTAssertGreaterThan(photos.count, 0)
         // Metal photo elements have frames but do not report hittability. Use the visible projection's upper third.
         let witnessIndex = photos.count / 3
-        let witness = photos.element(boundBy: witnessIndex)
-        XCTAssertTrue(window.frame.contains(witness.frame), "The witness must be a complete visible tile")
+        let witness = photos[witnessIndex]
+        XCTAssertTrue(windowSnapshot.frame.contains(witness.frame), "The witness must be a complete visible tile")
         let witnessY = witness.frame.midY
         // The production accessibility provider preserves engine order, so every row is contiguous.
         let lower = max(0, witnessIndex - 20)
         let upper = min(photos.count, witnessIndex + 20)
-        let row = (lower..<upper).map { photos.element(boundBy: $0) }
+        let row = (lower..<upper).map { photos[$0] }
             .filter { abs($0.frame.midY - witnessY) < 0.5 }
         XCTAssertEqual(row.count, 20, "The production compact grid must actually reach its densest 20-column level")
         let label = witness.label
         let position = witness.value as? String
-        witness.tap()
-        XCTAssertTrue(wait(for: witness, "isSelected == true"))
+        let witnessElement = app.buttons.matching(
+            NSPredicate(format: "label == %@ AND value == %@", label, position ?? "")).firstMatch
+        witnessElement.tap()
+        XCTAssertTrue(wait(for: witnessElement, "isSelected == true"))
         let oldY = witness.frame.midY
         let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
         let end = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.55))
