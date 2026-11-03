@@ -95,4 +95,12 @@ import Testing
         #expect(!moved.intersects(wide))
         #expect(moved.midX == tile.midX)
     }
+    @Test func aHorizontalOcclusionIsNotATabletopDivision() {
+        let area = active(CGRect(x: 0, y: 285, width: 951, height: 40))
+        let layout = ReservedRegionLayout(areas: [area], bounds: bounds)
+        #expect(layout.horizontalFold == nil)
+        #expect(
+            layout.selectionMarkRect(in: tile, side: side, inset: inset)
+                == CGRect(x: 191, y: 258, width: 22, height: 22))
+    }
 }

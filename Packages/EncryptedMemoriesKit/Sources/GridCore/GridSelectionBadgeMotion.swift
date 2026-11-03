@@ -32,16 +32,21 @@ public struct GridSelectionBadgeMotion {
     private var source: CGRect = .zero
     private var startedAt: Double = 0
     private var exterior = false
+    private var wasTabletop = false
 
     public mutating func frame(
         tile: CGRect, side: CGFloat, inset: CGFloat, regions: ReservedRegionLayout,
         avoiding occupied: [CGRect] = [], neighboringTiles: [CGRect] = [], row: GridSelectionBadgeRow? = nil,
         layout: GridSelectionBadgeLayout? = nil, now: Double, reduceMotion: Bool
     ) -> CGRect {
-        // Zoom and display resizing own the geometry change. Do not animate a slot from an obsolete tile size.
-        if target.isNull || previousTile.map({ $0.size != tile.size }) == true {
+        let tabletop = regions.horizontalFold != nil
+        // Zoom and posture changes own geometry. Do not carry a tabletop slide into an unchanged no-fold path.
+        if target.isNull || previousTile.map({ $0.size != tile.size }) == true
+            || (previousTile != nil && wasTabletop != tabletop)
+        {
             self = GridSelectionBadgeMotion()
         }
+        wasTabletop = tabletop
         let inset = ReservedRegionLayout.selectionMarkInset(in: tile, side: side, preferred: inset)
         let home = ReservedRegionLayout.homeMarkRect(in: tile, side: side, inset: inset)
         let oldTile = previousTile
@@ -51,12 +56,16 @@ public struct GridSelectionBadgeMotion {
             source = source.offsetBy(dx: delta.x, dy: delta.y)
             target = target.offsetBy(dx: delta.x, dy: delta.y)
         }
+        if tabletop {
+            source.origin.x = home.minX
+            target.origin.x = home.minX
+        }
         // Finish the old clock before validating its slot; otherwise a covered target can stop the render pump.
         if isAnimating && now - startedAt >= Self.duration { isAnimating = false }
         let shown = presentation(now: now)
         let wasAlternate = usesAlternate
         if let shared = row?.usesAlternate {
-            usesAlternate = shared || !regions.isClear(home)
+            usesAlternate = shared || (!tabletop && !regions.isClear(home))
             band = row?.band
         } else {
             decision.update(tile: tile, home: home, regions: regions, delta: delta)
@@ -64,7 +73,9 @@ public struct GridSelectionBadgeMotion {
             band = decision.band
         }
         var desired = home
-        if usesAlternate {
+        if tabletop {
+            desired = ReservedRegionLayout.homeMarkRect(in: tile, side: side, inset: inset, top: !usesAlternate)
+        } else if usesAlternate {
             let availableInside =
                 exterior
                 ? regions.inTileSelectionMarkRect(in: tile, side: side, inset: inset, avoiding: occupied) : nil
@@ -145,6 +156,43 @@ struct GridSelectionBadgeDecision {
     private var triggerShare = GridSelectionBadgeMotion.switchShare
 
     mutating func update(tile: CGRect, home: CGRect, regions: ReservedRegionLayout, delta: CGPoint) {
+        if let fold = regions.horizontalFold {
+            if band != fold {
+                band = fold
+                usesAlternate = tile.midY >= fold.midY
+                entersBefore = !usesAlternate
+            }
+            if tile.maxY < fold.minY { entersBefore = true }
+            if tile.minY > fold.maxY { entersBefore = false }
+            let extent = tile.height
+            let entry = entersBefore ? fold.minY - extent : fold.maxY
+            let direction: CGFloat = entersBefore ? 1 : -1
+            let preferredLine = entry + direction * extent * GridSelectionBadgeMotion.switchShare
+            // Reflect the row's exact bottom-mark envelope into its top-mark envelope.
+            let top = home.offsetBy(dx: 0, dy: tile.minY + tile.maxY - home.minY - home.maxY)
+            let upperClearThrough = fold.minY - (top.maxY - tile.minY)
+            let lowerClearFrom = fold.maxY - (home.minY - tile.minY)
+            let commonRange = upperClearThrough - lowerClearFrom
+            let safeZone = max(4, min(extent * 0.10, commonRange))
+            let switchLine: CGFloat
+            if abs(commonRange) >= safeZone {
+                let lower = min(lowerClearFrom, upperClearThrough) + (entersBefore ? safeZone : 0)
+                let upper = max(lowerClearFrom, upperClearThrough) - (entersBefore ? 0 : safeZone)
+                switchLine = min(upper, max(lower, preferredLine))
+            } else {
+                // Borderline sizes give clearance priority; when neither corner fits, retain ECKEN.
+                switchLine = min(
+                    max(upperClearThrough, lowerClearFrom), max(min(upperClearThrough, lowerClearFrom), preferredLine))
+            }
+            let releaseLine = switchLine - direction * safeZone
+            let crossed = entersBefore ? tile.minY >= switchLine : tile.minY <= switchLine
+            let released = entersBefore ? tile.minY < releaseLine : tile.minY > releaseLine
+            if crossed { usesAlternate = entersBefore }
+            if released { usesAlternate = !entersBefore }
+            if fold.intersects(home), !fold.intersects(top) { usesAlternate = false }
+            if fold.intersects(top), !fold.intersects(home) { usesAlternate = true }
+            return
+        }
         let active = regions.exclusions.first {
             regions.isCrossingBand($0) && ($0.intersects(tile) || $0.intersects(home))
         }

@@ -2306,11 +2306,15 @@
         private func currentReservedRegionLayout() -> ReservedRegionLayout {
             #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
                 if #available(iOS 27.1, *) {
-                    let regions =
-                        reservedRegions(kind: .division) + reservedRegions(kind: .occlusion)
+                    let divisions = reservedRegions(kind: .division).map {
+                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive, isDivision: true)
+                    }
+                    let occlusions = reservedRegions(kind: .occlusion).map {
+                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive)
+                    }
                     // Tiles under the bars are not visible, so a mark must not move there.
                     return ReservedRegionLayout(
-                        areas: regions.map { ReservedRegionArea(frame: $0.frame, isActive: $0.isActive) },
+                        areas: divisions + occlusions,
                         bounds: bounds.inset(by: scrollView.adjustedContentInset))
                 }
             #endif
@@ -2325,7 +2329,7 @@
             #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
                 if #available(iOS 27.1, *) {
                     return reservedRegions(kind: .division, options: .includeInactive).map {
-                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive)
+                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive, isDivision: true)
                     }
                 }
             #endif

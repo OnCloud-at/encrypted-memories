@@ -8,10 +8,12 @@ public struct ReservedRegionArea: Equatable, Sendable {
     public var frame: CGRect
     /// A division is active only while the device is partly open.
     public var isActive: Bool
+    public var isDivision: Bool
 
-    public init(frame: CGRect, isActive: Bool) {
+    public init(frame: CGRect, isActive: Bool, isDivision: Bool = false) {
         self.frame = frame
         self.isActive = isActive
+        self.isDivision = isDivision
     }
 }
 
@@ -22,15 +24,22 @@ public struct ReservedRegionLayout: Equatable, Sendable {
 
     /// The frames of the active regions, including their interactive margins.
     public let exclusions: [CGRect]
+    public let divisions: [CGRect]
     /// The visible part of the view, without the bars; a mark that moves must stay inside it.
     public let bounds: CGRect
 
     public init(areas: [ReservedRegionArea], bounds: CGRect) {
         exclusions = areas.filter { $0.isActive && !$0.frame.isEmpty }.map(\.frame)
+        divisions = areas.filter { $0.isActive && $0.isDivision && !$0.frame.isEmpty }.map(\.frame)
         self.bounds = bounds
     }
 
     public var isEmpty: Bool { exclusions.isEmpty }
+
+    /// A viewport-spanning horizontal division supplies the generic tabletop placement rule.
+    public var horizontalFold: CGRect? {
+        divisions.first { $0.width >= $0.height && isCrossingBand($0) }
+    }
 
     /// Whether `rect` stays clear of every active region.
     public func isClear(_ rect: CGRect) -> Bool {
@@ -49,6 +58,12 @@ public struct ReservedRegionLayout: Equatable, Sendable {
         neighboringTiles: [CGRect] = [], prefersAlternate: Bool = false, layout: GridSelectionBadgeLayout? = nil
     ) -> CGRect {
         let inset = Self.selectionMarkInset(in: tile, side: side, preferred: inset)
+        if horizontalFold != nil {
+            var decision = GridSelectionBadgeDecision()
+            decision.update(
+                tile: tile, home: Self.homeMarkRect(in: tile, side: side, inset: inset), regions: self, delta: .zero)
+            return Self.homeMarkRect(in: tile, side: side, inset: inset, top: !decision.usesAlternate)
+        }
         return inTileSelectionMarkRect(
             in: tile, side: side, inset: inset, avoiding: occupied,
             prefersAlternate: prefersAlternate)
@@ -161,8 +176,10 @@ public struct ReservedRegionLayout: Equatable, Sendable {
     }
 
     /// The mark of `side` points in the bottom-trailing corner of a tile, `inset` points from both edges.
-    public static func homeMarkRect(in tile: CGRect, side: CGFloat, inset: CGFloat) -> CGRect {
-        CGRect(x: tile.maxX - side - inset, y: tile.maxY - side - inset, width: side, height: side)
+    public static func homeMarkRect(in tile: CGRect, side: CGFloat, inset: CGFloat, top: Bool = false) -> CGRect {
+        CGRect(
+            x: tile.maxX - side - inset, y: top ? tile.minY + inset : tile.maxY - side - inset,
+            width: side, height: side)
     }
 
     /// Positions from `start` down to `end` in steps of `step`, ending exactly on `end` when the steps miss it. A start
@@ -296,7 +313,8 @@ public final class GridSelectionBadgeLayout {
     private func updateRowDecisions(regions: ReservedRegionLayout) {
         let horizontal = ReservedRegionLayout(
             areas: regions.exclusions.filter { regions.isCrossingBand($0) && $0.width >= $0.height }
-                .map { ReservedRegionArea(frame: $0, isActive: true) }, bounds: regions.bounds)
+                .map { ReservedRegionArea(frame: $0, isActive: true, isDivision: regions.divisions.contains($0)) },
+            bounds: regions.bounds)
         var next: [Int: RowState] = [:]
         for (index, row) in rows.enumerated() {
             let identity = rowIDs[index]
