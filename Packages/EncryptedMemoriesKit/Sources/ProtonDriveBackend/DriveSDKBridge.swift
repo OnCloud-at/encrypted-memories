@@ -3213,12 +3213,17 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         }
     }
 
+    /// The roles of the series members. "Keep only favorites" names the members that stay in the library
+    /// without a reported role in its completion notice, so this read must not stand on a cut-short answer:
+    /// the server can hide a photo behind its trashed main photo, and the notice would promise grid
+    /// visibility the photo does not have. A cut-short answer therefore throws before anything is trashed,
+    /// like the dedupe reads that protect backups. Nil for a member means the server no longer knows it.
     func memberRoles(of uids: [PhotoUID]) async throws -> [PhotoUID: RemoteLinkVisibility] {
         guard !uids.isEmpty else { return [:] }
         return try await withOpenSession(cause: .series) { bridge in
             let context = try await bridge.photosShareContext()
             let links = try await bridge.driveSession.fetchLinkVisibility(
-                shareID: context.shareID, linkIDs: uids.map(\.nodeID))
+                shareID: context.shareID, linkIDs: uids.map(\.nodeID), requiresCompleteResponse: true)
             return Dictionary(
                 uids.compactMap { uid in links[uid.nodeID].map { (uid, $0) } }, uniquingKeysWith: { first, _ in first })
         }
