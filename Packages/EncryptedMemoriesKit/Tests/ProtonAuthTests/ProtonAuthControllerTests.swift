@@ -22,7 +22,7 @@ struct ProtonAuthControllerTests {
         let store = FakeSessionStore(loadError: FakeStoreError.unavailable)
         let controller = ProtonAuthController(store: store, authenticator: FakeAuthenticator())
 
-        #expect(controller.bootstrap() == .signedOut(error: "session store unavailable"))
+        #expect(controller.bootstrap() == .signedOut(error: L10n.string("auth.saved_sign_in_unreadable")))
     }
 
     @MainActor
@@ -112,8 +112,7 @@ struct ProtonAuthControllerTests {
 
         #expect(
             await waitUntil {
-                if case .signedOut(error: "offline") = controller.state { return true }
-                return false
+                controller.state == .signedOut(error: L10n.string("auth.sign_in_incomplete"))
             })
         #expect(store.savedSessions().isEmpty)
     }
@@ -128,7 +127,7 @@ struct ProtonAuthControllerTests {
 
         #expect(
             await waitUntil {
-                controller.state == .signedOut(error: "session store unavailable")
+                controller.state == .signedOut(error: L10n.string("auth.sign_in_not_saved"))
             })
         #expect(controller.currentSession == nil)
     }
