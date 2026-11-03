@@ -1,6 +1,244 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "backup.waiting_for_library_check": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup is waiting for the library check."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Backup wartet auf die Mediathekprüfung."
+          }
+        }
+      }
+    },
+    "backup.waiting_for_ios": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for iOS to allow background backup."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Warten auf die iOS-Freigabe für Hintergrund-Backups."
+          }
+        }
+      }
+    },
+    "backup.background_unavailable_action": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Background backup is unavailable; check Background App Refresh in Settings or keep the app open."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hintergrund-Backups sind nicht verfügbar; prüfe die Hintergrundaktualisierung in den Einstellungen oder lasse die App geöffnet."
+          }
+        }
+      }
+    },
+    "auth.sign_in_incomplete": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sign-in could not be completed."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Anmeldung konnte nicht abgeschlossen werden."
+          }
+        }
+      }
+    },
+    "auth.saved_sign_in_unreadable": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your saved sign-in could not be read."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Deine gespeicherte Anmeldung konnte nicht gelesen werden."
+          }
+        }
+      }
+    },
+    "auth.sign_in_not_saved": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your sign-in could not be saved."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Deine Anmeldung konnte nicht gespeichert werden."
+          }
+        }
+      }
+    },
+    "auth.sign_in_again": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Please sign in to Proton again."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bitte melde dich erneut bei Proton an."
+          }
+        }
+      }
+    },
+    "error.proton_change_not_allowed": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Proton does not allow this change."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Proton erlaubt diese Änderung nicht."
+          }
+        }
+      }
+    },
+    "upload.file_upload_failed": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This file could not be uploaded."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diese Datei konnte nicht hochgeladen werden."
+          }
+        }
+      }
+    },
+    "upload.album_update_failed_after_upload": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The file was uploaded, but the album could not be updated."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Datei wurde hochgeladen, aber das Album konnte nicht aktualisiert werden."
+          }
+        }
+      }
+    },
+    "mlsearch.model_unusable": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This search model cannot be used."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dieses Suchmodell kann nicht verwendet werden."
+          }
+        }
+      }
+    },
+    "albumsync.sync_failed": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The album could not be synced."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Album konnte nicht synchronisiert werden."
+          }
+        }
+      }
+    },
+    "backup.folder_open_failed": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This folder could not be opened."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dieser Ordner konnte nicht geöffnet werden."
+          }
+        }
+      }
+    },
+    "albums.load_failed_message": {
+      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Albums could not be loaded."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Alben konnten nicht geladen werden."
+          }
+        }
+      }
+    },
     "backup.issue_unknown_waiting": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Not finished yet." } },
@@ -152,8 +390,8 @@
     "albums.add_busy_message": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Another album change is still running. Try again in a moment." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Eine andere Album-Änderung läuft noch. Versuche es gleich noch einmal." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Another album change is running; try again when it finishes." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eine andere Albumänderung läuft gerade; versuche es danach erneut." } }
       }
     },
     "albums.new_album_menu": {
@@ -614,29 +852,29 @@
     "error.album_created_add_failed %@": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The album “%@” was created, but the selected items could not be added. Select the album and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Das Album „%@“ wurde erstellt, aber die ausgewählten Objekte konnten nicht hinzugefügt werden. Wähle das Album aus und versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Album “%@” was created; select it to add the remaining items." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Album „%@“ wurde erstellt; wähle es aus, um die übrigen Objekte hinzuzufügen." } }
       }
     },
     "error.album_partial_add %lld %lld": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "%1$lld of %2$lld items were added. Try again for the remaining items." } },
-        "de": { "stringUnit": { "state": "translated", "value": "%1$lld von %2$lld Objekten wurden hinzugefügt. Versuche es für die übrigen Objekte erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "%1$lld of %2$lld items were added." } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$lld von %2$lld Objekten wurden hinzugefügt." } }
       }
     },
     "error.batch_action_incomplete %lld %lld": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The change could not be confirmed for %1$lld of %2$lld items. Refresh and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Änderung konnte für %1$lld von %2$lld Objekten nicht bestätigt werden. Aktualisiere die Ansicht und versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "The change could not be confirmed for %1$lld of %2$lld items." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Änderung konnte für %1$lld von %2$lld Objekten nicht bestätigt werden." } }
       }
     },
     "error.album_backend": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The album could not be updated. Try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Das Album konnte nicht aktualisiert werden. Versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "The album could not be changed." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Album konnte nicht geändert werden." } }
       }
     },
     "backup.detail_already_backed_up %lld": {
@@ -732,8 +970,8 @@
     "backup.error_background_registration": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Background backup could not be registered. Restart Encrypted Memories; keep it open until backup completes." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Hintergrundsicherung konnte nicht registriert werden. Starte Encrypted Memories neu und lasse die App bis zum Abschluss geöffnet." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Background backup could not start; restart the app or keep it open." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Hintergrund-Backup konnte nicht starten; starte die App neu oder lasse sie geöffnet." } }
       }
     },
     "backup.error_background_scheduler_capacity": {
@@ -1089,13 +1327,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The backup cannot continue on this device right now. Please restart the app."
+            "value": "Backup cannot continue; restart the app."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das Backup kann auf diesem Gerät gerade nicht weitermachen. Bitte starte die App neu."
+            "value": "Das Backup kann nicht fortgesetzt werden; starte die App neu."
           }
         }
       }
@@ -1107,13 +1345,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Backup cannot start safely right now. Please try again."
+            "value": "Backup cannot start safely right now."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Backup kann gerade nicht sicher gestartet werden. Bitte versuche es erneut."
+            "value": "Das Backup kann gerade nicht sicher starten."
           }
         }
       }
@@ -2013,13 +2251,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Album sync is unavailable because its local database could not be opened."
+            "value": "Album sync is unavailable on this device."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Album-Synchronisierung ist nicht verfügbar, weil die lokale Datenbank nicht geöffnet werden konnte."
+            "value": "Die Album-Synchronisierung ist auf diesem Gerät nicht verfügbar."
           }
         }
       }
@@ -2031,13 +2269,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The local album no longer exists. Restore it, then try again."
+            "value": "This album is no longer in Photos."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das lokale Album existiert nicht mehr. Stelle es wieder her und versuche es erneut."
+            "value": "Dieses Album ist nicht mehr in Fotos vorhanden."
           }
         }
       }
@@ -2049,13 +2287,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Another album is already syncing. Try again when it finishes."
+            "value": "Another album is syncing."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ein anderes Album wird bereits synchronisiert. Versuche es danach erneut."
+            "value": "Ein anderes Album wird gerade synchronisiert."
           }
         }
       }
@@ -2067,13 +2305,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Sync stopped. Progress is saved and the next run continues where it left off."
+            "value": "Album sync stopped."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Synchronisierung gestoppt. Der Fortschritt bleibt erhalten, der nächste Lauf setzt fort."
+            "value": "Die Album-Synchronisierung wurde gestoppt."
           }
         }
       }
@@ -2798,8 +3036,8 @@
     "infopanel.load_failed_message": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The photo details couldn't be loaded. Check your connection and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Fotodetails konnten nicht geladen werden. Prüfe deine Verbindung und versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "The photo details could not be loaded." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Fotodetails konnten nicht geladen werden." } }
       }
     },
     "infopanel.close": {
@@ -3311,13 +3549,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The library couldn’t be created. Please try again later."
+            "value": "The library could not be created."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die Mediathek konnte nicht erstellt werden. Bitte versuche es später noch einmal."
+            "value": "Die Mediathek konnte nicht erstellt werden."
           }
         }
       }
@@ -4229,24 +4467,24 @@
       "extractionState": "manual",
       "comment": "Shown when a selected folder or one of its subfolders cannot be read. %@ is the folder name.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Upload stopped because %@ could not be read. Check its permissions and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Upload wurde beendet, weil %@ nicht gelesen werden konnte. Prüfe die Berechtigungen und versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Encrypted Memories cannot read “%@”; allow access and select the folder again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Encrypted Memories kann „%@“ nicht lesen; erlaube den Zugriff und wähle den Ordner erneut aus." } }
       }
     },
     "upload.folder_error_missing %@": {
       "extractionState": "manual",
       "comment": "Shown when a selected file or subfolder disappears during enumeration. %@ is its name.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Upload stopped because %@ is no longer available. Select the folder again and retry." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Upload wurde beendet, weil %@ nicht mehr verfügbar ist. Wähle den Ordner erneut aus und versuche es noch einmal." } }
+        "en": { "stringUnit": { "state": "translated", "value": "“%@” is no longer available." } },
+        "de": { "stringUnit": { "state": "translated", "value": "„%@“ ist nicht mehr verfügbar." } }
       }
     },
     "upload.folder_error_transient %@": {
       "extractionState": "manual",
       "comment": "Shown for another filesystem error during folder enumeration. %@ is the affected name.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Upload could not finish reading %@. Try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Upload konnte %@ nicht vollständig lesen. Versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "“%@” could not be read completely." } },
+        "de": { "stringUnit": { "state": "translated", "value": "„%@“ konnte nicht vollständig gelesen werden." } }
       }
     },
     "action.dismiss": {
@@ -4353,13 +4591,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Encrypted Memories could not open the protected upload state. Existing records remain unchanged."
+            "value": "Uploads cannot continue on this device."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Encrypted Memories konnte den geschützten Upload-Status nicht öffnen. Vorhandene Einträge bleiben unverändert."
+            "value": "Uploads können auf diesem Gerät nicht fortgesetzt werden."
           }
         }
       }
@@ -4458,8 +4696,8 @@
     "albums.delete_failed_message": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The album couldn't be deleted safely. Some photos may exist only in this album. No photos were deleted." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Das Album konnte nicht sicher gelöscht werden. Manche Fotos sind eventuell nur in diesem Album. Es wurden keine Fotos gelöscht." } }
+        "en": { "stringUnit": { "state": "translated", "value": "The album could not be deleted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Album konnte nicht gelöscht werden." } }
       }
     },
     "albums.delete_failed_title": {
@@ -4636,13 +4874,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die lokalen Daten konnten nicht vollständig gelöscht werden. Versuche es erneut oder schließe die App vollständig und öffne sie wieder. Beim nächsten Start wird die Bereinigung abgeschlossen, bevor eine Anmeldung möglich ist."
+            "value": "Lokale Daten konnten nicht vollständig entfernt werden; versuche es erneut oder öffne die App neu."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The local data could not be deleted completely. Try again, or fully close and reopen the app. Cleanup will finish at the next launch before sign-in is available."
+            "value": "Local data could not be removed completely; try again or reopen the app."
           }
         }
       }
@@ -4845,13 +5083,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Location data couldn't be loaded. Please try again later."
+            "value": "Location data could not be loaded."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die Standortdaten konnten nicht geladen werden. Bitte später erneut versuchen."
+            "value": "Die Standortdaten konnten nicht geladen werden."
           }
         }
       }
@@ -5311,13 +5549,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Recently Deleted couldn’t be emptied. Try again later."
+            "value": "Recently Deleted could not be emptied."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "„Zuletzt gelöscht“ konnte nicht geleert werden. Versuche es später erneut."
+            "value": "„Zuletzt gelöscht“ konnte nicht geleert werden."
           }
         }
       }
@@ -5325,15 +5563,15 @@
     "trash.empty_blocked_merge_message": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "A duplicate merge is still being checked, so Recently Deleted can’t be emptied yet. Nothing was deleted. Try again later." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Eine Zusammenführung von Duplikaten wird noch geprüft, deshalb kann „Zuletzt gelöscht“ noch nicht geleert werden. Es wurde nichts gelöscht. Versuche es später erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Recently Deleted cannot be emptied while a duplicate merge is being checked." } },
+        "de": { "stringUnit": { "state": "translated", "value": "„Zuletzt gelöscht“ kann während der Prüfung einer Duplikatzusammenführung nicht geleert werden." } }
       }
     },
     "trash.empty_blocked_journal_message": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The record of earlier duplicate merges can’t be read, so Recently Deleted can’t be emptied. Nothing was deleted." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Aufzeichnung früherer Zusammenführungen von Duplikaten kann nicht gelesen werden, deshalb kann „Zuletzt gelöscht“ nicht geleert werden. Es wurde nichts gelöscht." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Recently Deleted cannot be emptied. Nothing was deleted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "„Zuletzt gelöscht“ kann nicht geleert werden. Es wurde nichts gelöscht." } }
       }
     },
     "trash.empty_failed_title": {
@@ -6533,8 +6771,8 @@
     },
     "duplicates.kept_reason_copy_failed": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "It couldn't be merged. Try again later." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Es ließ sich nicht zusammenführen. Versuche es später erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "This copy could not be merged." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Diese Kopie konnte nicht zusammengeführt werden." } }
       }
     },
     "duplicates.kept_reason_waiting_for_wifi": {
@@ -6569,8 +6807,8 @@
     },
     "duplicates.kept_reason_unreadable": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "It could not be read. Try again later." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Es konnte nicht gelesen werden. Versuche es später erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "This item could not be read." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dieses Objekt konnte nicht gelesen werden." } }
       }
     },
     "duplicates.not_merged_title": {
@@ -6581,8 +6819,8 @@
     },
     "duplicates.kept_photo_unreadable": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The photo to keep could not be read. Choose another one or try again later." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Das Foto, das bleiben soll, konnte nicht gelesen werden. Wähle ein anderes oder versuche es später erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "The chosen item could not be read; choose another item." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das gewählte Objekt konnte nicht gelesen werden; wähle ein anderes." } }
       }
     },
     "duplicates.partial_failure_title": {
@@ -6672,8 +6910,8 @@
     },
     "duplicates.merge_failed_message": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Check your connection and try again." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Prüfe deine Verbindung und versuche es erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Some duplicates could not be merged." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Einige Duplikate konnten nicht zusammengeführt werden." } }
       }
     },
     "viewer.show_original": {

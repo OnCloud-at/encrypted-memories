@@ -1701,8 +1701,8 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(
             error.localizedDescription, L10n.string("backup.error_local_state_unavailable"), file: file, line: line)
         for (language, expected) in [
-            ("en", "The backup cannot continue on this device right now. Please restart the app."),
-            ("de", "Das Backup kann auf diesem Gerät gerade nicht weitermachen. Bitte starte die App neu."),
+            ("en", "Backup cannot continue; restart the app."),
+            ("de", "Das Backup kann nicht fortgesetzt werden; starte die App neu."),
         ] {
             let translated = try catalogTranslation(of: key, language: language)
             XCTAssertEqual(translated, expected, language, file: file, line: line)
