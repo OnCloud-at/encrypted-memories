@@ -518,8 +518,11 @@ extension DriveSessionStubSuite {
             let links = try await makeSession().fetchLinkVisibility(
                 shareID: "share1", linkIDs: ["trashed-edit", "original", "deleted"])
 
-            #expect(links["trashed-edit"] == .init(isActive: false, mainPhotoLinkID: nil, trashTime: 1_790_000_000))
-            #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit"))
+            #expect(
+                links["trashed-edit"]
+                    == .init(
+                        isActive: false, mainPhotoLinkID: nil, hasExplicitState: true, trashTime: 1_790_000_000))
+            #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit", hasExplicitState: true))
             #expect(links["deleted"] == nil, "a link that the server no longer knows is absent")
         }
 
@@ -537,8 +540,34 @@ extension DriveSessionStubSuite {
             let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["unproven"])
 
             #expect(
-                links["unproven"] == .init(isActive: true, mainPhotoLinkID: "some-main", hasExplicitPhotoState: false),
+                links["unproven"]
+                    == .init(
+                        isActive: true, mainPhotoLinkID: "some-main", hasExplicitState: false,
+                        hasExplicitPhotoState: false
+                    ),
                 "the legacy active default carries the role, yet the answer states nothing")
+        }
+
+        @Test func linkVisibilityWithAStateButNoRoleReportsAnExplicitState() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"""
+                    {"Code":1000,"Links":[{"LinkID":"roleless","Type":2,"State":1}]}
+                    """#)
+
+            let links = try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["roleless"])
+
+            #expect(
+                links["roleless"]
+                    == .init(
+                        isActive: true, mainPhotoLinkID: nil, hasExplicitState: true, hasExplicitPhotoState: false),
+                "an explicit state without role data is the pattern that #988 counts as kept")
+        }
+
+        @Test func theInitializerDefaultsToNoExplicitState() {
+            let legacy = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+            #expect(legacy.hasExplicitState == false, "the safety signal must default to false (fail-closed)")
         }
 
         @Test(arguments: [

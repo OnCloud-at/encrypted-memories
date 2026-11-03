@@ -235,6 +235,9 @@ public struct SeriesDissolutionProgress: Sendable, Equatable {
         /// Copying favorite `index` (0-based) of `count`.
         case copyingFavorite(index: Int, count: Int)
         case movingSeriesToTrash
+        /// `count` members stay in the library because the server reported no role for them. The operation
+        /// still finishes normally; this step tells the person that those photos stay.
+        case membersStayedWithoutARole(count: Int)
     }
 
     public let step: Step
@@ -247,11 +250,28 @@ public struct SeriesDissolutionProgress: Sendable, Equatable {
     }
 }
 
-/// What `resumePending` did for one journaled series. `result` holds the standalone copies once the whole series
-/// is in the trash, or the error that keeps the journal pending.
+/// The result of one "Keep Only Favorites" operation: the standalone copies and the UIDs of members that stayed
+/// in the library without being trashed. The count is derived from the UIDs.
+public struct SeriesDissolutionOutcome: Sendable {
+    public let copyUIDs: [PhotoUID]
+    /// UIDs of members that the server reported with an explicit active state but without role data. They stay
+    /// active in the library (issue #988: role unknown, not deleted).
+    public let keptWithoutReportedRoleUIDs: [PhotoUID]
+    /// Members that stay in the library (computed from the UIDs).
+    public var keptWithoutReportedRoleCount: Int { keptWithoutReportedRoleUIDs.count }
+
+    public init(copyUIDs: [PhotoUID], keptWithoutReportedRoleUIDs: [PhotoUID]) {
+        self.copyUIDs = copyUIDs
+        self.keptWithoutReportedRoleUIDs = keptWithoutReportedRoleUIDs
+    }
+}
+
+/// What `resumePending` did for one journaled series. `result` holds the completion outcome — the standalone
+/// copies and the members that stay in the library without being trashed — once the whole series is in the
+/// trash, or the error that keeps the journal pending.
 public struct SeriesDissolutionResumeOutcome: Sendable {
     public let seriesUIDs: [PhotoUID]
-    public let result: Result<[PhotoUID], any Error>
+    public let result: Result<SeriesDissolutionOutcome, any Error>
 }
 
 // MARK: - Orchestrator
@@ -299,14 +319,15 @@ public actor SeriesDissolutionOrchestrator {
     }
 
     /// Copies every favorite into a standalone photo and then moves the whole series to the trash.
-    /// Returns the standalone photos. Safe to call again after any failure or crash.
+    /// Returns the standalone photos and how many members stayed in the library without a reported role.
+    /// Safe to call again after any failure or crash.
     @discardableResult
     public func keepOnlyFavorites(
         seriesMainUID: PhotoUID,
         seriesUIDs: [PhotoUID],
         favoriteUIDs: [PhotoUID],
         onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void = { _ in }
-    ) async throws -> [PhotoUID] {
+    ) async throws -> SeriesDissolutionOutcome {
         try await admission.withAdmission { [self] in
             try await self.admittedKeepOnlyFavorites(
                 seriesMainUID: seriesMainUID,
@@ -349,7 +370,7 @@ public actor SeriesDissolutionOrchestrator {
         seriesUIDs: [PhotoUID],
         favoriteUIDs: [PhotoUID],
         onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void
-    ) async throws -> [PhotoUID] {
+    ) async throws -> SeriesDissolutionOutcome {
         let existing = try journalStore.journal(forSeries: seriesMainUID)
         // A retry keeps every photo that either attempt knew. The caller's list can be older than the journal.
         let membership = Self.union(existing?.seriesUIDs ?? [], seriesUIDs)
@@ -378,7 +399,7 @@ public actor SeriesDissolutionOrchestrator {
         var outcomes: [SeriesDissolutionResumeOutcome] = []
         for var journal in try journalStore.pendingJournals() where journal.phase == .trashingSeries {
             try Task.checkCancellation()
-            let result: Result<[PhotoUID], any Error>
+            let result: Result<SeriesDissolutionOutcome, any Error>
             do {
                 result = .success(try await run(&journal, onProgress: { _ in }))
             } catch {
@@ -392,7 +413,7 @@ public actor SeriesDissolutionOrchestrator {
     private func run(
         _ journal: inout SeriesDissolutionJournal,
         onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void
-    ) async throws -> [PhotoUID] {
+    ) async throws -> SeriesDissolutionOutcome {
         let mainUID = journal.seriesMainUID
         guard running.insert(mainUID).inserted else { throw SeriesDissolutionError.alreadyRunning }
         defer { running.remove(mainUID) }
@@ -421,7 +442,11 @@ public actor SeriesDissolutionOrchestrator {
         }
 
         onProgress(.init(step: .movingSeriesToTrash, fraction: 0.9))
-        let trashed = try await photosToTrash(journal)
+        let plan = try await photosToTrash(journal)
+        if !plan.staying.isEmpty {
+            onProgress(.init(step: .membersStayedWithoutARole(count: plan.staying.count), fraction: 0.9))
+        }
+        let trashed = plan.toTrash
         // A resumed trash step skips photos that an earlier attempt already moved.
         let remaining = try await remote.activeUIDs(among: trashed)
         if !remaining.isEmpty {
@@ -435,26 +460,46 @@ public actor SeriesDissolutionOrchestrator {
         try journalStore.remove(forSeries: mainUID)
         await duplicateChecker.invalidateCachedRemoteState()
         onProgress(.init(step: .movingSeriesToTrash, fraction: 1))
-        return journal.favorites.compactMap(\.copyUID)
+        return .init(
+            copyUIDs: journal.favorites.compactMap(\.copyUID), keptWithoutReportedRoleUIDs: plan.staying)
     }
 
-    /// The photos of the series that move to the trash: the main photo and every member without a main photo. A series
-    /// can join photos that are no related photos of the main photo: burst photos that only their capture times group,
-    /// or a second main photo with related photos of its own. A related photo never moves on its own. Proton hides it
-    /// with its main photo and brings it back when the person restores that main photo; a related photo trashed on its
-    /// own would not come back with the series. Related photos keep their own active state, so only the photos in
-    /// this list confirm the step. A member that the server no longer knows is skipped. A member whose role the server
-    /// does not report is skipped as well: it stays in the library untouched, and nothing is shown.
-    private func photosToTrash(_ journal: SeriesDissolutionJournal) async throws -> [PhotoUID] {
+    /// The photos of the series that move to the trash: the main photo and every member that the server reports
+    /// as a main photo without a related file's role. A series can join photos that are no related photos of the
+    /// main photo: burst photos that only their capture times group, or a second main photo with related photos
+    /// of its own. A related photo never moves on its own. Proton hides it with its main photo and brings it
+    /// back when the person restores that main photo; a related photo trashed on its own would not come back
+    /// with the series. Related photos keep their own active state, so only the photos in this list confirm
+    /// the step. A member that the server no longer knows is skipped. A member whose state the server does not
+    /// report is skipped as well: an unknown role is not proof of ownership, so the member is never trashed and
+    /// is not reported (the safe default is no notice).
+    ///
+    /// The photos that stay reported: the server reports an explicit state, the member is active, and the answer
+    /// carries no role data (the #988 pattern: "role unknown, not deleted"). The trash list never holds such a
+    /// member, so the person must learn in plain words that it stays. A member whose role data the server did
+    /// report is not reported: a main without a role moves to the trash, and a related photo keeps its behavior
+    /// (it stays visible with its main photo when that main photo stays out of the trash). The main photo of a
+    /// related photo is therefore not fetched (issue #988, option 1).
+    private func photosToTrash(
+        _ journal: SeriesDissolutionJournal
+    ) async throws -> (toTrash: [PhotoUID], staying: [PhotoUID]) {
         let mainUID = journal.seriesMainUID
         let members = journal.seriesUIDs.filter { $0 != mainUID }
         let roles = members.isEmpty ? [:] : try await remote.memberRoles(of: members)
         var trashed = [mainUID]
         for member in members {
-            guard let link = roles[member], link.hasExplicitPhotoState else { continue }
-            if link.mainPhotoLinkID == nil { trashed.append(member) }
+            guard let link = roles[member], link.hasExplicitPhotoState, link.mainPhotoLinkID == nil else {
+                continue
+            }
+            trashed.append(member)
         }
-        return trashed
+        var staying: [PhotoUID] = []
+        for member in members {
+            guard let link = roles[member] else { continue }
+            guard link.hasExplicitState, link.isActive, !link.hasExplicitPhotoState else { continue }
+            staying.append(member)
+        }
+        return (trashed, staying)
     }
 
     /// A retry may carry another selection while no series photo is trashed yet. Confirmed copies of favorites

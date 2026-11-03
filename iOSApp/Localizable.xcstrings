@@ -1810,6 +1810,64 @@
         }
       }
     },
+    "series.kept_members_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Einige Fotos bleiben in deiner Mediathek"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Some Photos Stay in Your Library"
+          }
+        }
+      }
+    },
+    "series.kept_members_message %lld": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "1 Foto blieb in deiner Mediathek. Seine Rolle in der Serie ist unbekannt, daher wurde es nicht gelöscht."
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld Fotos blieben in deiner Mediathek. Ihre Rolle in der Serie ist unbekannt, daher wurden sie nicht gelöscht."
+                }
+              }
+            }
+          }
+        },
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "1 photo stayed in your library. Its role in the burst is unknown, so it was not deleted."
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld photos stayed in your library. Their role in the burst is unknown, so they were not deleted."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "series.progress_copying %lld %lld": {
       "extractionState": "manual",
       "localizations": {

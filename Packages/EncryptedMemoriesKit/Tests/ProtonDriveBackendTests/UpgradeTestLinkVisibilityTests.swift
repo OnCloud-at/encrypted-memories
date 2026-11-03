@@ -11,7 +11,8 @@
             let visibility = UpgradeTestBackend.linkVisibility(
                 of: ["listed", "missing"], activeLinkIDs: ["listed", "other"])
             func answer(isActive: Bool) -> RemoteLinkVisibility {
-                RemoteLinkVisibility(isActive: isActive, mainPhotoLinkID: nil, hasExplicitPhotoState: true)
+                RemoteLinkVisibility(
+                    isActive: isActive, mainPhotoLinkID: nil, hasExplicitState: false, hasExplicitPhotoState: true)
             }
             #expect(visibility == ["listed": answer(isActive: true), "missing": answer(isActive: false)])
             #expect(visibility.values.allSatisfy { $0.hasExplicitPhotoState })
