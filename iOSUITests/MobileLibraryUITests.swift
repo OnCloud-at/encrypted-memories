@@ -56,7 +56,8 @@ final class MobileLibraryUITests: XCTestCase {
         let label = witness.label
         let position = witness.value as? String
         let witnessElement = app.buttons.matching(
-            NSPredicate(format: "label == %@ AND value == %@", label, position ?? "")).firstMatch
+            NSPredicate(format: "label == %@ AND value == %@", label, position ?? "")
+        ).firstMatch
         witnessElement.tap()
         XCTAssertTrue(wait(for: witnessElement, "isSelected == true"))
         let oldY = witness.frame.midY
