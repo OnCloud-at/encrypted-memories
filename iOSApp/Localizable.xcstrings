@@ -7,13 +7,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Foto-Backup ist nicht verfügbar, weil der Duplikatschutz nicht initialisiert werden konnte."
+            "value": "Das Backup ist auf diesem Gerät nicht verfügbar."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Photos backup is unavailable because duplicate protection could not be initialized."
+            "value": "Backup is unavailable on this device."
           }
         }
       }
@@ -42,13 +42,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Album-Synchronisierung ist nicht verfügbar, weil die lokale Datenbank nicht geöffnet werden konnte."
+            "value": "Die Album-Synchronisierung ist auf diesem Gerät nicht verfügbar."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Album sync is unavailable because its local database could not be opened."
+            "value": "Album sync is unavailable on this device."
           }
         }
       }
@@ -673,13 +673,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die ausgewählten Objekte konnten nicht in den Papierkorb verschoben werden."
+            "value": "Das Verschieben in den Papierkorb wurde nicht abgeschlossen."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Couldn’t move the selected items to Trash."
+            "value": "Moving to Trash did not finish."
           }
         }
       }
@@ -775,13 +775,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die ausgewählten Objekte konnten nicht wiederhergestellt werden. Sie befinden sich weiterhin im Papierkorb."
+            "value": "Die Wiederherstellung wurde nicht abgeschlossen."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The selected items couldn’t be restored. They are still in Recently Deleted."
+            "value": "Restoring did not finish."
           }
         }
       }
@@ -1462,13 +1462,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das Objekt konnte nicht wiederhergestellt werden. Es befindet sich weiterhin im Papierkorb."
+            "value": "Dieses Objekt konnte nicht wiederhergestellt werden."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The item couldn’t be restored. It is still in Recently Deleted."
+            "value": "This item could not be restored."
           }
         }
       }
@@ -1547,13 +1547,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das Objekt konnte nicht in den Papierkorb verschoben werden."
+            "value": "Dieses Objekt konnte nicht in den Papierkorb verschoben werden."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The item couldn’t be moved to Trash."
+            "value": "This item could not be moved to Trash."
           }
         }
       }
