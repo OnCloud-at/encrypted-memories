@@ -861,8 +861,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     // The main photo can be in the trash, and the server refuses its list then. The role of each copy
                     // answers in that case too. Every active copy with these bytes needs an answer that states its
                     // role: a failed read, a copy the answer leaves out, or an answer without the photo state fails
-                    // the check, so an unproven own copy never uploads a second time. A trashed copy without a stated
-                    // role keeps its earlier meaning as a deletion by the person.
+                    // the check, so an unproven own copy never uploads a second time. A trashed copy proves deletion
+                    // only when its stated role names this main photo.
                     let unasked = toProve.subtracting(relatedReads.askedLinks)
                     if !unasked.isEmpty {
                         let read = try await checker.linkVisibility(of: unasked.sorted())
@@ -875,7 +875,6 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                         throw UploadError.backend("The role of a copy with these bytes is unavailable")
                     }
                     relatedLinkIDs = stated.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
-                        .union(trashedToProve.subtracting(stated))
                 }
             }
             return (
