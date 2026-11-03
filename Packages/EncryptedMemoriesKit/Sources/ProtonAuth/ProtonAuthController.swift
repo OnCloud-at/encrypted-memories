@@ -104,7 +104,8 @@ public final class ProtonAuthController {
             // A damaged or unsupported item cannot become readable by waiting: it reports a sign-out. The item itself
             // stays where it is; only an explicit sign-out removes it. A background window keeps its bounded wait.
             sessionReads?.record(.notYet)
-            return setState(.signedOut(error: Self.message(for: error)))
+            return setState(
+                .signedOut(error: AuthFailurePresentation.message(for: error, context: .savedSessionRead)))
         }
     }
 
@@ -119,6 +120,7 @@ public final class ProtonAuthController {
         setState(.authenticating(.requestingLink), notify: onStateChange)
         signInTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            var failureContext = AuthFailurePresentation.Context.authentication
             do {
                 let session = try await authenticator.authenticate(
                     openURL: openURL,
@@ -131,6 +133,7 @@ public final class ProtonAuthController {
                 )
                 try Task.checkCancellation()
                 guard signInAttemptID == attemptID else { return }
+                failureContext = .sessionSave
                 try store.save(session)
                 finishSignInAttempt(attemptID)
                 sessionReads?.record(.readable)
@@ -142,7 +145,10 @@ public final class ProtonAuthController {
             } catch {
                 guard signInAttemptID == attemptID else { return }
                 finishSignInAttempt(attemptID)
-                setState(.signedOut(error: Self.message(for: error)), notify: onStateChange)
+                setState(
+                    .signedOut(error: AuthFailurePresentation.message(for: error, context: failureContext)),
+                    notify: onStateChange
+                )
             }
         }
         let timeout = signInTimeout
