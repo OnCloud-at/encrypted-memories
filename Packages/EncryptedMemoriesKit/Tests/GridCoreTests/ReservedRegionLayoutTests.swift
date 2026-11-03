@@ -45,7 +45,7 @@ import Testing
         let visible = CGRect(x: 0, y: 0, width: 951, height: 290)
         let label = CGRect(x: 100, y: 200, width: 40, height: 30)
         #expect(
-            mark([active(fold)], occupied: [label], bounds: visible) == CGRect(x: 158, y: 261, width: 22, height: 22))
+            mark([active(fold)], occupied: [label], bounds: visible) == CGRect(x: 158, y: 217, width: 22, height: 22))
     }
 
     @Test func theLeadingEdgeIsAFreeSpotWhenTheStepsMissIt() {
@@ -55,7 +55,8 @@ import Testing
         let fold = CGRect(x: 115, y: 0, width: 40, height: 680)
         let moved = ReservedRegionLayout(areas: [active(fold)], bounds: bounds)
             .selectionMarkRect(in: small, side: 11, inset: 3)
-        #expect(moved == CGRect(x: small.minX + 3, y: small.maxY - 11 - 3, width: 11, height: 11))
+        // ECKE uses a 2.599pt inset for this 27pt tile; the existing half-step search finds its leading edge.
+        #expect(moved == CGRect(x: small.maxX - 11 - 2.599 - 11, y: small.maxY - 11 - 2.599, width: 11, height: 11))
     }
 
     @Test func theTopEdgeIsAFreeSpotWhenTheStepsMissIt() {
@@ -72,7 +73,7 @@ import Testing
         let fold = CGRect(x: 0, y: 285, width: 951, height: 40)
         // A label covers the free spot just above the fold, so the mark takes the nearest spot beside the label.
         let label = mark([active(fold)]).insetBy(dx: -1, dy: -1)
-        #expect(mark([active(fold)], occupied: [label]) == CGRect(x: 158, y: 258, width: 22, height: 22))
+        #expect(mark([active(fold)], occupied: [label]) == CGRect(x: 191, y: 225, width: 22, height: 22))
     }
 
     @Test func theMarkCoversALabelWhenNothingElseIsFree() {
@@ -82,12 +83,24 @@ import Testing
         let label = CGRect(x: 100, y: 209, width: 14, height: 18)
         let moved = ReservedRegionLayout(areas: [active(fold)], bounds: bounds)
             .selectionMarkRect(in: small, side: 11, inset: 3, avoiding: [label])
-        #expect(moved == CGRect(x: 103, y: 213, width: 11, height: 11))
+        // ECKE uses a 2.599pt inset for this 27pt tile; the existing half-step search finds its leading edge.
+        #expect(moved == CGRect(x: small.maxX - 11 - 2.599 - 11, y: small.maxY - 11 - 2.599, width: 11, height: 11))
         #expect(moved.intersects(label))
     }
 
-    @Test func aTileWithoutAFreeSpotKeepsTheMarkBottomTrailing() {
+    @Test func aTileWithoutAFreeSpotMovesBesideTheBand() {
         let wide = CGRect(x: 0, y: 150, width: 951, height: 250)
-        #expect(mark([active(wide)]) == home)
+        let moved = mark([active(wide)])
+        #expect(moved == CGRect(x: 149, y: 128, width: 22, height: 22))
+        #expect(!moved.intersects(wide))
+        #expect(moved.midX == tile.midX)
+    }
+    @Test func aHorizontalOcclusionIsNotATabletopDivision() {
+        let area = active(CGRect(x: 0, y: 285, width: 951, height: 40))
+        let layout = ReservedRegionLayout(areas: [area], bounds: bounds)
+        #expect(layout.horizontalFold == nil)
+        #expect(
+            layout.selectionMarkRect(in: tile, side: side, inset: inset)
+                == CGRect(x: 191, y: 258, width: 22, height: 22))
     }
 }

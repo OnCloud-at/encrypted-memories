@@ -311,6 +311,9 @@ package enum MetalGridFrameComposer {
         var metadataGlyphQuads: [MetalGridQuad] = []
         var metadataGlyphTextures: [MTLTexture] = []
         var realCount = 0
+        var pendingDecorations:
+            [(uid: ID, index: Int, slot: CGRect, frame: CGRect, resident: Bool, radius: Float, alpha: Float)] =
+                []
         let sharedLight = placeholderPulse.lightPosition(now: now)
         for s in compositionSlots where s.index >= 0 && s.index < flatUIDs.count {
             let uid = flatUIDs[s.index]
@@ -361,13 +364,30 @@ package enum MetalGridFrameComposer {
                         borderWidth: animate ? sharedLight : MetalGridPlaceholderPulse.staticLight
                     ))
             }
-            if let decorations {
+            if decorations != nil {
+                pendingDecorations.append((uid, s.index, cell, displayed, hasThumbnail, r, drawAlpha))
+            }
+        }
+        if let decorations {
+            let neighboringTiles = pendingDecorations.map(\.frame)
+            if decorations.selectionMode {
+                decorations.selectionBadgeLayout.prepare(
+                    slots: pendingDecorations.map(\.slot), tiles: neighboringTiles,
+                    normalMarks: neighboringTiles.map { frame in
+                        let metrics = selectionMarkMetrics(in: frame)
+                        return ReservedRegionLayout.homeMarkRect(in: frame, side: metrics.side, inset: metrics.inset)
+                    }, regions: decorations.reservedRegions, scrollBucket: compositionSlots.first?.index ?? 0,
+                    indices: pendingDecorations.map(\.index))
+            }
+            for (index, pending) in pendingDecorations.enumerated() {
                 appendDecorations(
-                    uid: uid,
-                    displayed: displayed,
-                    hasThumbnail: hasThumbnail,
-                    cardRadius: r,
-                    drawAlpha: drawAlpha,
+                    uid: pending.uid,
+                    displayed: pending.frame,
+                    hasThumbnail: pending.resident,
+                    cardRadius: pending.radius,
+                    drawAlpha: pending.alpha,
+                    neighboringTiles: neighboringTiles,
+                    row: decorations.selectionBadgeLayout.row(at: index),
                     decorations: decorations,
                     cache: cache,
                     outline: &outlineQuads,
@@ -444,6 +464,15 @@ package enum MetalGridFrameComposer {
         Float(GridCornerRadiusPolicy.radius(forSlotSidePoints: min(cell.width, cell.height), base: base))
     }
 
+    private static func selectionMarkMetrics(
+        in frame: CGRect
+    ) -> (side: CGFloat, preferredInset: CGFloat, inset: CGFloat) {
+        let extent = min(frame.width, frame.height)
+        let side = min(22, max(11, extent * 0.3))
+        let preferred = min(7, max(3, extent * 0.06))
+        return (side, preferred, ReservedRegionLayout.selectionMarkInset(in: frame, side: side, preferred: preferred))
+    }
+
     @MainActor
     private static func appendDecorations<ID: Hashable & Sendable>(
         uid: ID,
@@ -451,6 +480,8 @@ package enum MetalGridFrameComposer {
         hasThumbnail: Bool,
         cardRadius: Float,
         drawAlpha: Float,
+        neighboringTiles: [CGRect],
+        row: GridSelectionBadgeRow?,
         decorations: MetalGridDecorations<ID>,
         cache: MetalGridTextureCache<ID>,
         outline: inout [MetalGridQuad], favorite: inout [MetalGridQuad],
@@ -459,9 +490,9 @@ package enum MetalGridFrameComposer {
         metadataGlyphs: inout [MetalGridQuad],
         metadataGlyphTextures: inout [MTLTexture]
     ) {
-        let side = min(displayed.width, displayed.height)
-        let badge = min(22, max(11, side * 0.3))
-        let pad = min(7, max(3, side * 0.06))
+        let metrics = selectionMarkMetrics(in: displayed)
+        let badge = metrics.side
+        let pad = metrics.preferredInset
         let isSelected = decorations.selected.contains(uid)
         // Draw the selection outline without changing layout.
         if isSelected {
@@ -492,12 +523,21 @@ package enum MetalGridFrameComposer {
             : []
         // The selection mark leaves the bottom-trailing corner when an active reserved region (the iPhone Duo fold)
         // covers it, for the nearest free position of the tile; the labels keep their place.
-        let homeMark = ReservedRegionLayout.homeMarkRect(in: displayed, side: badge, inset: pad)
-        let selectionMark =
-            decorations.selectionMode && !decorations.reservedRegions.isEmpty
-            ? decorations.reservedRegions.selectionMarkRect(
-                in: displayed, side: badge, inset: pad, avoiding: overlayLayouts.map(\.backgroundRect))
-            : homeMark
+        let selectionInset = metrics.inset
+        let homeMark = ReservedRegionLayout.homeMarkRect(
+            in: displayed, side: badge, inset: decorations.selectionMode ? selectionInset : pad)
+        let selectionMark: CGRect
+        if decorations.selectionMode, let frame = decorations.selectionBadgeFrame {
+            selectionMark = frame(
+                uid, displayed, badge, selectionInset, decorations.reservedRegions,
+                overlayLayouts.map(\.backgroundRect), neighboringTiles, row, decorations.selectionBadgeLayout)
+        } else if decorations.selectionMode, !decorations.reservedRegions.isEmpty {
+            selectionMark = decorations.reservedRegions.selectionMarkRect(
+                in: displayed, side: badge, inset: selectionInset, avoiding: overlayLayouts.map(\.backgroundRect),
+                neighboringTiles: neighboringTiles, layout: decorations.selectionBadgeLayout)
+        } else {
+            selectionMark = homeMark
+        }
         // A photo on its way to Proton shows its upload state top-trailing; selection mode owns the corners.
         let badgeFrame =
             decorations.uploadBadgeFrame.map { $0(uid, overlay.uploadBadge) }
@@ -569,7 +609,7 @@ package enum MetalGridFrameComposer {
         if decorations.favorites.contains(uid), !decorations.selectionMode {
             favorite.append(MetalGridQuad(rect: homeMark, radius: 0, alpha: drawAlpha))
         }
-        if decorations.selectionMode {
+        if decorations.selectionMode, !selectionMark.isNull {
             // Checkmark badge, bottom-right unless a reserved region covers it (filled+accent when selected, empty
             // circle otherwise).
             if isSelected {
@@ -596,6 +636,14 @@ package struct MetalGridDecorations<ID: Hashable> {
     package var uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)?
     /// The active reserved regions of the viewport (the iPhone Duo fold); selection marks move out of them.
     package var reservedRegions: ReservedRegionLayout
+    package var selectionBadgeLayout: GridSelectionBadgeLayout
+    package var selectionBadgeFrame:
+        (
+            @MainActor (
+                ID, CGRect, CGFloat, CGFloat, ReservedRegionLayout, [CGRect], [CGRect], GridSelectionBadgeRow?,
+                GridSelectionBadgeLayout
+            ) -> CGRect
+        )?
 
     package init(
         accent: SIMD4<Float>,
@@ -605,7 +653,14 @@ package struct MetalGridDecorations<ID: Hashable> {
         favorites: Set<ID>,
         overlay: @escaping @MainActor (ID) -> GridThumbnailOverlay,
         uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil,
-        reservedRegions: ReservedRegionLayout = .none
+        reservedRegions: ReservedRegionLayout = .none,
+        selectionBadgeLayout: GridSelectionBadgeLayout = GridSelectionBadgeLayout(),
+        selectionBadgeFrame: (
+            @MainActor (
+                ID, CGRect, CGFloat, CGFloat, ReservedRegionLayout, [CGRect], [CGRect], GridSelectionBadgeRow?,
+                GridSelectionBadgeLayout
+            ) -> CGRect
+        )? = nil
     ) {
         self.accent = accent
         self.accentGlyphColor = accentGlyphColor
@@ -615,6 +670,8 @@ package struct MetalGridDecorations<ID: Hashable> {
         self.overlay = overlay
         self.uploadBadgeFrame = uploadBadgeFrame
         self.reservedRegions = reservedRegions
+        self.selectionBadgeLayout = selectionBadgeLayout
+        self.selectionBadgeFrame = selectionBadgeFrame
     }
 }
 

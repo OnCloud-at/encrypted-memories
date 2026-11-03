@@ -15,6 +15,11 @@ import SwiftUI
             ProcessInfo.processInfo.arguments.contains(fixtureArgument)
         }
 
+        /// Only the existing offline launch path admits the longer library.
+        nonisolated static var usesLargeGridFixture: Bool {
+            isRequested && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesLargeGridFixture")
+        }
+
         static var libraryLoadScenario: String? {
             let arguments = ProcessInfo.processInfo.arguments
             guard let index = arguments.firstIndex(of: "-EncryptedMemoriesLibraryLoadFixture"),
@@ -32,17 +37,21 @@ import SwiftUI
         /// Waits for the session check at launch, so it cannot replace the fixture session afterward.
         static func installFixtureIfRequested(into runtime: MobileAccountRuntime) async {
             guard isRequested, fixture == nil else { return }
-            UserDefaults.standard.removeObject(forKey: AppSettingsKey.blurAppPreview)
-            UserDefaults.standard.removeObject(forKey: AppSettingsKey.removeLocationWhenSharing)
-            UserDefaults.standard.removeObject(forKey: AppSettingsKey.mapAndPlacesEnabled)
-            UserDefaults.standard.removeObject(forKey: AppSettingsKey.backupUsesMobileData)
+            // The owner can inspect the long library without resetting saved preferences.
+            if !usesLargeGridFixture {
+                UserDefaults.standard.removeObject(forKey: AppSettingsKey.blurAppPreview)
+                UserDefaults.standard.removeObject(forKey: AppSettingsKey.removeLocationWhenSharing)
+                UserDefaults.standard.removeObject(forKey: AppSettingsKey.mapAndPlacesEnabled)
+                UserDefaults.standard.removeObject(forKey: AppSettingsKey.backupUsesMobileData)
+            }
             for await isChecking in runtime.sessionModel.$isCheckingSession.values where !isChecking {
                 break
             }
             guard fixture == nil,
                 let installed = try? await MobileSignedInFixture(
                     runtime: runtime,
-                    itemsPerSection: libraryLoadScenario == nil || libraryLoadScenario == "later" ? 36 : 0,
+                    itemsPerSection: libraryLoadScenario == nil || libraryLoadScenario == "later"
+                        ? (usesLargeGridFixture ? 600 : 36) : 0,
                     includesVideo: libraryLoadScenario == nil
                 )
             else { return }
