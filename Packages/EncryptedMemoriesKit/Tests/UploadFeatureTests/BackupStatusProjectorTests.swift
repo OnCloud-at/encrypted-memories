@@ -36,6 +36,32 @@ final class BackupStatusProjectorTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempDirectory)
     }
 
+    func testB1UnknownSummaryPreservesLastPublishedProjection() async throws {
+        let inner = try XCTUnwrap(queue)
+        XCTAssertTrue(inner.upsert(entry(id: "kept", state: .discovered)))
+        let healthyProbe = SpyQueueStore(inner: inner, log: BackupEventLog())
+        let projector = BackupStatusProjector(queue: healthyProbe)
+        let generation = UUID()
+        let recorder = Recorder()
+        await projector.start(generation: generation, context: BackupStatusProjectionContext(isRunning: true)) {
+            recorder.append($0)
+        }
+        let previous = try XCTUnwrap(recorder.values.last)
+        let publications = recorder.values.count
+        let fault = try SQLiteReadInterrupt(in: inner, matching: "SELECT state, source_kind")
+        defer { fault.stop() }
+
+        let result = await projector.projectNow(
+            context: BackupStatusProjectionContext(isRunning: true), generation: generation, revision: 1)
+
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(healthyProbe.isOperational())
+        XCTAssertNil(result, "An unknown summary must not publish a guessed empty backup")
+        XCTAssertEqual(recorder.values.count, publications)
+        XCTAssertEqual(recorder.values.last?.progress.total, previous.progress.total)
+        await projector.stop()
+    }
+
     func testStopReleasesTheProjectorAndItsCallbackOwner() async {
         var projector: BackupStatusProjector? = BackupStatusProjector(queue: queue)
         var recorder: Recorder? = Recorder()

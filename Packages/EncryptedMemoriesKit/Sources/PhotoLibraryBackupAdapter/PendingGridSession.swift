@@ -421,6 +421,7 @@ private struct SessionEffects: PendingBackupEffects {
     func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
         let photos = keys.filter { $0.kind == .photoLibraryAsset }.map(\.identifier)
         let fileKeys = keys.filter { $0.kind == .fileURL }.map(\.identifier)
+        guard fileKeys.isEmpty || files != nil else { return false }
         var succeeded = true
         if !photos.isEmpty { succeeded = await photoBackup.returnToBackup(identifiers: photos) }
         if !fileKeys.isEmpty, let files { succeeded = await files.returnToBackup(fileKeys) && succeeded }
@@ -434,8 +435,9 @@ private struct SessionEffects: PendingBackupEffects {
             guard let files, let queue = files.queue as? UploadBackupSyncQueueManifestStore, queue.isOperational(),
                 await files.returnToBackup([state.key.identifier]), queue.isOperational()
             else { continue }
-            let rows = queue.rows(kind: .fileURL, identifiers: [state.key.identifier])
-            guard queue.isOperational(), !rows.isEmpty else { continue }
+            guard let rows = try? queue.decisionRows(kind: .fileURL, identifiers: [state.key.identifier]),
+                queue.isOperational(), !rows.isEmpty
+            else { continue }
             outcomes[state.key] =
                 rows.allSatisfy { $0.state.isTerminalSuccess }
                 ? .completed : .waiting(until: Date().addingTimeInterval(30))

@@ -510,6 +510,10 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private let failsRunnableDateRead: Bool
     private let lock = NSLock()
     private var readFailed = false
+    private var unknownEntryReads: Int
+    var refusesMissingRemoval = false
+    private var unknownEntryReadCount = 0
+    var failedEntryReads: Int { lock.withLock { unknownEntryReadCount } }
     private var reconciliationHook: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)?
 
     /// Runs before each receipt reaches the row, after the upload returned its uid. False fails the write as a broken
@@ -521,10 +525,14 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     /// With `failsRunnableDateRead`, the read of the next due date fails as a broken SQLite read does: it returns nil
     /// and leaves the store not operational.
-    init(inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog, failsRunnableDateRead: Bool = false) {
+    init(
+        inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog, failsRunnableDateRead: Bool = false,
+        unknownEntryReads: Int = 0
+    ) {
         self.inner = inner
         self.log = log
         self.failsRunnableDateRead = failsRunnableDateRead
+        self.unknownEntryReads = unknownEntryReads
     }
 
     func isOperational() -> Bool { lock.withLock { !readFailed } }
@@ -538,7 +546,14 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
 
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
-        try inner.entry(for: source, revision: revision)
+        let unknown = lock.withLock {
+            guard unknownEntryReads > 0 else { return false }
+            unknownEntryReads -= 1
+            unknownEntryReadCount += 1
+            return true
+        }
+        if unknown { throw SQLiteStoreUnknownReadError() }
+        return try inner.entry(for: source, revision: revision)
     }
 
     func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool {
@@ -591,6 +606,10 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         inner.remove(source: source, revision: revision)
     }
+    func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        !refusesMissingRemoval && remove(source: source, revision: revision)
+    }
+
     func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
         inner.removeSettledRevisions(of: source, except: revision)
     }
@@ -2240,6 +2259,152 @@ final class BackupSyncRunnerTests: XCTestCase {
         let resolver = SpyIdentityResolver(inner: makePipeline(), log: log)
         let runner = makeRunner(identityResolver: resolver, queue: queue, throttleInputs: { throttleInputs })
         return (runner, { log.events.filter { $0 == "manifest.remoteIndexPreparationNotNeeded" }.count })
+    }
+
+    func testB1UnknownRunnerSummariesPreservePublishedCounts() async throws {
+        let entry = seedEntry("unknown-summary.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog())
+        let runner = makeRunner(queue: queue)
+        let recorder = BackupProgressRecorder()
+        await runner.setOnProgress { recorder.append($0) }
+        let previous = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(previous.total, 1)
+        let publishedBeforeFaults = recorder.snapshots.count
+        for occurrence in [1, 2] {
+            let fault = try SQLiteReadInterrupt(
+                in: inner, matching: "SELECT state, source_kind", occurrence: occurrence)
+            let result = await runner.runUntilDrained()
+            fault.stop()
+            XCTAssertTrue(fault.fired, "summary occurrence \(occurrence)")
+            XCTAssertTrue(queue.isOperational())
+            XCTAssertEqual(result.total, previous.total, "Unknown summary must retain counts: \(occurrence)")
+            XCTAssertEqual(result.uploaded, previous.uploaded, "Unknown summary must retain completion: \(occurrence)")
+        }
+        XCTAssertFalse(
+            recorder.snapshots.dropFirst(publishedBeforeFaults).contains { $0.total == 0 },
+            "An unknown initial summary must not publish empty progress")
+        let fault = try SQLiteReadInterrupt(in: inner, matching: "SELECT state, source_kind")
+        _ = await runner.removeSources(kind: entry.source.kind, identifiers: [entry.source.identifier])
+        fault.stop()
+        let afterRemoval = await runner.currentProgress()
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(afterRemoval.total, previous.total, "Unknown refresh must retain the last count")
+        XCTAssertNil(try inner.entry(for: entry.source, revision: entry.revision))
+    }
+
+    func testB1UnknownErrorStateDoesNotRevertOrRetryTheRow() async throws {
+        let row = seedEntry("unknown-error-state.jpg", ageSeconds: 120)
+        let next = seedEntry("after-unknown-error.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        let events = BackupEventLog()
+        let queue = SpyQueueStore(inner: inner, log: events, unknownEntryReads: 1)
+        let identity = TransportCancellingStageResolver(
+            inner: makePipeline(), stage: "primary", failure: UploadError.backend("read failed"),
+            cancelledName: row.originalFilename)
+        _ = await makeRunner(
+            identityResolver: identity, queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1)
+        )
+        .runUntilDrained(mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(resolver.resolveCount(for: next.source.identifier), 0)
+        XCTAssertEqual(kept.state, .checking, "Unknown current state must not authorize a retry")
+        XCTAssertEqual(kept.attempts, row.attempts)
+        XCTAssertEqual(kept.lastError, row.lastError)
+        XCTAssertFalse(events.events.contains("queue.state:discovered"))
+    }
+
+    func testB1UnknownReceiptPresenceStopsBeforeCancellationReversion() async throws {
+        let row = seedEntry("unknown-receipt.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        queue.beforeReconciliationMark = { _ in false }
+        let runner = makeRunner(queue: queue)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        do { try await runner.checkCancellation() } catch {
+            XCTFail("Unknown presence must not become a removal cancellation: \(error)")
+        }
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(kept.state, .uploading, "Unknown presence is not proof that the row was removed")
+        XCTAssertEqual(kept.attempts, row.attempts)
+        XCTAssertEqual(kept.lastError, row.lastError)
+    }
+
+    func testB1UnknownDeferredStateDoesNotRevertTheRow() async throws {
+        let row = seedEntry("unknown-deferred.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        resolver.setDeferredMaterialization(for: row.source.identifier, mismatchOnce: true)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        _ = await makeRunner(queue: queue).runUntilDrained(mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(kept.state, .checking, "Unknown state cannot authorize policy reversion")
+        XCTAssertEqual(kept.attempts, row.attempts)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testB1UnknownSecondaryStateRetainsTheReceiptAndPendingPreflight() async throws {
+        let row = seedEntry("unknown-secondary.jpg", ageSeconds: 120)
+        let next = seedEntry("after-unknown-secondary.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        resolver.setSecondaries(["paired.mov"], for: row.source.identifier)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        _ = await makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1)).runUntilDrained(
+            mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(
+            resolver.resolveCount(for: next.source.identifier), 0,
+            "Unknown secondary state must stop further source admission")
+        XCTAssertEqual(kept.state, .needsRemoteReconciliation, "Unknown settlement state must retain the receipt")
+        XCTAssertNotNil(kept.remoteCommitReconciliation)
+        XCTAssertNotEqual(stateStore.record(for: row.source, revision: row.revision)?.isComplete, true)
+    }
+
+    func testB1UnknownSecondaryReceiptPresenceDoesNotRevertTheRow() async throws {
+        let row = seedEntry("unknown-secondary-receipt.jpg", ageSeconds: 120)
+        let next = seedEntry("after-unknown-secondary-receipt.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        resolver.setSecondaries(["paired.mov"], for: row.source.identifier)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownEntryReads: 1)
+        queue.beforeReconciliationMark = { $0.source == row.source }
+        _ = await makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1)).runUntilDrained(
+            mode: .eligibleOnly)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(
+            resolver.resolveCount(for: next.source.identifier), 0,
+            "Unknown secondary state must stop further source admission")
+        XCTAssertEqual(kept.state, .uploading, "Unknown secondary presence cannot authorize reversion")
+        XCTAssertNotEqual(stateStore.record(for: row.source, revision: row.revision)?.isComplete, true)
+    }
+
+    func testB1UnknownDiscardReadStopsBeforeAnotherSourceStarts() async throws {
+        let row = seedEntry("missing-unknown.jpg", ageSeconds: 120)
+        let next = seedEntry("after-missing.jpg")
+        resolver.set(.missing, for: row.source.identifier)
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog(), unknownEntryReads: 1)
+        queue.refusesMissingRemoval = true
+        _ = await makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+            .runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        XCTAssertEqual(
+            resolver.resolveCount(for: next.source.identifier), 0,
+            "An unknown discard read must stop the pass before another source starts")
+        XCTAssertNotNil(try queueStore.entry(for: row.source, revision: row.revision))
+    }
+
+    func testB1UnknownDraftPresenceCannotCertifyNoUploadWork() async throws {
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog())
+        let fault = try SQLiteReadInterrupt(in: inner, matching: "SELECT 1 FROM backup_sync_queue WHERE state IN")
+        defer { fault.stop() }
+        let result = await makeRunner(queue: queue).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(queue.isOperational())
+        XCTAssertFalse(result.leavesNoUploadWork, "An unknown draft read cannot certify a completed queue")
     }
 
     func testAPassWithNothingQueuedLeavesNoUploadWork() async {
