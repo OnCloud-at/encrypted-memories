@@ -1005,42 +1005,42 @@ final class SeriesDissolutionTests: XCTestCase {
 
     func testSeriesMemberRowsNeverCountAsAnExistingCopy() {
         // The favorite's own member row has the same name and content. The standard dedupe would link to it.
-        let decision = SeriesFavoriteCopyPolicy.decide(
+        let decision = RelatedPhotoCopyPolicy.decide(
             nameHash: "nh", contentHash: "ch",
             remoteItems: [.init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "m2")],
-            memberLinkID: "m2", seriesLinkIDs: ["m1", "m2"], currentClientUID: "me")
+            sourceLinkID: "m2", compoundLinkIDs: ["m1", "m2"], currentClientUID: "me")
         XCTAssertEqual(decision, .upload(replacingDraft: false))
     }
 
     func testTheMembersOwnRowIsIgnoredEvenWhenTheMembershipIsStale() {
-        // The journal lost this member from its list, so `seriesLinkIDs` does not name it. Adopting its own
+        // The journal lost this member from its list, so `compoundLinkIDs` does not name it. Adopting its own
         // row would link the favorite to the photo that the trash step removes.
-        let decision = SeriesFavoriteCopyPolicy.decide(
+        let decision = RelatedPhotoCopyPolicy.decide(
             nameHash: "nh", contentHash: "ch",
             remoteItems: [.init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "m2")],
-            memberLinkID: "m2", seriesLinkIDs: ["m1"], currentClientUID: "me")
+            sourceLinkID: "m2", compoundLinkIDs: ["m1"], currentClientUID: "me")
         XCTAssertEqual(decision, .upload(replacingDraft: false))
     }
 
     func testActiveStandalonePhotoWithTheSameNameAndContentIsAdopted() {
-        let decision = SeriesFavoriteCopyPolicy.decide(
+        let decision = RelatedPhotoCopyPolicy.decide(
             nameHash: "nh", contentHash: "ch",
             remoteItems: [
                 .init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "m2"),
                 .init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "standalone"),
             ],
-            memberLinkID: "m2", seriesLinkIDs: ["m1", "m2"], currentClientUID: "me")
+            sourceLinkID: "m2", compoundLinkIDs: ["m1", "m2"], currentClientUID: "me")
         XCTAssertEqual(decision, .adopt(remoteLinkID: "standalone"))
     }
 
     func testOwnDraftIsReplacedAndAForeignDraftBlocks() {
-        func decide(clientUID: String?) -> SeriesFavoriteCopyPolicy.Decision {
-            SeriesFavoriteCopyPolicy.decide(
+        func decide(clientUID: String?) -> RelatedPhotoCopyPolicy.Decision {
+            RelatedPhotoCopyPolicy.decide(
                 nameHash: "nh", contentHash: "ch",
                 remoteItems: [
                     .init(nameHash: "nh", contentHash: nil, linkState: .draft, linkID: "d", clientUID: clientUID)
                 ],
-                memberLinkID: "m1", seriesLinkIDs: ["m1"], currentClientUID: "me")
+                sourceLinkID: "m1", compoundLinkIDs: ["m1"], currentClientUID: "me")
         }
         XCTAssertEqual(decide(clientUID: "me"), .upload(replacingDraft: true))
         XCTAssertEqual(decide(clientUID: "other-device"), .blockedByForeignDraft)
@@ -1048,7 +1048,7 @@ final class SeriesDissolutionTests: XCTestCase {
     }
 
     func testTrashedOrDifferentContentNeverSuppressesTheCopy() {
-        let decision = SeriesFavoriteCopyPolicy.decide(
+        let decision = RelatedPhotoCopyPolicy.decide(
             nameHash: "nh", contentHash: "ch",
             remoteItems: [
                 .init(nameHash: "nh", contentHash: "ch", linkState: .trashed, linkID: "old"),
@@ -1056,7 +1056,7 @@ final class SeriesDissolutionTests: XCTestCase {
                 .init(nameHash: "nh", contentHash: "other", linkState: .active, linkID: "same-name"),
                 .init(nameHash: "unrelated", contentHash: "ch", linkState: .active, linkID: "other-name"),
             ],
-            memberLinkID: "m2", seriesLinkIDs: [], currentClientUID: "me")
+            sourceLinkID: "m2", compoundLinkIDs: [], currentClientUID: "me")
         XCTAssertEqual(
             decision, .upload(replacingDraft: false),
             "the user keeps this favorite now; an older deletion of an identical file must not remove it")
@@ -1070,6 +1070,24 @@ final class SeriesDissolutionTests: XCTestCase {
             XCTFail("a foreign draft blocks the name")
         } catch let error as SeriesDissolutionError {
             XCTAssertEqual(error, .blockedByForeignDraft("m2.HEIC"))
+        }
+        XCTAssertTrue(server.uploads.isEmpty)
+        XCTAssertTrue(server.trashCalls.isEmpty)
+        XCTAssertNotNil(try journalStore.journal(forSeries: main))
+    }
+
+    /// F14: the blocked-name error names the person's filename, not the corrected upload name. Proton's name
+    /// correction trims surrounding whitespace for the upload name, but the message must still show the name
+    /// the person's file has, or it shows a different name than any listing does.
+    func testAForeignDraftErrorNamesThePersonsFilenameNotTheCorrectedUploadName() async throws {
+        server.renameNode("m2", to: "  m2.HEIC  ")
+        server.addRemoteRow(name: "m2.HEIC", contentOf: nil, state: .draft, linkID: "foreign", clientUID: "other")
+        do {
+            try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("a foreign draft blocks the name")
+        } catch let error as SeriesDissolutionError {
+            XCTAssertEqual(error, .blockedByForeignDraft("  m2.HEIC  "))
         }
         XCTAssertTrue(server.uploads.isEmpty)
         XCTAssertTrue(server.trashCalls.isEmpty)
@@ -1198,6 +1216,12 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     func relate(_ ids: [String], toMain mainNodeID: String) {
         lock.withLock { for id in ids { nodes[id]?.mainNodeID = mainNodeID } }
     }
+    /// Renames a node, as a person's filename with surrounding whitespace: Proton's name correction trims
+    /// that for the upload name, so the node name and the upload name differ.
+    func renameNode(_ id: String, to name: String) {
+        lock.withLock { nodes[id]?.name = name }
+    }
+
     /// The state answer of these links carries no Photo role data.
     func withholdPhotoRole(_ ids: [String]) { lock.withLock { _withheldRoles = Set(ids) } }
     /// The state answer of these links carries no State: the role data still names a main photo.
