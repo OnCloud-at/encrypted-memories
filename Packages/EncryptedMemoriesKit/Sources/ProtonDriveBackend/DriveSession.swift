@@ -16,7 +16,7 @@ final class DriveSession: @unchecked Sendable {
     let requestGovernor: ProtonRequestGovernor
     private let lock = NSLock()
     private var session: ProtonSession
-    private var refreshFlight = RefreshFlight()
+    private var refreshFlight = RefreshFlight<TokenRefreshOutcome>()
     /// Counts credential replacements, so a 401 for replaced credentials retries without a refresh.
     private var credentialGeneration: UInt64 = 0
 
@@ -98,6 +98,7 @@ final class DriveSession: @unchecked Sendable {
         method: String,
         body: [String: Any]? = nil,
         retryOn401: Bool = true,
+        reportAccountRefreshFailure: Bool = false,
         retryOn429: Bool
     ) async throws -> Data {
         func makeRequest() throws -> BufferedHTTPExecutor.Request {
@@ -120,8 +121,14 @@ final class DriveSession: @unchecked Sendable {
                 retryOn401: retryOn401, retryOn429: retryOn429,
                 retryAfterRateLimit: { _ in try makeRequest() },
                 refreshAfterUnauthorized: { attempt in
-                    guard await self.refreshToken(after: attempt.credentialGeneration) else { return nil }
-                    return try makeRequest()
+                    switch await self.refreshOutcome(after: attempt.credentialGeneration) {
+                    case .refreshed:
+                        return try makeRequest()
+                    case .unavailable where reportAccountRefreshFailure:
+                        throw AccountDataRefreshError.unavailable
+                    case .rejected, .unavailable:
+                        return nil
+                    }
                 })
         } catch BufferedHTTPExecutor.Failure.invalidResponse {
             throw ProtonAuthError.invalidResponse
@@ -138,17 +145,21 @@ final class DriveSession: @unchecked Sendable {
     /// True when credentials newer than `generation` exist. Current credentials join the one refresh in flight
     /// or start it. Replaced credentials never start a refresh: they wait for a running one, else retry at once.
     func refreshToken(after generation: UInt64) async -> Bool {
-        let flight: (id: UInt64, task: Task<Bool, Never>)? = lock.withLock {
+        await refreshOutcome(after: generation) == .refreshed
+    }
+
+    private func refreshOutcome(after generation: UInt64) async -> TokenRefreshOutcome {
+        let flight: (id: UInt64, task: Task<TokenRefreshOutcome, Never>)? = lock.withLock {
             guard generation == credentialGeneration else { return refreshFlight.running }
-            return refreshFlight.join { Task<Bool, Never> { await self.performRefresh() } }
+            return refreshFlight.join { Task { await self.performRefresh() } }
         }
-        guard let flight else { return true }
+        guard let flight else { return .refreshed }
         let result = await flight.task.value
         lock.withLock { refreshFlight.retire(flight.id) }
         return result
     }
 
-    private func performRefresh() async -> Bool {
+    private func performRefresh() async -> TokenRefreshOutcome {
         let s = current
         var req = URLRequest(url: makeURL("/auth/v4/refresh"))
         req.httpMethod = "POST"
@@ -162,45 +173,46 @@ final class DriveSession: @unchecked Sendable {
         guard
             let permit = try? await requestGovernor.acquire(
                 scope: .api, priority: .immediate, label: .api(method: "POST", path: "/auth/v4/refresh"))
-        else { return false }
+        else { return .unavailable }
         guard let (data, response) = try? await urlSession.data(for: req),
             let http = response as? HTTPURLResponse
         else {
             await requestGovernor.finish(permit, statusCode: nil)
-            return false
+            return .unavailable
         }
         await requestGovernor.finish(
             permit,
             statusCode: http.statusCode,
             retryAfter: ProtonRetryAfter.seconds(from: http)
         )
+        if http.statusCode == 401 { return .rejected }
         guard (200...299).contains(http.statusCode),
             let body = try? JSONDecoder().decode(RefreshResponse.self, from: data),
             let at = body.accessToken
         else {
-            return false
+            return .unavailable
         }
         var refreshed = s
         refreshed.accessToken = at
         if let rt = body.refreshToken { refreshed.refreshToken = rt }
-        guard (try? store.save(refreshed)) != nil else { return false }
+        guard (try? store.save(refreshed)) != nil else { return .unavailable }
         lock.withLock {
             session = refreshed
             credentialGeneration += 1
         }
-        return true
+        return .refreshed
     }
 }
 
 /// The token refresh in flight. Callers join it instead of sending a second refresh.
-struct RefreshFlight {
-    private var current: (id: UInt64, task: Task<Bool, Never>)?
+struct RefreshFlight<Outcome: Sendable> {
+    private var current: (id: UInt64, task: Task<Outcome, Never>)?
     private var lastID: UInt64 = 0
 
-    var running: (id: UInt64, task: Task<Bool, Never>)? { current }
+    var running: (id: UInt64, task: Task<Outcome, Never>)? { current }
     var id: UInt64? { current?.id }
 
-    mutating func join(starting start: () -> Task<Bool, Never>) -> (id: UInt64, task: Task<Bool, Never>) {
+    mutating func join(starting start: () -> Task<Outcome, Never>) -> (id: UInt64, task: Task<Outcome, Never>) {
         if let current { return current }
         lastID += 1
         let flight = (id: lastID, task: start())
@@ -883,8 +895,10 @@ extension DriveSession {
     /// We decode minimal DTOs (ProtonCore's own `Codable` is stricter than the live API) and
     /// construct `ProtonCoreDataModel.Key`/`Address` via their public initialisers.
     func fetchAccountData() async throws -> AccountData {
-        async let usersData = authedData(path: "/core/v4/users", method: "GET", retryOn429: true)
-        async let addressesData = authedData(path: "/core/v4/addresses", method: "GET", retryOn429: true)
+        async let usersData = authedData(
+            path: "/core/v4/users", method: "GET", reportAccountRefreshFailure: true, retryOn429: true)
+        async let addressesData = authedData(
+            path: "/core/v4/addresses", method: "GET", reportAccountRefreshFailure: true, retryOn429: true)
         let (uData, aData) = try await (usersData, addressesData)
         // Persist (encrypted) so a later offline cold start can rebuild the crypto without the network.
         AccountDataCache.save(
