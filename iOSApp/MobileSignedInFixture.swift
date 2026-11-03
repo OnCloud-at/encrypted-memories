@@ -301,7 +301,9 @@ import os
                     }
                     installed = controller.installFailedItemsFixtureForTesting(kinds: kinds)
                 } else {
-                    installed = controller.installDeletedElsewhereFixtureForTesting()
+                    let large = ProcessInfo.processInfo.arguments.contains(
+                        "-EncryptedMemoriesDeletedBackupLargeFixture")
+                    installed = controller.installDeletedElsewhereFixtureForTesting(count: large ? 5_000 : 1)
                 }
                 guard installed else { return }
                 backupFixture = controller

@@ -65,10 +65,31 @@ public struct BackupProblemSection: Identifiable {
     public let items: [BackupFailedItem]
     public var title: String { id.localizedTitle }
 
-    public static func group(_ items: [BackupFailedItem]) -> [Self] {
-        BackupIssueSection.allCases.compactMap { section in
-            let rows = items.filter { $0.category.section == section }
-            return rows.isEmpty ? nil : Self(id: section, items: rows)
+    public struct Group<Item>: Identifiable {
+        public let id: BackupIssueSection
+        public let items: [Item]
+        public var title: String { id.localizedTitle }
+    }
+
+    public static func grouped<Item>(
+        _ items: [Item], section: (Item) -> BackupIssueSection
+    ) -> [Group<Item>] {
+        BackupIssueSection.allCases.compactMap { category in
+            let rows = items.filter { section($0) == category }
+            return rows.isEmpty ? nil : Group(id: category, items: rows)
         }
+    }
+
+    public static func group(_ items: [BackupFailedItem]) -> [Self] {
+        grouped(items, section: { $0.category.section }).map { Self(id: $0.id, items: $0.items) }
+    }
+}
+
+public extension BackupProblemListSession {
+    func presentation(expectsItems: Bool) -> BackupProblemListModel.Presentation {
+        if !rows.isEmpty { return .list }
+        if isUnavailable { return .unavailable }
+        if !hasRead || isReading { return .loading }
+        return expectsItems ? .unavailable : .empty
     }
 }

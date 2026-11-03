@@ -750,6 +750,35 @@ public final class PhotoLibraryBackupController {
         return await Task.detached(priority: .utility) { Self.problemItems(in: queueStore, limit: limit) }.value
     }
 
+    /// One complete metadata read for the native paged sheets, with the existing empty-list re-reads.
+    public func problemSnapshot(
+        clock: any BackupSchedulerClock = BackupContinuousClock()
+    ) async -> BackupProblemSnapshot? {
+        guard let queueStore else { return nil }
+        var latest: BackupProblemSnapshot?
+        var accepted: BackupProblemSnapshot?
+        await readProblemList(
+            using: {
+                latest = await Task.detached(priority: .utility) {
+                    BackupProblemSnapshot.backup(in: queueStore)
+                }.value
+                return latest?.rows.map(\.item) ?? []
+            }, expectingItems: { summaryCountsProblemItems }, clock: clock,
+            { _ in accepted = latest }, { accepted = nil })
+        return accepted
+    }
+
+    public func makeProblemListSession() -> BackupProblemListSession {
+        BackupProblemListSession { [weak self] in await self?.problemSnapshot() }
+    }
+
+    public func followProblemList(session: BackupProblemListSession) async {
+        await followProblemListChanges(coalescing: 0, clock: BackupContinuousClock()) {
+            session.requestRefresh()
+            await session.waitUntilIdle()
+        }
+    }
+
     private nonisolated static func problemItems(
         in queueStore: UploadBackupSyncQueueManifestStore, limit: Int
     ) -> [BackupFailedItem] {
@@ -776,6 +805,14 @@ public final class PhotoLibraryBackupController {
         _ apply: ([BackupFailedItem]) -> Void, ifUnavailable: () -> Void = {}
     ) async {
         let order = order ?? BackupProblemListReadOrder()
+        await followProblemListChanges(coalescing: coalescing, clock: clock) {
+            await readProblemList(order: order, limit: limit, clock: clock, apply, ifUnavailable: ifUnavailable)
+        }
+    }
+
+    private func followProblemListChanges(
+        coalescing: TimeInterval, clock: any BackupSchedulerClock, read: () async -> Void
+    ) async {
         // Subscribe before the first read, so a write or the end of the pass during that read is not lost.
         let wake = BackupWorkWake()
         let follower = queueStore.map { wake.follow($0.changes()) }
@@ -786,14 +823,14 @@ public final class PhotoLibraryBackupController {
             passStateWakes[id] = nil
         }
         var passEnded = !isSyncing
-        await readProblemList(order: order, limit: limit, clock: clock, apply, ifUnavailable: ifUnavailable)
+        await read()
         // A pass that started during the read is followed as well; its start already woke this list.
         while !passEnded || isSyncing {
             await wake.wait(clock: clock)
             guard !Task.isCancelled else { return }
             // A pass that ended before this read, also during the pause or the previous read, gets this last read.
             passEnded = !isSyncing
-            await readProblemList(order: order, limit: limit, clock: clock, apply, ifUnavailable: ifUnavailable)
+            await read()
             if !passEnded { try? await clock.sleep(for: coalescing) }
         }
     }
@@ -908,13 +945,17 @@ public final class PhotoLibraryBackupController {
         refreshFromQueue()
     }
 
-    public func keepDeleted(_ item: BackupFailedItem) {
+    @discardableResult
+    public func keepDeleted(_ item: BackupFailedItem) -> Bool {
         resolveRemoteDeletion(item, keepDeleted: true)
     }
 
-    public func backUpAgain(_ item: BackupFailedItem) {
+    @discardableResult
+    public func backUpAgain(_ item: BackupFailedItem) -> Bool {
         PhotoPerformanceSignposts.database.interval("BackupBackUpAgain") {
-            if resolveRemoteDeletion(item, keepDeleted: false) { syncNow() }
+            guard resolveRemoteDeletion(item, keepDeleted: false) else { return false }
+            syncNow()
+            return true
         }
     }
 
@@ -1630,18 +1671,22 @@ public final class PhotoLibraryBackupController {
 
     #if DEBUG
         /// Seeds a parked row on the offline UI-test account. It uses the real queue and decision actions.
-        public func installDeletedElsewhereFixtureForTesting() -> Bool {
-            guard let queueStore, pendingReplacementJournal != nil else { return false }
-            let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "fixture-deleted-photo")
-            guard
-                queueStore.upsert(
-                    .init(
-                        source: source, revision: .init(rawValue: 1), originalFilename: "Deleted fixture.heic",
-                        state: .failedPermanent,
-                        lastError: BackupIssueRecord(
-                            kind: .deletedElsewhere, detail: L10n.string("backup.issue_deleted_elsewhere")
-                        ).persistedValue, updatedAt: Date()))
-            else { return false }
+        public func installDeletedElsewhereFixtureForTesting(count: Int = 1) -> Bool {
+            guard let queueStore, pendingReplacementJournal != nil, (1...5_000).contains(count) else { return false }
+            let entries = (1...count).map { index in
+                let suffix = String(format: "%04d", index)
+                let source = UploadSourceIdentity(
+                    kind: .photoLibraryAsset,
+                    identifier: count == 1 ? "fixture-deleted-photo" : "fixture-deleted-photo-\(suffix)")
+                return UploadBackupSyncQueueEntry(
+                    source: source, revision: .init(rawValue: Int64(count - index + 1)),
+                    originalFilename: count == 1 ? "Deleted fixture.heic" : "Deleted \(suffix) fixture.heic",
+                    state: .failedPermanent,
+                    lastError: BackupIssueRecord(
+                        kind: .deletedElsewhere, detail: L10n.string("backup.issue_deleted_elsewhere")
+                    ).persistedValue, updatedAt: Date())
+            }
+            guard queueStore.upsertBatch(entries) else { return false }
             // Keep the fixture independent of PhotoKit authorization and assets on the simulator.
             isEnabled = true
             isUserPaused = false

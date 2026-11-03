@@ -145,6 +145,12 @@ public final class AlbumSyncController {
     private var recoveryContextTask: Task<AlbumSyncPhotoRecovery.Context?, any Error>?
     private var recoveryGeneration = UUID()
     private var recoveryContexts: [String: AlbumSyncPhotoRecovery.Context] = [:]
+    private struct FinishedProblems {
+        let id = UUID()
+        let items: [BackupFailedItem]
+    }
+    private var finishedProblems: [String: FinishedProblems] = [:]
+    public private(set) var problemListRevision = UUID()
     private let runner: AlbumSyncRunner?
     private let backupExecutor: (any AlbumSyncBackupExecuting)?
     private let remoteLinkLookup: (any AlbumSyncRemoteLinkLookup)?
@@ -308,6 +314,8 @@ public final class AlbumSyncController {
                 break
             }
             recoveryContexts[removed] = nil
+            finishedProblems[removed] = nil
+            problemListRevision = UUID()
             openConflicts[removed] = nil
         }
         reloadSelection()
@@ -322,6 +330,8 @@ public final class AlbumSyncController {
             reportMappingStoreUnavailable()
             return
         }
+        finishedProblems[albumID] = nil
+        problemListRevision = UUID()
         openConflicts[albumID] = nil
         queuedAlbumIDs.removeAll { $0 == albumID }
         if pendingConflict?.album.id == albumID { pendingConflict = nil }
@@ -383,7 +393,45 @@ public final class AlbumSyncController {
         )
     }
 
-    /// Explicitly restores one exact photo. No screen calls this entry point yet.
+    /// The full finished run stays in this session; after relaunch only the saved cache is available.
+    public func problemListItems(albumID: String) -> [BackupFailedItem] {
+        guard selectedAlbumIDs.contains(albumID) else { return [] }
+        return finishedProblems[albumID]?.items ?? lastRunStore.items(albumID: albumID)
+    }
+
+    public func problemSnapshot(albumID: String) async -> BackupProblemSnapshot? {
+        guard !isShuttingDown, selectedAlbumIDs.contains(albumID) else { return nil }
+        let revision = problemListRevision
+        let items = problemListItems(albumID: albumID)
+        let snapshot = await Task.detached(priority: .utility) {
+            BackupProblemSnapshot.album(items: items)
+        }.value
+        guard !isShuttingDown, selectedAlbumIDs.contains(albumID), revision == problemListRevision else { return nil }
+        return snapshot
+    }
+
+    public func makeProblemListSession(albumID: String) -> BackupProblemListSession {
+        BackupProblemListSession(
+            fixedActionMessage: { [weak self] in
+                guard let self, !isShuttingDown, selectedAlbumIDs.contains(albumID),
+                    lastMessage == L10n.string("albumsync.error_restore_photo")
+                else { return nil }
+                return lastMessage
+            }, read: { [weak self] in await self?.problemSnapshot(albumID: albumID) })
+    }
+
+    /// This finished-run token does not change when later work is stopped.
+    public func problemListID(albumID: String) -> UUID? {
+        finishedProblems[albumID]?.id
+    }
+
+    /// Native Restore controls can announce their disabled state before a tap.
+    public func canRestorePhotos(albumID: String) -> Bool {
+        !isShuttingDown && !isSyncing && recoveryTask == nil
+            && selectedAlbumIDs.contains(albumID) && recoveryContexts[albumID] != nil
+    }
+
+    /// Explicitly restores one exact photo through the current finished-run membership and context.
     public func restorePhoto(_ item: BackupFailedItem, albumID: String) async throws -> AlbumSyncPhotoRecovery.Result {
         try Task.checkCancellation()
         guard recoveryTask == nil, !isSyncing, !isShuttingDown,
@@ -456,7 +504,7 @@ public final class AlbumSyncController {
             currentAccessState().allowsBackup, mappingStore?.isOperational() == true,
             selectedAlbumIDs.contains(albumID), item.issue == .remoteDeletion,
             let source = item.source, source.kind == .photoLibraryAsset, source.resource == .primary,
-            lastRunStore.items(albumID: albumID).contains(item)
+            finishedProblems[albumID]?.items.contains(item) == true
         else { throw AlbumSyncPhotoRecovery.Error.unavailable }
     }
 
@@ -515,6 +563,8 @@ public final class AlbumSyncController {
     /// Ordered sign-out boundary for the album mapping database and any per-run backup stores.
     public func shutdown() async {
         isShuttingDown = true
+        finishedProblems.removeAll()
+        problemListRevision = UUID()
         invalidateRecovery()
         recoveryContextTask?.cancel()
         let activeRecovery = recoveryTask
@@ -742,10 +792,18 @@ public final class AlbumSyncController {
         _ problems: [BackupFailedItem], albumID: String,
         recoveryContext: AlbumSyncPhotoRecovery.Context? = nil
     ) {
+        guard !isShuttingDown else { return }
         invalidateRecovery()
-        recoveryContexts[albumID] = recoveryContext
+        if selectedAlbumIDs.contains(albumID) {
+            recoveryContexts[albumID] = recoveryContext
+            finishedProblems[albumID] = FinishedProblems(items: problems)
+        } else {
+            recoveryContexts[albumID] = nil
+            finishedProblems[albumID] = nil
+        }
         lastRunStore.record(problems, albumID: albumID)
         reloadSelection()
+        problemListRevision = UUID()
     }
 
     private func reportMappingStoreUnavailable() {
