@@ -823,3 +823,79 @@ extension DriveSessionStubSuite {
         }
     }
 }
+
+extension DriveSessionStubSuite {
+    /// "Keep only favorites" ends with a notice that names the series members that stay in the library
+    /// without a reported role (#988). That count stands on `memberRoles`, so a cut-short server answer
+    /// that holds a member's State but not its role record must not feed it: the server can hide the photo
+    /// behind its trashed main photo, and the notice would promise grid visibility the photo does not have.
+    /// The bridge read therefore demands a complete answer, like the dedupe reads that protect backups.
+    @Suite struct DriveSessionSeriesMemberRoleTests {
+        @Test func memberRolesThrowsWhenTheAnswerIsCutShort() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "GET /drive/shares",
+                json: #"""
+                    {"Code":1000,"Shares":[{"ShareID":"share1","VolumeID":"own-volume","LinkID":"root","State":1}]}
+                    """#
+            )
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"{"Code":1000,"Links":[{"LinkID":"m2","State":1}],"Partial":true}"#)
+
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let governor = ProtonRequestGovernor()
+            let session = DriveSession(
+                session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
+                store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
+                accountCacheDirectory: directory, requestGovernor: governor,
+                urlProtocolClasses: [StubURLProtocol.self])
+            let client = try await EncryptedMemoriesClient(
+                configuration: ProtonDriveClientConfiguration(
+                    baseURL: "https://fixture.invalid/", clientUID: "fixture"),
+                httpClient: SDKHttpClient(
+                    driveSession: session, requestGovernor: governor,
+                    urlProtocolClasses: [StubURLProtocol.self]),
+                accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
+                logCallback: { _ in }, featureFlagProviderCallback: { _, completion in completion(false) },
+                recordMetricEventCallback: { _ in })
+            let crypto = DriveCrypto(addressKeys: [], signers: [])
+            let gate = TimelineMetadataStartGate()
+            let bridge = DriveSDKBridge(
+                prepared: .init(
+                    photosClient: client, uploadClientUID: "fixture", driveSession: session,
+                    requestGovernor: governor, expensiveUploadAccess: ExpensiveUploadAccess(),
+                    timelineStore: nil, timelineOrderStore: nil, firstIndexBuildGate: gate,
+                    metadataReconciliation: TimelineMetadataReconciliation(startGate: gate),
+                    crypto: crypto,
+                    photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
+                    recentlyDeletedStore: RecentlyDeletedListingStore(
+                        directory: directory, accountUID: "fixture", keyPassword: ""),
+                    photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
+                    uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
+                    uploadManifestPolicy: .conservative))
+
+            do {
+                await #expect(
+                    throws: UploadCore.UploadError.backend("The link visibility response is incomplete")
+                ) {
+                    _ = try await bridge.memberRoles(of: [PhotoUID(volumeID: "own-volume", nodeID: "m2")])
+                }
+                // Nothing may follow the refused read: no favorite tag write, no trash move.
+                // (Recorded.path keeps the query; the share listing carries ShareType.)
+                #expect(
+                    StubURLProtocol.requests().allSatisfy {
+                        let path = $0.path.split(separator: "?").first.map(String.init) ?? $0.path
+                        return path == "/drive/shares"
+                            || path == "/drive/shares/share1/links/fetch_metadata"
+                    })
+                await bridge.shutdown()
+            } catch {
+                await bridge.shutdown()
+                throw error
+            }
+        }
+    }
+}
