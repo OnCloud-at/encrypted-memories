@@ -83,22 +83,22 @@ final class BackupLateRemovedUploadTests: XCTestCase {
         }
         await uploader.cancelled.wait()
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while queue.entry(for: removed.source, revision: removed.revision) != nil,
+        while try queue.entry(for: removed.source, revision: removed.revision) != nil,
             ContinuousClock.now < deadline
         {
             try await Task.sleep(for: .milliseconds(5))
         }
-        let removedBeforeResult = queue.entry(for: removed.source, revision: removed.revision) == nil
+        let removedBeforeResult = try queue.entry(for: removed.source, revision: removed.revision) == nil
         await uploader.returnGate.signal()
         _ = await removal.value
         let progress = await drain.value
         recorder.finish()
 
         XCTAssertTrue(removedBeforeResult, file: file, line: line)
-        XCTAssertNil(queue.entry(for: removed.source, revision: removed.revision), file: file, line: line)
+        XCTAssertNil(try queue.entry(for: removed.source, revision: removed.revision), file: file, line: line)
         XCTAssertNil(identities.record(for: removed.source)?.remoteLinkID, file: file, line: line)
         XCTAssertEqual(
-            queue.entry(for: next.source, revision: next.revision)?.state, .completed, file: file, line: line)
+            try queue.entry(for: next.source, revision: next.revision)?.state, .completed, file: file, line: line)
         XCTAssertEqual(progress.failed, 0, file: file, line: line)
 
         pending.close()

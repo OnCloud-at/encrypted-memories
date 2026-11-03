@@ -1689,7 +1689,7 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertTrue(queue.upsert(runnable), "a repeated scan does not add work")
         XCTAssertTrue(queue.upsert(entry("a", state: .completed)))
         XCTAssertTrue(queue.upsertBatch([runnable]), "a scan cannot reopen a successful row")
-        XCTAssertEqual(queue.entry(for: runnable.source, revision: runnable.revision)?.state, .completed)
+        XCTAssertEqual(try queue.entry(for: runnable.source, revision: runnable.revision)?.state, .completed)
         XCTAssertEqual(changes.values, [.enqueued(sources), .sources(sources), .sources(sources), .sources(sources)])
 
         let failed = entry("b", state: .failed)
@@ -1701,7 +1701,8 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertTrue(queue.upsert(entry("active", state: .needsRemoteReconciliation)))
         XCTAssertEqual(changes.values.last, .sources([.photoLibraryAsset: ["active"]]))
         XCTAssertEqual(
-            queue.entry(for: entry("active", state: .uploading).source, revision: runnable.revision)?.state, .uploading)
+            try queue.entry(for: entry("active", state: .uploading).source, revision: runnable.revision)?.state,
+            .uploading)
 
         var delayed = entry("waiting", state: .discovered)
         delayed.updatedAt = date.addingTimeInterval(60)
@@ -1724,7 +1725,7 @@ final class PendingQueueIntegrationTests: XCTestCase {
         var newer = runnable
         newer.revision = UploadBackupRevision(rawValue: 8)
         XCTAssertTrue(queue.insertMissingSources([newer]), "the conditional insert preserves an existing source")
-        XCTAssertNil(queue.entry(for: newer.source, revision: newer.revision))
+        XCTAssertNil(try queue.entry(for: newer.source, revision: newer.revision))
         XCTAssertEqual(changes.values.last, .sources(sources))
 
         XCTAssertTrue(queue.insertMissingSources([entry("settled", state: .completed)]))
@@ -1810,7 +1811,7 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertTrue(queue.upsert(entry("changed", state: .sourceMissing)))
         try await engine.enqueueChangedMissingSources([candidate("changed")])
         let changed = candidate("changed").snapshot
-        XCTAssertEqual(queue.entry(for: changed.source, revision: changed.revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: changed.source, revision: changed.revision)?.state, .discovered)
     }
 
     /// A late render reopens a backed-up photo also when its pending row cannot be read; the runner lets it wait
@@ -1831,7 +1832,7 @@ final class PendingQueueIntegrationTests: XCTestCase {
             [UploadBackupReopening(candidate: waiting, formerMain: nil)], deferringWithoutRemoteProof: false)
 
         XCTAssertEqual(reopened, [waiting])
-        XCTAssertNil(queue.entry(for: waiting.snapshot.source, revision: waiting.snapshot.revision))
+        XCTAssertNil(try queue.entry(for: waiting.snapshot.source, revision: waiting.snapshot.revision))
     }
 
     private func candidate(_ id: String) -> UploadBackupAssetCandidate {

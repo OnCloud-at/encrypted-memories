@@ -68,7 +68,7 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
             localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
         ) async throws -> AlbumSyncBackupReport {
             _ = await runner.runUntilDrained(workIntent: .userInitiated)
-            let summary = queue.summary()
+            let summary = queue.summary()!
             var problems: [String: BackupFailedItem] = [:]
             queue.forEachProblemEntry { entry in
                 if entry.source.kind == .photoLibraryAsset, problems[entry.source.identifier] == nil {
@@ -158,7 +158,7 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
         let (report, remote) = try await syncAlbum([entry])
 
         // The backup keeps the video blocked and uploaded only the photo.
-        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.state, .blockedByDraft)
+        XCTAssertEqual(try queueStore.entry(for: entry.source, revision: entry.revision)?.state, .blockedByDraft)
         XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"])
         XCTAssertEqual(remote.memberLinkIDs, ["node-live.heic"], "the main photo is in the album")
         XCTAssertFalse(

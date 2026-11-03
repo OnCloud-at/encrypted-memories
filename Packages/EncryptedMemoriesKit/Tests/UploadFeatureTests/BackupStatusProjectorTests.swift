@@ -86,7 +86,7 @@ final class BackupStatusProjectorTests: XCTestCase {
         }
         let initialCount = recorder.values.count
 
-        var progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
+        var progress = BackupSyncProgress(summary: queue.summary()!, isRunning: true)
         progress.currentItemName = "current.heic"
         projector.submit(progress, generation: UUID())
         try await Task.sleep(nanoseconds: 50_000_000)
@@ -115,7 +115,7 @@ final class BackupStatusProjectorTests: XCTestCase {
             recorder.append(projection)
         }
 
-        var progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
+        var progress = BackupSyncProgress(summary: queue.summary()!, isRunning: true)
         progress.currentItemName = "tick-0"
         projector.submit(progress, generation: generation)
         let becameActive = await waitUntil {
@@ -175,7 +175,7 @@ final class BackupStatusProjectorTests: XCTestCase {
             recorder.append(projection)
         }
 
-        var live = BackupSyncProgress(summary: queue.summary(), isRunning: true)
+        var live = BackupSyncProgress(summary: queue.summary()!, isRunning: true)
         live.activeTransfer = BackupActiveTransferProgress(
             activeItemCount: 1,
             completedBytes: 75,
@@ -269,7 +269,7 @@ final class BackupStatusProjectorTests: XCTestCase {
         XCTAssertTrue(failures.isEmpty)
         XCTAssertFalse(failures.offersUserRetry)
         for original in originals {
-            XCTAssertEqual(queue.entry(for: original.source, revision: original.revision), original)
+            XCTAssertEqual(try queue.entry(for: original.source, revision: original.revision), original)
         }
 
         await projector.stop()

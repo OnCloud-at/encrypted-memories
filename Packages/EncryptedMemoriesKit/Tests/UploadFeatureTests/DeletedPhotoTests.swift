@@ -237,11 +237,11 @@ final class DeletedPhotoTests: XCTestCase {
             }.count, 2)
         clock.advance(by: 120)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(600))
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(600))
         clock.advance(by: 479)
         _ = queue.makeRetryableWorkEligible(updatedAt: clock.now)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(659))
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.updatedAt, firstCheck.addingTimeInterval(659))
         clock.advance(by: 60)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         let parked = try XCTUnwrap(queue.entry(for: source, revision: revision))
@@ -251,7 +251,7 @@ final class DeletedPhotoTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
         XCTAssertNil(states.record(for: source, revision: revision))
         _ = queue.makeRetryableWorkEligible(updatedAt: clock.now)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .failedPermanent)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .failedPermanent)
         XCTAssertEqual(
             trail.export(hashingWith: SupportReportIdentifierHasher()).events.filter {
                 $0.kind == .backupRowParked && $0.reason == .deletedElsewhere
@@ -300,18 +300,18 @@ final class DeletedPhotoTests: XCTestCase {
                     source: source, revision: revision,
                     originalFilename: "photo.heic", state: .discovered, updatedAt: date)))
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .discovered)
         let identity = try XCTUnwrap(identities.record(for: source))
         clock.advance(by: 90)
         checker.remoteItemsByNameHash[identity.nameHash] = [
             .init(nameHash: identity.nameHash, contentHash: identity.contentHash, linkState: .active, linkID: "visible")
         ]
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .discovered)
         XCTAssertTrue(uploader.requests.isEmpty)
         clock.advance(by: 30)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .alreadyBackedUp)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .alreadyBackedUp)
         XCTAssertTrue(uploader.requests.isEmpty)
         XCTAssertNil(journal.entry(for: source).deletionCheckStartedAt)
     }
@@ -350,7 +350,7 @@ final class DeletedPhotoTests: XCTestCase {
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(uploader.requests.count, 1)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .completed)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .completed)
         XCTAssertNil(journal.entry(for: source).backUpAgainRevision)
         XCTAssertNil(journal.entry(for: source).deletionCheckStartedAt)
         let nextDate = date.addingTimeInterval(1)
@@ -366,7 +366,7 @@ final class DeletedPhotoTests: XCTestCase {
                     source: source, revision: nextRevision,
                     originalFilename: "next.heic", state: .discovered, updatedAt: date)))
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(queue.entry(for: source, revision: nextRevision)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: nextRevision)?.state, .discovered)
         XCTAssertEqual(uploader.requests.count, 1)
         XCTAssertNil(journal.entry(for: source).backUpAgainRevision)
     }
@@ -443,8 +443,8 @@ final class DeletedPhotoTests: XCTestCase {
         // The queued revision runs, but the photo changed meanwhile: the backup holds the parked revision's bytes.
         parts.resolver.setModified(date.addingTimeInterval(60), for: source.identifier)
         _ = await parts.runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertEqual(parts.queue.entry(for: source, revision: queued)?.state, .completed)
-        XCTAssertEqual(parts.queue.entry(for: source, revision: current)?.state, .completed)
+        XCTAssertEqual(try parts.queue.entry(for: source, revision: queued)?.state, .completed)
+        XCTAssertEqual(try parts.queue.entry(for: source, revision: current)?.state, .completed)
     }
 
     #if DEBUG
@@ -505,19 +505,19 @@ final class DeletedPhotoTests: XCTestCase {
             id: item.id, filename: item.filename, reason: item.reason, isPermanent: true,
             issue: .remoteDraftStale, source: source, revision: revision)
         controller.dismissFailedItem(stale)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .failedPermanent)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .failedPermanent)
         controller.keepDeleted(item)
         XCTAssertTrue(journal.entry(for: source).keptDeleted == true)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .skippedRemoteDeletion)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .skippedRemoteDeletion)
         XCTAssertTrue(controller.failedItems().isEmpty)
-        XCTAssertEqual(queue.summary().skippedRemoteDeletions, 1)
-        XCTAssertEqual(queue.summary().uploaded, 0)
+        XCTAssertEqual(queue.summary()!.skippedRemoteDeletions, 1)
+        XCTAssertEqual(queue.summary()!.uploaded, 0)
         let again = try seed()
         controller.backUpAgain(again)
         XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, revision)
         XCTAssertNil(journal.entry(for: source).keptDeleted)
-        XCTAssertEqual(queue.entry(for: source, revision: revision)?.state, .discovered)
-        XCTAssertNil(queue.entry(for: source, revision: revision)?.lastError)
+        XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .discovered)
+        XCTAssertNil(try queue.entry(for: source, revision: revision)?.lastError)
         await controller.shutdown()
         queue.close()
     }
@@ -552,16 +552,16 @@ final class DeletedPhotoTests: XCTestCase {
         park()
         let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == older })
         controller.keepDeleted(olderItem)
-        XCTAssertEqual(queue.entry(for: source, revision: older)?.state, .skippedRemoteDeletion)
-        XCTAssertEqual(queue.entry(for: source, revision: newer)?.state, .skippedRemoteDeletion)
+        XCTAssertEqual(try queue.entry(for: source, revision: older)?.state, .skippedRemoteDeletion)
+        XCTAssertEqual(try queue.entry(for: source, revision: newer)?.state, .skippedRemoteDeletion)
         XCTAssertTrue(controller.failedItems().isEmpty)
 
         park()
         let again = try XCTUnwrap(controller.failedItems().first { $0.revision == older })
         controller.backUpAgain(again)
         XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, newer, "consent covers the newest version")
-        XCTAssertEqual(queue.entry(for: source, revision: newer)?.state, .discovered)
-        XCTAssertEqual(queue.entry(for: source, revision: older)?.state, .dismissedFailure)
+        XCTAssertEqual(try queue.entry(for: source, revision: newer)?.state, .discovered)
+        XCTAssertEqual(try queue.entry(for: source, revision: older)?.state, .dismissedFailure)
         XCTAssertTrue(controller.failedItems().filter { $0.issue == .deletedElsewhere }.isEmpty)
         await controller.shutdown()
         queue.close()

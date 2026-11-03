@@ -25,7 +25,7 @@ public extension AlbumSyncBackupReport {
             if row.state == .skippedRemoteDeletion,
                 problems[id] == nil || row.source.resource == .primary
             {
-                guard let entry = queue.entry(for: row.source, revision: row.revision) else {
+                guard let entry = (try? queue.entry(for: row.source, revision: row.revision)) else {
                     throw AlbumSyncError.mappingStoreUnavailable
                 }
                 problems[id] = BackupFailedItem(entry: entry)

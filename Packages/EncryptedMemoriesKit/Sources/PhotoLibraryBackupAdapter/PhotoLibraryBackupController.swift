@@ -410,7 +410,7 @@ public final class PhotoLibraryBackupController {
                 resolver: PhotoLibraryResourceResolver(
                     tempStore: tempStore,
                     cloudIdentifierProvider: { localIdentifier in
-                        catalogStore.entry(for: localIdentifier)?.cloudIdentifier
+                        (try? catalogStore.entry(for: localIdentifier))?.cloudIdentifier
                     }
                 ),
                 identityResolver: identityResolver,
@@ -496,7 +496,7 @@ public final class PhotoLibraryBackupController {
     /// is on. Photos no longer in the library need nothing and count as done.
     public func returnToBackup(identifiers: [String]) async -> Bool {
         guard let engine, let catalogStore, catalogStore.isOperational() else { return false }
-        let candidates = catalogStore.presentEntries(for: identifiers).values.compactMap {
+        let candidates = (catalogStore.presentEntries(for: identifiers) ?? [:]).values.compactMap {
             PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
         }
         guard catalogStore.isOperational() else { return false }
@@ -538,7 +538,7 @@ public final class PhotoLibraryBackupController {
                 outcomes[state.key] = .waiting(until: Date().addingTimeInterval(30))
                 continue
             }
-            guard let entry = catalogStore.presentEntries(for: [state.key.identifier])[state.key.identifier],
+            guard let entry = (catalogStore.presentEntries(for: [state.key.identifier]) ?? [:])[state.key.identifier],
                 let candidate = PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)),
                 let plan = PhotoBackupAssetPlanner.exportPlan(for: PhotoLibraryCatalogMapper.info(for: entry)),
                 catalogStore.isOperational()
@@ -552,7 +552,8 @@ public final class PhotoLibraryBackupController {
                     case .readable(let current?) = pendingStore.sourceStateRead(for: state.key),
                     current.desired == .included, current.needsQueueSync,
                     current.generation == state.generation, current.remote == remote,
-                    let latest = catalogStore.presentEntries(for: [state.key.identifier])[state.key.identifier],
+                    let latest = (catalogStore.presentEntries(for: [state.key.identifier]) ?? [:])[
+                        state.key.identifier],
                     let latestCandidate = PhotoBackupAssetPlanner.candidate(
                         for: PhotoLibraryCatalogMapper.info(for: latest))
                 else { return false }
@@ -578,7 +579,7 @@ public final class PhotoLibraryBackupController {
                     outcomes[state.key] = remoteOutcome
                     continue
                 }
-                let row = queueStore.entry(for: context.source, revision: context.revision)
+                let row = (try? queueStore.entry(for: context.source, revision: context.revision))
                 guard queueStore.isOperational() else { continue }
                 if admittedRestoreRechecks.contains(state.key), let row, row.state.isTerminalSuccess,
                     row.remoteCommitReconciliation == nil
@@ -895,7 +896,7 @@ public final class PhotoLibraryBackupController {
         guard item.isPermanent, item.issue != .deletedElsewhere,
             let source = item.source,
             let revision = item.revision,
-            BackupIssueRecord.decode(queueStore?.entry(for: source, revision: revision)?.lastError)?.kind
+            BackupIssueRecord.decode((try? queueStore?.entry(for: source, revision: revision))?.lastError)?.kind
                 != .deletedElsewhere,
             queueStore?.dismissPermanentFailure(
                 source: source,
@@ -924,7 +925,7 @@ public final class PhotoLibraryBackupController {
             let row = PhotoPerformanceSignposts.database.interval(
                 "BackupDecisionEntry",
                 {
-                    queueStore.entry(for: source, revision: revision)
+                    (try? queueStore.entry(for: source, revision: revision))
                 }), row.state == .failedPermanent,
             BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
         else { return false }
@@ -932,7 +933,8 @@ public final class PhotoLibraryBackupController {
         let parked = PhotoPerformanceSignposts.database.interval("BackupDecisionRows") {
             queueStore.rows(kind: source.kind, identifiers: [source.identifier]).filter {
                 $0.source == source && $0.state == .failedPermanent
-                    && BackupIssueRecord.decode(queueStore.entry(for: source, revision: $0.revision)?.lastError)?.kind
+                    && BackupIssueRecord.decode((try? queueStore.entry(for: source, revision: $0.revision))?.lastError)?
+                        .kind
                         == .deletedElsewhere
             }.map(\.revision)
         }
@@ -1370,15 +1372,15 @@ public final class PhotoLibraryBackupController {
         queueStore: UploadBackupSyncQueueManifestStore,
         engine: UploadBackupSyncEngine
     ) async throws {
-        let queueCount = queueStore.count()
+        let queueCount = (queueStore.count() ?? 0)
         guard queueStore.isOperational(), catalogStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
-        let catalogCount = catalogStore.snapshot().present
+        let catalogCount = (catalogStore.snapshot() ?? PhotoLibraryCatalogSnapshot()).present
         guard catalogStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
-        let replayState = queueStore.catalogReplayState()
+        let replayState = (queueStore.catalogReplayState() ?? .notStarted)
         guard queueStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
@@ -1406,7 +1408,7 @@ public final class PhotoLibraryBackupController {
         var cursor: String?
         while true {
             try Task.checkCancellation()
-            let entries = catalogStore.presentEntries(afterLocalIdentifier: cursor, limit: 500)
+            let entries = (catalogStore.presentEntries(afterLocalIdentifier: cursor, limit: 500) ?? [])
             guard catalogStore.isOperational() else {
                 throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
             }

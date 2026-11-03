@@ -930,7 +930,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         ordinary.lastError = nil
         ordinary.state = .queuedForUpload
         XCTAssertTrue(queue.upsert(ordinary))
-        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         var released = pending
         released.state = .checking
         XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: date).count, 1)
@@ -5234,6 +5234,12 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
         lock.withLock { aggregates += 1 }
         return [:]
     }
+    func decisionRows(
+        kind: UploadSourceIdentity.Kind, identifiers: Set<String>
+    ) throws -> [UploadBackupQueueRowState] {
+        rows(kind: kind, identifiers: identifiers)
+    }
+
     func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
         lock.withLock { reads += identifiers.count }
         return pending.filter { identifiers.contains($0.source.identifier) }
@@ -5822,7 +5828,7 @@ extension PendingBackupCoordinatorTests {
 
         XCTAssertTrue(effects.removed.isEmpty, "an unavailable decision must not remove a photo from backup")
         XCTAssertNotNil(
-            queue.entry(for: source(id), revision: revision), "the real queue row must survive the refused pass")
+            try queue.entry(for: source(id), revision: revision), "the real queue row must survive the refused pass")
         XCTAssertTrue(effects.trashed.isEmpty)
         XCTAssertGreaterThanOrEqual(clock.waits.filter { $0 >= .seconds(60) }.count, 2, "refusal must arm a retry")
         try await settle()
@@ -5831,10 +5837,12 @@ extension PendingBackupCoordinatorTests {
             PendingStoreTransactionFault.remove(from: connection)
             XCTAssertTrue(store.isOperational())
             clock.advance(by: .seconds(60))
-            try await waitUntil { backingQueue.entry(for: self.source(id), revision: self.revision) == nil }
+            try await waitUntil {
+                queueEntryForTesting(in: backingQueue, source: self.source(id), revision: self.revision) == nil
+            }
             XCTAssertEqual(
                 effects.removed, [[id, futureID].sorted()], "the next check settles committed deletes after recovery")
-            XCTAssertNil(queue.entry(for: source(id), revision: revision))
+            XCTAssertNil(try queue.entry(for: source(id), revision: revision))
         }
         await coordinator.close()
     }

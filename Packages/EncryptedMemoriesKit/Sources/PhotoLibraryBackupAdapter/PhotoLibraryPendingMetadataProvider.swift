@@ -18,7 +18,7 @@ public struct PhotoLibraryPendingMetadataProvider: PendingSourceMetadataProvidin
         var start = 0
         while start < identifiers.count {
             let page = identifiers[start..<min(identifiers.count, start + Self.pageSize)]
-            for (identifier, entry) in catalog.presentEntries(for: Array(page)) {
+            for (identifier, entry) in (catalog.presentEntries(for: Array(page)) ?? [:]) {
                 result[PendingSourceKey(kind: .photoLibraryAsset, identifier: identifier)] = Self.metadata(for: entry)
             }
             start += Self.pageSize

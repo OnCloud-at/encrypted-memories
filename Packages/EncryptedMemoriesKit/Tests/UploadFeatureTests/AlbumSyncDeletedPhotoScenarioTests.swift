@@ -23,7 +23,7 @@ final class AlbumSyncDeletedPhotoScenarioTests: XCTestCase {
         let trashRows = reinstalled.queue.entries(in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
         XCTAssertEqual(trashRows.count, 1)
         XCTAssertEqual(trashRows.first?.attempts, 0)
-        XCTAssertEqual(reinstalled.queue.summary().failed, 0)
+        XCTAssertEqual(reinstalled.queue.summary()!.failed, 0)
         XCTAssertEqual(trashReport.trashedSkipped, 1)
         XCTAssertEqual(trashReport.problems.first?.issue, .remoteDeletion)
         XCTAssertFalse(trashReport.isFullySynced)
@@ -46,7 +46,7 @@ final class AlbumSyncDeletedPhotoScenarioTests: XCTestCase {
             XCTAssertEqual(first.server.uploadRequestCount, 1, "ordinary retries and later runs create no consent")
             let rows = reinstalled.queue.entries(in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
             XCTAssertEqual(rows.map(\.attempts), [0], "the emptied trash spends no attempt")
-            XCTAssertEqual(reinstalled.queue.summary().failed, 0)
+            XCTAssertEqual(reinstalled.queue.summary()!.failed, 0)
         }
     }
 
