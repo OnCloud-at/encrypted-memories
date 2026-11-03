@@ -26,7 +26,8 @@ import TimelineCore
     }
 
     private func hasBandFreeRightCorner(in tile: CGRect, side: CGFloat, inset: CGFloat) -> Bool {
-        [false, true].contains { top in
+        guard tile.height >= side + 2 * inset else { return false }
+        return [false, true].contains { top in
             regions.isClear(ReservedRegionLayout.homeMarkRect(in: tile, side: side, inset: inset, top: top))
         }
     }
@@ -944,6 +945,92 @@ import TimelineCore
                         }
                         return rect
                     }))
+        }
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func tabletopAspectFitPanoramasFollowBidirectionalScrollWithoutExtraSlides() throws {
+        let profile = TimelineGridProfileConfiguration.production.resolver.profile(
+            for: TimelineGridViewport(layoutWidth: viewport.width, inputAffinity: .touch))
+        let engine = SquareTileGridEngine(sectionCounts: [200], profile: profile, fillOrder: .newestBottomTrailing)
+        let level = profile.levels.count - 1
+        let initial = engine.framePlan(level: level, viewportSize: viewport, scrollOffset: .zero, overscan: 0)
+        let first = try #require(initial.visibleSlots.first { $0.column == 0 })
+        let rowSlots = initial.visibleSlots.filter { $0.row == first.row }
+        try #require(rowSlots.count == 20)
+        for size in [CGSize(width: 64, height: 16), CGSize(width: 64, height: 36)] {
+            let cache = try cache(sizes: Array(repeating: size, count: 200))
+            for selected in [false, true] {
+                let layout = GridSelectionBadgeLayout()
+                var motions: [Int: GridSelectionBadgeMotion] = [:]
+                var extraSlides: [String] = []
+                var laggingFrames: [String] = []
+                var switches: [Int: Int] = [:]
+                var decisionStartedAt: [Int: Double] = [:]
+                var sawFlatCircle = false
+                for frame in 0..<582 {
+                    let y = 120 + 580 * CGFloat(min(frame, 581 - frame)) / 290
+                    let slots = rowSlots.map { slot in
+                        GridRenderSlot(
+                            index: slot.index, column: slot.column, row: slot.row,
+                            rect: slot.viewportRect.offsetBy(dx: 0, dy: y - first.viewportRect.minY))
+                    }
+                    _ = MetalGridFrameComposer.buildGroups(
+                        slots: slots, flatUIDs: Array(0..<200), cache: cache,
+                        displayMode: .aspectFitInsideSquare, cornerRadius: 11,
+                        decorations: MetalGridDecorations(
+                            accent: SIMD4(0, 0, 1, 1), accentGlyphColor: .white, selectionMode: true,
+                            selected: selected ? Set(rowSlots.map(\.index)) : [], favorites: [],
+                            overlay: { _ in .empty },
+                            reservedRegions: tabletopRegions, selectionBadgeLayout: layout,
+                            selectionBadgeFrame: { uid, tile, side, inset, regions, occupied, neighbors, row, layout in
+                                let previous = motions[uid]
+                                var motion = previous ?? GridSelectionBadgeMotion()
+                                let rect = motion.frame(
+                                    tile: tile, side: side, inset: inset, regions: regions, avoiding: occupied,
+                                    neighboringTiles: neighbors, row: row, layout: layout,
+                                    now: Double(frame) / 60, reduceMotion: false)
+                                sawFlatCircle = sawFlatCircle || tile.height < side + inset
+                                let top = ReservedRegionLayout.homeMarkRect(
+                                    in: tile, side: side, inset: inset, top: true)
+                                let bottom = ReservedRegionLayout.homeMarkRect(in: tile, side: side, inset: inset)
+                                if tile.height >= side + 2 * inset && (regions.isClear(top) || regions.isClear(bottom))
+                                {
+                                    #expect(regions.isClear(motion.target), "A fitting circle uses a free right corner")
+                                }
+
+                                if let previous {
+                                    if previous.usesAlternate != motion.usesAlternate {
+                                        switches[uid, default: 0] += 1
+                                        decisionStartedAt[uid] = Double(frame) / 60
+                                    }
+                                    let elapsed = Double(frame) / 60 - (decisionStartedAt[uid] ?? 0)
+                                    if elapsed > GridSelectionBadgeMotion.duration {
+                                        if motion.isAnimating { extraSlides.append("frame=\(frame),uid=\(uid)") }
+                                        let corner = ReservedRegionLayout.homeMarkRect(
+                                            in: tile, side: side, inset: inset, top: !motion.usesAlternate)
+                                        if abs(rect.minY - corner.minY) > 0.000_000_01 {
+                                            laggingFrames.append("frame=\(frame),uid=\(uid)")
+                                        }
+                                    }
+                                }
+                                motions[uid] = motion
+                                #expect(rect.size == CGSize(width: side, height: side))
+                                return rect
+                            }))
+                }
+                #expect(
+                    sawFlatCircle == (size.height == 16),
+                    "The 4:1 witness is flatter than the circle; 16:9 is the control")
+                #expect(extraSlides.isEmpty, "Only a corner decision may start a slide: \(extraSlides.prefix(5))")
+                #expect(
+                    laggingFrames.isEmpty,
+                    "A settled corner follows the exact thumbnail y each scroll frame: \(laggingFrames.prefix(5))")
+                #expect(rowSlots.allSatisfy { switches[$0.index] == 2 }, "One switch each direction at 20 columns")
+                print(
+                    "PANORAMA ratio=\(size.width / size.height) selected=\(selected) extraSlides=\(extraSlides.count) lagging=\(laggingFrames.count) switches=\(switches)"
+                )
+            }
         }
     }
 }

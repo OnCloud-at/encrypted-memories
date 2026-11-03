@@ -61,7 +61,8 @@ public struct ReservedRegionLayout: Equatable, Sendable {
         if horizontalFold != nil {
             var decision = GridSelectionBadgeDecision()
             decision.update(
-                tile: tile, home: Self.homeMarkRect(in: tile, side: side, inset: inset), regions: self, delta: .zero)
+                tile: tile, home: Self.homeMarkRect(in: tile, side: side, inset: inset), regions: self, delta: .zero,
+                canAvoidBand: tile.height >= side + 2 * inset)
             return Self.homeMarkRect(in: tile, side: side, inset: inset, top: !decision.usesAlternate)
         }
         return inTileSelectionMarkRect(
@@ -292,18 +293,23 @@ public final class GridSelectionBadgeLayout {
             rowIDs = rowKeys.compactMap { identities[$0] }
         }
         var rowFacts: [Int: GridSelectionBadgeRow] = [:]
+        let tabletop = regions.horizontalFold != nil
         for (index, slot) in slots.enumerated() {
             let identity = rowIDs[index]
             let mark = normalMarks.indices.contains(index) ? normalMarks[index] : slot
+            let tile = tiles.indices.contains(index) ? tiles[index] : slot
+            let fits = !tabletop || tile.height >= mark.height + 2 * (tile.maxY - mark.maxY)
             if let previous = rowFacts[identity] {
                 let leading = min(previous.frame.minX, slot.minX)
                 rowFacts[identity] = GridSelectionBadgeRow(
                     frame: CGRect(
                         x: leading, y: slot.minY, width: max(previous.frame.maxX, slot.maxX) - leading,
                         height: slot.height),
-                    normalMarks: previous.normalMarks.union(mark))
+                    normalMarks: fits
+                        ? (previous.hasFittingMarks ? previous.normalMarks.union(mark) : mark) : previous.normalMarks,
+                    hasFittingMarks: previous.hasFittingMarks || fits)
             } else {
-                rowFacts[identity] = GridSelectionBadgeRow(frame: slot, normalMarks: mark)
+                rowFacts[identity] = GridSelectionBadgeRow(frame: slot, normalMarks: mark, hasFittingMarks: fits)
             }
         }
         rows = rowIDs.compactMap { rowFacts[$0] }
@@ -328,7 +334,8 @@ public final class GridSelectionBadgeLayout {
                 state = RowState()
             }
             let delta = state.frame.map { CGPoint(x: frame.minX - $0.minX, y: frame.minY - $0.minY) } ?? .zero
-            state.decision.update(tile: frame, home: marks, regions: horizontal, delta: delta)
+            state.decision.update(
+                tile: frame, home: marks, regions: horizontal, delta: delta, canAvoidBand: row.hasFittingMarks)
             state.frame = frame
             next[identity] = state
         }
@@ -341,7 +348,8 @@ public final class GridSelectionBadgeLayout {
         let decision = rowStates[rowIDs[index]]?.decision
         return GridSelectionBadgeRow(
             frame: row.frame, normalMarks: row.normalMarks,
-            usesAlternate: decision?.band == nil ? nil : decision?.usesAlternate, band: decision?.band)
+            usesAlternate: decision?.band == nil ? nil : decision?.usesAlternate, band: decision?.band,
+            hasFittingMarks: row.hasFittingMarks)
     }
 
     public func clearsTileCenters(_ mark: CGRect) -> Bool {

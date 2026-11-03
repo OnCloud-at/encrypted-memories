@@ -6,12 +6,17 @@ public struct GridSelectionBadgeRow: Equatable, Sendable {
     public var normalMarks: CGRect
     public var usesAlternate: Bool?
     public var band: CGRect?
+    public var hasFittingMarks: Bool
 
-    public init(frame: CGRect, normalMarks: CGRect, usesAlternate: Bool? = nil, band: CGRect? = nil) {
+    public init(
+        frame: CGRect, normalMarks: CGRect, usesAlternate: Bool? = nil, band: CGRect? = nil,
+        hasFittingMarks: Bool = true
+    ) {
         self.frame = frame
         self.normalMarks = normalMarks
         self.usesAlternate = usesAlternate
         self.band = band
+        self.hasFittingMarks = hasFittingMarks
     }
 }
 
@@ -68,7 +73,8 @@ public struct GridSelectionBadgeMotion {
             usesAlternate = shared || (!tabletop && !regions.isClear(home))
             band = row?.band
         } else {
-            decision.update(tile: tile, home: home, regions: regions, delta: delta)
+            decision.update(
+                tile: tile, home: home, regions: regions, delta: delta, canAvoidBand: tile.height >= side + 2 * inset)
             usesAlternate = decision.usesAlternate
             band = decision.band
         }
@@ -131,7 +137,7 @@ public struct GridSelectionBadgeMotion {
             isAnimating = source != target
         }
         // A new decision interrupts from the current presentation, not from the previous slot.
-        exterior = usesAlternate && !tile.contains(target)
+        exterior = !tabletop && usesAlternate && !tile.contains(target)
         previousTile = tile
         let result = presentation(now: now)
         return CGRect(origin: result.origin, size: CGSize(width: side, height: side))
@@ -155,7 +161,9 @@ struct GridSelectionBadgeDecision {
     private var entersBefore = true
     private var triggerShare = GridSelectionBadgeMotion.switchShare
 
-    mutating func update(tile: CGRect, home: CGRect, regions: ReservedRegionLayout, delta: CGPoint) {
+    mutating func update(
+        tile: CGRect, home: CGRect, regions: ReservedRegionLayout, delta: CGPoint, canAvoidBand: Bool = true
+    ) {
         if let fold = regions.horizontalFold {
             if band != fold {
                 band = fold
@@ -173,9 +181,11 @@ struct GridSelectionBadgeDecision {
             let upperClearThrough = fold.minY - (top.maxY - tile.minY)
             let lowerClearFrom = fold.maxY - (home.minY - tile.minY)
             let commonRange = upperClearThrough - lowerClearFrom
-            let safeZone = max(4, min(extent * 0.10, commonRange))
+            let safeZone = max(4, canAvoidBand ? min(extent * 0.10, commonRange) : extent * 0.10)
             let switchLine: CGFloat
-            if abs(commonRange) >= safeZone {
+            if !canAvoidBand {
+                switchLine = preferredLine
+            } else if abs(commonRange) >= safeZone {
                 let lower = min(lowerClearFrom, upperClearThrough) + (entersBefore ? safeZone : 0)
                 let upper = max(lowerClearFrom, upperClearThrough) - (entersBefore ? 0 : safeZone)
                 switchLine = min(upper, max(lower, preferredLine))
@@ -189,8 +199,8 @@ struct GridSelectionBadgeDecision {
             let released = entersBefore ? tile.minY < releaseLine : tile.minY > releaseLine
             if crossed { usesAlternate = entersBefore }
             if released { usesAlternate = !entersBefore }
-            if fold.intersects(home), !fold.intersects(top) { usesAlternate = false }
-            if fold.intersects(top), !fold.intersects(home) { usesAlternate = true }
+            if canAvoidBand, fold.intersects(home), !fold.intersects(top) { usesAlternate = false }
+            if canAvoidBand, fold.intersects(top), !fold.intersects(home) { usesAlternate = true }
             return
         }
         let active = regions.exclusions.first {
