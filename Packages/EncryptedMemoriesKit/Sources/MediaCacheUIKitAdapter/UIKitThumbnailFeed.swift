@@ -74,10 +74,6 @@
             core.applyDecodedMemoryPressure(scale: scale, purge: purge)
         }
 
-        public static func decodedCost(_ image: UIImage) -> Int {
-            UIKitThumbnailImageDecoder.decodedCost(image)
-        }
-
         public func cachedImage(for uid: PhotoUID) async -> UIImage? {
             let ticket = imageWrappers.captureTicket()
             guard await core.cachedDecoded(for: uid) != nil else { return nil }

@@ -453,26 +453,6 @@ public final class SmartSearchDiscoveryModel {
         )
     }
 
-    /// Identity of every input that can change the suggestions. Hosts restart `refresh` when it changes.
-    public static func revisionKey(
-        timelineRevision: UInt64,
-        favoriteCount: Int,
-        coordinateCount: Int,
-        snapshot: MLSmartSearchSnapshot?,
-        now: Date = Date()
-    ) -> String {
-        let day = Calendar.current.ordinality(of: .day, in: .era, for: now) ?? 0
-        return [
-            "\(timelineRevision)",
-            "\(favoriteCount)",
-            "\(coordinateCount / 250)",
-            "\(snapshot?.isEnabled == true)",
-            snapshot?.selectedModelID.map { "\($0)" } ?? "-",
-            indexingBucket(snapshot),
-            "\(day)",
-        ].joined(separator: "|")
-    }
-
     /// Coarse indexing progress: evidence is recomputed at most once per 10 % of coverage gained.
     private static func indexingBucket(_ snapshot: MLSmartSearchSnapshot?) -> String {
         switch snapshot?.indexingState {
