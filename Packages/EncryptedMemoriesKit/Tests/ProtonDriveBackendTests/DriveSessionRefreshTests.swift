@@ -158,7 +158,7 @@ struct DriveSessionRefreshTests {
 
     /// A late waiter of an earlier flight must not retire the flight that runs now.
     @Test func aLateWaiterOfAnEarlierFlightKeepsTheCurrentFlight() {
-        var flights = RefreshFlight()
+        var flights = RefreshFlight<Bool>()
         let first = flights.join { Task { true } }
         flights.retire(first.id)
         let second = flights.join { Task { true } }
@@ -171,7 +171,7 @@ struct DriveSessionRefreshTests {
     }
 
     @Test func theWaiterOfTheCurrentFlightRetiresIt() {
-        var flights = RefreshFlight()
+        var flights = RefreshFlight<Bool>()
         let flight = flights.join { Task { true } }
 
         flights.retire(flight.id)

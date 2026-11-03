@@ -131,9 +131,8 @@ public enum ProtonDriveBackendFactory {
 /// Classifies a library-open failure that no Retry with the same session can clear.
 public enum LibraryOpenFailurePermanence {
     /// True only for a confirmed permanent cause: the account has no photos share, the drive scope is terminally
-    /// lost, or the server rejected the session after one refresh attempt already failed to renew it. Every other
-    /// cause — a network failure, a rate limit, or an unclear server answer — can still clear on a new attempt,
-    /// so the caller keeps the Retry button.
+    /// lost, or the server rejected the session. Account fetches report an unsuccessful refresh separately
+    /// when rejection is unproved. Network failures, rate limits and unclear answers keep Retry.
     public static func isPermanent(_ error: Error) -> Bool {
         if error is DriveBridgeError { return true }
         if error is any LibraryChangeTerminalError { return true }
