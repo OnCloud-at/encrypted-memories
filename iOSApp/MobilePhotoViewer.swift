@@ -44,6 +44,11 @@ struct MobilePhotoViewer: View {
     @State private var chromeVisible = true
     /// Whether the system put the media and the lower part side by side: the folded layout of a partly open device.
     @State private var arrangementSideBySide = false
+    @State private var videoTransport: ViewerVideoTransport
+    #if DEBUG
+        @Environment(\.mobileViewerIsDividedForTesting) private var dividedArrangementForTesting
+        @Environment(\.mobileViewerTransportChromeForTesting) private var transportChromeForTesting
+    #endif
     @State private var burstSelection = BurstSelectionModel()
     @State private var editedOriginal = EditedPhotoOriginalState()
     @State private var editedOriginalLookup = EditedPhotoOriginalLookup()
@@ -92,8 +97,10 @@ struct MobilePhotoViewer: View {
         viewerRouter: MobileViewerRouter,
         showsInfoInitially: Bool = false,
         followsLibraryReplacements: Bool = false,
-        duplicateGroup: MobileDuplicateViewerGroup? = nil
+        duplicateGroup: MobileDuplicateViewerGroup? = nil,
+        videoTransport: ViewerVideoTransport? = nil
     ) {
+        _videoTransport = State(initialValue: videoTransport ?? ViewerVideoTransport())
         _showInfo = State(initialValue: showsInfoInitially)
         _items = State(initialValue: items)
         self.startIndex = startIndex
@@ -163,7 +170,8 @@ struct MobilePhotoViewer: View {
                     MobileViewerPage(
                         item: item,
                         isCurrent: isCurrent,
-                        showsChrome: chromeVisible,
+                        videoTransport: videoTransport,
+                        transportPlacement: videoTransportPlacement,
                         resolvedMediaKind: resolvedMediaKinds[item.uid],
                         libraryModel: libraryModel,
                         imageStore: imageStore,
@@ -340,6 +348,9 @@ struct MobilePhotoViewer: View {
         if chromeVisible {
             let profile = chromeLayoutProfile
             VStack(spacing: 0) {
+                if videoTransportPlacement == .lowerPart {
+                    MobileViewerTransportRow(transport: videoTransport)
+                }
                 MobileViewerFilmstrip(
                     items: items,
                     selectedUID: currentBaseItem?.uid,
@@ -378,9 +389,29 @@ struct MobilePhotoViewer: View {
         }
     }
 
+    private var isDivided: Bool {
+        #if DEBUG
+            if let dividedArrangementForTesting { return dividedArrangementForTesting }
+        #endif
+        return arrangementSideBySide
+    }
+
+    private var transportChromeVisible: Bool {
+        #if DEBUG
+            if let transportChromeForTesting { return transportChromeForTesting }
+        #endif
+        return chromeVisible
+    }
+
+    private var videoTransportPlacement: ViewerArrangement.VideoTransportPlacement {
+        let available = videoTransport.isAttached(to: currentBaseItem.map { editedOriginal.displayed($0).uid })
+        return ViewerArrangement.videoTransportPlacement(
+            isDivided: isDivided, showsChrome: transportChromeVisible, isAvailable: available)
+    }
+
     private var isCompactLandscape: Bool { verticalSizeClass == .compact }
     private var chromeLayoutProfile: ViewerChromeLayoutProfile {
-        MobileViewerBottomLayout.profile(compactLandscape: isCompactLandscape, sideBySide: arrangementSideBySide)
+        MobileViewerBottomLayout.profile(compactLandscape: isCompactLandscape, sideBySide: isDivided)
     }
 
     /// Native bar content. Close leads the navigation bar and the more-actions menu trails it; the per-photo
@@ -1156,7 +1187,8 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
 private struct MobileViewerPage: View {
     let item: PhotoItem
     let isCurrent: Bool
-    let showsChrome: Bool
+    let videoTransport: ViewerVideoTransport
+    let transportPlacement: ViewerArrangement.VideoTransportPlacement
     let resolvedMediaKind: MediaKind?
     let libraryModel: MobileLibraryModel
     let imageStore: UIKitViewerImageStore
@@ -1170,7 +1202,8 @@ private struct MobileViewerPage: View {
             MobileVideoPage(
                 item: item,
                 isCurrent: isCurrent,
-                showsChrome: showsChrome,
+                transport: videoTransport,
+                transportPlacement: transportPlacement,
                 libraryModel: libraryModel,
                 onToggleChrome: onToggleChrome,
                 onCloseRequested: onCloseRequested
@@ -1739,6 +1772,19 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
     }
 }
 
+private struct MobileViewerTransportRow: View {
+    let transport: ViewerVideoTransport
+
+    var body: some View {
+        let snapshot = transport.snapshot
+        MobileVideoPlaybackControls(
+            currentTime: snapshot.currentTime, duration: snapshot.duration, isPlaying: snapshot.isPlaying,
+            isLoading: snapshot.isLoading, onTogglePlayback: transport.togglePlayback,
+            onSeekTo: transport.seek(to:), fillsHeight: false
+        )
+    }
+}
+
 private struct MobileVideoPlaybackControls: View {
     let currentTime: Double
     let duration: Double
@@ -1746,6 +1792,7 @@ private struct MobileVideoPlaybackControls: View {
     let isLoading: Bool
     let onTogglePlayback: () -> Void
     let onSeekTo: (Double) -> Void
+    let fillsHeight: Bool
 
     @State private var scrubTime: Double?
     @Environment(\.verticalSizeClass) private var verticalSizeClass
@@ -1753,13 +1800,13 @@ private struct MobileVideoPlaybackControls: View {
     private var displayedTime: Double { scrubTime ?? currentTime }
     private var seekRange: ClosedRange<Double> { 0...max(duration, 0.1) }
     private var layoutProfile: ViewerChromeLayoutProfile {
-        // The transport sits on the media and follows the size class only, in every arrangement.
+        // Both placements keep the existing transport sizes and design.
         MobileViewerBottomLayout.profile(compactLandscape: verticalSizeClass == .compact, sideBySide: false)
     }
 
     var body: some View {
         VStack {
-            Spacer()
+            if fillsHeight { Spacer() }
 
             HStack(spacing: 12) {
                 playbackButton(
@@ -1835,7 +1882,8 @@ private struct MobileVideoPlaybackControls: View {
 private struct MobileVideoPage: View {
     let item: PhotoItem
     let isCurrent: Bool
-    let showsChrome: Bool
+    let transport: ViewerVideoTransport
+    let transportPlacement: ViewerArrangement.VideoTransportPlacement
     let libraryModel: MobileLibraryModel
     let onToggleChrome: () -> Void
     let onCloseRequested: () -> Void
@@ -1904,7 +1952,7 @@ private struct MobileVideoPage: View {
                     }
                 }
 
-                if showsChrome {
+                if transportPlacement == .media {
                     MobileVideoPlaybackControls(
                         currentTime: playbackTime,
                         duration: playbackDuration,
@@ -1914,7 +1962,7 @@ private struct MobileVideoPage: View {
                             isActivelyPlaying: playbackIsPlaying
                         ),
                         onTogglePlayback: togglePlayback,
-                        onSeekTo: seek(to:)
+                        onSeekTo: seek(to:), fillsHeight: true
                     )
                     .transition(.opacity)
                 }
@@ -1961,9 +2009,11 @@ private struct MobileVideoPage: View {
             if current {
                 playbackIntendsToPlay = true
                 player?.play()
+                attachTransport()
             } else {
                 playbackIntendsToPlay = false
                 player?.pause()
+                detachTransport()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime)) {
@@ -2036,6 +2086,7 @@ private struct MobileVideoPage: View {
             @unknown default:
                 break
             }
+            publishTransport()
             try? await Task.sleep(for: .milliseconds(150))
         }
     }
@@ -2055,6 +2106,7 @@ private struct MobileVideoPage: View {
         }
         playbackIsPlaying = willPlay && player.timeControlStatus == .playing
         playbackIsBuffering = willPlay && player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        publishTransport()
     }
 
     private func seek(to seconds: Double) {
@@ -2063,6 +2115,33 @@ private struct MobileVideoPage: View {
         let target = min(max(0, seconds), upper)
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         playbackTime = target
+        publishTransport()
+    }
+
+    private var transportSnapshot: ViewerVideoTransport.Snapshot {
+        ViewerVideoTransport.Snapshot(
+            currentTime: playbackTime, duration: playbackDuration,
+            isPlaying: playbackIsPlaying || playbackIsBuffering,
+            isLoading: MobileVideoPlaybackIntent.showsLoadingIndicator(
+                intendsToPlay: playbackIntendsToPlay, isActivelyPlaying: playbackIsPlaying)
+        )
+    }
+
+    private func attachTransport() {
+        guard isCurrent, let playbackAttachment else { return }
+        transport.attach(
+            uid: item.uid, attachment: playbackAttachment, snapshot: transportSnapshot,
+            onTogglePlayback: togglePlayback, onSeekTo: seek(to:))
+    }
+
+    private func publishTransport() {
+        guard let playbackAttachment else { return }
+        transport.update(transportSnapshot, attachment: playbackAttachment)
+    }
+
+    private func detachTransport() {
+        guard let playbackAttachment else { return }
+        transport.detach(attachment: playbackAttachment)
     }
 
     private var placeholderDismissDrag: some Gesture {
@@ -2199,6 +2278,7 @@ private struct MobileVideoPage: View {
                 playbackIntendsToPlay = true
                 newPlayer.play()
             }
+            attachTransport()
         } catch is CancellationError {
             return
         } catch {
@@ -2212,6 +2292,7 @@ private struct MobileVideoPage: View {
     }
 
     private func teardown() {
+        detachTransport()
         playbackGeneration &+= 1
         playbackAttachment = nil
         playbackSourceIdentity = nil
@@ -2272,6 +2353,7 @@ private struct MobileVideoPage: View {
         playbackIsPlaying = false
         playbackIntendsToPlay = false
         playbackIsBuffering = false
+        publishTransport()
     }
 
     private func failPlayback(
@@ -2282,6 +2364,7 @@ private struct MobileVideoPage: View {
     ) {
         guard isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem) else { return }
         failure = error
+        detachTransport()
         playbackGeneration &+= 1
         playbackAttachment = nil
         playbackSourceIdentity = nil

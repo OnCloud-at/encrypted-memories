@@ -75,6 +75,79 @@ struct UIKitTimelineMissingTilesTests {
         #expect(!host.placeholderIsAnimating)
     }
 
+    @Test(arguments: [false, true])
+    func scrollingRestartsTheBoundedSweepOnlyAfterNewLoadingTilesSettle(decelerates: Bool) throws {
+        let items = (0..<180).map {
+            PhotoItem(
+                uid: uid("scroll-\($0)"), captureTime: Date(timeIntervalSince1970: Double($0)), mediaType: "image/jpeg")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let feed = UIKitThumbnailFeed(cache: ThumbnailCache(rootDirectory: directory), loader: ChromeProbeLoader())
+        let host = UIKitTimelineGridHostView(
+            frame: CGRect(x: 0, y: 0, width: 390, height: 844),
+            displayLink: UIKitTimelineDisplayLinkDriver(), renderFrame: { .drawn(hasPendingWork: false) })
+        let window = UIWindow(frame: host.bounds)
+        window.addSubview(host)
+        window.isHidden = false
+        defer {
+            host.setActive(false)
+            host.removeFromSuperview()
+            window.isHidden = true
+        }
+        host.configure(items: items, thumbnailFeed: feed, initialViewportPlacement: .oldest)
+        host.layoutIfNeeded()
+        host.setPlaceholderReduceMotion(false)
+        func visible() throws -> [PhotoUID] {
+            let plan = try #require(host.accessibilityFramePlan())
+            return plan.visibleSlots.map { items[$0.index].uid }
+        }
+        func update(_ time: Double) throws {
+            host.updatePlaceholderPulse(visibleUIDs: try visible(), isResident: { _ in false }, now: time)
+        }
+        let initial = Set(try visible())
+        try #require(!initial.isEmpty)
+        try update(0)
+        try update(5)
+        #expect(!host.placeholderIsAnimating)
+        host.scrollViewWillBeginDragging(host.scrollView)
+        host.scrollView.setContentOffset(CGPoint(x: 0, y: 1_200), animated: false)
+        try #require(!Set(try visible()).subtracting(initial).isEmpty, "SETUP: scrolling reveals new photos")
+        host.scrollViewDidEndDragging(host.scrollView, willDecelerate: decelerates)
+        if decelerates {
+            try update(10)
+            #expect(!host.placeholderIsAnimating, "The sweep waits until deceleration ends")
+            host.scrollViewDidEndDecelerating(host.scrollView)
+        }
+        try update(10)
+        #expect(host.placeholderIsAnimating, "The real scroll-end route restarts for newly visible loading tiles")
+        try update(15)
+        #expect(!host.placeholderIsAnimating, "The new sweep keeps the existing duration bound")
+        host.scrollViewDidEndDecelerating(host.scrollView)
+        try update(16)
+        #expect(!host.placeholderIsAnimating, "A repeated end notification cannot restart the same sweep")
+        host.scrollViewWillBeginDragging(host.scrollView)
+        host.scrollViewDidEndDragging(host.scrollView, willDecelerate: false)
+        try update(17)
+        #expect(!host.placeholderIsAnimating, "A gesture that reveals no new tiles cannot restart the sweep")
+        host.setPlaceholderReduceMotion(true)
+        host.scrollViewWillBeginDragging(host.scrollView)
+        let previous = Set(try visible())
+        host.scrollView.setContentOffset(CGPoint(x: 0, y: 2_400), animated: false)
+        try #require(!Set(try visible()).subtracting(previous).isEmpty)
+        host.scrollViewDidEndDragging(host.scrollView, willDecelerate: false)
+        try update(18)
+        #expect(!host.placeholderIsAnimating, "Reduce Motion remains static after new tiles settle")
+        host.setPlaceholderReduceMotion(false)
+        let beforeJump = Set(try visible())
+        host.scrollToLatest(animated: false)
+        try #require(!Set(try visible()).subtracting(beforeJump).isEmpty)
+        try update(19)
+        #expect(host.placeholderIsAnimating, "An explicit jump also ends on newly visible loading tiles")
+        try update(24)
+        #expect(!host.placeholderIsAnimating)
+    }
+
     @Test func theSweepRestartsWhenTheGridBecomesActiveAgain() {
         let id = uid("restart")
         let host = makeHost([id])

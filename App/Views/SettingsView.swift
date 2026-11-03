@@ -846,8 +846,8 @@ private struct MacExcludedPhotosSheet: View {
 }
 
 /// Native macOS presentation over the same shared failed-item and retry contracts as iOS/iPadOS.
-/// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
-/// Sync now is its retry.
+/// An album row opens the same sheet with its last-run photos and restores a trashed copy through the shared
+/// controller. Sync now on the album row retries the album.
 private struct MacFailedBackupSheet: View {
     enum Source {
         case backup(PhotoLibraryBackupController)
@@ -928,6 +928,13 @@ private struct MacFailedBackupSheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .list:
                 List {
+                    if case .album(let albumSync, _) = source, let message = albumSync.lastMessage,
+                        message == L10n.string("albumsync.error_restore_photo")
+                    {
+                        Text(message)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("albumsync.restoreError")
+                    }
                     BackupProblemSections(items: items) { item in
                         BackupProblemRow(item: item, previews: previews) {
                             if let controller, item.issue == .deletedElsewhere {
@@ -943,6 +950,16 @@ private struct MacFailedBackupSheet: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .help(L10n.string("backup.back_up_again"))
+                            } else if case .album(let albumSync, let albumID) = source, item.issue == .remoteDeletion {
+                                Button(L10n.string("contextmenu.restore")) {
+                                    personReadTask?.cancel()
+                                    personReadTask = Task {
+                                        await albumSync.restorePhotoFromProblemList(item, albumID: albumID)
+                                    }
+                                }
+                                .buttonStyle(.borderless)
+                                .help(L10n.string("contextmenu.restore"))
+                                .accessibilityIdentifier("albumsync.restore.\(item.id)")
                             } else if let controller, item.isPermanent {
                                 Button {
                                     controller.dismissFailedItem(item)

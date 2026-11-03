@@ -2529,7 +2529,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 if duration >= .seconds(60) { await retry.wait() } else { try await Task.sleep(for: duration) }
             })
         await coordinator.start()
-        XCTAssertTrue(effects.favorites.isEmpty, "while one state is unreadable, a source without state is unknown")
+        XCTAssertEqual(effects.favorites, [remote], "a readable rowless source acts while another state is unreadable")
 
         try setDesired("excluded", of: "bad")
         retry.open()

@@ -29,6 +29,106 @@ final class AlbumSyncPhotoRecoveryControllerTests: XCTestCase {
         }
     }
 
+    func testProblemListRestoreRunsNormalSyncAndAttachesWithoutUpload() async throws {
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                let uploads = fixture.device.server.uploadRequestCount
+                let source = try XCTUnwrap(fixture.problem.source)
+                let journal = fixture.device.journal.entry(for: source)
+
+                await fixture.controller.restorePhotoFromProblemList(fixture.problem, albumID: "local-album")
+                await waitForSync(fixture.controller)
+
+                XCTAssertEqual(probe.ensureBackedUpCalls, 1, "Restore must run the normal album sync once")
+                let row = try XCTUnwrap(fixture.controller.selectedAlbums.first { $0.id == "local-album" })
+                XCTAssertTrue(row.problems.isEmpty)
+                XCTAssertFalse(row.hasNeedsAttention)
+                let members = try await fixture.device.server.childMainLinkIDs(albumID: "own-album")
+                XCTAssertEqual(members, [fixture.original.nodeID], "The same existing copy enters the album")
+                XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+                XCTAssertEqual(fixture.device.journal.entry(for: source), journal)
+                XCTAssertNil(fixture.controller.lastMessage)
+            })
+    }
+
+    func testProblemListUnknownRemoteKeepsTheRowAndReportsRestoreFailure() async throws {
+        try await assertProblemListRestoreUnavailable(permanentlyMissing: false)
+    }
+
+    func testProblemListPermanentlyMissingRemoteKeepsTheRowAndReportsRestoreFailure() async throws {
+        try await assertProblemListRestoreUnavailable(permanentlyMissing: true)
+    }
+
+    func testStoppingProblemListRestoreKeepsTheRowWithoutSyncOrAnError() async throws {
+        let gate = RecoveryGate()
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            onEvidence: { await gate.wait() },
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                let before = fixture.controller.selectedAlbums.first?.problems
+                let uploads = fixture.device.server.uploadRequestCount
+                let task = Task {
+                    await fixture.controller.restorePhotoFromProblemList(fixture.problem, albumID: "local-album")
+                }
+                await fulfillment(of: [gate.entered], timeout: 5)
+                fixture.controller.stopSync()
+                await fulfillment(of: [gate.cancelled], timeout: 5)
+                await gate.release()
+                await task.value
+
+                XCTAssertEqual(probe.ensureBackedUpCalls, 0)
+                XCTAssertEqual(fixture.controller.selectedAlbums.first?.problems, before)
+                XCTAssertNil(fixture.controller.lastMessage)
+                XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+                assertTrashed(fixture)
+            })
+    }
+
+    private func assertProblemListRestoreUnavailable(permanentlyMissing: Bool) async throws {
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                let before = fixture.controller.selectedAlbums.first?.problems
+                let uploads = fixture.device.server.uploadRequestCount
+                let source = try XCTUnwrap(fixture.problem.source)
+                let journal = fixture.device.journal.entry(for: source)
+                if permanentlyMissing {
+                    fixture.device.server.personEmptyTrash()
+                } else {
+                    fixture.device.server.omitVisibility(of: [fixture.original.nodeID])
+                }
+                let restores = fixture.device.server.steps.filter { $0.action.hasPrefix("person restore ") }.count
+
+                await fixture.controller.restorePhotoFromProblemList(fixture.problem, albumID: "local-album")
+                await waitForSync(fixture.controller)
+
+                XCTAssertEqual(probe.ensureBackedUpCalls, 0, "A refused restore must not start backup or album sync")
+                XCTAssertEqual(fixture.controller.selectedAlbums.first?.problems, before)
+                XCTAssertEqual(fixture.controller.lastMessage, L10n.string("albumsync.error_restore_photo"))
+                XCTAssertEqual(fixture.controller.lastMessageStyle, .error)
+                XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+                XCTAssertEqual(fixture.device.journal.entry(for: source), journal)
+                XCTAssertEqual(
+                    fixture.device.server.steps.filter { $0.action.hasPrefix("person restore ") }.count, restores)
+                XCTAssertEqual(
+                    fixture.device.server.links.first { $0.linkID == fixture.original.nodeID }?.state,
+                    permanentlyMissing ? .deleted : .trashed)
+            })
+    }
+
     func testStopCancelsHeldEvidenceAndRejectsRepeatedActionUntilItEnds() async throws {
         let gate = RecoveryGate()
         try await withFixture(

@@ -44,9 +44,13 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
 
     private var contentReadyReported = false
+    var allowsPlaceholderContentReady = false {
+        didSet { if oldValue != allowsPlaceholderContentReady { requestRedraw() } }
+    }
     private var firstContentReadyLogged = false
     private var placeholderPulse = MetalGridPlaceholderPulse(
         reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+    private var placeholderScroll = MetalGridPlaceholderScrollTracker<PhotoUID>()
     /// Notifies the shell while the grid is presenting a live resize.
     var liveResizeChanged: ((Bool) -> Void)?
     /// One-shot cold-start `[FirstContent]` trace state for the first on-screen frame with real visible cells.
@@ -307,6 +311,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
 
     func setDataSource(_ newSource: MetalGridDataSource, preservingColumnPhase: Bool = false) {
         invalidateContentReadiness()
+        if dataSource !== newSource { placeholderScroll.reset() }
         dataSource = newSource
         newSource.updateUploadBadges(uploadBadges)
         rebuildIndex(preservingColumnPhase: preservingColumnPhase)
@@ -2219,19 +2224,42 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         if placeholderPulse.setReduceMotion(enabled) { requestRedraw() }
     }
 
+    func beginPlaceholderScroll() {
+        placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
+    }
+
+    func endPlaceholderScroll(isVisible: Bool) {
+        if placeholderScroll.ended(
+            visibleIDs: visiblePlaceholderUIDs(), isVisible: isVisible, reduceMotion: placeholderPulse.reduceMotion,
+            isLoading: isLoadingPlaceholder, pulse: &placeholderPulse)
+        {
+            requestRedraw()
+        }
+    }
+
+    private func visiblePlaceholderUIDs() -> [PhotoUID] {
+        let ids = dataSource.flatUIDs
+        return visibleCells().compactMap { cell in
+            ids.indices.contains(cell.flatIndex) ? ids[cell.flatIndex] : nil
+        }
+    }
+
     /// The grid is hidden or detached: pending readiness is void and the next loading tile starts a new sweep.
     func presentationSuspended() {
         invalidateContentReadiness()
+        placeholderScroll.reset()
         placeholderPulse.restart()
     }
 
-    /// Placeholders draw as soon as the grid is visible, but the shell lifts the loading screen only once a visible
-    /// thumbnail is resident, so a failing byte route still reaches the shell as a load failure.
+    /// A known-photo placeholder may reveal fresh metadata. Other callers retain the resident-thumbnail gate.
     func didRenderVisible(_ uids: [PhotoUID]) {
-        guard !contentReadyReported else { return }
+        guard !contentReadyReported,
+            MetalGridFrameComposer.hasPresentableFirstContent(
+                visibleIDs: uids, allowsPlaceholders: allowsPlaceholderContentReady,
+                isKnown: { self.indexByUID[$0] != nil }, isResident: cache.isResident)
+        else { return }
         var resident = 0
         for uid in uids where cache.isResident(uid) { resident += 1 }
-        guard resident > 0 else { return }
         contentReadyReported = true
         if !firstContentReadyLogged {
             firstContentReadyLogged = true

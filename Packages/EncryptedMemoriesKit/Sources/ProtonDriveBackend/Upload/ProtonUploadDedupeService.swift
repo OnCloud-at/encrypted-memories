@@ -817,6 +817,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let eventLineageStore = lineageStore.flatMap {
             $0.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: checkpoint.eventID) ? $0 : nil
         }
+        var lineageSaveFailed = false
         while true {
             try Task.checkCancellation()
             let page = try await session.fetchVolumeEvents(
@@ -895,14 +896,16 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     expectedEventID: eventID, eventID: page.eventID,
                     unresolvedRemoteLinkIDs: rows.lineageRows.unresolvedLinkIDs)
             {
-                // The same incomplete-read failure as a failed lineage repair: the pass ends partial, not success.
-                // A later finish is ignored, and the wrapper's success no longer hides the failed save.
-                measurement?.finish(.partial)
+                // Mark the completed pass partial without hiding a later failure or cancellation.
+                lineageSaveFailed = true
                 DebugLog.log("[Dedupe] lineage index changes could not be saved; reads remain incomplete")
             }
             eventID = page.eventID
             if !page.hasMore { break }
         }
+        // Only a completed batch leaves the loop here: pages after a failed lineage save still counted, and a
+        // later failure or cancellation still ended the pass through the loop's own error paths.
+        if lineageSaveFailed { measurement?.finish(.partial) }
         // After the events: a repair backlog never delays them, and it writes only at the checkpoint they reached.
         if let eventLineageStore, eventLineageStore.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: eventID) {
             try await WorkMeasurementOperation.run(.lineageRepair, collector: workMeasurements) { measurement in

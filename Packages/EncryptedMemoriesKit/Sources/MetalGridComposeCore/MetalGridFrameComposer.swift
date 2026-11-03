@@ -14,6 +14,13 @@ import simd
 /// It is data-in / data-out. It never retains AppKit/UIKit objects, imports no platform view framework, and
 /// mutates only the injected texture cache (which is itself platform-neutral).
 package enum MetalGridFrameComposer {
+    /// The host calls this after encoding a frame. Placeholder readiness never establishes inventory authority.
+    package static func hasPresentableFirstContent<ID>(
+        visibleIDs: [ID], allowsPlaceholders: Bool, isKnown: (ID) -> Bool, isResident: (ID) -> Bool
+    ) -> Bool {
+        visibleIDs.contains { isKnown($0) && (allowsPlaceholders || isResident($0)) }
+    }
+
     /// Only the even-column profile uses division alignment. Compact and pointer ladders keep their geometry.
     /// Activity does not filter divisions: the same physical gap stays in place when the display becomes flat.
     package static func gridDivisionFrame(

@@ -1989,6 +1989,23 @@
         }
       }
     },
+    "albumsync.error_restore_photo": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wiederherstellen nicht möglich."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't restore this photo."
+          }
+        }
+      }
+    },
     "albumsync.error_store_unavailable": {
       "extractionState": "manual",
       "comment": "Album sync error: the local album-mapping database could not be opened; syncing without it could create duplicate albums.",
