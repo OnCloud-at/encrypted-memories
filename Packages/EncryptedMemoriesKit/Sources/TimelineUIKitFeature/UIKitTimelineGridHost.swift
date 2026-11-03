@@ -303,6 +303,10 @@
         private var pendingContentEpochs = PendingContentEpochTracker()
         private var pendingHandovers = PendingHandoverTracker()
         private let uploadBadgeAnimator = GridUploadBadgeAnimator<PhotoUID>()
+        private let selectionBadgeLayout = GridSelectionBadgeLayout()
+        private var selectionBadgeMotions: [PhotoUID: GridSelectionBadgeMotion] = [:]
+        private var selectionBadgeSeen: Set<PhotoUID> = []
+        private var selectionBadgeAnimationActive = false
         var texturePolicy: UIKitMetalGridTexturePolicy?
         private var texturePressureRegistration: MemoryPressureRegistration?
         var thumbnailFeed: UIKitThumbnailFeed?
@@ -1930,6 +1934,7 @@
             let activeReveal =
                 textureCache.hasActiveThumbnailReveal(in: uids, now: now)
                 || uploadBadgeAnimator.isAnimating(uids, now: now)
+                || selectionBadgeAnimationActive
             let uploadsProgressing = MetalGridFrameComposer.hasProgressingVisibleUploads(
                 cache: textureCache, ramReadyMissing: ramReadyMissing)
             return .drawn(
@@ -1965,9 +1970,6 @@
                     flatUIDs: itemUIDs, viewportSize: viewportSize
                 ) { isLoadingPlaceholder($0, isResident: textureCache.isResident) },
                 now: now)
-            let activeReveal =
-                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
-                || uploadBadgeAnimator.isAnimating(uids, now: now)
             textureCache.evictToBudget()
             let sourceGroups = MetalGridFrameComposer.buildGroups(
                 slots: MetalGridFrameComposer.viewportDrawSlots(sourceSlots, viewportSize: viewportSize),
@@ -1975,7 +1977,7 @@
                 cache: textureCache,
                 displayMode: plan.sourceDisplayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
-                decorations: productionDecorations(),
+                decorations: productionDecorations(animateSelectionBadges: false),
                 now: now,
                 placeholderPulse: placeholderPulse,
                 canRetryPlaceholder: canRetryPlaceholder
@@ -1986,11 +1988,14 @@
                 cache: textureCache,
                 displayMode: plan.targetDisplayMode,
                 cornerRadius: GridVisualConstants.thumbnailCornerRadius,
-                decorations: productionDecorations(),
+                decorations: productionDecorations(animateSelectionBadges: false),
                 now: now,
                 placeholderPulse: placeholderPulse,
                 canRetryPlaceholder: canRetryPlaceholder
             ).groups
+            let activeReveal =
+                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+                || uploadBadgeAnimator.isAnimating(uids, now: now)
             guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
             let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
             renderer.renderLayerDissolve(
@@ -2148,6 +2153,7 @@
                 || placeholderPulse.isAnimating
                 || textureCache.hasActiveThumbnailReveal(in: ids.visible, now: now)
                 || uploadBadgeAnimator.isAnimating(ids.visible, now: now)
+                || selectionBadgeAnimationActive
                 || MetalGridFrameComposer.hasProgressingVisibleUploads(
                     cache: textureCache, ramReadyMissing: ramReadyMissing)
                 || (streamResult.pendingVisibleQualityUpgrade && canMakeProgress)
@@ -2254,11 +2260,18 @@
             return items[slot.index]
         }
 
-        private func productionDecorations() -> MetalGridDecorations<PhotoUID> {
+        private func productionDecorations(animateSelectionBadges: Bool = true) -> MetalGridDecorations<PhotoUID> {
             let accent = SIMD4<Float>(Float(0x6D) / 255, Float(0x4A) / 255, Float(0xFF) / 255, 1)
             // One time for the whole frame, so every badge of the frame animates in step.
             let frameTime = CACurrentMediaTime()
-            return MetalGridDecorations(
+            selectionBadgeMotions = selectionBadgeMotions.filter { selectionBadgeSeen.contains($0.key) }
+            selectionBadgeSeen.removeAll(keepingCapacity: true)
+            selectionBadgeAnimationActive = false
+            if !animateSelectionBadges {
+                // Dissolve layers have different geometry for the same UID. Their compositor owns the transition.
+                selectionBadgeMotions.removeAll(keepingCapacity: true)
+            }
+            var decorations = MetalGridDecorations<PhotoUID>(
                 accent: accent,
                 accentGlyphColor: MetalGridGlyphColor(
                     red: Double(accent.x), green: Double(accent.y), blue: Double(accent.z), alpha: 1),
@@ -2271,8 +2284,22 @@
                 uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
                     uploadBadgeAnimator.frame(for: uid, target: badge, now: frameTime)
                 },
-                reservedRegions: reservedRegionLayout
-            )
+                reservedRegions: reservedRegionLayout, selectionBadgeLayout: selectionBadgeLayout)
+            if animateSelectionBadges {
+                decorations.selectionBadgeFrame = {
+                    [self] uid, tile, side, inset, regions, occupied, neighbors, row, layout in
+                    selectionBadgeSeen.insert(uid)
+                    var motion = selectionBadgeMotions[uid] ?? GridSelectionBadgeMotion()
+                    let rect = motion.frame(
+                        tile: tile, side: side, inset: inset, regions: regions, avoiding: occupied,
+                        neighboringTiles: neighbors, row: row, layout: layout, now: frameTime,
+                        reduceMotion: UIAccessibility.isReduceMotionEnabled)
+                    selectionBadgeMotions[uid] = motion
+                    selectionBadgeAnimationActive = selectionBadgeAnimationActive || motion.isAnimating
+                    return rect
+                }
+            }
+            return decorations
         }
 
         /// The Metal view fills the host, so the host's reserved regions are already in viewport coordinates.
