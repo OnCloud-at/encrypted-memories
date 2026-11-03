@@ -421,6 +421,7 @@ private struct SessionEffects: PendingBackupEffects {
     func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
         let photos = keys.filter { $0.kind == .photoLibraryAsset }.map(\.identifier)
         let fileKeys = keys.filter { $0.kind == .fileURL }.map(\.identifier)
+        guard fileKeys.isEmpty || files != nil else { return false }
         var succeeded = true
         if !photos.isEmpty { succeeded = await photoBackup.returnToBackup(identifiers: photos) }
         if !fileKeys.isEmpty, let files { succeeded = await files.returnToBackup(fileKeys) && succeeded }

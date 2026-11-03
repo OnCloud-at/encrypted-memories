@@ -7,6 +7,67 @@ import UploadCore
 @testable import PhotoLibraryBackupAdapter
 
 @Suite @MainActor struct PendingGridConnectionTests {
+    @Test func missingFileAdapterKeepsQueueSyncDuty() async throws {
+        try await assertFileReturnDuty(adapterResult: nil)
+    }
+
+    @Test func refusedFileAdapterKeepsQueueSyncDuty() async throws {
+        try await assertFileReturnDuty(adapterResult: false)
+    }
+
+    @Test func successfulFileAdapterAcknowledgesQueueSyncDuty() async throws {
+        try await assertFileReturnDuty(adapterResult: true)
+    }
+
+    private func assertFileReturnDuty(adapterResult: Bool?) async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let key = PendingSourceKey(
+            kind: .fileURL, identifier: fixture.directory.appendingPathComponent("photo.heic").path)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let excluded = try #require(
+            fixture.store.exclude(
+                [
+                    .init(
+                        key: key,
+                        presentation: .init(captureTime: date, mediaType: "image/heic", displayName: "photo.heic"),
+                        remote: nil, revision: .init(rawValue: 1))
+                ], at: date)?.first)
+        #expect(fixture.store.completeEffect(.queueSync, for: key, generation: excluded.generation, at: date))
+        let queue = try #require(
+            UploadBackupSyncQueueManifestStore(url: fixture.directory.appendingPathComponent("files.sqlite")))
+        let calls = ChangeCounter()
+        let files = adapterResult.map { result in
+            PendingFileSource(
+                queue: queue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true },
+                returnToBackup: { _ in
+                    calls.count += 1
+                    return result
+                })
+        }
+        let session = try #require(
+            PendingGridSession(
+                store: fixture.store, photoBackup: fixture.controller, remote: NoRemoteEffects(), files: files))
+
+        #expect(await session.restore([key.localUID]))
+
+        let after = fixture.store.sourceState(for: key)
+        if adapterResult == true {
+            #expect(after == nil, "A successful file callback can acknowledge the included source's queue duty")
+        } else {
+            #expect(after?.desired == .included)
+            #expect(
+                after?.needsQueueSync == true,
+                "Without a successful file adapter, performQueueSync must retain the duty")
+        }
+        #expect(calls.count == (adapterResult == nil ? 0 : 1))
+        #expect(fixture.store.isOperational())
+        await session.close()
+        await fixture.controller.shutdown()
+        fixture.store.close()
+        queue.close()
+    }
+
     @Test func aStoreWithoutASessionStaysForTheTeardown() async throws {
         let fixture = try Fixture(pendingStoreInController: false)
         defer { fixture.remove() }
