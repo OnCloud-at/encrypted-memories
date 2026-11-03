@@ -72,6 +72,12 @@ public actor UploadManager: UploadManaging {
         var controlTask: Task<Void, Never>? = nil
         var controlID: UUID? = nil
         var nativeCancellationTask: Task<Void, Never>? = nil
+
+        var snapshot: UploadItem {
+            var snapshot = item
+            snapshot.hasTerminalSettlement = settlementRecord?.isPending == false
+            return snapshot
+        }
     }
 
     private var jobs: [UploadQueueItemID: Job] = [:]
@@ -1413,7 +1419,7 @@ public actor UploadManager: UploadManaging {
             // too; a snapshot that comes first starts it here, without a notification.
             startDurableSettlementReplaySynchronouslyIfNeeded()
         }
-        return order.compactMap { jobs[$0]?.item }
+        return order.compactMap { jobs[$0]?.snapshot }
     }
 
     /// Loads durable rows once per manager lifetime and schedules only the metadata/album replay
@@ -1445,7 +1451,7 @@ public actor UploadManager: UploadManaging {
         stats.persistenceUnavailable =
             requiresDurableSettlement && !(settlementStore?.isOperational() ?? false)
         for id in order {
-            guard let item = jobs[id]?.item else { continue }
+            guard let item = jobs[id]?.snapshot else { continue }
             items.append(item)
             switch item.state {
             case .queued: stats.queued += 1
