@@ -152,58 +152,6 @@ extension SeriesAlbumCarryOver {
     }
 }
 
-// MARK: - Dedupe collision rule
-
-/// Decides how one favorite becomes a standalone photo.
-///
-/// The standard upload dedupe cannot be used here. The favorite's bytes already exist remotely as the
-/// series member itself, so the standard rule would answer "active duplicate" and link the favorite to the
-/// member that is about to move to the trash. The favorite would be lost.
-///
-/// Rule. The copy keeps the member's original filename. Proton's duplicate rows for that name are read, and
-/// every row that belongs to the series is ignored, because the series is the source and not a copy. The
-/// member's own row is ignored even when a stale membership misses it. Then:
-/// 1. An active row with the same content is a standalone copy that already exists: an earlier attempt
-///    committed it before the journal recorded it, or the user uploaded the same file separately. It is
-///    adopted. No bytes upload, so a retry never creates a duplicate.
-/// 2. A draft of this installation is an interrupted copy attempt. The upload replaces it.
-/// 3. A draft of another client blocks the name. The operation stops and stays resumable.
-/// 4. A trashed or deleted row with the same content does not block. The user chose to keep this favorite
-///    now, so an older deletion of an identical file must not remove it from the result.
-/// 5. A row with the same name and other content is another photo. The copy uploads under the same name.
-public enum SeriesFavoriteCopyPolicy {
-    public enum Decision: Sendable, Equatable {
-        case adopt(remoteLinkID: String)
-        case upload(replacingDraft: Bool)
-        case blockedByForeignDraft
-    }
-
-    public static func decide(
-        nameHash: String,
-        contentHash: String,
-        remoteItems: [RemotePhotoDuplicate],
-        memberLinkID: String,
-        seriesLinkIDs: Set<String>,
-        currentClientUID: String?
-    ) -> Decision {
-        let candidates = remoteItems.filter { item in
-            item.nameHash == nameHash && item.linkID != memberLinkID
-                && !(item.linkID.map(seriesLinkIDs.contains) ?? false)
-        }
-        if let existing = candidates.first(where: { $0.linkState == .active && $0.contentHash == contentHash }),
-            let linkID = existing.linkID, !linkID.isEmpty
-        {
-            return .adopt(remoteLinkID: linkID)
-        }
-        let drafts = candidates.filter { $0.linkState == .draft }
-        guard !drafts.isEmpty else { return .upload(replacingDraft: false) }
-        if let currentClientUID, drafts.allSatisfy({ $0.clientUID == currentClientUID }) {
-            return .upload(replacingDraft: true)
-        }
-        return .blockedByForeignDraft
-    }
-}
-
 // MARK: - Errors and progress
 
 public enum SeriesDissolutionError: LocalizedError, Equatable {
@@ -284,12 +232,11 @@ public struct SeriesDissolutionResumeOutcome: Sendable {
 public actor SeriesDissolutionOrchestrator {
     private let remote: any SeriesDissolutionRemote
     private let albums: any SeriesAlbumCarryOver
-    private let uploader: any PhotoUploading
     private let duplicateChecker: any UploadDuplicateChecking
+    /// Shared copy helper, so the series copy path and the revert to original share one implementation.
+    private let copier: RelatedPhotoCopier
     private let journalStore: any SeriesDissolutionJournalStore
     private let admission: JoinedShutdownGate
-    private let tempDirectory: URL
-    private let currentClientUID: String?
     private var running: Set<PhotoUID> = []
 
     public init(
@@ -304,12 +251,16 @@ public actor SeriesDissolutionOrchestrator {
     ) {
         self.remote = remote
         self.albums = albums
-        self.uploader = uploader
         self.duplicateChecker = duplicateChecker
+        self.copier = RelatedPhotoCopier(
+            uploader: uploader,
+            duplicateChecker: duplicateChecker,
+            provider: remote,
+            tempDirectory: tempDirectory,
+            currentClientUID: currentClientUID
+        )
         self.journalStore = journalStore
         self.admission = admission
-        self.tempDirectory = tempDirectory
-        self.currentClientUID = currentClientUID
     }
 
     /// True only for a series that lies completely in the account's own photos volume. Shared albums live in
@@ -652,73 +603,20 @@ public actor SeriesDissolutionOrchestrator {
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> PhotoUID {
         let source = try await remote.source(for: member)
-        let workDirectory = tempDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: workDirectory) }
-
-        let correctedName = ProtonPhotoNameCorrection.correctedName(for: source.filename)
-        let fileURL = workDirectory.appendingPathComponent(correctedName)
-        try await remote.writeOriginal(for: member, to: fileURL, onProgress: { onProgress($0 * 0.5) })
-
-        let sha1Digest = try UploadContentSHA1.digest(ofFileAt: fileURL)
-        let nameHash = try await duplicateChecker.nameHash(forCorrectedName: correctedName)
-        let contentHash = try await duplicateChecker.contentHash(
-            forSHA1Hex: UploadContentSHA1.hexString(digest: sha1Digest))
-        let decision = SeriesFavoriteCopyPolicy.decide(
-            nameHash: nameHash,
-            contentHash: contentHash,
-            remoteItems: try await duplicateChecker.findDuplicates(nameHashes: [nameHash]),
-            memberLinkID: member.nodeID,
-            seriesLinkIDs: seriesLinkIDs,
-            currentClientUID: currentClientUID
-        )
-
-        switch decision {
-        case .adopt(let remoteLinkID):
-            return PhotoUID(volumeID: member.volumeID, nodeID: remoteLinkID)
-        case .blockedByForeignDraft:
-            throw SeriesDissolutionError.blockedByForeignDraft(source.filename)
-        case .upload(let replacingDraft):
-            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-            let token = UUID()
-            var request = PhotoUploadRequest(
-                queueItemID: UUID(),
-                cancellationToken: token,
-                fileURL: fileURL,
-                name: correctedName,
-                mediaType: source.mediaType,
-                fileSize: (attributes[.size] as? NSNumber)?.int64Value ?? 0,
-                captureTime: source.captureTime,
-                modificationDate: source.modificationDate,
-                // No bursts tag and no main photo: the copy is a plain standalone photo.
-                tags: [],
-                additionalMetadata: source.additionalMetadata,
-                expectedSHA1: sha1Digest,
-                overrideExistingDraft: replacingDraft
+        do {
+            return try await copier.makeStandaloneCopy(
+                sourceUID: member,
+                source: source,
+                uploadName: ProtonPhotoNameCorrection.correctedName(for: source.filename),
+                extraMetadata: [],
+                sourceLinkID: member.nodeID,
+                compoundLinkIDs: seriesLinkIDs,
+                onProgress: onProgress
             )
-            let uploader = self.uploader
-            let reservation = try await uploader.reserveNetwork(allowsExpensiveNetwork: request.allowsExpensiveNetwork)
-            defer { reservation.release() }
-            request.networkReservation = reservation
-            let reservedRequest = request
-            let cancellation = BackupUploadCancellation()
-            let uid: PhotoUID
-            do {
-                uid = try await withTaskCancellationHandler {
-                    try await uploader.upload(reservedRequest) { progress in
-                        if progress.phase == .uploading { onProgress(0.5 + progress.fraction * 0.5) }
-                    }
-                } onCancel: {
-                    // Task cancellation does not reach the native upload; only its token stops it.
-                    Task { await cancellation.request(uploader: uploader, token: token) }
-                }
-            } catch {
-                // Join the native cancellation, so the upload has stopped before the operation reports it.
-                if Task.isCancelled { await cancellation.request(uploader: uploader, token: token) }
-                throw error
-            }
-            await duplicateChecker.recordUploaded(contentHash: contentHash, remoteLinkID: uid.nodeID)
-            return uid
+        } catch RelatedPhotoCopyError.blockedByForeignDraft(occupiedName: _, sourceFilename: let filename) {
+            // The series message names the person's file, so it carries the source's filename, not the
+            // corrected upload name (a corrected name can be a trimmed name or a placeholder).
+            throw SeriesDissolutionError.blockedByForeignDraft(filename)
         }
     }
 }
