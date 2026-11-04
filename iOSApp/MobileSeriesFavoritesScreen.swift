@@ -27,7 +27,7 @@ final class MobileSeriesFavoritesModel: Identifiable {
     enum Operation: Equatable {
         case idle
         case running(SeriesDissolutionProgress?)
-        case failed(String)
+        case failed(SeriesFailurePresentation)
         /// The operation ended, but members without a known role stayed in the library. The mode stays open
         /// until the person read the notice that those photos stay.
         case finishedWithKeptMembers(count: Int)
@@ -67,8 +67,17 @@ final class MobileSeriesFavoritesModel: Identifiable {
     }
 
     var failureMessage: String? {
-        if case .failed(let message) = operation { return message }
+        if case .failed(let failure) = operation { return failure.message }
         return nil
+    }
+
+    var canRetryFailure: Bool {
+        if case .failed(let failure) = operation { return failure.canRetry }
+        return false
+    }
+
+    var failureAlertMessage: String {
+        failureMessage ?? ""
     }
 
     /// True while the person must read the notice that members without a role stayed in the library.
@@ -144,7 +153,7 @@ final class MobileSeriesFavoritesModel: Identifiable {
             }
         } catch {
             hasUnfinishedAttempt = true
-            operation = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            operation = .failed(SeriesFailurePresentation(error: error))
         }
     }
 
@@ -224,14 +233,12 @@ struct MobileSeriesFavoritesScreen: View {
                 set: { if !$0 { model.dismissFailure() } }
             )
         ) {
-            Button(RetryButton.title) { Task { await model.keepOnlyMarkedFavorites() } }
+            if model.canRetryFailure {
+                Button(RetryButton.title) { Task { await model.keepOnlyMarkedFavorites() } }
+            }
             Button(L10n.string("action.cancel"), role: .cancel) {}
         } message: {
-            Text(
-                [model.failureMessage, String(localized: "series.failed_recovery")]
-                    .compactMap { $0 }
-                    .joined(separator: "\n\n")
-            )
+            Text(model.failureAlertMessage)
         }
     }
 
