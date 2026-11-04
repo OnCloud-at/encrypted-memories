@@ -9,7 +9,7 @@ import XCTest
 @testable import TimelineUIKitFeature
 
 final class MobileGridDivisionGeometryTests: XCTestCase {
-    @MainActor func testProfileChangeUsesTheDividedSourceTileSizeAndCachesDivisionFacts() throws {
+    @MainActor func testProfileChangeUsesFullWidthSourceTileSizeAndCachesDivisionFacts() throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 867, height: 669)
@@ -25,7 +25,7 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
         }
         let host = UIKitTimelineGridHostView(frame: window.bounds)
         let band = CGRect(x: 60, y: 0, width: 40, height: 669)
-        host.divisionAreasForTesting = [ReservedRegionArea(frame: band, isActive: false)]
+        host.divisionAreasForTesting = [ReservedRegionArea(frame: band, isActive: true)]
         window.addSubview(host)
         defer {
             host.setActive(false)
@@ -35,7 +35,7 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
         host.layoutIfNeeded()
         let sourceProfile = host.currentProfile()
         let sourceEngine = host.currentEngine(profile: sourceProfile)
-        XCTAssertEqual(sourceEngine.divisionFrame, band, "SETUP: source must use the near-edge division")
+        XCTAssertNil(sourceEngine.divisionFrame, "Vertical divisions do not reserve a column gap")
         let sourceWidth = UIKitTimelineGridProfileAdapter.layoutSize(
             forBounds: host.bounds, safeAreaInsets: host.safeAreaInsets
         ).width
@@ -56,15 +56,15 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
             sourceLevel: sourceLevel, sourceWidth: sourceWidth, in: targetEngine, targetWidth: targetWidth)
         var undivided = sourceEngine
         undivided.divisionFrame = nil
-        XCTAssertNotEqual(
+        XCTAssertEqual(
             expected,
             undivided.closestVisualLevel(
                 sourceLevel: sourceLevel, sourceWidth: sourceWidth, in: targetEngine, targetWidth: targetWidth),
-            "SETUP: the division must change the nearest visual level")
+            "A vertical division keeps the ordinary visual level")
         XCTAssertEqual(host.interactiveLevel, expected, "Profile changes compare the tile sizes actually displayed")
     }
 
-    @MainActor func testPhysicalDivisionAndHitTargetsAgreeInBothLayoutDirections() throws {
+    @MainActor func testVerticalDivisionUsesFullWidthAndKeepsHitTargetsInBothLayoutDirections() throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 867, height: 669)
@@ -85,7 +85,7 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
         for direction in [UISemanticContentAttribute.forceLeftToRight, .forceRightToLeft] {
             let host = UIKitTimelineGridHostView(frame: frame)
             host.semanticContentAttribute = direction
-            host.divisionAreasForTesting = [ReservedRegionArea(frame: band, isActive: false)]
+            host.divisionAreasForTesting = [ReservedRegionArea(frame: band, isActive: true)]
             window.addSubview(host)
             defer {
                 host.setActive(false)
@@ -99,14 +99,15 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
             let plan = try XCTUnwrap(host.accessibilityFramePlan())
             XCTAssertEqual(plan.columns, 6)
             XCTAssertFalse(plan.visibleSlots.isEmpty)
-            XCTAssertTrue(
-                plan.visibleSlots.allSatisfy { $0.viewportRect.maxX <= band.minX || $0.viewportRect.minX >= band.maxX })
+            let row = plan.visibleSlots.filter { $0.row == 0 }
+            XCTAssertEqual(row.map(\.slotRect.minX).min(), 0)
+            XCTAssertEqual(try XCTUnwrap(row.map(\.slotRect.maxX).max()), frame.width, accuracy: 1e-9)
             for slot in plan.visibleSlots {
                 let point = CGPoint(x: slot.slotRect.midX, y: slot.slotRect.midY)
                 XCTAssertEqual(host.item(at: point)?.uid, items[slot.index].uid)
             }
             let witness = try XCTUnwrap(plan.visibleSlots.first)
-            XCTAssertNil(host.item(at: CGPoint(x: band.midX, y: witness.slotRect.midY)))
+            XCTAssertNotNil(host.item(at: CGPoint(x: band.midX, y: witness.slotRect.midY)))
             let rects = plan.visibleSlots.map(\.slotRect)
             if let previousRects { XCTAssertEqual(rects, previousRects, "Hardware frames must not be mirrored twice") }
             previousRects = rects

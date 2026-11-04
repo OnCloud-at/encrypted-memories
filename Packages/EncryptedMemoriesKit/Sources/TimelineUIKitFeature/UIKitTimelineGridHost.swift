@@ -2321,7 +2321,7 @@
             return .none
         }
 
-        /// Keep raw divisions separate from active selection exclusions: flat displays retain the alignment gap.
+        /// Pass raw division facts to the shared resolver, separately from active selection exclusions.
         private func currentDivisionAreas() -> [ReservedRegionArea] {
             #if DEBUG
                 if let divisionAreasForTesting { return divisionAreasForTesting }
