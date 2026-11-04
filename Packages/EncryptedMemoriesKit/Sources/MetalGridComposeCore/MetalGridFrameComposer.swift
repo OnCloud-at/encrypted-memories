@@ -21,23 +21,12 @@ package enum MetalGridFrameComposer {
         visibleIDs.contains { isKnown($0) && (allowsPlaceholders || isResident($0)) }
     }
 
-    /// Only the even-column profile uses division alignment. Compact and pointer ladders keep their geometry.
-    /// Activity does not filter divisions: the same physical gap stays in place when the display becomes flat.
+    /// Column geometry fills the viewport without a reserved division gap, regardless of division activity.
+    /// Horizontal reserved-region rules operate separately from the column layout.
     package static func gridDivisionFrame(
         areas: [ReservedRegionArea], bounds: CGRect, profile: GridLevelProfile
     ) -> CGRect? {
-        var nearest: CGRect?
-        for area in areas {
-            let frame = area.frame
-            let local = frame.offsetBy(dx: -bounds.minX, dy: -bounds.minY)
-            guard frame.minY < bounds.maxY, frame.maxY > bounds.minY,
-                GridVerticalDivision.isUsable(local, width: bounds.width, levels: profile.levels)
-            else { continue }
-            if nearest == nil || abs(local.midX - bounds.width / 2) < abs(nearest!.midX - bounds.width / 2) {
-                nearest = local
-            }
-        }
-        return nearest
+        nil
     }
 
     @MainActor

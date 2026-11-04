@@ -8,6 +8,12 @@ import TimelineCore
     private let viewport = CGSize(width: 867, height: 669)
     private let division = CGRect(x: 455.116, y: 0, width: 40, height: 669)
 
+    private struct ComparableTransitionDraw: Equatable {
+        let index: Int
+        let rect: CGRect
+        let isTarget: Bool
+    }
+
     private func engine(
         width: CGFloat = 867, count: Int = 3_000, fillOrder: GridFillOrder = .newestBottomTrailing
     )
@@ -16,14 +22,113 @@ import TimelineCore
         let profile = TimelineGridProfileConfiguration.production.resolver.profile(
             for: TimelineGridViewport(layoutWidth: width, inputAffinity: .touch))
         var engine = SquareTileGridEngine(sectionCounts: [count], profile: profile, fillOrder: fillOrder)
-        engine.divisionFrame = MetalGridFrameComposer.gridDivisionFrame(
-            areas: [ReservedRegionArea(frame: division, isActive: false)],
-            bounds: CGRect(x: 0, y: 0, width: width, height: viewport.height), profile: profile)
+        // Exercise the legacy core geometry directly until its separate removal; the composer no longer selects it.
+        engine.divisionFrame = division
         return engine
     }
 
     private func isClear(_ rect: CGRect) -> Bool {
         rect.maxX <= division.minX || rect.minX >= division.maxX
+    }
+
+    @Test(arguments: [CGFloat(867), 951], [false, true])
+    func verticalDivisionsUseTheOrdinaryFullWidthAtEveryZoomStep(width: CGFloat, isActive: Bool) throws {
+        let size = CGSize(width: width, height: viewport.height)
+        let profile = TimelineGridProfileConfiguration.production.resolver.profile(
+            for: TimelineGridViewport(layoutWidth: width, inputAffinity: .touch))
+        let ordinary = SquareTileGridEngine(sectionCounts: [3_000], profile: profile)
+        var candidate = ordinary
+        candidate.divisionFrame = MetalGridFrameComposer.gridDivisionFrame(
+            areas: [ReservedRegionArea(frame: CGRect(x: 455.5, y: 0, width: 40, height: 669), isActive: isActive)],
+            bounds: CGRect(origin: .zero, size: size), profile: profile)
+        #expect(candidate.divisionFrame == nil)
+        for level in 0..<candidate.levelCount {
+            let plan = candidate.framePlan(level: level, viewportSize: size, scrollOffset: .zero, overscan: 0)
+            #expect(plan == ordinary.framePlan(level: level, viewportSize: size, scrollOffset: .zero, overscan: 0))
+            let row = plan.visibleSlots.filter { $0.row == 0 }.sorted { $0.column < $1.column }
+            #expect(row.count == profile.levels[level].nominalColumns)
+            let first = try #require(row.first)
+            let last = try #require(row.last)
+            #expect(first.slotRect.minX == 0)
+            #expect(abs(last.slotRect.maxX - width) < 1e-9)
+            for pair in zip(row, row.dropFirst()) {
+                #expect(abs(pair.1.slotRect.minX - pair.0.slotRect.maxX - profile.levels[level].gap) < 1e-9)
+            }
+            for slot in plan.visibleSlots {
+                let point = CGPoint(x: slot.slotRect.midX, y: slot.slotRect.midY)
+                #expect(candidate.hitTest(contentPoint: point, level: level, width: width)?.index == slot.index)
+                #expect(candidate.cursorColumn(viewportX: point.x, level: level, width: width) == slot.column)
+                #expect(candidate.slotRect(flatIndex: slot.index, level: level, width: width) == slot.slotRect)
+            }
+        }
+
+        let contentPoint = CGPoint(x: width / 2, y: 1_200)
+        let viewportPoint = CGPoint(x: width / 2, y: 300)
+        let actualZoom = try #require(
+            candidate.beginZoomTransaction(
+                cursorContentPoint: contentPoint, viewportPoint: viewportPoint, level: 1, width: width))
+        let ordinaryZoom = try #require(
+            ordinary.beginZoomTransaction(
+                cursorContentPoint: contentPoint, viewportPoint: viewportPoint, level: 1, width: width))
+        for step in 0...50 {
+            let level = CGFloat(step) / 10
+            #expect(
+                actualZoom.frame(continuousLevel: level, viewportSize: size, overscan: 0)
+                    == ordinaryZoom.frame(continuousLevel: level, viewportSize: size, overscan: 0))
+        }
+        func comparableDraws(_ controller: GridTransitionController) -> [ComparableTransitionDraw] {
+            controller.currentDraws().map { draw in
+                ComparableTransitionDraw(index: draw.index, rect: draw.rect, isTarget: draw.isTarget)
+            }.sorted { lhs, rhs in
+                // Compare end-state geometry within one zoom pair, independently of hash-backed draw ordering.
+                let left = (
+                    lhs.index, lhs.rect.minX, lhs.rect.minY, lhs.rect.width, lhs.rect.height, lhs.isTarget ? 1 : 0
+                )
+                let right = (
+                    rhs.index, rhs.rect.minX, rhs.rect.minY, rhs.rect.width, rhs.rect.height, rhs.isTarget ? 1 : 0
+                )
+                return left < right
+            }
+        }
+        var realPassed = true
+        var controlPassed = true
+        for level in 0..<(candidate.levelCount - 1) {
+            let ordinarySource = ordinary.framePlan(
+                level: level, viewportSize: size, scrollOffset: .zero, overscan: 100)
+            let ordinaryTarget = ordinary.framePlan(
+                level: level + 1, viewportSize: size, scrollOffset: .zero, overscan: 100)
+            let actualTransition = GridTransitionController()
+            let ordinaryTransition = GridTransitionController()
+            let controlTransition = GridTransitionController()
+            for (engine, controller) in [
+                (candidate, actualTransition), (ordinary, ordinaryTransition), (ordinary, controlTransition),
+            ] {
+                let source = engine.framePlan(
+                    level: level, viewportSize: size, scrollOffset: .zero, overscan: 100)
+                let target = engine.framePlan(
+                    level: level + 1, viewportSize: size, scrollOffset: .zero, overscan: 100)
+                // Full input equality includes columns, square side, origins, gaps, viewport and every level slot.
+                #expect(source == ordinarySource)
+                #expect(target == ordinaryTarget)
+                #expect(
+                    controller.beginPinch(
+                        source: source, target: target,
+                        anchorIndex: 0, viewportSize: size, selection: []))
+            }
+            for progress in [0.0, 1] {
+                actualTransition.setProgress(progress)
+                ordinaryTransition.setProgress(progress)
+                controlTransition.setProgress(progress)
+                let actual = comparableDraws(actualTransition)
+                let expected = comparableDraws(ordinaryTransition)
+                let control = comparableDraws(controlTransition)
+                realPassed = realPassed && actual == expected
+                controlPassed = controlPassed && control == expected
+                #expect(actual == expected)
+                #expect(control == expected)
+            }
+        }
+        print("DUO1125_TRANSITION_COMPARE width=\(width) real=\(realPassed) control=\(controlPassed)")
     }
 
     @Test func overzoomKeepsTheUnscaledAnchorColumnAcrossTheBoundaryCursors() throws {
@@ -167,9 +272,9 @@ import TimelineCore
         let nearEdge = CGRect(x: 60, y: 0, width: 40, height: 669)
         #expect(
             MetalGridFrameComposer.gridDivisionFrame(
-                areas: [ReservedRegionArea(frame: nearEdge, isActive: false)],
+                areas: [ReservedRegionArea(frame: nearEdge, isActive: true)],
                 bounds: CGRect(origin: .zero, size: viewport),
-                profile: profile) == nearEdge)
+                profile: profile) == nil)
         var edge = plain
         edge.divisionFrame = nearEdge
         for level in 0..<profile.levels.count {
@@ -199,7 +304,7 @@ import TimelineCore
         }
     }
 
-    @Test func divisionSelectionRejectsInvalidFactsAndChoosesTheNearestCentre() {
+    @Test func divisionFactsDoNotCreateColumnAlignment() {
         let profile = TimelineGridProfileConfiguration.production.resolver.profile(
             for: TimelineGridViewport(layoutWidth: viewport.width, inputAffinity: .touch))
         let bounds = CGRect(origin: .zero, size: viewport)
@@ -216,15 +321,14 @@ import TimelineCore
         for frame in invalid {
             #expect(
                 MetalGridFrameComposer.gridDivisionFrame(
-                    areas: [ReservedRegionArea(frame: frame, isActive: false)], bounds: bounds, profile: profile) == nil
+                    areas: [ReservedRegionArea(frame: frame, isActive: true)], bounds: bounds, profile: profile) == nil
             )
         }
         for facts in [[farther, nearer], [nearer, farther]] + invalid.map({ [$0, farther] }) {
-            let expected = facts.contains(nearer) ? nearer : farther
             #expect(
                 MetalGridFrameComposer.gridDivisionFrame(
-                    areas: facts.map { ReservedRegionArea(frame: $0, isActive: false) }, bounds: bounds,
-                    profile: profile) == expected)
+                    areas: facts.map { ReservedRegionArea(frame: $0, isActive: true) }, bounds: bounds,
+                    profile: profile) == nil)
         }
     }
 
@@ -288,7 +392,8 @@ import TimelineCore
         }
     }
 
-    @Test func compactPointerAndHorizontalDivisionsKeepTheirExistingGeometry() {
+    @Test(arguments: [false, true])
+    func compactPointerAndHorizontalDivisionsKeepTheirExistingGeometry(isActive: Bool) {
         let resolver = TimelineGridProfileConfiguration.production.resolver
         let bounds = CGRect(origin: .zero, size: viewport)
         for profile in [
@@ -297,7 +402,7 @@ import TimelineCore
         ] {
             #expect(
                 MetalGridFrameComposer.gridDivisionFrame(
-                    areas: [ReservedRegionArea(frame: division, isActive: true)], bounds: bounds, profile: profile)
+                    areas: [ReservedRegionArea(frame: division, isActive: isActive)], bounds: bounds, profile: profile)
                     == nil)
         }
         let profile = resolver.profile(for: TimelineGridViewport(layoutWidth: 867, inputAffinity: .touch))
@@ -306,12 +411,12 @@ import TimelineCore
                 areas: [], bounds: bounds, profile: profile) == nil)
         #expect(
             MetalGridFrameComposer.gridDivisionFrame(
-                areas: [ReservedRegionArea(frame: CGRect(x: 0, y: 300, width: 867, height: 40), isActive: true)],
+                areas: [ReservedRegionArea(frame: CGRect(x: 0, y: 300, width: 867, height: 40), isActive: isActive)],
                 bounds: bounds, profile: profile) == nil)
         #expect(
             MetalGridFrameComposer.gridDivisionFrame(
-                areas: [ReservedRegionArea(frame: division.offsetBy(dx: 84, dy: 0), isActive: false)],
-                bounds: bounds.offsetBy(dx: 84, dy: 0), profile: profile) == division)
+                areas: [ReservedRegionArea(frame: division.offsetBy(dx: 84, dy: 0), isActive: true)],
+                bounds: bounds.offsetBy(dx: 84, dy: 0), profile: profile) == nil)
     }
 
     @Test func bothDenseOverviewLayersKeepTheirPhotosOutOfTheDivision() throws {
@@ -432,14 +537,11 @@ import TimelineCore
         }
     }
 
-    @Test(arguments: [false, true])
-    func anOffCentreDivisionKeepsEveryPhotoAndItsHitTargetClear(isActive: Bool) throws {
+    @Test func legacyOffCentreDivisionKeepsEveryPhotoAndItsHitTargetClear() throws {
         let profile = TimelineGridProfileConfiguration.production.resolver.profile(
             for: TimelineGridViewport(layoutWidth: viewport.width, inputAffinity: .touch))
         var engine = SquareTileGridEngine(sectionCounts: [3_000], profile: profile)
-        engine.divisionFrame = MetalGridFrameComposer.gridDivisionFrame(
-            areas: [ReservedRegionArea(frame: division, isActive: isActive)],
-            bounds: CGRect(origin: .zero, size: viewport), profile: profile)
+        engine.divisionFrame = division
         let plan = engine.framePlan(
             level: profile.defaultLevel, viewportSize: viewport, scrollOffset: .zero, overscan: 0)
         let row = plan.visibleSlots.filter { $0.row == 0 }
