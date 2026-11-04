@@ -94,6 +94,91 @@ final class MobileSeriesFavoritesTests: XCTestCase {
         XCTAssertEqual(probe.abandonCalls, 0, "a finished operation has nothing to abandon")
     }
 
+    @MainActor func testFailureAlertUsesOnlyItsTypedReason() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = SeriesDissolutionError.copyNotConfirmed
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        let reason = SeriesDissolutionError.copyNotConfirmed.errorDescription ?? ""
+        XCTAssertEqual(model.failureMessage, reason)
+        XCTAssertEqual(model.failureAlertMessage, reason)
+        XCTAssertTrue(model.canRetryFailure)
+        XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+        XCTAssertTrue(model.selection.isFavorite(probe.items[0].uid))
+        XCTAssertTrue(probe.finished.isEmpty)
+    }
+
+    @MainActor func testUnknownFailureHasAnEmptyBodyAndStillPresentsTheAlert() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = NSError(
+            domain: "ExampleSeriesFailure", code: 503,
+            userInfo: [NSLocalizedDescriptionKey: "Example service diagnostic"])
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(model.failureMessage, Optional.some(""))
+        XCTAssertNotNil(model.failureMessage)
+        XCTAssertTrue(model.failureMessage != nil)
+        XCTAssertEqual(model.failureAlertMessage, "")
+        XCTAssertTrue(model.canRetryFailure)
+        XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+    }
+
+    @MainActor func testInvalidSelectionDoesNotOfferRetry() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = SeriesDissolutionError.invalidSelection
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertFalse(model.canRetryFailure)
+        XCTAssertEqual(model.failureMessage, SeriesDissolutionError.invalidSelection.errorDescription)
+        XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+    }
+
+    @MainActor func testTransientAndAmbiguousFailuresKeepRetryAndMarks() async {
+        let failures: [SeriesDissolutionError] = [
+            .notOwnLibrary, .alreadyRunning, .blockedByForeignDraft("example.jpg"),
+            .copyNotConfirmed, .trashNotConfirmed,
+        ]
+        for failure in failures {
+            let probe = FlowProbe()
+            probe.injectedFailure = failure
+            let model = probe.makeModel(canKeepOnlyFavorites: true)
+            model.toggleFavorite(probe.items[0].uid)
+
+            await model.keepOnlyMarkedFavorites()
+
+            XCTAssertTrue(model.canRetryFailure)
+            XCTAssertEqual(probe.keepOnlyCalls.count, 1)
+            XCTAssertTrue(model.selection.isFavorite(probe.items[0].uid))
+            XCTAssertTrue(probe.finished.isEmpty)
+        }
+    }
+
+    @MainActor func testUnknownFailureRetriesOnlyOnRequestWithTheSameMarks() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = NSError(domain: "ExampleSeriesFailure", code: 503)
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+        XCTAssertEqual(probe.keepOnlyCalls, [[probe.items[0].uid]])
+
+        probe.injectedFailure = nil
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(probe.keepOnlyCalls, [[probe.items[0].uid], [probe.items[0].uid]])
+        XCTAssertEqual(probe.finished, [true])
+        XCTAssertEqual(probe.abandonCalls, 0)
+    }
+
     @MainActor func testLeavingTheModeAfterAFailureAbandonsThePendingOperation() async {
         for leave in [
             { (model: MobileSeriesFavoritesModel) in model.cancel() },
@@ -204,6 +289,7 @@ final class MobileSeriesFavoritesTests: XCTestCase {
     var keepOnlyCalls: [[PhotoUID]] = []
     var abandonCalls = 0
     var failuresBeforeSuccess = 0
+    var injectedFailure: (any Error)?
     /// Members without a known role that the fake backend reports as staying in the library.
     var keptMembersWithoutRole = 0
 
@@ -221,6 +307,7 @@ final class MobileSeriesFavoritesTests: XCTestCase {
                     failuresBeforeSuccess -= 1
                     throw SeriesDissolutionError.copyNotConfirmed
                 }
+                if let injectedFailure { throw injectedFailure }
                 // The model records each report on the main actor, so let those hops land before this call returns.
                 try? await Task.sleep(for: .milliseconds(50))
             },
