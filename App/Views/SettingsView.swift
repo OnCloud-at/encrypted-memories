@@ -1029,13 +1029,22 @@ private struct MacFailedBackupSheet: View {
             }
             BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil) {
                 if sessionSourceID == sourceID, let controller {
-                    BulkBackUpAgainControls(
+                    BulkPhotoActionControls(
                         runner: controller.bulkPhotoActions, count: pagedList.decisionCount,
                         isAvailable: { controller.isBulkBackUpAgainAvailable },
                         prepare: { await controller.prepareBackUpAgain() },
                         start: { controller.startBackUpAgain($0) }
                     )
                     .id(ObjectIdentifier(controller))
+                } else if sessionSourceID == sourceID, case .album(let albumSync, let albumID) = source {
+                    BulkPhotoActionControls(
+                        runner: albumSync.bulkPhotoActions, action: .restore, count: pagedList.decisionCount,
+                        isAvailable: { albumSync.isBulkRestoreAvailable(albumID: albumID) },
+                        ownsActivity: { albumSync.bulkRestoreAlbumID == albumID },
+                        prepare: { await albumSync.prepareRestore(albumID: albumID) },
+                        start: { albumSync.startRestore($0, albumID: albumID) }
+                    )
+                    .id(sourceID)
                 }
             }
         }

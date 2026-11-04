@@ -108,6 +108,40 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    func testBulkRestoreCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("albumsync.bulk_action %@", "Restore All (%@)", "Alle wiederherstellen (%@)"),
+            ("albumsync.bulk_title_one %@", "Restore %@ photo?", "%@ Foto wiederherstellen?"),
+            ("albumsync.bulk_title_other %@", "Restore %@ photos?", "%@ Fotos wiederherstellen?"),
+            (
+                "albumsync.bulk_message",
+                "Photos that are still in the Proton Drive trash are restored. Album sync then adds them to the album. "
+                    + "Photos that were deleted permanently stay unchanged.",
+                "Fotos, die noch im Proton-Papierkorb liegen, werden wiederhergestellt. Die Album-Synchronisierung "
+                    + "fügt sie danach zum Album hinzu. Endgültig gelöschte Fotos bleiben unverändert."
+            ),
+            (
+                "albumsync.bulk_outcome_one %@ %@ %@", "%1$@ of %2$@ photo restored. %3$@ unchanged.",
+                "%1$@ von %2$@ Foto wiederhergestellt. %3$@ unverändert."
+            ),
+            (
+                "albumsync.bulk_outcome_other %@ %@ %@", "%1$@ of %2$@ photos restored. %3$@ unchanged.",
+                "%1$@ von %2$@ Fotos wiederhergestellt. %3$@ unverändert."
+            ),
+            (
+                "albumsync.bulk_restored_detail", "Album sync adds restored photos to the album.",
+                "Die Album-Synchronisierung fügt wiederhergestellte Fotos zum Album hinzu."
+            ),
+            // Reused unchanged: the per-photo word and its error stay as they are.
+            ("contextmenu.restore", "Restore", "Wiederherstellen"),
+            ("albumsync.error_restore_photo", "Couldn't restore this photo.", "Wiederherstellen nicht möglich."),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
     func testSourceLanguageIsEnglish() throws {
         XCTAssertEqual(try loadCatalog(appCatalog).sourceLanguage, "en")
         XCTAssertEqual(try loadCatalog(mobileCatalog).sourceLanguage, "en")
