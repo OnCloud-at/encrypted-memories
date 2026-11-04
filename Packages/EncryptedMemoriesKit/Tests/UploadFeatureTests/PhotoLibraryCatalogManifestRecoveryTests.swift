@@ -116,7 +116,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             let range = try XCTUnwrap(image.firstRange(of: Array("\"broken.jpg\"".utf8)))
             image[range.lowerBound] = UInt8(ascii: "!")
         }
-        XCTAssertNil(try store!.entry(for: "broken"), "Only the unrelated row fails to decode")
+        XCTAssertThrowsError(try store!.entry(for: "broken"), "An undecodable row is unknown, not absent")
         XCTAssertNotNil(try store!.entry(for: "known"), "The requested row remains readable")
         XCTAssertFalse(store!.isOperational(), "The unrelated decode failure remains sticky")
         try read(store!)
@@ -141,37 +141,36 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertTrue(store!.isOperational())
     }
 
-    func testLegacyEntryKeepsItsOldAnswerAfterABindingFailure() throws {
+    func testAnEntryReadThrowsAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
         connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
-        XCTAssertNil(try store!.entry(for: String(repeating: "x", count: 128)))
-        XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
+        XCTAssertThrowsError(try store!.entry(for: String(repeating: "x", count: 128)))
+        XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }
 
-    func testLegacyPresenceKeepsItsOldAnswerAfterABindingFailure() throws {
+    func testAPresenceReadIsUnknownAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
         connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
-        XCTAssertEqual(store!.presentEntries(for: [String(repeating: "x", count: 128)])?.count, 0)
-        XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
+        XCTAssertNil(store!.presentEntries(for: [String(repeating: "x", count: 128)]))
+        XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }
 
-    func testLegacyPageKeepsItsOldAnswerAfterABindingFailure() throws {
+    func testAPageReadIsUnknownAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
         connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
-        XCTAssertEqual(
-            store!.presentEntries(afterLocalIdentifier: String(repeating: "x", count: 128), limit: 10)?.count, 0)
-        XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
+        XCTAssertNil(store!.presentEntries(afterLocalIdentifier: String(repeating: "x", count: 128), limit: 10))
+        XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }
 
-    func testLegacyClassificationKeepsItsOldAnswerAfterABindingFailure() throws {
+    func testAClassificationIsShorterAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
         connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
-        XCTAssertEqual(store!.classifyBatch([entry(String(repeating: "x", count: 128))]), [.inserted])
-        XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
+        XCTAssertEqual(store!.classifyBatch([entry(String(repeating: "x", count: 128))]), [])
+        XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }
 
     func testUnknownEntryReadsThrowInsteadOfProvingAbsence() throws {

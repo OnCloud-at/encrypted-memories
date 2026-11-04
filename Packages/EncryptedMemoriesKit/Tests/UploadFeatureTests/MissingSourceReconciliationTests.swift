@@ -1893,7 +1893,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         func hasCompletedFullScan() -> Bool { inner.hasCompletedFullScan() }
         func markFullScanOwed() -> Bool { inner.markFullScanOwed() }
         func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
-        func fullScanProgress() -> PhotoLibraryFullScanProgress? { inner.fullScanProgress() }
+        func fullScanProgress() throws -> PhotoLibraryFullScanProgress? { try inner.fullScanProgress() }
         func recordFullScanProgress(_ p: PhotoLibraryFullScanProgress) -> Bool { inner.recordFullScanProgress(p) }
         func completeFullScan() -> Bool { inner.completeFullScan() }
         func clearFullScanResumePoint() -> Bool { inner.clearFullScanResumePoint() }
@@ -1904,7 +1904,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         func beginFullScanSnapshot(epochStart: Date) -> Bool { inner.beginFullScanSnapshot(epochStart: epochStart) }
         func appendFullScanSnapshotIdentifiers(_ ids: [String]) -> Bool { inner.appendFullScanSnapshotIdentifiers(ids) }
         func finishFullScanSnapshot() -> Bool { inner.finishFullScanSnapshot() }
-        func fullScanSnapshotIdentifiers(startingAt: Int, limit: Int) -> [String] {
+        func fullScanSnapshotIdentifiers(startingAt: Int, limit: Int) -> [String]? {
             inner.fullScanSnapshotIdentifiers(startingAt: startingAt, limit: limit)
         }
         func fullScanSnapshotCount() -> Int? { inner.fullScanSnapshotCount() }

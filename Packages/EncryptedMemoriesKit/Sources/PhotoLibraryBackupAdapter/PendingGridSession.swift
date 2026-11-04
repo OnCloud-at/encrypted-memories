@@ -379,13 +379,17 @@ private struct SessionMetadata: PendingSourceMetadataProviding {
     let files: (any PendingSourceMetadataProviding)?
 
     func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
+        await metadataAnswer(for: keys).metadata
+    }
+
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer {
         let photoKeys = keys.filter { $0.kind == .photoLibraryAsset }
         let fileKeys = keys.filter { $0.kind == .fileURL }
-        var result = photoKeys.isEmpty ? [:] : await photos.metadata(for: photoKeys)
+        var answer = photoKeys.isEmpty ? PendingSourceMetadataAnswer() : await photos.metadataAnswer(for: photoKeys)
         if let files, !fileKeys.isEmpty {
-            result.merge(await files.metadata(for: fileKeys)) { current, _ in current }
+            answer.merge(await files.metadataAnswer(for: fileKeys))
         }
-        return result
+        return answer
     }
 }
 

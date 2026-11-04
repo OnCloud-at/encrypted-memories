@@ -174,6 +174,18 @@ public struct PhotoLibraryCatalogSnapshot: Sendable, Equatable {
     }
 }
 
+/// A keyed presence read. An identifier in neither set is absent or removed; an unknown one is neither (#1004).
+public struct PhotoLibraryCatalogPresence: Sendable, Equatable {
+    public var present: [String: PhotoLibraryCatalogEntry] = [:]
+    /// Identifiers whose own row could not be read.
+    public var unknown = Set<String>()
+
+    public init(present: [String: PhotoLibraryCatalogEntry] = [:], unknown: Set<String> = []) {
+        self.present = present
+        self.unknown = unknown
+    }
+}
+
 /// Result of a catalog mutation where zero affected rows is a valid success. Keeping the success
 /// bit separate prevents SQLite failures from being mistaken for an empty removal set.
 public struct PhotoLibraryCatalogMutationResult: Sendable, Equatable {
@@ -238,8 +250,9 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// The in-progress full-scan epoch, or nil if none is underway (the next full scan starts fresh).
     /// A full scan of a large library rarely finishes in one foreground/BG window; persisting this lets
     /// an interrupted scan resume from `cursor` instead of restarting, so it converges instead of
-    /// looping forever and never marking itself complete.
-    func fullScanProgress() -> PhotoLibraryFullScanProgress?
+    /// looping forever and never marking itself complete. Throws when the progress could not be read, so a caller
+    /// never starts a new epoch over an unknown one (#1004).
+    func fullScanProgress() throws -> PhotoLibraryFullScanProgress?
     /// Persists mid-scan progress so a resumed scan continues within the same epoch.
     @discardableResult
     func recordFullScanProgress(_ progress: PhotoLibraryFullScanProgress) -> Bool
@@ -281,7 +294,8 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// Publishes the completely-built snapshot and creates its cursor at zero.
     @discardableResult
     func finishFullScanSnapshot() -> Bool
-    func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String]
+    /// A nil page is an unknown read, not the end of the snapshot (#1004).
+    func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String]?
     /// A nil count is an unknown read, not an empty snapshot (#1004).
     func fullScanSnapshotCount() -> Int?
 }

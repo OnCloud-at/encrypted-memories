@@ -562,25 +562,34 @@ public final class PhotoLibraryBackupController {
                 source: candidate.snapshot.source, revision: candidate.snapshot.revision,
                 generation: state.generation, confirmedRemote: remote,
                 requiredMembers: plan.secondaries.map(\.sourceResource))
-            let isCurrent: @Sendable () -> Bool = {
-                guard pendingStore.isOperational(), catalogStore.isOperational(),
-                    case .readable(let current?) = pendingStore.sourceStateRead(for: state.key),
-                    current.desired == .included, current.needsQueueSync,
-                    current.generation == state.generation, current.remote == remote,
-                    let latest = (catalogStore.presentEntries(for: [state.key.identifier]) ?? [:])[
-                        state.key.identifier],
+            // Nil when a read failed: unknown is neither current nor stale (#1004).
+            let currentRead: @Sendable () -> Bool? = {
+                guard pendingStore.isOperational(), catalogStore.isOperational() else { return nil }
+                guard case .readable(let read) = pendingStore.sourceStateRead(for: state.key) else { return nil }
+                guard let current = read, current.desired == .included, current.needsQueueSync,
+                    current.generation == state.generation, current.remote == remote
+                else { return false }
+                let presence = catalogStore.presence(for: [state.key.identifier])
+                guard !presence.unknown.contains(state.key.identifier) else { return nil }
+                guard let latest = presence.present[state.key.identifier],
                     let latestCandidate = PhotoBackupAssetPlanner.candidate(
                         for: PhotoLibraryCatalogMapper.info(for: latest))
                 else { return false }
                 return latestCandidate.snapshot == candidate.snapshot
             }
-            guard isCurrent() else {
-                // A stale check ends the context it registered, so it cannot hold back a later version.
+            let isCurrent: @Sendable () -> Bool = { currentRead() == true }
+            switch currentRead() {
+            case true?: break
+            case false?:
+                // A certified stale check ends the context it registered, so it cannot hold back a later version.
                 if let stale = restoredRechecks[state.key], stale.generation == state.generation {
                     restoredRechecks.removeValue(forKey: state.key)
                     admittedRestoreRechecks.remove(state.key)
                     await identityResolver.endRestoredCompound(stale)
                 }
+                continue
+            case nil:
+                // An unknown read keeps the registered check; the durable duty asks again.
                 continue
             }
             do {

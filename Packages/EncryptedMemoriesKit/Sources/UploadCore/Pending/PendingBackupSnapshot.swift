@@ -102,6 +102,33 @@ public protocol PendingSourceMetadataProviding: Sendable {
     /// Metadata of the sources that are still accessible. A missing key means not accessible (deleted,
     /// or outside a limited Photos selection).
     func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata]
+    /// The same metadata plus the sources whose own read failed. An unknown source is neither accessible nor gone, so
+    /// it keeps its earlier answer (#1004).
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer
+}
+
+public extension PendingSourceMetadataProviding {
+    /// A provider without failed reads answers every key it does not list as not accessible.
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer {
+        PendingSourceMetadataAnswer(metadata: await metadata(for: keys))
+    }
+}
+
+public struct PendingSourceMetadataAnswer: Sendable, Equatable {
+    public var metadata: [PendingSourceKey: PendingPresentationMetadata]
+    /// Requested sources whose read failed: neither accessible nor proven gone.
+    public var unknown: Set<PendingSourceKey>
+
+    public init(metadata: [PendingSourceKey: PendingPresentationMetadata] = [:], unknown: Set<PendingSourceKey> = []) {
+        self.metadata = metadata
+        self.unknown = unknown
+    }
+
+    /// Joins the answers of separate providers; the first answer keeps a key that both list.
+    public mutating func merge(_ other: PendingSourceMetadataAnswer) {
+        metadata.merge(other.metadata) { current, _ in current }
+        unknown.formUnion(other.unknown.filter { metadata[$0] == nil })
+    }
 }
 
 /// Outcome of one remote effect.
