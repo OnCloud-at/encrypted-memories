@@ -310,7 +310,7 @@ final class MobileLibraryUITests: XCTestCase {
         try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
         XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10), "the viewer did not open")
 
-        let more = app.buttons.matching(NSPredicate(format: "label == 'More actions' OR label == 'More'")).firstMatch
+        let more = app.viewerMoreButton
         let showOriginal = app.buttons["Show Original"]
         // The viewer asks for the original once the photo stayed on screen and the app admits the ask, so the item
         // appears after a wait of unknown length, also while the library still loads on a slow runner.

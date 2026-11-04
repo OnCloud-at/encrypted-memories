@@ -137,21 +137,3 @@ private actor SuspendedMetadataProvider: PhotoMetadataProvider {
         return PhotoMetadata()
     }
 }
-
-private struct MetadataEmptyThumbnailLoader: ThumbnailBatchLoader {
-    func loadThumbnails(
-        for uids: [PhotoUID],
-        onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult { .delivered }
-}
-
-private struct MetadataFailingMediaProvider: FullMediaProvider {
-    func preview(for uid: PhotoUID) async throws -> Data { throw MetadataTestError.unavailable }
-    func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
-        throw MetadataTestError.unavailable
-    }
-}
-
-private enum MetadataTestError: Error {
-    case unavailable
-}

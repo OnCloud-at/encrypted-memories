@@ -771,6 +771,15 @@ import os
         func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {}
     }
 
+    /// The fixture reverts at once, or refuses every revert when the UI test passes `revertFixtureFails`.
+    extension MobileFixtureBackend: EditedPhotoReverting {
+        func revertToOriginal(of main: PhotoItem, original: PhotoItem) async throws {
+            if MobileUITestLaunch.revertFixtureFails { throw MobileFixtureRevertRefused() }
+        }
+    }
+
+    private struct MobileFixtureRevertRefused: Error {}
+
     /// Every fixture photo is an edit with an original, so the UI tests can show it; the video has none.
     extension MobileFixtureBackend: EditedPhotoOriginalProviding {
         func editedOriginal(of item: PhotoItem) async throws -> PhotoItem? {

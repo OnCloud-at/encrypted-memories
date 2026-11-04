@@ -52,6 +52,7 @@ struct MobilePhotoViewer: View {
     @State private var burstSelection = BurstSelectionModel()
     @State private var editedOriginal = EditedPhotoOriginalState()
     @State private var editedOriginalLookup = EditedPhotoOriginalLookup()
+    @State private var revert = EditedPhotoRevertController()
     @State private var selection = MobileGridSelectionController()
     @State private var isRestoring = false
     @State private var showRestoreError = false
@@ -305,6 +306,23 @@ struct MobilePhotoViewer: View {
         } message: {
             Text(String(localized: "viewer.favorite_failed_message"))
         }
+        // Only the buttons end the confirmation: the controller, not the binding, decides what a tap does, so a
+        // dismissal that SwiftUI reports before the button action can never cancel the confirmed revert.
+        .alert(
+            L10n.string("viewer.revert_original_title"),
+            isPresented: Binding(get: { revert.isConfirming }, set: { _ in })
+        ) {
+            Button(L10n.string("viewer.revert_original_confirm")) { confirmRevertToOriginal() }
+            Button(L10n.string("action.cancel"), role: .cancel) { revert.cancel() }
+        } message: {
+            Text(L10n.string("viewer.revert_original_message"))
+        }
+        .alert(
+            L10n.string("viewer.revert_original_failed"),
+            isPresented: Binding(get: { revert.showsFailure }, set: { _ in })
+        ) {
+            Button(L10n.string("action.ok"), role: .cancel) { revert.dismissFailure() }
+        }
         .alert(
             saveToLibraryMessage ?? "",
             isPresented: Binding(
@@ -320,6 +338,7 @@ struct MobilePhotoViewer: View {
             liveTextHighlighted = false
             visibleThumbnail?.select(uid)
             editedOriginal.pageChanged(to: uid)
+            revert.pageChanged()
             lookUpEditedOriginal()
         }
         // The library may still load when the viewer opens; the photo on screen then asks as soon as it is ready.
@@ -334,6 +353,8 @@ struct MobilePhotoViewer: View {
             titleMetadataCoordinator.cancelAll()
             visibleThumbnail?.end()
             editedOriginalLookup.cancel()
+            // The viewer closed: a revert that ends later must not close or dismiss anything.
+            revert.detach()
         }
         .animation(
             MobileViewerMotionPolicy.animation(.smooth(duration: 0.24), reduceMotion: reduceMotion),
@@ -705,6 +726,15 @@ struct MobilePhotoViewer: View {
             }
         }
 
+        if offersRevertToOriginal {
+            Button {
+                revert.request()
+            } label: {
+                Label(L10n.string("viewer.revert_original"), systemImage: "arrow.counterclockwise")
+            }
+            .disabled(revert.phase != .idle)
+        }
+
         if currentBaseItem?.uid != nil, liveTextUID == currentBaseItem?.uid {
             Button {
                 liveTextHighlighted.toggle()
@@ -848,6 +878,31 @@ struct MobilePhotoViewer: View {
             isSavingToLibrary = false
             saveToLibraryMessage = result?.message ?? L10n.string("library.save_to_library_failed")
         }
+    }
+
+    /// The command shows for an edited photo with a proven original, in the own library, when a backend reverts.
+    private var offersRevertToOriginal: Bool {
+        guard let base = currentBaseItem else { return false }
+        return EditedPhotoRevertController.isAvailable(
+            canShowOriginal: editedOriginal.canShowOriginal(of: base.uid),
+            mutationAction: viewerMutationAction,
+            hasReverter: libraryModel.editedPhotoReverter != nil)
+    }
+
+    /// The person confirmed. The controller starts the revert once, whatever the number of taps.
+    private func confirmRevertToOriginal() {
+        guard let base = currentBaseItem, let original = editedOriginal.original(of: base.uid),
+            let reverter = libraryModel.editedPhotoReverter
+        else { return revert.cancel() }
+        let libraryModel = libraryModel
+        revert.confirm(
+            perform: {
+                try await libraryModel.revertEditedPhoto(main: base, original: original, using: reverter)
+                // The screen behind the viewer must hear of the revert although the viewer may be gone by then, so
+                // this belongs here and not in `onSuccess`, which only closes the viewer.
+                viewerRouter.noteCompletedMutation(uid: base.uid)
+            },
+            onSuccess: { dismiss() })
     }
 
     private func confirmMoveToTrash() {

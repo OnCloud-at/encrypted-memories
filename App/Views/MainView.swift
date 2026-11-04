@@ -1104,7 +1104,17 @@ struct MainView: View {
             cacheOriginals: offline.offlineEnabled,
             originalsCapBytes: offline.originalsCapBytes,
             allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails,
-            editedOriginalProvider: backend as? any EditedPhotoOriginalProviding)
+            editedOriginalProvider: backend as? any EditedPhotoOriginalProviding,
+            editedPhotoReverter: facade.editedPhotoReverter,
+            mutationAction: viewerMutationAction,
+            onReverted: { main in
+                // The edited photo moved to the Trash: it leaves the grid and the Duplicates screen at once, and the
+                // refresh brings the restored original, a new library photo, into the grid.
+                await timelineModel.commitTrash([main])
+                if mapClusterPresentation != nil { await mapClusterModel.commitTrash([main]) }
+                duplicates?.didTrashElsewhere([main.uid])
+                refreshLibraryManually()
+            })
     }
 
     /// Shows local photos on their way to Proton in the whole-library grid.
