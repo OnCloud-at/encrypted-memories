@@ -6,6 +6,10 @@ import SQLite3
 /// identities and revisions, not temporary export URLs; platform adapters rematerialize resources
 /// when work resumes after a launch, background wake, or extension invocation.
 public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStore, @unchecked Sendable {
+    #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
+        enum ProblemReadEvent { case healthProbe, willLock, didLock, statement, step, row, didUnlock }
+        var onProblemReadEvent: ((ProblemReadEvent) -> Void)?
+    #endif
     public static let databaseFileName = "upload-backup-sync-queue-v1.sqlite"
 
     private static let schemaVersion = 2
@@ -35,7 +39,12 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     deinit { close() }
 
     /// Recovery activation stays off until all decision consumers use strict reads.
-    public func isOperational() -> Bool { connection.isOperational() }
+    public func isOperational() -> Bool {
+        #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
+            onProblemReadEvent?(.healthProbe)
+        #endif
+        return connection.isOperational()
+    }
 
     /// Complete decision reads refuse an open transaction or a lasting failure. Call under `connection.withLock`.
     private func readerMayProceedLocked() -> Bool {
@@ -493,7 +502,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// A waiting row counts only when its text is an issue record; an older build's message is no problem.
     /// `body` runs under the store's lock and must not call the store.
     public func forEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) {
+        #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
+            onProblemReadEvent?(.willLock)
+            defer { onProblemReadEvent?(.didUnlock) }
+        #endif
         connection.withLock {
+            #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
+                onProblemReadEvent?(.didLock)
+                onProblemReadEvent?(.statement)
+            #endif
             var stmt: OpaquePointer?
             guard
                 requireOperational(
@@ -513,8 +530,14 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_int64(stmt, 1, Int64(BackupIssueRecord.storagePrefix.count))
             bindText(stmt, 2, BackupIssueRecord.storagePrefix)
+            #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
+                onProblemReadEvent?(.step)
+            #endif
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
+                #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
+                    onProblemReadEvent?(.row)
+                #endif
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
                     connection.markFailed()
                     return
@@ -522,6 +545,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
                 guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return }
                 if !entry.isDismissedSourceRecheck, !body(entry) { return }
+                #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
+                    onProblemReadEvent?(.step)
+                #endif
                 stepResult = sqlite3_step(stmt)
             }
             _ = requireOperational(stepResult == SQLITE_DONE)

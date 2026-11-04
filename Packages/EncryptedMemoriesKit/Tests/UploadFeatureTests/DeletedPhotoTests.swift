@@ -469,6 +469,113 @@ final class DeletedPhotoTests: XCTestCase {
             XCTAssertNotNil(controller.activeExecutionRunID)
             await controller.shutdown()
         }
+
+        @MainActor
+        func testBackUpAgainRefusesARejectedDecisionWithoutStartingAPass() async throws {
+            let suite = "deletion-controller-refused-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
+                    runtimeSignals: .wiFiWithMobileDataOff),
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+            XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
+            controller.setAccessStateForTesting(.full)
+            controller.replacePassBodyForTesting {}
+            let item = try XCTUnwrap(controller.failedItems().first)
+            let rejected = BackupFailedItem(
+                id: item.id, filename: item.filename, reason: item.reason, isPermanent: item.isPermanent,
+                issue: .remoteDraftStale, source: item.source, revision: item.revision)
+            XCTAssertFalse(controller.backUpAgain(rejected))
+            XCTAssertFalse(controller.isSyncing)
+            XCTAssertNil(controller.activeExecutionRunID)
+            XCTAssertEqual(controller.failedItems(), [item])
+            XCTAssertTrue(journal.entry(for: try XCTUnwrap(item.source)).isEmpty)
+            await controller.shutdown()
+        }
+    #endif
+
+    @MainActor
+    func testPagedProblemListKeepsTheRow250DecisionAndItsOtherRows() async throws {
+        let suite = "deletion-page-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        defer { queue.close() }
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<1_000).map { index in
+                    .init(
+                        source: .init(kind: .photoLibraryAsset, identifier: "page-photo-\(index)"),
+                        revision: .init(rawValue: Int64(index)), originalFilename: "photo-\(index).heic",
+                        state: .failedPermanent,
+                        lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                        updatedAt: date)
+                }))
+        let session = controller.makeProblemListSession()
+        session.requestRefresh()
+        await session.waitUntilIdle()
+        XCTAssertEqual(session.total, 1_000)
+        XCTAssertTrue(session.requestNextPage())
+        await session.waitUntilIdle()
+        let before = session.rows.map(\.id)
+        let decision = session.rows[249].item
+        let decisionSource = try XCTUnwrap(decision.source)
+        controller.keepDeleted(decision)
+        session.requestRefresh()
+        await session.waitUntilIdle()
+        XCTAssertEqual(session.total, 999)
+        XCTAssertEqual(session.rows.count, 400, "An action keeps the loaded page progress")
+        XCTAssertEqual(Array(session.rows.prefix(399)).map(\.id), before.filter { $0 != before[249] })
+        XCTAssertTrue(journal.entry(for: decisionSource).keptDeleted == true)
+        XCTAssertEqual(
+            try queue.entry(for: decisionSource, revision: XCTUnwrap(decision.revision))?.state,
+            .skippedRemoteDeletion)
+        XCTAssertEqual(try XCTUnwrap(queue.summary()).uploaded, 0)
+        while session.rows.count < session.total {
+            XCTAssertTrue(session.requestNextPage())
+            await session.waitUntilIdle()
+        }
+        XCTAssertEqual(Set(session.rows.map(\.id)).count, 999)
+        XCTAssertFalse(session.rows.contains { $0.item.source == decisionSource })
+        await session.shutdown()
+        await controller.shutdown()
+    }
+
+    #if DEBUG
+        @MainActor
+        func testCommittedDecisionDisappearsBeforeThePacedRefresh() async throws {
+            let suite = "deletion-immediate-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting(count: 1_000))
+            let session = controller.makeProblemListSession()
+            session.requestRefresh()
+            await session.waitUntilIdle()
+            XCTAssertTrue(session.requestNextPage())
+            await session.waitUntilIdle()
+            let item = session.rows[249].item
+            let committed = session.resolveDecision(item) { controller.keepDeleted(item) }
+            XCTAssertTrue(committed)
+            XCTAssertEqual(session.rows.count, 399, "A committed row leaves before the paced refresh can run")
+            XCTAssertFalse(session.rows.contains { $0.item.id == item.id })
+            XCTAssertEqual(session.total, 999)
+            XCTAssertTrue(journal.entry(for: try XCTUnwrap(item.source)).keptDeleted == true)
+            await session.waitUntilIdle()
+            XCTAssertFalse(session.rows.contains { $0.item.id == item.id })
+            await session.shutdown()
+            await controller.shutdown()
+        }
     #endif
 
     @MainActor

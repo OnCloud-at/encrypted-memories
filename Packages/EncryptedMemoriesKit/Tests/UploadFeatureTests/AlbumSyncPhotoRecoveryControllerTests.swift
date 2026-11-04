@@ -1,5 +1,6 @@
 import AlbumSyncCore
 import Foundation
+import Observation
 import Photos
 import PhotosCore
 import UploadCore
@@ -9,6 +10,82 @@ import XCTest
 
 @MainActor
 final class AlbumSyncPhotoRecoveryControllerTests: XCTestCase {
+    func testRestoreBeyondSavedProblemLimitUsesFinishedSessionMembership() async throws {
+        try await withFixture { fixture in
+            let preceding = (0..<249).map { index in
+                BackupFailedItem(
+                    id: "earlier-\(index)", filename: "earlier-\(index).heic",
+                    reason: "Reason", isPermanent: false, issue: .network)
+            }
+            fixture.controller.recordFinishedRun(
+                preceding + fixture.report.problems,
+                albumID: "local-album", recoveryContext: fixture.remote.context)
+            XCTAssertEqual(
+                fixture.controller.selectedAlbums.first?.problems.count, 200,
+                "The saved last-run cache keeps its existing limit")
+            XCTAssertEqual(fixture.controller.problemListItems(albumID: "local-album").count, 250)
+            XCTAssertTrue(fixture.controller.canRestorePhotos(albumID: "local-album"))
+            let uploads = fixture.device.server.uploadRequestCount
+            let result = try await fixture.restore()
+            XCTAssertEqual(result, .restored, "The photo at row 250 remains recoverable")
+            XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+        }
+    }
+
+    func testFinishedSessionMembershipSurvivesStopOfLaterRun() async throws {
+        try await withFixture { fixture in
+            let preceding = (0..<249).map { index in
+                BackupFailedItem(
+                    id: "earlier-\(index)", filename: "earlier-\(index).heic",
+                    reason: "Reason", isPermanent: false, issue: .network)
+            }
+            fixture.controller.recordFinishedRun(
+                preceding + fixture.report.problems,
+                albumID: "local-album", recoveryContext: fixture.remote.context)
+            let finishedID = fixture.controller.problemListID(albumID: "local-album")
+            fixture.controller.stopSync()
+            XCTAssertEqual(fixture.controller.problemListID(albumID: "local-album"), finishedID)
+            let result = try await fixture.restore()
+            XCTAssertEqual(
+                result, .restored,
+                "Stopping later work must not discard the earlier finished problem set")
+        }
+    }
+
+    func testCompleteDisplayDoesNotRequireRecoveryContext() async throws {
+        try await withFixture { fixture in
+            let items = (0..<1_000).map { index in
+                BackupFailedItem(
+                    id: "unavailable-\(index)", filename: "photo-\(index).heic",
+                    reason: "Reason", isPermanent: false, issue: .network)
+            }
+            fixture.controller.recordFinishedRun(items, albumID: "local-album")
+            XCTAssertEqual(fixture.controller.problemListItems(albumID: "local-album"), items)
+            XCTAssertEqual(fixture.controller.selectedAlbums.first?.problems.count, 200)
+            XCTAssertFalse(fixture.controller.canRestorePhotos(albumID: "local-album"))
+        }
+    }
+
+    func testRemovedAndShutDownSessionsRejectLateFinishedLists() async throws {
+        try await withFixture { fixture in
+            fixture.controller.removeFromSelection("local-album")
+            fixture.controller.recordFinishedRun(
+                fixture.report.problems,
+                albumID: "local-album", recoveryContext: fixture.remote.context)
+            XCTAssertNil(fixture.controller.problemListID(albumID: "local-album"))
+            XCTAssertTrue(fixture.controller.problemListItems(albumID: "local-album").isEmpty)
+            XCTAssertFalse(fixture.controller.canRestorePhotos(albumID: "local-album"))
+        }
+        try await withFixture { fixture in
+            await fixture.controller.shutdown()
+            fixture.controller.recordFinishedRun(
+                fixture.report.problems,
+                albumID: "local-album", recoveryContext: fixture.remote.context)
+            XCTAssertNil(fixture.controller.problemListID(albumID: "local-album"))
+            XCTAssertFalse(fixture.controller.canRestorePhotos(albumID: "local-album"))
+        }
+    }
+
     func testExplicitRestoreUsesTheControllerAndLeavesSettlementToNextSync() async throws {
         try await withFixture { fixture in
             let before = fixture.device.server.uploadRequestCount
@@ -58,6 +135,44 @@ final class AlbumSyncPhotoRecoveryControllerTests: XCTestCase {
 
     func testProblemListUnknownRemoteKeepsTheRowAndReportsRestoreFailure() async throws {
         try await assertProblemListRestoreUnavailable(permanentlyMissing: false)
+    }
+
+    func testDeepRestoreFailureUsesTheFixedActionMessageWithoutChangingPhotoRows() async throws {
+        try await withFixture { fixture in
+            let preceding = (0..<249).map { index in
+                BackupFailedItem(
+                    id: "earlier-\(index)", filename: "earlier-\(index).heic",
+                    reason: "Reason", isPermanent: false, issue: .network)
+            }
+            fixture.controller.recordFinishedRun(
+                preceding + fixture.report.problems,
+                albumID: "local-album", recoveryContext: fixture.remote.context)
+            let session = fixture.controller.makeProblemListSession(albumID: "local-album")
+            session.requestRefresh()
+            await session.waitUntilIdle()
+            XCTAssertTrue(session.requestNextPage())
+            await session.waitUntilIdle()
+            XCTAssertEqual(session.rows.count, 250)
+            let before = session.rows
+            let uploads = fixture.device.server.uploadRequestCount
+            let messageChanged = XCTestExpectation(description: "Fixed action area observes restore failure")
+            withObservationTracking {
+                XCTAssertNil(session.fixedActionMessage)
+            } onChange: {
+                messageChanged.fulfill()
+            }
+            fixture.device.server.personEmptyTrash()
+            await fixture.controller.restorePhotoFromProblemList(fixture.problem, albumID: "local-album")
+            XCTAssertEqual(fixture.controller.lastMessage, L10n.string("albumsync.error_restore_photo"))
+            await fulfillment(of: [messageChanged], timeout: 1)
+            XCTAssertEqual(
+                session.fixedActionMessage, L10n.string("albumsync.error_restore_photo"),
+                "The real session must expose the error outside its scrolling photo rows")
+            XCTAssertEqual(session.rows, before)
+            XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+            await session.shutdown()
+            XCTAssertNil(session.fixedActionMessage)
+        }
     }
 
     func testProblemListPermanentlyMissingRemoteKeepsTheRowAndReportsRestoreFailure() async throws {

@@ -856,40 +856,94 @@ private struct MacFailedBackupSheet: View {
 
     let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var problemList = BackupProblemListModel()
+    @State private var pagedList: BackupProblemListSession
+    @State private var sessionSourceID: String
     @State private var previews = BackupProblemPreviewModel(
         load: PhotoKitLocalThumbnailLoader.problemListPreviews(
             request: PhotoKitPlatformImages.request
         ).listThumbnail(for:))
     @State private var personReadTask: Task<Void, Never>?
-    @State private var readOrder = BackupProblemListReadOrder()
 
     init(controller: PhotoLibraryBackupController) {
         source = .backup(controller)
+        _pagedList = State(initialValue: controller.makeProblemListSession())
+        _sessionSourceID = State(initialValue: "backup-\(ObjectIdentifier(controller))")
     }
 
     init(albumSync: AlbumSyncController, albumID: String) {
         source = .album(albumSync, albumID: albumID)
+        _pagedList = State(initialValue: albumSync.makeProblemListSession(albumID: albumID))
+        _sessionSourceID = State(initialValue: "album-\(ObjectIdentifier(albumSync))-\(albumID)")
     }
 
     private var controller: PhotoLibraryBackupController? {
         if case .backup(let controller) = source { controller } else { nil }
     }
 
-    private var items: [BackupFailedItem] {
+    private var sourceID: String {
         switch source {
-        case .backup: problemList.items
-        case .album(let albumSync, let albumID):
-            albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
+        case .backup(let controller): "backup-\(ObjectIdentifier(controller))"
+        case .album(let controller, let albumID): "album-\(ObjectIdentifier(controller))-\(albumID)"
         }
     }
 
-    /// What the sheet shows. The backup list never says that nothing needs attention while the summary counts items.
-    private var presentation: BackupProblemListModel.Presentation {
-        if let controller {
-            return problemList.presentation(expectsItems: controller.status.needsAttentionCount > 0)
+    private var sourceIsSelected: Bool {
+        if case .album(let controller, let albumID) = source {
+            return controller.selectedAlbumIDs.contains(albumID)
         }
-        return items.isEmpty ? .empty : .list
+        return true
+    }
+
+    private struct FollowKey: Equatable {
+        let session: ObjectIdentifier
+        let source: String
+        let backup: BackupStatus.ProblemListKey?
+        let album: UUID?
+    }
+
+    private var followKey: FollowKey {
+        let albumRevision: UUID?
+        if case .album(let controller, _) = source {
+            albumRevision = controller.problemListRevision
+        } else {
+            albumRevision = nil
+        }
+        return FollowKey(
+            session: ObjectIdentifier(pagedList), source: sourceID,
+            backup: controller?.status.problemListKey, album: albumRevision)
+    }
+
+    private var items: [BackupFailedItem] {
+        guard sessionSourceID == sourceID, sourceIsSelected else { return [] }
+        return pagedList.rows.map(\.item)
+    }
+
+    private var presentation: BackupProblemListModel.Presentation {
+        guard sessionSourceID == sourceID else { return .loading }
+        guard sourceIsSelected else { return .empty }
+        let expectsItems: Bool
+        switch source {
+        case .backup(let controller): expectsItems = controller.status.needsAttentionCount > 0
+        case .album(let controller, let albumID):
+            expectsItems = controller.selectedAlbums.first { $0.id == albumID }?.hasNeedsAttention == true
+        }
+        return pagedList.presentation(expectsItems: expectsItems)
+    }
+
+    private func makeSession() -> BackupProblemListSession {
+        switch source {
+        case .backup(let controller): controller.makeProblemListSession()
+        case .album(let controller, let albumID): controller.makeProblemListSession(albumID: albumID)
+        }
+    }
+
+    private func prepareSession() {
+        guard sessionSourceID != sourceID || pagedList.isRetired else { return }
+        let previous = pagedList
+        pagedList = makeSession()
+        sessionSourceID = sourceID
+        personReadTask?.cancel()
+        Task { await previous.shutdown() }
     }
 
     var body: some View {
@@ -921,32 +975,21 @@ private struct MacFailedBackupSheet: View {
             switch presentation {
             case .loading, .unavailable, .empty:
                 BackupProblemListStateView(presentation) {
-                    guard let controller else { return }
-                    problemList.beginReading()
-                    readList(of: controller)
+                    pagedList.requestRefresh()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .list:
                 List {
-                    if case .album(let albumSync, _) = source, let message = albumSync.lastMessage,
-                        message == L10n.string("albumsync.error_restore_photo")
-                    {
-                        Text(message)
-                            .foregroundStyle(.red)
-                            .accessibilityIdentifier("albumsync.restoreError")
-                    }
-                    BackupProblemSections(items: items) { item in
+                    BackupProblemSections(rows: pagedList.rows) { item in
                         BackupProblemRow(item: item, previews: previews) {
                             if let controller, item.issue == .deletedElsewhere {
                                 Button(L10n.string("backup.keep_deleted")) {
-                                    controller.keepDeleted(item)
-                                    readList(of: controller)
+                                    pagedList.resolveDecision(item) { controller.keepDeleted(item) }
                                 }
                                 .buttonStyle(.borderless)
                                 .help(L10n.string("backup.keep_deleted"))
                                 Button(L10n.string("backup.back_up_again")) {
-                                    controller.backUpAgain(item)
-                                    readList(of: controller, afterDecision: item)
+                                    pagedList.resolveDecision(item) { controller.backUpAgain(item) }
                                 }
                                 .buttonStyle(.borderless)
                                 .help(L10n.string("backup.back_up_again"))
@@ -959,11 +1002,12 @@ private struct MacFailedBackupSheet: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .help(L10n.string("contextmenu.restore"))
+                                .disabled(!albumSync.canRestorePhotos(albumID: albumID))
                                 .accessibilityIdentifier("albumsync.restore.\(item.id)")
                             } else if let controller, item.isPermanent {
                                 Button {
                                     controller.dismissFailedItem(item)
-                                    problemList.dismissItem(id: item.id)
+                                    pagedList.dismissItem(id: item.id)
                                 } label: {
                                     Image(systemName: "xmark.circle")
                                 }
@@ -971,6 +1015,7 @@ private struct MacFailedBackupSheet: View {
                                 .help(L10n.string("backup.failed_item_dismiss"))
                             }
                         }
+                        .onAppear { pagedList.requestNextPage(near: item) }
                     }
                 }
                 if controller != nil {
@@ -982,26 +1027,25 @@ private struct MacFailedBackupSheet: View {
                         .padding()
                 }
             }
+            BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil)
         }
         .frame(width: 520, height: 380)
-        // A photo can need the person while the list is open; Try again then appears.
-        .task(id: controller?.status.problemListKey) {
-            guard let controller else { return }
-            await controller.followProblemList(
-                order: readOrder, { problemList.replaceItems($0) }, ifUnavailable: { problemList.markUnavailable() })
+        .task(id: followKey) {
+            guard sessionSourceID == sourceID, sourceIsSelected else { return }
+            switch source {
+            case .backup(let controller): await controller.followProblemList(session: pagedList)
+            case .album:
+                pagedList.requestRefresh()
+                await pagedList.waitUntilIdle()
+            }
         }
+        .onAppear { prepareSession() }
+        .onChange(of: sourceID) { _, _ in prepareSession() }
         .backupProblemPreviews(previews)
-        .onDisappear { personReadTask?.cancel() }
-    }
-
-    /// A person's action reads the list like the automatic follow does. The sheet keeps the task, so closing the
-    /// sheet or a newer action ends it.
-    private func readList(of controller: PhotoLibraryBackupController, afterDecision item: BackupFailedItem? = nil) {
-        personReadTask?.cancel()
-        personReadTask = Task {
-            await controller.readProblemList(
-                order: readOrder, afterDecision: item, { problemList.replaceItems($0) },
-                ifUnavailable: { problemList.markUnavailable() })
+        .onDisappear {
+            personReadTask?.cancel()
+            let session = pagedList
+            Task { await session.shutdown() }
         }
     }
 }

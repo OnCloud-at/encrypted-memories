@@ -5,22 +5,51 @@ import UploadCore
 
 /// Shared sections inside each platform's native List. The host supplies native row actions.
 public struct BackupProblemSections<Row: View>: View {
-    private let items: [BackupFailedItem]
+    private struct IdentifiedProblem: Identifiable {
+        let id: BackupProblemSnapshot.Row.ID
+        let item: BackupFailedItem
+    }
+    private let rows: [IdentifiedProblem]
     private let row: (BackupFailedItem) -> Row
 
     public init(items: [BackupFailedItem], @ViewBuilder row: @escaping (BackupFailedItem) -> Row) {
-        self.items = items
+        rows = items.map { IdentifiedProblem(id: .item($0.id), item: $0) }
+        self.row = row
+    }
+
+    public init(rows: [BackupProblemSnapshot.Row], @ViewBuilder row: @escaping (BackupFailedItem) -> Row) {
+        self.rows = rows.map { IdentifiedProblem(id: $0.id, item: $0.item) }
         self.row = row
     }
 
     public var body: some View {
-        ForEach(BackupProblemSection.group(items)) { section in
+        ForEach(BackupProblemSection.grouped(rows, section: { $0.item.category.section })) { section in
             Section {
-                ForEach(section.items) { item in row(item) }
+                ForEach(section.items) { item in row(item.item) }
             } header: {
                 Text(section.title)
                     .accessibilityIdentifier("backup.issueSection.\(section.id.rawValue)")
             }
+        }
+    }
+}
+
+/// The native hosts place this one action area outside their scrolling photo rows.
+public struct BackupProblemActionArea: View {
+    private let message: String?
+
+    public init(message: String?) { self.message = message }
+
+    public var body: some View {
+        if let message {
+            Text(message)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                .background(.bar)
+                .accessibilityIdentifier("albumsync.restoreError")
         }
     }
 }

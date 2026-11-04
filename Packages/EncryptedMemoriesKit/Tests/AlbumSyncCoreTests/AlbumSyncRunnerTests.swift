@@ -1252,6 +1252,38 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(report.problems.count == store.mapping(localAlbumID: album.id)?.lastFailedCount)
     }
 
+    @Test func mixedFinishedReportKeepsDistinctProblemIdentitiesForTheCompleteList() async throws {
+        let remote = FakeRemoteOps()
+        remote.children = ["l-incomplete"]
+        remote.failAttachOf = ["l-attach"]
+        remote.deletionStates = ["l-trash": .trashed]
+        let backup = FakeBackupExecutor()
+        for identifier in ["incomplete", "attach"] {
+            backup.problems[identifier] = BackupFailedItem(
+                id: "queue-\(identifier)", filename: "\(identifier).heic", reason: "network reason",
+                isPermanent: false, issue: .network,
+                source: .init(kind: .photoLibraryAsset, identifier: identifier))
+        }
+        let (runner, _, _, store) = makeRunner(
+            contents: ["local-1": ["missing", "attach", "trash", "incomplete"]],
+            links: [
+                "attach": link("l-attach"), "trash": link("l-trash", trashed: true),
+                "incomplete": link("l-incomplete"),
+            ], remote: remote, backup: backup)
+        defer { store.close() }
+        let report = try await runner.sync(album: .init(id: "local-1", title: "Mixed", assetCount: 4))
+        #expect(report.incomplete == 1)
+        #expect(report.unattachable == 1)
+        #expect(report.trashedSkipped == 1)
+        #expect(report.attachFailed == 1)
+        #expect(report.problems.count == 4)
+        #expect(Set(report.problems.map(\.id)).count == 4)
+        #expect(report.problems.map(\.source?.identifier) == ["incomplete", "missing", "trash", "attach"])
+        let snapshot = try #require(BackupProblemSnapshot.album(items: report.problems))
+        #expect(snapshot.rows.count == 4)
+        #expect(Set(snapshot.rows.map(\.id)).count == 4)
+    }
+
     @Test func attachFailuresAreListedForEachPhoto() async throws {
         let remote = FakeRemoteOps()
         remote.failAttachOf = ["l-a", "l-c"]
