@@ -32,6 +32,9 @@ public final class AlbumSyncController {
             PhotoLibraryBackupCatalog(localIdentifiers: [$0])
         }
         var recoveryResourceResolver: (any BackupResourceResolving)?
+        var bulkActionPause: @MainActor (TimeInterval) async throws -> Void = {
+            try await Task.sleep(for: .seconds($0))
+        }
 
         public init(accountDataDirectory: URL, databasePolicy: LibraryDatabasePolicy) {
             self.accountDataDirectory = accountDataDirectory
@@ -187,6 +190,7 @@ public final class AlbumSyncController {
     ) {
         self.remoteOps = remoteOps
         self.identityResolver = identityResolver
+        bulkPhotoActions = BulkPhotoActionRunner(sleep: configuration.bulkActionPause)
         recoveryCatalog = configuration.recoveryCatalog
         let recoveryTempStore = BackupTempFileStore(
             directory: configuration.accountDataDirectory.appendingPathComponent("album-sync-restore-temp"))
@@ -427,12 +431,20 @@ public final class AlbumSyncController {
 
     /// Native Restore controls can announce their disabled state before a tap.
     public func canRestorePhotos(albumID: String) -> Bool {
-        !isShuttingDown && !isSyncing && recoveryTask == nil
+        !isShuttingDown && !isSyncing && recoveryTask == nil && !isBulkRestoring
             && selectedAlbumIDs.contains(albumID) && recoveryContexts[albumID] != nil
     }
 
     /// Explicitly restores one exact photo through the current finished-run membership and context.
     public func restorePhoto(_ item: BackupFailedItem, albumID: String) async throws -> AlbumSyncPhotoRecovery.Result {
+        guard !isBulkRestoring else { throw AlbumSyncPhotoRecovery.Error.unavailable }
+        return try await restoreAdmittedPhoto(item, albumID: albumID)
+    }
+
+    /// The single exact restore path; a running bulk restore calls it for each confirmed row.
+    private func restoreAdmittedPhoto(
+        _ item: BackupFailedItem, albumID: String
+    ) async throws -> AlbumSyncPhotoRecovery.Result {
         try Task.checkCancellation()
         guard recoveryTask == nil, !isSyncing, !isShuttingDown,
             let context = recoveryContexts[albumID]
@@ -463,6 +475,83 @@ public final class AlbumSyncController {
             setMessage(L10n.string("albumsync.error_restore_photo"))
         }
     }
+
+    // MARK: - Bulk restore
+
+    public let bulkPhotoActions: BulkPhotoActionRunner
+    /// The confirmation that prepareRestore made and the finished run it covers; each run has its own id.
+    private var bulkRestoreConsent: (problemListID: UUID, confirmationID: UUID)?
+    /// From start to settlement no album sync starts, also between photos of the run.
+    private var isBulkRestoring = false
+    private var bulkRestoreStopped = false
+    private var bulkRestoreRestored = 0
+    /// The album whose run or result the shared runner holds; only that album's list shows them.
+    public private(set) var bulkRestoreAlbumID: String?
+    private var bulkRestoreTask: Task<Void, Never>?
+
+    public func isBulkRestoreAvailable(albumID: String) -> Bool {
+        canRestorePhotos(albumID: albumID)
+    }
+
+    /// Consent covers every deleted row of the finished run, beyond the loaded page. No row changes here.
+    public func prepareRestore(albumID: String) async -> BulkPhotoActionRunner.Confirmation? {
+        guard isBulkRestoreAvailable(albumID: albumID), let finished = finishedProblems[albumID] else { return nil }
+        let deleted = finished.items.filter { $0.issue == .remoteDeletion }
+        guard let confirmation = bulkPhotoActions.prepare(deleted, action: .restore) else { return nil }
+        bulkRestoreConsent = (finished.id, confirmation.id)
+        return confirmation
+    }
+
+    /// Call only from the visible confirmation. Each row uses the existing exact restore; a refused row stays.
+    @discardableResult
+    public func startRestore(_ confirmation: BulkPhotoActionRunner.Confirmation, albumID: String) -> Bool {
+        // Only the confirmation that prepareRestore made (always .restore), for the album's current run, can start.
+        guard let consent = bulkRestoreConsent,
+            consent.confirmationID == confirmation.id, finishedProblems[albumID]?.id == consent.problemListID,
+            isBulkRestoreAvailable(albumID: albumID)
+        else { return false }
+        let generation = recoveryGeneration
+        guard
+            bulkPhotoActions.start(
+                confirmation,
+                perform: { [weak self] item in
+                    guard let self else { return false }
+                    // Stop, selection changes and a new finished run invalidate recovery; the run ends there.
+                    guard recoveryGeneration == generation else {
+                        bulkPhotoActions.cancel()
+                        return false
+                    }
+                    do {
+                        _ = try await restoreAdmittedPhoto(item, albumID: albumID)
+                        bulkRestoreRestored += 1
+                        return true
+                    } catch {
+                        return false
+                    }
+                })
+        else { return false }
+        isBulkRestoring = true
+        bulkRestoreStopped = false
+        bulkRestoreRestored = 0
+        bulkRestoreAlbumID = albumID
+        bulkRestoreTask = Task { [weak self, bulkPhotoActions] in
+            await bulkPhotoActions.waitUntilFinished()
+            guard let self else { return }
+            isBulkRestoring = false
+            bulkRestoreConsent = nil
+            bulkRestoreTask = nil
+            guard !isShuttingDown else { return }
+            // The normal album sync adds restored copies once; after Stop the next sync reconciles them.
+            if !bulkRestoreStopped, bulkRestoreRestored > 0 {
+                syncNow(albumID: albumID)
+            } else {
+                startBatchIfIdle()
+            }
+        }
+        return true
+    }
+
+    func waitUntilBulkRestoreSettled() async { await bulkRestoreTask?.value }
 
     private func invalidateRecovery() {
         recoveryGeneration = UUID()
@@ -545,6 +634,10 @@ public final class AlbumSyncController {
     }
 
     public func stopSync() {
+        if isBulkRestoring {
+            bulkRestoreStopped = true
+            bulkPhotoActions.cancel()
+        }
         invalidateRecovery()
         recoveryContextTask?.cancel()
         stopState.stopPressed(isSyncing: isSyncing, queuedAlbums: queuedAlbumIDs.count)
@@ -568,6 +661,9 @@ public final class AlbumSyncController {
         invalidateRecovery()
         recoveryContextTask?.cancel()
         let activeRecovery = recoveryTask
+        let bulkRestore = bulkRestoreTask
+        await bulkPhotoActions.shutdown()
+        await bulkRestore?.value
         changeSubscription?.cancel()
         changeSubscription = nil
         isObservingChanges = false
@@ -598,7 +694,8 @@ public final class AlbumSyncController {
     }
 
     private func startBatchIfIdle() {
-        guard !isShuttingDown, let runner, !isSyncing, recoveryTask == nil, !queuedAlbumIDs.isEmpty else { return }
+        guard !isShuttingDown, let runner, !isSyncing, recoveryTask == nil, !isBulkRestoring, !queuedAlbumIDs.isEmpty
+        else { return }
         isSyncing = true
         remoteAlbumsChangedDuringBatch = false
         stopState.batchStarted()
@@ -845,6 +942,12 @@ public final class AlbumSyncController {
             // Keep the fixture independent of PhotoKit authorization on the simulator.
             accessState = .denied
             reloadSelection()
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncBulkRestoreFixture") {
+                // A finished run with a session context offers Restore All; denied access keeps every row.
+                recordFinishedRun(
+                    items, albumID: albumID,
+                    recoveryContext: .init(sessionID: UUID(), volumeID: "fixture-volume", hashKeyEpoch: "fixture"))
+            }
             return true
         }
     #endif

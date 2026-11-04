@@ -1273,3 +1273,403 @@ private struct RecoveryAlteredResolver: BackupResourceResolving {
             captureDate: original.captureDate, secondaries: original.secondaries, cleanup: original.cleanup)
     }
 }
+
+// MARK: - Restore all (#1091)
+
+extension AlbumSyncPhotoRecoveryControllerTests {
+    func testBulkRestoreConfirmsEveryDeletedRowOfTheFinishedRunBeyondTheSavedLimit() async throws {
+        try await withFixture { fixture in
+            let items = otherRows(5) + missingRows(1_000) + fixture.report.problems
+            fixture.controller.recordFinishedRun(
+                items, albumID: "local-album", recoveryContext: fixture.remote.context)
+            XCTAssertEqual(fixture.controller.selectedAlbums.first?.problems.count, 200)
+            XCTAssertTrue(fixture.controller.isBulkRestoreAvailable(albumID: "local-album"))
+            let confirmation = try await unwrapAsync(await fixture.controller.prepareRestore(albumID: "local-album"))
+            XCTAssertEqual(confirmation.action, .restore)
+            XCTAssertEqual(confirmation.count, 1_001, "Consent covers the whole finished run, not the saved page")
+            XCTAssertTrue(confirmation.items.allSatisfy { $0.issue == .remoteDeletion })
+            XCTAssertTrue(confirmation.items.contains(fixture.problem))
+            XCTAssertFalse(fixture.controller.bulkPhotoActions.isRunning, "Preparing never starts work")
+            assertTrashed(fixture)
+        }
+    }
+
+    func testBulkRestoreRestoresTheTrashedCopyKeepsRefusedRowsAndSyncsOnceWithoutUpload() async throws {
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                fixture.controller.recordFinishedRun(
+                    missingRows(2) + fixture.report.problems,
+                    albumID: "local-album", recoveryContext: fixture.remote.context)
+                let uploads = fixture.device.server.uploadRequestCount
+                let source = try XCTUnwrap(fixture.problem.source)
+                let journal = fixture.device.journal.entry(for: source)
+
+                let summary = try await runBulkRestore(fixture)
+
+                assertSummary(summary, total: 3, completed: 1)
+                XCTAssertEqual(probe.ensureBackedUpCalls, 1, "The normal album sync runs once, after the run")
+                let members = try await fixture.device.server.childMainLinkIDs(albumID: "own-album")
+                XCTAssertEqual(members, [fixture.original.nodeID], "The same existing copy enters the album")
+                XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads, "A restore never uploads again")
+                XCTAssertEqual(fixture.device.journal.entry(for: source), journal)
+                XCTAssertNil(fixture.controller.lastMessage)
+            })
+    }
+
+    func testBulkRestoreOfAPermanentlyDeletedCopyKeepsTheRowWithoutSyncOrUpload() async throws {
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                let before = fixture.controller.selectedAlbums.first?.problems
+                let uploads = fixture.device.server.uploadRequestCount
+                fixture.device.server.personEmptyTrash()
+                let restores = restoreCalls(fixture)
+
+                let summary = try await runBulkRestore(fixture)
+
+                assertSummary(summary, total: 1, completed: 0)
+                XCTAssertEqual(probe.ensureBackedUpCalls, 0, "Nothing restored, so no sync starts")
+                XCTAssertEqual(fixture.controller.selectedAlbums.first?.problems, before)
+                XCTAssertEqual(restoreCalls(fixture), restores)
+                XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+                XCTAssertEqual(
+                    fixture.device.server.links.first { $0.linkID == fixture.original.nodeID }?.state, .deleted)
+            })
+    }
+
+    func testBulkRestoreCountsAnAlreadyActiveCopyWithoutAnotherRestoreCall() async throws {
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                let first = try await fixture.restore()
+                XCTAssertEqual(first, .restored)
+                let restores = restoreCalls(fixture)
+                let uploads = fixture.device.server.uploadRequestCount
+
+                let summary = try await runBulkRestore(fixture)
+
+                assertSummary(summary, total: 1, completed: 1)
+                XCTAssertEqual(restoreCalls(fixture), restores, "An active copy needs no second restore")
+                XCTAssertEqual(probe.ensureBackedUpCalls, 1, "The album sync still adds the active copy")
+                XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+            })
+    }
+
+    func testBulkRestoreNeedsTheExactConfirmationAndStartsOnlyOnce() async throws {
+        let gate = RecoveryGate()
+        try await withFixture(
+            onEvidence: { await gate.wait() },
+            body: { fixture in
+                let controller = fixture.controller
+                let declined = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                let second = await controller.prepareRestore(albumID: "local-album")
+                XCTAssertNil(second, "One open confirmation at a time")
+                controller.bulkPhotoActions.dismissConfirmation()
+                XCTAssertFalse(controller.startRestore(declined, albumID: "local-album"), "Cancel revokes consent")
+                assertTrashed(fixture)
+
+                let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                XCTAssertFalse(controller.startRestore(confirmation, albumID: "next-album"), "Consent is per album")
+                XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+                await fulfillment(of: [gate.entered], timeout: 5)
+                XCTAssertFalse(controller.startRestore(confirmation, albumID: "local-album"), "A repeated tap")
+                let duringRun = await controller.prepareRestore(albumID: "local-album")
+                XCTAssertNil(duringRun)
+                XCTAssertFalse(controller.isBulkRestoreAvailable(albumID: "local-album"))
+                await gate.release()
+                await controller.waitUntilBulkRestoreSettled()
+                XCTAssertEqual(controller.bulkPhotoActions.summary?.completed, 1)
+            })
+    }
+
+    func testBulkRestoreHoldsAlbumSyncUntilTheWholeRunEnds() async throws {
+        let gate = RecoveryGate()
+        let pause = RecoveryGate()
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            onEvidence: { await gate.wait() },
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+                configuration.bulkActionPause = { _ in await pause.wait() }
+            },
+            body: { fixture in
+                let controller = fixture.controller
+                controller.recordFinishedRun(
+                    fixture.report.problems + missingRows(1),
+                    albumID: "local-album", recoveryContext: fixture.remote.context)
+                let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+                await fulfillment(of: [gate.entered], timeout: 5)
+                controller.syncNow(albumID: "local-album")
+                XCTAssertFalse(controller.isSyncing)
+                await gate.release()
+                // The run now waits between its two photos; no per-photo restore task is active.
+                await fulfillment(of: [pause.entered], timeout: 5)
+                XCTAssertEqual(controller.bulkPhotoActions.processed, 1)
+                XCTAssertTrue(controller.bulkPhotoActions.isRunning)
+                XCTAssertFalse(controller.isSyncing, "No album sync may start between the photos of one run")
+                XCTAssertFalse(
+                    controller.canRestorePhotos(albumID: "local-album"),
+                    "Per-photo Restore stays unavailable for the whole run")
+                var refused = false
+                do {
+                    _ = try await controller.restorePhoto(fixture.problem, albumID: "local-album")
+                } catch {
+                    refused = (error as? AlbumSyncPhotoRecovery.Error) == .unavailable
+                }
+                XCTAssertTrue(refused, "A per-photo restore between two photos must be refused")
+                await pause.release()
+                await controller.waitUntilBulkRestoreSettled()
+                await waitForSync(controller)
+                XCTAssertEqual(probe.ensureBackedUpCalls, 1, "The held request and the run end share one sync")
+                XCTAssertEqual(controller.bulkPhotoActions.summary?.completed, 1)
+            })
+    }
+
+    func testStopDuringBulkRestoreEndsTheRunWithoutSyncAndKeepsTheRow() async throws {
+        let gate = RecoveryGate()
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            onEvidence: { await gate.wait() },
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                let controller = fixture.controller
+                // The held photo is the last one: only Stop itself can end the run as cancelled.
+                controller.recordFinishedRun(
+                    missingRows(3) + fixture.report.problems,
+                    albumID: "local-album", recoveryContext: fixture.remote.context)
+                let before = controller.selectedAlbums.first?.problems
+                let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+                await fulfillment(of: [gate.entered], timeout: 5)
+                controller.stopSync()
+                await fulfillment(of: [gate.cancelled], timeout: 5)
+                await gate.release()
+                await controller.waitUntilBulkRestoreSettled()
+                await waitForSync(controller)
+
+                let summary = try XCTUnwrap(controller.bulkPhotoActions.summary)
+                XCTAssertTrue(summary.cancelled)
+                XCTAssertEqual(summary.completed, 0)
+                XCTAssertEqual(summary.total, 4)
+                XCTAssertEqual(probe.ensureBackedUpCalls, 0)
+                XCTAssertEqual(controller.selectedAlbums.first?.problems, before)
+                assertTrashed(fixture)
+            })
+    }
+
+    func testShutdownJoinsTheBulkRestoreAndRejectsLaterRuns() async throws {
+        let pause = RecoveryGate()
+        try await withFixture(
+            configure: { configuration, _ in configuration.bulkActionPause = { _ in await pause.wait() } },
+            body: { fixture in
+                let controller = fixture.controller
+                controller.recordFinishedRun(
+                    fixture.report.problems + missingRows(2),
+                    albumID: "local-album", recoveryContext: fixture.remote.context)
+                let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+                await fulfillment(of: [pause.entered], timeout: 5)
+                let shutdown = Task { await controller.shutdown() }
+                await fulfillment(of: [pause.cancelled], timeout: 5)
+                await pause.release()
+                await shutdown.value
+                XCTAssertFalse(controller.bulkPhotoActions.isRunning, "Shutdown joins the run before stores close")
+                let summary = try XCTUnwrap(controller.bulkPhotoActions.summary)
+                XCTAssertTrue(summary.cancelled)
+                XCTAssertEqual(summary.completed, 1, "The photo restored before shutdown keeps its outcome")
+                let afterShutdown = await controller.prepareRestore(albumID: "local-album")
+                XCTAssertNil(afterShutdown)
+                XCTAssertFalse(controller.startRestore(confirmation, albumID: "local-album"))
+            })
+    }
+
+    func testBulkRestoreRefusesConfirmationsThatPrepareRestoreDidNotMake() async throws {
+        try await withFixture { fixture in
+            let controller = fixture.controller
+            let restore = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+            XCTAssertEqual(restore.count, 1)
+            controller.bulkPhotoActions.dismissConfirmation()
+            let backUp = try XCTUnwrap(
+                controller.bulkPhotoActions.prepare(fixture.report.problems, action: .backUpAgain))
+            XCTAssertFalse(controller.startRestore(backUp, albumID: "local-album"), "Back Up Again consent")
+            controller.bulkPhotoActions.dismissConfirmation()
+            let other = try XCTUnwrap(controller.bulkPhotoActions.prepare(fixture.report.problems, action: .restore))
+            XCTAssertFalse(controller.startRestore(other, albumID: "local-album"), "Consent not shown by the list")
+            XCTAssertFalse(controller.bulkPhotoActions.isRunning)
+            assertTrashed(fixture)
+        }
+    }
+
+    func testSelectionChangeDuringBulkRestoreEndsTheRun() async throws {
+        let pause = RecoveryGate()
+        try await withFixture(
+            configure: { configuration, _ in configuration.bulkActionPause = { _ in await pause.wait() } },
+            body: { fixture in
+                let controller = fixture.controller
+                controller.recordFinishedRun(
+                    missingRows(1) + fixture.report.problems,
+                    albumID: "local-album", recoveryContext: fixture.remote.context)
+                let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+                await fulfillment(of: [pause.entered], timeout: 5)
+                // The picker invalidates recovery even when it keeps the same albums.
+                controller.applySelection(controller.selectedAlbumIDs)
+                await pause.release()
+                await controller.waitUntilBulkRestoreSettled()
+                let summary = try XCTUnwrap(controller.bulkPhotoActions.summary)
+                XCTAssertTrue(summary.cancelled, "Recovery changed after consent, so the run ends")
+                XCTAssertEqual(summary.completed, 0)
+                assertTrashed(fixture)
+            })
+    }
+
+    func testBulkRestoreConsentOfOneAlbumNeverStartsAnother() async throws {
+        let source = RecoveryBatchSource()
+        source.includeAsset()
+        try await withFixture(
+            localSource: source, automaticBatch: true,
+            configure: { configuration, device in
+                configuration.backupExecutorOverride = EditScenarioAlbumBackup(device: device)
+            },
+            body: { fixture in
+                let controller = fixture.controller
+                await waitForSync(controller)
+                XCTAssertTrue(controller.selectedAlbumIDs.isSuperset(of: ["local-album", "next-album"]))
+                for album in ["local-album", "next-album"] {
+                    controller.recordFinishedRun(
+                        fixture.report.problems, albumID: album, recoveryContext: fixture.remote.context)
+                }
+                XCTAssertTrue(controller.isBulkRestoreAvailable(albumID: "next-album"))
+                let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                XCTAssertFalse(
+                    controller.startRestore(confirmation, albumID: "next-album"),
+                    "Each album's finished run has its own identity")
+                XCTAssertFalse(controller.bulkPhotoActions.isRunning)
+                XCTAssertNil(controller.bulkRestoreAlbumID)
+                assertTrashed(fixture)
+                // The shared runner's progress and result belong to the album that started it, not to the other list.
+                XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+                XCTAssertEqual(controller.bulkRestoreAlbumID, "local-album")
+                await controller.waitUntilBulkRestoreSettled()
+                XCTAssertEqual(controller.bulkRestoreAlbumID, "local-album", "The result stays with its album")
+            })
+    }
+
+    func testStopAfterARestoredPhotoLeavesTheAlbumToTheNextSync() async throws {
+        let probe = RecoveryShutdownProbeBackup()
+        try await withFixture(
+            configure: { configuration, device in
+                probe.setBase(EditScenarioAlbumBackup(device: device))
+                configuration.backupExecutorOverride = probe
+            },
+            body: { fixture in
+                let controller = fixture.controller
+                controller.recordFinishedRun(
+                    fixture.report.problems + missingRows(3),
+                    albumID: "local-album", recoveryContext: fixture.remote.context)
+                let uploads = fixture.device.server.uploadRequestCount
+                let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+                XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+                let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+                while controller.bulkPhotoActions.processed < 1, ContinuousClock.now < deadline { await Task.yield() }
+                controller.stopSync()
+                await controller.waitUntilBulkRestoreSettled()
+                await waitForSync(controller)
+
+                let summary = try XCTUnwrap(controller.bulkPhotoActions.summary)
+                XCTAssertTrue(summary.cancelled)
+                XCTAssertEqual(summary.completed, 1)
+                XCTAssertEqual(probe.ensureBackedUpCalls, 0, "Stop also stops the final album sync")
+                XCTAssertEqual(
+                    fixture.device.server.links.first { $0.linkID == fixture.original.nodeID }?.state, .active)
+
+                controller.syncNow(albumID: "local-album")
+                await waitForSync(controller)
+                XCTAssertEqual(probe.ensureBackedUpCalls, 1)
+                let members = try await fixture.device.server.childMainLinkIDs(albumID: "own-album")
+                XCTAssertEqual(members, [fixture.original.nodeID], "The next sync adds the restored copy")
+                XCTAssertEqual(fixture.device.server.uploadRequestCount, uploads)
+            })
+    }
+
+    func testBulkRestoreRefusesConsentFromAnEarlierFinishedRun() async throws {
+        try await withFixture { fixture in
+            let controller = fixture.controller
+            let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+            controller.recordFinishedRun(
+                fixture.report.problems, albumID: "local-album", recoveryContext: fixture.remote.context)
+            XCTAssertFalse(
+                controller.startRestore(confirmation, albumID: "local-album"),
+                "A new finished run needs fresh consent, even with the same rows")
+            XCTAssertFalse(controller.bulkPhotoActions.isRunning)
+            assertTrashed(fixture)
+        }
+    }
+
+    private func runBulkRestore(_ fixture: RecoveryControllerFixture) async throws -> BulkPhotoActionRunner.Summary {
+        let controller = fixture.controller
+        let confirmation = try await unwrapAsync(await controller.prepareRestore(albumID: "local-album"))
+        XCTAssertTrue(controller.startRestore(confirmation, albumID: "local-album"))
+        await controller.waitUntilBulkRestoreSettled()
+        await waitForSync(controller)
+        return try XCTUnwrap(controller.bulkPhotoActions.summary)
+    }
+
+    private func restoreCalls(_ fixture: RecoveryControllerFixture) -> Int {
+        fixture.device.server.steps.filter { $0.action.hasPrefix("person restore ") }.count
+    }
+
+    /// Rows deleted in Proton Drive whose photo is not in the album; the existing restore path refuses them.
+    private func missingRows(_ count: Int) -> [BackupFailedItem] {
+        (0..<count).map { index in
+            BackupFailedItem(
+                id: "missing-\(index)", filename: "missing-\(index).heic", reason: "Deleted",
+                isPermanent: false, issue: .remoteDeletion,
+                source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "missing-\(index)"))
+        }
+    }
+
+    private func otherRows(_ count: Int) -> [BackupFailedItem] {
+        (0..<count).map { index in
+            BackupFailedItem(
+                id: "other-\(index)", filename: "other-\(index).heic", reason: "Reason",
+                isPermanent: false, issue: .network)
+        }
+    }
+
+    private func unwrapAsync<T>(
+        _ value: @autoclosure () async throws -> T?, file: StaticString = #filePath, line: UInt = #line
+    ) async throws -> T {
+        let unwrapped = try await value()
+        return try XCTUnwrap(unwrapped, file: file, line: line)
+    }
+
+    private func assertSummary(
+        _ summary: BulkPhotoActionRunner.Summary, total: Int, completed: Int,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(summary.action, .restore, file: file, line: line)
+        XCTAssertEqual(summary.total, total, file: file, line: line)
+        XCTAssertEqual(summary.completed, completed, "restored", file: file, line: line)
+        XCTAssertEqual(summary.stayed, total - completed, "unchanged", file: file, line: line)
+        XCTAssertFalse(summary.cancelled, file: file, line: line)
+    }
+}

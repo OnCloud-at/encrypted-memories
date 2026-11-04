@@ -1,6 +1,125 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "albumsync.bulk_action %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore All (%@)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Alle wiederherstellen (%@)"
+          }
+        }
+      }
+    },
+    "albumsync.bulk_title_one %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore %@ photo?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Foto wiederherstellen?"
+          }
+        }
+      }
+    },
+    "albumsync.bulk_title_other %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore %@ photos?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Fotos wiederherstellen?"
+          }
+        }
+      }
+    },
+    "albumsync.bulk_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Photos that are still in the Proton Drive trash are restored. Album sync then adds them to the album. Photos that were deleted permanently stay unchanged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fotos, die noch im Proton-Papierkorb liegen, werden wiederhergestellt. Die Album-Synchronisierung fügt sie danach zum Album hinzu. Endgültig gelöschte Fotos bleiben unverändert."
+          }
+        }
+      }
+    },
+    "albumsync.bulk_outcome_one %@ %@ %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ of %2$@ photo restored. %3$@ unchanged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ von %2$@ Foto wiederhergestellt. %3$@ unverändert."
+          }
+        }
+      }
+    },
+    "albumsync.bulk_outcome_other %@ %@ %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ of %2$@ photos restored. %3$@ unchanged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ von %2$@ Fotos wiederhergestellt. %3$@ unverändert."
+          }
+        }
+      }
+    },
+    "albumsync.bulk_restored_detail": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Album sync adds restored photos to the album."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Album-Synchronisierung fügt wiederhergestellte Fotos zum Album hinzu."
+          }
+        }
+      }
+    },
     "backup.bulk_count_one %@": {
       "extractionState": "manual",
       "localizations": {

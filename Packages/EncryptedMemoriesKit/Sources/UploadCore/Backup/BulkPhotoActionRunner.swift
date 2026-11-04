@@ -39,7 +39,8 @@ public final class BulkPhotoActionRunner {
         self.init { try await Task.sleep(for: .seconds($0)) }
     }
 
-    init(sleep: @escaping @MainActor (TimeInterval) async throws -> Void) {
+    /// `sleep` paces the start of each later photo; tests can hold a run between two photos.
+    public init(sleep: @escaping @MainActor (TimeInterval) async throws -> Void) {
         self.sleep = sleep
     }
 
