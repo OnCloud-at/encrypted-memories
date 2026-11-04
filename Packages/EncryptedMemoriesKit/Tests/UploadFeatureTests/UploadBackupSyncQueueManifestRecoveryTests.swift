@@ -176,13 +176,17 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         XCTAssertEqual(try store!.entry(for: row.source, revision: row.revision), row)
     }
 
-    func testLegacyEntryKeepsItsOldAnswerAfterABindingFailure() throws {
+    /// A failed bind would make the lookup prove an absence it never read (#1004 B2).
+    func testEntryBindingFailureThrowsInsteadOfProvingAbsence() throws {
         store = try makeStore()
         let connection = try queueConnection()
         connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
         let row = entry(String(repeating: "x", count: 128))
-        XCTAssertNil(try store!.entry(for: row.source, revision: row.revision))
-        XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
+        XCTAssertThrowsError(try store!.entry(for: row.source, revision: row.revision))
+        connection.withLock {
+            XCTAssertTrue(connection.operationFailed, "The failed bind must be recorded")
+            XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure")
+        }
     }
 
     func testLegacyPresenceKeepsItsOldAnswerAfterABindingFailure() throws {
@@ -194,14 +198,14 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
     }
 
-    func testLegacyResourceLookupKeepsItsOldAnswerAfterABindingFailure() throws {
+    func testEntryResourceBindingFailureThrowsInsteadOfProvingAbsence() throws {
         store = try makeStore()
         let connection = try queueConnection()
         connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
         let source = UploadSourceIdentity(
             kind: .fileURL, identifier: "file", resource: .init(rawValue: String(repeating: "r", count: 128)))
-        XCTAssertNil(try store!.entry(for: source, revision: .init(rawValue: 1)))
-        XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
+        XCTAssertThrowsError(try store!.entry(for: source, revision: .init(rawValue: 1)))
+        connection.withLock { XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure") }
     }
 
     func testDecisionBindingFailuresThrowInsteadOfProvingAbsence() throws {
@@ -645,6 +649,211 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             }
         }
         XCTAssertFalse(try recoveryProbe(in: store!), "the store stays stopped until the probe clears it")
+    }
+
+    // MARK: - B2: complete reads for decisions (#1004)
+
+    /// A setup failure of a durable write records its own lasting code even after an earlier transient failure, so a
+    /// later passing probe cannot forget it (#1004, row 9).
+    func testADurableWriteSetupFailureAfterATransientFailureKeepsItsLastingCode() throws {
+        store = try makeStore()
+        let row = entry("setup-after-busy")
+        let connection = try queueConnection()
+        var handle: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_open_v2(tempDir.appendingPathComponent("queue.sqlite").path, &handle, SQLITE_OPEN_READWRITE, nil),
+            SQLITE_OK)
+        let blocker = try XCTUnwrap(handle)
+        defer { sqlite3_close(blocker) }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertFalse(store!.upsert(row), "the busy write persists nothing")
+        XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        connection.withLock { XCTAssertTrue(connection.failuresAreTransient, "the busy write is transient") }
+
+        try withDeniedSQLitePragma(in: store!) {
+            XCTAssertFalse(store!.upsert(row), "the denied setup runs no write")
+        }
+
+        connection.withLock {
+            XCTAssertFalse(connection.failuresAreTransient, "the denied setup records its own lasting code")
+        }
+        XCTAssertFalse(try recoveryProbe(in: store!), "a passing probe must not forget the lasting failure")
+        XCTAssertNil(try store!.entry(for: row.source, revision: row.revision))
+    }
+
+    func testCompleteUnsettledInventoryRefusesEveryIncompleteRead() throws {
+        let rows = [entry("a", revision: 1), entry("b", revision: 2), entry("c", revision: 3)]
+        let rowSQL = "SELECT source_kind, source_id, resource, revision_us, state, original_filename"
+
+        store = try makeStore(file: "healthy.sqlite")
+        XCTAssertEqual(try store!.decisionUnsettledRows(), [], "an empty queue is a complete empty answer")
+        for row in rows { XCTAssertTrue(store!.upsert(row)) }
+        XCTAssertEqual(try store!.decisionUnsettledRows(), store!.unsettledRows())
+        XCTAssertEqual(try store!.decisionUnsettledRows().count, 3)
+        store!.close()
+
+        store = try makeStore(file: "prepare.sqlite")
+        for row in rows { XCTAssertTrue(store!.upsert(row)) }
+        try withDeniedSQLiteSelect(in: store!) {
+            XCTAssertThrowsError(try store!.decisionUnsettledRows(), "a failed prepare proves no empty queue")
+        }
+        store!.close()
+
+        store = try makeStore(file: "prefix.sqlite")
+        for row in rows { XCTAssertTrue(store!.upsert(row)) }
+        let fault = try SQLiteReadInterrupt(in: store!, matching: rowSQL, afterRows: 2)
+        XCTAssertThrowsError(try store!.decisionUnsettledRows(), "a failed step after a prefix returns no prefix")
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(fault.tracedRows, 2)
+        store!.close()
+
+        store = try makeStore(file: "undecodable.sqlite")
+        XCTAssertTrue(store!.upsert(entry("x", state: .failed, revision: 1)))
+        XCTAssertTrue(store!.upsert(entry("y", state: .failedPermanent, revision: 2)))
+        let connection = try queueConnection()
+        try SerializedImageMutation.install(on: connection) { image in
+            let needle = Array("failedPermanent".utf8)
+            let range = try XCTUnwrap(image.firstRange(of: needle))
+            image[range.lowerBound] = UInt8(ascii: "x")
+        }
+        XCTAssertThrowsError(try store!.decisionUnsettledRows(), "an undecodable row cannot vanish from the inventory")
+        XCTAssertFalse(try recoveryProbe(in: store!))
+    }
+
+    /// Each decision read throws on a failed step instead of answering "nothing waits".
+    func testDecisionQueueReadsRefuseAFailedStep() throws {
+        let issue = BackupIssueRecord(kind: .remoteService, detail: "index", automaticRetryAttempt: 3)
+        let reads: [(String, String, (UploadBackupSyncQueueManifestStore) throws -> Void)] = [
+            (
+                "next-date", "SELECT MIN(updated_at) FROM backup_sync_queue",
+                {
+                    _ = try $0.decisionNextRunnableDate(excludingSourcesOf: [])
+                }
+            ),
+            (
+                "earliest", "WHERE state='blockedByDraft' ORDER BY updated_at ASC LIMIT 1",
+                {
+                    _ = try $0.decisionEarliestEntry(in: .blockedByDraft)
+                }
+            ),
+            (
+                "entries", "WHERE state = ? AND updated_at < ?",
+                {
+                    _ = try $0.decisionEntries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 10)
+                }
+            ),
+            (
+                "runtime-issue", "SELECT value FROM backup_sync_runtime_issue",
+                {
+                    _ = try $0.decisionRuntimeIssue(for: .remoteIndexPreparation)
+                }
+            ),
+            (
+                "problems", "WHERE state IN ('failed', 'failedPermanent'",
+                {
+                    try $0.decisionForEachProblemEntry { _ in true }
+                }
+            ),
+        ]
+        for (name, sql, read) in reads {
+            store = try makeStore(file: "\(name).sqlite")
+            XCTAssertTrue(store!.upsert(entry("runnable", revision: 1)), name)
+            XCTAssertTrue(store!.upsert(entry("draft", state: .blockedByDraft, revision: 2)), name)
+            XCTAssertTrue(store!.upsert(entry("failed", state: .failed, revision: 3)), name)
+            XCTAssertTrue(store!.setRuntimeIssue(issue, for: .remoteIndexPreparation), name)
+            XCTAssertNoThrow(try read(store!), "\(name): a healthy read answers")
+            let fault = try SQLiteReadInterrupt(in: store!, matching: sql)
+            XCTAssertThrowsError(try read(store!), "\(name): a failed step is no answer")
+            fault.stop()
+            XCTAssertTrue(fault.fired, name)
+            store!.close()
+        }
+    }
+
+    /// A decision read refuses a lasting failure and an open transaction, even when its rows are readable.
+    func testDecisionQueueReadsRefuseALastingFailureAndAnOpenTransaction() throws {
+        let reads: [(String, (UploadBackupSyncQueueManifestStore) throws -> Void)] = [
+            ("next-date", { _ = try $0.decisionNextRunnableDate(excludingSourcesOf: []) }),
+            ("earliest", { _ = try $0.decisionEarliestEntry(in: .blockedByDraft) }),
+            ("entries", { _ = try $0.decisionEntries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 10) }),
+            ("runtime-issue", { _ = try $0.decisionRuntimeIssue(for: .remoteIndexPreparation) }),
+            ("problems", { try $0.decisionForEachProblemEntry { _ in true } }),
+            ("unsettled", { _ = try $0.decisionUnsettledRows() }),
+        ]
+        for (name, read) in reads {
+            for lasting in [true, false] {
+                store = try makeStore(file: "\(name)-\(lasting).sqlite")
+                XCTAssertTrue(store!.upsert(entry("draft", state: .blockedByDraft, revision: 2)), name)
+                XCTAssertNoThrow(try read(store!), "\(name): a healthy read answers")
+                let connection = try queueConnection()
+                connection.withLock {
+                    if lasting {
+                        connection.markFailed()
+                    } else {
+                        XCTAssertEqual(
+                            sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK, name)
+                    }
+                }
+                XCTAssertThrowsError(
+                    try read(store!), "\(name): refused while \(lasting ? "failed" : "in a transaction")")
+                if !lasting {
+                    connection.withLock { _ = sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil) }
+                }
+                store!.close()
+            }
+        }
+    }
+
+    /// The healthy answers of the decision reads equal the legacy answers.
+    func testDecisionQueueReadsAnswerLikeTheLegacyReadsWhenHealthy() throws {
+        store = try makeStore()
+        XCTAssertNil(try store!.decisionNextRunnableDate(excludingSourcesOf: []), "nothing runnable is nil")
+        XCTAssertNil(try store!.decisionRuntimeIssue(for: .remoteIndexPreparation))
+        let issue = BackupIssueRecord(kind: .remoteService, detail: "index", automaticRetryAttempt: 3)
+        XCTAssertTrue(store!.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+        let runnable = entry("runnable", revision: 1)
+        XCTAssertTrue(store!.upsert(runnable))
+        XCTAssertTrue(store!.upsert(entry("draft", state: .blockedByDraft, revision: 2)))
+        XCTAssertTrue(store!.upsert(entry("failed", state: .failed, revision: 3)))
+        XCTAssertEqual(
+            try store!.decisionNextRunnableDate(excludingSourcesOf: []), store!.nextRunnableDate(excludingSourcesOf: [])
+        )
+        XCTAssertNil(try store!.decisionNextRunnableDate(excludingSourcesOf: [runnable.source]))
+        XCTAssertEqual(try store!.decisionEarliestEntry(in: .blockedByDraft), store!.earliestEntry(in: .blockedByDraft))
+        XCTAssertEqual(
+            try store!.decisionEntries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 10),
+            store!.entries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 10))
+        XCTAssertEqual(try store!.decisionRuntimeIssue(for: .remoteIndexPreparation), issue)
+        var strict: [UploadBackupSyncQueueEntry] = []
+        try store!.decisionForEachProblemEntry {
+            strict.append($0)
+            return true
+        }
+        var legacy: [UploadBackupSyncQueueEntry] = []
+        store!.forEachProblemEntry {
+            legacy.append($0)
+            return true
+        }
+        XCTAssertEqual(strict, legacy)
+        XCTAssertFalse(strict.isEmpty)
+    }
+
+    /// A strict read checks its binds: a key longer than the length limit fails to bind instead of matching nothing.
+    func testDecisionReadBindingFailureThrowsInsteadOfProvingNothingWaits() throws {
+        store = try makeStore()
+        XCTAssertTrue(store!.upsert(entry("runnable", revision: 1)))
+        let connection = try queueConnection()
+        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, -1), 32, "the limit applies")
+        }
+        let excluded = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: String(repeating: "x", count: 128))
+        XCTAssertThrowsError(try store!.decisionNextRunnableDate(excludingSourcesOf: [excluded]))
+        connection.withLock {
+            XCTAssertTrue(connection.operationFailed, "The failed bind must be recorded")
+            XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure")
+        }
     }
 }
 

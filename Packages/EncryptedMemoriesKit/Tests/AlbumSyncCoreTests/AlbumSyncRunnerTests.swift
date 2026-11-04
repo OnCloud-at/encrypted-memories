@@ -725,6 +725,38 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(report.unattachable == 1)
         #expect(report.problems.map { $0.source?.identifier } == ["missing"])
         #expect(report.problems.allSatisfy { $0.isRetryable })
+        // An unknown queue read never becomes proof: the photo stays out of the album and the run is not complete.
+        #expect(!report.isFullySynced)
+    }
+
+    /// The attach plan comes from the links, the album members and the same-content evidence, never from the backup
+    /// report: an open backup reason only labels the photo as incomplete (#1004 B2, row 8).
+    @Test func theAttachPlanDoesNotDependOnTheBackupReport() async throws {
+        var batches: [[[String]]] = []
+        for reportsProblem in [false, true] {
+            let remote = FakeRemoteOps()
+            remote.children = ["l-c"]
+            let backup = FakeBackupExecutor()
+            if reportsProblem {
+                backup.problems = [
+                    "a": BackupFailedItem(
+                        id: "queue-a", filename: "a.heic", reason: "still finishing", isPermanent: false,
+                        issue: .remoteDraft, source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "a"),
+                        category: .automatic)
+                ]
+            }
+            let (runner, _, _, store) = makeRunner(
+                contents: ["album": ["a", "b", "c"]], links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c")],
+                remote: remote, backup: backup)
+            defer { store.close() }
+            let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+            batches.append(remote.attachedBatches)
+            #expect(report.attached == 2)
+            #expect(report.alreadyMember == 1)
+            #expect(report.incomplete == (reportsProblem ? 1 : 0))
+        }
+        #expect(batches[0] == batches[1], "the backup report changes no attach")
+        #expect(batches[0].flatMap { $0 } == ["l-a", "l-b"])
     }
 
     @Test func cancelledProofCallerWithOrdinaryErrorAdmitsNoFurtherWork() async throws {

@@ -267,7 +267,9 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
             sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
             SQLITE_OK)
 
-        XCTAssertNil(try queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertThrowsError(
+            try queue.entry(for: entry.source, revision: entry.revision),
+            "an undecodable receipt is unknown, not an absent row")
         XCTAssertFalse(queue.isOperational())
         XCTAssertEqual(queue.backupSupportSnapshot(), BackupQueueSupportSnapshot())
         XCTAssertTrue(queue.upsert(entry), "the handle remains open after the recorded failure")

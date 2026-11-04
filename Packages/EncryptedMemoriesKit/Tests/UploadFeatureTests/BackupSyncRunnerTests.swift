@@ -7260,3 +7260,121 @@ private final class RestoreRevisionRecordingResolver: UploadIdentityResolving, @
         await inner.identityRecord(for: source)
     }
 }
+
+// MARK: - #1004 B2: the runner decides only from complete queue reads
+
+extension BackupSyncRunnerTests {
+    /// After a transient failure is forgotten, an unknown next date must not certify that no upload work is left.
+    func testAnUnknownRunnableDateCannotCertifyNoUploadWorkAfterRecovery() async throws {
+        _ = seedEntry("waiting.jpg")
+        let store = try XCTUnwrap(queueStore)
+        store.recoversTransientFailuresForTesting = true
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT MIN(updated_at) FROM backup_sync_queue")
+        defer { fault.stop() }
+        let runner = makeRunner()
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(fault.fired)
+        XCTAssertFalse(progress.leavesNoUploadWork, "an unknown date proves no empty queue")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the pass that could not read its queue reports it unknown")
+    }
+
+    /// An unknown wait date ends the pass as unknown, never as a drained queue that a caller may trust.
+    func testAnUnknownWaitDateEndsThePassAsUnknownAfterRecovery() async throws {
+        let entry = seedEntry("later.jpg")
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 1, lastError: nil,
+                updatedAt: clock.now.addingTimeInterval(600)))
+        let store = try XCTUnwrap(queueStore)
+        store.recoversTransientFailuresForTesting = true
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT MIN(updated_at) FROM backup_sync_queue")
+        defer { fault.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        XCTAssertTrue(fault.fired)
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the drain did not finish; it could not read when its retries are due")
+        XCTAssertEqual(state(of: entry), .discovered)
+        fault.stop()
+        // The next pass reads the queue again and answers for itself.
+        _ = await runner.runUntilDrained()
+        let operationalAgain = await runner.isQueueOperational()
+        XCTAssertTrue(operationalAgain, "an unknown read of an earlier pass does not stop the next one")
+    }
+
+    /// The due draft re-check must not be skipped silently when its read fails.
+    func testAnUnknownDraftRecheckReadEndsThePassAsUnknownAfterRecovery() async throws {
+        let issue = BackupIssueRecord(
+            kind: .remoteService, detail: "draft", nextAttemptAt: clock.now.addingTimeInterval(-60))
+        let entry = seedEntry("draft.jpg", state: .blockedByDraft)
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .blockedByDraft, attempts: 0,
+                lastError: issue.persistedValue, updatedAt: clock.now.addingTimeInterval(-60)))
+        let store = try XCTUnwrap(queueStore)
+        store.recoversTransientFailuresForTesting = true
+        let fault = try SQLiteReadInterrupt(in: store, matching: "WHERE state = ? AND updated_at < ?")
+        defer { fault.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(state(of: entry), .blockedByDraft)
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the due re-check did not run, so the pass is unknown")
+    }
+
+    /// A failed read of the stored retry ordinal must not restart the backoff from its first, shortest step.
+    func testAFailedRetryOrdinalReadKeepsTheStoredBackoff() async throws {
+        _ = seedEntry("waiting.jpg")
+        let stored = BackupIssueRecord(
+            kind: .remoteService, detail: "index", nextAttemptAt: clock.now.addingTimeInterval(-1),
+            automaticRetryAttempt: 3)
+        XCTAssertTrue(queueStore.setRuntimeIssue(stored, for: .remoteIndexPreparation))
+        let store = try XCTUnwrap(queueStore)
+        // The pass reads the issue once for its status, then once more as the previous ordinal of the new failure.
+        let fault = try SQLiteReadInterrupt(
+            in: store, matching: "SELECT value FROM backup_sync_runtime_issue", occurrence: 2)
+        defer { fault.stop() }
+        _ = await makeRunner(identityResolver: PreparationFailingIdentityResolver(inner: makePipeline()))
+            .runUntilDrained()
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(try XCTUnwrap(queueStore.runtimeIssue(for: .remoteIndexPreparation)), stored)
+    }
+
+    /// The person's retry clears the stored backoff also when the read of that backoff fails.
+    func testAFailedRetryIssueReadStillClearsTheBackoffOnManualRetry() async throws {
+        XCTAssertTrue(
+            queueStore.setRuntimeIssue(
+                BackupIssueRecord(
+                    kind: .remoteService, detail: "index", nextAttemptAt: clock.now.addingTimeInterval(64),
+                    automaticRetryAttempt: 7),
+                for: .remoteIndexPreparation))
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT value FROM backup_sync_runtime_issue")
+        defer { fault.stop() }
+        _ = await makeRunner().makeRetryableWorkEligibleNow()
+        XCTAssertTrue(fault.fired)
+        XCTAssertNil(queueStore.runtimeIssue(for: .remoteIndexPreparation), "the retry runs without the old backoff")
+    }
+}
+
+extension BackupSyncRunnerTests {
+    /// The final drain of a scan stops at a due draft read that fails. It must not hand back the earlier drain's
+    /// "no upload work": the controller would then skip the first index build although photos wait (#1004 B2).
+    func testAnUnknownFinalDrainNeverReportsTheEarlierNoUploadWork() async throws {
+        let store = try XCTUnwrap(queueStore)
+        let runner = makeRunner()
+        let scanDone = BackupScanSignal()
+        await scanDone.markDone()
+        // The first drain finds nothing to upload; the second, final drain cannot read its due drafts.
+        let fault = try SQLiteReadInterrupt(in: store, matching: "WHERE state = ? AND updated_at < ?", occurrence: 2)
+        defer { fault.stop() }
+        let final = await PhotoLibraryBackupController.reconcileWhileScanning(
+            runner: runner, scanDone: scanDone, workIntent: .automatic, queue: store)
+        XCTAssertTrue(fault.fired, "the final drain's draft read must actually fail")
+        XCTAssertFalse(final.leavesNoUploadWork, "an unknown final drain proves no empty queue")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational)
+    }
+}

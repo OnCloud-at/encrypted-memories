@@ -10,6 +10,11 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         enum ProblemReadEvent { case healthProbe, willLock, didLock, statement, step, row, didUnlock }
         var onProblemReadEvent: ((ProblemReadEvent) -> Void)?
     #endif
+    #if DEBUG
+        /// Lets a test reach the recovering health probe before recovery activation (#1004), so it can show what a
+        /// consumer does when a transient failure is forgotten. Release builds have no such switch.
+        var recoversTransientFailuresForTesting = false
+    #endif
     public static let databaseFileName = "upload-backup-sync-queue-v1.sqlite"
 
     private static let schemaVersion = 2
@@ -43,7 +48,26 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
             onProblemReadEvent?(.healthProbe)
         #endif
+        #if DEBUG
+            if recoversTransientFailuresForTesting { return connection.isOperationalAfterTransientFailure() }
+        #endif
         return connection.isOperational()
+    }
+
+    /// Starts a read under `connection.withLock`. A complete read refuses an open transaction or a lasting failure.
+    private func beginReadLocked(requireComplete: Bool) throws {
+        if requireComplete, !readerMayProceedLocked() { throw SQLiteStoreUnknownReadError() }
+    }
+
+    /// The answer of a read that could not run: a complete read throws, a legacy read gives `fallback` (#1004).
+    private func unknownRead<T>(requireComplete: Bool, _ fallback: T) throws -> T {
+        if requireComplete { throw SQLiteStoreUnknownReadError() }
+        return fallback
+    }
+
+    /// Checks a bind of a complete read; a legacy read keeps its unchecked bind. Call under `connection.withLock`.
+    private func checkBinding(_ resultCode: Int32, requireComplete: Bool) throws {
+        if requireComplete { try connection.requireReadableBinding(resultCode: resultCode) }
     }
 
     /// Complete decision reads refuse an open transaction or a lasting failure. Call under `connection.withLock`.
@@ -71,6 +95,19 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    /// Runs `body` with durable commits. When the setup cannot raise durability, the body never runs and the setup's
+    /// own code is recorded, also after an earlier failure: a lasting PRAGMA refusal must not hide behind an earlier
+    /// transient one. A body that ran records its own failures (#1004, row 9).
+    private func withDurableCommitsRecordingSetup<T>(_ body: () -> T) -> T? {
+        var bodyRan = false
+        let result = SQLiteStoreSchemaGate.withDurableCommits(db) { () -> T in
+            bodyRan = true
+            return body()
+        }
+        if !bodyRan { markFailedWithFreshStepCode() }
+        return result
+    }
+
     /// Marks the store failed with the failed step's own extended code, replacing any earlier recorded failure. The
     /// caller invokes it right after a failed `sqlite3_step`, so the code is fresh. A lasting code must survive even
     /// when a transient failure was recorded earlier and no health check ran in between (#1004).
@@ -96,7 +133,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private func upsertBatchUnobserved(_ entries: [UploadBackupSyncQueueEntry]) -> UploadBackupSyncQueueChange? {
         connection.withLock {
             let change =
-                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> UploadBackupSyncQueueChange? in
+                withDurableCommitsRecordingSetup { () -> UploadBackupSyncQueueChange? in
                     var write: OpaquePointer?
                     var prior: OpaquePointer?
                     guard
@@ -179,9 +216,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    /// Reads one row. Closed stores and failed statements throw `SQLiteStoreUnknownReadError`.
-    /// Legacy binding and decode results stay unchanged until the decision consumers migrate (#1004).
-    /// A lasting failure with successful SQL still answers the row, as
+    /// Reads one row. Closed stores, failed binds, failed statements and a row that does not decode throw
+    /// `SQLiteStoreUnknownReadError` (#1004). A lasting failure with successful SQL still answers the row, as
     /// `testQueueDecodeFailureStaysStickyAfterSuccessfulSQLAndRefusesDurability` pins.
     public func entry(
         for source: UploadSourceIdentity, revision: UploadBackupRevision
@@ -203,13 +239,18 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     ) == SQLITE_OK)
             else { throw SQLiteStoreUnknownReadError() }
             defer { sqlite3_finalize(stmt) }
+            // The identifier and the resource name come from the library and can exceed a length limit.
             bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
+            try connection.requireReadableBinding(resultCode: bindText(stmt, 2, source.identifier))
+            try connection.requireReadableBinding(resultCode: bindText(stmt, 3, source.resource.rawValue))
             sqlite3_bind_int64(stmt, 4, revision.rawValue)
             let result = sqlite3_step(stmt)
             if result == SQLITE_ROW {
-                return row(stmt, source: source, revision: revision)
+                // A row whose stored receipt does not decode is unknown, never an absent row (#1004 B2).
+                guard let entry = row(stmt, source: source, revision: revision) else {
+                    throw SQLiteStoreUnknownReadError()
+                }
+                return entry
             }
             if result != SQLITE_DONE {
                 connection.markFailed(resultCode: sqlite3_extended_errcode(db))
@@ -316,8 +357,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     public func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
+        (try? runnableDate(excludingSourcesOf: excludedSources, requireComplete: false)) ?? nil
+    }
+
+    private func runnableDate(
+        excludingSourcesOf excludedSources: [UploadSourceIdentity], requireComplete: Bool
+    ) throws -> Date? {
         let exclusion = SourceExclusion(excludedSources)
-        return connection.withLock {
+        return try connection.withLock {
+            try beginReadLocked(requireComplete: requireComplete)
             var stmt: OpaquePointer?
             guard
                 requireOperational(
@@ -327,11 +375,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                             + "WHERE state IN (\(Self.runnableStateList))\(exclusion.clause);",
                         -1, &stmt, nil
                     ) == SQLITE_OK)
-            else { return nil }
+            else { return try unknownRead(requireComplete: requireComplete, nil) }
             defer { sqlite3_finalize(stmt) }
-            _ = bind(exclusion, to: stmt, from: 1)
+            _ = try bind(exclusion, to: stmt, from: 1) { try checkBinding($0, requireComplete: requireComplete) }
             let result = sqlite3_step(stmt)
-            guard requireOperational(result == SQLITE_ROW) else { return nil }
+            guard requireOperational(result == SQLITE_ROW) else {
+                return try unknownRead(requireComplete: requireComplete, nil)
+            }
             guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
                 return nil
             }
@@ -356,11 +406,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         let perState = Self.runnableStates
             .map { "SELECT * FROM (\(Self.earliestEntrySQL(forState: $0)))" }
             .joined(separator: " UNION ALL ")
-        return earliestEntry(sql: "SELECT * FROM (\(perState)) ORDER BY updated_at ASC LIMIT 1;")
+        return
+            (try? earliestEntry(
+                sql: "SELECT * FROM (\(perState)) ORDER BY updated_at ASC LIMIT 1;", requireComplete: false)) ?? nil
     }
 
     public func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry? {
-        earliestEntry(sql: Self.earliestEntrySQL(forState: state.rawValue) + ";")
+        (try? earliestEntry(sql: Self.earliestEntrySQL(forState: state.rawValue) + ";", requireComplete: false)) ?? nil
     }
 
     /// True when any row carries one of `states`. False is a real answer only after a successful read; a read that
@@ -502,11 +554,16 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// A waiting row counts only when its text is an issue record; an older build's message is no problem.
     /// `body` runs under the store's lock and must not call the store.
     public func forEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) {
+        try? problemEntries(body, requireComplete: false)
+    }
+
+    private func problemEntries(_ body: (UploadBackupSyncQueueEntry) -> Bool, requireComplete: Bool) throws {
         #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
             onProblemReadEvent?(.willLock)
             defer { onProblemReadEvent?(.didUnlock) }
         #endif
-        connection.withLock {
+        try connection.withLock {
+            try beginReadLocked(requireComplete: requireComplete)
             #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
                 onProblemReadEvent?(.didLock)
                 onProblemReadEvent?(.statement)
@@ -526,7 +583,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK)
-            else { return }
+            else { return try unknownRead(requireComplete: requireComplete, ()) }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_int64(stmt, 1, Int64(BackupIssueRecord.storagePrefix.count))
             bindText(stmt, 2, BackupIssueRecord.storagePrefix)
@@ -540,17 +597,21 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 #endif
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
                     connection.markFailed()
-                    return
+                    return try unknownRead(requireComplete: requireComplete, ())
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
-                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return }
+                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else {
+                    return try unknownRead(requireComplete: requireComplete, ())
+                }
                 if !entry.isDismissedSourceRecheck, !body(entry) { return }
                 #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
                     onProblemReadEvent?(.step)
                 #endif
                 stepResult = sqlite3_step(stmt)
             }
-            _ = requireOperational(stepResult == SQLITE_DONE)
+            guard requireOperational(stepResult == SQLITE_DONE) else {
+                return try unknownRead(requireComplete: requireComplete, ())
+            }
         }
     }
 
@@ -559,7 +620,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     ) -> Bool? {
         let changed: Int? = connection.withLock {
             let changed =
-                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Int? in
+                withDurableCommitsRecordingSetup { () -> Int? in
                     var stmt: OpaquePointer?
                     guard
                         requireOperational(
@@ -684,8 +745,18 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         updatedBefore: Date,
         limit: Int
     ) -> [UploadBackupSyncQueueEntry] {
+        (try? entries(in: state, updatedBefore: updatedBefore, limit: limit, requireComplete: false)) ?? []
+    }
+
+    private func entries(
+        in state: UploadBackupSyncQueueState,
+        updatedBefore: Date,
+        limit: Int,
+        requireComplete: Bool
+    ) throws -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
-        return connection.withLock {
+        return try connection.withLock {
+            try beginReadLocked(requireComplete: requireComplete)
             var stmt: OpaquePointer?
             guard
                 requireOperational(
@@ -701,8 +772,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK)
-            else { return [] }
+            else { return try unknownRead(requireComplete: requireComplete, []) }
             defer { sqlite3_finalize(stmt) }
+            // A state name, a double and a clamped integer cannot exceed a length limit; their binds stay unchecked.
             bindText(stmt, 1, state.rawValue)
             sqlite3_bind_double(stmt, 2, updatedBefore.timeIntervalSince1970)
             sqlite3_bind_int(stmt, 3, Int32(clamping: clampedLimit))
@@ -711,14 +783,18 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             while stepResult == SQLITE_ROW {
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
                     connection.markFailed()
-                    return []
+                    return try unknownRead(requireComplete: requireComplete, [])
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
-                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return [] }
+                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else {
+                    return try unknownRead(requireComplete: requireComplete, [])
+                }
                 entries.append(entry)
                 stepResult = sqlite3_step(stmt)
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
+            guard requireOperational(stepResult == SQLITE_DONE) else {
+                return try unknownRead(requireComplete: requireComplete, [])
+            }
             return entries
         }
     }
@@ -792,7 +868,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private func makeRetryableWorkEligibleUnobserved(updatedAt: Date) -> Int {
         connection.withLock {
             let changed =
-                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Int? in
+                withDurableCommitsRecordingSetup { () -> Int? in
                     guard
                         requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
                     else {
@@ -1069,7 +1145,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         guard !scopes.isEmpty else { return [] }
         return connection.withLock {
             let changed =
-                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Set<UploadSourceIdentity>? in
+                withDurableCommitsRecordingSetup { () -> Set<UploadSourceIdentity>? in
                     guard
                         requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
                     else {
@@ -1313,7 +1389,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     ) == SQLITE_OK)
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, Self.catalogReplayStateKey)
+            // A failed bind would read as "never started" and complete an interrupted replay. The fixed key is shorter
+            // than any length limit, so only out-of-memory can fail it.
+            let bound = bindText(stmt, 1, Self.catalogReplayStateKey)
+            guard bound == SQLITE_OK else {
+                connection.markFailed(resultCode: bound)
+                return nil
+            }
             let result = sqlite3_step(stmt)
             if result == SQLITE_DONE { return .notStarted }
             guard requireOperational(result == SQLITE_ROW) else { return nil }
@@ -1389,7 +1471,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         var enqueued = false
         let result = connection.withLock { () -> Bool in
             let committed =
-                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Bool in
+                withDurableCommitsRecordingSetup { () -> Bool in
                     var stmt: OpaquePointer?
                     guard
                         requireOperational(
@@ -1441,7 +1523,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         guard source.kind == .photoLibraryAsset else { return remove(source: source, revision: revision) }
         let result = connection.withLock { () -> Bool in
             let committed =
-                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Bool in
+                withDurableCommitsRecordingSetup { () -> Bool in
                     guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
                     else {
                         return false
@@ -1471,19 +1553,29 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     public func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? {
-        connection.withLock {
+        (try? runtimeIssue(for: key, requireComplete: false)) ?? nil
+    }
+
+    /// An undecodable stored value answers nil: that is a fact about the value, not a failed read.
+    private func runtimeIssue(for key: BackupRuntimeIssueKey, requireComplete: Bool) throws -> BackupIssueRecord? {
+        try connection.withLock {
+            try beginReadLocked(requireComplete: requireComplete)
             var stmt: OpaquePointer?
             guard
                 requireOperational(
                     sqlite3_prepare_v2(
                         db, "SELECT value FROM backup_sync_runtime_issue WHERE key=?;", -1, &stmt, nil
                     ) == SQLITE_OK)
-            else { return nil }
+            else { return try unknownRead(requireComplete: requireComplete, nil) }
             defer { sqlite3_finalize(stmt) }
+            // The fixed key is shorter than any length limit SQLite accepts; its bind stays unchecked.
             bindText(stmt, 1, key.rawValue)
             let result = sqlite3_step(stmt)
             if result == SQLITE_ROW { return BackupIssueRecord.decode(columnText(stmt, 0)) }
-            if result != SQLITE_DONE { connection.markFailed(resultCode: sqlite3_extended_errcode(db)) }
+            if result != SQLITE_DONE {
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+                return try unknownRead(requireComplete: requireComplete, nil)
+            }
             return nil
         }
     }
@@ -1684,28 +1776,35 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return UploadSourceIdentity(kind: kind, identifier: id, resource: resource)
     }
 
-    private func earliestEntry(sql: String) -> UploadBackupSyncQueueEntry? {
-        connection.withLock {
+    private func earliestEntry(sql: String, requireComplete: Bool) throws -> UploadBackupSyncQueueEntry? {
+        try connection.withLock {
+            try beginReadLocked(requireComplete: requireComplete)
             var stmt: OpaquePointer?
             guard requireOperational(sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK) else {
-                return nil
+                return try unknownRead(requireComplete: requireComplete, nil)
             }
             defer { sqlite3_finalize(stmt) }
             let result = sqlite3_step(stmt)
             guard result == SQLITE_ROW else {
-                if result != SQLITE_DONE { connection.markFailed(resultCode: sqlite3_extended_errcode(db)) }
+                if result != SQLITE_DONE {
+                    connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+                    return try unknownRead(requireComplete: requireComplete, nil)
+                }
                 return nil
             }
             guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
                 connection.markFailed()
-                return nil
+                return try unknownRead(requireComplete: requireComplete, nil)
             }
-            return row(
-                stmt,
-                source: source,
-                revision: UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3)),
-                offset: 4
-            )
+            guard
+                let entry = row(
+                    stmt,
+                    source: source,
+                    revision: UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3)),
+                    offset: 4
+                )
+            else { return try unknownRead(requireComplete: requireComplete, nil) }
+            return entry
         }
     }
 
@@ -1895,10 +1994,17 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     /// Binds the exclusion's parameters from `first` on and returns the next free parameter index.
     private func bind(_ exclusion: SourceExclusion, to stmt: OpaquePointer?, from first: Int32) -> Int32 {
+        bind(exclusion, to: stmt, from: first) { _ in }
+    }
+
+    /// Binds as `bind(_:to:from:)` and hands each bind's result to `check`.
+    private func bind(
+        _ exclusion: SourceExclusion, to stmt: OpaquePointer?, from first: Int32, check: (Int32) throws -> Void
+    ) rethrows -> Int32 {
         var parameter = first
         for key in exclusion.keys {
-            bindText(stmt, parameter, key.kind)
-            bindText(stmt, parameter + 1, key.identifier)
+            try check(bindText(stmt, parameter, key.kind))
+            try check(bindText(stmt, parameter + 1, key.identifier))
             parameter += 2
         }
         return parameter
@@ -1956,14 +2062,15 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
         }
     }
 
+    private static let unsettledCondition = """
+        state NOT IN ('alreadyBackedUp', 'completed', 'skippedRemoteDeletion', 'sourceMissing',
+                      'dismissedFailure')
+        """
+
     public func unsettledRows() -> [UploadBackupQueueRowState] {
-        ((try? rowStates(
-            where: """
-                state NOT IN ('alreadyBackedUp', 'completed', 'skippedRemoteDeletion', 'sourceMissing',
-                              'dismissedFailure')
-                """,
-            bindings: [nil]
-        )) ?? []).filter { $0.state != .dismissedFailure }
+        ((try? rowStates(where: Self.unsettledCondition, bindings: [nil])) ?? []).filter {
+            $0.state != .dismissedFailure
+        }
     }
 
     public func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
@@ -1978,6 +2085,39 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
                     }
                 }
             )) ?? []
+    }
+
+    // MARK: - Complete reads for decisions (#1004)
+    // Each runs the same SQL as its legacy reader. It refuses an open transaction or a lasting failure, checks the
+    // binds of library values, and throws `SQLiteStoreUnknownReadError` on a failed statement or a row that does not
+    // decode. It never answers a prefix.
+
+    public func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] {
+        try rowStates(where: Self.unsettledCondition, bindings: [nil], requireComplete: true)
+            .filter { $0.state != .dismissedFailure }
+    }
+
+    public func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
+        try runnableDate(excludingSourcesOf: excludedSources, requireComplete: true)
+    }
+
+    public func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
+        try earliestEntry(sql: Self.earliestEntrySQL(forState: state.rawValue) + ";", requireComplete: true)
+    }
+
+    public func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry] {
+        try entries(in: state, updatedBefore: updatedBefore, limit: limit, requireComplete: true)
+    }
+
+    public func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord? {
+        try runtimeIssue(for: key, requireComplete: true)
+    }
+
+    /// Streams the problem rows as `forEachProblemEntry` does. After a throw the caller discards what it received.
+    public func decisionForEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) throws {
+        try problemEntries(body, requireComplete: true)
     }
 
     /// A complete read for a decision; presentation callers keep using `rows`.

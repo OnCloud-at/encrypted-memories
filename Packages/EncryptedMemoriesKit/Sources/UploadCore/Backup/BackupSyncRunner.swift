@@ -103,6 +103,9 @@ public actor BackupSyncRunner {
     private var drainMode: DrainMode = .waitForScheduledRetries
     private var deletionStateInvalidated = false
     private var stopRequested = false
+    /// A queue read of this pass could not run completely. The pass ends as unknown, never as drained, until the next
+    /// pass reads the queue again (#1004 B2).
+    private var queueReadUnknown = false
     /// Transport cancellation can arrive without cancelling the Swift task. Keep it until the next pass.
     private var runCancellationError: (any Error)?
     /// Consecutive items that could not even reserve disk space since the last one that did.
@@ -236,7 +239,7 @@ public actor BackupSyncRunner {
     /// Queue health is part of the runner contract: callers must never treat an empty result from a
     /// failed SQLite read as a drained backup.
     public func isQueueOperational() -> Bool {
-        queue.isOperational()
+        !queueReadUnknown && queue.isOperational()
     }
 
     /// User-initiated retry contract. Eligibility changes and remote-cache invalidation stay together
@@ -244,7 +247,13 @@ public actor BackupSyncRunner {
     @discardableResult
     public func makeRetryableWorkEligibleNow() async -> Int {
         let changed = queue.makeRetryableWorkEligible(updatedAt: now())
-        let hadRemoteIndexIssue = queue.runtimeIssue(for: .remoteIndexPreparation) != nil
+        let hadRemoteIndexIssue: Bool
+        do {
+            hadRemoteIndexIssue = try queue.decisionRuntimeIssue(for: .remoteIndexPreparation) != nil
+        } catch {
+            // Unknown: clear it anyway. Clearing a missing issue changes nothing.
+            hadRemoteIndexIssue = true
+        }
         let clearedRemoteIndexIssue =
             !hadRemoteIndexIssue
             || queue.setRuntimeIssue(nil, for: .remoteIndexPreparation)
@@ -318,6 +327,10 @@ public actor BackupSyncRunner {
     ) async -> BackupSyncProgress {
         guard !isRunning else { return progress }
         runCancellationError = nil
+        queueReadUnknown = false
+        // Only this pass may claim that no upload work is left; a pass that stops early must not return the claim of
+        // an earlier one (#1004 B2).
+        progress.leavesNoUploadWork = false
         guard queue.isOperational() else {
             progress.isRunning = false
             progress.currentItemName = nil
@@ -358,9 +371,9 @@ public actor BackupSyncRunner {
         // Crash recovery first: anything still marked active predates this run and must become
         // runnable again before this runner atomically claims new work.
         queue.requeueStaleActive(before: now().addingTimeInterval(-configuration.staleActiveGrace), updatedAt: now())
-        guard queue.isOperational() else { return progress }
+        guard isQueueOperational() else { return progress }
         await requeueDueBlockedRows()
-        guard queue.isOperational() else { return progress }
+        guard isQueueOperational() else { return progress }
 
         // The last known index health stays visible until this pass reads it again.
         let previousIndexHealth = progress.remoteContentIndexHealth
@@ -369,11 +382,20 @@ public actor BackupSyncRunner {
         progress.remoteContentIndexHealth = previousIndexHealth
         progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
-        guard queue.isOperational() else { return progress }
+        guard isQueueOperational() else { return progress }
         emitProgress()
 
         if mode == .eligibleOnly {
-            guard let nextRunnableDate = queue.nextRunnableDate() else {
+            let nextRunnableDate: Date?
+            do {
+                nextRunnableDate = try queue.decisionNextRunnableDate(excludingSourcesOf: [])
+            } catch {
+                // An unknown date proves neither due work nor an empty queue.
+                queueReadUnknown = true
+                progress.isRunning = false
+                return progress
+            }
+            guard let nextRunnableDate else {
                 // Nothing is due now or later. A parked draft whose re-check is due later can still start an index
                 // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
                 progress.isRunning = false
@@ -418,10 +440,19 @@ public actor BackupSyncRunner {
             cancelRemoteIndexPreparation(generation: remoteIndexGeneration)
             if recordCancellation(error) { return progress }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let previous: BackupIssueRecord?
+            do {
+                previous = try queue.decisionRuntimeIssue(for: .remoteIndexPreparation)
+            } catch {
+                // Without the stored ordinal the backoff would restart at its first, shortest step.
+                queueReadUnknown = true
+                stopRequested = true
+                return progress
+            }
             let issue = automaticRetryIssue(
                 kind: Self.issueKind(for: error),
                 detail: message,
-                previous: queue.runtimeIssue(for: .remoteIndexPreparation)
+                previous: previous
             )
             guard queue.setRuntimeIssue(issue, for: .remoteIndexPreparation) else {
                 stopRequested = true
@@ -437,7 +468,7 @@ public actor BackupSyncRunner {
         // Warm the dedup pipeline's remote cache for the first batch so per-item resolves are cache
         // hits (see primeRunnableLookahead). Re-warmed periodically as the queue drains.
         await primeRunnableLookahead()
-        guard queue.isOperational() else { return progress }
+        guard isQueueOperational() else { return progress }
         var startsSincePrime = 0
         var storeFailed = false
 
@@ -465,12 +496,12 @@ public actor BackupSyncRunner {
                     await waitForSchedulerWake()
                     continue
                 }
-                guard queue.isOperational() else {
+                guard isQueueOperational() else {
                     storeFailed = true
                     continue
                 }
                 await requeueDueBlockedRows()
-                guard queue.isOperational() else {
+                guard isQueueOperational() else {
                     storeFailed = true
                     continue
                 }
@@ -535,12 +566,21 @@ public actor BackupSyncRunner {
                 }
 
                 if claimedItemCount == 0 {
-                    guard queue.isOperational() else {
+                    guard isQueueOperational() else {
                         storeFailed = true
                         continue
                     }
-                    guard let wait = shortestPendingWait(policy: .idleScheduledRetries) else {
-                        if !queue.isOperational() { storeFailed = true }
+                    let idleWait: TimeInterval?
+                    do {
+                        idleWait = try shortestPendingWait(policy: .idleScheduledRetries)
+                    } catch {
+                        // An unknown date ends the pass as unknown: it is not drained.
+                        queueReadUnknown = true
+                        storeFailed = true
+                        continue
+                    }
+                    guard let wait = idleWait else {
+                        if !isQueueOperational() { storeFailed = true }
                         break
                     }
                     if mode == .eligibleOnly { break }
@@ -552,10 +592,11 @@ public actor BackupSyncRunner {
                     continue
                 }
                 // Free slots that the claim could not fill also wait for the earliest row that becomes runnable.
+                // An unknown date waits without a timer: the settlement of a running item wakes the loop.
                 let wait =
                     runningSources.count < limit
-                    ? shortestPendingWait(
-                        policy: .freeUploadSlots, excludingSourcesOf: runningSources.values.map(\.source))
+                    ? (try? shortestPendingWait(
+                        policy: .freeUploadSlots, excludingSourcesOf: runningSources.values.map(\.source))) ?? nil
                     : nil
                 await waitForSchedulerWake(orAfter: wait)
             }
@@ -774,11 +815,13 @@ public actor BackupSyncRunner {
     private func shortestPendingWait(
         policy: PendingWaitPolicy,
         excludingSourcesOf excludedSources: [UploadSourceIdentity] = []
-    ) -> TimeInterval? {
+    ) throws -> TimeInterval? {
         let currentTime = now()
-        var dates = [queue.nextRunnableDate(excludingSourcesOf: excludedSources + Array(deferredSources.values))]
+        var dates = [
+            try queue.decisionNextRunnableDate(excludingSourcesOf: excludedSources + Array(deferredSources.values))
+        ]
         if policy == .freeUploadSlots {
-            dates.append(queue.earliestEntry(in: .blockedByDraft)?.updatedAt)
+            dates.append(try queue.decisionEarliestEntry(in: .blockedByDraft)?.updatedAt)
         }
         let eligibleDates = dates.compactMap { $0 }.filter {
             policy == .idleScheduledRetries || $0 > currentTime
@@ -798,7 +841,16 @@ public actor BackupSyncRunner {
     /// that never clears is re-checked at most once per cap window: visible, never hot-looping.
     private func requeueDueBlockedRows() async {
         let currentTime = now()
-        let blocked = queue.entries(in: .blockedByDraft, updatedBefore: currentTime, limit: configuration.batchSize)
+        let blocked: [UploadBackupSyncQueueEntry]
+        do {
+            blocked = try queue.decisionEntries(
+                in: .blockedByDraft, updatedBefore: currentTime, limit: configuration.batchSize)
+        } catch {
+            // The due re-check did not run; the pass must not end as if it had.
+            queueReadUnknown = true
+            stopRequested = true
+            return
+        }
         var requeued = false
         for entry in blocked {
             let issue = BackupIssueRecord.decode(entry.lastError)
@@ -1120,7 +1172,8 @@ public actor BackupSyncRunner {
                         // The row is gone, for example after a deletion or an exclusion. The handoff above keeps
                         // the photo and, for an exclusion, schedules its trash. Settlement ends as cancelled; the
                         // runner ends the pass unless it removed this source itself.
-                        if (try? queue.entry(for: entry.source, revision: entry.revision)) == nil {
+                        // A failed read is no removal: it ends settlement as a store failure, which stops the pass.
+                        if try queue.entry(for: entry.source, revision: entry.revision) == nil {
                             throw CancellationError()
                         }
                         throw UploadError.backend("Remote commit reconciliation could not be persisted")

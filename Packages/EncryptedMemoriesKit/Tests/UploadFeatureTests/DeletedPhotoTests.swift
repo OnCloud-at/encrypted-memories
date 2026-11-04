@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
@@ -1071,6 +1072,67 @@ final class DeletedPhotoTests: XCTestCase {
             journalBefore: journalBefore, journalAfter: journalAfter, reloadedJournal: reloaded.entry(for: source),
             restoreAttempts: journal.restoreAttempts, message: message, lines: lines.values,
             journalLines: journalLinesAfter)
+    }
+
+    /// A sibling revision whose stored receipt no longer decodes is unknown, not absent: the decision must not skip
+    /// it and choose an older revision (#1004 B2, row 15). The healthy and the single-revision routes are pinned by
+    /// testOneChoiceSettlesEveryParkedRevisionOfThePhoto and testControllerMapsDecisionRowsAndWritesBothChoices.
+    @MainActor
+    func testACorruptSiblingReceiptStopsTheDecisionInsteadOfChoosingAnOlderRevision() async throws {
+        for keepDeleted in [false, true] {
+            let account = directory.appendingPathComponent("corrupt-receipt-\(keepDeleted)")
+            try FileManager.default.createDirectory(at: account, withIntermediateDirectories: true)
+            let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: account))
+            let suite = "deletion-corrupt-receipt-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(accountDataDirectory: account, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            let rows = [date, date.addingTimeInterval(60)].map { timestamp in
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: UploadBackupRevision(date: timestamp), originalFilename: "photo.heic",
+                    state: .failedPermanent,
+                    lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                    updatedAt: date)
+            }
+            for row in rows { XCTAssertTrue(queue.upsert(row)) }
+            let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision })
+            let url = account.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+            XCTAssertEqual(
+                sqlite3_exec(
+                    handle,
+                    "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B' "
+                        + "WHERE revision_us=\(rows[1].revision.rawValue);", nil, nil, nil),
+                SQLITE_OK)
+            sqlite3_close(handle)
+
+            let decided = keepDeleted ? controller.keepDeleted(olderItem) : controller.backUpAgain(olderItem)
+
+            XCTAssertFalse(decided, "an unknown sibling stops the decision")
+            XCTAssertTrue(journal.entry(for: source).isEmpty, "no choice for a revision the decision cannot see")
+            var observer: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &observer), SQLITE_OK)
+            var stmt: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(
+                    observer, "SELECT state, last_error FROM backup_sync_queue ORDER BY revision_us;", -1, &stmt, nil),
+                SQLITE_OK)
+            var states: [String] = []
+            var errors: [String?] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                states.append(String(cString: sqlite3_column_text(stmt, 0)))
+                errors.append(sqlite3_column_text(stmt, 1).map { String(cString: $0) })
+            }
+            sqlite3_finalize(stmt)
+            sqlite3_close(observer)
+            XCTAssertEqual(states, ["failedPermanent", "failedPermanent"], "no revision changes state")
+            XCTAssertEqual(errors, rows.map(\.lastError), "no reason changes")
+            await controller.shutdown()
+        }
     }
 
     @MainActor
