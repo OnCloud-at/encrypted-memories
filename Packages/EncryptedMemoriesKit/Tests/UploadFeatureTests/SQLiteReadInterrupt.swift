@@ -13,13 +13,18 @@ final class SQLiteReadInterrupt {
     private var interrupted = false
     private(set) var fired = false
     private(set) var tracedRows = 0
+    /// Runs once on the store's thread while the interrupted statement executes, before it fails.
+    private let onFire: (() -> Void)?
 
-    init(in store: Any, matching: String, occurrence: Int = 1, afterRows: Int = 0) throws {
+    init(
+        in store: Any, matching: String, occurrence: Int = 1, afterRows: Int = 0, onFire: (() -> Void)? = nil
+    ) throws {
         connection = try XCTUnwrap(
             Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value
                 as? SQLiteStoreConnection)
         self.matching = matching
         self.afterRows = afterRows
+        self.onFire = onFire
         remaining = occurrence
         connection.withLock {
             sqlite3_trace_v2(
@@ -53,6 +58,7 @@ final class SQLiteReadInterrupt {
                     guard fault.armed, !fault.interrupted else { return 0 }
                     fault.fired = true
                     fault.interrupted = true
+                    fault.onFire?()
                     return 1
                 }, Unmanaged.passUnretained(self).toOpaque())
         }

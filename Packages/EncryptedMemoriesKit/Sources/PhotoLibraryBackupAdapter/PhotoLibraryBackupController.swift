@@ -1094,6 +1094,11 @@ public final class PhotoLibraryBackupController {
                     return false
                 }
             }
+            // The journal is a file, so it cannot share the queue transaction. It takes the choice first: a reopened
+            // revision without it would only wait for the question again. A failed queue write takes it back while
+            // the journal still holds it.
+            let previousChoice = journal.entry(for: source).deletionChoice
+            let writtenChoice: EditReplacementDeletionChoice = keepDeleted ? .keptDeleted : .backUpAgain(newest)
             try PhotoPerformanceSignposts.database.interval("BackupDecisionJournal") {
                 if keepDeleted {
                     try journal.keepDeleted(for: source)
@@ -1101,24 +1106,32 @@ public final class PhotoLibraryBackupController {
                     try journal.backUpAgain(revision: newest, for: source)
                 }
             }
-            for parkedRevision in Set(parked + [revision]) {
+            let lastError =
+                keepDeleted
+                ? BackupIssueRecord(
+                    kind: .remoteDeletion, detail: L10n.string("backup.state_skipped_remote_deletion")
+                ).persistedValue : nil
+            let updates = Set(parked + [revision]).sorted().map { parkedRevision in
                 let reopens = !keepDeleted && parkedRevision == newest
-                let state: UploadBackupSyncQueueState =
-                    keepDeleted ? .skippedRemoteDeletion : reopens ? .discovered : .dismissedFailure
-                guard
-                    PhotoPerformanceSignposts.database.interval(
-                        "BackupDecisionQueueWrite",
-                        {
-                            queueStore.updateState(
-                                source: source, revision: parkedRevision, state: state, attempts: nil,
-                                lastError: keepDeleted
-                                    ? BackupIssueRecord(
-                                        kind: .remoteDeletion,
-                                        detail: L10n.string("backup.state_skipped_remote_deletion")
-                                    ).persistedValue : nil,
-                                updatedAt: Date())
-                        })
-                else { throw UploadError.backend(L10n.string("backup.error_local_state_unavailable")) }
+                return UploadBackupSyncQueueManifestStore.StateUpdate(
+                    revision: parkedRevision,
+                    state: keepDeleted ? .skippedRemoteDeletion : reopens ? .discovered : .dismissedFailure,
+                    lastError: lastError)
+            }
+            // All revisions change together, or none does: a photo reported as unchanged has no reopened revision.
+            guard
+                PhotoPerformanceSignposts.database.interval(
+                    "BackupDecisionQueueWrite",
+                    { queueStore.updateStates(of: source, updates, updatedAt: Date()) })
+            else {
+                do {
+                    try journal.restoreDeletionChoice(previousChoice, ifStill: writtenChoice, for: source)
+                } catch {
+                    backgroundLog.notice(
+                        .photoBackup, "decision.choiceNotRestored",
+                        [(.init("choice"), .word(keepDeleted ? "keepDeleted" : "backUpAgain"))])
+                }
+                throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
             }
             SupportEventTrail.shared.record(
                 keepDeleted ? .backupDeletionKept : .backupDeletionReopened, subject: source.identifier)

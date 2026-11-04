@@ -885,42 +885,81 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     ) -> Bool {
         connection.withLock {
             var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        UPDATE backup_sync_queue SET
-                          state=?,
-                          attempts=COALESCE(?, attempts),
-                          last_error=?,
-                          remote_commit_reconciliation=CASE
-                            WHEN ?='needsRemoteReconciliation' THEN remote_commit_reconciliation
-                            ELSE NULL
-                          END,
-                          updated_at=?
-                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
+            guard requireOperational(sqlite3_prepare_v2(db, Self.updateStateSQL, -1, &stmt, nil) == SQLITE_OK)
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, state.rawValue)
-            if let attempts {
-                sqlite3_bind_int(stmt, 2, Int32(max(0, attempts)))
-            } else {
-                sqlite3_bind_null(stmt, 2)
-            }
-            bindNullableText(stmt, 3, lastError)
-            bindText(stmt, 4, state.rawValue)
-            sqlite3_bind_double(stmt, 5, updatedAt.timeIntervalSince1970)
-            bindText(stmt, 6, source.kind.rawValue)
-            bindText(stmt, 7, source.identifier)
-            bindText(stmt, 8, source.resource.rawValue)
-            sqlite3_bind_int64(stmt, 9, revision.rawValue)
+            bindStateUpdate(
+                stmt, source: source, revision: revision, state: state, attempts: attempts, lastError: lastError,
+                updatedAt: updatedAt)
             guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
             return sqlite3_changes(db) > 0
         }
+    }
+
+    /// One transaction: every revision changes, or none does. A missing row or a failed statement rolls back all of
+    /// them, so a caller that sees false never finds one of them changed.
+    private func updateStatesUnobserved(
+        of source: UploadSourceIdentity, _ updates: [StateUpdate], updatedAt: Date
+    ) -> Bool {
+        connection.withLock {
+            var stmt: OpaquePointer?
+            guard requireOperational(sqlite3_prepare_v2(db, Self.updateStateSQL, -1, &stmt, nil) == SQLITE_OK)
+            else { return false }
+            defer { sqlite3_finalize(stmt) }
+            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+                return false
+            }
+            for update in updates {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindStateUpdate(
+                    stmt, source: source, revision: update.revision, state: update.state, attempts: nil,
+                    lastError: update.lastError, updatedAt: updatedAt)
+                guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE), sqlite3_changes(db) == 1 else {
+                    sqlite3_reset(stmt)
+                    connection.rollBack()
+                    return false
+                }
+            }
+            sqlite3_reset(stmt)
+            guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+                connection.rollBack()
+                return false
+            }
+            return true
+        }
+    }
+
+    private static let updateStateSQL = """
+        UPDATE backup_sync_queue SET
+          state=?,
+          attempts=COALESCE(?, attempts),
+          last_error=?,
+          remote_commit_reconciliation=CASE
+            WHEN ?='needsRemoteReconciliation' THEN remote_commit_reconciliation
+            ELSE NULL
+          END,
+          updated_at=?
+        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
+        """
+
+    private func bindStateUpdate(
+        _ stmt: OpaquePointer?, source: UploadSourceIdentity, revision: UploadBackupRevision,
+        state: UploadBackupSyncQueueState, attempts: Int?, lastError: String?, updatedAt: Date
+    ) {
+        bindText(stmt, 1, state.rawValue)
+        if let attempts {
+            sqlite3_bind_int(stmt, 2, Int32(max(0, attempts)))
+        } else {
+            sqlite3_bind_null(stmt, 2)
+        }
+        bindNullableText(stmt, 3, lastError)
+        bindText(stmt, 4, state.rawValue)
+        sqlite3_bind_double(stmt, 5, updatedAt.timeIntervalSince1970)
+        bindText(stmt, 6, source.kind.rawValue)
+        bindText(stmt, 7, source.identifier)
+        bindText(stmt, 8, source.resource.rawValue)
+        sqlite3_bind_int64(stmt, 9, revision.rawValue)
     }
 
     @discardableResult
@@ -1736,6 +1775,30 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             notify(UploadBackupSyncQueueChange(sources: [source]))
         }
         return result
+    }
+
+    /// The new state of one revision in `updateStates`. The attempt count stays.
+    public struct StateUpdate: Sendable, Equatable {
+        public let revision: UploadBackupRevision
+        public let state: UploadBackupSyncQueueState
+        public let lastError: String?
+
+        public init(revision: UploadBackupRevision, state: UploadBackupSyncQueueState, lastError: String?) {
+            self.revision = revision
+            self.state = state
+            self.lastError = lastError
+        }
+    }
+
+    /// Writes several revisions of one source together: every row changes, or, after a missing row or a failed
+    /// statement, none does and the result is false. An empty list writes nothing and succeeds.
+    @discardableResult
+    public func updateStates(of source: UploadSourceIdentity, _ updates: [StateUpdate], updatedAt: Date) -> Bool {
+        guard !updates.isEmpty else { return true }
+        guard updateStatesUnobserved(of: source, updates, updatedAt: updatedAt) else { return false }
+        for update in updates { recordSupportEvent(source: source, state: update.state, lastError: update.lastError) }
+        notify(UploadBackupSyncQueueChange(sources: [source]))
+        return true
     }
 
     @discardableResult

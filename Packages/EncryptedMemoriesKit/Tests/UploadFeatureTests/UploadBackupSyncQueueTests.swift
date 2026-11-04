@@ -1251,6 +1251,103 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 
+    /// `updateStates` writes every revision of the source or none: a missing row and a failed statement both leave the
+    /// rows that came before them unchanged (#1004).
+    func testUpdateStatesChangesEveryRevisionOrNone() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        defer { store.close() }
+        let photo = source("decided")
+        let rows = [revision(10), revision(20)].map {
+            UploadBackupSyncQueueEntry(
+                source: photo, revision: $0, originalFilename: "photo.heic", state: .failedPermanent,
+                lastError: "parked", updatedAt: Date(timeIntervalSinceReferenceDate: 5))
+        }
+        for row in rows { XCTAssertTrue(store.upsert(row)) }
+        let reopen = rows.map {
+            UploadBackupSyncQueueManifestStore.StateUpdate(revision: $0.revision, state: .discovered, lastError: nil)
+        }
+        let later = Date(timeIntervalSinceReferenceDate: 50)
+        let changes = RecordedQueueChanges()
+        store.setChangeObserver { changes.append($0) }
+
+        let missing = reopen + [.init(revision: revision(30), state: .discovered, lastError: nil)]
+        XCTAssertFalse(
+            store.updateStates(of: photo, missing, updatedAt: later), "a missing row refuses the whole write")
+        for row in rows { XCTAssertEqual(try store.entry(for: photo, revision: row.revision), row) }
+        XCTAssertTrue(store.isOperational(), "a missing row is no store failure")
+
+        let fault = try SQLiteReadInterrupt(in: store, matching: "attempts=COALESCE(?, attempts)", occurrence: 2)
+        XCTAssertFalse(store.updateStates(of: photo, reopen, updatedAt: later))
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+        let observer = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        defer { observer.close() }
+        for row in rows {
+            XCTAssertEqual(try observer.entry(for: photo, revision: row.revision), row, "the first write rolled back")
+        }
+        XCTAssertEqual(changes.values, [], "a refused write reports no change")
+
+        let healthy = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("healthy.sqlite")))
+        defer { healthy.close() }
+        for row in rows { XCTAssertTrue(healthy.upsert(row)) }
+        let healthyChanges = RecordedQueueChanges()
+        healthy.setChangeObserver { healthyChanges.append($0) }
+        XCTAssertTrue(healthy.updateStates(of: photo, reopen, updatedAt: later))
+        XCTAssertEqual(
+            healthyChanges.values, [UploadBackupSyncQueueChange(sources: [photo])], "one change after the commit")
+        for row in rows {
+            let written = try XCTUnwrap(healthy.entry(for: photo, revision: row.revision))
+            XCTAssertEqual(written.state, .discovered)
+            XCTAssertNil(written.lastError)
+            XCTAssertEqual(written.attempts, row.attempts)
+        }
+        XCTAssertTrue(healthy.updateStates(of: photo, [], updatedAt: later), "an empty write changes nothing")
+    }
+
+    /// A statement error that SQLite does not roll back by itself (RAISE(ABORT) keeps the transaction open) after
+    /// two written revisions: the store itself must end the transaction, so no written revision survives (#1004).
+    func testUpdateStatesRollsBackAnOpenTransactionAfterALaterStatementFails() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        defer { store.close() }
+        let photo = source("aborted")
+        let rows = [revision(10), revision(20), revision(30)].map {
+            UploadBackupSyncQueueEntry(
+                source: photo, revision: $0, originalFilename: "photo.heic", state: .failedPermanent,
+                lastError: "parked", updatedAt: Date(timeIntervalSinceReferenceDate: 5))
+        }
+        for row in rows { XCTAssertTrue(store.upsert(row)) }
+        let connection = try XCTUnwrap(
+            Mirror(reflecting: store).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
+        let trigger = """
+            CREATE TEMP TRIGGER refuse_third BEFORE UPDATE ON main.backup_sync_queue
+            WHEN OLD.revision_us = \(rows[2].revision.rawValue)
+            BEGIN SELECT RAISE(ABORT, 'refused'); END;
+            """
+        XCTAssertEqual(connection.withLock { sqlite3_exec(connection.database, trigger, nil, nil, nil) }, SQLITE_OK)
+        defer {
+            _ = connection.withLock {
+                sqlite3_exec(connection.database, "DROP TRIGGER IF EXISTS temp.refuse_third;", nil, nil, nil)
+            }
+        }
+        let reopen = rows.map {
+            UploadBackupSyncQueueManifestStore.StateUpdate(revision: $0.revision, state: .discovered, lastError: nil)
+        }
+
+        XCTAssertFalse(store.updateStates(of: photo, reopen, updatedAt: Date(timeIntervalSinceReferenceDate: 50)))
+
+        XCTAssertNotEqual(
+            connection.withLock { sqlite3_get_autocommit(connection.database) }, 0,
+            "the failed write must not leave its transaction open")
+        for row in rows {
+            XCTAssertEqual(
+                try store.entry(for: photo, revision: row.revision), row,
+                "the same connection must not see the earlier revisions of the failed write")
+        }
+    }
+
     func testQueueHealthProbeRecordsDeniedSelect() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
@@ -2288,4 +2385,11 @@ extension UploadBackupSyncQueueTests {
             try q.entry(for: newer.source, revision: newer.revision), newer,
             "The latest terminal row cannot lend its identity to an older observation")
     }
+}
+
+private final class RecordedQueueChanges: @unchecked Sendable {
+    private let lock = NSLock()
+    private var changes: [UploadBackupSyncQueueChange] = []
+    var values: [UploadBackupSyncQueueChange] { lock.withLock { changes } }
+    func append(_ change: UploadBackupSyncQueueChange) { lock.withLock { changes.append(change) } }
 }
