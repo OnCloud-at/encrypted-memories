@@ -9,6 +9,7 @@ public final class BackupProblemListSession {
     public private(set) var isUnavailable = false
     public private(set) var isReading = false
     public private(set) var total = 0
+    public private(set) var decisionCount = 0
     public private(set) var hasRead = false
     public var isRetired: Bool { retired }
     public var fixedActionMessage: String? { retired ? nil : message() }
@@ -91,6 +92,7 @@ public final class BackupProblemListSession {
                     rows = loaded.rows
                     next = loaded.next
                     total = captured.rows.count
+                    decisionCount = captured.decisionCount
                     isUnavailable = false
                     continueNearEndRequest()
                 } else {
@@ -123,7 +125,9 @@ public final class BackupProblemListSession {
 
     public func dismissItem(id: String) {
         let before = rows.count
+        let removedDecisions = rows.filter { $0.item.id == id && $0.item.issue == snapshot?.decisionIssue }.count
         rows.removeAll { $0.item.id == id }
+        decisionCount -= removedDecisions
         total -= before - rows.count
     }
 
@@ -186,6 +190,7 @@ public final class BackupProblemListSession {
         next = nil
         rows = []
         total = 0
+        decisionCount = 0
         hasRead = false
         isUnavailable = false
     }

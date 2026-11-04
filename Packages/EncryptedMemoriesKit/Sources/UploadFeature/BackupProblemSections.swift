@@ -35,22 +35,35 @@ public struct BackupProblemSections<Row: View>: View {
 }
 
 /// The native hosts place this one action area outside their scrolling photo rows.
-public struct BackupProblemActionArea: View {
+public struct BackupProblemActionArea<Controls: View>: View {
     private let message: String?
+    private let controls: Controls
 
-    public init(message: String?) { self.message = message }
+    public init(message: String?, @ViewBuilder controls: () -> Controls) {
+        self.message = message
+        self.controls = controls()
+    }
 
     public var body: some View {
-        if let message {
-            Text(message)
-                .foregroundStyle(.red)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal)
-                .padding(.vertical, 8)
-                .background(.bar)
-                .accessibilityIdentifier("albumsync.restoreError")
+        VStack(alignment: .leading, spacing: 8) {
+            controls
+            if let message {
+                Text(message)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
+                    .background(.bar)
+                    .accessibilityIdentifier("albumsync.restoreError")
+            }
         }
+    }
+}
+
+extension BackupProblemActionArea where Controls == EmptyView {
+    public init(message: String?) {
+        self.init(message: message) { EmptyView() }
     }
 }
 

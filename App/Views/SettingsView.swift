@@ -1027,7 +1027,17 @@ private struct MacFailedBackupSheet: View {
                         .padding()
                 }
             }
-            BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil)
+            BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil) {
+                if sessionSourceID == sourceID, let controller {
+                    BulkBackUpAgainControls(
+                        runner: controller.bulkPhotoActions, count: pagedList.decisionCount,
+                        isAvailable: { controller.isBulkBackUpAgainAvailable },
+                        prepare: { await controller.prepareBackUpAgain() },
+                        start: { controller.startBackUpAgain($0) }
+                    )
+                    .id(ObjectIdentifier(controller))
+                }
+            }
         }
         .frame(width: 520, height: 380)
         .task(id: followKey) {

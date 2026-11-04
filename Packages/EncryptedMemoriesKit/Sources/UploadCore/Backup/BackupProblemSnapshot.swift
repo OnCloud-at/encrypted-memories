@@ -23,9 +23,16 @@ public struct BackupProblemSnapshot: Sendable {
 
     public let id = UUID()
     public let rows: [Row]
+    public let revisionsBySource: [UploadSourceIdentity: Set<UploadBackupRevision>]
+    public let decisionIssue: BackupIssueKind
+    public let decisionCount: Int
 
     public init(items: [BackupFailedItem], decisionIssue: BackupIssueKind = .deletedElsewhere) {
-        rows = BackupProblemPhotoSelection(items, decisionIssue: decisionIssue).items.map { item in
+        let selection = BackupProblemPhotoSelection(items, decisionIssue: decisionIssue)
+        self.decisionIssue = decisionIssue
+        decisionCount = selection.items.filter { $0.issue == decisionIssue }.count
+        revisionsBySource = selection.revisionsBySource
+        rows = selection.items.map { item in
             let identity: Row.ID
             if item.issue == decisionIssue, let source = item.source {
                 identity = .decision(source)

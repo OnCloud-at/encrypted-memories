@@ -70,6 +70,44 @@ final class LocalizationTests: XCTestCase {
         return unit?["value"] as? String
     }
 
+    func testBulkBackUpAgainCopyUsesTheFrozenEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("backup.bulk_count_one %@", "%@ photo · Deleted in Proton Drive", "%@ Foto · In Proton Drive gelöscht"),
+            (
+                "backup.bulk_count_other %@", "%@ photos · Deleted in Proton Drive",
+                "%@ Fotos · In Proton Drive gelöscht"
+            ),
+            ("backup.bulk_action %@", "Back Up Again (%@)", "Erneut sichern (%@)"),
+            ("backup.bulk_title_one %@", "Back up %@ photo again?", "%@ Foto erneut sichern?"),
+            ("backup.bulk_title_other %@", "Back up %@ photos again?", "%@ Fotos erneut sichern?"),
+            (
+                "backup.bulk_message",
+                "Photos that were deleted in Proton Drive will be uploaded again. Unavailable photos stay unchanged.",
+                "Fotos, die in Proton Drive gelöscht wurden, werden erneut hochgeladen. Nicht verfügbare Fotos bleiben unverändert."
+            ),
+            ("backup.bulk_progress_one %@ %@", "%1$@ of %2$@ photo checked", "%1$@ von %2$@ Foto geprüft"),
+            ("backup.bulk_progress_other %@ %@", "%1$@ of %2$@ photos checked", "%1$@ von %2$@ Fotos geprüft"),
+            (
+                "backup.bulk_outcome_one %@ %@ %@", "%1$@ of %2$@ photo queued for backup. %3$@ unchanged.",
+                "%1$@ von %2$@ Foto für das Backup eingereiht. %3$@ unverändert."
+            ),
+            (
+                "backup.bulk_outcome_other %@ %@ %@", "%1$@ of %2$@ photos queued for backup. %3$@ unchanged.",
+                "%1$@ von %2$@ Fotos für das Backup eingereiht. %3$@ unverändert."
+            ),
+            (
+                "backup.bulk_queued_detail", "Queued photos are not backed up yet.",
+                "Eingereihte Fotos sind noch nicht gesichert."
+            ),
+            ("backup.bulk_cancelled", "Cancelled", "Abgebrochen"),
+            ("backup.bulk_dismiss_result", "Dismiss result", "Ergebnis schließen"),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
     func testSourceLanguageIsEnglish() throws {
         XCTAssertEqual(try loadCatalog(appCatalog).sourceLanguage, "en")
         XCTAssertEqual(try loadCatalog(mobileCatalog).sourceLanguage, "en")

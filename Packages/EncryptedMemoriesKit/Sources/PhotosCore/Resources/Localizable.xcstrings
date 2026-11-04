@@ -1,6 +1,227 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "backup.bulk_count_one %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ photo · Deleted in Proton Drive"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Foto · In Proton Drive gelöscht"
+          }
+        }
+      }
+    },
+    "backup.bulk_count_other %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ photos · Deleted in Proton Drive"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Fotos · In Proton Drive gelöscht"
+          }
+        }
+      }
+    },
+    "backup.bulk_action %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back Up Again (%@)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erneut sichern (%@)"
+          }
+        }
+      }
+    },
+    "backup.bulk_title_one %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back up %@ photo again?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Foto erneut sichern?"
+          }
+        }
+      }
+    },
+    "backup.bulk_title_other %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back up %@ photos again?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Fotos erneut sichern?"
+          }
+        }
+      }
+    },
+    "backup.bulk_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Photos that were deleted in Proton Drive will be uploaded again. Unavailable photos stay unchanged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fotos, die in Proton Drive gelöscht wurden, werden erneut hochgeladen. Nicht verfügbare Fotos bleiben unverändert."
+          }
+        }
+      }
+    },
+    "backup.bulk_progress_one %@ %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ of %2$@ photo checked"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ von %2$@ Foto geprüft"
+          }
+        }
+      }
+    },
+    "backup.bulk_progress_other %@ %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ of %2$@ photos checked"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ von %2$@ Fotos geprüft"
+          }
+        }
+      }
+    },
+    "backup.bulk_outcome_one %@ %@ %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ of %2$@ photo queued for backup. %3$@ unchanged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ von %2$@ Foto für das Backup eingereiht. %3$@ unverändert."
+          }
+        }
+      }
+    },
+    "backup.bulk_outcome_other %@ %@ %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ of %2$@ photos queued for backup. %3$@ unchanged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ von %2$@ Fotos für das Backup eingereiht. %3$@ unverändert."
+          }
+        }
+      }
+    },
+    "backup.bulk_queued_detail": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Queued photos are not backed up yet."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Eingereihte Fotos sind noch nicht gesichert."
+          }
+        }
+      }
+    },
+    "backup.bulk_cancelled": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancelled"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abgebrochen"
+          }
+        }
+      }
+    },
+    "backup.bulk_dismiss_result": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dismiss result"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ergebnis schließen"
+          }
+        }
+      }
+    },
     "backup.waiting_for_library_check": {
       "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
       "localizations": {
