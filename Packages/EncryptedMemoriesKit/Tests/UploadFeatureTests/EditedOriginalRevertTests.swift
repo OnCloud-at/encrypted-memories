@@ -28,13 +28,15 @@ final class EditedOriginalRevertTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempDir)
     }
 
-    private func makeOrchestrator() -> EditedOriginalRevert {
+    private func makeOrchestrator(
+        journalStore store: (any EditedOriginalRevertJournalStore)? = nil
+    ) -> EditedOriginalRevert {
         EditedOriginalRevert(
             remote: server,
             albums: server,
             copier: server.makeCopier(tempDirectory: tempDir.appendingPathComponent("work")),
             relations: server,
-            journalStore: journalStore,
+            journalStore: store ?? journalStore,
             admission: admission
         )
     }
@@ -118,6 +120,211 @@ final class EditedOriginalRevertTests: XCTestCase {
         XCTAssertTrue(outcomes.isEmpty)
     }
 
+    // MARK: - The automatic resume never makes a copy
+
+    /// The resume at app start has no tap behind it, so it must never download or upload. A journal whose confirmed
+    /// copy vanished stays exactly as it is, and the person's next Revert tap makes the copy again.
+    func testResumeNeverMakesANewCopyWhenTheConfirmedCopyVanished() async throws {
+        server.failTrashOnce()
+        do {
+            try await performRevert()
+            XCTFail("trash should fail")
+        } catch {}
+        let before = try XCTUnwrap(try journalStore.journal(forEditedMain: editedMain))
+        let vanishedCopy = try XCTUnwrap(before.copyUID)
+        server.markTrashed(nodeID: vanishedCopy.nodeID)
+        let logBefore = server.operationLog()
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        XCTAssertTrue(outcomes.isEmpty, "a journal that needs a new copy waits for the person and reports nothing")
+        XCTAssertEqual(
+            server.operationLog(), logBefore, "the resume writes nothing: no upload, favorite, album or trash")
+        XCTAssertEqual(server.uploadNames().count, 1, "only the first attempt uploaded")
+        XCTAssertEqual(
+            try journalStore.journal(forEditedMain: editedMain), before, "the journal stays pending, unchanged")
+
+        // The person taps Revert again: the same journal continues, makes the copy and finishes.
+        let newCopy = try await performRevert()
+        XCTAssertNotEqual(newCopy, vanishedCopy)
+        XCTAssertEqual(server.uploadNames().count, 2)
+        XCTAssertTrue(server.trashCalls().contains { $0.contains(editedMain) })
+        XCTAssertNil(try journalStore.journal(forEditedMain: editedMain))
+    }
+
+    /// A journal in the trash step that never recorded a copy is the same case: the resume waits for the person.
+    func testResumeNeverMakesACopyForATrashStepWithoutARecordedCopy() async throws {
+        let orphan = EditedOriginalRevertJournal(
+            editedMainUID: editedMain, originalLinkID: "original", restoredName: "IMG_0001 (original).heic",
+            phase: .trashingEdit)
+        try journalStore.save(orphan)
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        XCTAssertTrue(outcomes.isEmpty)
+        XCTAssertTrue(server.operationLog().isEmpty, "no write of any kind")
+        XCTAssertEqual(try journalStore.journal(forEditedMain: editedMain), orphan)
+
+        _ = try await performRevert()
+        XCTAssertEqual(server.uploadNames().count, 1, "the person's tap makes the copy once")
+        XCTAssertNil(try journalStore.journal(forEditedMain: editedMain))
+    }
+
+    // MARK: - The resume acts only on the journal that is on disk right now
+
+    /// A journal at phase `copying` with a confirmed copy is the state after a failed carry-over. The resume must not
+    /// continue it: that would write the favorite tag and the album memberships without a tap.
+    func testResumeNeverContinuesACopyingJournalThatHasAConfirmedCopy() async throws {
+        server.failAlbumAddOnce(albumID: "album1")
+        do {
+            _ = try await performRevert()
+            XCTFail("album add should fail")
+        } catch {}
+        let before = try XCTUnwrap(try journalStore.journal(forEditedMain: editedMain))
+        XCTAssertEqual(before.phase, .copying)
+        XCTAssertNotNil(before.copyUID)
+        let logBefore = server.operationLog()
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        XCTAssertTrue(outcomes.isEmpty)
+        XCTAssertEqual(server.operationLog(), logBefore, "no favorite, album or trash write without a tap")
+        XCTAssertEqual(try journalStore.journal(forEditedMain: editedMain), before)
+    }
+
+    /// The resume reads the list of journals once, and a tap can finish before the resume reaches a journal. The
+    /// resume then must neither write that journal back nor trash the edited photo again.
+    func testAResumeNeverBringsBackAJournalThatATapFinishedMeanwhile() async throws {
+        server.seedStandaloneCopy(nodeID: "copy-1", contentHash: "ch-computed")
+        let snapshot = EditedOriginalRevertJournal(
+            editedMainUID: editedMain, originalLinkID: "original", restoredName: "IMG_0001 (original).heic",
+            copyUID: server.uid("copy-1"), favoriteDone: true, addedAlbumIDs: ["album1", "album2"],
+            phase: .trashingEdit)
+        try journalStore.save(snapshot)
+        let store = RacingJournalStore(base: journalStore) { [journalStore] in
+            try journalStore?.remove(forEditedMain: snapshot.editedMainUID)
+        }
+
+        let outcomes = try await makeOrchestrator(journalStore: store).resumePending()
+
+        XCTAssertTrue(outcomes.isEmpty, "the finished journal is no work for the resume")
+        XCTAssertNil(try journalStore.journal(forEditedMain: editedMain), "the journal does not come back")
+        XCTAssertTrue(server.trashCalls().isEmpty, "the edited photo is not trashed a second time")
+    }
+
+    /// The same race, but the tap moved the journal on: the resume must not write its older state over the newer one.
+    func testAResumeNeverWritesAnOlderJournalOverANewerOne() async throws {
+        server.seedStandaloneCopy(nodeID: "copy-1", contentHash: "ch-computed")
+        let snapshot = EditedOriginalRevertJournal(
+            editedMainUID: editedMain, originalLinkID: "original", restoredName: "IMG_0001 (original).heic",
+            copyUID: server.uid("copy-1"), favoriteDone: true, addedAlbumIDs: ["album1", "album2"],
+            phase: .trashingEdit)
+        try journalStore.save(snapshot)
+        var newer = snapshot
+        newer.phase = .repointingDevice
+        let store = RacingJournalStore(base: journalStore) { [journalStore, newer] in
+            try journalStore?.save(newer)
+        }
+
+        let outcomes = try await makeOrchestrator(journalStore: store).resumePending()
+
+        XCTAssertTrue(outcomes.isEmpty)
+        XCTAssertEqual(try journalStore.journal(forEditedMain: editedMain), newer, "the newer state stays")
+        XCTAssertTrue(server.trashCalls().isEmpty)
+    }
+
+    // MARK: - The summary that both hosts log at app start
+
+    func testTheSummaryCountsAFinishedTrashStep() async throws {
+        server.failTrashOnce()
+        do {
+            _ = try await performRevert()
+            XCTFail("trash should fail")
+        } catch {}
+
+        let summary = await makeOrchestrator().resumeAndSummarize()
+
+        XCTAssertEqual(summary.finished, 1)
+        XCTAssertTrue(summary.failures.isEmpty)
+        XCTAssertNil(summary.readFailure)
+        XCTAssertNil(try journalStore.journal(forEditedMain: editedMain))
+    }
+
+    func testTheSummaryReportsAFailedStepAndKeepsItsJournal() async throws {
+        server.failTrashOnce()
+        do {
+            _ = try await performRevert()
+            XCTFail("trash should fail")
+        } catch {}
+        server.failTrashOnce()
+
+        let summary = await makeOrchestrator().resumeAndSummarize()
+
+        XCTAssertEqual(summary.finished, 0)
+        XCTAssertEqual(summary.failures.count, 1)
+        XCTAssertNotNil(try journalStore.journal(forEditedMain: editedMain))
+    }
+
+    func testTheSummaryOfAJournalThatWaitsForThePersonIsEmpty() async throws {
+        try journalStore.save(
+            EditedOriginalRevertJournal(
+                editedMainUID: editedMain, originalLinkID: "original", restoredName: "IMG_0001 (original).heic",
+                phase: .trashingEdit))
+
+        let summary = await makeOrchestrator().resumeAndSummarize()
+
+        XCTAssertEqual(summary.finished, 0)
+        XCTAssertTrue(summary.failures.isEmpty)
+        XCTAssertNil(summary.readFailure)
+        XCTAssertTrue(server.operationLog().isEmpty)
+    }
+
+    func testTheSummaryReportsAnAccountThatShutDown() async throws {
+        admission.closeAdmission()
+
+        let summary = await makeOrchestrator().resumeAndSummarize()
+
+        XCTAssertEqual(summary.finished, 0)
+        XCTAssertTrue(summary.readFailure is CancellationError)
+    }
+
+    func testTheSummaryLogLineNamesTheCountsAndTheErrors() {
+        struct StepFailure: Error {}
+        struct ReadFailure: Error {}
+        let quiet = EditedOriginalRevertResumeSummary(finished: 2, failures: [], readFailure: nil)
+        XCTAssertEqual(quiet.logLine, "revert: resumed trash steps finished=2 failed=0")
+
+        let loud = EditedOriginalRevertResumeSummary(
+            finished: 0, failures: [StepFailure()], readFailure: ReadFailure())
+        XCTAssertTrue(loud.logLine.contains("finished=0 failed=1"))
+        XCTAssertTrue(loud.logLine.contains("StepFailure"), "the error of a failed step is in the line")
+        XCTAssertTrue(
+            loud.logLine.contains("unread=") && loud.logLine.contains("ReadFailure"), "a read failure is named")
+    }
+
+    /// The log line can reach a support report. It names the kind of each error and never its payload: a blocked
+    /// draft carries the person's file name, and a file error carries a path.
+    func testTheSummaryLogLineNeverContainsAFileNameAPathOrAnIdentifier() {
+        let secretName = "IMG_SECRET_0042.heic"
+        let secretPath = "/example/private/\(secretName)"
+        let summary = EditedOriginalRevertResumeSummary(
+            finished: 1,
+            failures: [
+                EditedOriginalRevert.RevertError.blockedByForeignDraft(secretName),
+                CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: secretPath]),
+            ],
+            readFailure: CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: secretPath]))
+
+        let line = summary.logLine
+
+        XCTAssertFalse(line.contains("IMG_SECRET"), line)
+        XCTAssertFalse(line.contains("/example"), line)
+        XCTAssertFalse(line.contains(".heic"), line)
+        XCTAssertTrue(line.contains("blockedByForeignDraft"), "the kind of the error stays visible: \(line)")
+        XCTAssertTrue(
+            line.contains("NSCocoaErrorDomain#4"), "the domain and code of a foreign error stay visible: \(line)")
+    }
+
     private func performRevert() async throws -> PhotoUID {
         try await makeOrchestrator().revert(
             editedMain: editedMain, original: original, restoredName: "IMG_0001 (original).heic")
@@ -173,7 +380,7 @@ final class EditedOriginalRevertTests: XCTestCase {
         XCTAssertNil(try journalStore.journal(forEditedMain: editedMain))
     }
 
-    /// F1: Copy vanishes between confirm and trash; resume re-confirms before trash.
+    /// F1: Copy vanishes between confirm and trash; the person's next Revert re-confirms before trash.
     func testTrashStepReconfirmsCopyIsActive() async throws {
         // Start revert, fail trash, then delete the copy externally
         server.failTrashOnce()
@@ -191,10 +398,9 @@ final class EditedOriginalRevertTests: XCTestCase {
             server.markTrashed(nodeID: copyNode)
         }
 
-        // Resume: it should re-make the copy, then succeed
-        let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertEqual(outcomes.count, 1)
-        let newCopyUID = try outcomes.first!.result.get()
+        // The person taps Revert again: the same journal makes the copy again, then succeeds. The automatic
+        // resume never does this (see testResumeNeverMakesANewCopyWhenTheConfirmedCopyVanished).
+        let newCopyUID = try await performRevert()
         XCTAssertNotEqual(newCopyUID.nodeID, journal.copyUID?.nodeID, "new copy should be created")
 
         // Verify upload count increased by exactly one (the re-copy)
@@ -220,10 +426,8 @@ final class EditedOriginalRevertTests: XCTestCase {
             server.markTrashed(nodeID: copyNode)
         }
 
-        // Resume: should reset favoriteDone=false, recreate copy, and redo favorite + albums
-        let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertEqual(outcomes.count, 1)
-        _ = try outcomes.first!.result.get()
+        // The person taps Revert again: reset favoriteDone=false, recreate the copy, redo favorite + albums
+        _ = try await performRevert()
 
         // Verify favorite was written to the new copy
         let finalLog = server.operationLog()
@@ -297,8 +501,8 @@ final class EditedOriginalRevertTests: XCTestCase {
         XCTAssertNotNil(try journalStore.journal(forEditedMain: editedMain))
     }
 
-    /// Tier A gap 3: Another device deletes the copy right after the album add but before trash. The resume path
-    /// detects the missing copy via `copyIsInactive`, re-makes it, and retries carry-over + trash.
+    /// Tier A gap 3: Another device deletes the copy right after the album add but before trash. The person's next
+    /// Revert detects the missing copy via `copyIsInactive`, re-makes it, and retries carry-over + trash.
     func testCopyDeletedBetweenAlbumAddAndTrashTriggersRerun() async throws {
         server.deleteCopyOnAlbumAdd()
 
@@ -310,14 +514,11 @@ final class EditedOriginalRevertTests: XCTestCase {
 
         let journal = try XCTUnwrap(try journalStore.journal(forEditedMain: editedMain))
         XCTAssertEqual(journal.phase, .trashingEdit)
-        // The journal keeps the vanished copy UID. The resume detects the copy is inactive and re-makes it.
+        // The journal keeps the vanished copy UID. The person's next Revert detects the inactive copy and re-makes it.
         XCTAssertNotNil(journal.copyUID)
         XCTAssertTrue(server.trashCalls().isEmpty, "nothing is trashed while the copy is unconfirmed")
 
-        // Resume: it should re-create the copy and succeed
-        let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertEqual(outcomes.count, 1)
-        let recoveredCopyUID = try outcomes.first!.result.get()
+        let recoveredCopyUID = try await performRevert()
 
         XCTAssertNotNil(recoveredCopyUID)
         XCTAssertTrue(server.trashCalls().contains { $0.contains(editedMain) })
@@ -367,44 +568,48 @@ final class EditedOriginalRevertTests: XCTestCase {
         XCTAssertNil(try journalStore.journal(forEditedMain: editedMain))
     }
 
-    /// Tier A gap 5: Resume reaches `ensureCopy` but the journal lost its `restoredName`. The guard throws
-    /// `invalidRestoredName` because the name cannot be re-discovered.
+    /// Tier A gap 5: a journal that lost its `restoredName` is no work for the resume, because it needs a new copy.
+    /// The person's next Revert supplies the name again. The `ensureCopy` guard against a missing name has no
+    /// direct test: no public call reaches it.
     func testEnsureCopyFailsWithoutRestoredName() async throws {
         // Create a journal manually at .trashingEdit without a copyUID and without restoredName
         let brokenJournal = EditedOriginalRevertJournal(
             editedMainUID: editedMain, originalLinkID: "original", restoredName: nil, phase: .trashingEdit)
         try journalStore.save(brokenJournal)
 
+        // The resume needs a copy for this journal, so it waits for the person and writes nothing.
         let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertEqual(outcomes.count, 1)
-        XCTAssertThrowsError(try outcomes.first!.result.get()) { error in
-            XCTAssertEqual(
-                error as? EditedOriginalRevert.RevertError, .invalidRestoredName,
-                "ensureCopy must reject a journal without restoredName")
-        }
+        XCTAssertTrue(outcomes.isEmpty)
+        XCTAssertTrue(server.operationLog().isEmpty)
 
         // Journal persists for manual recovery
-        XCTAssertNotNil(try journalStore.journal(forEditedMain: editedMain))
+        XCTAssertEqual(try journalStore.journal(forEditedMain: editedMain), brokenJournal)
+
+        // The person's Revert supplies the name, makes the copy through the actor and finishes the journal.
+        _ = try await performRevert()
+        XCTAssertEqual(server.uploadNames(), ["IMG_0001 (original).heic"])
+        XCTAssertTrue(server.trashCalls().contains { $0.contains(editedMain) })
+        XCTAssertNil(try journalStore.journal(forEditedMain: editedMain))
     }
 
-    /// Row 07: a journal that carries an empty restored name is rejected in `ensureCopy`, before any
-    /// upload or trash write. The empty string passes the nil check, so only the isEmpty clause catches it.
+    /// Row 07: a journal that carries an empty restored name is no work for the resume, and the resume writes
+    /// nothing. The person's next Revert replaces the name and finishes.
     func testResumeOfAJournalWithAnEmptyRestoredNameFailsBeforeAnyWrite() async throws {
         let namelessJournal = EditedOriginalRevertJournal(
             editedMainUID: editedMain, originalLinkID: "original", restoredName: "", phase: .trashingEdit)
         try journalStore.save(namelessJournal)
 
         let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertEqual(outcomes.count, 1)
-        XCTAssertThrowsError(try outcomes.first!.result.get()) { error in
-            XCTAssertEqual(
-                error as? EditedOriginalRevert.RevertError, .invalidRestoredName,
-                "ensureCopy must reject a journal with an empty restoredName")
-        }
+        XCTAssertTrue(outcomes.isEmpty, "the resume needs a copy for this journal and waits for the person")
 
         XCTAssertTrue(server.uploadNames().isEmpty, "no upload may happen for an empty name")
         XCTAssertTrue(server.trashCalls().isEmpty, "no trash may happen for an empty name")
-        XCTAssertNotNil(try journalStore.journal(forEditedMain: editedMain))
+        XCTAssertEqual(try journalStore.journal(forEditedMain: editedMain), namelessJournal)
+
+        // The person's Revert supplies the name, makes the copy through the actor and finishes the journal.
+        _ = try await performRevert()
+        XCTAssertEqual(server.uploadNames(), ["IMG_0001 (original).heic"])
+        XCTAssertNil(try journalStore.journal(forEditedMain: editedMain))
     }
 
     /// Tier A gap 6: `copyMustBeMadeAgain` returns true when the journal reached .trashingEdit without a
@@ -416,11 +621,8 @@ final class EditedOriginalRevertTests: XCTestCase {
             phase: .trashingEdit)
         try journalStore.save(orphanJournal)
 
-        // Resume must re-make the copy and succeed
-        let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertEqual(outcomes.count, 1)
-
-        let resultCopyUID = try outcomes.first!.result.get()
+        // The person's Revert must re-make the copy and succeed
+        let resultCopyUID = try await performRevert()
         XCTAssertFalse(resultCopyUID.nodeID.isEmpty)
         XCTAssertEqual(server.uploadNames().count, 1, "the copy is made exactly once")
         XCTAssertTrue(server.trashCalls().contains { $0.contains(editedMain) })
@@ -582,12 +784,16 @@ final class EditedOriginalRevertTests: XCTestCase {
             favoriteDone: true, phase: .trashingEdit)
         try journalStore.save(journal)
 
-        let outcomes = try await makeOrchestrator().resumePending()
-        XCTAssertEqual(outcomes.count, 1)
-        XCTAssertThrowsError(try outcomes.first!.result.get()) { error in
-            XCTAssertEqual(
-                error as? EditedOriginalRevert.RevertError, .copyNotConfirmed,
-                "a related file must not count as a confirmed copy")
+        // The automatic resume treats the rejected copy as a vanished one: it waits for the person.
+        let resumed = try await makeOrchestrator().resumePending()
+        XCTAssertTrue(resumed.isEmpty)
+        XCTAssertEqual(try journalStore.journal(forEditedMain: editedMain), journal)
+
+        do {
+            _ = try await performRevert()
+            XCTFail("a related file must not count as a confirmed copy")
+        } catch let error as EditedOriginalRevert.RevertError {
+            XCTAssertEqual(error, .copyNotConfirmed)
         }
         XCTAssertTrue(server.trashCalls().isEmpty, "the edited main is never trashed")
         XCTAssertNotNil(try journalStore.journal(forEditedMain: editedMain))
@@ -823,6 +1029,33 @@ final class EditedOriginalRevertTests: XCTestCase {
 }
 
 // MARK: Fake Remote
+
+/// A journal store that changes the disk right after `pendingJournals` returned its list, like a tap that finishes
+/// while a resume works on an earlier journal.
+private final class RacingJournalStore: EditedOriginalRevertJournalStore, @unchecked Sendable {
+    private let base: EditedOriginalRevertJournalFileStore
+    private let afterPendingRead: @Sendable () throws -> Void
+
+    init(base: EditedOriginalRevertJournalFileStore, afterPendingRead: @escaping @Sendable () throws -> Void) {
+        self.base = base
+        self.afterPendingRead = afterPendingRead
+    }
+
+    func journal(forEditedMain mainUID: PhotoUID) throws -> EditedOriginalRevertJournal? {
+        try base.journal(forEditedMain: mainUID)
+    }
+    func decodableJournal(forEditedMain mainUID: PhotoUID) throws -> EditedOriginalRevertJournal? {
+        try base.decodableJournal(forEditedMain: mainUID)
+    }
+    func undecodableJournalCount() throws -> Int { try base.undecodableJournalCount() }
+    func save(_ journal: EditedOriginalRevertJournal) throws { try base.save(journal) }
+    func remove(forEditedMain mainUID: PhotoUID) throws { try base.remove(forEditedMain: mainUID) }
+    func pendingJournals() throws -> [EditedOriginalRevertJournal] {
+        let snapshot = try base.pendingJournals()
+        try afterPendingRead()
+        return snapshot
+    }
+}
 
 private final class FakeRevertRemote: EditedOriginalRevertRemote, SeriesAlbumCarryOver, PhotoUploading,
     UploadDuplicateChecking, @unchecked Sendable

@@ -1464,6 +1464,33 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         return original
     }
 
+    /// The decrypted names of an edited photo and its hidden original, which decide the name of the restored photo.
+    /// One batched name read, like the lookup of the original. Nil outside the own library or when a name does not
+    /// decrypt, so the revert starts nothing without a name.
+    func editedRevertNames(main: PhotoUID, original: PhotoUID) async throws -> EditedPhotoRevertNames? {
+        try await withOpenSession(cause: .carryOver) { bridge in
+            try await bridge.editedRevertNamesImpl(main: main, original: original)
+        }
+    }
+
+    private func editedRevertNamesImpl(main: PhotoUID, original: PhotoUID) async throws -> EditedPhotoRevertNames? {
+        let root = try await resolvePhotosRoot()
+        guard main.volumeID == root.volumeID, original.volumeID == root.volumeID,
+            let shareID = photosShareID, let keySource = try? await fileSource()
+        else { return nil }
+        var links: [AlbumPhotoLinkBody] = []
+        for batch in Self.metadataBatches([main.nodeID, original.nodeID]) {
+            links += try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
+        }
+        // Photos are children of the photos root, whose key decrypts their names.
+        let rootKey = try await keySource.nodeKey(ofLinkID: root.nodeID)
+        let files = Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
+        guard let mainName = files[main.nodeID]?.name, let originalName = files[original.nodeID]?.name else {
+            return nil
+        }
+        return EditedPhotoRevertNames(main: mainName, original: originalName)
+    }
+
     /// A listing without the given photos: its sections, and the burst entries that the burst catalog reads. A kept
     /// burst entry also loses them as related photos, so the burst viewer does not show them as members.
     static func removing(
@@ -3148,6 +3175,17 @@ extension DriveSDKBridge: PhotoTagAdding {
 
 extension DriveSDKBridge: EditReplacementRemote {}
 
+extension DriveSDKBridge: EditedOriginalRevertRemote {
+    /// The hidden original is read like a series member: the same node read supplies the metadata that the restored
+    /// copy keeps, and the copy drops the sections that describe the edited photo.
+    func originalSource(for uid: PhotoUID) async throws -> EditedOriginalSource {
+        try await withOpenSession(cause: .carryOver) { bridge in
+            EditedOriginalSource(
+                try await SDKPhotoMetadataReader.seriesMemberSource(for: uid, client: bridge.photosClient))
+        }
+    }
+}
+
 extension DriveSDKBridge: ExactDuplicateRemote {
     func downloadRelatedFile(
         _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
@@ -3285,6 +3323,38 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
             tempDirectory: accountDataDirectory.appendingPathComponent("series-dissolution-temp", isDirectory: true),
             currentClientUID: uploadClientUID
         )
+    }
+
+    /// The revert to original of this account's edited photos. It shares the duplicate service with uploads, like the
+    /// series dissolution. Nil when the upload manifest is unavailable, as uploads are then disabled.
+    nonisolated func makeEditedOriginalRevert(
+        duplicateChecker: (any UploadDuplicateChecking)?,
+        albums: any SeriesAlbumCarryOver
+    ) -> EditedOriginalRevert? {
+        guard let duplicateChecker else { return nil }
+        let accountDataDirectory = uploadManifestURL.deletingLastPathComponent()
+        return EditedOriginalRevert(
+            remote: self,
+            albums: albums,
+            copier: RelatedPhotoCopier(
+                uploader: self,
+                duplicateChecker: duplicateChecker,
+                provider: self,
+                tempDirectory: accountDataDirectory.appendingPathComponent("edited-revert-temp", isDirectory: true),
+                currentClientUID: uploadClientUID),
+            relations: duplicateChecker,
+            journalStore: EditedOriginalRevertJournalFileStore(accountDataDirectory: accountDataDirectory),
+            // The shared account gate: bridge teardown cancels and joins a running revert before the sign-out purge
+            // removes the journal directory, and a call after teardown is refused.
+            admission: shutdownGate
+        )
+    }
+
+    /// The viewer's entry to the revert: it proves the pair with this bridge's own lookup and reads the names here.
+    nonisolated func makeEditedPhotoReverter(revert: EditedOriginalRevert) -> EditedPhotoRevertService {
+        EditedPhotoRevertService(
+            revert: revert, originals: self,
+            names: { [self] main, original in try await editedRevertNames(main: main, original: original) })
     }
 }
 

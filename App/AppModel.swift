@@ -108,9 +108,20 @@ final class AppModel {
             // The Duplicates screen scans only when it opens, and a library window may not be open. A merge that the
             // end of the app left open is checked now; a new account or a sign-out ends the check of the earlier one.
             duplicatesLifetime.checkPendingMerges(of: facade?.exactDuplicates)
+            resumeEditedOriginalReverts()
         }
     }
     @ObservationIgnored private let duplicatesLifetime = ExactDuplicatesAccountLifetime()
+    /// The resume of interrupted reverts to original at app start. It finishes only the trash step of a confirmed
+    /// copy and never makes a copy. A new account or a sign-out replaces or cancels it.
+    @ObservationIgnored private let editedRevertResume = EditedOriginalRevertResumeSlot()
+
+    private func resumeEditedOriginalReverts() {
+        guard let revert = facade?.editedOriginalRevert else { return editedRevertResume.cancel() }
+        editedRevertResume.start(
+            resume: { await revert.resumeAndSummarize() },
+            report: { DebugLog.log($0.logLine) })
+    }
     /// macOS folder-backup composition. This type owns folder access and lifecycle; sync semantics stay in core.
     private(set) var backupController: FolderBackupController?
     private(set) var photoBackupController: PhotoLibraryBackupController?

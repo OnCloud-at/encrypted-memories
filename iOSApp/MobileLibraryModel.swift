@@ -431,6 +431,9 @@ final class MobileLibraryModel {
     /// Resume and abandon work of "Keep Only Favorites". Teardown cancels it, so no journal write survives
     /// the account. The orchestrator's own admission gate joins a write that is already in flight.
     private var seriesDissolutionTask: Task<Void, Never>?
+    /// The resume of interrupted reverts to original at app start. It finishes only the trash step of a confirmed
+    /// copy and never makes a copy. A new account or a teardown replaces or cancels it.
+    private let editedRevertResume = EditedOriginalRevertResumeSlot()
     /// "Keep Only Favorites" runs that are in progress. Each one changes the library token many times.
     private var runningSeriesDissolutions = 0
     /// Generation token used to reject off-main snapshot results from superseded loads or teardown.
@@ -984,6 +987,7 @@ final class MobileLibraryModel {
                 self.isThumbnailPrefetchLoading = false
                 self.favoriteLoadTask?.cancel()
                 self.seriesDissolutionTask?.cancel()
+                self.editedRevertResume.cancel()
                 self.snapshot = TimelineSnapshot()
                 self.sections = []
                 self.favoriteState.reset(keepingFavorites: false)
@@ -1343,6 +1347,7 @@ final class MobileLibraryModel {
                 isThumbnailPrefetchLoading = false
                 active.favorites?.cancel()
                 favoriteLoadTask = nil
+                editedRevertResume.cancel()
                 if !signingOut {
                     active.series?.cancel()
                     seriesDissolutionTask = nil
@@ -1619,6 +1624,15 @@ final class MobileLibraryModel {
                     self.seriesDissolutionTask = Task(priority: .utility) { [weak self] in
                         await self?.resumePendingSeriesDissolutions(seriesDissolution)
                     }
+                }
+                if let revert = client.editedOriginalRevert {
+                    self.editedRevertResume.start(
+                        resume: { await revert.resumeAndSummarize() },
+                        report: { [weak self] summary in
+                            DebugLog.log(summary.logLine)
+                            // The edited photos left the library; the refresh removes them and adds the originals.
+                            if summary.finished > 0 { self?.refreshAfterLocalUpload() }
+                        })
                 }
                 self.albumActions = AlbumActionCoordinator(repository: client.albums)
                 let replacedPhotoBackup = self.photoBackup
