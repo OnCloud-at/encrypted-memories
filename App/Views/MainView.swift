@@ -1608,8 +1608,9 @@ struct MainView: View {
                 try await facade.albums.setAlbumCover(albumID: albumID, photoUID: uid)
                 await loadAlbums()
             } catch {
-                albumCoverFailureMessage = String(
-                    localized: "albums.cover_failed_message \(error.localizedDescription)")
+                albumCoverFailureMessage = LibraryActionFailureMessage.message(
+                    for: error, action: .albumCover, specificAlbumReason: albumCoverSpecificReason(error),
+                    underlyingError: (error as? AlbumError)?.underlyingCause, text: libraryActionFailureText)
             }
         }
     }
@@ -2616,9 +2617,13 @@ struct MainView: View {
                 exportFailureMessage = result.message
                 if !result.saved.isEmpty { refreshLibraryManually() }
             } catch {
-                DebugLog.log("save to library failed: \(error)")
-                exportFailureTitle = L10n.string("library.save_to_library_failed")
-                exportFailureMessage = error.localizedDescription
+                if let message = LibraryActionFailureMessage.message(
+                    for: error, action: .saveToLibrary, text: libraryActionFailureText)
+                {
+                    DebugLog.log("save to library failed: \(error)")
+                    exportFailureTitle = L10n.string("library.save_to_library_failed")
+                    exportFailureMessage = message
+                }
             }
         }
     }
@@ -2824,15 +2829,35 @@ struct MainView: View {
                     items: items, to: dest, provider: backend, onProgress: onProgress)
             }
             NSWorkspace.shared.activateFileViewerSelecting([dest])
-        } catch is CancellationError {
-            // User cancelled from the ring popover; the worker's `defer` already discarded any partial output.
-        } catch OriginalExportWriter.Failure.lowDisk {
-            exportFailureTitle = String(localized: "export.low_disk_title")
-            exportFailureMessage = String(localized: "export.low_disk_message")
         } catch {
-            DebugLog.log("export failed: \(error)")
-            exportFailureTitle = String(localized: "export.failed_title")
-            exportFailureMessage = String(localized: "export.failed_message \(error.localizedDescription)")
+            if let message = LibraryActionFailureMessage.message(
+                for: error, action: .export, text: libraryActionFailureText)
+            {
+                let title = LibraryActionFailureMessage.exportTitle(for: error)
+                if title != .lowDiskTitle { DebugLog.log("export failed: \(error)") }
+                exportFailureTitle = libraryActionFailureText(title)
+                exportFailureMessage = message
+            }
+        }
+    }
+
+    private func albumCoverSpecificReason(_ error: any Error) -> String? {
+        guard let albumError = error as? AlbumError else { return nil }
+        switch albumError {
+        case .unsupported, .sharedAlbumReadOnly, .albumCreatedButPhotosNotAdded, .partialAdd, .partialAddWithCauses:
+            return albumError.errorDescription
+        case .backend, .requestFailed:
+            return nil
+        }
+    }
+
+    private func libraryActionFailureText(_ text: LibraryActionFailureMessage.Text) -> String {
+        switch text {
+        case .albumCover: String(localized: "albums.cover_failed_generic")
+        case .export: String(localized: "export.failed_generic")
+        case .lowDisk: String(localized: "export.low_disk_message")
+        case .exportTitle: String(localized: "export.failed_title")
+        case .lowDiskTitle: String(localized: "export.low_disk_title")
         }
     }
 
