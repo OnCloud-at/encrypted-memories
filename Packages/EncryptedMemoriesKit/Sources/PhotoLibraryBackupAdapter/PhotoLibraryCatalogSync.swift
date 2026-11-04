@@ -282,7 +282,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
         // A numeric cursor over a live PHFetchResult is unsafe: deleting an earlier item shifts an
         // unseen item behind the cursor. Persist the epoch's identifiers first, then resolve that
         // immutable list in chunks. New assets are handled independently by persistent changes.
-        let existingProgress = store.fullScanProgress()
+        // An unknown resume point must not start a new epoch over the saved one (#1004).
+        let existingProgress = try readOrUnavailable { try store.fullScanProgress() }
         guard store.isOperational() else {
             throw UploadError.backend("Photo library scan state is unavailable")
         }
@@ -315,7 +316,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             }
         }
 
-        guard let resume = store.fullScanProgress() else {
+        guard let resume = try readOrUnavailable({ try store.fullScanProgress() }) else {
             throw UploadError.backend("Photo library scan snapshot is unavailable")
         }
         guard store.isOperational() else {
@@ -326,8 +327,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
         let snapshotIsDurable = await synchronizeQueueThenCatalog(engine: engine)
         if snapshotIsDurable { onSnapshotReady() }
         let epochStart = resume.epochStart
-        let total = (store.fullScanSnapshotCount() ?? 0)
-        guard store.isOperational() else {
+        // An unknown size is no empty snapshot: it must never reach the removal sweep or complete the scan (#1004).
+        guard let total = store.fullScanSnapshotCount(), store.isOperational() else {
             throw UploadError.backend("Photo library scan snapshot could not be read")
         }
         var cursor = resume.cursor
@@ -337,8 +338,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
         onProgress?(progress)
         while cursor < total {
             try Task.checkCancellation()
-            let identifiers = store.fullScanSnapshotIdentifiers(startingAt: cursor, limit: chunkSize)
-            guard store.isOperational() else {
+            // An unknown page keeps the snapshot and its cursor; only a page that answers empty proves it incomplete.
+            guard let identifiers = store.fullScanSnapshotIdentifiers(startingAt: cursor, limit: chunkSize),
+                store.isOperational()
+            else {
                 throw UploadError.backend("Photo library scan snapshot could not be read")
             }
             guard !identifiers.isEmpty else {
@@ -410,8 +413,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
         var cursor = store.lateRenderSweepResumePoint()
         while true {
             try Task.checkCancellation()
-            let page = (store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize) ?? [])
-            guard store.isOperational() else {
+            // An unknown page is not the end of the catalog; the pass stays owed (#1004).
+            guard let page = store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize),
+                store.isOperational()
+            else {
                 throw UploadError.backend("Photo library catalog could not be read")
             }
             guard let last = page.last else { break }
@@ -463,8 +468,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
         }
         while true {
             try Task.checkCancellation()
-            let page = (store.presentEntries(afterLocalIdentifier: sweep.afterLocalIdentifier, limit: chunkSize) ?? [])
-            guard store.isOperational() else { throw UploadError.backend("Photo library catalog could not be read") }
+            // An unknown page is not the end of the catalog; the sweep stays owed (#1004).
+            guard let page = store.presentEntries(afterLocalIdentifier: sweep.afterLocalIdentifier, limit: chunkSize),
+                store.isOperational()
+            else { throw UploadError.backend("Photo library catalog could not be read") }
             guard let last = page.last else { break }
             let candidates = page.compactMap {
                 PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
@@ -514,7 +521,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             }
             if let candidate = PhotoBackupAssetPlanner.candidate(for: info) {
                 candidates.append(candidate)
-                if change == .changed, rendersLate(info) {
+                if change == .changed, try rendersLate(info) {
                     reopened.append(
                         UploadBackupReopening(
                             candidate: candidate,
@@ -535,12 +542,19 @@ public struct PhotoLibraryCatalogSync: Sendable {
     }
 
     /// An edit whose rendered file Photos lists only now. When Photos leaves the dates alone, its revision can
-    /// equal one that an earlier build recorded as complete with the original as main photo.
-    private func rendersLate(_ info: PhotoBackupAssetInfo) -> Bool {
-        guard PhotoBackupAssetPlanner.listsRender(info), let stored = (try? store.entry(for: info.localIdentifier))
-        else {
-            return false
-        }
+    /// equal one that an earlier build recorded as complete with the original as main photo. An unknown stored row
+    /// stops the chunk: answering false would record the render without its reopening (#1004).
+    private func rendersLate(_ info: PhotoBackupAssetInfo) throws -> Bool {
+        guard PhotoBackupAssetPlanner.listsRender(info),
+            let stored = try readOrUnavailable({ try store.entry(for: info.localIdentifier) })
+        else { return false }
         return !PhotoBackupAssetPlanner.listsRender(PhotoLibraryCatalogMapper.info(for: stored))
+    }
+
+    /// A strict catalog read; its unknown result stops the pass with the local-state error.
+    private func readOrUnavailable<Value>(_ read: () throws -> Value) throws -> Value {
+        do { return try read() } catch {
+            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+        }
     }
 }

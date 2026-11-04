@@ -281,9 +281,10 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             // expected
         }
         XCTAssertFalse(catalog.hasCompletedFullScan(), "an interrupted scan is NOT complete")
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2, "the frontier is persisted so the next run resumes there")
+        XCTAssertEqual(
+            try catalog.fullScanProgress()?.cursor, 2, "the frontier is persisted so the next run resumes there")
         XCTAssertEqual(queue.summary()!.total, 2, "only the two observed assets are queued so far")
-        let epochStart = catalog.fullScanProgress()?.epochStart
+        let epochStart = try catalog.fullScanProgress()?.epochStart
         XCTAssertNotNil(epochStart)
 
         // Run 2 (later wall clock) resumes at the cursor, skips A/B, finishes C/D/E, and completes.
@@ -293,7 +294,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(
             catalog.hasCompletedFullScan(), "reaching the library's end across resumed runs completes the scan")
-        XCTAssertNil(catalog.fullScanProgress(), "a completed epoch clears its resume state")
+        XCTAssertNil(try catalog.fullScanProgress(), "a completed epoch clears its resume state")
         XCTAssertEqual(
             queue.summary()!.total, 5, "all five assets are queued exactly once (A/B not re-enqueued on resume)")
         XCTAssertEqual(
@@ -328,7 +329,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let firstFinished = try await startScanPass(history: history)
         XCTAssertFalse(firstFinished)
         XCTAssertEqual(enumerator.readCount, 2)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
 
         enumerator.throwAfter = nil
         enumerator.readCount = 0
@@ -337,7 +338,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         XCTAssertTrue(secondFinished)
         XCTAssertEqual(enumerator.readCount, 3, "the resumed scan reads only the photos after the saved position")
         XCTAssertTrue(catalog.hasCompletedFullScan())
-        XCTAssertNil(catalog.fullScanProgress())
+        XCTAssertNil(try catalog.fullScanProgress())
         XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 5, present: 5, removed: 0))
         XCTAssertEqual(queue.summary()!.total, 5)
     }
@@ -348,7 +349,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let history = FakeChangeHistory()
         enumerator.throwAfter = 2
         try await startScanPass(history: history)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2, "A and B were read before the interruption")
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2, "A and B were read before the interruption")
 
         // While the app is closed: a new photo F arrives, and B, which the scan already read, is edited.
         let edited = modDate.addingTimeInterval(3_600)
@@ -382,7 +383,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let history = FakeChangeHistory()
         enumerator.throwAfter = 2
         try await startScanPass(history: history)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
 
         // X, an imported photo with an older capture date, lands before the saved position. A, already read, is deleted.
         enumerator.infos = [
@@ -418,7 +419,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.readCount = 0
         try await startScanPass(history: history)
         XCTAssertEqual(enumerator.readCount, 1, "only the new photo is read")
-        XCTAssertNil(catalog.fullScanProgress(), "no full scan starts")
+        XCTAssertNil(try catalog.fullScanProgress(), "no full scan starts")
         XCTAssertEqual(queue.summary()!.total, 4)
 
         enumerator.readCount = 0
@@ -443,7 +444,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.readCount = 0
         let rescanFinished = try await startScanPass(history: history)
         XCTAssertFalse(rescanFinished)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
 
         enumerator.throwAfter = nil
         enumerator.readCount = 0
@@ -451,7 +452,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         XCTAssertTrue(finished)
         XCTAssertEqual(enumerator.readCount, 3, "the rescan resumes after A and B")
-        XCTAssertNil(catalog.fullScanProgress())
+        XCTAssertNil(try catalog.fullScanProgress())
         XCTAssertEqual(
             catalog.presentEntries(for: ["E"])?["E"]?.modificationDate, edited,
             "the edit that the expired history lost is found by the resumed rescan")
@@ -472,7 +473,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.throwAfter = 2
         let rescanFinished = try await startScanPass(history: history)
         XCTAssertFalse(rescanFinished)
-        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2)
         XCTAssertFalse(history.prepare().changes.requiresFullRescan, "the rescan stored a newer token")
 
         enumerator.throwAfter = nil
@@ -480,7 +481,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         enumerator.failsSnapshot = true
         let failedFinished = try await startScanPass(history: history)
         XCTAssertFalse(failedFinished)
-        XCTAssertNil(catalog.fullScanProgress(), "the failed snapshot cleared the earlier resume point")
+        XCTAssertNil(try catalog.fullScanProgress(), "the failed snapshot cleared the earlier resume point")
 
         // After a relaunch the live request is gone, and the change history since the token is empty.
         history.relaunch()
@@ -511,7 +512,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         defer { survivor.close() }
 
         XCTAssertFalse(survivor.hasCompletedFullScan(), "the rescan is still owed")
-        XCTAssertNotNil(survivor.fullScanProgress(), "the published snapshot survives")
+        XCTAssertNotNil(try survivor.fullScanProgress(), "the published snapshot survives")
         XCTAssertEqual(survivor.fullScanSnapshotCount(), 5)
     }
 
@@ -664,9 +665,10 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
                 survivingQueue.close()
             }
             // The store reads at least one identifier, so a scan position of zero reads none here.
-            let cursor = survivingCatalog.fullScanProgress()?.cursor ?? 0
+            let cursor = try survivingCatalog.fullScanProgress()?.cursor ?? 0
             var identifiers = Set(
-                cursor > 0 ? survivingCatalog.fullScanSnapshotIdentifiers(startingAt: 0, limit: cursor) : [])
+                cursor > 0
+                    ? try XCTUnwrap(survivingCatalog.fullScanSnapshotIdentifiers(startingAt: 0, limit: cursor)) : [])
             var after: String?
             while true {
                 let page = try XCTUnwrap(survivingCatalog.presentEntries(afterLocalIdentifier: after, limit: 500))

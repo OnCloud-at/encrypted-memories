@@ -1208,7 +1208,8 @@ public actor PendingBackupCoordinator {
         }
         guard !missing.isEmpty else { return }
         let requested = Dictionary(uniqueKeysWithValues: missing.map { ($0, currentRevision($0)) })
-        let fetched = await metadataProvider.metadata(for: Array(missing))
+        let answer = await metadataProvider.metadataAnswer(for: Array(missing))
+        let fetched = answer.metadata
         guard !closed else { return }
         for key in missing {
             // The source may have left or changed revision while the fetch ran; its next event refetches.
@@ -1219,6 +1220,9 @@ public actor PendingBackupCoordinator {
                 metadata[key] = value
                 metadataRevision[key] = requested[key] ?? nil
                 staleMetadata.remove(key)
+            } else if answer.unknown.contains(key) {
+                // A failed read proves nothing: the source keeps its current metadata and its next event reads again.
+                continue
             } else if staleMetadata.remove(key) != nil {
                 // The catalog does not know the new revision yet; the current metadata stays until the next
                 // revision. A deleted photo leaves through `noteSourcesMissing`.
@@ -1245,10 +1249,12 @@ public actor PendingBackupCoordinator {
             }
             return
         }
-        let accessible = await metadataProvider.metadata(for: excluded)
+        let answer = await metadataProvider.metadataAnswer(for: excluded)
         guard !closed else { return }
-        // A photo excluded during the read keeps the answer that its exclusion stored.
-        let checked = excludedAccessible.subtracting(excluded).union(accessible.keys).subtracting(excludedMissing)
+        // A photo excluded during the read keeps the answer that its exclusion stored. A photo whose read failed keeps
+        // its earlier answer (#1004).
+        let checked = excludedAccessible.subtracting(excluded).union(answer.metadata.keys)
+            .union(excludedAccessible.intersection(answer.unknown)).subtracting(excludedMissing)
         guard checked != excludedAccessible else { return }
         excludedAccessible = checked
         listsDirty = true
@@ -1563,11 +1569,12 @@ public actor PendingBackupCoordinator {
             guard !closed else { return }
             finish(.queueSync, group, succeeded: ok, at: date)
         }
+        // Each kind returns on its own, so a missing or failing adapter of one kind keeps only its own duty.
         let included = states.filter { $0.desired == .included && $0.remote == nil }
-        if !included.isEmpty {
-            let ok = await effects.returnToBackup(included.map(\.key))
+        for (_, group) in Dictionary(grouping: included, by: \.key.kind) {
+            let ok = await effects.returnToBackup(group.map(\.key))
             guard !closed else { return }
-            finish(.queueSync, included, succeeded: ok, at: date)
+            finish(.queueSync, group, succeeded: ok, at: date)
         }
         for state in states where state.desired == .included && state.remote != nil {
             let previous = restoreRecheckCounts[state.key]

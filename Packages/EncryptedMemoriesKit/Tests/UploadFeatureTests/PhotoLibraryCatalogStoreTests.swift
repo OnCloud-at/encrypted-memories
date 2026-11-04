@@ -343,18 +343,18 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         store.beginFullScanSnapshot(epochStart: epoch)
         store.appendFullScanSnapshotIdentifiers(["A", "B"])
         store.appendFullScanSnapshotIdentifiers(["C", "D"])
-        XCTAssertNil(store.fullScanProgress(), "an incomplete snapshot must never be resumed")
+        XCTAssertNil(try store.fullScanProgress(), "an incomplete snapshot must never be resumed")
 
         store.finishFullScanSnapshot()
-        XCTAssertEqual(store.fullScanProgress(), PhotoLibraryFullScanProgress(epochStart: epoch, cursor: 0))
+        XCTAssertEqual(try store.fullScanProgress(), PhotoLibraryFullScanProgress(epochStart: epoch, cursor: 0))
         XCTAssertEqual(store.fullScanSnapshotCount(), 4)
         XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 2, limit: 2), ["C", "D"])
 
         store.recordFullScanProgress(PhotoLibraryFullScanProgress(epochStart: epoch, cursor: 2))
-        XCTAssertEqual(store.fullScanProgress()?.cursor, 2)
+        XCTAssertEqual(try store.fullScanProgress()?.cursor, 2)
         store.completeFullScan()
         XCTAssertEqual(store.fullScanSnapshotCount(), 0)
-        XCTAssertNil(store.fullScanProgress())
+        XCTAssertNil(try store.fullScanProgress())
     }
 
     func testResumedSnapshotCannotSkipWhenEarlierLiveAssetWasDeleted() async throws {
@@ -447,7 +447,7 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         }
 
         XCTAssertNil(try store.entry(for: "A"), "an unqueued asset must remain unseen and re-yield")
-        XCTAssertEqual(store.fullScanProgress()?.cursor, 0, "the stable frontier must not pass unqueued work")
+        XCTAssertEqual(try store.fullScanProgress()?.cursor, 0, "the stable frontier must not pass unqueued work")
     }
 
     func testOpenCatalogDecodeFailureStaysStickyAcrossSuccessfulSQLAndRejectsDurabilityAndAppend() throws {
@@ -471,7 +471,8 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
                     nil, nil, nil), SQLITE_OK)
         }
 
-        XCTAssertNil(try store.entry(for: "corrupt"), "a malformed resource blob must fail decoding on the open store")
+        XCTAssertThrowsError(
+            try store.entry(for: "corrupt"), "a malformed resource blob is unknown on the open store, not absent")
         XCTAssertFalse(store.isOperational())
         XCTAssertFalse(store.synchronizeToDisk(), "an open handle with a recorded failure cannot prove durability")
         XCTAssertFalse(store.appendFullScanSnapshotIdentifiers(["rejected"]))

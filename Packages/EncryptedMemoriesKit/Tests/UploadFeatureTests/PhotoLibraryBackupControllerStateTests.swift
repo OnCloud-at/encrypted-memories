@@ -1,11 +1,11 @@
 import Foundation
 import PhotosCore
 import SQLite3
-import UploadCore
 import UploadFeature
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
+@testable import UploadCore
 
 @MainActor
 final class PhotoLibraryBackupControllerStateTests: XCTestCase {
@@ -5927,6 +5927,68 @@ extension PhotoLibraryBackupControllerStateTests {
                 guarded = UploadError.isCancellation(error)
             }
             XCTAssertFalse(guarded, "The next pass ends the stale context")
+        }
+    }
+
+    /// Only a certified stale read ends a registered restore check; an unknown read keeps it (#1004 B2 row 13).
+    func testAnUnknownRestoreCheckReadKeepsTheRegisteredContext() async throws {
+        try await withRestore829Fixture(.burst) { f in
+            let main = try await f.initialBackup(omittingSecondary: true)
+            let checked = try f.restoredState(main)
+            let admission = await f.controller.returnToBackup([checked])
+            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
+            let context = UploadRestoredCompoundContext(
+                source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
+                generation: checked.generation, confirmedRemote: main,
+                requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
+            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                return XCTFail("Fixture prerequisite: the context is registered")
+            }
+
+            let fault = try SQLiteReadInterrupt(
+                in: f.pending!, matching: "FROM source_state WHERE source_kind=? AND source_id=?")
+            let unknown = await f.controller.returnToBackup([checked])
+            fault.stop()
+
+            XCTAssertTrue(fault.fired, "The current-state read of the check failed")
+            XCTAssertEqual(unknown[f.key], .unreadable, "The unknown check reports nothing")
+            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                return XCTFail("An unknown read must not end the registered context")
+            }
+        }
+    }
+
+    /// An unknown catalog read in the restore check keeps the registered context too (#1004 B2 row 13).
+    func testAnUnknownRestoreCheckCatalogReadKeepsTheRegisteredContext() async throws {
+        try await withRestore829Fixture(.burst) { f in
+            let main = try await f.initialBackup(omittingSecondary: true)
+            let checked = try f.restoredState(main)
+            let admission = await f.controller.returnToBackup([checked])
+            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
+            let context = UploadRestoredCompoundContext(
+                source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
+                generation: checked.generation, confirmedRemote: main,
+                requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
+            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                return XCTFail("Fixture prerequisite: the context is registered")
+            }
+            // The controller's own catalog connection. Its health check forgets the transient fault, as it will once
+            // recovery ships, so only the failed read itself is unknown.
+            let catalog = try XCTUnwrap(
+                Mirror(reflecting: f.controller!).children.first { $0.label == "catalogStore" }?.value
+                    as? PhotoLibraryCatalogManifestStore)
+            catalog.recoversTransientFailuresForTesting = true
+            // The first keyed catalog read plans the check; the second is the current-state read.
+            let fault = try SQLiteReadInterrupt(
+                in: catalog, matching: "FROM photo_catalog WHERE local_id=?", occurrence: 2)
+            let unknown = await f.controller.returnToBackup([checked])
+            fault.stop()
+
+            XCTAssertTrue(fault.fired, "The current-state catalog read of the check failed")
+            XCTAssertEqual(unknown[f.key], .unreadable, "The unknown check reports nothing")
+            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                return XCTFail("An unknown catalog read must not end the registered context")
+            }
         }
     }
 

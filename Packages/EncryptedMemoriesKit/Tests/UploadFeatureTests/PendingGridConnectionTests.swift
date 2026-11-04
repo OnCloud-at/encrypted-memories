@@ -87,12 +87,24 @@ import UploadCore
         queue.close()
     }
 
-    @Test func mixedBatchWithoutFileAdapterKeepsBothQueueDuties() async throws {
+    /// Each kind returns on its own (#1004 B2 row 14): a missing file adapter keeps only the file duty.
+    @Test func mixedBatchWithoutFileAdapterKeepsOnlyTheFileDuty() async throws {
         try await assertFileReturnDuty(adapterResult: nil, mixed: true)
     }
 
-    private func assertFileReturnDuty(adapterResult: Bool?, mixed: Bool = false) async throws {
-        let fixture = try Fixture(withPhotoEngine: mixed)
+    @Test func mixedBatchWithBothAdaptersAcknowledgesBothDuties() async throws {
+        try await assertFileReturnDuty(adapterResult: true, mixed: true)
+    }
+
+    @Test func mixedBatchWithAFailedPhotoReturnKeepsOnlyThePhotoDuty() async throws {
+        try await assertFileReturnDuty(adapterResult: true, mixed: true, photoReturnSucceeds: false)
+    }
+
+    private func assertFileReturnDuty(
+        adapterResult: Bool?, mixed: Bool = false, photoReturnSucceeds: Bool = true
+    ) async throws {
+        // A controller without a backup engine refuses every photo return.
+        let fixture = try Fixture(withPhotoEngine: mixed && photoReturnSucceeds)
         defer { fixture.remove() }
         let key = PendingSourceKey(
             kind: .fileURL, identifier: fixture.directory.appendingPathComponent("photo.heic").path)
@@ -128,14 +140,14 @@ import UploadCore
 
         for returnedKey in keys {
             let after = fixture.store.sourceState(for: returnedKey)
-            if adapterResult == true {
-                #expect(after == nil, "A successful file callback can acknowledge the included source's queue duty")
+            let returned = returnedKey.kind == .fileURL ? adapterResult == true : photoReturnSucceeds
+            if returned {
+                #expect(after == nil, "A successful return of its own kind acknowledges the source's queue duty")
             } else {
                 #expect(after?.desired == .included)
                 #expect(
                     after?.needsQueueSync == true,
-                    "Without a successful file adapter, performQueueSync must retain every duty, including mixed photo keys"
-                )
+                    "A failed or missing adapter retains the queue duty of its own kind only: \(returnedKey.kind)")
             }
         }
         #expect(calls.count == (adapterResult == nil ? 0 : 1))
@@ -328,6 +340,47 @@ import UploadCore
         await session.close()
         await fixture.controller.shutdown()
         fixture.store.close()
+    }
+
+    /// The session joins the answers of its sources: a file whose read failed is unknown, not inaccessible (#1004).
+    @Test func anUnknownFileReadIsReadAgainOnTheNextEvent() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let fileQueue = try #require(
+            UploadBackupSyncQueueManifestStore(url: fixture.directory.appendingPathComponent("file-queue.sqlite")))
+        let path = fixture.directory.appendingPathComponent("watched/photo.heic").path
+        let source = UploadSourceIdentity(kind: .fileURL, identifier: path)
+        let revision = UploadBackupRevision(rawValue: 1)
+        #expect(
+            fileQueue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: revision, originalFilename: "photo.heic",
+                    state: .queuedForUpload, updatedAt: Date(timeIntervalSince1970: 1_700_000_000))))
+        let metadata = UnknownUntilReadableMetadata()
+        let files = PendingFileSource(
+            queue: fileQueue, metadata: metadata, removeFromBackup: { _ in true }, returnToBackup: { _ in true })
+        let connection = PendingGridConnection()
+        let started = connection.start(store: fixture.store) {
+            PendingGridSession(store: $0, photoBackup: fixture.controller, remote: NoRemoteEffects(), files: files)
+        }
+        let session = try #require(started.session)
+        let uid = PendingSourceKey(kind: .fileURL, identifier: path).localUID
+        #expect(await eventually { metadata.reads > 0 }, "fixture: the first read answered unknown")
+        #expect(session.pendingSnapshot.tiles.isEmpty)
+
+        metadata.readable = true
+        #expect(
+            fileQueue.updateState(
+                source: source, revision: revision, state: .uploading, attempts: nil, lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 1_700_000_001)))
+        #expect(
+            await eventually { session.pendingSnapshot.tiles.contains { $0.item.uid == uid } },
+            "the next event reads the unknown file again")
+        _ = connection.retire()
+        await session.close()
+        await fixture.controller.shutdown()
+        fixture.store.close()
+        fileQueue.close()
     }
 
     @Test func theTrashAndExcludedListsFollowTheSessionUntilRetired() async throws {
@@ -869,6 +922,31 @@ private struct AllFilesMetadata: PendingSourceMetadataProviding {
                         displayName: "photo.heic")
                 )
             })
+    }
+}
+
+/// Answers unknown for every file until it becomes readable.
+private final class UnknownUntilReadableMetadata: PendingSourceMetadataProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _readable = false
+    private var _reads = 0
+    var readable: Bool {
+        get { lock.withLock { _readable } }
+        set { lock.withLock { _readable = newValue } }
+    }
+    var reads: Int { lock.withLock { _reads } }
+
+    func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
+        await metadataAnswer(for: keys).metadata
+    }
+
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer {
+        let readable = lock.withLock { () -> Bool in
+            _reads += 1
+            return _readable
+        }
+        guard readable else { return PendingSourceMetadataAnswer(unknown: Set(keys)) }
+        return PendingSourceMetadataAnswer(metadata: await AllFilesMetadata().metadata(for: keys))
     }
 }
 
