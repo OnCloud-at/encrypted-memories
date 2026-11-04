@@ -232,9 +232,6 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// adapters set it to the toolbar/safe-area height plumbed from their host view.
     public var topInset: CGFloat = 0
 
-    /// The system division in the same physical coordinates as the grid viewport, including its margins.
-    public var divisionFrame: CGRect?
-
     public init(
         sectionCounts: [Int], levels: [GridLevelMetrics], defaultLevel: Int,
         fillOrder: GridFillOrder = .newestBottomTrailing
@@ -519,7 +516,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         } else {
             columns = Self.columnsForFixedSide(side: target, gap: g, width: w, maxColumns: maxColumns)
         }
-        let geometry = GridColumnGeometry(columns: columns, gap: g, width: w, division: usableDivision(width: w))
+        let geometry = GridColumnGeometry(columns: columns, gap: g, width: w)
         let side = geometry.side
         let pitch = side + g
         let singleSection = sectionCounts.count == 1
@@ -701,11 +698,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// within the ladder it interpolates the bracketing detents; past the largest end it grows with
     /// diminishing return; past the densest end it clamps (never over-shrink below fill).
     public func apparentSlotSide(at x: CGFloat, width: CGFloat) -> CGFloat {
-        GridApparentMetrics.slotSide(at: x, width: width, levels: levels, division: divisionFrame)
-    }
-
-    package func usableDivision(width: CGFloat) -> CGRect? {
-        divisionFrame.flatMap { GridVerticalDivision.isUsable($0, width: width, levels: levels) ? $0 : nil }
+        GridApparentMetrics.slotSide(at: x, width: width, levels: levels)
     }
 
     /// The apparent gap for a continuous level position (first-class: scales smoothly through the pinch).

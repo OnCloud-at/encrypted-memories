@@ -436,21 +436,6 @@
         /// The active reserved regions (the iPhone Duo fold, a camera) in viewport coordinates; selection marks move
         /// out of them. Read on every layout; a hinge change asks for a layout.
         private(set) var reservedRegionLayout: ReservedRegionLayout = .none
-        private var divisionAreas: [ReservedRegionArea] = []
-        private struct DivisionInput: Equatable {
-            let areas: [ReservedRegionArea]
-            let bounds: CGRect
-            let profile: GridLevelProfile
-        }
-        private var cachedDivisionInput: DivisionInput?
-        private var cachedDivisionFrame: CGRect?
-        private var lastLaidOutDivisionFrame: CGRect?
-        #if DEBUG
-            private(set) var gridDivisionResolutionCount = 0
-            var divisionAreasForTesting: [ReservedRegionArea]? {
-                didSet { setNeedsLayout() }
-            }
-        #endif
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
@@ -888,22 +873,11 @@
 
         public override func layoutSubviews() {
             updateScopeBarClearanceIfNeeded()
-            let newDivisionAreas = currentDivisionAreas()
-            let divisionChanged =
-                cachedProfile.map { profile in
-                    resolvedDivision(areas: newDivisionAreas, bounds: bounds, profile: profile)
-                        != lastLaidOutDivisionFrame
-                } ?? false
             if lastInsetBounds != bounds {
                 lastInsetBounds = bounds
                 scheduleInsetFollowUp()
             }
-            let resizePosition = captureViewportResizePositionIfNeeded(divisionChanged: divisionChanged)
-            divisionAreas = newDivisionAreas
-            if divisionChanged {
-                cancelLiveZoomState()
-                cachedEngine = nil
-            }
+            let resizePosition = captureViewportResizePositionIfNeeded()
             super.layoutSubviews()
             metalView.frame = bounds
             scrollView.frame = bounds
@@ -914,7 +888,6 @@
             restoreViewportResizePosition(resizePosition)
             lastLaidOutViewportSize = bounds.size
             lastLaidOutSafeAreaInsets = safeAreaInsets
-            lastLaidOutDivisionFrame = cachedEngine?.divisionFrame
             reservedRegionLayout = currentReservedRegionLayout()
             requestRender()
             invalidateAccessibilityElements()
@@ -1501,13 +1474,13 @@
         /// Capture against the previous layout, not the already-mutated `bounds`: the scroll offset belongs to the
         /// previous column geometry until `refreshContentSize()` resolves the new one. Preserve the newest edge as an
         /// edge; otherwise preserve the first photo below the top bar plus its distance to the bar.
-        private func captureViewportResizePositionIfNeeded(divisionChanged: Bool = false) -> ViewportResizePosition? {
+        private func captureViewportResizePositionIfNeeded() -> ViewportResizePosition? {
             guard lastLaidOutViewportSize.width > 0,
                 lastLaidOutViewportSize.height > 0,
                 !needsInitialViewportPlacement,
                 !itemUIDs.isEmpty,
                 let profile = cachedProfile,
-                viewportGeometryChangedSinceLastLayout || divisionChanged
+                viewportGeometryChangedSinceLastLayout
             else { return nil }
 
             let oldMaximumY = max(
@@ -1525,7 +1498,6 @@
                 sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
             )
             engine.topInset = scopeBarClearance
-            engine.divisionFrame = lastLaidOutDivisionFrame
             let plan = engine.framePlan(
                 level: level,
                 viewportSize: lastLaidOutViewportSize,
@@ -1617,20 +1589,14 @@
                 previousLayoutSize.width > 0, layoutSize.width > 0
             {
                 let sourceLevel = activeLevel(profile: previousProfile)
-                var sourceEngine =
+                let sourceEngine =
                     cachedEngine
                     ?? SquareTileGridEngine(
                         sectionCounts: [items.count], profile: previousProfile, fillOrder: fillOrder
                     )
-                if cachedEngine == nil {
-                    sourceEngine.divisionFrame = resolvedDivision(
-                        areas: divisionAreas, bounds: CGRect(origin: .zero, size: previousLayoutSize),
-                        profile: previousProfile)
-                }
-                var targetEngine = SquareTileGridEngine(
+                let targetEngine = SquareTileGridEngine(
                     sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
                 )
-                targetEngine.divisionFrame = resolvedDivision(areas: divisionAreas, bounds: bounds, profile: profile)
                 interactiveLevel = profileLevelMemory.level(
                     leaving: previousProfile.id, at: sourceLevel, entering: profile.id
                 ) {
@@ -1654,35 +1620,18 @@
         /// `scopeBarClearance` participates in the cache key: a scope picker appearing or disappearing rebuilds
         /// so the layout origin shift takes effect.
         func currentEngine(profile: GridLevelProfile) -> SquareTileGridEngine {
-            let division = resolvedDivision(areas: divisionAreas, bounds: bounds, profile: profile)
             if let cachedEngine, cachedEngineItemCount == items.count, cachedEngineProfileID == profile.id,
-                cachedEngineFillOrder == fillOrder, cachedEngine.topInset == scopeBarClearance,
-                cachedEngine.divisionFrame == division
+                cachedEngineFillOrder == fillOrder, cachedEngine.topInset == scopeBarClearance
             {
                 return cachedEngine
             }
             var engine = SquareTileGridEngine(sectionCounts: [items.count], profile: profile, fillOrder: fillOrder)
             engine.topInset = scopeBarClearance
-            engine.divisionFrame = division
             cachedEngine = engine
             cachedEngineItemCount = items.count
             cachedEngineProfileID = profile.id
             cachedEngineFillOrder = fillOrder
             return engine
-        }
-
-        private func resolvedDivision(areas: [ReservedRegionArea], bounds: CGRect, profile: GridLevelProfile) -> CGRect?
-        {
-            let input = DivisionInput(areas: areas, bounds: bounds, profile: profile)
-            if cachedDivisionInput == input { return cachedDivisionFrame }
-            #if DEBUG
-                gridDivisionResolutionCount += 1
-            #endif
-            let division = MetalGridFrameComposer.gridDivisionFrame(
-                areas: areas, bounds: bounds, profile: profile)
-            cachedDivisionInput = input
-            cachedDivisionFrame = division
-            return division
         }
 
         // MARK: - Coalesced render loop
@@ -2321,21 +2270,6 @@
             return .none
         }
 
-        /// Pass raw division facts to the shared resolver, separately from active selection exclusions.
-        private func currentDivisionAreas() -> [ReservedRegionArea] {
-            #if DEBUG
-                if let divisionAreasForTesting { return divisionAreasForTesting }
-            #endif
-            #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
-                if #available(iOS 27.1, *) {
-                    return reservedRegions(kind: .division, options: .includeInactive).map {
-                        ReservedRegionArea(frame: $0.frame, isActive: $0.isActive, isDivision: true)
-                    }
-                }
-            #endif
-            return []
-        }
-
         /// UIKit reports no separate change of reserved regions. Folding or opening iPhone Duo changes the hinge, so
         /// the hinge update reads the regions again and draws only when they changed. The angle itself decides nothing.
         private func observeHingeForReservedRegions() {
@@ -2348,7 +2282,7 @@
 
         private func refreshReservedRegions() {
             let layout = currentReservedRegionLayout()
-            guard layout != reservedRegionLayout || currentDivisionAreas() != divisionAreas else { return }
+            guard layout != reservedRegionLayout else { return }
             reservedRegionLayout = layout
             setNeedsLayout()
             requestRender()
