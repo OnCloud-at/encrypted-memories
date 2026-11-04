@@ -1001,6 +1001,86 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertTrue(server.trashCalls.isEmpty)
     }
 
+    // MARK: Temporary volume read failures
+
+    func testAVolumeReadFailureIsATemporaryFailureNotASharedAlbum() async throws {
+        // The volume read fails once, then works again: a retry after the reported failure dissolves.
+        server.failNextVolumeRead()
+        let orchestrator = makeOrchestrator()
+
+        do {
+            _ = try await orchestrator.keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("the unreadable own volume must fail the operation")
+        } catch SeriesDissolutionError.notOwnLibrary {
+            XCTFail("a failing volume read is a temporary failure, not proof of a shared album")
+        } catch let error as UploadError {
+            guard case UploadError.retryableBackend(503, "volume read unavailable") = error else {
+                return XCTFail("expected the injected volume read failure, got \(error)")
+            }
+        }
+        XCTAssertTrue(server.uploads.isEmpty, "no photo is copied before the own volume is known")
+        XCTAssertTrue(server.trashCalls.isEmpty, "no photo moves to the trash before the own volume is known")
+        XCTAssertEqual(
+            try journalStore.pendingJournals(), [], "an unreadable own volume leaves no journal behind")
+
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+        XCTAssertEqual(server.uploads.count, 1, "the retry reads the volume again and dissolves")
+        XCTAssertEqual(server.trashCalls.count, 1)
+    }
+
+    func testAVolumeReadFailureDoesNotHideKeepOnlyFavorites() async throws {
+        server.failNextVolumeRead()
+
+        let canDissolve = await makeOrchestrator().canDissolve(seriesUIDs: series)
+
+        XCTAssertTrue(
+            canDissolve,
+            "an unreadable own volume is no proof of a shared album, so the option stays available")
+    }
+
+    func testALastingVolumeReadFailureNeverDissolvesTheSeries() async throws {
+        server.failNextVolumeRead(times: 100)
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("a lasting read failure must never report success")
+        } catch SeriesDissolutionError.notOwnLibrary {
+            XCTFail("a failing volume read is a temporary failure, not proof of a shared album")
+        } catch let error as UploadError {
+            guard case UploadError.retryableBackend(503, "volume read unavailable") = error else {
+                return XCTFail("expected the injected volume read failure, got \(error)")
+            }
+        }
+        XCTAssertTrue(server.uploads.isEmpty)
+        XCTAssertTrue(server.trashCalls.isEmpty)
+    }
+
+    func testAClosedSessionStillAnswersCanDissolveWithFalse() async throws {
+        admission.closeAdmission()
+
+        let canDissolve = await makeOrchestrator().canDissolve(seriesUIDs: series)
+
+        XCTAssertFalse(canDissolve, "a closed session must not offer the option")
+    }
+
+    func testAnEmptySeriesStaysRefusedAsNotOwnLibrary() async throws {
+        let canDissolve = await makeOrchestrator().canDissolve(seriesUIDs: [])
+        XCTAssertFalse(canDissolve)
+
+        do {
+            _ = try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: [], favoriteUIDs: [])
+            XCTFail("an empty series must be refused")
+        } catch let error as SeriesDissolutionError {
+            XCTAssertEqual(error, .notOwnLibrary)
+        }
+        XCTAssertTrue(server.uploads.isEmpty)
+        XCTAssertTrue(server.trashCalls.isEmpty)
+    }
+
     // MARK: Dedupe collision rule
 
     func testSeriesMemberRowsNeverCountAsAnExistingCopy() {
@@ -1155,6 +1235,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     private var cancelsAfterAlbumWrite = Set<String>()
     private var roleReadFailures = 0
     private var albumReadFailures = 0
+    private var volumeReadFailures = 0
     private var _uploads: [PhotoUploadRequest] = []
     private var _trashCalls: [[PhotoUID]] = []
     private var _events: [Event] = []
@@ -1266,6 +1347,8 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
     func cancelAfterAlbumWrite(to albumID: String) { lock.withLock { _ = cancelsAfterAlbumWrite.insert(albumID) } }
     func failNextRoleRead() { lock.withLock { roleReadFailures = 1 } }
     func failNextAlbumRead() { lock.withLock { albumReadFailures = 1 } }
+    /// Makes the next `times` reads of the own photos volume fail with a temporary backend error.
+    func failNextVolumeRead(times: Int = 1) { lock.withLock { volumeReadFailures = times } }
     /// The next trash request reports success while its photos stay active, as Proton did in the field.
     func acceptNextTrashWithoutEffect() { lock.withLock { _trashRemainsActive = true } }
 
@@ -1288,7 +1371,15 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
 
     // SeriesDissolutionRemote
 
-    func ownPhotosVolumeID() async throws -> String { ownVolumeID }
+    func ownPhotosVolumeID() async throws -> String {
+        try lock.withLock {
+            if volumeReadFailures > 0 {
+                volumeReadFailures -= 1
+                throw UploadError.retryableBackend(code: 503, message: "volume read unavailable")
+            }
+        }
+        return ownVolumeID
+    }
 
     func source(for member: PhotoUID) async throws -> SeriesMemberSource {
         let node = try lock.withLock { try XCTUnwrap(nodes[member.nodeID]) }

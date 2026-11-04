@@ -263,10 +263,21 @@ public actor SeriesDissolutionOrchestrator {
         self.admission = admission
     }
 
-    /// True only for a series that lies completely in the account's own photos volume. Shared albums live in
-    /// a foreign volume, and the trash and upload writes address the own volume only.
+    /// True when the own-volume check confirms that the series lies completely in the account's own
+    /// photos volume, or when the check cannot answer. Shared albums live in a foreign volume, and
+    /// the trash and upload writes address the own volume only. A failed volume read answers true,
+    /// because it is no proof of a shared album; the real operation rechecks and reports the failure.
     public func canDissolve(seriesUIDs: [PhotoUID]) async -> Bool {
-        (try? await admission.withAdmission { [self] in await self.isOwnLibrary(seriesUIDs) }) ?? false
+        do {
+            try await admission.withAdmission { [self] in try await self.assertOwnLibrary(seriesUIDs) }
+            return true
+        } catch is CancellationError {
+            return false
+        } catch SeriesDissolutionError.notOwnLibrary {
+            return false
+        } catch {
+            return true
+        }
     }
 
     /// Copies every favorite into a standalone photo and then moves the whole series to the trash.
@@ -311,9 +322,15 @@ public actor SeriesDissolutionOrchestrator {
         }
     }
 
-    private func isOwnLibrary(_ seriesUIDs: [PhotoUID]) async -> Bool {
-        guard !seriesUIDs.isEmpty, let own = try? await remote.ownPhotosVolumeID() else { return false }
-        return seriesUIDs.allSatisfy { $0.volumeID == own }
+    /// Confirms that the series lies completely in the account's own photos volume. An empty series
+    /// and a readable foreign volume throw `notOwnLibrary`. A failed volume read propagates, so a
+    /// temporary read failure is never mistaken for a shared album.
+    private func assertOwnLibrary(_ seriesUIDs: [PhotoUID]) async throws {
+        guard !seriesUIDs.isEmpty else { throw SeriesDissolutionError.notOwnLibrary }
+        let own = try await remote.ownPhotosVolumeID()
+        guard seriesUIDs.allSatisfy({ $0.volumeID == own }) else {
+            throw SeriesDissolutionError.notOwnLibrary
+        }
     }
 
     private func admittedKeepOnlyFavorites(
@@ -325,7 +342,7 @@ public actor SeriesDissolutionOrchestrator {
         let existing = try journalStore.journal(forSeries: seriesMainUID)
         // A retry keeps every photo that either attempt knew. The caller's list can be older than the journal.
         let membership = Self.union(existing?.seriesUIDs ?? [], seriesUIDs)
-        guard await isOwnLibrary(membership) else { throw SeriesDissolutionError.notOwnLibrary }
+        try await assertOwnLibrary(membership)
         let series = Set(membership)
         guard !favoriteUIDs.isEmpty, series.contains(seriesMainUID), favoriteUIDs.allSatisfy(series.contains)
         else { throw SeriesDissolutionError.invalidSelection }
