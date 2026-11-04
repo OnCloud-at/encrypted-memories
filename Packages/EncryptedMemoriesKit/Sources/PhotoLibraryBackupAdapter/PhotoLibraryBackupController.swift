@@ -97,6 +97,8 @@ public final class PhotoLibraryBackupController {
         var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
         /// How often a pass renews its execution lock. The lease lets a crashed owner go after 120 s.
         var heartbeatInterval: TimeInterval = 30
+        var bulkResourceResolver: (any BackupResourceResolving)?
+        var bulkResourceCoordinator: LibraryResourceCoordinator?
 
         public var defaults: UserDefaults
         public var runtimeSignals: BackupRuntimeSignalSource
@@ -205,6 +207,11 @@ public final class PhotoLibraryBackupController {
     private var statusProjectionRevision: UInt64 = 0
     private var lastAppliedStatusProjectionRevision: UInt64 = 0
     private let tempStore: BackupTempFileStore
+    private let bulkResourceResolver: any BackupResourceResolving
+    private let bulkResourceCoordinator: LibraryResourceCoordinator
+    private var bulkPolicyPaused = false
+    private var bulkPreparationMessage: String?
+    private var bulkCompletionTask: Task<Void, Never>?
     private var changeSubscription: PhotoLibraryChangeMonitor.Subscription?
     private let monitor: PhotoLibraryChangeMonitor
     private let currentAccessState: () -> PhotoBackupAccessState
@@ -358,6 +365,8 @@ public final class PhotoLibraryBackupController {
         defaults = configuration.defaults
         let runtimeSignals = configuration.runtimeSignals
         self.runtimeSignals = runtimeSignals
+        bulkPolicyPaused = BackupThrottlePolicy().maxConcurrentItems(for: runtimeSignals.current()) == 0
+        bulkResourceCoordinator = configuration.bulkResourceCoordinator ?? .shared
         firstNetworkPathWait = configuration.firstNetworkPathWait
         backgroundLog = configuration.backgroundLog
         heartbeatInterval = configuration.heartbeatInterval
@@ -390,6 +399,11 @@ public final class PhotoLibraryBackupController {
             policy: configuration.databasePolicy
         )
         self.catalogStore = catalogStore
+        bulkResourceResolver =
+            configuration.bulkResourceResolver
+            ?? PhotoLibraryResourceResolver(
+                tempStore: tempStore,
+                cloudIdentifierProvider: { (try? catalogStore?.entry(for: $0))?.cloudIdentifier })
         lockStore = BackupExecutionLockManifestStore(
             url: directory.appendingPathComponent(Self.lockDatabaseFileName),
             policy: configuration.databasePolicy,
@@ -770,7 +784,9 @@ public final class PhotoLibraryBackupController {
     }
 
     public func makeProblemListSession() -> BackupProblemListSession {
-        BackupProblemListSession { [weak self] in await self?.problemSnapshot() }
+        BackupProblemListSession(
+            fixedActionMessage: { [weak self] in self?.bulkPreparationMessage },
+            read: { [weak self] in await self?.problemSnapshot() })
     }
 
     public func followProblemList(session: BackupProblemListSession) async {
@@ -946,6 +962,95 @@ public final class PhotoLibraryBackupController {
         refreshFromQueue()
     }
 
+    public let bulkPhotoActions = BulkPhotoActionRunner()
+    public var isBulkBackUpAgainAvailable: Bool { !isShuttingDown && !bulkPolicyPaused }
+
+    private var bulkReadPolicyAllowsWork: Bool {
+        BackupThrottlePolicy().maxConcurrentItems(for: runtimeSignals.current()) > 0
+    }
+
+    public func prepareBackUpAgain() async -> BulkPhotoActionRunner.Confirmation? {
+        guard !isShuttingDown, bulkCompletionTask == nil, let queueStore else { return nil }
+        bulkPreparationMessage = nil
+        let confirmation = await bulkPhotoActions.prepareBackUpAgain(in: queueStore)
+        if confirmation == nil, !Task.isCancelled, !isShuttingDown, !queueStore.isOperational() {
+            bulkPreparationMessage = L10n.string("backup.error_local_state_unavailable")
+        }
+        return confirmation
+    }
+
+    @discardableResult
+    public func startBackUpAgain(_ confirmation: BulkPhotoActionRunner.Confirmation) -> Bool {
+        guard !isShuttingDown, bulkCompletionTask == nil, confirmation.action == .backUpAgain else { return false }
+        guard bulkReadPolicyAllowsWork else {
+            if bulkPhotoActions.confirmation == confirmation { bulkPhotoActions.dismissConfirmation() }
+            return false
+        }
+        guard
+            bulkPhotoActions.start(
+                confirmation,
+                perform: { [weak self] item in
+                    guard let self, let source = item.source,
+                        let revisions = confirmation.revisionsBySource[source]
+                    else { return false }
+                    return await backUpAgainIfAvailable(item, revisions: revisions)
+                })
+        else { return false }
+        bulkCompletionTask = Task { [weak self, bulkPhotoActions] in
+            await bulkPhotoActions.waitUntilFinished()
+            guard let self else { return }
+            bulkCompletionTask = nil
+            guard !Task.isCancelled, !isShuttingDown,
+                (bulkPhotoActions.summary?.completed ?? 0) > 0
+            else { return }
+            syncNow()
+        }
+        return true
+    }
+
+    /// A failed source read leaves the original decision and its reason intact. Resolving reads photo resources;
+    /// the existing decision helper writes consent only after the exact confirmed version is still readable.
+    private func backUpAgainIfAvailable(
+        _ item: BackupFailedItem, revisions: Set<UploadBackupRevision>
+    ) async -> Bool {
+        guard !isShuttingDown, !Task.isCancelled, currentAccessState().allowsBackup,
+            item.issue == .deletedElsewhere, let source = item.source, let revision = item.revision,
+            source.kind == .photoLibraryAsset, source.resource == .primary,
+            pendingReplacementJournal != nil, let queueStore, queueStore.isOperational(),
+            let entry = try? queueStore.entry(for: source, revision: revision), entry.state == .failedPermanent,
+            BackupIssueRecord.decode(entry.lastError)?.kind == .deletedElsewhere
+        else { return false }
+        do {
+            let inputs = runtimeSignals.current
+            let policy = BackupThrottlePolicy()
+            let admission: BackupResourceReadAdmission = {
+                try Task.checkCancellation()
+                guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw BulkSourceReadDeferred() }
+            }
+            let resolver = bulkResourceResolver
+            let resolved = try await bulkResourceCoordinator.withHeavyPermit(
+                LibraryWorkRequest(workload: .backupMaterialization, intent: .userInitiated, memoryClass: .large)
+            ) { _ in
+                try admission()
+                return try await resolver.resolve(entry, onPreparationProgress: { _ in }, readAdmission: admission)
+            }
+            guard let resource = resolved else { return false }
+            defer { resource.cleanup?() }
+            guard !isShuttingDown, !Task.isCancelled, currentAccessState().allowsBackup,
+                resource.candidate.snapshot.source == source, resource.candidate.snapshot.revision == revision
+            else { return false }
+            return resolveRemoteDeletion(item, keepDeleted: false, expectedRevisions: revisions)
+        } catch is BulkSourceReadDeferred {
+            bulkPhotoActions.stopAfterCurrentPhoto()
+            return false
+        } catch {
+            // The summary reports this photo as unchanged; its existing decision remains available.
+            return false
+        }
+    }
+
+    private struct BulkSourceReadDeferred: Error {}
+
     @discardableResult
     public func keepDeleted(_ item: BackupFailedItem) -> Bool {
         resolveRemoteDeletion(item, keepDeleted: true)
@@ -961,7 +1066,9 @@ public final class PhotoLibraryBackupController {
     }
 
     @discardableResult
-    private func resolveRemoteDeletion(_ item: BackupFailedItem, keepDeleted: Bool) -> Bool {
+    private func resolveRemoteDeletion(
+        _ item: BackupFailedItem, keepDeleted: Bool, expectedRevisions: Set<UploadBackupRevision>? = nil
+    ) -> Bool {
         guard item.issue == .deletedElsewhere, let source = item.source, let revision = item.revision,
             let queueStore, let journal = pendingReplacementJournal,
             let row = PhotoPerformanceSignposts.database.interval(
@@ -982,6 +1089,11 @@ public final class PhotoLibraryBackupController {
                 }.map(\.revision)
             }
             let newest = parked.max() ?? revision
+            if let expectedRevisions {
+                guard queueStore.isOperational(), Set(parked) == expectedRevisions, newest == revision else {
+                    return false
+                }
+            }
             try PhotoPerformanceSignposts.database.interval("BackupDecisionJournal") {
                 if keepDeleted {
                     try journal.keepDeleted(for: source)
@@ -1915,6 +2027,11 @@ public final class PhotoLibraryBackupController {
     /// Sign-out must await this before removing `accountDataDirectory`.
     public func shutdown() async {
         isShuttingDown = true
+        let bulkCompletion = bulkCompletionTask
+        bulkCompletion?.cancel()
+        await bulkPhotoActions.shutdown()
+        await bulkCompletion?.value
+        bulkCompletionTask = nil
         manualWiFiRetryPending = false
         pendingSyncAfterStop = false
         changeSubscription?.cancel()
@@ -2032,6 +2149,11 @@ public final class PhotoLibraryBackupController {
         networkObservationTask = Task { @MainActor [weak self] in
             for await _ in updates {
                 guard let self, !Task.isCancelled else { return }
+                self.bulkPolicyPaused = !self.bulkReadPolicyAllowsWork
+                if self.bulkPolicyPaused {
+                    self.bulkPhotoActions.dismissConfirmation()
+                    self.bulkPhotoActions.stopAfterCurrentPhoto()
+                }
                 self.startAfterFirstNetworkPath()
                 self.resumeIfWiFiWaitEnded()
             }

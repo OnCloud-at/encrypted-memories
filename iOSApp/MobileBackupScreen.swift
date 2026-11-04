@@ -676,6 +676,23 @@ struct MobileFailedBackupSheet: View {
                     #endif
                 }
             }
+            // Inside the stack, so the List insets its last rows above the fixed area instead of under it.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil) {
+                    if sessionSourceID == sourceID, let controller {
+                        BulkBackUpAgainControls(
+                            runner: controller.bulkPhotoActions, count: pagedList.decisionCount,
+                            isAvailable: { controller.isBulkBackUpAgainAvailable },
+                            prepare: { await controller.prepareBackUpAgain() },
+                            start: { controller.startBackUpAgain($0) }
+                        )
+                        .id(ObjectIdentifier(controller))
+                    }
+                }
+                // One container frame that starts at the bar background; the inner elements keep their identifiers.
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("backup.problemList.actionArea")
+            }
             .mobileNavigationTitle(
                 controller == nil
                     ? AlbumSyncController.SelectedAlbum.localizedProblemSheetTitle(for: items)
@@ -714,9 +731,6 @@ struct MobileFailedBackupSheet: View {
             Button(L10n.string("action.cancel"), role: .cancel) { deletionItem = nil }
         }
         .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.large] : [.medium, .large])
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil)
-        }
         .task(id: followKey) {
             guard sessionSourceID == sourceID, sourceIsSelected else { return }
             switch source {

@@ -38,6 +38,16 @@ final class MobilePagedBackupUITests: XCTestCase {
         // Native lists can clamp the direct jump before the final row in a medium sheet.
         if !last.isHittable { list.swipeUp() }
         assertHittable(last)
+        // The jump lands on estimated row heights; only the real end of the list proves the bar placement.
+        let end = scrollToEnd(list, last: last)
+        let area = app.otherElements["backup.problemList.actionArea"]
+        XCTAssertTrue(area.exists, "The fixed action area must show at the end of the list")
+        XCTAssertTrue(area.buttons["backup.bulk.backUpAgain"].exists, "The area must keep the bulk action")
+        XCTAssertTrue(area.staticTexts["backup.bulk.count"].exists, "The area must keep the bulk count")
+        // The area frame starts at the bar background, which `isHittable` cannot see covering a row.
+        let barTop = area.frame.minY
+        XCTAssertLessThanOrEqual(
+            end.maxY, barTop, "At the end of the list, the last row \(end) must stay above the bar (top \(barTop))")
         last.tap()
         XCTAssertTrue(app.buttons["backup.keepDeleted.dialog"].firstMatch.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)
@@ -57,6 +67,32 @@ final class MobilePagedBackupUITests: XCTestCase {
         XCTAssertEqual(
             XCTWaiter.wait(for: [loaded], timeout: 30), .completed,
             "Expected \(value); observed \(String(describing: list.value))")
+    }
+
+    /// Swipes until a further swipe no longer moves the last row, which is the real end of the list.
+    private func scrollToEnd(_ list: XCUIElement, last: XCUIElement) -> CGRect {
+        var frame = settledFrame(of: last)
+        for _ in 0..<4 {
+            list.swipeUp()
+            let next = settledFrame(of: last)
+            if abs(next.minY - frame.minY) < 0.5 { return next }
+            frame = next
+        }
+        XCTFail("The list did not reach its end; the last row is still at \(frame)")
+        return frame
+    }
+
+    /// Returns the frame once two reads 0.5 s apart agree.
+    private func settledFrame(of element: XCUIElement) -> CGRect {
+        var previous = element.frame
+        for _ in 0..<20 {
+            Thread.sleep(forTimeInterval: 0.5)
+            let current = element.frame
+            if abs(current.minY - previous.minY) < 0.5 { return current }
+            previous = current
+        }
+        XCTFail("The last row did not settle; last read \(previous)")
+        return previous
     }
 
     private func assertHittable(_ row: XCUIElement) {
