@@ -36,6 +36,14 @@ public struct ReservedRegionLayout: Equatable, Sendable {
 
     public var isEmpty: Bool { exclusions.isEmpty }
 
+    /// Optional bounds for centering the whole loading block in tabletop. Other layouts keep their existing placement.
+    public var centeredLoadingBounds: CGRect? {
+        guard let fold = horizontalFold else { return nil }
+        return CGRect(
+            x: bounds.minX, y: bounds.minY, width: bounds.width,
+            height: max(0, min(bounds.maxY, fold.minY) - bounds.minY))
+    }
+
     /// A viewport-spanning horizontal division supplies the generic tabletop placement rule.
     public var horizontalFold: CGRect? {
         divisions.first { $0.width >= $0.height && isCrossingBand($0) }

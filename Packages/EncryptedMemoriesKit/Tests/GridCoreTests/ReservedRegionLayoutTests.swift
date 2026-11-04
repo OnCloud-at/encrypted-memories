@@ -103,4 +103,55 @@ import Testing
             layout.selectionMarkRect(in: tile, side: side, inset: inset)
                 == CGRect(x: 191, y: 258, width: 22, height: 22))
     }
+
+    @Test func tabletopCentersTheWholeLoadingBlockAboveTheFold() {
+        let bounds = CGRect(x: 0, y: 0, width: 669, height: 951)
+        let fold = CGRect(x: 0, y: 455, width: 669, height: 40)
+        let layout = ReservedRegionLayout(
+            areas: [ReservedRegionArea(frame: fold, isActive: true, isDivision: true)], bounds: bounds)
+        let region = layout.centeredLoadingBounds ?? bounds
+        let block = CGRect(x: region.midX - 110, y: region.midY - 70, width: 220, height: 140)
+        #expect(region == CGRect(x: 0, y: 0, width: 669, height: 455))
+        #expect(block.midY == 227.5, "Indicator and text share one centered block")
+        #expect(block.maxY < fold.minY)
+        #expect(block.midX == bounds.midX)
+    }
+
+    @Test func loadingPlacementWithoutATabletopDivisionKeepsTheExistingCenter() {
+        for size in [
+            CGSize(width: 393, height: 852), CGSize(width: 1024, height: 1366),
+            CGSize(width: 1440, height: 900), CGSize(width: 466, height: 678), CGSize(width: 669, height: 951),
+        ] {
+            let bounds = CGRect(origin: .zero, size: size)
+            for areas in [
+                [],
+                [
+                    ReservedRegionArea(
+                        frame: CGRect(x: 0, y: 400, width: size.width, height: 40), isActive: false, isDivision: true)
+                ],
+                [
+                    ReservedRegionArea(
+                        frame: CGRect(x: size.width / 2, y: 0, width: 40, height: size.height), isActive: true,
+                        isDivision: true)
+                ],
+                [ReservedRegionArea(frame: CGRect(x: 0, y: 400, width: size.width, height: 40), isActive: true)],
+            ] {
+                let layout = ReservedRegionLayout(areas: areas, bounds: bounds)
+                #expect(layout.centeredLoadingBounds == nil, "No tabletop override preserves the existing view path")
+                let region = layout.centeredLoadingBounds ?? bounds
+                #expect(region.midX == bounds.midX && region.midY == bounds.midY)
+            }
+        }
+    }
+
+    @Test func aSyntheticHorizontalDivisionCentersLoadingAboveItsOwnFold() {
+        let bounds = CGRect(x: 20, y: 30, width: 900, height: 760)
+        let layout = ReservedRegionLayout(
+            areas: [
+                ReservedRegionArea(
+                    frame: CGRect(x: 20, y: 300, width: 900, height: 30), isActive: true, isDivision: true)
+            ],
+            bounds: bounds)
+        #expect(layout.centeredLoadingBounds == CGRect(x: 20, y: 30, width: 900, height: 270))
+    }
 }
