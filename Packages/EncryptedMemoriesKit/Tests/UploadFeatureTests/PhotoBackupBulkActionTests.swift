@@ -319,6 +319,31 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    /// The second sibling write of the photo fails once: the photo counts as unchanged, so no revision may have
+    /// changed and no consent may remain.
+    func testAFailedSiblingWriteCountsThePhotoUnchangedAndChangesNoRevision() async throws {
+        let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date.addingTimeInterval(1)))
+        defer { fixture.cleanup() }
+        try fixture.park("edited", at: date)
+        try fixture.park("edited", at: date.addingTimeInterval(1))
+        let before = [fixture.entry("edited", at: date), fixture.entry("edited", at: date.addingTimeInterval(1))]
+        let captured = await fixture.controller.prepareBackUpAgain()
+        let confirmation = try XCTUnwrap(captured)
+        let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+        let fault = try SQLiteReadInterrupt(in: queue, matching: "attempts=COALESCE(?, attempts)", occurrence: 2)
+        defer { fault.stop() }
+        XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
+        await fixture.controller.bulkPhotoActions.waitUntilFinished()
+        XCTAssertTrue(fault.fired, "the second sibling write must actually fail")
+        XCTAssertEqual(
+            [fixture.entry("edited", at: date), fixture.entry("edited", at: date.addingTimeInterval(1))], before,
+            "a photo counted as unchanged must have no reopened or dismissed revision")
+        XCTAssertTrue(fixture.journal.entry(for: fixture.source("edited")).isEmpty)
+        XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, 0)
+        XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.stayed, 1)
+        await fixture.controller.shutdown()
+    }
+
     func testCancellationDuringSourceReadNeverChangesTheDecisionOrJournal() async throws {
         let gate = BulkSourceReadGate()
         let fixture = try makeFixture(
