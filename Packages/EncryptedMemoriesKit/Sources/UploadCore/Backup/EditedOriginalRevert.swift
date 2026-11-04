@@ -31,6 +31,15 @@ public struct EditedOriginalSource: Sendable, Equatable {
     }
 }
 
+extension EditedOriginalSource {
+    /// The hidden original is read like a series member: both reads keep the metadata that the copy carries.
+    public init(_ member: SeriesMemberSource) {
+        self.init(
+            filename: member.filename, mediaType: member.mediaType, captureTime: member.captureTime,
+            modificationDate: member.modificationDate, additionalMetadata: member.additionalMetadata)
+    }
+}
+
 /// The outcome of a resume attempt that finished in the trash step. The host reports the restored copy or the
 /// error that kept the operation pending.
 public struct EditedOriginalRevertResumeOutcome: Sendable {
@@ -120,7 +129,8 @@ public actor EditedOriginalRevert {
                 journal = EditedOriginalRevertJournal(
                     editedMainUID: editedMain, originalLinkID: original.nodeID, restoredName: restoredName)
             }
-            return try await self.run(&journal, onProgress: onProgress)
+            // The person asked for this revert, so it may make the copy.
+            return try await self.run(&journal, allowsNewCopy: true, onProgress: onProgress)
         }
     }
 
@@ -151,25 +161,29 @@ public actor EditedOriginalRevert {
     }
 
     /// Finishes every interrupted operation that reached the trash step, and reports each result to the host.
-    /// A journal that still copies waits for the person to re-trigger the revert.
+    /// The host calls this without a tap of the person, so it never makes a copy: it does not download, upload or
+    /// carry over anything. A journal that still copies, and a journal whose confirmed copy is gone, wait for the
+    /// person to re-trigger the revert. Such a journal stays unchanged and produces no outcome.
     public func resumePending(
         onProgress: @escaping @Sendable (Double) -> Void = { _ in }
     ) async throws -> [EditedOriginalRevertResumeOutcome] {
-        // The admission closure is not actor-isolated, so the set of edits this actor runs right now is
-        // captured here. `run` still rejects a revert that starts between this read and the iteration.
-        let busyEdits = running
         return try await admission.withAdmission { [self] in
             var outcomes: [EditedOriginalRevertResumeOutcome] = []
-            for var journal in try journalStore.pendingJournals()
-            where journal.phase == .trashingEdit || journal.phase == .repointingDevice {
-                // A revert that another task is running right now keeps its journal; the next resume of this
-                // actor finishes it, so it is not reported as a failure here.
-                guard !busyEdits.contains(journal.editedMainUID) else { continue }
+            for var journal in try journalStore.pendingJournals() {
                 try Task.checkCancellation()
                 let result: Result<PhotoUID, any Error>
                 do {
-                    let copyUID = try await run(&journal, onProgress: onProgress)
+                    let copyUID = try await run(&journal, allowsNewCopy: false, onProgress: onProgress)
                     result = .success(copyUID)
+                } catch is ResumeNeedsPerson {
+                    // No step of this journal wrote to the server, and the journal is unchanged: the person's next
+                    // Revert tap continues it.
+                    continue
+                } catch RevertError.editAlreadyRunning {
+                    // The person's tap runs this journal right now and finishes it itself. This is no failed step,
+                    // and the check sits at the insertion into `running`, so no earlier snapshot of the running
+                    // edits can go stale.
+                    continue
                 } catch {
                     result = .failure(error)
                 }
@@ -179,13 +193,31 @@ public actor EditedOriginalRevert {
         }
     }
 
+    /// A resume without the person's tap found that the journal needs a new copy. Internal signal of `run`.
+    private struct ResumeNeedsPerson: Error {}
+
+    /// `allowsNewCopy` is true only for a revert that the person started. A resume passes false, so it can finish
+    /// the trash and device steps of a confirmed copy but never makes a copy.
     private func run(
         _ journal: inout EditedOriginalRevertJournal,
+        allowsNewCopy: Bool,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> PhotoUID {
         let mainUID = journal.editedMainUID
         guard running.insert(mainUID).inserted else { throw RevertError.editAlreadyRunning }
         defer { running.remove(mainUID) }
+
+        if !allowsNewCopy {
+            // A resume has no tap behind it. It never continues a journal that still copies: that would write the
+            // favorite tag and the albums of a copy that the person has not confirmed again.
+            guard journal.phase != .copying else { throw ResumeNeedsPerson() }
+            // The resume works from a list that it read earlier. A tap can finish, fail or move on while the resume
+            // waits on another journal. The resume acts only on the journal that is on disk right now, so it never
+            // brings back a removed journal and never writes an older state over a newer one.
+            guard try journalStore.decodableJournal(forEditedMain: mainUID) == journal else {
+                throw ResumeNeedsPerson()
+            }
+        }
 
         // The journal exists before the first remote write, so every later state is recoverable.
         try journalStore.save(journal)
@@ -197,6 +229,8 @@ public actor EditedOriginalRevert {
         // made again. Lowering that phase would drop the device-side step and make the journal invisible to a
         // later resume, because the resume filter skips a journal that is still copying.
         if journal.phase != .repointingDevice, try await copyMustBeMadeAgain(journal) {
+            // The resume at app start has no tap behind it. The journal stays as it is.
+            guard allowsNewCopy else { throw ResumeNeedsPerson() }
             journal.phase = .copying
             journal.copyUID = nil
             // The carry-over of the old copy is void with it: the new copy needs the favorite tag and the albums
@@ -236,8 +270,8 @@ public actor EditedOriginalRevert {
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
         guard journal.copyUID == nil else { return }
-        // A resume can reach this step when the earlier copy vanished, and it knows the upload name only from
-        // the journal. A journal without the name cannot re-make the copy; the person re-triggers the revert.
+        // Only a tap reaches this step, and `revert` sets the name first, so this guard has no direct test: no
+        // public call reaches it. It stays as a defense against a journal that an older build wrote without a name.
         guard let uploadName = journal.restoredName, !uploadName.isEmpty else { throw RevertError.invalidRestoredName }
         // The server refuses the related list of a main in the trash, on every attempt. Fail with the precise
         // cause instead, so the host can offer `abandon` instead of a dead end.

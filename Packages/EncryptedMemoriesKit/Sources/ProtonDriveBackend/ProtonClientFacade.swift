@@ -44,6 +44,11 @@ public final class ProtonClientFacade {
     public let photoTagAdder: any PhotoTagAdding
     /// "Keep Only Favorites" for a series of the account's own library. Nil while uploads are disabled.
     public let seriesDissolution: SeriesDissolutionOrchestrator?
+    /// The journaled revert to original of edited photos. The app resumes it at start; it finishes only the trash and
+    /// device steps of a confirmed copy and never makes a copy. Nil while uploads are disabled.
+    public let editedOriginalRevert: EditedOriginalRevert?
+    /// Starts a revert to original for the viewer. Nil while uploads are disabled.
+    public let editedPhotoReverter: (any EditedPhotoReverting)?
     /// Replaces the earlier upload of a photo that was edited in the photo library. Nil while uploads are disabled.
     public let editedPhotoReplacement: EditedPhotoReplacement?
     /// Finds and merges exact duplicates of the own library. Nil while uploads are disabled.
@@ -74,6 +79,8 @@ public final class ProtonClientFacade {
         photoUploader: any PhotoUploading,
         photoTagAdder: any PhotoTagAdding,
         seriesDissolution: SeriesDissolutionOrchestrator?,
+        editedOriginalRevert: EditedOriginalRevert?,
+        editedPhotoReverter: (any EditedPhotoReverting)?,
         editedPhotoReplacement: EditedPhotoReplacement?,
         exactDuplicates: ExactDuplicateFinder?,
         uploadIdentityResolver: (any UploadIdentityResolving)?,
@@ -91,6 +98,8 @@ public final class ProtonClientFacade {
         self.photoUploader = photoUploader
         self.photoTagAdder = photoTagAdder
         self.seriesDissolution = seriesDissolution
+        self.editedOriginalRevert = editedOriginalRevert
+        self.editedPhotoReverter = editedPhotoReverter
         self.editedPhotoReplacement = editedPhotoReplacement
         self.exactDuplicates = exactDuplicates
         self.uploadIdentityResolver = uploadIdentityResolver
@@ -177,6 +186,8 @@ public final class ProtonClientFacade {
         // the other account stores. One cache serves the whole account: the duplicate service invalidates it, the
         // finder reads it. Nil when the file cannot open: the ranking then reads every node.
         let fingerprintCache = identityComposition.fingerprintCache
+        let editedOriginalRevert = bridge.makeEditedOriginalRevert(
+            duplicateChecker: identityComposition.duplicateChecker, albums: albumCarryOver)
         return ProtonClientFacade(
             backend: bridge,
             librarySources: librarySources,
@@ -189,6 +200,8 @@ public final class ProtonClientFacade {
                 duplicateChecker: identityComposition.duplicateChecker,
                 albums: albumCarryOver
             ),
+            editedOriginalRevert: editedOriginalRevert,
+            editedPhotoReverter: editedOriginalRevert.map { bridge.makeEditedPhotoReverter(revert: $0) },
             editedPhotoReplacement: {
                 guard let checker = identityComposition.duplicateChecker,
                     let identities = identityComposition.identityStore,
@@ -291,6 +304,8 @@ public final class ProtonClientFacade {
                 backend: backend, librarySources: sources, albums: albums, uploads: manager,
                 uploadCoordinator: coordinator, photoUploader: backend, photoTagAdder: backend,
                 seriesDissolution: nil,
+                editedOriginalRevert: nil,
+                editedPhotoReverter: nil,
                 editedPhotoReplacement: nil,
                 exactDuplicates: nil,
                 uploadIdentityResolver: pipeline, accountDataDirectory: directory,

@@ -20,7 +20,7 @@ struct DriveSDKBridgePriorityScopeTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let governor = ProtonRequestGovernor()
-        let bridge = try await makeBridge(directory: directory, governor: governor)
+        let bridge = try await Self.makeBridge(directory: directory, governor: governor)
         await #expect(throws: (any Error).self) { try await bridge.loadTimelineSnapshot() }
         let state = governor.workMeasurements.workMeasurementSupportSnapshot().passes[
             SupportMeasurementKind.timelineLoad.rawValue]
@@ -39,7 +39,7 @@ struct DriveSDKBridgePriorityScopeTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let governor = ProtonRequestGovernor()
-        let bridge = try await makeBridge(directory: directory, governor: governor)
+        let bridge = try await Self.makeBridge(directory: directory, governor: governor)
         let uid = PhotoUID(volumeID: "vol", nodeID: "photo")
 
         await #expect(throws: (any Error).self) { try await read(entry, of: uid, from: bridge, in: directory) }
@@ -78,7 +78,8 @@ struct DriveSDKBridgePriorityScopeTests {
         return await condition()
     }
 
-    private func makeBridge(directory: URL, governor: ProtonRequestGovernor) async throws -> DriveSDKBridge {
+    /// A bridge whose every request fails as if the device were offline. Other bridge suites reuse it.
+    static func makeBridge(directory: URL, governor: ProtonRequestGovernor) async throws -> DriveSDKBridge {
         let session = DriveSession(
             session: ProtonSession(uid: "scope-fixture", accessToken: "", refreshToken: "", keyPassword: ""),
             store: SessionKeychainStore(service: "scope-fixture", account: "fixture", keychain: ScopeDenyKeychain()),
@@ -109,14 +110,14 @@ struct DriveSDKBridgePriorityScopeTests {
 }
 
 /// Every request fails as if the device were offline.
-private final class ScopeDenyHTTP: URLProtocol {
+final class ScopeDenyHTTP: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() { client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet)) }
     override func stopLoading() {}
 }
 
-private struct ScopeDenyKeychain: AppleKeychainStoring {
+struct ScopeDenyKeychain: AppleKeychainStoring {
     func data(for item: AppleKeychainItem) throws -> Data? { throw CocoaError(.userCancelled) }
     func setData(_ data: Data, for item: AppleKeychainItem) throws { throw CocoaError(.userCancelled) }
     func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data { throw CocoaError(.userCancelled) }
