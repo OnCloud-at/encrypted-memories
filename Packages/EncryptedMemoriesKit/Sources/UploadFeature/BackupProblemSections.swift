@@ -12,11 +12,6 @@ public struct BackupProblemSections<Row: View>: View {
     private let rows: [IdentifiedProblem]
     private let row: (BackupFailedItem) -> Row
 
-    public init(items: [BackupFailedItem], @ViewBuilder row: @escaping (BackupFailedItem) -> Row) {
-        rows = items.map { IdentifiedProblem(id: .item($0.id), item: $0) }
-        self.row = row
-    }
-
     public init(rows: [BackupProblemSnapshot.Row], @ViewBuilder row: @escaping (BackupFailedItem) -> Row) {
         self.rows = rows.map { IdentifiedProblem(id: $0.id, item: $0.item) }
         self.row = row
