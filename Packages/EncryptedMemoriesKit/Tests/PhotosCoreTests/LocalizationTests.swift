@@ -142,6 +142,38 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    /// The owner froze these texts: the command, the alert title, the message, the confirm button and the failure. The
+    /// trash word is the one that the app uses elsewhere in each language. The failure offers no retry and does not
+    /// claim that nothing changed.
+    func testRevertToOriginalCopyUsesTheFrozenEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("viewer.revert_original", "Revert to Original\u{2026}", "Zum Original zurückkehren \u{2026}"),
+            ("viewer.revert_original_title", "Revert to Original", "Zum Original zurückkehren"),
+            (
+                "viewer.revert_original_message",
+                "The original becomes a new photo. The edited version moves to the Trash.",
+                "Das Original wird ein neues Foto. Die bearbeitete Version wandert in den Papierkorb."
+            ),
+            ("viewer.revert_original_confirm", "Revert", "Zurückkehren"),
+            (
+                "viewer.revert_original_failed", "The original couldn\u{2019}t be restored.",
+                "Das Original konnte nicht wiederhergestellt werden."
+            ),
+            ("action.cancel", "Cancel", "Abbrechen"),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+        for language in ["en", "de"] {
+            let failure = try XCTUnwrap(
+                try localizedValue("viewer.revert_original_failed", language: language, in: packageCatalog), language)
+            XCTAssertFalse(failure.localizedCaseInsensitiveContains("retry"), failure)
+            XCTAssertFalse(failure.localizedCaseInsensitiveContains("nothing was changed"), failure)
+            XCTAssertFalse(failure.localizedCaseInsensitiveContains("nichts"), failure)
+        }
+    }
+
     func testSourceLanguageIsEnglish() throws {
         XCTAssertEqual(try loadCatalog(appCatalog).sourceLanguage, "en")
         XCTAssertEqual(try loadCatalog(mobileCatalog).sourceLanguage, "en")

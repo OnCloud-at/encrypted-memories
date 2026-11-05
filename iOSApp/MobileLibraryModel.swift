@@ -633,6 +633,26 @@ final class MobileLibraryModel {
         refreshAfterLocalUpload()
     }
 
+    /// The backend that reverts an edited photo to its original: the account's own, or the offline fixture's. Nil when
+    /// uploads are disabled, so the viewer offers no command.
+    var editedPhotoReverter: (any EditedPhotoReverting)? {
+        facade?.editedPhotoReverter ?? (backend as? any EditedPhotoReverting)
+    }
+
+    /// Reverts an edited photo to its original. The restored original is a new photo and the edited photo moves to the
+    /// Trash, so the edited photo leaves the visible library when the remote work succeeds, like "Keep Only Favorites".
+    /// The journal of the revert resumes an interrupted run, so calling this again after a failure continues it.
+    func revertEditedPhoto(
+        main: PhotoItem, original: PhotoItem, using reverter: any EditedPhotoReverting
+    ) async throws {
+        try await removeFromVisibleLibrary([main.uid]) {
+            try await reverter.revertToOriginal(of: main, original: original)
+        }
+        duplicates?.didTrashElsewhere([main.uid])
+        // The restored original is a new library photo; the refresh brings it into the timeline.
+        refreshAfterLocalUpload()
+    }
+
     /// The user left "Keep Only Favorites" after a failure. The pending journal goes away, so no later activation
     /// can finish the operation without the user. Copies that are already saved stay as standalone photos.
     func abandonKeepOnlySeriesFavorites(seriesMainUID: PhotoUID) {

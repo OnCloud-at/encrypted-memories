@@ -271,9 +271,29 @@ public struct PhotoViewerView: View {
                     close: onClose,
                     canShowOriginal: model.canShowOriginal,
                     isShowingOriginal: model.isShowingOriginal,
-                    toggleOriginal: { model.toggleOriginal() }
+                    toggleOriginal: { model.toggleOriginal() },
+                    canRevertToOriginal: model.canRevertToOriginal,
+                    revertToOriginal: { model.requestRevertToOriginal() }
                 )
         )
+        // Only the buttons end the confirmation: the controller, not the binding, decides what a tap does.
+        .alert(
+            L10n.string("viewer.revert_original_title"),
+            isPresented: Binding(get: { model.revert.isConfirming }, set: { _ in })
+        ) {
+            Button(L10n.string("viewer.revert_original_confirm")) {
+                model.confirmRevertToOriginal(onSuccess: { onClose() })
+            }
+            Button(L10n.string("action.cancel"), role: .cancel) { model.revert.cancel() }
+        } message: {
+            Text(L10n.string("viewer.revert_original_message"))
+        }
+        .alert(
+            L10n.string("viewer.revert_original_failed"),
+            isPresented: Binding(get: { model.revert.showsFailure }, set: { _ in })
+        ) {
+            Button(L10n.string("action.ok"), role: .cancel) { model.revert.dismissFailure() }
+        }
         .onAppear {
             model.start()
         }

@@ -123,7 +123,15 @@ public final class PhotoViewerModel {
     private let silentRetryDelays: (VideoPlaybackError) -> [Duration]
     /// Waits out one silent retry delay; a cancelled viewer ends the wait early.
     private let silentRetryWait: (Duration) async -> Void
-    private let editedOriginalLookup = EditedPhotoOriginalLookup()
+    private let editedOriginalLookup: EditedPhotoOriginalLookup
+    /// Reverts an edited photo to its original; nil when the account cannot upload.
+    private let editedPhotoReverter: (any EditedPhotoReverting)?
+    /// The viewer's mutation for its context: only the own library ("Move to Trash") offers the revert.
+    private let mutationAction: ViewerMutationAction?
+    /// Host work after a revert, for example the removal of the edited photo from the timeline.
+    private let onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)?
+    /// The confirmation, the run and the failure of "Revert to Original".
+    public let revert = EditedPhotoRevertController()
     /// The originals of edited photos that this viewer found, and whether the page shows one.
     public private(set) var editedOriginal = EditedPhotoOriginalState()
 
@@ -142,6 +150,10 @@ public final class PhotoViewerModel {
         cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
         allowsVisibleDuplicateThumbnails: Bool = false,
         editedOriginalProvider: (any EditedPhotoOriginalProviding)? = nil,
+        editedPhotoReverter: (any EditedPhotoReverting)? = nil,
+        mutationAction: ViewerMutationAction? = nil,
+        onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)? = nil,
+        editedOriginalLookup: EditedPhotoOriginalLookup = EditedPhotoOriginalLookup(),
         silentRetryDelays: @escaping (VideoPlaybackError) -> [Duration] = { $0.silentRetryDelays },
         silentRetryWait: @escaping (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
@@ -165,6 +177,10 @@ public final class PhotoViewerModel {
         self.knownLocationUIDs = knownLocationUIDs
         self.burstProvider = burstProvider
         self.editedOriginalProvider = editedOriginalProvider
+        self.editedOriginalLookup = editedOriginalLookup
+        self.editedPhotoReverter = editedPhotoReverter
+        self.mutationAction = mutationAction
+        self.onReverted = onReverted
         self.previewCache = previewCache
         self.originalsCache = originalsCache
         self.cacheOriginals = cacheOriginals
@@ -285,6 +301,30 @@ public final class PhotoViewerModel {
     public var canShowOriginal: Bool { editedOriginal.canShowOriginal(of: baseCurrent.uid) }
     public var isShowingOriginal: Bool { editedOriginal.isShowingOriginal(of: baseCurrent.uid) }
 
+    /// The page is an edited photo whose original this viewer found, in the own library, with a backend that reverts,
+    /// and no confirmation, run or failure is open.
+    public var canRevertToOriginal: Bool {
+        revert.canStart(
+            canShowOriginal: canShowOriginal, mutationAction: mutationAction,
+            hasReverter: editedPhotoReverter != nil)
+    }
+
+    /// Opens the confirmation of "Revert to Original". Nothing is written until the person confirms.
+    public func requestRevertToOriginal() {
+        guard canRevertToOriginal else { return }
+        revert.request()
+    }
+
+    /// The person confirmed. `onSuccess` runs after the revert and its host work, while the viewer still exists.
+    public func confirmRevertToOriginal(onSuccess: @escaping @MainActor () -> Void) {
+        guard let original = editedOriginal.original(of: baseCurrent.uid), let editedPhotoReverter else {
+            return revert.cancel()
+        }
+        revert.confirm(
+            main: baseCurrent, original: original, reverter: editedPhotoReverter, onReverted: onReverted,
+            onSuccess: onSuccess)
+    }
+
     /// Switches the page between the edited version and its original.
     public func toggleOriginal() {
         guard canShowOriginal else { return }
@@ -326,6 +366,8 @@ public final class PhotoViewerModel {
         albumMembershipTask?.cancel()
         placeTask?.cancel()
         editedOriginalLookup.cancel()
+        // The viewer closed: a revert that ends later closes nothing. The host work of the revert still runs.
+        revert.detach()
         titleMetadataCoordinator.cancelAll()
         isLoadingOriginal = false
         video.teardown()
@@ -537,6 +579,7 @@ public final class PhotoViewerModel {
         burstSelection.reset()
         let item = baseCurrent
         editedOriginal.pageChanged(to: item.uid)
+        revert.pageChanged()
         editedOriginalLookup.settled(on: item, provider: editedOriginalProvider) { [weak self] base, original in
             self?.editedOriginal.record(original, of: base.uid)
         }

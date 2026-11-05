@@ -7270,6 +7270,46 @@
         "de": { "stringUnit": { "state": "translated", "value": "Bearbeitung zeigen" } }
       }
     },
+    "viewer.revert_original": {
+      "comment": "Viewer command that restores the unedited original of a photo edited in Photos as a new photo. It opens a confirmation, so it ends with an ellipsis.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Revert to Original…" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zum Original zurückkehren …" } }
+      }
+    },
+    "viewer.revert_original_title": {
+      "comment": "Title of the confirmation alert of the revert to original.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Revert to Original" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zum Original zurückkehren" } }
+      }
+    },
+    "viewer.revert_original_message": {
+      "comment": "Message of the confirmation alert of the revert to original. The trash word is the one that the app uses elsewhere.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The original becomes a new photo. The edited version moves to the Trash." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Original wird ein neues Foto. Die bearbeitete Version wandert in den Papierkorb." } }
+      }
+    },
+    "viewer.revert_original_confirm": {
+      "comment": "Confirm button of the revert to original.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Revert" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zurückkehren" } }
+      }
+    },
+    "viewer.revert_original_failed": {
+      "comment": "Alert text when the revert to original failed. No retry is offered.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The original couldn’t be restored." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Original konnte nicht wiederhergestellt werden." } }
+      }
+    },
     "viewer.original_badge": {
       "comment": "Short visible badge while the viewer shows the unedited original of an edited photo.",
       "extractionState": "manual",

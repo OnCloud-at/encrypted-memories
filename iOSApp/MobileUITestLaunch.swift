@@ -26,6 +26,12 @@ import SwiftUI
                 ? Int.max : nil
         }
 
+        /// With `-EncryptedMemoriesRevertFixtureFails` the fixture backend refuses every revert to original, so a UI
+        /// test can show the failure alert.
+        nonisolated static var revertFixtureFails: Bool {
+            isRequested && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesRevertFixtureFails")
+        }
+
         static var libraryLoadScenario: String? {
             let arguments = ProcessInfo.processInfo.arguments
             guard let index = arguments.firstIndex(of: "-EncryptedMemoriesLibraryLoadFixture"),

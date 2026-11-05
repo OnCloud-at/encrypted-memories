@@ -2,6 +2,14 @@ import CoreGraphics
 import XCTest
 
 extension XCUIApplication {
+    /// The viewer's menu button. It reports its long accessibility name or the short system name, in English or
+    /// German ("More actions" or "More", "Weitere Aktionen" or "Weitere").
+    var viewerMoreButton: XCUIElement {
+        buttons.matching(
+            NSPredicate(format: "label IN %@", ["More actions", "More", "Weitere Aktionen", "Weitere"])
+        ).firstMatch
+    }
+
     /// Read a rendered screen pixel in window coordinates, outside the native button backgrounds.
     func screenshotPixel(at point: CGPoint, in window: CGRect) throws -> [UInt8] {
         let image = try XCTUnwrap(screenshot().image.cgImage)
@@ -94,7 +102,8 @@ extension XCUIApplication {
     /// Metal photo elements do not report hittability. Select a complete tile below horizontal navigation,
     /// clear of the vertical controls, so its centre cannot tap the status bar or a bar action.
     func visiblePhoto(beside column: CGRect?) throws -> XCUIElement {
-        let photos = descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
+        let photos = descendants(matching: .any).matching(
+            NSPredicate(format: "label BEGINSWITH 'Photo, ' OR label BEGINSWITH 'Foto, '"))
         XCTAssertTrue(photos.firstMatch.waitForExistence(timeout: 60), "The library shows no photo")
         let window = windows.firstMatch.frame
         let navigationBottom = navigationBars.allElementsBoundByIndex

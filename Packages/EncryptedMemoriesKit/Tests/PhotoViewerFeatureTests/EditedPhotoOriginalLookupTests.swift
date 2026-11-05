@@ -10,6 +10,14 @@ final class EditedPhotoOriginalLookupTests: XCTestCase {
     private let other = item("other")
     private let original = item("original", mediaType: "image/heic")
 
+    func testTheStateGivesTheOriginalThatTheViewerFoundAndNoOtherOne() {
+        var state = EditedPhotoOriginalState()
+        XCTAssertNil(state.original(of: edited.uid))
+        state.record(original, of: edited.uid)
+        XCTAssertEqual(state.original(of: edited.uid), original)
+        XCTAssertNil(state.original(of: other.uid))
+    }
+
     // MARK: - Lookup
 
     func testTheAskStartsOnlyAfterThePhotoStaysForTheDwell() async throws {
