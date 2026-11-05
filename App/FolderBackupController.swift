@@ -245,20 +245,19 @@ final class FolderBackupController {
         return queueStore?.isOperational() == true
     }
 
-    /// Enqueues restored files again and starts a pass. Files that are gone need nothing and count as done.
+    /// Enqueues restored files again and starts a pass. A file that is gone needs nothing and
+    /// counts as done; a file whose attributes cannot be read does not count as returned, so its
+    /// queue duty stays and the next backoff tries it again.
     private func returnToBackup(paths: [String]) async -> Bool {
         guard let engine else { return false }
-        let candidates = paths.compactMap { path in
-            pendingAccess.fileURL(forPath: path).flatMap { try? FolderBackupCatalog.candidate(for: $0) }
-        }
-        do {
-            _ = try await engine.enqueueBatch(candidates)
-        } catch {
-            return false
-        }
+        let batch = await FolderBackupCatalog.returnToBackup(
+            paths: paths,
+            resolve: { [pendingAccess] path in pendingAccess.fileURL(forPath: path) },
+            engine: engine
+        )
         refreshFromQueue()
-        if !candidates.isEmpty { syncNow() }
-        return true
+        if batch.queuedCount > 0 { syncNow() }
+        return batch.allDone
     }
 
     private func persistFolders() {
