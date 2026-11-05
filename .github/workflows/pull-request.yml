@@ -284,13 +284,11 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Start the simulator
+      - name: Record the runner state at the start
+        if: ${{ !cancelled() }}
         continue-on-error: true
         timeout-minutes: 2
-        env:
-          IOS_TEST_ACTION: boot-simulator
-          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
-        run: bash ./scripts/verify-ios-app-tests.sh
+        run: bash .github/scripts/runner_state.sh start
       - uses: ./.github/actions/prepare-apple-build
         id: prepare
         with:
@@ -298,6 +296,13 @@ jobs:
           # A queue run saves to its own temporary branch (gh-readonly-queue/...), which no other run can read.
           save-cache: ${{ github.event_name != 'merge_group' }}
           measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
+      - name: Start the simulator
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          IOS_TEST_ACTION: boot-simulator
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
       - name: Verify iOS shared architecture
         id: architecture
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
