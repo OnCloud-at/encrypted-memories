@@ -130,15 +130,14 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertFalse(store!.isOperational())
     }
 
-    func testApplicationHealthStaysStickyUntilRecoveryIsExplicit() throws {
+    func testATransientFailureIsForgottenOnceTheDatabaseAnswers() throws {
         store = try makeStore()
         let fault = try SQLiteReadInterrupt(in: store!, matching: "SELECT COUNT(*) FROM photo_catalog")
         defer { fault.stop() }
         XCTAssertNil(store!.count())
         XCTAssertTrue(fault.fired)
-        XCTAssertFalse(store!.isOperational(), "Application recovery must stay disabled")
-        XCTAssertTrue(try recoveryProbe(in: store!))
-        XCTAssertTrue(store!.isOperational())
+        XCTAssertTrue(store!.isOperational(), "the transient interrupt is forgotten once the database answers")
+        XCTAssertTrue(store!.isOperational(), "and stays forgotten")
     }
 
     func testAnEntryReadThrowsAfterABindingFailure() throws {
@@ -181,7 +180,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertThrowsError(try store!.entry(for: row.localIdentifier))
         XCTAssertTrue(fault.fired)
         fault.stop()
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
         try withDeniedSQLiteSelect(in: store!) {
             XCTAssertThrowsError(try store!.entry(for: row.localIdentifier))
         }
@@ -210,7 +209,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             } else {
                 XCTAssertNil(store!.presentEntries(for: ["known"]))
             }
-            XCTAssertFalse(try recoveryProbe(in: store!))
+            XCTAssertFalse(store!.isOperational())
             store!.close()
         }
     }
@@ -221,7 +220,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertFalse(store!.appendFullScanSnapshotIdentifiers(["known"]))
         XCTAssertTrue(fault.fired)
         fault.stop()
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
         XCTAssertEqual(store!.fullScanSnapshotCount(), 0)
     }
 
@@ -244,7 +243,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             XCTAssertFalse(store.upsertBatch([entry]), "the refused write (code \(code)) persists nothing")
 
             WriteFaultVFS.arm(nil)
-            XCTAssertTrue(try recoveryProbe(in: store), "code \(code): the store answers again without a reopen")
+            XCTAssertTrue(store.isOperational(), "code \(code): the store answers again without a reopen")
             XCTAssertTrue(store.upsertBatch([entry]), "code \(code): the same instance persists the entry")
 
             XCTAssertEqual(
@@ -280,7 +279,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertEqual(store!.count(), 1, "the busy database still answers the count read")
 
         XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
-        XCTAssertTrue(try recoveryProbe(in: store!), "the database answers again")
+        XCTAssertTrue(store!.isOperational(), "the database answers again")
         XCTAssertTrue(store!.upsertBatch([self.entry("after-clearing")]))
     }
 
@@ -296,7 +295,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertNil(store!.count(), "the interrupted count answers unknown, not zero")
 
         connection.withLock { sqlite3_progress_handler(connection.database, 0, nil, nil) }
-        XCTAssertTrue(try recoveryProbe(in: store!), "the store answers again")
+        XCTAssertTrue(store!.isOperational(), "the store answers again")
         XCTAssertTrue(store!.upsertBatch([self.entry("after-interrupt")]))
     }
 
@@ -318,7 +317,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             XCTAssertFalse(connection.failuresAreTransient, "a refused commit is not a passing failure")
         }
 
-        XCTAssertFalse(try recoveryProbe(in: store!), "a refused commit is a lasting failure")
+        XCTAssertFalse(store!.isOperational(), "a refused commit is a lasting failure")
         XCTAssertNil(try store!.entry(for: entry.localIdentifier), "nothing was written")
         XCTAssertEqual(store!.snapshot()?.total, 0, "The successful legacy read confirms the rollback")
         XCTAssertEqual(store!.count(), 0)
@@ -342,7 +341,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertEqual(store!.presentEntries(for: [entry.localIdentifier])?.keys.sorted(), [entry.localIdentifier])
         XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.count, 1)
         XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: entry.localIdentifier, limit: 10)?.count, 0)
-        XCTAssertFalse(try recoveryProbe(in: store!), "the open transaction keeps the store stopped")
+        XCTAssertFalse(store!.isOperational(), "the open transaction keeps the store stopped")
 
         connection.withLock {
             XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
@@ -356,7 +355,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.map(\.localIdentifier),
             [entry.localIdentifier],
             "the paged read answers again")
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
         XCTAssertTrue(store!.upsertBatch([self.entry("after-rollback")]))
     }
 
@@ -378,7 +377,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
                 "a write carries no select, so it answers on its own while reads are denied")
         }
 
-        XCTAssertFalse(try recoveryProbe(in: store!), "a lasting failure stays recorded")
+        XCTAssertFalse(store!.isOperational(), "a lasting failure stays recorded")
         XCTAssertEqual(store!.presentEntries(for: [entry.localIdentifier])?.keys.sorted(), [entry.localIdentifier])
         XCTAssertEqual(store!.count(), 2, "The legacy count still answers its own successful SQL")
         XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.count, 2)
@@ -421,7 +420,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             XCTAssertTrue(connection.operationFailed)
             XCTAssertTrue(connection.failuresAreTransient, "the interrupt records as a transient failure")
         }
-        XCTAssertTrue(try recoveryProbe(in: store!), "the probe clears the transient classify failure")
+        XCTAssertTrue(store!.isOperational(), "the probe clears the transient classify failure")
         XCTAssertEqual(
             store!.classifyBatch([existing, self.entry("recovered-new")]),
             [.unchanged, .inserted],
@@ -451,7 +450,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             XCTAssertTrue(connection.operationFailed)
             XCTAssertFalse(connection.failuresAreTransient, "the corrupt step code records as lasting")
         }
-        XCTAssertFalse(try recoveryProbe(in: store!), "the corrupted database keeps the catalog stopped")
+        XCTAssertFalse(store!.isOperational(), "the corrupted database keeps the catalog stopped")
         XCTAssertEqual(store!.count(), 1, "The legacy scalar read still answers")
         XCTAssertNil(
             store!.presentEntries(for: [existing.localIdentifier]),

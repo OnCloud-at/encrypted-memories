@@ -72,11 +72,11 @@ import UploadCore
                 remote: NoRemoteEffects(), files: files))
         #expect(await session.restore([key.localUID]))
         if holdTransaction {
-            #expect(queue.isOperational(), "A passing legacy health check must not certify an open transaction")
+            #expect(!queue.isOperational(), "The health check refuses an open transaction")
             #expect(connection.withLock { sqlite3_get_autocommit(connection.database) } == 0)
         } else {
             #expect(try #require(calls.readFault).fired)
-            #expect(!queue.isOperational(), "Recovery stays off; the existing health guard also rejects this fault")
+            #expect(queue.isOperational(), "The transient interrupt is forgotten once the database answers")
         }
         #expect(fixture.store.sourceState(for: key)?.needsQueueSync == true)
         calls.readFault?.stop()

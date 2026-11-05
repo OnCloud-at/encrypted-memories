@@ -108,7 +108,6 @@ final class QueueDecisionReadTests: XCTestCase {
                         lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue)))
         }
         XCTAssertEqual(BackupProblemSnapshot.backup(in: queue)?.rows.count, 3)
-        queue.recoversTransientFailuresForTesting = true
         let fault = try SQLiteReadInterrupt(in: queue, matching: Self.problemSQL, afterRows: 2)
         defer { fault.stop() }
         XCTAssertNil(BackupProblemSnapshot.backup(in: queue), "a cut-short list must not become a bulk target")
@@ -128,7 +127,6 @@ final class QueueDecisionReadTests: XCTestCase {
                         lastError: BackupIssueRecord(kind: .permission, detail: "denied").persistedValue)))
         }
         XCTAssertEqual(try AlbumSyncBackupReport.read(from: queue, localIdentifiers: ids).problems.count, 3)
-        queue.recoversTransientFailuresForTesting = true
         let fault = try SQLiteReadInterrupt(in: queue, matching: Self.problemSQL, afterRows: 2)
         defer { fault.stop() }
         XCTAssertThrowsError(try AlbumSyncBackupReport.read(from: queue, localIdentifiers: ids)) {
@@ -146,7 +144,6 @@ final class QueueDecisionReadTests: XCTestCase {
             XCTAssertTrue(queue.upsert(row(id, state: .completed, revision: Int64(index + 1))))
         }
         XCTAssertEqual(try AlbumSyncBackupReport.read(from: queue, localIdentifiers: ids).backedUp, 3)
-        queue.recoversTransientFailuresForTesting = true
         let fault = try SQLiteReadInterrupt(
             in: queue, matching: "SELECT source_kind, source_id, resource, revision_us, state, original_filename",
             occurrence: 2)

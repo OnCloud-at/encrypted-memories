@@ -271,7 +271,7 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
-    func testAReadFailureRecordedDuringSourceReadRefusesTheDecisionEvenWithTheFullRevisionSet() async throws {
+    func testAFailedDecisionReadAfterTheSourceReadRefusesTheDecisionEvenWithTheFullRevisionSet() async throws {
         let gate = BulkSourceReadGate()
         let fixture = try makeFixture(
             HeldBulkSourceResolver(inner: ScriptedBackupResolver(defaultModified: date), gate: gate))
@@ -282,8 +282,6 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         let stored = try XCTUnwrap(Mirror(reflecting: fixture.controller).children.first { $0.label == "queueStore" })
         let queue = try XCTUnwrap(
             Mirror(reflecting: stored.value).children.first?.value as? UploadBackupSyncQueueManifestStore)
-        let connection = try XCTUnwrap(
-            Mirror(reflecting: queue).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
         XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
         let deadline = ContinuousClock.now + .seconds(3)
         while !(await gate.hasStarted), ContinuousClock.now < deadline {
@@ -291,11 +289,25 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         }
         let entered = await gate.hasStarted
         XCTAssertTrue(entered)
-        // Inject the real connection's transient failure latch. This is not an interrupted-SQL-read measurement.
-        connection.withLock { connection.markFailed(resultCode: SQLITE_INTERRUPT) }
+        // The decision's own read of the revisions fails after the source read, after it returned the whole parked
+        // set: a newer, completed revision follows the parked one. A health check that passes again afterwards
+        // proves nothing about that read.
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: fixture.source("held"), revision: UploadBackupRevision(date: date.addingTimeInterval(60)),
+                    originalFilename: "held.heic", state: .completed, updatedAt: date)))
+        // Other statements contain the same text (a removal and two existence checks). The test relies on none of them
+        // running on this connection before the keyed revision read. If one did, it would take the fault's one match
+        // without returning two rows, the keyed read would run without the fault, and XCTAssertTrue(fault.fired) below
+        // fails loudly.
+        let fault = try SQLiteReadInterrupt(
+            in: queue, matching: "FROM backup_sync_queue WHERE source_kind=? AND source_id=?", afterRows: 2)
+        defer { fault.stop() }
         await gate.release()
         await fixture.controller.bulkPhotoActions.waitUntilFinished()
-        XCTAssertFalse(queue.isOperational())
+        XCTAssertTrue(fault.fired, "the decision's revision read failed")
+        XCTAssertTrue(queue.isOperational(), "the transient interrupt is forgotten once the database answers")
         XCTAssertEqual(fixture.entry("held", at: date)?.state, .failedPermanent)
         XCTAssertTrue(fixture.journal.entry(for: fixture.source("held")).isEmpty)
         XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, 0)
@@ -659,15 +671,18 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         defer { fixture.cleanup() }
         try fixture.park("photo", at: date)
         let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
-        let connection = try XCTUnwrap(
-            Mirror(reflecting: queue).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
         let session = fixture.controller.makeProblemListSession()
-        connection.withLock { connection.markFailed(resultCode: SQLITE_INTERRUPT) }
+        // A transaction that stays open refuses the preparation's read and keeps the store stopped while it is open.
+        let connection = try storeConnection(queue)
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        }
         let failed = await fixture.controller.prepareBackUpAgain()
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        }
         XCTAssertNil(failed)
         XCTAssertEqual(session.fixedActionMessage, L10n.string("backup.error_local_state_unavailable"))
-        // Explicit fixture repair tests message lifetime, not automatic production recovery (#1004 activation is off).
-        XCTAssertTrue(connection.isOperationalAfterRecovery())
         let fresh = await fixture.controller.prepareBackUpAgain()
         XCTAssertEqual(fresh?.count, 1)
         XCTAssertNil(session.fixedActionMessage)

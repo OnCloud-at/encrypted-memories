@@ -5972,12 +5972,11 @@ extension PhotoLibraryBackupControllerStateTests {
             guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
                 return XCTFail("Fixture prerequisite: the context is registered")
             }
-            // The controller's own catalog connection. Its health check forgets the transient fault, as it will once
-            // recovery ships, so only the failed read itself is unknown.
+            // The controller's own catalog connection. Its health check forgets the transient fault, so only the
+            // failed read itself is unknown.
             let catalog = try XCTUnwrap(
                 Mirror(reflecting: f.controller!).children.first { $0.label == "catalogStore" }?.value
                     as? PhotoLibraryCatalogManifestStore)
-            catalog.recoversTransientFailuresForTesting = true
             // The first keyed catalog read plans the check; the second is the current-state read.
             let fault = try SQLiteReadInterrupt(
                 in: catalog, matching: "FROM photo_catalog WHERE local_id=?", occurrence: 2)
@@ -6336,7 +6335,6 @@ final class RecordedLogLines: @unchecked Sendable {
             }
             for row in rows { XCTAssertTrue(queue.upsert(row)) }
             XCTAssertTrue(fixture.controller.failedItems().offersUserRetry)
-            queue.recoversTransientFailuresForTesting = true
             let fault = try SQLiteReadInterrupt(
                 in: queue, matching: "WHERE state IN ('failed', 'failedPermanent', 'sourceMissing', 'blockedByDraft')",
                 afterRows: 2)
@@ -6353,6 +6351,66 @@ final class RecordedLogLines: @unchecked Sendable {
                     "\(row.originalFilename): a cut-short list reopens no photo")
             }
             XCTAssertEqual(fixture.controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
+            await fixture.controller.shutdown()
+        }
+    }
+#endif
+
+// MARK: - #1004 B2c: a removal for an exclusion is proven by the queue, not by a later health check
+
+#if DEBUG
+    extension PhotoLibraryBackupControllerStateTests {
+        /// A removal that a transient failure undid keeps the exclusion's duty, so the retry removes the row. A later
+        /// health check that passes again proves nothing about the removal.
+        func testAFailedQueueRemovalKeepsTheExclusionOwed() async throws {
+            let fixture = try makeControllerFixture(
+                prefix: "backup-exclusion-removal", identityResolver: FakeIdentityResolver())
+            defer { fixture.cleanup() }
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let row = UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: "excluded"), revision: .init(rawValue: 1),
+                originalFilename: "excluded", state: .failedPermanent, attempts: 8,
+                lastError: BackupIssueRecord(kind: .permission, detail: "denied").persistedValue,
+                updatedAt: Date(timeIntervalSince1970: 1_720_000_000))
+            XCTAssertTrue(queue.upsert(row))
+
+            let fault = try SQLiteReadInterrupt(
+                in: queue, matching: "DELETE FROM backup_sync_queue WHERE source_kind=? AND source_id=?;")
+            let removed = await fixture.controller.removeFromBackup(identifiers: ["excluded"])
+            fault.stop()
+            XCTAssertTrue(fault.fired)
+            XCTAssertFalse(removed, "a removal that did not happen keeps its duty")
+            XCTAssertEqual(try queue.entry(for: row.source, revision: row.revision), row, "the row stays")
+
+            let retried = await fixture.controller.removeFromBackup(identifiers: ["excluded"])
+            XCTAssertTrue(retried, "the retry removes the row once the database answers")
+            XCTAssertNil(try queue.entry(for: row.source, revision: row.revision))
+            await fixture.controller.shutdown()
+        }
+
+        /// A removal whose confirming read fails is not proven. The duty stays, and the retry finds the row gone.
+        func testAnUnknownRemovalCheckKeepsTheExclusionOwed() async throws {
+            let fixture = try makeControllerFixture(
+                prefix: "backup-exclusion-check", identityResolver: FakeIdentityResolver())
+            defer { fixture.cleanup() }
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let row = UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: "excluded"), revision: .init(rawValue: 1),
+                originalFilename: "excluded", state: .failedPermanent, attempts: 8,
+                lastError: BackupIssueRecord(kind: .permission, detail: "denied").persistedValue,
+                updatedAt: Date(timeIntervalSince1970: 1_720_000_000))
+            XCTAssertTrue(queue.upsert(row))
+
+            let fault = try SQLiteReadInterrupt(
+                in: queue, matching: "SELECT source_kind, source_id, resource, revision_us, state, original_filename")
+            let removed = await fixture.controller.removeFromBackup(identifiers: ["excluded"])
+            fault.stop()
+            XCTAssertTrue(fault.fired)
+            XCTAssertFalse(removed, "a removal that no complete read confirms keeps its duty")
+            XCTAssertNil(try queue.entry(for: row.source, revision: row.revision), "the removal itself ran")
+
+            let retried = await fixture.controller.removeFromBackup(identifiers: ["excluded"])
+            XCTAssertTrue(retried, "the retry confirms that the row is gone")
             await fixture.controller.shutdown()
         }
     }

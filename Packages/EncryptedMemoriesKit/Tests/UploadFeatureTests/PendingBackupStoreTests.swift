@@ -1742,11 +1742,12 @@ final class PendingQueueIntegrationTests: XCTestCase {
                 entry("dup", state: .alreadyBackedUp),
                 entry("failed", state: .failedPermanent),
             ]))
-        XCTAssertEqual(Set(queue.unsettledRows().map(\.source.identifier)), ["waiting", "failed"])
-        XCTAssertEqual(queue.rows(kind: .photoLibraryAsset, identifiers: ["done"]).map(\.state), [.completed])
+        XCTAssertEqual(Set((try queue.decisionUnsettledRows()).map(\.source.identifier)), ["waiting", "failed"])
+        XCTAssertEqual(
+            try queue.decisionRows(kind: .photoLibraryAsset, identifiers: ["done"]).map(\.state), [.completed])
     }
 
-    func testRowsForSeveralSourcesReturnEachSourceAndSkipUnknownOnes() {
+    func testRowsForSeveralSourcesReturnEachSourceAndSkipUnknownOnes() throws {
         XCTAssertTrue(
             queue.upsertBatch([
                 entry("waiting", state: .discovered),
@@ -1754,14 +1755,15 @@ final class PendingQueueIntegrationTests: XCTestCase {
                 entry("failed", state: .failedPermanent),
             ]))
 
-        let rows = queue.rows(kind: .photoLibraryAsset, identifiers: ["waiting", "done", "unknown", "failed"])
+        let rows = try queue.decisionRows(
+            kind: .photoLibraryAsset, identifiers: ["waiting", "done", "unknown", "failed"])
 
         XCTAssertEqual(rows.count, 3)
         XCTAssertEqual(
             Dictionary(uniqueKeysWithValues: rows.map { ($0.source.identifier, $0.state) }),
             ["waiting": .discovered, "done": .completed, "failed": .failedPermanent])
-        XCTAssertTrue(queue.rows(kind: .photoLibraryAsset, identifiers: []).isEmpty)
-        XCTAssertTrue(queue.rows(kind: .fileURL, identifiers: ["waiting"]).isEmpty)
+        XCTAssertTrue(try queue.decisionRows(kind: .photoLibraryAsset, identifiers: []).isEmpty)
+        XCTAssertTrue(try queue.decisionRows(kind: .fileURL, identifiers: ["waiting"]).isEmpty)
         XCTAssertTrue(queue.isOperational())
     }
 
@@ -1774,14 +1776,14 @@ final class PendingQueueIntegrationTests: XCTestCase {
             now: { [date] in date }
         )
         _ = try await engine.enqueueBatch([candidate("kept"), candidate("excluded")])
-        XCTAssertEqual(Set(queue.unsettledRows().map(\.source.identifier)), ["kept"])
+        XCTAssertEqual(Set((try queue.decisionUnsettledRows()).map(\.source.identifier)), ["kept"])
 
         exclusions.available = false
         do {
             _ = try await engine.enqueueBatch([candidate("later")])
             XCTFail("an unknown exclusion state must never enqueue a photo")
         } catch {}
-        XCTAssertFalse(queue.unsettledRows().contains { $0.source.identifier == "later" })
+        XCTAssertFalse((try queue.decisionUnsettledRows()).contains { $0.source.identifier == "later" })
     }
 
     /// A photo whose pending row this build cannot read is queued like an included photo, so a scan never marks its
@@ -1794,7 +1796,7 @@ final class PendingQueueIntegrationTests: XCTestCase {
 
         _ = try await engine.enqueueBatch([candidate("kept"), candidate("excluded"), candidate("waiting")])
 
-        XCTAssertEqual(Set(queue.unsettledRows().map(\.source.identifier)), ["kept", "waiting"])
+        XCTAssertEqual(Set((try queue.decisionUnsettledRows()).map(\.source.identifier)), ["kept", "waiting"])
     }
 
     /// The repair paths keep a photo whose pending row this build cannot read: the missing-source sweep inserts it,
@@ -1806,7 +1808,7 @@ final class PendingQueueIntegrationTests: XCTestCase {
             now: { [date] in date })
 
         try await engine.enqueueMissingSources([candidate("waiting"), candidate("excluded")])
-        XCTAssertEqual(Set(queue.unsettledRows().map(\.source.identifier)), ["waiting"])
+        XCTAssertEqual(Set((try queue.decisionUnsettledRows()).map(\.source.identifier)), ["waiting"])
 
         XCTAssertTrue(queue.upsert(entry("changed", state: .sourceMissing)))
         try await engine.enqueueChangedMissingSources([candidate("changed")])

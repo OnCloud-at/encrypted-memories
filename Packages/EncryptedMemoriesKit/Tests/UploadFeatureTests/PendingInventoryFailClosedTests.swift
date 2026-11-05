@@ -157,7 +157,9 @@ final class PendingInventoryFailClosedTests: XCTestCase {
         for index in 0..<3 { enqueue("unchecked-\(index)", .discovered) }
         // The interrupt armed by the second row also ends the step that returns it, so the prefix is one row.
         let probe = try SQLiteReadInterrupt(in: queue!, matching: Self.inventoryRead, afterRows: 2)
-        XCTAssertEqual(queue.unsettledRows().count, 1, "the fixture leaves a prefix of one row")
+        XCTAssertThrowsError(try queue.decisionUnsettledRows(), "the fixture cuts the read short")
+        XCTAssertTrue(probe.fired)
+        XCTAssertEqual(probe.tracedRows, 2, "the second row arms the interrupt, so one row came before it")
         probe.stop()
         let fault = try SQLiteReadInterrupt(in: queue!, matching: Self.inventoryRead, afterRows: 2)
         faults.append { fault.stop() }
@@ -499,7 +501,7 @@ final class PendingInventoryFailClosedTests: XCTestCase {
                     source: source(id), revision: revision, reconciliation: receipt, lastError: nil,
                     updatedAt: date.addingTimeInterval(-60)))
         }
-        let claimed = queue.claimRunnable(limit: 10, claimedAt: date, excludingSourcesOf: [])
+        let claimed = try XCTUnwrap(queue.claimRunnable(limit: 10, claimedAt: date, excludingSourcesOf: []))
         XCTAssertEqual(Set(claimed.map(\.source.identifier)), ["a-stale", "b-stale"])
         for id in ["a-stale", "b-stale"] {
             // The claim returns the rows as it selected them; the stored row is `checking` and keeps its receipt.
@@ -689,61 +691,6 @@ final class PendingInventoryFailClosedTests: XCTestCase {
     }
 }
 
-/// Fails every statement whose expanded SQL matches, until `stop()`. Other statements and probes run normally.
-/// With `fails: false` it only counts the matching statement runs.
-private final class SQLiteStatementFaults {
-    private let connection: SQLiteStoreConnection
-    private let matches: (String) -> Bool
-    private let fails: Bool
-    private var statement: UnsafeMutableRawPointer?
-    private var fired = 0
-    private var matched = 0
-    private var stopped = false
-
-    init(in store: Any, fails: Bool = true, matches: @escaping (String) -> Bool) throws {
-        connection = try storeConnection(store)
-        self.matches = matches
-        self.fails = fails
-        connection.withLock {
-            sqlite3_trace_v2(
-                connection.database, UInt32(SQLITE_TRACE_STMT),
-                { _, context, statement, _ in
-                    guard let context, let statement else { return 0 }
-                    let faults = Unmanaged<SQLiteStatementFaults>.fromOpaque(context).takeUnretainedValue()
-                    faults.statement = nil
-                    guard let expanded = sqlite3_expanded_sql(OpaquePointer(statement)) else { return 0 }
-                    defer { sqlite3_free(expanded) }
-                    guard faults.matches(String(cString: expanded)) else { return 0 }
-                    faults.matched += 1
-                    if faults.fails { faults.statement = statement }
-                    return 0
-                }, Unmanaged.passUnretained(self).toOpaque())
-            sqlite3_progress_handler(
-                connection.database, 1,
-                { context in
-                    guard let context else { return 0 }
-                    let faults = Unmanaged<SQLiteStatementFaults>.fromOpaque(context).takeUnretainedValue()
-                    guard faults.statement != nil else { return 0 }
-                    faults.statement = nil
-                    faults.fired += 1
-                    return 1
-                }, Unmanaged.passUnretained(self).toOpaque())
-        }
-    }
-
-    var firedCount: Int { connection.withLock { fired } }
-    var matchedCount: Int { connection.withLock { matched } }
-
-    func stop() {
-        connection.withLock {
-            guard !stopped else { return }
-            stopped = true
-            sqlite3_trace_v2(connection.database, 0, nil, nil)
-            sqlite3_progress_handler(connection.database, 0, nil, nil)
-        }
-    }
-}
-
 private struct EveryKeyMetadata: PendingSourceMetadataProviding {
     func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
         Dictionary(
@@ -818,13 +765,9 @@ private final class CountingDecisionReads: UploadBackupSyncQueueObserving, @unch
         inner.setChangeObserver(observer)
     }
     func changes() -> AsyncStream<UploadBackupSyncQueueChange> { inner.changes() }
-    func unsettledRows() -> [UploadBackupQueueRowState] { inner.unsettledRows() }
     func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { try inner.decisionUnsettledRows() }
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
         inner.backedUpRevisions(kind: kind)
-    }
-    func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
-        inner.rows(kind: kind, identifiers: identifiers)
     }
     func decisionRows(
         kind: UploadSourceIdentity.Kind, identifiers: Set<String>
