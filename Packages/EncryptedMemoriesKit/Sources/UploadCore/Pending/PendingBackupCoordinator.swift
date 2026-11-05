@@ -32,6 +32,8 @@ public actor PendingBackupCoordinator {
         /// First retry after a source state could not be read. Each further failed retry doubles it, up to the limit.
         public var unreadableRetryDelay: Duration
         public var unreadableRetryLimit: Duration
+        /// While a full queue read is owed, queue events retry it at most once per this delay (#1004).
+        public var inventoryRetryDelay: Duration
 
         public init(
             membershipInterval: Duration = .seconds(1),
@@ -43,7 +45,8 @@ public actor PendingBackupCoordinator {
             acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60,
             libraryChangeDelay: Duration = .milliseconds(500),
             unreadableRetryDelay: Duration = .seconds(60),
-            unreadableRetryLimit: Duration = .seconds(30 * 60)
+            unreadableRetryLimit: Duration = .seconds(30 * 60),
+            inventoryRetryDelay: Duration = .seconds(2)
         ) {
             self.membershipInterval = membershipInterval
             self.progressInterval = progressInterval
@@ -56,6 +59,7 @@ public actor PendingBackupCoordinator {
             // A zero delay would retry an unreadable row without pause.
             self.unreadableRetryDelay = max(.seconds(1), unreadableRetryDelay)
             self.unreadableRetryLimit = unreadableRetryLimit
+            self.inventoryRetryDelay = inventoryRetryDelay
         }
     }
 
@@ -206,6 +210,16 @@ public actor PendingBackupCoordinator {
     /// Sources with an earlier revision that is backed up. Their Proton photo represents them until the
     /// duplicate check of a newer revision decides on an upload, so no tile shows beside it meanwhile.
     private var backedUpBefore = Set<PendingSourceKey>()
+    /// Kinds whose last full queue inventory failed. Their cached rows stay the last known ones, and unchecked photos
+    /// wait, until the next queue event of the kind or the next library change reads the inventory again (#1004).
+    private var inventoryOwed = Set<UploadSourceIdentity.Kind>()
+    /// Sources whose keyed reload failed. They keep their cached row and state until a later read answers.
+    private var reloadOwed = Set<PendingSourceKey>()
+    /// Unchecked sources whose earlier revisions could not be read. One may be an edit of a backed-up photo, so it
+    /// waits out of admission until a read answers.
+    private var earlierRevisionsUnknown = Set<PendingSourceKey>()
+    /// The one pending retry of an owed full read per kind. Queue events within its delay share it.
+    private var inventoryRetries: [UploadSourceIdentity.Kind: Task<Void, Never>] = [:]
 
     // Presentation, maintained incrementally.
     private var tilesByKey: [PendingSourceKey: PendingTile] = [:]
@@ -305,7 +319,7 @@ public actor PendingBackupCoordinator {
                         await self?.handle(change, kind: kind)
                     }
                 })
-            for row in queue.unsettledRows() where row.source.kind == kind { absorb(row) }
+            for row in certifiedInventory(of: kind, from: queue) ?? [] { absorb(row) }
         }
         learnBackedUpSources()
         learnEarlierRevisions()
@@ -340,6 +354,8 @@ public actor PendingBackupCoordinator {
         reconcileTimer?.cancel()
         actionTimer?.cancel()
         excludedCheckTask?.cancel()
+        for retry in inventoryRetries.values { retry.cancel() }
+        inventoryRetries.removeAll()
         laterTrashRecoveryTask?.cancel()
         startupLaterTrashKeys.removeAll()
         startupLaterTrashGenerations.removeAll()
@@ -790,6 +806,7 @@ public actor PendingBackupCoordinator {
         guard !Task.isCancelled, !closed else { return }
         excludedCheckReading = true
         excludedCheckAgain = false
+        if retryOwedReads() { await refreshMetadata() }
         await refreshExcludedAccessibility()
         excludedCheckReading = false
         excludedCheckTask = nil
@@ -807,30 +824,117 @@ public actor PendingBackupCoordinator {
         guard !closed, let queue = queues[kind] else { return }
         switch change {
         case .all:
-            let previousRows = rows.filter { $0.key.kind == kind }
-            for key in previousRows.keys { rows[key] = nil }
-            for row in queue.unsettledRows() where row.source.kind == kind { absorb(row) }
-            if kind == .photoLibraryAsset { learnBackedUpSources() }
-            learnEarlierRevisions()
-            let current = Set(rows.keys.filter { $0.kind == kind })
-            let gone = Set(previousRows.keys).subtracting(current)
-            // A row that was still active settled or left: it takes the per-source path, so its durable handoff
-            // keeps the tile. Rows that had settled before only drop their state; there can be many of them.
-            let wasActive = gone.filter { key in
-                guard let state = previousRows[key]?.state else { return false }
-                return state != .completed && state != .alreadyBackedUp
-            }
-            for key in gone.subtracting(wasActive) where handoffs[key] == nil { dropSourceState(key) }
-            reloadRows(for: Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current).union(wasActive))
-            dirty.formUnion(Set(previousRows.keys).union(current))
+            reloadInventory(of: kind, from: queue)
+            retryOwedKeys(of: kind)
         case .sources(let grouped), .enqueued(let grouped):
+            scheduleInventoryRetry(of: kind)
             let identifiers = grouped[kind] ?? []
             let keys = Set(identifiers.map { PendingSourceKey(kind: kind, identifier: $0) })
-            reloadRows(for: keys)
+            retryOwedKeys(of: kind, with: keys)
             dirty.formUnion(keys)
         }
         await refreshMetadata()
         scheduleMembershipPublish()
+    }
+
+    /// The complete unsettled rows of a kind. A failed read answers nil and owes the inventory: a prefix or an empty
+    /// answer never counts as the queue (#1004).
+    private func certifiedInventory(
+        of kind: UploadSourceIdentity.Kind, from queue: any UploadBackupSyncQueueObserving
+    ) -> [UploadBackupQueueRowState]? {
+        guard let inventory = try? queue.decisionUnsettledRows() else {
+            inventoryOwed.insert(kind)
+            return nil
+        }
+        inventoryOwed.remove(kind)
+        return inventory.filter { $0.source.kind == kind }
+    }
+
+    /// Replaces the cached rows of a kind with its complete inventory. An unknown inventory changes nothing: no row
+    /// counts as gone, and no source state, checkmark or replacement evidence is dropped.
+    private func reloadInventory(of kind: UploadSourceIdentity.Kind, from queue: any UploadBackupSyncQueueObserving) {
+        guard let inventory = certifiedInventory(of: kind, from: queue) else { return }
+        let wasUnknown = earlierRevisionsUnknown.filter { $0.kind == kind }
+        let previousRows = rows.filter { $0.key.kind == kind }
+        for key in previousRows.keys { rows[key] = nil }
+        for row in inventory { absorb(row) }
+        if kind == .photoLibraryAsset { learnBackedUpSources() }
+        learnEarlierRevisions()
+        let current = Set(rows.keys.filter { $0.kind == kind })
+        let gone = Set(previousRows.keys).subtracting(current)
+        // A row that was still active settled or left: it takes the per-source path, so its durable handoff
+        // keeps the tile. Rows that had settled before only drop their state; there can be many of them.
+        let wasActive = gone.filter { key in
+            guard let state = previousRows[key]?.state else { return false }
+            return state != .completed && state != .alreadyBackedUp
+        }
+        for key in gone.subtracting(wasActive) where handoffs[key] == nil { dropSourceState(key) }
+        let reload = Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current).union(wasActive)
+        // A failed reload must not hide these sources, for example a photo that just settled and whose handoff event
+        // has not arrived yet: their last known rows stay until a read answers.
+        for key in reload { rows[key] = previousRows[key] }
+        reloadRows(for: reload)
+        // A restored row keeps its earlier-revision hold until a keyed read answers: the full read above dropped the
+        // hold, because the source was missing from the inventory.
+        earlierRevisionsUnknown.formUnion(wasUnknown.intersection(reload).intersection(reloadOwed))
+        dirty.formUnion(Set(previousRows.keys).union(current))
+    }
+
+    /// Queue events retry an owed full read after `inventoryRetryDelay`, once for all events meanwhile: a read that
+    /// fails again on every event would otherwise scan the queue once per event. A library change or the app becoming
+    /// active still reads at once.
+    private func scheduleInventoryRetry(of kind: UploadSourceIdentity.Kind) {
+        guard inventoryOwed.contains(kind), inventoryRetries[kind] == nil, !closed else { return }
+        let delay = configuration.inventoryRetryDelay
+        inventoryRetries[kind] = Task { [weak self, sleep] in
+            // The sleep suspends this task only; the coordinator handles events meanwhile.
+            do { try await sleep(delay) } catch { return }
+            await self?.retryInventory(of: kind)
+        }
+    }
+
+    private func retryInventory(of kind: UploadSourceIdentity.Kind) async {
+        inventoryRetries[kind] = nil
+        guard !closed, inventoryOwed.contains(kind), let queue = queues[kind] else { return }
+        reloadInventory(of: kind, from: queue)
+        retryOwedKeys(of: kind)
+        await refreshMetadata()
+        scheduleMembershipPublish()
+    }
+
+    /// Reads the owed keyed rows and earlier revisions of a kind again, together with `keys`.
+    private func retryOwedKeys(of kind: UploadSourceIdentity.Kind, with keys: Set<PendingSourceKey> = []) {
+        let owed = keys.union(reloadOwed.filter { $0.kind == kind })
+        if !owed.isEmpty { reloadRows(for: owed) }
+        retryEarlierRevisions(of: kind)
+    }
+
+    /// Reads the unknown earlier revisions of a kind in turns of at most the admission limit, in a fixed order, all
+    /// within this retry: `learnEarlierRevisions` reads nothing for a larger set. More unknown keys than the limit
+    /// happen when unknown photos leave the admission count (their upload evidence arrives) and a later admission adds
+    /// new unknown ones. A turn whose read fails is read again one source at a time, so one source whose read keeps
+    /// failing holds only itself.
+    private func retryEarlierRevisions(of kind: UploadSourceIdentity.Kind) {
+        let unknown = earlierRevisionsUnknown.filter { $0.kind == kind }.sorted()
+        let turn = max(1, configuration.uncheckedAdmissionLimit)
+        for start in stride(from: 0, to: unknown.count, by: turn) {
+            let keys = Set(unknown[start..<min(start + turn, unknown.count)])
+            learnEarlierRevisions(of: keys)
+            let failed = keys.intersection(earlierRevisionsUnknown)
+            guard failed.count > 1 else { continue }
+            for key in failed.sorted() { learnEarlierRevisions(of: [key]) }
+        }
+    }
+
+    /// A library change or the app becoming active reads every owed inventory and keyed row again, so an unknown read
+    /// does not wait for a queue change. Answers whether anything was owed.
+    private func retryOwedReads() -> Bool {
+        guard !inventoryOwed.isEmpty || !reloadOwed.isEmpty || !earlierRevisionsUnknown.isEmpty else { return false }
+        for (kind, queue) in queues {
+            if inventoryOwed.contains(kind) { reloadInventory(of: kind, from: queue) }
+            retryOwedKeys(of: kind)
+        }
+        return true
     }
 
     private func handle(_ event: PendingRuntimeEvent) async {
@@ -899,13 +1003,20 @@ public actor PendingBackupCoordinator {
         let grouped = Dictionary(grouping: keys, by: \.kind)
         for (kind, kindKeys) in grouped {
             guard let queue = queues[kind] else { continue }
+            // An unknown answer is not an absent row: the cached row and its state stay until a later read answers.
+            guard let fetched = try? queue.decisionRows(kind: kind, identifiers: Set(kindKeys.map(\.identifier))) else {
+                reloadOwed.formUnion(kindKeys)
+                continue
+            }
+            reloadOwed.subtract(kindKeys)
             for key in kindKeys { rows[key] = nil }
-            let fetched = queue.rows(kind: kind, identifiers: Set(kindKeys.map(\.identifier)))
             for row in fetched { absorb(row) }
             for row in fetched where row.state == .completed || row.state == .alreadyBackedUp {
                 let key = PendingSourceKey(row.source)
                 if let newest = rows[key]?.revision, row.revision < newest { backedUpBefore.insert(key) }
             }
+            // The keyed read returned every revision of these sources.
+            earlierRevisionsUnknown.subtract(kindKeys)
             rememberDurableHandoffs(for: kindKeys)
             for key in kindKeys where rows[key] == nil && handoffs[key] == nil { dropSourceState(key) }
         }
@@ -946,11 +1057,21 @@ public actor PendingBackupCoordinator {
         let unchecked = (candidates.map { Array($0) } ?? Array(rows.keys)).filter { key in
             rows[key].map { Self.isUnchecked($0.state) } == true && !backedUpBefore.contains(key)
         }
+        // A source that is no longer unchecked, or is known to be backed up before, needs no earlier read. This only
+        // bounds the set: a stale key is never read, because the candidates are filtered to unchecked rows first.
+        // Mutation row M24 (#1004) survives by design: removing this line has no output or I/O effect.
+        earlierRevisionsUnknown.subtract((candidates ?? earlierRevisionsUnknown).subtracting(unchecked))
         guard !unchecked.isEmpty, unchecked.count <= configuration.uncheckedAdmissionLimit else { return }
         for (kind, keys) in Dictionary(grouping: unchecked, by: \.kind) {
             guard let queue = queues[kind] else { continue }
-            for row in queue.rows(kind: kind, identifiers: Set(keys.map(\.identifier)))
-            where row.state == .completed || row.state == .alreadyBackedUp {
+            guard let fetched = try? queue.decisionRows(kind: kind, identifiers: Set(keys.map(\.identifier))) else {
+                earlierRevisionsUnknown.formUnion(keys)
+                continue
+            }
+            let answered = earlierRevisionsUnknown.intersection(keys)
+            earlierRevisionsUnknown.subtract(answered)
+            dirty.formUnion(answered)
+            for row in fetched where row.state == .completed || row.state == .alreadyBackedUp {
                 let key = PendingSourceKey(row.source)
                 if let newest = rows[key]?.revision, row.revision < newest { backedUpBefore.insert(key) }
             }
@@ -1069,7 +1190,8 @@ public actor PendingBackupCoordinator {
             }
         }
         assert(uncheckedSources == Set(rows.keys.filter(countsAsUnchecked)), "a changed source was not marked dirty")
-        let admits = uncheckedSources.count <= configuration.uncheckedAdmissionLimit
+        // An unknown inventory may hold many more unchecked photos than the known rows (#1004).
+        let admits = inventoryOwed.isEmpty && uncheckedSources.count <= configuration.uncheckedAdmissionLimit
         guard admits != admitsUnchecked else { return }
         admitsUnchecked = admits
         guard admits else { return }
@@ -1118,7 +1240,9 @@ public actor PendingBackupCoordinator {
                 // The earlier Proton photo shows until the check decides on an upload: a tile beside it would
                 // show the photo twice, and most rechecks upload nothing.
                 guard !backedUpBefore.contains(key), earlierUploads(of: key).isEmpty else { return false }
-                guard admitsUnchecked, Self.isUnchecked(row.state) else { return false }
+                guard admitsUnchecked, Self.isUnchecked(row.state), !earlierRevisionsUnknown.contains(key) else {
+                    return false
+                }
             }
             shownSources.insert(key)
             return true

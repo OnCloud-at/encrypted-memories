@@ -5230,6 +5230,7 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
         lock.withLock { unsettled += 1 }
         return pending
     }
+    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { unsettledRows() }
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
         lock.withLock { aggregates += 1 }
         return [:]

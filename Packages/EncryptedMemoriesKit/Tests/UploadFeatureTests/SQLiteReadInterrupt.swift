@@ -19,9 +19,7 @@ final class SQLiteReadInterrupt {
     init(
         in store: Any, matching: String, occurrence: Int = 1, afterRows: Int = 0, onFire: (() -> Void)? = nil
     ) throws {
-        connection = try XCTUnwrap(
-            Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value
-                as? SQLiteStoreConnection)
+        connection = try storeConnection(store)
         self.matching = matching
         self.afterRows = afterRows
         self.onFire = onFire

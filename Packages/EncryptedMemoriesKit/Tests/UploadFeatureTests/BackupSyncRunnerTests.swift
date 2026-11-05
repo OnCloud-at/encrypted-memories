@@ -641,6 +641,7 @@ extension SpyQueueStore: UploadBackupSyncQueueObserving {
     }
     func changes() -> AsyncStream<UploadBackupSyncQueueChange> { inner.changes() }
     func unsettledRows() -> [UploadBackupQueueRowState] { inner.unsettledRows() }
+    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { try inner.decisionUnsettledRows() }
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
         inner.backedUpRevisions(kind: kind)
     }
