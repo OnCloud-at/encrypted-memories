@@ -204,6 +204,27 @@ public struct UploadManualSettlementRecord: Codable, Sendable, Equatable {
     }
 
     public var isPending: Bool { stage != .terminal }
+
+    /// Terminal is proven only with a recorded terminal state (#1104). Every durable
+    /// terminal write records the state with the stage; a terminal stage without a state
+    /// exists only in an in-memory copy whose terminal write failed, so callers must treat
+    /// such a copy as unproven, never as settled.
+    public var isProvenTerminal: Bool { stage == .terminal && terminalState != nil }
+}
+
+/// The result of one settlement-record read. `unreadable` separates a failed read from an
+/// absent row (#1104): a caller must never mistake a store it could not read for an empty one,
+/// even when a later operation has already healed the recorded failure.
+public enum UploadManualSettlementReadOutcome: Sendable {
+    case found(UploadManualSettlementRecord)
+    case absent
+    case unreadable
+}
+
+/// The result of one settlement-table sweep. An unreadable sweep is never an empty table (#1104).
+public enum UploadManualSettlementListReadOutcome: Sendable {
+    case records([UploadManualSettlementRecord])
+    case unreadable
 }
 
 /// Synchronous, thread-safe store contract used by the actor-owned manual queue and its settlement
@@ -211,10 +232,19 @@ public struct UploadManualSettlementRecord: Codable, Sendable, Equatable {
 /// interpreted as a drained queue.
 public protocol UploadManualSettlementStoreProtocol: Sendable {
     func isOperational() -> Bool
+    /// Healing health probe for gate checks (#1104): unlike `isOperational()`, this check lets a
+    /// transiently recorded failure heal when the database answers again, so one failed write
+    /// never refuses new work for the rest of the session. A lasting failure stays recorded.
+    func isOperationalAllowingTransientRecovery() -> Bool
+    /// True when the store cannot work again before a relaunch: the connection is closed, a
+    /// transaction is open, or a recorded failure was not transient. Never probes the database.
+    func hasLastingFailure() -> Bool
     @discardableResult
     func upsert(_ record: UploadManualSettlementRecord) -> Bool
     func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord?
+    func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome
     func allRecords() -> [UploadManualSettlementRecord]
+    func readAllOutcome() -> UploadManualSettlementListReadOutcome
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool
     func close()
@@ -245,14 +275,43 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
 
     public func isOperational() -> Bool { connection.isOperational(probeDatabase: false) }
 
+    /// Healing health probe (#1104): probes the database file itself and forgets a recorded
+    /// transient failure when it answers again. A probe failure is recorded as its own failure.
+    public func isOperationalAllowingTransientRecovery() -> Bool {
+        connection.isOperationalAfterTransientFailure()
+    }
+
+    public func hasLastingFailure() -> Bool {
+        connection.withLock {
+            guard let db, sqlite3_get_autocommit(db) != 0 else { return true }
+            return connection.operationFailed && !connection.failuresAreTransient
+        }
+    }
+
     public func close() { connection.close() }
+
+    /// Lets a transiently recorded connection heal before an operation runs, so one failed write never
+    /// stops the whole session (#1104; the recovery check `PendingBackupStore` uses, #982). When the
+    /// database answers a page read again, recorded transient failures are forgotten and the operation
+    /// proceeds. A lasting failure, a closed connection and an open transaction stay recorded, and
+    /// `isOperational()` keeps reporting them.
+    private func allowTransientRecovery() {
+        _ = connection.isOperationalAfterRecovery()
+    }
 
     @discardableResult
     public func upsert(_ record: UploadManualSettlementRecord) -> Bool {
-        connection.withLock {
-            guard let db, !connection.operationFailed,
-                let payload = try? encoder.encode(record)
-            else {
+        allowTransientRecovery()
+        return connection.withLock {
+            // A closed handle or an outside transaction is a lasting condition with no SQLite code.
+            guard let db, sqlite3_get_autocommit(db) != 0 else {
+                connection.markFailed()
+                return false
+            }
+            // Keep an already recorded failure exactly as it is; marking again would turn a transient
+            // latch into a lasting one.
+            guard !connection.operationFailed else { return false }
+            guard let payload = try? encoder.encode(record) else {
                 connection.markFailed()
                 return false
             }
@@ -271,7 +330,7 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                connection.markFailed()
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
                 return false
             }
             defer { sqlite3_finalize(statement) }
@@ -280,7 +339,7 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             bindText(statement, 3, String(decoding: payload, as: UTF8.self))
             sqlite3_bind_double(statement, 4, record.updatedAt.timeIntervalSince1970)
             guard sqlite3_step(statement) == SQLITE_DONE else {
-                connection.markFailed()
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
                 return false
             }
             return true
@@ -288,8 +347,20 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
     }
 
     public func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? {
-        connection.withLock {
-            guard let db, !connection.operationFailed else { return nil }
+        switch readOutcome(for: queueItemID) {
+        case .found(let record): return record
+        case .absent, .unreadable: return nil
+        }
+    }
+
+    public func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
+        allowTransientRecovery()
+        return connection.withLock {
+            guard let db, sqlite3_get_autocommit(db) != 0 else {
+                connection.markFailed()
+                return .unreadable
+            }
+            guard !connection.operationFailed else { return .unreadable }
             var statement: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -300,35 +371,49 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                connection.markFailed()
-                return nil
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+                return .unreadable
             }
             defer { sqlite3_finalize(statement) }
             bindText(statement, 1, queueItemID.uuidString)
             let result = sqlite3_step(statement)
             guard result == SQLITE_ROW else {
-                if result != SQLITE_DONE { connection.markFailed() }
-                return nil
+                if result != SQLITE_DONE {
+                    connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+                    return .unreadable
+                }
+                return .absent
             }
             guard let payload = columnText(statement, 0),
                 let data = payload.data(using: .utf8),
                 let record = try? decoder.decode(UploadManualSettlementRecord.self, from: data)
             else {
                 connection.markFailed()
-                return nil
+                return .unreadable
             }
-            return record
+            return .found(record)
         }
     }
 
     public func allRecords() -> [UploadManualSettlementRecord] {
-        readRecords(whereClause: nil)
+        if case .records(let records) = readAllOutcome() { return records }
+        return []
+    }
+
+    public func readAllOutcome() -> UploadManualSettlementListReadOutcome {
+        guard let records = readRecords(whereClause: nil) else { return .unreadable }
+        return .records(records)
     }
 
     @discardableResult
     public func remove(queueItemID: UploadQueueItemID) -> Bool {
-        connection.withLock {
-            guard let db, !connection.operationFailed else { return false }
+        allowTransientRecovery()
+        return connection.withLock {
+            guard let db, sqlite3_get_autocommit(db) != 0 else {
+                connection.markFailed()
+                return false
+            }
+            guard !connection.operationFailed else { return false }
             var statement: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -339,22 +424,27 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                connection.markFailed()
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
                 return false
             }
             defer { sqlite3_finalize(statement) }
             bindText(statement, 1, queueItemID.uuidString)
             guard sqlite3_step(statement) == SQLITE_DONE else {
-                connection.markFailed()
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
                 return false
             }
             return true
         }
     }
 
-    private func readRecords(whereClause: String?) -> [UploadManualSettlementRecord] {
-        connection.withLock {
-            guard let db, !connection.operationFailed else { return [] }
+    private func readRecords(whereClause: String?) -> [UploadManualSettlementRecord]? {
+        allowTransientRecovery()
+        return connection.withLock {
+            guard let db, sqlite3_get_autocommit(db) != 0 else {
+                connection.markFailed()
+                return nil
+            }
+            guard !connection.operationFailed else { return nil }
             var statement: OpaquePointer?
             let suffix = whereClause.map { " WHERE \($0)" } ?? ""
             guard
@@ -366,8 +456,8 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     nil
                 ) == SQLITE_OK
             else {
-                connection.markFailed()
-                return []
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+                return nil
             }
             defer { sqlite3_finalize(statement) }
             var records: [UploadManualSettlementRecord] = []
@@ -378,14 +468,14 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     let record = try? decoder.decode(UploadManualSettlementRecord.self, from: data)
                 else {
                     connection.markFailed()
-                    return []
+                    return nil
                 }
                 records.append(record)
                 result = sqlite3_step(statement)
             }
             guard result == SQLITE_DONE else {
-                connection.markFailed()
-                return []
+                connection.markFailed(resultCode: sqlite3_extended_errcode(db))
+                return nil
             }
             return records
         }
