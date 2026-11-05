@@ -30,12 +30,12 @@ public struct PendingExcludedPhotosEntryLabel: View {
 public struct PendingExcludedPhotosList: View {
     private let tiles: [PendingTile]
     private let thumbnail: @Sendable (PhotoUID) async -> CGImage?
-    private let include: @MainActor (PendingTile) async -> Void
+    private let include: @MainActor (PendingTile) async -> Bool
 
     public init(
         tiles: [PendingTile],
         thumbnail: @escaping @Sendable (PhotoUID) async -> CGImage?,
-        include: @escaping @MainActor (PendingTile) async -> Void
+        include: @escaping @MainActor (PendingTile) async -> Bool
     ) {
         self.tiles = tiles
         self.thumbnail = thumbnail

@@ -108,6 +108,16 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    func testExcludedIncludeFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("backup.excluded_include_failed", "Couldn’t back up this photo again.", "Wieder sichern nicht möglich.")
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
     func testBulkRestoreCopyUsesTheApprovedEnglishAndGermanText() throws {
         let texts: [(String, String, String)] = [
             ("albumsync.bulk_action %@", "Restore All (%@)", "Alle wiederherstellen (%@)"),
