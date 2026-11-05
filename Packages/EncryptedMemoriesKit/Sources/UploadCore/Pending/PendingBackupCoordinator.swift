@@ -266,6 +266,7 @@ public actor PendingBackupCoordinator {
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
         restoreRecheckDelays: [TimeInterval] = PendingBackupCoordinator.defaultRestoreRecheckDelays
     ) {
+        precondition(!restoreRecheckDelays.isEmpty, "Restore rechecks need at least one delay")
         self.store = store
         self.queues = queues
         self.metadataProvider = metadataProvider

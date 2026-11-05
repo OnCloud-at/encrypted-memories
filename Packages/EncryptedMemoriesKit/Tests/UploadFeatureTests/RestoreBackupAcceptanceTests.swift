@@ -302,6 +302,11 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             for waiter in due { waiter.resume(returning: false) }
         }
 
+        /// The earliest date at which a long sleep is parked, or nil when none is.
+        func earliestParkedDeadline() -> Date? {
+            lock.withLock { deadlineWaiters.map(\.deadline).min() }
+        }
+
         func sleep(for seconds: TimeInterval) async throws {
             let advanceAfterWake = await withCheckedContinuation { continuation in
                 let resumeNow = lock.withLock { () -> Bool in
@@ -554,6 +559,12 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
                 } else {
                     // A reconcile may still be in flight; it registers the next recheck shortly.
                     try await Task.sleep(for: .milliseconds(50))
+                }
+                // A timer that parks after the jump above needs its own deadline jumped to as well:
+                // its parked date was computed from fake time before the jump, so it sits a whole
+                // delay ahead. Without this, extreme scheduler lag can strand it past this budget.
+                if let parked = clockGate.earliestParkedDeadline(), parked > clock.now {
+                    clockGate.advance(by: max(1, parked.timeIntervalSince(clock.now)))
                 }
                 for _ in 0..<50 where !predicate() {
                     try await Task.sleep(for: .milliseconds(50))
