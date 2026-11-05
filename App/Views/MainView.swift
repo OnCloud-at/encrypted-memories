@@ -2720,41 +2720,29 @@ struct MainView: View {
         for sourceItems: [PhotoItem],
         preferredSeriesNameSource: PhotoItem?
     ) async -> ExportRequest {
-        var expanded: [PhotoItem] = []
-        var seen = Set<PhotoUID>()
-        var expandedSingleSeries = false
+        let result = await BurstExportExpansion.expand(
+            sourceItems: sourceItems,
+            preferredSeriesNameSource: preferredSeriesNameSource,
+            burstGroupReader: { try await backend.burstGroup(containing: $0) }
+        )
 
-        func appendUnique(_ item: PhotoItem) {
-            guard seen.insert(item.uid).inserted else { return }
-            expanded.append(item)
-        }
-
-        let memberIDSet = Set(
-            (preferredSeriesNameSource?.burstMemberIDs ?? []).map {
-                PhotoUID(volumeID: preferredSeriesNameSource?.uid.volumeID ?? "", nodeID: $0)
-            })
-        let sourceUIDSet = Set(sourceItems.map(\.uid))
-        let alreadyExpandedPreferredSeries =
-            sourceItems.count > 1
-            && preferredSeriesNameSource?.isBurstCandidate == true
-            && !memberIDSet.isEmpty
-            && sourceUIDSet.isSubset(of: memberIDSet)
-
-        if alreadyExpandedPreferredSeries {
-            sourceItems.forEach(appendUnique)
-            expandedSingleSeries = true
-        } else {
-            for item in sourceItems {
-                if item.isBurstCandidate,
-                    let group = try? await backend.burstGroup(containing: item.uid),
-                    group.count > 1
-                {
-                    group.forEach(appendUnique)
-                    expandedSingleSeries = true
-                } else {
-                    appendUnique(item)
-                }
-            }
+        let expanded: [PhotoItem]
+        let expandedSingleSeries: Bool
+        switch result {
+        case .success(let items, let singleSeries):
+            expanded = items
+            expandedSingleSeries = singleSeries
+        case .cancelled:
+            // The export task was cancelled by the person or superseded; no failure happened
+            // and no alert may appear.
+            return ExportRequest(items: [], zipSuggestedName: nil)
+        case .burstReadFailed(let failedSources):
+            // Reading the burst group failed, so nothing is exported; presenting only the tapped
+            // photo as a successful export would silently lose the rest of the series.
+            DebugLog.log("burst group read failed during export: \(failedSources.count) source(s)")
+            exportFailureTitle = String(localized: "export.failed_title")
+            exportFailureMessage = String(localized: "export.burst_load_failed")
+            return ExportRequest(items: [], zipSuggestedName: nil)
         }
 
         let zipName: String?

@@ -35,6 +35,23 @@
         }
       }
     },
+    "export.burst_load_failed": {
+      "comment": "Shown in the export-failure alert when reading a burst group failed; nothing was exported.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The photos of this burst could not be loaded, so nothing was exported."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos dieser Serie konnten nicht geladen werden. Deshalb wurde nichts exportiert."
+          }
+        }
+      }
+    },
     "%@ / %@": {
       "comment": "Used and total Proton storage.",
       "extractionState": "manual",
