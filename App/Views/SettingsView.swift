@@ -838,7 +838,7 @@ private struct MacExcludedPhotosSheet: View {
             Divider()
 
             PendingExcludedPhotosList(tiles: appModel.excludedPendingTiles, thumbnail: thumbnail) { tile in
-                await appModel.pendingGrid?.restore([tile.item.uid])
+                await (appModel.pendingGrid?.restore([tile.item.uid]) ?? false)
             }
         }
         .frame(width: 520, height: 380)

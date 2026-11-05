@@ -40,7 +40,9 @@ private struct MobileExcludedPhotosScreen: View {
             tiles: libraryModel.excludedPendingTiles,
             thumbnail: PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request).listThumbnail(for:)
         ) { tile in
-            try? await libraryModel.restoreItems([tile.item])
+            // The pending grid answers with a cancellation error when it refuses the photo, so any thrown
+            // error means the photo did not go back into the backup.
+            (try? await libraryModel.restoreItems([tile.item])) != nil
         }
         .mobileNavigationTitle(L10n.string("backup.excluded_title"))
     }

@@ -867,6 +867,12 @@
         "en": { "stringUnit": { "state": "translated", "value": "Back Up Again" } }
       }
     },
+    "backup.excluded_include_failed": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wieder sichern nicht möglich." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Couldn’t back up this photo again." } }
+      }
+    },
     "backup.excluded_empty": {
       "localizations": {
         "de": { "stringUnit": { "state": "translated", "value": "Keine ausgenommenen Fotos" } },
