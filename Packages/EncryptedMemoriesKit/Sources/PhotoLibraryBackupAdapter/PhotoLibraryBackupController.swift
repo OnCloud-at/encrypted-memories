@@ -944,10 +944,15 @@ public final class PhotoLibraryBackupController {
         problemListChanges &+= 1
     }
 
-    /// Every row the person can resolve, independent of how many rows the list shows.
-    private func userResolvableEntries() -> [UploadBackupSyncQueueEntry] {
+    /// Every row the person can resolve, independent of how many rows the list shows. Throws when the list could not
+    /// be read completely: a cut-short list would leave the missing rows parked (#1004 B2).
+    private func userResolvableEntries(
+        in queueStore: UploadBackupSyncQueueManifestStore
+    ) throws
+        -> [UploadBackupSyncQueueEntry]
+    {
         var entries: [UploadBackupSyncQueueEntry] = []
-        queueStore?.forEachProblemEntry { entry in
+        try queueStore.decisionForEachProblemEntry { entry in
             if BackupFailedItem(entry: entry).category == .userResolvable { entries.append(entry) }
             return true
         }
@@ -1158,7 +1163,15 @@ public final class PhotoLibraryBackupController {
     public func retryUserResolvableWork() async {
         guard let queueStore else { return }
         let now = Date()
-        for entry in userResolvableEntries() {
+        let entries: [UploadBackupSyncQueueEntry]
+        do {
+            entries = try userResolvableEntries(in: queueStore)
+        } catch {
+            lastMessage = L10n.string("backup.error_local_state_unavailable")
+            refreshFromQueue()
+            return
+        }
+        for entry in entries {
             // A row that the runner claimed or changed meanwhile keeps its new state.
             _ = queueStore.reopenForUserRetry(
                 entry, attempts: entry.state == .failed ? 0 : entry.attempts, updatedAt: now)
@@ -1346,8 +1359,7 @@ public final class PhotoLibraryBackupController {
             }
         }
         if !scanOnly, owner != .manual, !carriesManualRetry,
-            let retryAt = queueStore.runtimeIssue(for: .remoteIndexPreparation)?.nextAttemptAt,
-            retryAt > Date()
+            Self.remoteIndexBackoffHoldsAutomaticPass(in: queueStore, now: Date())
         {
             refreshFromQueue()
             scheduleAutoResumeIfOutstanding()
@@ -1681,17 +1693,42 @@ public final class PhotoLibraryBackupController {
         return BackupSyncProgress()
     }
 
+    /// True while the stored remote-index issue waits for its next attempt: an automatic pass then waits too.
+    /// An issue that could not be read holds the pass as well; the automatic resume reads it again (#1004 B2).
+    nonisolated static func remoteIndexBackoffHoldsAutomaticPass(
+        in queue: UploadBackupSyncQueueManifestStore, now: Date
+    ) -> Bool {
+        let issue: BackupIssueRecord?
+        do {
+            issue = try queue.decisionRuntimeIssue(for: .remoteIndexPreparation)
+        } catch {
+            return true
+        }
+        guard let retryAt = issue?.nextAttemptAt else { return false }
+        return retryAt > now
+    }
+
     /// The longest timed wait of the drain: the runner's longest park (Proton storage, 6 h). A later or damaged date
     /// wakes the drain after this time, which then reads the dates again; a sleep never gets an unbounded value.
     nonisolated static let longestDueWait: TimeInterval = 6 * 3600
+
+    /// The wait after a due date that could not be read: the shortest automatic retry delay (BackupIssue).
+    nonisolated static let unknownDueDateWait: TimeInterval = 30
 
     /// Seconds until the earliest persisted retry date or draft re-check, 0 when one is already due, or nil when
     /// nothing waits for a date. A due date counts: as the minimum it would otherwise hide every later date.
     nonisolated static func nextDueDelay(in queue: UploadBackupSyncQueueManifestStore, now: Date) -> TimeInterval? {
         // A blocked draft stores its re-check date as `updatedAt`, as the runner's own wait reads it.
-        let dates = [
-            queue.nextRunnableDate(excludingSourcesOf: []), queue.earliestEntry(in: .blockedByDraft)?.updatedAt,
-        ]
+        let dates: [Date?]
+        do {
+            dates = [
+                try queue.decisionNextRunnableDate(excludingSourcesOf: []),
+                try queue.decisionEarliestEntry(in: .blockedByDraft)?.updatedAt,
+            ]
+        } catch {
+            // An unknown date reads again soon instead of waiting for the next queue write.
+            return unknownDueDateWait
+        }
         guard let next = dates.compactMap({ $0 }).min() else { return nil }
         return min(longestDueWait, max(0, next.timeIntervalSince(now)))
     }

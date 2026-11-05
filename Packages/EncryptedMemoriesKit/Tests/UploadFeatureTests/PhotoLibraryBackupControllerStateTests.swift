@@ -6315,3 +6315,45 @@ final class RecordedLogLines: @unchecked Sendable {
 
     func append(_ line: String) { lock.withLock { lines.append(line) } }
 }
+
+// MARK: - #1004 B2: the person's retry decides from the complete problem list
+
+#if DEBUG
+    extension PhotoLibraryBackupControllerStateTests {
+        /// A retry whose problem list a failed read cut short reopens nothing, also after the failure is forgotten:
+        /// the photos missing from the cut-short list would stay parked although the retry reported success.
+        func testARetryWithACutShortProblemListReopensNothingAfterRecovery() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-retry-cut-short")
+            defer { fixture.cleanup() }
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let rows = (1...3).map { index in
+                UploadBackupSyncQueueEntry(
+                    source: .init(kind: .photoLibraryAsset, identifier: "permission-\(index)"),
+                    revision: .init(rawValue: Int64(index)), originalFilename: "permission-\(index)", state: .failed,
+                    attempts: 8,
+                    lastError: BackupIssueRecord(kind: .permission, detail: "denied").persistedValue,
+                    updatedAt: Date(timeIntervalSince1970: 1_720_000_000))
+            }
+            for row in rows { XCTAssertTrue(queue.upsert(row)) }
+            XCTAssertTrue(fixture.controller.failedItems().offersUserRetry)
+            queue.recoversTransientFailuresForTesting = true
+            let fault = try SQLiteReadInterrupt(
+                in: queue, matching: "WHERE state IN ('failed', 'failedPermanent', 'sourceMissing', 'blockedByDraft')",
+                afterRows: 2)
+            await fixture.controller.retryUserResolvableWork()
+            fault.stop()
+            XCTAssertTrue(fault.fired)
+            let observer = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { observer.close() }
+            for row in rows {
+                XCTAssertEqual(
+                    try observer.entry(for: row.source, revision: row.revision), row,
+                    "\(row.originalFilename): a cut-short list reopens no photo")
+            }
+            XCTAssertEqual(fixture.controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
+            await fixture.controller.shutdown()
+        }
+    }
+#endif

@@ -72,13 +72,18 @@ public struct BackupProblemSnapshot: Sendable {
             }
         }
         onEvent?(.willRead)
-        queue.forEachProblemEntry { entry in
-            #if canImport(ObjectiveC)
-                autoreleasepool { collect(entry) }
-            #else
-                collect(entry)
-            #endif
-            return true
+        do {
+            // A list that a failed read cut short is no snapshot: a bulk action would miss the rest (#1004 B2).
+            try queue.decisionForEachProblemEntry { entry in
+                #if canImport(ObjectiveC)
+                    autoreleasepool { collect(entry) }
+                #else
+                    collect(entry)
+                #endif
+                return true
+            }
+        } catch {
+            return nil
         }
         onEvent?(.didRead)
         guard queue.isOperational() else { return nil }

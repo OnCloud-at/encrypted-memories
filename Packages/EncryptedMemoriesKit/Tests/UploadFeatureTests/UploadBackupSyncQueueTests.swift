@@ -1451,7 +1451,9 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
             SQLITE_OK)
 
-        XCTAssertNil(try store.entry(for: original.source, revision: original.revision))
+        XCTAssertThrowsError(
+            try store.entry(for: original.source, revision: original.revision),
+            "an undecodable receipt is unknown, not an absent row")
         XCTAssertFalse(store.isOperational())
         XCTAssertFalse(store.synchronizeToDisk())
         XCTAssertTrue(store.upsert(original), "later successful SQL keeps its existing result")

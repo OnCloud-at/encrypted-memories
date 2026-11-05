@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// A write to the backup queue, reported after it committed. The pending grid follows the queue through
 /// these notifications instead of polling it.
@@ -55,9 +56,15 @@ public protocol UploadBackupSyncQueueObserving: Sendable {
     func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState]
     /// Complete rows for a decision. Throws when a read fails or cannot return a complete result.
     func decisionRows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) throws -> [UploadBackupQueueRowState]
+    /// Every unsettled row, as `unsettledRows()`, from a complete read. Throws when the read fails or cannot return a
+    /// complete result, so a failed read never looks like an empty queue (#1004).
+    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState]
 }
 
 public extension UploadBackupSyncQueueObserving {
+    /// A store that cannot certify a complete inventory never answers one.
+    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { throw SQLiteStoreUnknownReadError() }
+
     /// Stores without live notifications can still provide the pending-grid reads.
     func changes() -> AsyncStream<UploadBackupSyncQueueChange> {
         AsyncStream { $0.finish() }

@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 public enum UploadBackupSyncQueueState: String, Sendable, Codable, CaseIterable {
     case discovered
@@ -376,6 +377,14 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord?
     @discardableResult
     func setRuntimeIssue(_ issue: BackupIssueRecord?, for key: BackupRuntimeIssueKey) -> Bool
+    /// Complete reads for decisions. Each throws `SQLiteStoreUnknownReadError` when the read could not run completely,
+    /// so a decision never treats a failed read as "nothing waits" (#1004).
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date?
+    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry?
+    func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry]
+    func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord?
 }
 
 public extension UploadBackupSyncQueueStore {
@@ -437,6 +446,33 @@ public extension UploadBackupSyncQueueStore {
     }
 
     func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? { nil }
+
+    /// Stores without a complete read prove a result by their health after the read.
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
+        let date = nextRunnableDate(excludingSourcesOf: excludedSources)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return date
+    }
+
+    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
+        let entry = earliestEntry(in: state)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return entry
+    }
+
+    func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry] {
+        let result = entries(in: state, updatedBefore: updatedBefore, limit: limit)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return result
+    }
+
+    func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord? {
+        let issue = runtimeIssue(for: key)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return issue
+    }
 
     @discardableResult
     func setRuntimeIssue(_ issue: BackupIssueRecord?, for key: BackupRuntimeIssueKey) -> Bool { true }
@@ -519,12 +555,15 @@ public extension UploadBackupSyncQueueStore {
         revision: UploadBackupRevision,
         updatedAt: Date
     ) -> Bool {
-        updateState(
+        // The dismissed row keeps its record: a missing photo needs it to be checked again when its bytes return. A
+        // row that could not be read is not dismissed, so a failed read never writes an empty record (#1004 B2).
+        guard let current = (try? entry(for: source, revision: revision)) ?? nil else { return false }
+        return updateState(
             source: source,
             revision: revision,
             state: .dismissedFailure,
             attempts: nil,
-            lastError: (try? entry(for: source, revision: revision))??.lastError,
+            lastError: current.lastError,
             updatedAt: updatedAt
         )
     }
