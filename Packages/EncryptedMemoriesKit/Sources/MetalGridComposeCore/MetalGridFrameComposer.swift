@@ -21,14 +21,6 @@ package enum MetalGridFrameComposer {
         visibleIDs.contains { isKnown($0) && (allowsPlaceholders || isResident($0)) }
     }
 
-    /// Column geometry fills the viewport without a reserved division gap, regardless of division activity.
-    /// Horizontal reserved-region rules operate separately from the column layout.
-    package static func gridDivisionFrame(
-        areas: [ReservedRegionArea], bounds: CGRect, profile: GridLevelProfile
-    ) -> CGRect? {
-        nil
-    }
-
     @MainActor
     package static func hasProgressingVisibleUploads<ID: Hashable & Sendable>(
         cache: MetalGridTextureCache<ID>, ramReadyMissing: Int

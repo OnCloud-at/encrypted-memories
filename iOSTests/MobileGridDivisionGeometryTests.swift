@@ -9,7 +9,7 @@ import XCTest
 @testable import TimelineUIKitFeature
 
 final class MobileGridDivisionGeometryTests: XCTestCase {
-    @MainActor func testProfileChangeUsesFullWidthSourceTileSizeAndCachesDivisionFacts() throws {
+    @MainActor func testProfileChangeComparesTheDisplayedTileSizes() throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 867, height: 669)
@@ -24,8 +24,6 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
                 mediaType: "image/jpeg")
         }
         let host = UIKitTimelineGridHostView(frame: window.bounds)
-        let band = CGRect(x: 60, y: 0, width: 40, height: 669)
-        host.divisionAreasForTesting = [ReservedRegionArea(frame: band, isActive: true)]
         window.addSubview(host)
         defer {
             host.setActive(false)
@@ -35,17 +33,10 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
         host.layoutIfNeeded()
         let sourceProfile = host.currentProfile()
         let sourceEngine = host.currentEngine(profile: sourceProfile)
-        XCTAssertNil(sourceEngine.divisionFrame, "Vertical divisions do not reserve a column gap")
         let sourceWidth = UIKitTimelineGridProfileAdapter.layoutSize(
             forBounds: host.bounds, safeAreaInsets: host.safeAreaInsets
         ).width
         let sourceLevel = sourceProfile.defaultLevel
-        #if DEBUG
-            let resolutions = host.gridDivisionResolutionCount
-            for _ in 0..<100 { _ = host.currentEngine(profile: sourceProfile) }
-            XCTAssertEqual(
-                host.gridDivisionResolutionCount, resolutions, "A cached engine must not resolve division facts again")
-        #endif
         host.frame.size.width = 402
         let targetProfile = host.currentProfile()
         let targetEngine = host.currentEngine(profile: targetProfile)
@@ -54,17 +45,10 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
         ).width
         let expected = sourceEngine.closestVisualLevel(
             sourceLevel: sourceLevel, sourceWidth: sourceWidth, in: targetEngine, targetWidth: targetWidth)
-        var undivided = sourceEngine
-        undivided.divisionFrame = nil
-        XCTAssertEqual(
-            expected,
-            undivided.closestVisualLevel(
-                sourceLevel: sourceLevel, sourceWidth: sourceWidth, in: targetEngine, targetWidth: targetWidth),
-            "A vertical division keeps the ordinary visual level")
         XCTAssertEqual(host.interactiveLevel, expected, "Profile changes compare the tile sizes actually displayed")
     }
 
-    @MainActor func testVerticalDivisionUsesFullWidthAndKeepsHitTargetsInBothLayoutDirections() throws {
+    @MainActor func testGridUsesFullWidthAndKeepsHitTargetsInBothLayoutDirections() throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 867, height: 669)
@@ -79,13 +63,14 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
                 mediaType: "image/jpeg")
         }
         let frame = CGRect(x: 0, y: 0, width: 867, height: 669)
-        let band = CGRect(x: 455.116, y: 0, width: 40, height: 669)
         let profile = UIKitTimelineGridProfileAdapter().profile(forBounds: frame)
+        // The removed vertical division spanned the half-way columns; the full-width layout must still show a
+        // photo there instead of a reserved gap.
+        let formerDivisionMidX: CGFloat = 455.116 + 20
         var previousRects: [CGRect]?
         for direction in [UISemanticContentAttribute.forceLeftToRight, .forceRightToLeft] {
             let host = UIKitTimelineGridHostView(frame: frame)
             host.semanticContentAttribute = direction
-            host.divisionAreasForTesting = [ReservedRegionArea(frame: band, isActive: true)]
             window.addSubview(host)
             defer {
                 host.setActive(false)
@@ -107,32 +92,17 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
                 XCTAssertEqual(host.item(at: point)?.uid, items[slot.index].uid)
             }
             let witness = try XCTUnwrap(plan.visibleSlots.first)
-            XCTAssertNotNil(host.item(at: CGPoint(x: band.midX, y: witness.slotRect.midY)))
+            XCTAssertNotNil(host.item(at: CGPoint(x: formerDivisionMidX, y: witness.slotRect.midY)))
             let rects = plan.visibleSlots.map(\.slotRect)
             if let previousRects { XCTAssertEqual(rects, previousRects, "Hardware frames must not be mirrored twice") }
             previousRects = rects
             host.scrollView.setContentOffset(CGPoint(x: 0, y: 420), animated: false)
             let anchor = try XCTUnwrap(host.currentScrollAnchor())
-            for areas in [
-                [], [ReservedRegionArea(frame: band, isActive: false)],
-                [ReservedRegionArea(frame: band, isActive: true)],
-            ] {
-                host.divisionAreasForTesting = areas
-                host.layoutIfNeeded()
-                let changed = try XCTUnwrap(host.accessibilityFramePlan())
-                let anchored = try XCTUnwrap(changed.visibleSlots.first { items[$0.index].uid == anchor.itemID })
-                XCTAssertEqual(anchored.slotRect.minY - host.scrollView.contentOffset.y, anchor.topOffset, accuracy: 1)
-            }
-            host.divisionAreasForTesting = []
+            host.setNeedsLayout()
             host.layoutIfNeeded()
-            host.zoomInOneStep()
-            let transaction = try XCTUnwrap(host.zoomTransaction)
-            host.divisionAreasForTesting = [
-                ReservedRegionArea(frame: CGRect(x: 0, y: 300, width: 867, height: 40), isActive: true)
-            ]
-            host.layoutIfNeeded()
-            XCTAssertEqual(host.zoomTransaction, transaction, "A horizontal fold does not change the photo geometry")
-            host.cancelLiveZoomState()
+            let relaid = try XCTUnwrap(host.accessibilityFramePlan())
+            let anchored = try XCTUnwrap(relaid.visibleSlots.first { items[$0.index].uid == anchor.itemID })
+            XCTAssertEqual(anchored.slotRect.minY - host.scrollView.contentOffset.y, anchor.topOffset, accuracy: 1)
         }
     }
 }
