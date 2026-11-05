@@ -295,7 +295,7 @@ final class CatalogReadFailClosedTests: XCTestCase {
             store: pending, replacementLedger: .shared(accountDataDirectory: directory), now: { Date() })
         let coordinator = PendingBackupCoordinator(
             store: pending, queues: [.photoLibraryAsset: queue],
-            metadataProvider: PhotoLibraryPendingMetadataProvider(catalog: catalog), effects: NoEffects(),
+            metadataProvider: PhotoLibraryPendingMetadataProvider(catalog: catalog), effects: InertPendingEffects(),
             recorder: recorder,
             configuration: .init(
                 membershipInterval: .zero, progressInterval: .milliseconds(1), libraryChangeDelay: .zero))
@@ -419,11 +419,6 @@ final class CatalogReadFailClosedTests: XCTestCase {
 }
 
 // MARK: - Fixtures
-
-private func storeConnection(_ store: Any) throws -> SQLiteStoreConnection {
-    try XCTUnwrap(
-        Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value as? SQLiteStoreConnection)
-}
 
 /// Lowers SQLITE_LIMIT_LENGTH on the store's own connection right after the info write that stores `marker`. The
 /// value was stored and read normally, and only its next bind fails, as a bind that runs out of memory does.
@@ -559,14 +554,4 @@ private final class Enqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendab
 
     func missingSourceDiscardGeneration() async throws -> Int64 { Self.generation }
     func synchronizeQueueToDisk() async -> Bool { true }
-}
-
-private struct NoEffects: PendingBackupEffects {
-    func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool { true }
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool { true }
-    func photosVolumeID() async -> String? { "volume" }
-    func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .done }
-    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
 }
