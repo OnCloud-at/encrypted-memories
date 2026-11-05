@@ -592,7 +592,7 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes hygiene.fetch("run"), "bash .github/scripts/test_run_ui_tests_with_retry.sh"
   end
 
-  def test_both_simulator_jobs_start_the_simulator_before_the_dependencies_and_never_depend_on_it
+  def test_both_simulator_jobs_keep_the_boot_decoupled_and_the_ios_job_boots_after_prepare
     %w[ios-verification ios-ui-verification].each do |name|
       job = @workflow.fetch("jobs").fetch(name)
       steps = job.fetch("steps")
@@ -609,14 +609,33 @@ class PullRequestWorkflowTests < Minitest::Test
       assert_equal 2, boot.fetch("timeout-minutes"), name
       refute boot.key?("id"), "No step may depend on the start of the simulator in #{name}"
       assert_nil boot["if"], name
-      # The boot runs while the dependencies and the test bundles build.
-      prepare = steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+      # The boot finishes before the test bundles build, in both orders.
       build = steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "build-for-testing" }
-      assert_operator steps.index(boot), :<, prepare, name
       assert_operator steps.index(boot), :<, build, name
       job.fetch("outputs", {}).each_value { |value| refute_includes value, boot.fetch("name"), name }
       steps.each { |step| refute_includes step["if"].to_s, "Start the simulator", name }
     end
+
+    # The boot order differs on purpose (#1165): the iOS job boots after prepare to measure whether
+    # the early boot slows the prepare step; the UI job keeps the boot before prepare as the control.
+    ios_steps = @workflow.fetch("jobs").fetch("ios-verification").fetch("steps")
+    ios_boot = ios_steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "boot-simulator" }
+    ios_prepare = ios_steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    assert_operator ios_prepare, :<, ios_boot, "The iOS job starts the simulator after prepare"
+
+    ui_steps = @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("steps")
+    ui_boot = ui_steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "boot-simulator" }
+    ui_prepare = ui_steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    assert_operator ui_boot, :<, ui_prepare, "The UI job keeps the simulator boot before prepare"
+
+    # The iOS job records the runner state before it boots, like the UI job.
+    ios_start = ios_steps.find { |step| step["name"] == "Record the runner state at the start" }
+    refute_nil ios_start, "The iOS job must record the runner state at the start"
+    assert_equal "bash .github/scripts/runner_state.sh start", ios_start.fetch("run")
+    assert_equal "${{ !cancelled() }}", ios_start.fetch("if")
+    assert_equal true, ios_start.fetch("continue-on-error")
+    assert_equal 2, ios_start.fetch("timeout-minutes")
+    assert_operator ios_steps.index(ios_start), :<, ios_prepare, "The iOS job records the runner state before prepare"
   end
 
   def test_the_test_steps_keep_a_result_bundle_so_that_a_run_without_tests_fails
