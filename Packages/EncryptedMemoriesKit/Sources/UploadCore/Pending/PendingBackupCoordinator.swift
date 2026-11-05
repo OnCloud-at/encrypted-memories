@@ -80,6 +80,7 @@ public actor PendingBackupCoordinator {
     private let configuration: Configuration
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (Duration) async throws -> Void
+    private let restoreRecheckDelays: [TimeInterval]
 
     // Model, all keyed by source.
     private var rows: [PendingSourceKey: UploadBackupQueueRowState] = [:]
@@ -159,7 +160,7 @@ public actor PendingBackupCoordinator {
     }
     private static let laterTrashBatchSize = 100
     /// The waits after the first, second and third automatic Restore check of one source and generation.
-    private static let restoreRecheckDelays: [TimeInterval] = [60, 300, 900]
+    package static let defaultRestoreRecheckDelays: [TimeInterval] = [60, 300, 900]
     /// A rejected dispatch marker sent nothing; the next reconcile tries it again.
     private var beginFailedKeys = Set<PendingSourceKey>()
     private var writesDegraded: Bool {
@@ -251,7 +252,7 @@ public actor PendingBackupCoordinator {
     private var excludedCheckReading = false
     private var excludedCheckAgain = false
 
-    public init(
+    package init(
         store: PendingBackupManifestStore,
         queues: [UploadSourceIdentity.Kind: any UploadBackupSyncQueueObserving],
         metadataProvider: any PendingSourceMetadataProviding,
@@ -262,7 +263,8 @@ public actor PendingBackupCoordinator {
         relations: (any UploadDuplicateChecking)? = nil,
         configuration: Configuration = Configuration(),
         now: @Sendable @escaping () -> Date = { Date() },
-        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        restoreRecheckDelays: [TimeInterval] = PendingBackupCoordinator.defaultRestoreRecheckDelays
     ) {
         self.store = store
         self.queues = queues
@@ -275,6 +277,7 @@ public actor PendingBackupCoordinator {
         self.configuration = configuration
         self.now = now
         self.sleep = sleep
+        self.restoreRecheckDelays = restoreRecheckDelays
         (snapshots, snapshotContinuation) = AsyncStream.makeStream(
             of: PendingBackupSnapshot.self,
             bufferingPolicy: .bufferingNewest(1)
@@ -1706,7 +1709,7 @@ public actor PendingBackupCoordinator {
                 previous?.generation == state.generation && previous?.remote == state.remote
                 ? (previous?.count ?? 0) + 1 : 1
             restoreRecheckCounts[state.key] = (state.generation, state.remote, count)
-            let delay = Self.restoreRecheckDelays[min(count - 1, 2)]
+            let delay = restoreRecheckDelays[min(count - 1, restoreRecheckDelays.count - 1)]
             // A late trash gets its first compensation at once and waits a minute after a refused one. A failed
             // read waits on the same schedule as an incomplete compound, so an offline device does not use up its
             // three checks within minutes. After the third check the source waits for a new launch or Restore.

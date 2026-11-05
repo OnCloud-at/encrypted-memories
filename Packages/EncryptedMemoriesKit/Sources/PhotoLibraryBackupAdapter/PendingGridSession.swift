@@ -63,11 +63,17 @@ public final class PendingGridSession {
     }
 
     /// `files` adds the Mac's watched folders; their backup runner must record into `photoBackup.pendingRecorder`.
+    /// `restoreRecheckDelays`, `now` and `sleep` are the recheck clock seam; tests run the Restore recheck
+    /// schedule on fake time while every caller without them keeps the production timers.
+    /// `nil` delays mean the production schedule.
     public init?(
         store: PendingBackupManifestStore,
         photoBackup: PhotoLibraryBackupController,
         remote: any PendingRemoteEffects,
-        files: PendingFileSource? = nil
+        files: PendingFileSource? = nil,
+        restoreRecheckDelays: [TimeInterval]? = nil,
+        now: @Sendable @escaping () -> Date = { Date() },
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         guard let recorder = photoBackup.pendingRecorder,
             let queue = photoBackup.pendingQueue,
@@ -86,7 +92,10 @@ public final class PendingGridSession {
             recorder: recorder,
             replacementJournal: photoBackup.pendingReplacementJournal,
             identities: photoBackup.pendingIdentities,
-            relations: photoBackup.pendingRelations
+            relations: photoBackup.pendingRelations,
+            now: now,
+            sleep: sleep,
+            restoreRecheckDelays: restoreRecheckDelays ?? PendingBackupCoordinator.defaultRestoreRecheckDelays
         )
         presenter = PendingTimelinePresenter(replacementLookup: { [ledger = recorder.replacementLedger] in
             ledger.replacementHandoffs()

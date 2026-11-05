@@ -31,12 +31,22 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             let uploads = fixture.server.uploadRequestCount
             let reads = fixture.resolver.readCount
 
+            // Freeze fake time so the freshly registered recheck date can be asserted before its timer runs it.
+            fixture.clockGate.hold()
             let result = try await fixture.restore(main)
 
             XCTAssertTrue(result.isReadable)
             guard case .waiting? = result.outcomes[fixture.key] else {
                 return XCTFail("The production effects must enqueue a real compound recheck")
             }
+            XCTAssertEqual(
+                PendingBackupCoordinator.defaultRestoreRecheckDelays, [60, 300, 900],
+                "Restore rechecks must keep the production backoff schedule")
+            XCTAssertEqual(
+                try XCTUnwrap(fixture.pending.nextEffectDate()).timeIntervalSince(fixture.clock.now), 60,
+                accuracy: 0.001,
+                "The first recheck must register 60 seconds ahead on the injected production schedule")
+            fixture.clockGate.release()
             let admitted = try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision))
             XCTAssertFalse(admitted.state.isTerminalSuccess, "The old completed queue row must reopen")
             XCTAssertTrue(try XCTUnwrap(fixture.pending.sourceState(for: fixture.key)).needsQueueSync)
@@ -47,8 +57,8 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             XCTAssertTrue(
                 try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision)).state
                     .isTerminalSuccess)
-            // The session uses the production 60-second recheck timer. Do not acknowledge the duty in the test.
-            await assertEventually(seconds: 75) { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
+            // The recheck timer runs on the fake clock: its 60-second sleep advances fake time at once.
+            await assertEventually { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
             XCTAssertEqual(
                 fixture.server.uploadRequestCount, uploads, "The real duplicate check must reuse Proton data")
             XCTAssertEqual(fixture.remote.compensations, 0, "A confirmed Restore must not send another remote Restore")
@@ -123,11 +133,78 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             }
             await fixture.drain()
             XCTAssertEqual(fixture.resolver.readCount, reads + 1)
-            // The trash check uses the first recheck. Admission after compensation uses the 300-second backoff.
-            await assertEventually(seconds: 325) { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
+            // The trash check uses the first recheck. Admission after compensation uses the second one.
+            // Those sleeps park on the fake clock, so drive fake time past each registered recheck date.
+            try await fixture.runRestoreRechecks {
+                fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil)
+            }
             XCTAssertEqual(fixture.remote.compensations, 1)
             XCTAssertEqual(fixture.server.uploadRequestCount, uploads)
             XCTAssertEqual(fixture.server.links.first { $0.uid == main }?.state, .active)
+        }
+    }
+
+    func testRestoreRecheckWaitsTheConfiguredFirstDelayOnTheFakeClock() async throws {
+        try await withFixture(.photo) { fixture in
+            let main = try await fixture.backUp()
+            try fixture.exclude(main)
+            // 61 s clears the compound's own real-time 30-second admission floor, so the registered date
+            // is exactly the configured delay; 61, not the production 60, proves the seam is live.
+            try await fixture.startSession(main, restoreRecheckDelays: [61, 62, 63])
+            await assertEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
+
+            fixture.clockGate.hold()
+            let result = try await fixture.restore(main)
+
+            XCTAssertTrue(result.isReadable)
+            guard case .waiting? = result.outcomes[fixture.key] else {
+                return XCTFail("The production effects must enqueue a real compound recheck")
+            }
+            XCTAssertEqual(
+                try XCTUnwrap(fixture.pending.nextEffectDate()).timeIntervalSince(fixture.clock.now), 61,
+                accuracy: 0.001,
+                "The first recheck must register at the configured first delay, not at the production one")
+            fixture.clockGate.release()
+            await assertEventually { fixture.session.excludedTiles.isEmpty }
+            await fixture.drain()
+            XCTAssertTrue(
+                try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision)).state
+                    .isTerminalSuccess)
+            await assertEventually { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
+        }
+    }
+
+    /// Opt-in: prove the untouched production path really waits the 60-second recheck on wall-clock time.
+    /// Skipped in every default run; set the variable to spend the real minute.
+    func testPhotoRecheckWaitsTheRealProductionTimersWhenOptedIn() async throws {
+        guard ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_REAL_RESTORE_RECHECKS"] == "1" else {
+            throw XCTSkip("Set ENCRYPTED_MEMORIES_REAL_RESTORE_RECHECKS=1 to exercise the real recheck timers")
+        }
+        try await withFixture(.photo) { fixture in
+            let main = try await fixture.backUp()
+            try fixture.exclude(main)
+            try await fixture.startSession(main, productionTimers: true)
+            await assertEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
+            let uploads = fixture.server.uploadRequestCount
+
+            let restoreStarted = Date()
+            let result = try await fixture.restore(main)
+
+            XCTAssertTrue(result.isReadable)
+            guard case .waiting? = result.outcomes[fixture.key] else {
+                return XCTFail("The production effects must enqueue a real compound recheck")
+            }
+            await assertEventually { fixture.session.excludedTiles.isEmpty }
+            await fixture.drain()
+            XCTAssertTrue(
+                try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision)).state
+                    .isTerminalSuccess)
+            await assertEventually(seconds: 400) { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
+            XCTAssertGreaterThanOrEqual(
+                Date().timeIntervalSince(restoreStarted), 55,
+                "The real recheck must wait the production 60-second timer, not an immediate fake advance")
+            XCTAssertEqual(
+                fixture.server.uploadRequestCount, uploads, "The real duplicate check must reuse Proton data")
         }
     }
 
@@ -172,6 +249,81 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             held = false
             continuation?.resume()
             continuation = nil
+        }
+    }
+
+    /// The coordinator's fake time. Short sleeps advance the fake clock at once, so publish and checkmark
+    /// timers behave exactly like before. Sleeps longer than `autoAdvanceLimit` — the Restore recheck and
+    /// backoff timers — park until `advance(by:)` moves fake time past their deadline, so a test drives
+    /// the recheck ladder itself. While `hold()` is active every sleep parks, freezing fake time, so a
+    /// registered recheck date can be asserted without racing the timer that will run it; `release()`
+    /// lets every sleep, parked then and parked later, advance the clock at once.
+    private final class GatedBackupClock: @unchecked Sendable {
+        private let inner: BackupTestClock
+        private let lock = NSLock()
+        private var holding = false
+        private var gated: [CheckedContinuation<Bool, Never>] = []
+        private var deadlineWaiters: [(deadline: Date, continuation: CheckedContinuation<Bool, Never>)] = []
+        /// Once a test has released fake time, later long sleeps advance it at once again, like they did
+        /// before the deadline parking existed. A timer task may reach its sleep only after `release()`,
+        /// and parking it then would freeze the fake clock with nobody left to drive it.
+        private var releaseAutoAdvances = false
+        /// The largest configured coordinator interval is 2 seconds; Restore recheck delays are 60 and up.
+        private static let autoAdvanceLimit: TimeInterval = 5
+
+        init(_ inner: BackupTestClock) { self.inner = inner }
+
+        var now: Date { inner.now }
+
+        func hold() { lock.withLock { holding = true } }
+
+        func release() {
+            let parked = lock.withLock {
+                holding = false
+                releaseAutoAdvances = true
+                let parked = gated + deadlineWaiters.map(\.continuation)
+                gated.removeAll()
+                deadlineWaiters.removeAll()
+                return parked
+            }
+            for waiter in parked { waiter.resume(returning: true) }
+        }
+
+        /// Moves fake time forward and wakes every parked long sleep whose deadline has passed. The woken
+        /// sleepers do not advance fake time themselves; this call already did it for them.
+        func advance(by seconds: TimeInterval) {
+            inner.advance(by: seconds)
+            let due = lock.withLock {
+                let now = inner.now
+                let due = deadlineWaiters.filter { $0.deadline <= now }.map(\.continuation)
+                deadlineWaiters.removeAll { $0.deadline <= now }
+                return due
+            }
+            for waiter in due { waiter.resume(returning: false) }
+        }
+
+        func sleep(for seconds: TimeInterval) async throws {
+            let advanceAfterWake = await withCheckedContinuation { continuation in
+                let resumeNow = lock.withLock { () -> Bool in
+                    if holding {
+                        gated.append(continuation)
+                        return false
+                    }
+                    if seconds > Self.autoAdvanceLimit, !releaseAutoAdvances {
+                        deadlineWaiters.append(
+                            (deadline: inner.now.addingTimeInterval(max(0, seconds)), continuation: continuation))
+                        return false
+                    }
+                    return true
+                }
+                if resumeNow { continuation.resume(returning: true) }
+            }
+            if advanceAfterWake { inner.advance(by: max(0, seconds)) }
+        }
+
+        static func seconds(of duration: Duration) -> TimeInterval {
+            let components = duration.components
+            return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1e18
         }
     }
 
@@ -228,6 +380,7 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
         let tagAdder = SpyTagAdder()
         let resolver: Resolver
         let clock: BackupTestClock
+        let clockGate: GatedBackupClock
         var session: PendingGridSession!
         var source: UploadSourceIdentity { resolver.resource.candidate.snapshot.source }
         var revision: UploadBackupRevision { resolver.resource.candidate.snapshot.revision }
@@ -242,6 +395,7 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             defaults.set(true, forKey: "photoBackup.enabled.v1")
             defaults.set(true, forKey: "photoBackup.userPaused.v1")
             clock = BackupTestClock(start: Date().addingTimeInterval(2))
+            clockGate = GatedBackupClock(clock)
             server = EditScenarioServer()
             remote = Remote(server)
             pending = try XCTUnwrap(
@@ -347,8 +501,26 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             XCTAssertTrue(pending.unlistFromTrash([key], at: Date()))
         }
 
-        func startSession(_ main: PhotoUID, waitForExcluded: Bool = true) async throws {
-            session = try XCTUnwrap(PendingGridSession(store: pending, photoBackup: controller, remote: remote))
+        func startSession(
+            _ main: PhotoUID,
+            waitForExcluded: Bool = true,
+            restoreRecheckDelays: [TimeInterval]? = nil,
+            productionTimers: Bool = false
+        ) async throws {
+            // Production timers use the session's own defaults: the real clock and the real sleep.
+            if productionTimers {
+                session = try XCTUnwrap(
+                    PendingGridSession(store: pending, photoBackup: controller, remote: remote))
+            } else {
+                session = try XCTUnwrap(
+                    PendingGridSession(
+                        store: pending, photoBackup: controller, remote: remote,
+                        restoreRecheckDelays: restoreRecheckDelays,
+                        now: { [clockGate] in clockGate.now },
+                        sleep: { [clockGate] duration in
+                            try await clockGate.sleep(for: GatedBackupClock.seconds(of: duration))
+                        }))
+            }
             let item = PhotoItem(
                 uid: .init(volumeID: main.volumeID, nodeID: "volume-anchor"), captureTime: Date(),
                 mediaType: "image/heic")
@@ -368,6 +540,26 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
         func drain() async {
             clock.advance(by: 2)
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        }
+
+        /// Fires the parked Restore recheck timers on the fake clock. Each round moves fake time past the
+        /// recheck date the coordinator registered and lets the woken reconcile run; the loop ends once the
+        /// predicate holds or no recheck remains. The trash check and the admission after compensation each
+        /// need their own recheck.
+        func runRestoreRechecks(until predicate: () -> Bool) async throws {
+            for _ in 0..<6 {
+                if predicate() { break }
+                if let next = try pending.nextEffectDate() {
+                    clockGate.advance(by: max(1, next.timeIntervalSince(clock.now)))
+                } else {
+                    // A reconcile may still be in flight; it registers the next recheck shortly.
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                for _ in 0..<50 where !predicate() {
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+            }
+            XCTAssertTrue(predicate(), "Driving the Restore recheck ladder must reach the expected source state")
         }
 
         func execute(_ sql: String) throws {
@@ -401,6 +593,7 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
 
         func close() async {
             await remote.trashGate.release()
+            clockGate.release()
             await session?.close()
             await runner.stop()
             await controller.shutdown()
