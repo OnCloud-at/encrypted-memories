@@ -118,6 +118,20 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    func testBurstExportFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            (
+                "export.burst_load_failed",
+                "The photos of this burst could not be loaded, so nothing was exported.",
+                "Die Fotos dieser Serie konnten nicht geladen werden. Deshalb wurde nichts exportiert."
+            )
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: appCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: appCatalog), german, key)
+        }
+    }
+
     func testBulkRestoreCopyUsesTheApprovedEnglishAndGermanText() throws {
         let texts: [(String, String, String)] = [
             ("albumsync.bulk_action %@", "Restore All (%@)", "Alle wiederherstellen (%@)"),
