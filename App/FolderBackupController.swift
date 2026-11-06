@@ -242,7 +242,7 @@ final class FolderBackupController {
     private func removeFromBackup(paths: [String]) async -> Bool {
         guard let runner, queueStore?.isOperational() == true else { return false }
         _ = await runner.removeSources(kind: .fileURL, identifiers: paths)
-        return queueStore?.isOperational() == true
+        return queueStore?.holdsNoRows(kind: .fileURL, identifiers: paths) == true
     }
 
     /// Enqueues restored files again and starts a pass. A file that is gone needs nothing and

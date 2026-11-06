@@ -10,6 +10,8 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
     public private(set) var operationFailed = false
     /// False once a recorded failure was not transient, see `transientResultCodes`.
     public private(set) var failuresAreTransient = true
+    /// Every failure recorded on this connection, also the ones that a recovering health check forgot since.
+    private var failuresRecorded: UInt64 = 0
     private let optimizesOnClose: Bool
 
     /// The primary SQLite result codes after which the same call can succeed when it runs again: the database was
@@ -35,8 +37,9 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
         try lock.withLock(body)
     }
 
-    /// Call inside `withLock`. Failure stays recorded for the lifetime of this connection, unless the store checks
-    /// with `isOperationalAfterRecovery()`.
+    /// Call inside `withLock`. A lasting failure stays recorded for the lifetime of this connection. A transient one
+    /// stays recorded until `isOperationalAfterRecovery()` or `isOperationalAfterTransientFailure()` finds the
+    /// database answering again.
     public func markFailed() {
         markFailed(resultCode: nil)
     }
@@ -44,6 +47,7 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
     /// Call inside `withLock` with the result code of the failed call, extended or primary; nil for an unknown cause.
     public func markFailed(resultCode: Int32?) {
         operationFailed = true
+        failuresRecorded &+= 1
         let transient = resultCode.map {
             Self.transientResultCodes.contains($0 & 0xFF) && !Self.corruptionResultCodes.contains($0)
         }
@@ -93,6 +97,10 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
     }
 
     public func isOperational() -> Bool { isOperational(probeDatabase: true) }
+
+    /// How many failures this connection recorded so far. A caller that compares two counts learns whether a failure
+    /// happened in between, also after a recovering health check forgot it.
+    public func recordedFailureCount() -> UInt64 { withLock { failuresRecorded } }
 
     /// Set probeDatabase to false only to preserve a store's existing state-only operational check.
     public func isOperational(probeDatabase: Bool) -> Bool {

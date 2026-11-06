@@ -1137,7 +1137,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         // Claim A to state flips to `checking` (atomically, begin immediate). Note: `claimRunnable`
         // returns the entries in their PRE-claim state (the select runs before the update); the
         // authoritative post-claim state is read back via `entry(for:)` below.
-        let claimed = queue.claimRunnable(limit: 16, claimedAt: clock.now)
+        let claimed = try XCTUnwrap(queue.claimRunnable(limit: 16, claimedAt: clock.now))
         XCTAssertEqual(claimed.count, 1)
         XCTAssertEqual(claimed.first?.state, .discovered, "returned entry reflects pre-claim state")
         XCTAssertEqual(
@@ -1160,7 +1160,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             "an upsert must never regress an in-flight checking row back to discovered")
 
         // A second claimRunnable must find zero runnable rows (A is still checking, not discovered).
-        let reclaimed = queue.claimRunnable(limit: 16, claimedAt: clock.now)
+        let reclaimed = try XCTUnwrap(queue.claimRunnable(limit: 16, claimedAt: clock.now))
         XCTAssertEqual(
             reclaimed.count, 0,
             "the guarded row is not reclaimable; no double-claim or double-upload path remains")

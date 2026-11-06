@@ -136,21 +136,20 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         XCTAssertFalse(store!.isOperational())
     }
 
-    func testApplicationHealthStaysStickyUntilRecoveryIsExplicit() throws {
+    func testATransientFailureIsForgottenOnceTheDatabaseAnswers() throws {
         store = try makeStore()
         let fault = try SQLiteReadInterrupt(in: store!, matching: "SELECT original_filename, byte_count, state")
         defer { fault.stop() }
         XCTAssertThrowsError(try store!.entry(for: entry("known").source, revision: entry("known").revision))
         XCTAssertTrue(fault.fired)
-        XCTAssertFalse(store!.isOperational(), "Application recovery must stay disabled")
-        XCTAssertTrue(try recoveryProbe(in: store!))
-        XCTAssertTrue(store!.isOperational())
+        XCTAssertTrue(store!.isOperational(), "the transient interrupt is forgotten once the database answers")
+        XCTAssertTrue(store!.isOperational(), "and stays forgotten")
     }
 
     func testClosedStoreKeepsRecoveryUnavailable() throws {
         store = try makeStore()
         store!.close()
-        XCTAssertFalse(try recoveryProbe(in: store!))
+        XCTAssertFalse(store!.isOperational())
     }
 
     func testAReadLockKeepsRecoveryUnavailableUntilTheDatabaseAnswers() throws {
@@ -170,9 +169,9 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         defer { _ = sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil) }
         XCTAssertThrowsError(try store!.entry(for: row.source, revision: row.revision))
         connection.withLock { XCTAssertTrue(connection.failuresAreTransient) }
-        XCTAssertFalse(try recoveryProbe(in: store!), "A constant SELECT would incorrectly clear the read failure")
+        XCTAssertFalse(store!.isOperational(), "A constant SELECT would incorrectly clear the read failure")
         XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
         XCTAssertEqual(try store!.entry(for: row.source, revision: row.revision), row)
     }
 
@@ -251,7 +250,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             XCTAssertTrue(connection.operationFailed)
             XCTAssertTrue(connection.failuresAreTransient)
         }
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
     }
 
     func testDecisionReadRefusesAPartialResultAndRetriesAfterRecovery() throws {
@@ -268,8 +267,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             "A decision must never receive the prefix of a failed read")
         XCTAssertTrue(fault.fired)
         XCTAssertEqual(fault.tracedRows, 2, "The failure occurs after at least one row was returned")
-        XCTAssertFalse(store!.isOperational(), "Application recovery remains disabled")
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational(), "the transient interrupt is forgotten once the database answers")
         XCTAssertEqual(try store!.decisionRows(kind: .photoLibraryAsset, identifiers: ["edited"]).count, 3)
     }
 
@@ -287,7 +285,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         XCTAssertThrowsError(
             try store!.decisionRows(kind: .photoLibraryAsset, identifiers: ["edited"]),
             "A malformed row cannot disappear from a complete decision read")
-        XCTAssertFalse(try recoveryProbe(in: store!))
+        XCTAssertFalse(store!.isOperational())
     }
 
     func testUnknownEntryAndPresenceReadsThrowInsteadOfProvingAbsence() throws {
@@ -306,13 +304,13 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         XCTAssertThrowsError(try store!.entry(for: row.source, revision: row.revision))
         XCTAssertTrue(rowFault.fired)
         rowFault.stop()
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
         let presenceFault = try SQLiteReadInterrupt(
             in: store!, matching: "SELECT 1 FROM backup_sync_queue WHERE state IN")
         XCTAssertThrowsError(try store!.containsAny(in: [.discovered]))
         XCTAssertTrue(presenceFault.fired)
         presenceFault.stop()
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
         try withDeniedSQLiteSelect(in: store!) {
             XCTAssertThrowsError(try store!.entry(for: row.source, revision: row.revision))
             XCTAssertThrowsError(try store!.containsAny(in: [.discovered]))
@@ -338,9 +336,9 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
                     }, nil), SQLITE_OK)
         }
         defer { connection.withLock { _ = sqlite3_set_authorizer(connection.database, nil, nil) } }
-        XCTAssertFalse(try recoveryProbe(in: store!), "A constant SELECT cannot prove that the database answers")
+        XCTAssertFalse(store!.isOperational(), "A constant SELECT cannot prove that the database answers")
         connection.withLock { _ = sqlite3_set_authorizer(connection.database, nil, nil) }
-        XCTAssertFalse(try recoveryProbe(in: store!), "The denied schema read must remain recorded")
+        XCTAssertFalse(store!.isOperational(), "The denied schema read must remain recorded")
     }
 
     // MARK: - One transient class at a time
@@ -361,7 +359,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             XCTAssertFalse(store.upsert(entry), "the refused write (code \(code)) persists nothing")
 
             WriteFaultVFS.arm(nil)
-            XCTAssertTrue(try recoveryProbe(in: store), "code \(code): the store answers again without a reopen")
+            XCTAssertTrue(store.isOperational(), "code \(code): the store answers again without a reopen")
             XCTAssertTrue(store.upsert(entry), "code \(code): the same instance persists the entry")
 
             let read = try store.entry(for: entry.source, revision: entry.revision)
@@ -389,7 +387,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             "a transient failure does not stop the presence read")
 
         XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
-        XCTAssertTrue(try recoveryProbe(in: store!), "the database answers again")
+        XCTAssertTrue(store!.isOperational(), "the database answers again")
         XCTAssertTrue(store!.upsert(entry))
     }
 
@@ -404,7 +402,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         XCTAssertFalse(store!.upsert(entry), "the interrupted write persists nothing")
 
         connection.withLock { sqlite3_progress_handler(connection.database, 0, nil, nil) }
-        XCTAssertTrue(try recoveryProbe(in: store!), "the store answers again")
+        XCTAssertTrue(store!.isOperational(), "the store answers again")
         XCTAssertTrue(store!.upsert(entry))
     }
 
@@ -426,7 +424,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             XCTAssertFalse(connection.failuresAreTransient, "a refused commit is not a passing failure")
         }
 
-        XCTAssertFalse(try recoveryProbe(in: store!), "a refused commit is a lasting failure")
+        XCTAssertFalse(store!.isOperational(), "a refused commit is a lasting failure")
         XCTAssertEqual(try store!.entry(for: entry.source, revision: entry.revision), nil, "nothing was written")
         XCTAssertTrue(store!.upsert(entry), "later calls answer on their own")
     }
@@ -443,14 +441,14 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         }
         XCTAssertEqual(store!.sourcesWithEntries([entry.source]), [entry.source], "Legacy reads retain their behavior")
         XCTAssertEqual(store!.missingSourceDiscardGeneration(), 0, "The legacy generation read still answers")
-        XCTAssertFalse(try recoveryProbe(in: store!), "the open transaction keeps the store stopped")
+        XCTAssertFalse(store!.isOperational(), "the open transaction keeps the store stopped")
 
         connection.withLock {
             XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
         }
         XCTAssertEqual(store!.sourcesWithEntries([entry.source]), [entry.source], "the read answers again")
         XCTAssertEqual(store!.missingSourceDiscardGeneration(), 0)
-        XCTAssertTrue(try recoveryProbe(in: store!))
+        XCTAssertTrue(store!.isOperational())
         XCTAssertTrue(store!.upsert(self.entry("after-rollback")))
     }
 
@@ -465,7 +463,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             XCTAssertFalse(store!.upsert(self.entry("during-denial")), "the denied write persists nothing")
         }
 
-        XCTAssertFalse(try recoveryProbe(in: store!), "a lasting failure stays recorded")
+        XCTAssertFalse(store!.isOperational(), "a lasting failure stays recorded")
         XCTAssertEqual(store!.sourcesWithEntries([entry.source]), [entry.source], "The requested legacy read succeeds")
         XCTAssertTrue(store!.upsert(self.entry("after-denial")), "later calls answer on their own")
         XCTAssertEqual(store!.sourcesWithEntries([entry.source]), [entry.source], "The healthy row remains readable")
@@ -515,7 +513,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             XCTAssertTrue(connection.operationFailed)
             XCTAssertFalse(connection.failuresAreTransient, "the lasting code replaced the transient failure")
         }
-        XCTAssertFalse(try recoveryProbe(in: store!), "the corrupted database keeps the store stopped")
+        XCTAssertFalse(store!.isOperational(), "the corrupted database keeps the store stopped")
         XCTAssertThrowsError(
             try store!.entry(for: entry.source, revision: entry.revision),
             "a failed row read must stay unknown")
@@ -558,7 +556,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             sqlite3_finalize(probe)
         }
         XCTAssertNil(store!.summary(), "the undecodable row stops the summary read")
-        XCTAssertFalse(try recoveryProbe(in: store!), "the lasting failure stays recorded after the passing probe")
+        XCTAssertFalse(store!.isOperational(), "the lasting failure stays recorded after the passing probe")
         XCTAssertEqual(store!.count(), 1, "The legacy scalar read still answers its own successful SQL")
     }
 
@@ -629,7 +627,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
                 XCTAssertTrue(connection.operationFailed, "the insert wrapper that could not run records a failure")
             }
         }
-        XCTAssertFalse(try recoveryProbe(in: store!), "the store stays stopped until the probe clears it")
+        XCTAssertFalse(store!.isOperational(), "the store stays stopped until the probe clears it")
     }
 
     /// The discard path shares the insert path's requirement: a wrapper that could not run records a failure
@@ -648,7 +646,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
                 XCTAssertTrue(connection.operationFailed, "the discard wrapper that could not run records a failure")
             }
         }
-        XCTAssertFalse(try recoveryProbe(in: store!), "the store stays stopped until the probe clears it")
+        XCTAssertFalse(store!.isOperational(), "the store stays stopped until the probe clears it")
     }
 
     // MARK: - B2: complete reads for decisions (#1004)
@@ -677,7 +675,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         connection.withLock {
             XCTAssertFalse(connection.failuresAreTransient, "the denied setup records its own lasting code")
         }
-        XCTAssertFalse(try recoveryProbe(in: store!), "a passing probe must not forget the lasting failure")
+        XCTAssertFalse(store!.isOperational(), "a passing probe must not forget the lasting failure")
         XCTAssertNil(try store!.entry(for: row.source, revision: row.revision))
     }
 
@@ -688,8 +686,14 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         store = try makeStore(file: "healthy.sqlite")
         XCTAssertEqual(try store!.decisionUnsettledRows(), [], "an empty queue is a complete empty answer")
         for row in rows { XCTAssertTrue(store!.upsert(row)) }
-        XCTAssertEqual(try store!.decisionUnsettledRows(), store!.unsettledRows())
-        XCTAssertEqual(try store!.decisionUnsettledRows().count, 3)
+        XCTAssertEqual(
+            try store!.decisionUnsettledRows().sorted { $0.source.identifier < $1.source.identifier },
+            rows.map {
+                UploadBackupQueueRowState(
+                    source: $0.source, revision: $0.revision, state: $0.state, originalFilename: $0.originalFilename,
+                    updatedAt: $0.updatedAt)
+            },
+            "every row with its state and revision")
         store!.close()
 
         store = try makeStore(file: "prepare.sqlite")
@@ -718,7 +722,7 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             image[range.lowerBound] = UInt8(ascii: "x")
         }
         XCTAssertThrowsError(try store!.decisionUnsettledRows(), "an undecodable row cannot vanish from the inventory")
-        XCTAssertFalse(try recoveryProbe(in: store!))
+        XCTAssertFalse(store!.isOperational())
     }
 
     /// Each decision read throws on a failed step instead of answering "nothing waits".

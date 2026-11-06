@@ -266,6 +266,11 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// False after a SQLite operation failed or the store was closed. An empty read is safe to
     /// interpret as "drained" only while this remains true.
     func isOperational() -> Bool
+    /// How many failures the store recorded so far, also the ones that its health check forgot since. The runner notes
+    /// the count when a pass starts and compares it at every health guard of the pass, so a write or read that failed
+    /// during the pass, also one of another reader of the same store, ends the pass as unknown (#1004). Every store
+    /// implements it; a store that answers a constant switches that guard off.
+    func recordedFailureCount() -> UInt64
     /// Makes every committed change survive a power loss. Returns false when that is not certain.
     func synchronizeToDisk() -> Bool
     /// Persists one row. The row survives a power loss once this returns true.
@@ -305,14 +310,16 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// active rows back to runnable via `requeueStaleActive`. Rows of a source in `excludedSources` (same kind and
     /// identifier, any resource or revision) stay unclaimed: the runner passes the sources it processes, because
     /// their rows can be runnable for a moment, for example while the paired video of an uploaded photo uploads.
+    /// Nil means the claim failed and changed nothing; an empty claim is only an empty array.
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
-    ) -> [UploadBackupSyncQueueEntry]
+    ) -> [UploadBackupSyncQueueEntry]?
     /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, oldest first.
     /// The runner uses this to find parked `blockedByDraft` rows whose re-check backoff elapsed.
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
+    /// Nil means the write failed and changed nothing; the caller must not continue as if stale rows were requeued.
     @discardableResult
-    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int
+    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int?
     /// Makes every non-active retryable row immediately eligible for an explicit user retry.
     /// Terminal successes, respected remote deletions, and missing local sources are untouched.
     @discardableResult
@@ -408,7 +415,7 @@ public extension UploadBackupSyncQueueStore {
         nextRunnableDate(excludingSourcesOf: [])
     }
 
-    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry]? {
         claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
     }
 

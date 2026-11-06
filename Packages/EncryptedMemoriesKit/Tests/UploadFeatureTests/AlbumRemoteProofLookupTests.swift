@@ -77,7 +77,6 @@ final class AlbumRemoteProofLookupTests: XCTestCase {
         try await withQueue { queue in
             let asset = self.candidate("asset")
             self.seed(asset, in: queue)
-            queue.recoversTransientFailuresForTesting = true
             let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
             defer { fault.stop() }
             let resolver = ScriptedAlbumProofResolver()

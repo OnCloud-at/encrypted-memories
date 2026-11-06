@@ -32,24 +32,15 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     deinit { close() }
 
-    /// Recovery activation stays off until all decision consumers use strict reads.
-    public func isOperational() -> Bool {
-        #if DEBUG
-            if recoversTransientFailuresForTesting { return connection.isOperationalAfterTransientFailure() }
-        #endif
-        return connection.isOperational()
-    }
-
-    #if DEBUG
-        /// Test-only stand-in for the recovery activation of #1004: the health check forgets transient failures, as it
-        /// will once activation ships. Absent from release builds; the activation change removes it together with the
-        /// queue store's switch of the same name.
-        var recoversTransientFailuresForTesting = false
-    #endif
+    /// A transient failure stops the store only until the database answers again. Every decision reads strictly, and a
+    /// catalog info read that answers nil or false on failure only causes more work, a rescan or a sweep from the start
+    /// (#1004).
+    public func isOperational() -> Bool { connection.isOperationalAfterTransientFailure() }
 
     /// Records a predicate under `withLock`, with the extended code of the failed SQLite call. A busy, locked, full,
-    /// interrupted, out-of-memory or broken-I/O failure remains eligible for the recovery primitive.
-    /// Application-facing health remains sticky until decision consumers migrate to strict reads.
+    /// interrupted, out-of-memory or I/O failure stops the store until `isOperational()` finds the database answering
+    /// again. Any other failure, and an I/O failure that reports damaged data (SQLITE_IOERR_DATA,
+    /// SQLITE_IOERR_CORRUPTFS), stops it until the store is opened again.
     @discardableResult
     private func requireOperational(_ condition: Bool) -> Bool {
         connection.requireOperationalRecordingSQLiteError(condition)

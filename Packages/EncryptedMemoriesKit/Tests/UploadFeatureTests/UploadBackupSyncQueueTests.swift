@@ -258,7 +258,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             }
             if change == "decode" {
                 XCTAssertEqual(
-                    observer.rows(kind: row.source.kind, identifiers: [row.source.identifier]).map(\.state),
+                    try observer.decisionRows(kind: row.source.kind, identifiers: [row.source.identifier]).map(\.state),
                     [.completed])
                 XCTAssertEqual(observer.count(), 1)
                 continue
@@ -400,7 +400,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             reopened.claimRunnable(
                 limit: 1,
                 claimedAt: Date(timeIntervalSince1970: 12)
-            ).first)
+            )?.first)
         XCTAssertEqual(claimed.state, .needsRemoteReconciliation)
         XCTAssertEqual(claimed.remoteCommitReconciliation, reconciliation)
         XCTAssertEqual(
@@ -442,7 +442,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(reconciling.remoteCommitReconciliation, reconciliation, "a reconciliation row keeps its receipt")
         XCTAssertEqual(reconciling.attempts, stored.attempts)
         XCTAssertEqual(reconciling.lastError, stored.lastError)
-        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 12)).count, 1)
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 12))?.count, 1)
 
         XCTAssertTrue(store.upsert(scanned))
         let claimed = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
@@ -609,7 +609,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(
             store.nextRunnable(limit: 2).map(\.source.identifier), ["fresh", "backlog"],
             "newest photo (highest revision) drains first, even though it was enqueued last")
-        let claimed = store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 9_000_001))
+        let claimed = try XCTUnwrap(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 9_000_001)))
         XCTAssertEqual(claimed.map(\.source.identifier), ["fresh"], "claim also prioritizes the newest photo")
     }
 
@@ -981,7 +981,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
 
         XCTAssertEqual(store.nextRunnableDate(), old.updatedAt)
 
-        let firstClaim = store.claimRunnable(limit: 2, claimedAt: now)
+        let firstClaim = try XCTUnwrap(store.claimRunnable(limit: 2, claimedAt: now))
 
         // Newest photo first among the eligible (future-backoff row excluded until its updated_at):
         // ready (revision 20) before the lower-revision row (revision 10).
@@ -989,11 +989,11 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(try store.entry(for: old.source, revision: old.revision)?.state, .checking)
         XCTAssertEqual(try store.entry(for: ready.source, revision: ready.revision)?.state, .checking)
         XCTAssertEqual(try store.entry(for: future.source, revision: future.revision)?.state, .discovered)
-        XCTAssertTrue(
-            store.claimRunnable(limit: 10, claimedAt: now).isEmpty,
+        XCTAssertEqual(
+            store.claimRunnable(limit: 10, claimedAt: now), [],
             "claimed rows are active and future-backoff rows are not claimable yet")
 
-        let secondClaim = store.claimRunnable(limit: 10, claimedAt: Date(timeIntervalSince1970: 250))
+        let secondClaim = try XCTUnwrap(store.claimRunnable(limit: 10, claimedAt: Date(timeIntervalSince1970: 250)))
         XCTAssertEqual(secondClaim.map(\.source.identifier), ["future"])
         XCTAssertNil(store.nextRunnableDate())
     }
@@ -1015,14 +1015,15 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         for row in rows { XCTAssertTrue(store.upsert(row)) }
         let now = Date(timeIntervalSince1970: 100)
 
-        let claimed = store.claimRunnable(limit: 10, claimedAt: now, excludingSourcesOf: [source("running")])
+        let claimed = try XCTUnwrap(
+            store.claimRunnable(limit: 10, claimedAt: now, excludingSourcesOf: [source("running")]))
 
         XCTAssertEqual(claimed.map(\.originalFilename), ["idle.heic"], "any resource of an excluded source stays")
         XCTAssertEqual(
             try store.entry(for: rows[0].source, revision: rows[0].revision)?.state, .needsRemoteReconciliation)
         XCTAssertEqual(try store.entry(for: rows[1].source, revision: rows[1].revision)?.state, .discovered)
         XCTAssertEqual(
-            store.claimRunnable(limit: 10, claimedAt: now).map(\.originalFilename), ["running.heic", "running.mov"],
+            store.claimRunnable(limit: 10, claimedAt: now)?.map(\.originalFilename), ["running.heic", "running.mov"],
             "the rows are claimable once the source is no longer excluded")
     }
 
@@ -1072,11 +1073,11 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         ) { group in
             group.addTask {
                 await gate.arriveAndWait()
-                return first.claimRunnable(limit: entries.count, claimedAt: claimedAt)
+                return first.claimRunnable(limit: entries.count, claimedAt: claimedAt) ?? []
             }
             group.addTask {
                 await gate.arriveAndWait()
-                return second.claimRunnable(limit: entries.count, claimedAt: claimedAt)
+                return second.claimRunnable(limit: entries.count, claimedAt: claimedAt) ?? []
             }
 
             var values: [[UploadBackupSyncQueueEntry]] = []
@@ -1087,7 +1088,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         let identifiers = claims.flatMap { $0.map(\.source.identifier) }
         XCTAssertEqual(identifiers.count, entries.count)
         XCTAssertEqual(Set(identifiers).count, entries.count, "each durable row may be claimed only once")
-        XCTAssertTrue(first.claimRunnable(limit: entries.count, claimedAt: claimedAt).isEmpty)
+        XCTAssertEqual(first.claimRunnable(limit: entries.count, claimedAt: claimedAt), [])
     }
 
     func testSQLiteQueueRequeuesStaleActiveStatesAfterCrash() throws {

@@ -188,7 +188,7 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
         queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
         XCTAssertEqual(queue.backupSupportSnapshot(), dismissed)
         let claimed = try XCTUnwrap(
-            queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: []).first)
+            queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: [])?.first)
         XCTAssertEqual(claimed.state, .discovered)
         XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision)?.state, .checking)
         XCTAssertEqual(claimed.lastError, missing)
@@ -208,7 +208,7 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
         XCTAssertEqual(
             queue.updateDismissedSourceRecheck(entry, matchingState: .dismissedFailure, matchingLastError: missing),
             true)
-        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: []).count, 1)
+        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: now, excludingSourcesOf: [])?.count, 1)
         entry.lastError = nil
         entry.byteCount = 10
         XCTAssertEqual(

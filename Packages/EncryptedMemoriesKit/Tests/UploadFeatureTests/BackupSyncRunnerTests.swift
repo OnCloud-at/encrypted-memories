@@ -536,6 +536,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
 
     func isOperational() -> Bool { lock.withLock { !readFailed } }
+    func recordedFailureCount() -> UInt64 { inner.recordedFailureCount() }
 
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
 
@@ -572,7 +573,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
-    ) -> [UploadBackupSyncQueueEntry] {
+    ) -> [UploadBackupSyncQueueEntry]? {
         log.append("queue.claimRunnable")
         return inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
@@ -583,7 +584,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
 
     @discardableResult
-    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int {
+    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int? {
         log.append("queue.requeueStaleActive")
         return inner.requeueStaleActive(before: cutoff, updatedAt: updatedAt)
     }
@@ -640,7 +641,6 @@ extension SpyQueueStore: UploadBackupSyncQueueObserving {
         inner.setChangeObserver(observer)
     }
     func changes() -> AsyncStream<UploadBackupSyncQueueChange> { inner.changes() }
-    func unsettledRows() -> [UploadBackupQueueRowState] { inner.unsettledRows() }
     func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { try inner.decisionUnsettledRows() }
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
         inner.backedUpRevisions(kind: kind)
@@ -649,10 +649,6 @@ extension SpyQueueStore: UploadBackupSyncQueueObserving {
         kind: UploadSourceIdentity.Kind, identifiers: Set<String>
     ) throws -> [UploadBackupQueueRowState] {
         try inner.decisionRows(kind: kind, identifiers: identifiers)
-    }
-
-    func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
-        inner.rows(kind: kind, identifiers: identifiers)
     }
 }
 
@@ -670,6 +666,7 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
 
     func isOperational() -> Bool { inner.isOperational() }
+    func recordedFailureCount() -> UInt64 { inner.recordedFailureCount() }
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool { inner.upsert(entry) }
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
@@ -685,14 +682,14 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
-    ) -> [UploadBackupSyncQueueEntry] {
+    ) -> [UploadBackupSyncQueueEntry]? {
         inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
     {
         inner.entries(in: state, updatedBefore: updatedBefore, limit: limit)
     }
-    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int {
+    func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int? {
         inner.requeueStaleActive(before: cutoff, updatedAt: updatedAt)
     }
     func updateState(
@@ -7269,7 +7266,6 @@ extension BackupSyncRunnerTests {
     func testAnUnknownRunnableDateCannotCertifyNoUploadWorkAfterRecovery() async throws {
         _ = seedEntry("waiting.jpg")
         let store = try XCTUnwrap(queueStore)
-        store.recoversTransientFailuresForTesting = true
         let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT MIN(updated_at) FROM backup_sync_queue")
         defer { fault.stop() }
         let runner = makeRunner()
@@ -7288,7 +7284,6 @@ extension BackupSyncRunnerTests {
                 source: entry.source, revision: entry.revision, state: .discovered, attempts: 1, lastError: nil,
                 updatedAt: clock.now.addingTimeInterval(600)))
         let store = try XCTUnwrap(queueStore)
-        store.recoversTransientFailuresForTesting = true
         let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT MIN(updated_at) FROM backup_sync_queue")
         defer { fault.stop() }
         let runner = makeRunner()
@@ -7314,7 +7309,6 @@ extension BackupSyncRunnerTests {
                 source: entry.source, revision: entry.revision, state: .blockedByDraft, attempts: 0,
                 lastError: issue.persistedValue, updatedAt: clock.now.addingTimeInterval(-60)))
         let store = try XCTUnwrap(queueStore)
-        store.recoversTransientFailuresForTesting = true
         let fault = try SQLiteReadInterrupt(in: store, matching: "WHERE state = ? AND updated_at < ?")
         defer { fault.stop() }
         let runner = makeRunner()
@@ -7377,5 +7371,137 @@ extension BackupSyncRunnerTests {
         XCTAssertFalse(final.leavesNoUploadWork, "an unknown final drain proves no empty queue")
         let operational = await runner.isQueueOperational()
         XCTAssertFalse(operational)
+    }
+}
+
+// MARK: - #1004 B2c: recovery from transient queue failures
+
+extension BackupSyncRunnerTests {
+    /// A transient failure stops only the read that hit it. Once the database answers, the next pass backs up.
+    func testATransientQueueFailureDoesNotStopTheNextPass() async throws {
+        let entry = seedEntry("waiting.jpg")
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT COUNT(*) FROM backup_sync_queue;")
+        XCTAssertNil(store.count(), "the interrupted read is unknown")
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed, "the next pass backs up once the database answers")
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    /// A lasting failure still stops backup: a row that does not decode is no passing failure.
+    func testAnUndecodableQueueRowStillStopsTheNextPass() async throws {
+        let entry = seedEntry("waiting.jpg")
+        XCTAssertTrue(queueStore.synchronizeToDisk())
+        var handle: OpaquePointer?
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
+            SQLITE_OK)
+        XCTAssertThrowsError(try queueStore.entry(for: entry.source, revision: entry.revision))
+
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertTrue(uploader.requests.isEmpty, "a lasting failure keeps every upload stopped")
+        // This assertion pins the guard: the health check keeps a lasting failure after the database answers again.
+        // The empty upload list alone does not prove it, because a pass can also end without uploading for other
+        // reasons.
+        XCTAssertFalse(queueStore.isOperational(), "a decode failure stays recorded after the database answers")
+    }
+
+    /// A pass whose requeue of stale active rows failed must not report that no upload work is left. The rows wait
+    /// for the next pass, which requeues and backs them up.
+    func testAFailedStaleRequeueNeverReportsNoUploadWork() async throws {
+        let entry = seedEntry("stale.jpg", state: .checking)
+        let store = try XCTUnwrap(queueStore)
+        let fault = try SQLiteReadInterrupt(in: store, matching: "WHEN 'checking' THEN CASE")
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+        XCTAssertFalse(progress.leavesNoUploadWork, "the stale row still waits for its requeue")
+        XCTAssertEqual(state(of: entry), .checking, "the failed requeue changed nothing")
+
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed, "the next pass requeues and backs up the row")
+    }
+
+    /// A failed claim ends the pass as unknown. A later health check can pass again, so a claim retried at once would
+    /// run again and again for as long as the write keeps failing, for example on a full disk.
+    func testAFailedClaimEndsThePassInsteadOfRetryingIt() async throws {
+        let entry = seedEntry("waiting.jpg")
+        let store = try XCTUnwrap(queueStore)
+        let faults = try SQLiteStatementFaults(in: store, failures: 3) { $0.contains("SET state='checking'") }
+        defer { faults.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(faults.firedCount, 1, "a failed claim ends the pass; it is not retried at once")
+        XCTAssertEqual(state(of: entry), .discovered, "the failed claim changed nothing")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "the pass that could not claim reports it unknown")
+
+        faults.stop()
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed, "the next pass claims and backs up the row")
+    }
+
+    /// "No upload work is left" needs a pass without a recorded failure. A failure that another reader of the same
+    /// connection records while the pass reads its last answer is forgotten by the health check at once, so only the
+    /// pass's own failure count shows it.
+    func testAFailureRecordedWhileTheLastReadRunsNeverReportsNoUploadWork() async throws {
+        let control = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(control.leavesNoUploadWork, "fixture control: an empty queue leaves no upload work")
+
+        let mark = try SQLiteRecordedFailure(
+            in: queueStore!, matching: "SELECT 1 FROM backup_sync_queue WHERE state IN")
+        defer { mark.stop() }
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertTrue(mark.recorded, "the failure was recorded while the last read ran")
+        XCTAssertTrue(queueStore.isOperational(), "the health check forgot it, because the database answers")
+        XCTAssertFalse(progress.leavesNoUploadWork, "a pass with a recorded failure proves no empty queue")
+    }
+
+    /// A pass that ends because its queue summary could not be read is unknown, also after the database answers
+    /// again: a caller that drains again at once would read the same failure about once per second.
+    func testAFailedSummaryReadEndsThePassAsUnknown() async throws {
+        let entry = seedEntry("waiting.jpg")
+        let fault = try SQLiteReadInterrupt(in: queueStore!, matching: "GROUP BY state, source_kind, check_reason")
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(state(of: entry), .discovered, "the pass ended before it claimed anything")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "a pass that could not read its summary reports it unknown")
+    }
+
+    /// A pass whose cleared remote-index issue could not be written is unknown, also after the database answers.
+    func testAFailedClearOfTheRemoteIndexIssueEndsThePassAsUnknown() async throws {
+        _ = seedEntry("waiting.jpg")
+        let faults = try SQLiteStatementFaults(in: queueStore!, failures: 1) {
+            $0.contains("DELETE FROM backup_sync_runtime_issue")
+        }
+        defer { faults.stop() }
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(faults.firedCount, 1, "the write that clears the issue failed")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "a pass that could not clear its issue reports it unknown")
+    }
+
+    /// A pass whose remote-index issue could not be saved is unknown, also after the database answers.
+    func testAFailedSaveOfTheRemoteIndexIssueEndsThePassAsUnknown() async throws {
+        _ = seedEntry("waiting.jpg")
+        let faults = try SQLiteStatementFaults(in: queueStore!, failures: 1) {
+            $0.contains("INSERT INTO backup_sync_runtime_issue")
+        }
+        defer { faults.stop() }
+        let runner = makeRunner(identityResolver: PreparationFailingIdentityResolver(inner: makePipeline()))
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(faults.firedCount, 1, "the write that saves the issue failed")
+        let operational = await runner.isQueueOperational()
+        XCTAssertFalse(operational, "a pass that could not save its issue reports it unknown")
     }
 }

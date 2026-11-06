@@ -84,7 +84,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertEqual(scan.discovered, 0)
         XCTAssertEqual(scan.changed, 0, "An unchanged library must not re-open on upgrade")
         XCTAssertEqual(scan.removed, 0)
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         await harness.drain()
 
         XCTAssertEqual(uploads, 0)
@@ -126,11 +126,11 @@ final class EditUpgradeScenarioTests: XCTestCase {
         let scan = try await harness.fullRescan()
         XCTAssertEqual(scan.changed, 0, "the Live effect alone must not re-open a photo on upgrade")
         XCTAssertEqual(scan.discovered, 0)
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         // A v1.0.5 edit deduped the original and the video against the first main, so it fails the S3 drain check.
         await harness.pass()
 
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         XCTAssertEqual(uploads, 0)
         XCTAssertTrue(trashed.isEmpty)
         XCTAssertEqual(serverState(), before, "the Live Photo stays in Proton until the next edit")
@@ -142,7 +142,7 @@ final class EditUpgradeScenarioTests: XCTestCase {
         harness.library.changeModificationDate()
         _ = try await harness.fullRescan()
         await harness.pass()
-        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try harness.queue.decisionUnsettledRows()).isEmpty)
         XCTAssertTrue(trashed.isEmpty)
         if fixture == .edited {
             // v1.0.5 counted the video of the edited version as saved, because the same file already sat under the

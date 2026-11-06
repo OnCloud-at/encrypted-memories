@@ -355,16 +355,8 @@ func makeTempFiles(_ names: [String], in dir: URL) throws -> [URL] {
     }
 }
 
-/// Exercises the dormant recovery primitive without enabling it in application-facing store health checks.
-func recoveryProbe(in store: Any) throws -> Bool {
-    let connection = try XCTUnwrap(
-        Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value as? SQLiteStoreConnection)
-    return connection.isOperationalAfterTransientFailure()
-}
-
 func withDeniedSQLitePragma(in store: Any, _ body: () throws -> Void) throws {
-    let connection = try XCTUnwrap(
-        Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value as? SQLiteStoreConnection)
+    let connection = try storeConnection(store)
     connection.withLock {
         XCTAssertEqual(
             sqlite3_set_authorizer(

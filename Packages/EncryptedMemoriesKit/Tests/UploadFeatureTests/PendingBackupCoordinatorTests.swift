@@ -933,7 +933,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(try queue.entry(for: pending.source, revision: pending.revision), pending)
         var released = pending
         released.state = .checking
-        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: date).count, 1)
+        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: date)?.count, 1)
         released.lastError = nil
         XCTAssertEqual(
             queue.updateDismissedSourceRecheck(released, matchingState: .checking, matchingLastError: reason), true)
@@ -5226,11 +5226,10 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
         let callback = lock.withLock { observer }
         callback?(.all)
     }
-    func unsettledRows() -> [UploadBackupQueueRowState] {
+    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] {
         lock.withLock { unsettled += 1 }
         return pending
     }
-    func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { unsettledRows() }
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
         lock.withLock { aggregates += 1 }
         return [:]
@@ -5238,10 +5237,6 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
     func decisionRows(
         kind: UploadSourceIdentity.Kind, identifiers: Set<String>
     ) throws -> [UploadBackupQueueRowState] {
-        rows(kind: kind, identifiers: identifiers)
-    }
-
-    func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
         lock.withLock { reads += identifiers.count }
         return pending.filter { identifiers.contains($0.source.identifier) }
     }

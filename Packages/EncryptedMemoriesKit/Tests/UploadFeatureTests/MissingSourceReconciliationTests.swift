@@ -740,9 +740,10 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(projection.progress.outstanding.count, 1, "The scheduler still owes a check")
         XCTAssertEqual(projection.status.needsAttentionCount, 0)
         XCTAssertEqual(projection.status.notBackedUpCount, 1)
-        XCTAssertTrue(queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try queue.decisionUnsettledRows()).isEmpty)
         XCTAssertEqual(
-            queue.rows(kind: .photoLibraryAsset, identifiers: [offered.snapshot.source.identifier]).map(\.state),
+            try queue.decisionRows(kind: .photoLibraryAsset, identifiers: [offered.snapshot.source.identifier]).map(
+                \.state),
             [.dismissedFailure])
         await projector.stop()
     }
@@ -753,9 +754,9 @@ final class MissingSourceReconciliationTests: XCTestCase {
         pending.lastError = BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue
         XCTAssertTrue(queue.upsert(pending))
         let date = pending.updatedAt.addingTimeInterval(10)
-        let claimed = try XCTUnwrap(queue.claimRunnable(limit: 1, claimedAt: date).first)
+        let claimed = try XCTUnwrap(queue.claimRunnable(limit: 1, claimedAt: date)?.first)
         XCTAssertEqual(claimed.lastError, pending.lastError)
-        XCTAssertTrue(queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try queue.decisionUnsettledRows()).isEmpty)
         closeStores()
         try openStores()
         XCTAssertEqual(queue.requeueStaleActive(before: date.addingTimeInterval(1), updatedAt: date), 1)
@@ -814,7 +815,9 @@ final class MissingSourceReconciliationTests: XCTestCase {
             return true
         }
         XCTAssertTrue(problems.isEmpty)
-        XCTAssertTrue(queue.unsettledRows().isEmpty, "Pending upload reconciliation must not restore a dismissed photo")
+        XCTAssertTrue(
+            (try queue.decisionUnsettledRows()).isEmpty,
+            "Pending upload reconciliation must not restore a dismissed photo")
         if relaunch {
             closeStores()
             try openStores()
@@ -1088,7 +1091,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             entry.updatedAt = clock.now
             XCTAssertEqual(try queue.entry(for: entry.source, revision: entry.revision), entry)
         }
-        let claimed = queue.claimRunnable(limit: expected.count, claimedAt: clock.now)
+        let claimed = try XCTUnwrap(queue.claimRunnable(limit: expected.count, claimedAt: clock.now))
         XCTAssertEqual(Set(claimed.map(\.source)), Set(expected.map(\.source)))
         XCTAssertEqual(claimed.count, expected.count)
     }
@@ -1522,7 +1525,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             return true
         }
         XCTAssertTrue(problems.isEmpty)
-        XCTAssertTrue(queue.unsettledRows().isEmpty)
+        XCTAssertTrue((try queue.decisionUnsettledRows()).isEmpty)
     }
 
     private func availabilityRunner(

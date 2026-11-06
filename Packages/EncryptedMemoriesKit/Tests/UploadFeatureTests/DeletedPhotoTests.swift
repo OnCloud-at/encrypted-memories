@@ -750,7 +750,7 @@ final class DeletedPhotoTests: XCTestCase {
 
         XCTAssertTrue(fault.fired, "The bulk statement must actually be interrupted")
         XCTAssertEqual(fault.tracedRows, afterRows, "The requested SQL fault must fire before any decision effects")
-        XCTAssertFalse(queue.isOperational(), "B1 must leave recovery activation OFF")
+        XCTAssertTrue(queue.isOperational(), "The transient interrupt is forgotten once the database answers")
         XCTAssertEqual(
             journal.entry(for: source), beforeJournal,
             "An incomplete inventory must not choose the clicked older revision")
@@ -762,38 +762,30 @@ final class DeletedPhotoTests: XCTestCase {
         await controller.shutdown()
     }
 
-    func testB1BulkFaultControlsProveLegacyPrefixAndStrictUnknown() throws {
-        for strict in [false, true] {
-            let queue = try XCTUnwrap(
-                UploadBackupSyncQueueManifestStore(
-                    url: directory.appendingPathComponent("bulk-control-\(strict).sqlite")))
-            defer { queue.close() }
-            let revisions = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map {
-                UploadBackupRevision(date: $0)
-            }
-            for revision in revisions {
-                XCTAssertTrue(
-                    queue.upsert(
-                        .init(
-                            source: source, revision: revision, originalFilename: "photo.heic", state: .failedPermanent,
-                            lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
-                            updatedAt: date)))
-            }
-            let fault = try SQLiteReadInterrupt(
-                in: queue, matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
-            defer { fault.stop() }
-            if strict {
-                XCTAssertThrowsError(try queue.decisionRows(kind: source.kind, identifiers: [source.identifier])) {
-                    XCTAssertTrue($0 is SQLiteStoreUnknownReadError)
-                }
-            } else {
-                let prefix = queue.rows(kind: source.kind, identifiers: [source.identifier])
-                XCTAssertEqual(prefix.map(\.revision), [revisions[0]], "The legacy API returns the older prefix")
-            }
-            XCTAssertTrue(fault.fired)
-            XCTAssertEqual(fault.tracedRows, 2)
-            XCTAssertFalse(queue.isOperational(), "The injected SQL failure must remain sticky")
+    func testB1BulkFaultControlsProveStrictUnknown() throws {
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent("bulk-control.sqlite")))
+        defer { queue.close() }
+        let revisions = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map {
+            UploadBackupRevision(date: $0)
         }
+        for revision in revisions {
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: source, revision: revision, originalFilename: "photo.heic", state: .failedPermanent,
+                        lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                        updatedAt: date)))
+        }
+        let fault = try SQLiteReadInterrupt(
+            in: queue, matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
+        defer { fault.stop() }
+        XCTAssertThrowsError(try queue.decisionRows(kind: source.kind, identifiers: [source.identifier])) {
+            XCTAssertTrue($0 is SQLiteStoreUnknownReadError)
+        }
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(fault.tracedRows, 2)
+        XCTAssertTrue(queue.isOperational(), "The transient interrupt is forgotten once the database answers")
     }
 
     // MARK: One decision writes all of its revisions or none (#1004)
@@ -1244,7 +1236,7 @@ final class DeletedPhotoTests: XCTestCase {
             UploadBackupSyncQueueManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
         defer { queue.close() }
-        XCTAssertTrue(queue.rows(kind: .photoLibraryAsset, identifiers: [source.identifier]).isEmpty)
+        XCTAssertTrue(try queue.decisionRows(kind: .photoLibraryAsset, identifiers: [source.identifier]).isEmpty)
         XCTAssertFalse(controller.isSyncing)
         await controller.shutdown()
     }

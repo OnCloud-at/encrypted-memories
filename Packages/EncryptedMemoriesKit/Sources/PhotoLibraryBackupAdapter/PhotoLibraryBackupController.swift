@@ -503,7 +503,7 @@ public final class PhotoLibraryBackupController {
             admittedRestoreRechecks.remove(key)
         }
         _ = await runner.removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
-        return queueStore?.isOperational() == true
+        return queueStore?.holdsNoRows(kind: .photoLibraryAsset, identifiers: identifiers) == true
     }
 
     /// Enqueues restored photos again from the catalog, without PhotoKit, and starts a pass when backup

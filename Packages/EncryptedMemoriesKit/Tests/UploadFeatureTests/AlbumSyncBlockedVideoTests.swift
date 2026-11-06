@@ -211,6 +211,65 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
         }
     }
 
+    /// Arms one failure of the receipt write on the executor's own queue at the first resolve, while the drain runs.
+    private final class ReceiptWriteFault: BackupResourceResolving, @unchecked Sendable {
+        let inner: ScriptedBackupResolver
+        weak var executor: PhotoAlbumBackupExecutor?
+        private let lock = NSLock()
+        private(set) var faults: SQLiteStatementFaults?
+        init(inner: ScriptedBackupResolver) { self.inner = inner }
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            try lock.withLock {
+                guard faults == nil, let executor else { return }
+                let runner = try XCTUnwrap(
+                    Mirror(reflecting: executor).children.first { $0.label == "activeRunner" }?.value
+                        as? BackupSyncRunner)
+                let queue = try XCTUnwrap(
+                    Mirror(reflecting: runner).children.first { $0.label == "queue" }?.value
+                        as? UploadBackupSyncQueueManifestStore)
+                faults = try SQLiteStatementFaults(in: queue, failures: 1) {
+                    $0.contains("state='needsRemoteReconciliation',")
+                }
+            }
+            return try await inner.resolve(entry)
+        }
+    }
+
+    /// A drain that ended because a write failed is no finished drain, also after the database answers again: the
+    /// album sync must not build its report from it and count the photo that did not settle as unattachable.
+    func testAFailedReceiptWriteEndsTheAlbumBackupAsUnavailable() async throws {
+        let faulting = ReceiptWriteFault(inner: resolver)
+        let executor = PhotoAlbumBackupExecutor(
+            accountDataDirectory: tempDir.appendingPathComponent("album-receipt-fault", isDirectory: true),
+            databasePolicy: .conservative,
+            identityResolver: UploadDedupePipeline(
+                store: manifest, hasher: hasher, checker: checker, now: { [clock] in clock!.now }),
+            uploader: uploader,
+            resourceResolver: faulting,
+            proofCatalog: FixedCandidates(items: [
+                UploadBackupAssetCandidate(
+                    snapshot: UploadBackupAssetSnapshot(
+                        source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "photo"),
+                        revision: UploadBackupRevision(date: resolver.defaultModified),
+                        resourceCount: 1),
+                    originalFilename: "photo.heic",
+                    byteCount: 4)
+            ]),
+            runtimeSignals: .wiFiWithMobileDataOff,
+            clock: clock)
+        faulting.executor = executor
+
+        do {
+            let report = try await executor.ensureBackedUp(localIdentifiers: ["photo"]) { _ in }
+            XCTFail("an unfinished drain must not become a report: \(report)")
+        } catch {
+            XCTAssertEqual(error as? AlbumSyncError, .mappingStoreUnavailable)
+        }
+        XCTAssertEqual(faulting.faults?.firedCount, 1, "the receipt write after the upload failed")
+        XCTAssertEqual(uploader.requests.map(\.name), ["photo.heic"])
+    }
+
     func testTheAlbumExecutorRouteAddsTheLivePhotoTagAfterBothPartsSettle() async throws {
         resolver.setSecondaries(["live.mov"], for: "live")
         let tagAdder = SpyTagAdder()

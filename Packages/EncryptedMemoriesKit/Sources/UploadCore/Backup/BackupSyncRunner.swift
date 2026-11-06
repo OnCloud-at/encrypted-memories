@@ -103,9 +103,13 @@ public actor BackupSyncRunner {
     private var drainMode: DrainMode = .waitForScheduledRetries
     private var deletionStateInvalidated = false
     private var stopRequested = false
-    /// A queue read of this pass could not run completely. The pass ends as unknown, never as drained, until the next
-    /// pass reads the queue again (#1004 B2).
+    /// A queue read, or the requeue of stale active rows, of this pass could not run completely. The pass ends as
+    /// unknown, never as drained, until the next pass reads the queue again (#1004 B2).
     private var queueReadUnknown = false
+    /// The queue's failure count when this pass started. Any failure recorded during the pass, a failed write as well
+    /// as a failed read, ends it as unknown: the queue's health check forgets a transient failure once the database
+    /// answers again, so it cannot show that the pass stopped early (#1004).
+    private var failuresBeforePass: UInt64 = 0
     /// Transport cancellation can arrive without cancelling the Swift task. Keep it until the next pass.
     private var runCancellationError: (any Error)?
     /// Consecutive items that could not even reserve disk space since the last one that did.
@@ -239,7 +243,7 @@ public actor BackupSyncRunner {
     /// Queue health is part of the runner contract: callers must never treat an empty result from a
     /// failed SQLite read as a drained backup.
     public func isQueueOperational() -> Bool {
-        !queueReadUnknown && queue.isOperational()
+        !queueReadUnknown && queue.recordedFailureCount() == failuresBeforePass && queue.isOperational()
     }
 
     /// User-initiated retry contract. Eligibility changes and remote-cache invalidation stay together
@@ -337,6 +341,7 @@ public actor BackupSyncRunner {
             emitProgress()
             return progress
         }
+        failuresBeforePass = queue.recordedFailureCount()
         isRunning = true
         deletionStateInvalidated = false
         drainMode = mode
@@ -370,7 +375,17 @@ public actor BackupSyncRunner {
 
         // Crash recovery first: anything still marked active predates this run and must become
         // runnable again before this runner atomically claims new work.
-        queue.requeueStaleActive(before: now().addingTimeInterval(-configuration.staleActiveGrace), updatedAt: now())
+        // A failed requeue changed nothing. A later health check can pass again, so only the write's own result shows
+        // it; the pass ends as unknown and never reports that no upload work is left (#1004). The pass count guard would
+        // also end the pass; this guard stays so the result of the call itself is never taken as empty.
+        guard
+            queue.requeueStaleActive(
+                before: now().addingTimeInterval(-configuration.staleActiveGrace), updatedAt: now())
+                != nil
+        else {
+            queueReadUnknown = true
+            return progress
+        }
         guard isQueueOperational() else { return progress }
         await requeueDueBlockedRows()
         guard isQueueOperational() else { return progress }
@@ -400,7 +415,7 @@ public actor BackupSyncRunner {
                 // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
                 progress.isRunning = false
                 progress.leavesNoUploadWork =
-                    (try? queue.containsAny(in: [.blockedByDraft])) == false && queue.isOperational()
+                    (try? queue.containsAny(in: [.blockedByDraft])) == false && isQueueOperational()
                 return progress
             }
             guard nextRunnableDate <= now() else {
@@ -542,7 +557,15 @@ public actor BackupSyncRunner {
                 }
 
                 if runningSources.count < limit {
-                    let claimed = claimEligible(limit: limit - runningSources.count)
+                    // A failed claim changed nothing. A later health check can pass again, so only the claim's own
+                    // result shows it; the pass ends as unknown instead of retrying the claim at once (#1004). The pass
+                    // count guard would also end the pass; this guard stays so the result of the call itself is never
+                    // taken as empty.
+                    guard let claimed = claimEligible(limit: limit - runningSources.count) else {
+                        queueReadUnknown = true
+                        storeFailed = true
+                        continue
+                    }
                     startsSincePrime += claimed.count
                     for entry in claimed {
                         claimedItemCount += 1
@@ -699,7 +722,7 @@ public actor BackupSyncRunner {
         publishActiveExecutionProgress(emit: false)
     }
 
-    private func claimEligible(limit: Int) -> [UploadBackupSyncQueueEntry] {
+    private func claimEligible(limit: Int) -> [UploadBackupSyncQueueEntry]? {
         let claimLimit = min(configuration.batchSize, max(1, limit))
         // Eligibility is persisted in `updatedAt` and enforced inside the same transaction that
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker

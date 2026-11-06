@@ -77,7 +77,9 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
             XCTAssertEqual(fixture.resolver.readCount, reads + 1)
             XCTAssertEqual(fixture.server.uploadRequestCount, uploads)
             XCTAssertEqual(fixture.remote.compensations, 0)
-            XCTAssertEqual(fixture.queue.rows(kind: .photoLibraryAsset, identifiers: [fixture.key.identifier]).count, 1)
+            XCTAssertEqual(
+                try fixture.queue.decisionRows(kind: .photoLibraryAsset, identifiers: [fixture.key.identifier]).count, 1
+            )
             XCTAssertEqual(fixture.remote.personRestores, 2)
             XCTAssertEqual(fixture.server.links.filter { $0.state == .active }.count, shape == .live ? 2 : 1)
         }

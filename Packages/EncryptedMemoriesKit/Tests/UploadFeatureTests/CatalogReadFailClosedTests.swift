@@ -70,7 +70,6 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
     func testAFailedSnapshotCountNeverSweepsTheLibraryOrCompletesTheScan() async throws {
         let store = try makeCatalog()
-        store.recoversTransientFailuresForTesting = true
         let infos = ["a", "b", "c"].map { photo($0) }
         _ = try await sync(store, infos: infos, at: 100).run(engine: Enqueuer())
         XCTAssertTrue(store.markFullScanOwed(), "a rescan is owed again")
@@ -93,7 +92,6 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
     func testAFailedSnapshotPageKeepsTheResumePoint() async throws {
         let store = try makeCatalog()
-        store.recoversTransientFailuresForTesting = true
         let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT local_id FROM photo_full_scan_snapshot")
         do {
             _ = try await sync(store, infos: ["a", "b", "c"].map { photo($0) }).run(engine: Enqueuer())
@@ -108,7 +106,6 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
     func testAFailedResumeReadKeepsTheInterruptedScanEpoch() async throws {
         let store = try makeCatalog()
-        store.recoversTransientFailuresForTesting = true
         let epoch = PhotoLibraryFullScanProgress(epochStart: Date(timeIntervalSince1970: 100), cursor: 1)
         XCTAssertTrue(store.beginFullScanSnapshot(epochStart: epoch.epochStart))
         XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["a", "b", "c"]))
@@ -164,7 +161,6 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
     func testAnUnknownLateRenderPageNeverCompletesThePass() async throws {
         let store = try makeCatalog()
-        store.recoversTransientFailuresForTesting = true
         XCTAssertTrue(store.upsertBatch(["a", "b"].map { entry(edit($0)) }))
         let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT local_id, cloud_id", occurrence: 2)
         do {
@@ -179,7 +175,6 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
     func testAnUnknownMissingSourcePageNeverCompletesTheSweep() async throws {
         let store = try makeCatalog()
-        store.recoversTransientFailuresForTesting = true
         XCTAssertTrue(store.upsertBatch(["a", "b"].map { entry(photo($0)) }))
         let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT local_id, cloud_id", occurrence: 2)
         do {
@@ -198,7 +193,6 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
     func testAFailedStoredEntryReadNeverSkipsALateRenderReopening() async throws {
         let store = try makeCatalog()
-        store.recoversTransientFailuresForTesting = true
         XCTAssertTrue(store.upsertBatch([entry(photo("a"))]))
         let engine = Enqueuer()
         // Photos now lists the rendered file of "a": classification reads first, then the stored row.
@@ -415,6 +409,27 @@ final class CatalogReadFailClosedTests: XCTestCase {
         let remaining = Set(snapshot.excludedTiles.map(\.key.identifier))
         XCTAssertTrue(remaining.contains("kept"), "a healthy row stays listed after an unrelated decode failure")
         XCTAssertTrue(remaining.contains("broken"), "an unknown read keeps the earlier answer")
+    }
+
+    // MARK: - B2c: recovery from transient catalog failures
+
+    /// A transient failure stops only the read that hit it. Once the database answers, the next scan runs and
+    /// completes.
+    func testATransientCatalogFailureDoesNotStopTheNextScan() async throws {
+        let store = try makeCatalog()
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT COUNT(*) FROM photo_catalog;")
+        XCTAssertNil(store.count(), "the interrupted read is unknown")
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+
+        do {
+            _ = try await sync(store, infos: ["a", "b"].map { photo($0) }).run(engine: Enqueuer())
+        } catch {
+            XCTFail("the next scan runs once the database answers: \(error)")
+        }
+        XCTAssertTrue(store.hasCompletedFullScan(), "the next scan completes")
+        XCTAssertEqual(try store.entry(for: "a")?.isRemoved, false)
+        XCTAssertEqual(try store.entry(for: "b")?.isRemoved, false)
     }
 }
 
