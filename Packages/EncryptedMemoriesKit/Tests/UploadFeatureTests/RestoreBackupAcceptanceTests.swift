@@ -46,19 +46,25 @@ final class RestoreBackupAcceptanceTests: XCTestCase {
                 try XCTUnwrap(fixture.pending.nextEffectDate()).timeIntervalSince(fixture.clock.now), 60,
                 accuracy: 0.001,
                 "The first recheck must register 60 seconds ahead on the injected production schedule")
-            fixture.clockGate.release()
             let admitted = try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision))
             XCTAssertFalse(admitted.state.isTerminalSuccess, "The old completed queue row must reopen")
             XCTAssertTrue(try XCTUnwrap(fixture.pending.sourceState(for: fixture.key)).needsQueueSync)
             await assertEventually { fixture.session.excludedTiles.isEmpty }
 
+            // The recheck timer must stay parked while the queue drains. A released timer runs its
+            // reconcile on fake time at once, so its restore recheck can re-admit the queue row
+            // between the runner's passes and give one restored revision a second resolver read.
+            // Draining under the held gate puts the drain wholly before the recheck.
             await fixture.drain()
-            XCTAssertEqual(fixture.resolver.readCount, reads + 1, "One restored revision needs one queue drain")
             XCTAssertTrue(
                 try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision)).state
                     .isTerminalSuccess)
-            // The recheck timer runs on the fake clock: its 60-second sleep advances fake time at once.
+            fixture.clockGate.release()
+            // The recheck ran and the queue is idle before the resolver reads are counted: the parked
+            // timer resumes with the drain finished, so its reconcile sees the completed row and can
+            // neither re-admit it nor start a second queue pass.
             await assertEventually { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
+            XCTAssertEqual(fixture.resolver.readCount, reads + 1, "One restored revision needs one queue drain")
             XCTAssertEqual(
                 fixture.server.uploadRequestCount, uploads, "The real duplicate check must reuse Proton data")
             XCTAssertEqual(fixture.remote.compensations, 0, "A confirmed Restore must not send another remote Restore")
