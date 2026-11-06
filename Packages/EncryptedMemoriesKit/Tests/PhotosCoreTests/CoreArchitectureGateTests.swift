@@ -1295,50 +1295,145 @@ final class CoreArchitectureGateTests: XCTestCase {
         )
     }
 
+    // MARK: - Proton boundary rules
+    //
+    // Each rule body below is a pure function over a scanned file (a repository-relative path
+    // plus stripped source text) or over a file list, so the real-tree tests and the
+    // fixed-text samples share one implementation. A rule that loses its teeth fails its
+    // sample first, on the exact text that regressed.
+
+    /// One scanned source file as the boundary rules see it: its repository-relative path (the
+    /// unit every allowlist matches) and its comment- and string-stripped source text.
+    private struct ScannedSourceFile {
+        let path: String
+        let source: String
+    }
+
+    /// The files as the boundary rules see them. `base` resolves relative paths and
+    /// defaults to the repository root, so a sample tree outside the working tree keeps
+    /// its tree-relative path.
+    private func scannedSourceFiles(_ files: [URL], under base: URL? = nil) throws -> [ScannedSourceFile] {
+        try files.map { file in
+            ScannedSourceFile(path: repoRelativePath(of: file, under: base), source: try strippedCode(of: file))
+        }
+    }
+
+    /// Rule: only the `protonDriveSDKImportAllowlist` directories may import `ProtonDriveSDK`.
+    private static func protonDriveSDKImportViolations(in file: ScannedSourceFile) -> [String] {
+        guard importedModules(inSource: file.source).contains("ProtonDriveSDK") else { return [] }
+        guard protonDriveSDKImportAllowlist.contains(where: { file.path.hasPrefix($0) }) else {
+            return ["\(file.path): imports ProtonDriveSDK outside the allowlist"]
+        }
+        return []
+    }
+
+    /// Rule: the ProtonCore modules belong in the allowlisted directories and files.
+    private static func protonCoreImportViolations(in file: ScannedSourceFile) -> [String] {
+        let imports = importedModules(inSource: file.source)
+            .filter { $0.hasPrefix("ProtonCore") }
+            .sorted()
+        guard !imports.isEmpty else { return [] }
+        let inAllowedDirectories = protonCoreImportAllowlist.directories.contains {
+            file.path.hasPrefix($0)
+        }
+        let inAllowedFiles = protonCoreImportAllowlist.files.contains(file.path)
+        guard inAllowedDirectories || inAllowedFiles else {
+            return ["\(file.path): imports ProtonCore modules \(imports) outside the allowlist"]
+        }
+        return []
+    }
+
+    /// Rule: an SDK-facing file (any file that imports `ProtonDriveSDK`) declares nothing
+    /// `public`, `package` or `open`, so no SDK type can leak through a module's public
+    /// surface.
+    private static func sdkFacingSurfaceViolations(in file: ScannedSourceFile) -> [String] {
+        guard importedModules(inSource: file.source).contains("ProtonDriveSDK") else { return [] }
+        return
+            prohibitedDeclarationModifiers
+            .filter { file.source.range(of: $0.pattern, options: .regularExpression) != nil }
+            .map {
+                "\(file.path): declares \($0.token) API. Files that import ProtonDriveSDK must keep "
+                    + "the SDK surface internal."
+            }
+    }
+
+    /// Rule: the host apps import `ProtonDriveBackend` only in the listed composition files.
+    /// Both directions fail: an unlisted importer, and a listed file that stopped importing
+    /// the backend.
+    private static func hostBackendImportViolations(
+        files: [ScannedSourceFile],
+        allowlist: [String]
+    ) -> [String] {
+        var violations: [String] = []
+        var backendImporters: Set<String> = []
+        for file in files
+        where importedModules(inSource: file.source).contains("ProtonDriveBackend") {
+            backendImporters.insert(file.path)
+            if !allowlist.contains(file.path) {
+                violations.append(
+                    "\(file.path): imports ProtonDriveBackend but is not a listed composition file"
+                )
+            }
+        }
+        for listedFile in allowlist.sorted() where !backendImporters.contains(listedFile) {
+            violations.append(
+                "\(listedFile): is listed as a composition file but does not import ProtonDriveBackend"
+            )
+        }
+        return violations
+    }
+
+    /// Re-export predicates shared by every rule that checks `@_exported` imports, so the
+    /// real-tree tests and the sample tests flag the same modules. A second copy of either
+    /// test would drift from the real gate.
+    ///
+    /// The SDK and the ProtonCore modules are Proton-internal plumbing; re-exporting one
+    /// leaks it past the import allowlists wherever the file lives.
+    private static func isForbiddenProtonModuleReexport(_ module: String) -> Bool {
+        module == "ProtonDriveSDK" || module.hasPrefix("ProtonCore")
+    }
+
+    /// A re-export of the backend module hands its wired types to every importer.
+    private static func isForbiddenBackendModuleReexport(_ module: String) -> Bool {
+        module == "ProtonDriveBackend"
+    }
+
+    /// Rule: a re-export (`@_exported import`) of a module `forbidden` names leaks that module
+    /// through every importer of the re-exporting file's module, wherever the file lives, so
+    /// it bypasses an allowlist even inside an allowed directory.
+    private static func reexportBoundaryViolations(
+        in file: ScannedSourceFile,
+        forbidden: (String) -> Bool
+    ) -> [String] {
+        reexportedModules(inSource: file.source)
+            .filter(forbidden)
+            .map {
+                "\(file.path): re-exports \($0) with @_exported; a re-export leaks the Proton boundary"
+            }
+    }
+
     /// Rule: only the allowlists in this file may import ProtonDriveSDK or the ProtonCore
-    /// modules. Production scope means every package `Sources/` target plus the `App` and
-    /// `iOSApp` trees; test targets exercise the backend boundary deliberately and stay out of
-    /// scope.
+    /// modules. Production scope is every tree `protonGateScannedRoots` lists; test targets
+    /// exercise the backend boundary deliberately and stay out of scope.
     func testProtonImportsStayOnModuleAllowlists() throws {
-        let productionFiles = try protonGateProductionSourceFiles()
-        XCTAssertFalse(productionFiles.isEmpty, "Expected production source files for the Proton import gate")
+        let scanned = try scannedSourceFiles(try protonGateProductionSourceFiles())
+        XCTAssertFalse(scanned.isEmpty, "Expected production source files for the Proton import gate")
 
         var violations: [String] = []
         var sdkImporters = 0
         var protonCoreImporters = 0
 
-        for file in productionFiles {
-            let code = try strippedCode(of: file)
-            let imports = Self.importedModules(inSource: code)
-            let path = repoRelativePath(of: file)
+        for file in scanned {
+            let imports = Self.importedModules(inSource: file.source)
+            sdkImporters += imports.contains("ProtonDriveSDK") ? 1 : 0
+            protonCoreImporters += imports.contains { $0.hasPrefix("ProtonCore") } ? 1 : 0
 
-            // A re-export leaks the imported module through every importer of this file's
-            // module, so it violates the boundary even inside an allowed directory.
-            for module in Self.reexportedModules(inSource: code)
-            where module == "ProtonDriveSDK" || module.hasPrefix("ProtonCore") {
-                violations.append(
-                    "\(path): re-exports \(module) with @_exported; a re-export leaks the Proton boundary"
-                )
-            }
-
-            if imports.contains("ProtonDriveSDK") {
-                sdkImporters += 1
-                if !Self.protonDriveSDKImportAllowlist.contains(where: { path.hasPrefix($0) }) {
-                    violations.append("\(path): imports ProtonDriveSDK outside the allowlist")
-                }
-            }
-
-            let protonCoreImports = imports.filter { $0.hasPrefix("ProtonCore") }.sorted()
-            if !protonCoreImports.isEmpty {
-                protonCoreImporters += 1
-                let inAllowedDirectories = Self.protonCoreImportAllowlist.directories.contains {
-                    path.hasPrefix($0)
-                }
-                let inAllowedFiles = Self.protonCoreImportAllowlist.files.contains(path)
-                if !inAllowedDirectories && !inAllowedFiles {
-                    violations.append("\(path): imports ProtonCore modules \(protonCoreImports) outside the allowlist")
-                }
-            }
+            violations += Self.reexportBoundaryViolations(
+                in: file,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            )
+            violations += Self.protonDriveSDKImportViolations(in: file)
+            violations += Self.protonCoreImportViolations(in: file)
         }
 
         // Empty-input guard: the backend must still wrap the SDK and use ProtonCore. Zero importers
@@ -1370,34 +1465,22 @@ final class CoreArchitectureGateTests: XCTestCase {
 
     /// Rule: an SDK-facing production file (any file the production scan reaches that imports
     /// `ProtonDriveSDK`) declares nothing `public`, `package` or `open`, so no SDK type can leak
-    /// through a module's public surface. Rule a confines SDK importers to ProtonDriveBackend
-    /// today; this rule still scans every production file, so widening that allowlist later
-    /// does not silently widen what may be published here.
+    /// through a module's public surface. Rule `testProtonImportsStayOnModuleAllowlists`
+    /// confines SDK importers to ProtonDriveBackend today; this rule still scans every
+    /// production file, so widening that allowlist later does not silently widen what may be
+    /// published here.
     func testProtonSDKFacingBackendFilesDeclareNoPublicSurface() throws {
-        let productionFiles = try protonGateProductionSourceFiles()
-        XCTAssertFalse(productionFiles.isEmpty, "Expected production source files")
+        let scanned = try scannedSourceFiles(try protonGateProductionSourceFiles())
+        XCTAssertFalse(scanned.isEmpty, "Expected production source files")
 
-        var violations: [String] = []
-        var sdkFacingFiles = 0
-
-        for file in productionFiles {
-            guard try importedModules(in: file).contains("ProtonDriveSDK") else { continue }
-            sdkFacingFiles += 1
-
-            let code = try strippedCode(of: file)
-            for modifier in Self.prohibitedDeclarationModifiers
-            where code.range(of: modifier.pattern, options: .regularExpression) != nil {
-                violations.append(
-                    """
-                    \(repoRelativePath(of: file)): declares \(modifier.token) API. Files that import \
-                    ProtonDriveSDK must keep the SDK surface internal.
-                    """
-                )
-            }
-        }
+        let violations = scanned.flatMap(Self.sdkFacingSurfaceViolations(in:))
 
         // Empty-input guard: zero SDK-facing files means the SDK moved and this rule lost its
         // subject. Update it consciously instead of passing on an empty scan.
+        let sdkFacingFiles =
+            scanned
+            .filter { Self.importedModules(inSource: $0.source).contains("ProtonDriveSDK") }
+            .count
         XCTAssertGreaterThanOrEqual(
             sdkFacingFiles, 1, "Expected the production tree to still contain files that import ProtonDriveSDK")
 
@@ -1415,11 +1498,11 @@ final class CoreArchitectureGateTests: XCTestCase {
 
     /// Rule: the macOS and iOS apps import `ProtonDriveBackend` only in the composition files the
     /// allowlist names. The check runs in both directions: an unlisted importer fails, and a
-    /// listed file that stops importing the backend fails as a stale list entry.
+    /// listed file that stops importing the backend fails as a stale list entry. The host
+    /// trees come from `protonGateScannedRoots` (every scanned root outside `Packages/`),
+    /// the same list the production scan reads.
     func testHostAppsImportBackendOnlyInCompositionFiles() throws {
-        let macHostFiles = try swiftFiles(in: repoRoot.appendingPathComponent("App"))
-        let iOSHostFiles = try swiftFiles(in: repoRoot.appendingPathComponent("iOSApp"))
-        let hostFiles = macHostFiles + iOSHostFiles
+        let hostFiles = try protonGateHostFiles()
         XCTAssertFalse(hostFiles.isEmpty, "Expected host app source files")
 
         for listedFile in Self.hostBackendImportAllowlist {
@@ -1429,38 +1512,19 @@ final class CoreArchitectureGateTests: XCTestCase {
             )
         }
 
-        var violations: [String] = []
-        var backendImporters: Set<String> = []
+        var violations = Self.hostBackendImportViolations(
+            files: try scannedSourceFiles(hostFiles),
+            allowlist: Array(Self.hostBackendImportAllowlist)
+        )
 
-        for file in hostFiles {
-            let path = repoRelativePath(of: file)
-            guard try importedModules(in: file).contains("ProtonDriveBackend") else { continue }
-            backendImporters.insert(path)
-            if !Self.hostBackendImportAllowlist.contains(path) {
-                violations.append("\(path): imports ProtonDriveBackend but is not a listed composition file")
-            }
-        }
-
-        for listedFile in Self.hostBackendImportAllowlist.sorted()
-        where !backendImporters.contains(listedFile) {
-            violations.append(
-                "\(listedFile): is listed as a composition file but does not import ProtonDriveBackend"
+        // A backend re-export inside the production scan leaks the backend's types (and,
+        // through them, the SDK) to every module that imports the re-exporting module, so it
+        // bypasses this rule no matter where the file lives.
+        for file in try scannedSourceFiles(try protonGateProductionSourceFiles()) {
+            violations += Self.reexportBoundaryViolations(
+                in: file,
+                forbidden: Self.isForbiddenBackendModuleReexport
             )
-        }
-
-        // A backend re-export inside the package leaks the backend's types (and, through them,
-        // the SDK) to every module that imports the re-exporting module, so it bypasses this
-        // rule no matter where the file lives.
-        for file in try swiftFiles(in: sourcesRoot) {
-            for module in Self.reexportedModules(inSource: try strippedCode(of: file))
-            where module == "ProtonDriveBackend" {
-                violations.append(
-                    """
-                    \(repoRelativePath(of: file)): re-exports ProtonDriveBackend with @_exported. \
-                    A re-export leaks the backend boundary.
-                    """
-                )
-            }
         }
 
         XCTAssertTrue(
@@ -1611,6 +1675,16 @@ final class CoreArchitectureGateTests: XCTestCase {
             "Expected both app trees among the scanned roots"
         )
 
+        // Every scanned root must actually hold a Swift file. An existing but empty root
+        // lists a tree the gates never read, and its empty scan would read as a pass.
+        for root in Self.protonGateScannedRoots {
+            let files = try swiftFiles(in: repoRoot.appendingPathComponent(String(root.dropLast())))
+            XCTAssertFalse(
+                files.isEmpty,
+                "Scanned root \(root) holds no Swift files; point the entry at a real source tree"
+            )
+        }
+
         XCTAssertTrue(
             unlisted.isEmpty,
             """
@@ -1620,8 +1694,89 @@ final class CoreArchitectureGateTests: XCTestCase {
             Every directory that holds Swift files must sit under a scanned root or an excluded
             tree. A new production tree joins the scan by adding it to protonGateScannedRoots;
             a new test or vendored tree goes into protonGateExcludedSourceTrees. Either way the
-            listing is a conscious gate update.
+            listing is a conscious gate update. Both the production scan and the host
+            composition-file rule read their trees from protonGateScannedRoots, so the list
+            entry is the single place that adds a tree to the gate.
             """
+        )
+    }
+
+    /// The scan helpers must fail closed on a missing path, on a path that is a regular
+    /// file, and on a nil enumerator: a nil enumerator silently shrinks a scan to nothing,
+    /// and an empty scan reads as a passing gate. Every probe sits outside the working tree,
+    /// so a crash can never leave a `.swift` file for a later scan to find.
+    func testScanHelpersThrowOnMissingDirectories() throws {
+        let probeBase = FileManager.default.temporaryDirectory
+        let missing = probeBase.appendingPathComponent("MissingSourceTree-\(UUID().uuidString)")
+
+        XCTAssertThrowsError(
+            try swiftFiles(in: missing),
+            "swiftFiles must refuse a missing path instead of returning nothing"
+        )
+        XCTAssertThrowsError(
+            try directoriesWithSwiftFiles(under: missing),
+            "directoriesWithSwiftFiles must refuse a missing path instead of returning nothing"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: missing.path),
+            "The probe directory must not exist; the helpers fail on a truly missing tree"
+        )
+
+        // A regular file is not a directory: FileManager hands out a non-nil, empty
+        // enumerator for it, so only the is-directory check makes this path fail closed.
+        let regularFile = probeBase.appendingPathComponent("GateProbe-\(UUID().uuidString).swift")
+        try "import Foundation\n".write(to: regularFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: regularFile) }
+        XCTAssertThrowsError(
+            try swiftFiles(in: regularFile),
+            "swiftFiles must refuse a path that is a regular file instead of returning nothing"
+        )
+        XCTAssertThrowsError(
+            try directoriesWithSwiftFiles(under: regularFile),
+            "directoriesWithSwiftFiles must refuse a path that is a regular file instead of "
+                + "returning nothing"
+        )
+    }
+
+    /// A new entry in `protonGateScannedRoots` must reach both gates that read the list: the
+    /// production scan behind the Proton import rules and the host trees behind the
+    /// composition-file rule, exactly as the coverage message states. A temporary sample
+    /// tree stands in for a new production tree; it sits under the system temporary
+    /// directory, never in the working tree, so a crash cannot leave a stray `.swift` file
+    /// for a later scan to find. The real roots stay untouched.
+    func testAddingAScannedRootFeedsTheProductionScanAndTheHostRule() throws {
+        let sampleBase = FileManager.default.temporaryDirectory
+        let treeName = "GateSampleTree-\(UUID().uuidString)"
+        let treeRoot = sampleBase.appendingPathComponent(treeName)
+        try FileManager.default.createDirectory(at: treeRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: treeRoot) }
+        try "import ProtonDriveBackend\n".write(
+            to: treeRoot.appendingPathComponent("Wiring.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let roots = ["\(treeName)/"]
+
+        let scannedPaths = try protonGateProductionSourceFiles(scanning: roots, under: sampleBase)
+            .map { repoRelativePath(of: $0, under: sampleBase) }
+        XCTAssertEqual(
+            scannedPaths,
+            ["\(treeName)/Wiring.swift"],
+            "A root added to the scanned list must feed the production scan"
+        )
+
+        let hostViolations = Self.hostBackendImportViolations(
+            files: try scannedSourceFiles(
+                try protonGateHostFiles(scanning: roots, under: sampleBase),
+                under: sampleBase
+            ),
+            allowlist: []
+        )
+        XCTAssertEqual(
+            hostViolations,
+            ["\(treeName)/Wiring.swift: imports ProtonDriveBackend but is not a listed composition file"],
+            "A root added to the scanned list must feed the host composition rule"
         )
     }
 
@@ -1655,7 +1810,9 @@ final class CoreArchitectureGateTests: XCTestCase {
     // regressed instead of a whole-repo scan the whole suite must interpret.
 
     /// Every import spelling the production scan must recognize. When a new Swift import form
-    /// appears, this sample grows first and the scan second.
+    /// appears, this sample grows first and the scan second. The access levels come from
+    /// SE-0409; attributes and the `import` keyword may each sit on their own line ahead of
+    /// the module name, and the compiler accepts the same-line and split spellings alike.
     func testImportedModulesSamplesCoverEveryAcceptedImportSpelling() {
         let sample = """
             import Plain
@@ -1666,6 +1823,19 @@ final class CoreArchitectureGateTests: XCTestCase {
             @_spi(Private) import Spi
             @_exported import ExportedFlag
             @_spi(Foo) @_exported import BothAttributes
+            internal import InternalLevel
+            package import PackageLevel
+            public import PublicLevel
+            private import PrivateLevel
+            fileprivate import FileprivateLevel
+            @_exported public import ExportedPublicLevel
+            @_exported
+            import ExportedOwnLine
+            public
+            import
+            NewlinePublicLevel
+            import
+            NewlineModule
             import struct Scoped.Struct
             import class Scoped.Klass
             import enum Scoped.Enuhm
@@ -1679,36 +1849,206 @@ final class CoreArchitectureGateTests: XCTestCase {
             import Trailing // import NotACount because this is a comment
             let inString = "import NotInString"
             /* import NotInBlockComment */
+            public func importThing()
+            let important = 1
+            internalValue
+            public
+            let notAnImport = 1
             """
             + "\n"
 
         let modules = Self.importedModules(inSource: sample)
         // `import Tabbed\tAfterTab` names only Tabbed: the module token ends at whitespace.
+        // The three-line `public` form needs the line join: parsed line by line it would
+        // leave `public`, `import` and the module name as fragments that name no module.
         let expected: Set<String> = [
             "Plain", "Tabbed", "ImplementationOnly", "Testable", "Preconcurrency",
-            "Spi", "ExportedFlag", "BothAttributes", "Scoped", "DotPath", "Semi", "Second",
-            "Trailing",
+            "Spi", "ExportedFlag", "BothAttributes", "InternalLevel", "PackageLevel",
+            "PublicLevel", "PrivateLevel", "FileprivateLevel", "ExportedPublicLevel",
+            "ExportedOwnLine", "NewlinePublicLevel", "NewlineModule",
+            "Scoped", "DotPath", "Semi", "Second", "Trailing",
         ]
         XCTAssertEqual(modules, expected)
         XCTAssertFalse(modules.contains("NotACount"))
         XCTAssertFalse(modules.contains("NotInString"))
         XCTAssertFalse(modules.contains("NotInBlockComment"))
+        XCTAssertFalse(modules.contains("importThing"))
+        XCTAssertFalse(modules.contains("important"))
+        XCTAssertFalse(modules.contains("internalValue"))
+        XCTAssertFalse(modules.contains("notAnImport"))
     }
 
-    /// A re-export is any import carrying `@_exported`, alone or among other attributes, in a
-    /// scoped import included. Everything else stays out of the re-export set.
+    /// A re-export is any import carrying `@_exported`, alone or among other attributes, with
+    /// an access level included, in a scoped import included, and on its own line included.
+    /// Everything else stays out of the re-export set.
     func testReexportedModulesSamplesFlagOnlyExportedImports() {
         let sample = """
             @_exported import Exported
             @_spi(Foo) @_exported import AlsoExported
             @_exported import struct Scoped.ExportedMember
+            @_exported
+            import OwnLineExported
+            @_exported public import PublicExportedLevel
+            public import AccessLevelWithoutAttribute
             import Plain
             @_implementationOnly import NotExported
             """
             + "\n"
 
         let reexported = Self.reexportedModules(inSource: sample)
-        XCTAssertEqual(reexported, ["Exported", "AlsoExported", "Scoped"])
+        XCTAssertEqual(
+            reexported,
+            ["Exported", "AlsoExported", "Scoped", "OwnLineExported", "PublicExportedLevel"]
+        )
+        XCTAssertFalse(reexported.contains("AccessLevelWithoutAttribute"))
+    }
+
+    /// Each Proton boundary rule flags its own violating sample, so a rule that loses its
+    /// teeth fails on fixed text instead of only against the real tree. Every violation
+    /// sample pairs with a control of the same shape that must stay clean.
+    func testProtonBoundaryRulesFlagTheirOwnSampleViolations() {
+        // SDK allowlist: an access-level import of ProtonDriveSDK outside ProtonDriveBackend.
+        let leaking = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Leaking.swift",
+            source: "internal import ProtonDriveSDK\n"
+        )
+        XCTAssertTrue(
+            Self.protonDriveSDKImportViolations(in: leaking)
+                == ["\(leaking.path): imports ProtonDriveSDK outside the allowlist"],
+            "An access-level import outside the backend must trip the SDK allowlist"
+        )
+
+        // SDK allowlist control: the same import inside ProtonDriveBackend stays clean.
+        let driving = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "import ProtonDriveSDK\n"
+        )
+        XCTAssertTrue(Self.protonDriveSDKImportViolations(in: driving).isEmpty)
+
+        // ProtonCore allowlist: a ProtonCore import outside the listed directories and files.
+        let coreLeaking = ScannedSourceFile(
+            path: "App/UnlistedStartup.swift",
+            source: "import ProtonCoreUtilities\n"
+        )
+        XCTAssertFalse(
+            Self.protonCoreImportViolations(in: coreLeaking).isEmpty,
+            "A ProtonCore import outside the allowlist must produce a violation"
+        )
+
+        // ProtonCore allowlist control: inside a listed directory stays clean.
+        let coreDriving = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Networking.swift",
+            source: "import ProtonCoreUtilities\n"
+        )
+        XCTAssertTrue(Self.protonCoreImportViolations(in: coreDriving).isEmpty)
+
+        // Public surface: an SDK-facing file that publishes API.
+        let publishing = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "import ProtonDriveSDK\npublic func shipping() {}\n"
+        )
+        XCTAssertFalse(
+            Self.sdkFacingSurfaceViolations(in: publishing).isEmpty,
+            "An SDK-facing file with a public declaration must produce a violation"
+        )
+
+        // Public surface control: the same file keeping its declarations internal stays clean.
+        let contained = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "import ProtonDriveSDK\nfunc shipping() {}\n"
+        )
+        XCTAssertTrue(Self.sdkFacingSurfaceViolations(in: contained).isEmpty)
+
+        // Host list: an unlisted host file importing the backend must fail by name.
+        let unlistedHost = ScannedSourceFile(
+            path: "App/UnlistedWiring.swift",
+            source: "import ProtonDriveBackend\n"
+        )
+        let hostViolations = Self.hostBackendImportViolations(
+            files: [unlistedHost],
+            allowlist: Array(Self.hostBackendImportAllowlist)
+        )
+        XCTAssertTrue(
+            hostViolations.contains(
+                "\(unlistedHost.path): imports ProtonDriveBackend but is not a listed composition file"
+            ),
+            "A host file outside the composition list must fail by name"
+        )
+
+        // Host list: a composition entry whose file no longer imports the backend fails too.
+        XCTAssertEqual(
+            Self.hostBackendImportViolations(files: [], allowlist: ["App/Stale.swift"]),
+            ["App/Stale.swift: is listed as a composition file but does not import ProtonDriveBackend"]
+        )
+
+        // Host list control: a host file that imports only Foundation stays clean.
+        let quietHost = ScannedSourceFile(
+            path: "App/Quiet.swift",
+            source: "import Foundation\n"
+        )
+        XCTAssertTrue(Self.hostBackendImportViolations(files: [quietHost], allowlist: []).isEmpty)
+
+        // Re-export: the split attribute form leaks the boundary even inside an allowed
+        // directory. The predicate is the one the real-tree rules call.
+        let reexporting = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Driving.swift",
+            source: "@_exported\nimport ProtonDriveSDK\n"
+        )
+        XCTAssertEqual(
+            Self.reexportBoundaryViolations(
+                in: reexporting,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            ),
+            [
+                "\(reexporting.path): re-exports ProtonDriveSDK with @_exported; "
+                    + "a re-export leaks the Proton boundary"
+            ],
+            "A re-export of a Proton module must produce a violation wherever the file lives"
+        )
+
+        // ProtonCore re-export: the same predicate flags the ProtonCore prefix too.
+        let coreReexporting = ScannedSourceFile(
+            path: "App/Startup.swift",
+            source: "@_exported import ProtonCoreUtilities\n"
+        )
+        XCTAssertEqual(
+            Self.reexportBoundaryViolations(
+                in: coreReexporting,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            ),
+            [
+                "\(coreReexporting.path): re-exports ProtonCoreUtilities with @_exported; "
+                    + "a re-export leaks the Proton boundary"
+            ],
+            "A re-export of a ProtonCore module must produce a violation wherever the file lives"
+        )
+
+        // Backend re-export: the predicate behind the host rule flags a re-export of
+        // ProtonDriveBackend.
+        let backendReexporting = ScannedSourceFile(
+            path: "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Reexport.swift",
+            source: "@_exported import ProtonDriveBackend\n"
+        )
+        XCTAssertEqual(
+            Self.reexportBoundaryViolations(
+                in: backendReexporting,
+                forbidden: Self.isForbiddenBackendModuleReexport
+            ),
+            [
+                "\(backendReexporting.path): re-exports ProtonDriveBackend with @_exported; "
+                    + "a re-export leaks the Proton boundary"
+            ],
+            "A re-export of ProtonDriveBackend must produce a violation wherever the file lives"
+        )
+
+        // Re-export control: importing without @_exported inside the allowed directory stays
+        // clean.
+        XCTAssertTrue(
+            Self.reexportBoundaryViolations(
+                in: driving,
+                forbidden: Self.isForbiddenProtonModuleReexport
+            ).isEmpty
+        )
     }
 
     /// The stripper must blank line comments, nested block comments, plain literals (with
@@ -1950,15 +2290,27 @@ final class CoreArchitectureGateTests: XCTestCase {
         XCTAssertTrue(empty.isEmpty, "an extension target with no dependencies is not a violation")
     }
 
-    /// The directories of the repository that directly contain a `.swift` file, sorted by path.
-    private func directoriesWithSwiftFiles() throws -> [URL] {
+    /// The directories under `root` (by default the whole repository) that directly contain a
+    /// `.swift` file, sorted by path.
+    private func directoriesWithSwiftFiles(under root: URL? = nil) throws -> [URL] {
+        let directory = root ?? repoRoot
+        var isDirectory: ObjCBool = false
         guard
+            FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+            isDirectory.boolValue,
             let enumerator = FileManager.default.enumerator(
-                at: repoRoot,
+                at: directory,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             )
-        else { return [] }
+        else {
+            // Fail closed: a missing path, a path that is not a directory, or a nil enumerator
+            // must stop the gate, never shrink the scan to an empty result that reads as a pass.
+            throw GateScanError(
+                description: "directoriesWithSwiftFiles could not read \(directory.path); the coverage test "
+                    + "cannot walk a missing source tree"
+            )
+        }
 
         var directories = Set<URL>()
         for case let url as URL in enumerator {
@@ -1971,14 +2323,24 @@ final class CoreArchitectureGateTests: XCTestCase {
         return directories.sorted { $0.path < $1.path }
     }
 
+    /// The `.swift` files under `directory`, sorted by path. Fails closed when the directory
+    /// is missing or unreadable: an empty result would silently shrink a rule's scan.
     private func swiftFiles(in directory: URL) throws -> [URL] {
+        var isDirectory: ObjCBool = false
         guard
+            FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+            isDirectory.boolValue,
             let enumerator = FileManager.default.enumerator(
                 at: directory,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             )
-        else { return [] }
+        else {
+            throw GateScanError(
+                description: "swiftFiles could not read \(directory.path); a rule's scan must not shrink to "
+                    + "nothing on a missing path or a path that is not a directory"
+            )
+        }
 
         var results: [URL] = []
         for case let url as URL in enumerator {
@@ -2016,13 +2378,29 @@ final class CoreArchitectureGateTests: XCTestCase {
     }
 
     /// Every import declaration of `source` as (module, reexported).
+    ///
+    /// An import declaration may spread its pieces across lines: the `@` attributes, the
+    /// access-level modifier and the `import` keyword each may sit alone on a line ahead of
+    /// the next piece, and the module name may follow `import` on the next line. The scan
+    /// therefore joins a line that stops mid declaration with the line after it before
+    /// parsing, and the sample test pins every joined shape. A line that stops after its
+    /// attributes or its access level always continues with an import or a declaration; only
+    /// the continuation that follows the `import` keyword is a reserved word, so the join can
+    /// manufacture no import the source does not declare.
     private static func imports(inSource source: String) -> [(module: String, reexported: Bool)] {
         let stripped = stripCommentsAndStringLiterals(from: source)
         var found: [(module: String, reexported: Bool)] = []
 
+        var pending: String?
         for rawLine in stripped.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = pending.map { $0 + " " + rawLine } ?? String(rawLine)
+            if isIncompleteImportPrefix(line) {
+                pending = line
+                continue
+            }
+            pending = nil
             // One line may hold several statements: `import A; import B`.
-            for segment in rawLine.split(separator: ";", omittingEmptySubsequences: false) {
+            for segment in line.split(separator: ";", omittingEmptySubsequences: false) {
                 found.append(contentsOf: imports(inSegment: segment))
             }
         }
@@ -2030,35 +2408,75 @@ final class CoreArchitectureGateTests: XCTestCase {
         return found
     }
 
+    /// The access levels an import declaration may carry between its attributes and the
+    /// `import` keyword. Each counts as an access level here only when whitespace follows it,
+    /// so an identifier such as `internalValue` never reads as one.
+    private static let importAccessLevels = [
+        "internal", "package", "public", "private", "fileprivate",
+    ]
+
+    /// Whether `line` stops inside an import declaration before its module name: only `@`
+    /// attributes and access levels so far, or exactly the `import` keyword. Such a line
+    /// continues on the next line; every other line is complete (or no import at all).
+    private static func isIncompleteImportPrefix(_ line: String) -> Bool {
+        guard let scanned = scanImportPrefix(Substring(line)) else { return false }
+        let rest = scanned.rest.trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty || rest == "import"
+    }
+
+    /// Consumes the leading `@` attributes (each with balanced parenthesized arguments) and
+    /// access-level modifiers of an import declaration, returning the remainder and whether
+    /// a leading `@_exported` marks a re-export. Returns nil when the prefix stops mid
+    /// attribute or mid modifier: such a line is complete and must not join the next one.
+    private static func scanImportPrefix(
+        _ line: Substring
+    ) -> (rest: Substring, reexported: Bool)? {
+        var rest = line.drop(while: { $0.isWhitespace })
+        var reexported = false
+
+        while !rest.isEmpty {
+            if rest.hasPrefix("@") {
+                let nameStart = rest.index(after: rest.startIndex)
+                let nameEnd =
+                    rest[nameStart...].firstIndex { !($0.isLetter || $0.isNumber || $0 == "_") }
+                    ?? rest.endIndex
+                guard nameEnd != nameStart else { return nil }
+                if rest[nameStart..<nameEnd] == "_exported" { reexported = true }
+                var afterName = nameEnd
+                if afterName < rest.endIndex, rest[afterName] == "(" {
+                    // Skip the attribute's argument list, with balanced parentheses.
+                    var depth = 1
+                    afterName = rest.index(after: afterName)
+                    while afterName < rest.endIndex, depth > 0 {
+                        if rest[afterName] == "(" { depth += 1 }
+                        if rest[afterName] == ")" { depth -= 1 }
+                        afterName = rest.index(after: afterName)
+                    }
+                }
+                guard afterName == rest.endIndex || rest[afterName].isWhitespace else { return nil }
+                rest = rest[afterName...].drop(while: { $0.isWhitespace })
+                continue
+            }
+
+            if let modifier = importAccessLevels.first(where: { rest.hasPrefix($0) }) {
+                let afterModifier = rest.index(rest.startIndex, offsetBy: modifier.count)
+                guard afterModifier == rest.endIndex || rest[afterModifier].isWhitespace else {
+                    return nil
+                }
+                rest = rest[afterModifier...].drop(while: { $0.isWhitespace })
+                continue
+            }
+
+            break
+        }
+
+        return (rest, reexported)
+    }
+
     /// The import declarations of one `;`-free segment of stripped source.
     private static func imports(inSegment segment: Substring) -> [(module: String, reexported: Bool)] {
-        var rest = segment.drop(while: { $0.isWhitespace })
-
-        // Any number of leading attributes, for example `@_implementationOnly import Foo` or
-        // `@_spi(Private) @_exported import Foo`. `@_exported` marks a re-export and is
-        // reported by `reexportedModules(inSource:)`.
-        var reexported = false
-        while rest.hasPrefix("@") {
-            let nameStart = rest.index(after: rest.startIndex)
-            let nameEnd =
-                rest[nameStart...].firstIndex { !($0.isLetter || $0.isNumber || $0 == "_") }
-                ?? rest.endIndex
-            guard nameEnd != nameStart else { break }
-            if rest[nameStart..<nameEnd] == "_exported" { reexported = true }
-            var afterName = nameEnd
-            if afterName < rest.endIndex, rest[afterName] == "(" {
-                // Skip the attribute's argument list, with balanced parentheses.
-                var depth = 1
-                afterName = rest.index(after: afterName)
-                while afterName < rest.endIndex, depth > 0 {
-                    if rest[afterName] == "(" { depth += 1 }
-                    if rest[afterName] == ")" { depth -= 1 }
-                    afterName = rest.index(after: afterName)
-                }
-            }
-            guard afterName < rest.endIndex, rest[afterName].isWhitespace else { break }
-            rest = rest[afterName...].drop(while: { $0.isWhitespace })
-        }
+        guard let scanned = scanImportPrefix(segment) else { return [] }
+        let rest = scanned.rest
 
         guard
             rest.hasPrefix("import"),
@@ -2088,22 +2506,51 @@ final class CoreArchitectureGateTests: XCTestCase {
             .first
             .map(String.init)
             ?? String(token)
-        return [(moduleName, reexported)]
+        return [(moduleName, scanned.reexported)]
     }
 
-    /// Every production Swift file the Proton gates scan: all package `Sources/` targets plus the
-    /// two shipped app trees. Test targets (`Tests/`, `macOSTests/`, `iOSTests/`) exercise the
-    /// backend boundary deliberately and are not part of these rules.
-    private func protonGateProductionSourceFiles() throws -> [URL] {
-        try swiftFiles(in: sourcesRoot)
-            + swiftFiles(in: repoRoot.appendingPathComponent("App"))
-            + swiftFiles(in: repoRoot.appendingPathComponent("iOSApp"))
+    /// Every production Swift file the Proton gates scan: the trees `protonGateScannedRoots`
+    /// lists, the same list the coverage test explains. Test targets (`Tests/`,
+    /// `macOSTests/`, `iOSTests/`) exercise the backend boundary deliberately and are not
+    /// part of these rules. Adding a production tree means adding its entry to the list.
+    /// `roots` nil means the shared `protonGateScannedRoots` list; tests that add a temporary
+    /// tree pass that tree as the only root and resolve it under `base` (the repository root
+    /// by default), so a sample tree can live outside the working tree.
+    private func protonGateProductionSourceFiles(
+        scanning roots: [String]? = nil,
+        under base: URL? = nil
+    ) throws -> [URL] {
+        let baseURL = base ?? repoRoot
+        let rootsToScan = roots ?? Self.protonGateScannedRoots
+        var files: [URL] = []
+        for root in rootsToScan {
+            files += try swiftFiles(in: baseURL.appendingPathComponent(String(root.dropLast())))
+        }
+        return files
     }
 
-    /// The path of `file` relative to the repository root, for failure messages that survive a
-    /// moved checkout.
-    private func repoRelativePath(of file: URL) -> String {
-        let root = repoRoot.standardizedFileURL.path
+    /// The host app source files among `roots`: every scanned tree outside `Packages/`. The
+    /// package targets build against the backend freely; only the hand-wired app trees obey
+    /// the composition-file rule, and they come from the same scanned-roots list as the
+    /// production scan. `base` resolves the root entries and defaults to the repository
+    /// root, so a sample host tree can live outside the working tree.
+    private func protonGateHostFiles(
+        scanning roots: [String]? = nil,
+        under base: URL? = nil
+    ) throws -> [URL] {
+        let baseURL = base ?? repoRoot
+        let rootsToScan = roots ?? Self.protonGateScannedRoots
+        var files: [URL] = []
+        for root in rootsToScan where !root.hasPrefix("Packages/") {
+            files += try swiftFiles(in: baseURL.appendingPathComponent(String(root.dropLast())))
+        }
+        return files
+    }
+
+    /// The path of `file` relative to `base` (the repository root by default), for failure
+    /// messages that survive a moved checkout.
+    private func repoRelativePath(of file: URL, under base: URL? = nil) -> String {
+        let root = (base ?? repoRoot).standardizedFileURL.path
         let path = file.standardizedFileURL.path
         guard path.hasPrefix(root + "/") else { return path }
         return String(path.dropFirst(root.count + 1))
@@ -2118,6 +2565,13 @@ final class CoreArchitectureGateTests: XCTestCase {
     /// Why `projectTargets(from:)` stopped: project.yml contains a shape the line parse refuses
     /// to guess about. The message names the offending line, so the failure is actionable.
     private struct ProjectManifestError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// A source-tree scan that could not read its input. A missing or unreadable directory
+    /// must stop the gate instead of shrinking a rule's scan to nothing, which would read
+    /// as a pass.
+    private struct GateScanError: Error, CustomStringConvertible {
         let description: String
     }
 
