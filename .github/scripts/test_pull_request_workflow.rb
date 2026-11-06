@@ -560,7 +560,7 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal "${{ steps.ui.outcome }}", job.fetch("outputs").fetch("ui")
     # The wrapper keeps the first attempt next to this bundle, under the name that the upload step collects.
     assert_equal "${{ runner.temp }}/ios-ui.xcresult", ui.fetch("env").fetch("IOS_TEST_RESULT_BUNDLE_PATH")
-    assert_equal 90, job.fetch("timeout-minutes")
+    assert_equal 120, job.fetch("timeout-minutes")
     # The runner state is informational: it never decides the result, and it runs at the start and at the end.
     start = steps.find { |step| step["name"] == "Record the runner state at the start" }
     finish = steps.find { |step| step["name"] == "Record the runner state at the end" }
