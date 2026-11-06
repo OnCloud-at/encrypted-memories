@@ -341,11 +341,22 @@ public final class PhotoViewerModel {
     }
     public var thumbnailFeed: ThumbnailFeed { feed }
     public var hasBurstFilmstrip: Bool { burstSelection.hasFilmstrip }
+    /// What Download hands to the export. `loadCurrent` replaces the burst state on every page
+    /// change, so the state always belongs to the shown page.
     public var exportItemsForDownload: [PhotoItem] {
-        burstSelection.exportItems(current: current)
+        switch burstSelection.viewerExportDecision(current: current, page: baseCurrent, belongsToPage: true) {
+        case .success(let items, _):
+            items
+        case .burstReadFailed(let failedSources):
+            // The export reads the whole group again from the series' main photo: it exports
+            // every photo or shows the existing burst failure, never part of the series.
+            failedSources
+        case .burstLoading, .cancelled:
+            []
+        }
     }
     public var canDownloadCurrentSelection: Bool {
-        !isLoadingBurst && !exportItemsForDownload.isEmpty
+        !exportItemsForDownload.isEmpty
     }
     public var gridReturnCandidates: [PhotoItem] {
         burstSelection.gridReturnCandidates(current: current, base: baseCurrent)

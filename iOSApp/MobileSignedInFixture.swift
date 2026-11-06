@@ -670,6 +670,8 @@ import os
         var favoriteWriter: (@Sendable ([PhotoUID], Bool) async throws -> Void)? = nil
         var trashEmptier: (@Sendable () async throws -> Void)? = nil
         var streamingAssetLoader: (@Sendable (PhotoUID) async throws -> StreamingVideoAsset)? = nil
+        /// Overrides the empty default burst-group answer, for viewer share/export wiring tests.
+        var burstGroupLoader: (@Sendable (PhotoUID) async throws -> [PhotoItem])? = nil
         /// Recently Deleted lists every fixture photo until it is emptied.
         let trashState = MobileFixtureTrashState()
 
@@ -751,7 +753,9 @@ import os
             return PhotoMetadata(
                 filename: "\(uid.nodeID).mov", mimeType: "video/quicktime", pixelWidth: 160, pixelHeight: 160)
         }
-        func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] { [] }
+        func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] {
+            try await burstGroupLoader?(uid) ?? []
+        }
         func favoriteUIDs() async throws -> Set<PhotoUID> {
             try await favoriteLoader?() ?? []
         }

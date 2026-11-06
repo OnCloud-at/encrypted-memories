@@ -2732,9 +2732,13 @@ struct MainView: View {
         case .success(let items, let singleSeries):
             expanded = items
             expandedSingleSeries = singleSeries
+        case .burstLoading:
+            // Only the viewer's decision reports a burst that is still loading; `expand`
+            // awaits every group read. Nothing failed, so the export does not start.
+            return ExportRequest(items: [], zipSuggestedName: nil)
         case .cancelled:
-            // The export task was cancelled by the person or superseded; no failure happened
-            // and no alert may appear.
+            // A cancelled read (for example during sign-out) is quiet, like a cancelled
+            // transfer in `performExport`: both use `LibraryActionFailureMessage`.
             return ExportRequest(items: [], zipSuggestedName: nil)
         case .burstReadFailed(let failedSources):
             // Reading the burst group failed, so nothing is exported; presenting only the tapped
