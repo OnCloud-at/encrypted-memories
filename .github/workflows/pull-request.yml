@@ -350,7 +350,7 @@ jobs:
     runs-on: xcode-27
     # The slowest finished queue run took 88 minutes, and another was cancelled at the 90-minute
     # job limit although no test failed; the merge queue then removed the pull request. 120 minutes
-    # gives a slow runner the same headroom that ios-verification already has. Refs #1197.
+    # gives a slow runner the same limit as ios-verification. Refs #1197.
     timeout-minutes: 120
     outputs:
       ui: ${{ steps.ui.outcome }}
@@ -364,6 +364,14 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         run: bash .github/scripts/runner_state.sh start
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          save-cache: "false"
+      # The simulator boots after prepare (#1165): the UI job's prepare step took 12.9, 9.1 and 11.0 minutes while
+      # it started the simulator before prepare, and 2.7 to 3.8 minutes in the job that boots after prepare.
+      # The order is the one difference between those measurements.
       - name: Start the simulator
         continue-on-error: true
         timeout-minutes: 2
@@ -371,11 +379,6 @@ jobs:
           IOS_TEST_ACTION: boot-simulator
           IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
         run: bash ./scripts/verify-ios-app-tests.sh
-      - uses: ./.github/actions/prepare-apple-build
-        id: prepare
-        with:
-          build-profile: app
-          save-cache: "false"
       - name: Build the app and both simulator test bundles once
         id: test-build
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
@@ -503,9 +506,9 @@ jobs:
     name: Cancel a queue run after a failure
     if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-24.04
-    # The longest queue runs took 123 minutes, because the macOS jobs wait for a runner. The loop ends by itself after
-    # 165 minutes, and the job limit is only the backstop.
-    timeout-minutes: 175
+    # The longest queue runs took 123 minutes, because the macOS jobs wait for a runner. A late UI run can take
+    # about 215 minutes, so the loop ends by itself after 235 minutes, and the job limit is only the backstop.
+    timeout-minutes: 240
     permissions:
       actions: write
     steps:
@@ -517,7 +520,7 @@ jobs:
           set -uo pipefail
           workers=("Repository hygiene" "Package verification and style" "iOS verification" "iOS UI verification" "macOS verification")
           own="Cancel a queue run after a failure"
-          deadline=$((SECONDS + 9900))
+          deadline=$((SECONDS + 14100))
           read_errors=0
           while (( SECONDS < deadline )); do
             if ! lines="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs" --paginate \
@@ -568,8 +571,8 @@ jobs:
     name: Cancel a superseded queue run
     if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-24.04
-    # The same limits as the failure watchdog: the loop of the script ends by itself after 165 minutes.
-    timeout-minutes: 175
+    # The same limits as the failure watchdog: the loop of the script ends by itself after 235 minutes.
+    timeout-minutes: 240
     permissions:
       actions: write
       contents: read

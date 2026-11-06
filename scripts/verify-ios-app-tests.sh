@@ -173,8 +173,8 @@ else
 fi
 export DEVELOPER_DIR
 
-# CI starts the simulator at the beginning of the job, while the dependencies and the test bundles build, so the
-# boot is done when the tests start. The wait below still covers a boot that has not finished.
+# CI starts the simulator after the prepare step, while the test bundles build, so the boot is done when the
+# tests start. The wait below still covers a boot that has not finished.
 if [[ "$ACTION" == "boot-simulator" ]]; then
   if [[ -z "$SIMULATOR_UDID" ]]; then
     echo "[ios-tests] no simulator to start."
