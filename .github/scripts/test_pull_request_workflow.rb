@@ -83,12 +83,14 @@ class PullRequestWorkflowTests < Minitest::Test
       refute_includes REQUIRED_CHECKS, jobs.fetch(watchdog_id).fetch("name"), watchdog_id
     end
     assert_equal "ubuntu-24.04", watchdog.fetch("runs-on")
-    # The longest queue run took 123 minutes. The loop ends before the job limit, which stays below the 180 minute
-    # check timeout of the queue.
+    # The longest queue run took 123 minutes, and a late UI run can take longer: the loop ends by itself before
+    # the job limit, which stays below the 360 minute check timeout of the queue.
     limit = watchdog.fetch("timeout-minutes")
-    assert_operator limit, :>=, 150
-    assert_operator limit, :<=, 180
-    assert_operator watchdog.fetch("steps").first.fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i, :<, limit * 60
+    assert_equal 240, limit, "The failure watchdog must keep its 240 minute job limit"
+    deadline = watchdog.fetch("steps").first.fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i
+    assert_equal 14100, deadline, "The failure watchdog loop must end after 14100 seconds"
+    # One iteration of the loop can take up to 300 seconds of gh calls, so the loop must still end in time.
+    assert_operator deadline + 300, :<=, limit * 60, "The loop must end before the job limit"
     {"merge_group" => true, "pull_request" => false, "workflow_dispatch" => false}.each do |event, expected|
       assert_equal expected, evaluate(watchdog.fetch("if"), {"github.event_name" => event}), event
     end
@@ -118,8 +120,16 @@ class PullRequestWorkflowTests < Minitest::Test
     end
     assert_equal "ubuntu-24.04", job.fetch("runs-on")
     limit = job.fetch("timeout-minutes")
-    assert_operator limit, :>=, 150
-    assert_operator limit, :<=, 180
+    assert_equal 240, limit, "The superseded-run watchdog must keep its 240 minute job limit"
+    # This watchdog ends by the LOOP_DEADLINE_SECONDS of the decision script, which the job fetches from the
+    # merge base. The failure watchdog computes the same number inline, so the two copies must not drift.
+    python = File.read(File.expand_path("cancel_superseded_queue_run.py", __dir__))
+    script_deadline = python[/^LOOP_DEADLINE_SECONDS = (\d+)/, 1].to_i
+    failure_deadline = @workflow.fetch("jobs").fetch(WATCHDOG).fetch("steps").first
+                             .fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i
+    assert_equal 14100, script_deadline, "The decision script must end its loop after 14100 seconds"
+    assert_equal failure_deadline, script_deadline, "Both watchdogs must share one deadline number"
+    assert_operator script_deadline + 300, :<=, limit * 60, "The loop must end before the job limit"
     steps = job.fetch("steps")
     assert_equal 1, steps.length
     step = steps.first
@@ -592,7 +602,7 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes hygiene.fetch("run"), "bash .github/scripts/test_run_ui_tests_with_retry.sh"
   end
 
-  def test_both_simulator_jobs_keep_the_boot_decoupled_and_the_ios_job_boots_after_prepare
+  def test_both_simulator_jobs_boot_the_simulator_after_prepare_and_never_depend_on_it
     %w[ios-verification ios-ui-verification].each do |name|
       job = @workflow.fetch("jobs").fetch(name)
       steps = job.fetch("steps")
@@ -609,15 +619,16 @@ class PullRequestWorkflowTests < Minitest::Test
       assert_equal 2, boot.fetch("timeout-minutes"), name
       refute boot.key?("id"), "No step may depend on the start of the simulator in #{name}"
       assert_nil boot["if"], name
-      # The boot finishes before the test bundles build, in both orders.
+      # The boot finishes before the test bundles build, in both jobs.
       build = steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "build-for-testing" }
       assert_operator steps.index(boot), :<, build, name
       job.fetch("outputs", {}).each_value { |value| refute_includes value, boot.fetch("name"), name }
       steps.each { |step| refute_includes step["if"].to_s, "Start the simulator", name }
     end
 
-    # The boot order differs on purpose (#1165): the iOS job boots after prepare to measure whether
-    # the early boot slows the prepare step; the UI job keeps the boot before prepare as the control.
+    # Both jobs boot the simulator after prepare (#1165): the UI job's prepare step took 12.9, 9.1 and 11.0
+    # minutes while it started the simulator before prepare, and 2.7 to 3.8 minutes in the job that boots after
+    # prepare. The order is the one difference between those measurements.
     ios_steps = @workflow.fetch("jobs").fetch("ios-verification").fetch("steps")
     ios_boot = ios_steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "boot-simulator" }
     ios_prepare = ios_steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
@@ -626,7 +637,7 @@ class PullRequestWorkflowTests < Minitest::Test
     ui_steps = @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("steps")
     ui_boot = ui_steps.index { |step| step.dig("env", "IOS_TEST_ACTION") == "boot-simulator" }
     ui_prepare = ui_steps.index { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
-    assert_operator ui_boot, :<, ui_prepare, "The UI job keeps the simulator boot before prepare"
+    assert_operator ui_prepare, :<, ui_boot, "The UI job starts the simulator after prepare"
 
     # The iOS job records the runner state before it boots, like the UI job.
     ios_start = ios_steps.find { |step| step["name"] == "Record the runner state at the start" }
