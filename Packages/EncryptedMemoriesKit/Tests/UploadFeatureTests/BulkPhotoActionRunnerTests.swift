@@ -324,53 +324,55 @@ final class BulkPhotoActionRunnerTests: XCTestCase {
             })
     }
 
-    func testShutdownJoinsAnInFlightCaptureAndCancelledCaptureNeverCreatesConsent() async throws {
-        for shutsDown in [true, false] {
-            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let queue = try XCTUnwrap(
-                UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent("queue")))
-            defer { queue.close() }
-            XCTAssertTrue(
-                queue.upsert(
-                    .init(
-                        source: .init(kind: .photoLibraryAsset, identifier: "photo"), revision: .init(rawValue: 1),
-                        originalFilename: "photo.heic", state: .failedPermanent,
-                        lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
-                        updatedAt: Date())))
-            let gate = BulkSnapshotReadGate()
-            queue.onProblemReadEvent = {
-                switch $0 {
-                case .willLock: gate.holdOnce()
-                case .didUnlock: gate.recordCancellation(Task.isCancelled)
-                default: break
+    #if DEBUG
+        func testShutdownJoinsAnInFlightCaptureAndCancelledCaptureNeverCreatesConsent() async throws {
+            for shutsDown in [true, false] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let queue = try XCTUnwrap(
+                    UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent("queue")))
+                defer { queue.close() }
+                XCTAssertTrue(
+                    queue.upsert(
+                        .init(
+                            source: .init(kind: .photoLibraryAsset, identifier: "photo"), revision: .init(rawValue: 1),
+                            originalFilename: "photo.heic", state: .failedPermanent,
+                            lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                            updatedAt: Date())))
+                let gate = BulkSnapshotReadGate()
+                queue.onProblemReadEvent = {
+                    switch $0 {
+                    case .willLock: gate.holdOnce()
+                    case .didUnlock: gate.recordCancellation(Task.isCancelled)
+                    default: break
+                    }
                 }
+                let runner = BulkPhotoActionRunner()
+                let capture = Task { await runner.prepareBackUpAgain(in: queue) }
+                let deadline = ContinuousClock.now + .seconds(3)
+                while !gate.hasStarted, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                XCTAssertTrue(gate.hasStarted)
+                let overlapping = await runner.prepareBackUpAgain(in: queue)
+                XCTAssertNil(overlapping, "The runner owns one complete capture at a time")
+                var returned = false
+                let shutdown = Task {
+                    if shutsDown { await runner.shutdown() } else { capture.cancel() }
+                    returned = true
+                }
+                try await Task.sleep(for: .milliseconds(30))
+                if shutsDown {
+                    XCTAssertFalse(returned, "Shutdown must join the capture before the account closes its store")
+                }
+                gate.release()
+                await shutdown.value
+                let confirmation = await capture.value
+                XCTAssertNil(confirmation)
+                XCTAssertTrue(gate.observedCancellation, "The owned read receives caller or shutdown cancellation")
+                XCTAssertNil(runner.confirmation)
+                await runner.shutdown()
             }
-            let runner = BulkPhotoActionRunner()
-            let capture = Task { await runner.prepareBackUpAgain(in: queue) }
-            let deadline = ContinuousClock.now + .seconds(3)
-            while !gate.hasStarted, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-            XCTAssertTrue(gate.hasStarted)
-            let overlapping = await runner.prepareBackUpAgain(in: queue)
-            XCTAssertNil(overlapping, "The runner owns one complete capture at a time")
-            var returned = false
-            let shutdown = Task {
-                if shutsDown { await runner.shutdown() } else { capture.cancel() }
-                returned = true
-            }
-            try await Task.sleep(for: .milliseconds(30))
-            if shutsDown {
-                XCTAssertFalse(returned, "Shutdown must join the capture before the account closes its store")
-            }
-            gate.release()
-            await shutdown.value
-            let confirmation = await capture.value
-            XCTAssertNil(confirmation)
-            XCTAssertTrue(gate.observedCancellation, "The owned read receives caller or shutdown cancellation")
-            XCTAssertNil(runner.confirmation)
-            await runner.shutdown()
         }
-    }
+    #endif
 
     private func rows(_ count: Int) -> [BackupFailedItem] {
         (0..<count).map {

@@ -69,32 +69,35 @@ final class QueueDecisionReadTests: XCTestCase {
 
     /// Dismissing a problem keeps its stored record when the read of that record fails. A missing photo needs the
     /// record to be checked again when its bytes return.
-    @MainActor
-    func testAFailedRecordReadKeepsTheDismissedProblemUnchanged() async throws {
-        let suite = "queue-decision-dismiss-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: nil, uploader: MockUploader())
-        let queue = try XCTUnwrap(controller.queueStoreForTesting)
-        let missing = row(
-            "missing", state: .sourceMissing,
-            lastError: BackupIssueRecord(kind: .sourceMissing, detail: "gone").persistedValue)
-        XCTAssertTrue(queue.upsert(missing))
-        let item = try XCTUnwrap(controller.failedItems().first { $0.source == missing.source })
-        XCTAssertTrue(item.isPermanent)
-        // The dismissal reads the row twice: its own check, then the record that the dismissed row keeps.
-        let fault = try SQLiteReadInterrupt(
-            in: queue, matching: "SELECT original_filename, byte_count, state", occurrence: 2)
-        controller.dismissFailedItem(item)
-        fault.stop()
-        XCTAssertTrue(fault.fired)
-        let observer = try makeQueue(PhotoLibraryBackupController.queueDatabaseFileName)
-        defer { observer.close() }
-        XCTAssertEqual(try observer.entry(for: missing.source, revision: missing.revision), missing)
-        await controller.shutdown()
-    }
+    #if DEBUG
+        @MainActor
+        func testAFailedRecordReadKeepsTheDismissedProblemUnchanged() async throws {
+            let suite = "queue-decision-dismiss-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader())
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            let missing = row(
+                "missing", state: .sourceMissing,
+                lastError: BackupIssueRecord(kind: .sourceMissing, detail: "gone").persistedValue)
+            XCTAssertTrue(queue.upsert(missing))
+            let item = try XCTUnwrap(controller.failedItems().first { $0.source == missing.source })
+            XCTAssertTrue(item.isPermanent)
+            // The dismissal reads the row twice: its own check, then the record that the dismissed row keeps.
+            let fault = try SQLiteReadInterrupt(
+                in: queue, matching: "SELECT original_filename, byte_count, state", occurrence: 2)
+            controller.dismissFailedItem(item)
+            fault.stop()
+            XCTAssertTrue(fault.fired)
+            let observer = try makeQueue(PhotoLibraryBackupController.queueDatabaseFileName)
+            defer { observer.close() }
+            XCTAssertEqual(try observer.entry(for: missing.source, revision: missing.revision), missing)
+            await controller.shutdown()
+        }
+    #endif
 
     /// A problem list that a failed read cut short is no snapshot, also after the failure is forgotten.
     func testAPartialProblemReadYieldsNoSnapshotAfterRecovery() throws {

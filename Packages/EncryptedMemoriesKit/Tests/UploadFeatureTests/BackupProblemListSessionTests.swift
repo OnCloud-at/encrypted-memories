@@ -120,35 +120,37 @@ final class BackupProblemListSessionTests: XCTestCase {
         await session.shutdown()
     }
 
-    func testShutdownRejectsALateReadAndEveryLaterAdmission() async {
-        let gate = Gate()
-        var reads = 0
-        let session = BackupProblemListSession(read: {
-            reads += 1
-            await gate.hold()
-            return self.snapshot(1_000)
-        })
-        var publishedAfterRetirement = false
-        session.onPublicationEvent = { event in
-            if event == .didApply, session.isRetired, !session.rows.isEmpty {
-                publishedAfterRetirement = true
+    #if DEBUG
+        func testShutdownRejectsALateReadAndEveryLaterAdmission() async {
+            let gate = Gate()
+            var reads = 0
+            let session = BackupProblemListSession(read: {
+                reads += 1
+                await gate.hold()
+                return self.snapshot(1_000)
+            })
+            var publishedAfterRetirement = false
+            session.onPublicationEvent = { event in
+                if event == .didApply, session.isRetired, !session.rows.isEmpty {
+                    publishedAfterRetirement = true
+                }
             }
+            session.requestRefresh()
+            await gate.waitForEntry()
+            let shutdown = Task { await session.shutdown() }
+            await Task.yield()
+            gate.release()
+            await shutdown.value
+            XCTAssertFalse(publishedAfterRetirement, "A late read must never publish rows into a retired session")
+            XCTAssertTrue(session.rows.isEmpty)
+            session.requestRefresh()
+            await Task.yield()
+            XCTAssertEqual(reads, 1)
+            gate.release()
+            await session.waitUntilIdle()
+            session.onPublicationEvent = nil
         }
-        session.requestRefresh()
-        await gate.waitForEntry()
-        let shutdown = Task { await session.shutdown() }
-        await Task.yield()
-        gate.release()
-        await shutdown.value
-        XCTAssertFalse(publishedAfterRetirement, "A late read must never publish rows into a retired session")
-        XCTAssertTrue(session.rows.isEmpty)
-        session.requestRefresh()
-        await Task.yield()
-        XCTAssertEqual(reads, 1)
-        gate.release()
-        await session.waitUntilIdle()
-        session.onPublicationEvent = nil
-    }
+    #endif
 
     func testNearEndAdmissionLoadsPagesWithoutScanningAgain() async throws {
         var reads = 0
@@ -208,24 +210,26 @@ final class BackupProblemListSessionTests: XCTestCase {
         XCTAssertTrue(session.isRetired)
     }
 
-    func testRefreshRetainsNearEndDemandWhenItCancelsAnOlderPage() async throws {
-        let captured = snapshot(1_000)
-        let session = BackupProblemListSession(now: { 10 }, sleep: { _ in }, read: { captured })
-        session.requestRefresh()
-        await session.waitUntilIdle()
-        let last = try XCTUnwrap(session.rows.last)
-        session.onPublicationEvent = { event in
-            if event == .willApply {
-                XCTAssertTrue(session.requestNextPage(near: last.item))
+    #if DEBUG
+        func testRefreshRetainsNearEndDemandWhenItCancelsAnOlderPage() async throws {
+            let captured = snapshot(1_000)
+            let session = BackupProblemListSession(now: { 10 }, sleep: { _ in }, read: { captured })
+            session.requestRefresh()
+            await session.waitUntilIdle()
+            let last = try XCTUnwrap(session.rows.last)
+            session.onPublicationEvent = { event in
+                if event == .willApply {
+                    XCTAssertTrue(session.requestNextPage(near: last.item))
+                }
             }
+            session.requestRefresh()
+            await session.waitUntilIdle()
+            XCTAssertEqual(session.rows.count, 400, "A surviving visible near-end row must not strand the next page")
+            XCTAssertEqual(session.rows.map(\.id), Array(captured.rows.prefix(400)).map(\.id))
+            session.onPublicationEvent = nil
+            await session.shutdown()
         }
-        session.requestRefresh()
-        await session.waitUntilIdle()
-        XCTAssertEqual(session.rows.count, 400, "A surviving visible near-end row must not strand the next page")
-        XCTAssertEqual(session.rows.map(\.id), Array(captured.rows.prefix(400)).map(\.id))
-        session.onPublicationEvent = nil
-        await session.shutdown()
-    }
+    #endif
 
     func testCompletedEmptyReadWithPositiveSummaryUsesExistingUnavailableState() async {
         let session = BackupProblemListSession(read: { self.snapshot(0) })

@@ -333,28 +333,30 @@ final class PhotoBackupBulkActionTests: XCTestCase {
 
     /// The second sibling write of the photo fails once: the photo counts as unchanged, so no revision may have
     /// changed and no consent may remain.
-    func testAFailedSiblingWriteCountsThePhotoUnchangedAndChangesNoRevision() async throws {
-        let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date.addingTimeInterval(1)))
-        defer { fixture.cleanup() }
-        try fixture.park("edited", at: date)
-        try fixture.park("edited", at: date.addingTimeInterval(1))
-        let before = [fixture.entry("edited", at: date), fixture.entry("edited", at: date.addingTimeInterval(1))]
-        let captured = await fixture.controller.prepareBackUpAgain()
-        let confirmation = try XCTUnwrap(captured)
-        let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
-        let fault = try SQLiteReadInterrupt(in: queue, matching: "attempts=COALESCE(?, attempts)", occurrence: 2)
-        defer { fault.stop() }
-        XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
-        await fixture.controller.bulkPhotoActions.waitUntilFinished()
-        XCTAssertTrue(fault.fired, "the second sibling write must actually fail")
-        XCTAssertEqual(
-            [fixture.entry("edited", at: date), fixture.entry("edited", at: date.addingTimeInterval(1))], before,
-            "a photo counted as unchanged must have no reopened or dismissed revision")
-        XCTAssertTrue(fixture.journal.entry(for: fixture.source("edited")).isEmpty)
-        XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, 0)
-        XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.stayed, 1)
-        await fixture.controller.shutdown()
-    }
+    #if DEBUG
+        func testAFailedSiblingWriteCountsThePhotoUnchangedAndChangesNoRevision() async throws {
+            let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date.addingTimeInterval(1)))
+            defer { fixture.cleanup() }
+            try fixture.park("edited", at: date)
+            try fixture.park("edited", at: date.addingTimeInterval(1))
+            let before = [fixture.entry("edited", at: date), fixture.entry("edited", at: date.addingTimeInterval(1))]
+            let captured = await fixture.controller.prepareBackUpAgain()
+            let confirmation = try XCTUnwrap(captured)
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let fault = try SQLiteReadInterrupt(in: queue, matching: "attempts=COALESCE(?, attempts)", occurrence: 2)
+            defer { fault.stop() }
+            XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
+            await fixture.controller.bulkPhotoActions.waitUntilFinished()
+            XCTAssertTrue(fault.fired, "the second sibling write must actually fail")
+            XCTAssertEqual(
+                [fixture.entry("edited", at: date), fixture.entry("edited", at: date.addingTimeInterval(1))], before,
+                "a photo counted as unchanged must have no reopened or dismissed revision")
+            XCTAssertTrue(fixture.journal.entry(for: fixture.source("edited")).isEmpty)
+            XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, 0)
+            XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.stayed, 1)
+            await fixture.controller.shutdown()
+        }
+    #endif
 
     func testCancellationDuringSourceReadNeverChangesTheDecisionOrJournal() async throws {
         let gate = BulkSourceReadGate()
@@ -396,84 +398,90 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         XCTAssertNil(fixture.controller.bulkPhotoActions.confirmation)
     }
 
-    func testASuccessfulBatchStartsOneNormalPassOnlyAfterTheBatchAndAnUnchangedBatchStartsNone() async throws {
-        for succeeds in [true, false] {
-            let resolver = ScriptedBackupResolver(defaultModified: date)
-            if !succeeds {
-                resolver.set(.missing, for: "first")
-                resolver.set(.missing, for: "second")
+    #if DEBUG
+        func testASuccessfulBatchStartsOneNormalPassOnlyAfterTheBatchAndAnUnchangedBatchStartsNone() async throws {
+            for succeeds in [true, false] {
+                let resolver = ScriptedBackupResolver(defaultModified: date)
+                if !succeeds {
+                    resolver.set(.missing, for: "first")
+                    resolver.set(.missing, for: "second")
+                }
+                let fixture = try makeFixture(resolver, hasIdentityResolver: true)
+                defer { fixture.cleanup() }
+                let passGate = BulkSourceReadGate()
+                fixture.controller.replacePassBodyForTesting { await passGate.hold() }
+                fixture.controller.setEnabledForTesting()
+                fixture.controller.setAccessStateForTesting(.full)
+                var starts = 0
+                fixture.controller.idleTimerHook = { running in
+                    if running {
+                        starts += 1
+                        XCTAssertFalse(
+                            fixture.controller.bulkPhotoActions.isRunning, "The pass starts after all bulk choices")
+                        XCTAssertEqual(fixture.controller.bulkPhotoActions.processed, 2)
+                    }
+                }
+                try fixture.park("first", at: date)
+                try fixture.park("second", at: date)
+                let captured = await fixture.controller.prepareBackUpAgain()
+                let confirmation = try XCTUnwrap(captured)
+                XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
+                await fixture.controller.bulkPhotoActions.waitUntilFinished()
+                if succeeds {
+                    let deadline = ContinuousClock.now + .seconds(3)
+                    while starts == 0, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                } else {
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                XCTAssertEqual(starts, succeeds ? 1 : 0)
+                XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, succeeds ? 2 : 0)
+                await passGate.release()
+                await fixture.controller.shutdown()
             }
-            let fixture = try makeFixture(resolver, hasIdentityResolver: true)
+        }
+    #endif
+
+    #if DEBUG
+        func testShutdownJoinsAHeldSourceReadRetiresTheRunnerAndLeavesTheDecisionUnchanged() async throws {
+            let gate = BulkSourceReadGate()
+            let fixture = try makeFixture(
+                HeldBulkSourceResolver(inner: ScriptedBackupResolver(defaultModified: date), gate: gate),
+                hasIdentityResolver: true)
             defer { fixture.cleanup() }
-            let passGate = BulkSourceReadGate()
-            fixture.controller.replacePassBodyForTesting { await passGate.hold() }
             fixture.controller.setEnabledForTesting()
             fixture.controller.setAccessStateForTesting(.full)
+            fixture.controller.replacePassBodyForTesting {}
             var starts = 0
-            fixture.controller.idleTimerHook = { running in
-                if running {
-                    starts += 1
-                    XCTAssertFalse(
-                        fixture.controller.bulkPhotoActions.isRunning, "The pass starts after all bulk choices")
-                    XCTAssertEqual(fixture.controller.bulkPhotoActions.processed, 2)
-                }
-            }
-            try fixture.park("first", at: date)
-            try fixture.park("second", at: date)
+            fixture.controller.idleTimerHook = { if $0 { starts += 1 } }
+            try fixture.park("held", at: date)
             let captured = await fixture.controller.prepareBackUpAgain()
             let confirmation = try XCTUnwrap(captured)
             XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
-            await fixture.controller.bulkPhotoActions.waitUntilFinished()
-            if succeeds {
-                let deadline = ContinuousClock.now + .seconds(3)
-                while starts == 0, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-            } else {
-                try await Task.sleep(for: .milliseconds(50))
+            let deadline = ContinuousClock.now + .seconds(3)
+            while !(await gate.hasStarted), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
             }
-            XCTAssertEqual(starts, succeeds ? 1 : 0)
-            XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, succeeds ? 2 : 0)
-            await passGate.release()
-            await fixture.controller.shutdown()
+            let entered = await gate.hasStarted
+            XCTAssertTrue(entered)
+            var returned = false
+            let shutdown = Task {
+                await fixture.controller.shutdown()
+                returned = true
+            }
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertFalse(returned, "Shutdown must join the non-cancellable admitted read before closing stores")
+            XCTAssertTrue(fixture.controller.bulkPhotoActions.isRunning)
+            await gate.release()
+            await shutdown.value
+            XCTAssertTrue(returned)
+            XCTAssertFalse(fixture.controller.bulkPhotoActions.isRunning)
+            XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.cancelled, true)
+            XCTAssertEqual(fixture.entry("held", at: date)?.state, .failedPermanent)
+            XCTAssertTrue(fixture.journal.entry(for: fixture.source("held")).isEmpty)
+            XCTAssertEqual(starts, 0)
+            XCTAssertNil(fixture.controller.bulkPhotoActions.prepare(confirmation.items, action: .backUpAgain))
         }
-    }
-
-    func testShutdownJoinsAHeldSourceReadRetiresTheRunnerAndLeavesTheDecisionUnchanged() async throws {
-        let gate = BulkSourceReadGate()
-        let fixture = try makeFixture(
-            HeldBulkSourceResolver(inner: ScriptedBackupResolver(defaultModified: date), gate: gate),
-            hasIdentityResolver: true)
-        defer { fixture.cleanup() }
-        fixture.controller.setEnabledForTesting()
-        fixture.controller.setAccessStateForTesting(.full)
-        fixture.controller.replacePassBodyForTesting {}
-        var starts = 0
-        fixture.controller.idleTimerHook = { if $0 { starts += 1 } }
-        try fixture.park("held", at: date)
-        let captured = await fixture.controller.prepareBackUpAgain()
-        let confirmation = try XCTUnwrap(captured)
-        XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
-        let deadline = ContinuousClock.now + .seconds(3)
-        while !(await gate.hasStarted), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        let entered = await gate.hasStarted
-        XCTAssertTrue(entered)
-        var returned = false
-        let shutdown = Task {
-            await fixture.controller.shutdown()
-            returned = true
-        }
-        try await Task.sleep(for: .milliseconds(30))
-        XCTAssertFalse(returned, "Shutdown must join the non-cancellable admitted read before closing stores")
-        XCTAssertTrue(fixture.controller.bulkPhotoActions.isRunning)
-        await gate.release()
-        await shutdown.value
-        XCTAssertTrue(returned)
-        XCTAssertFalse(fixture.controller.bulkPhotoActions.isRunning)
-        XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.cancelled, true)
-        XCTAssertEqual(fixture.entry("held", at: date)?.state, .failedPermanent)
-        XCTAssertTrue(fixture.journal.entry(for: fixture.source("held")).isEmpty)
-        XCTAssertEqual(starts, 0)
-        XCTAssertNil(fixture.controller.bulkPhotoActions.prepare(confirmation.items, action: .backUpAgain))
-    }
+    #endif
 
     func testPolicyPauseDismissesPendingConsentBeforeAStart() async throws {
         let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: LibraryNetworkState()))
@@ -576,119 +584,130 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         }
     }
 
-    func testFailedFullCaptureUsesTheExistingFixedActionMessage() async throws {
-        let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date))
-        defer { fixture.cleanup() }
-        try fixture.park("photo", at: date)
-        let session = fixture.controller.makeProblemListSession()
-        session.requestRefresh()
-        await session.waitUntilIdle()
-        XCTAssertEqual(session.decisionCount, 1)
-        fixture.controller.queueStoreForTesting?.close()
-        let confirmation = await fixture.controller.prepareBackUpAgain()
-        XCTAssertNil(confirmation)
-        XCTAssertEqual(session.fixedActionMessage, L10n.string("backup.error_local_state_unavailable"))
-        XCTAssertEqual(session.decisionCount, 1, "The failed read retains the visible count and rows")
-        await session.shutdown()
-        await fixture.controller.shutdown()
-    }
-
-    func testCancelledCompletionNeverStartsANormalPassEvenAfterACommittedChoice() async throws {
-        let gate = BulkSourceReadGate()
-        let fixture = try makeFixture(
-            HeldBulkSourceResolver(inner: ScriptedBackupResolver(defaultModified: date), gate: gate),
-            hasIdentityResolver: true)
-        defer { fixture.cleanup() }
-        fixture.controller.setEnabledForTesting()
-        fixture.controller.setAccessStateForTesting(.full)
-        fixture.controller.replacePassBodyForTesting {}
-        var starts = 0
-        fixture.controller.idleTimerHook = { if $0 { starts += 1 } }
-        try fixture.park("held", at: date)
-        let captured = await fixture.controller.prepareBackUpAgain()
-        let confirmation = try XCTUnwrap(captured)
-        XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
-        let deadline = ContinuousClock.now + .seconds(3)
-        while !(await gate.hasStarted), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        let owned = try XCTUnwrap(
-            Mirror(reflecting: fixture.controller).children.first { $0.label == "_bulkCompletionTask" })
-        let completion = try XCTUnwrap(Mirror(reflecting: owned.value).children.first?.value as? Task<Void, Never>)
-        completion.cancel()
-        await gate.release()
-        await fixture.controller.bulkPhotoActions.waitUntilFinished()
-        await completion.value
-        XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, 1)
-        XCTAssertEqual(starts, 0, "A cancelled completion must not request a normal pass")
-        await fixture.controller.shutdown()
-    }
-
-    func testEmptyCancelledAndRetiredCapturesDoNotShowAnError() async throws {
-        let empty = try makeFixture(ScriptedBackupResolver(defaultModified: date))
-        defer { empty.cleanup() }
-        let emptySession = empty.controller.makeProblemListSession()
-        let capturedEmpty = await empty.controller.prepareBackUpAgain()
-        XCTAssertNil(capturedEmpty)
-        XCTAssertNil(emptySession.fixedActionMessage)
-        await emptySession.shutdown()
-        await empty.controller.shutdown()
-        for retires in [false, true] {
+    #if DEBUG
+        func testFailedFullCaptureUsesTheExistingFixedActionMessage() async throws {
             let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date))
             defer { fixture.cleanup() }
-            try fixture.park("held", at: date)
-            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
-            let connection = try XCTUnwrap(
-                Mirror(reflecting: queue).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
-            let gate = BulkControllerSnapshotGate()
-            queue.onProblemReadEvent = { if case .willLock = $0 { gate.holdOnce() } }
+            try fixture.park("photo", at: date)
             let session = fixture.controller.makeProblemListSession()
-            let capture = Task { await fixture.controller.prepareBackUpAgain() }
-            let deadline = ContinuousClock.now + .seconds(3)
-            while !gate.hasStarted, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-            XCTAssertTrue(gate.hasStarted)
-            connection.withLock { connection.markFailed(resultCode: SQLITE_INTERRUPT) }
-            var shutdown: Task<Void, Never>?
-            if retires {
-                shutdown = Task { await fixture.controller.shutdown() }
-                while fixture.controller.isBulkBackUpAgainAvailable, ContinuousClock.now < deadline {
-                    try await Task.sleep(for: .milliseconds(5))
-                }
-                XCTAssertFalse(fixture.controller.isBulkBackUpAgainAvailable)
-            } else {
-                capture.cancel()
-            }
-            gate.release()
-            let confirmation = await capture.value
-            await shutdown?.value
+            session.requestRefresh()
+            await session.waitUntilIdle()
+            XCTAssertEqual(session.decisionCount, 1)
+            fixture.controller.queueStoreForTesting?.close()
+            let confirmation = await fixture.controller.prepareBackUpAgain()
             XCTAssertNil(confirmation)
-            XCTAssertNil(session.fixedActionMessage, "Cancellation and retirement are not preparation errors")
+            XCTAssertEqual(session.fixedActionMessage, L10n.string("backup.error_local_state_unavailable"))
+            XCTAssertEqual(session.decisionCount, 1, "The failed read retains the visible count and rows")
             await session.shutdown()
             await fixture.controller.shutdown()
         }
-    }
+    #endif
 
-    func testFreshPreparationClearsThePreviousFixedError() async throws {
-        let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date))
-        defer { fixture.cleanup() }
-        try fixture.park("photo", at: date)
-        let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
-        let session = fixture.controller.makeProblemListSession()
-        // A transaction that stays open refuses the preparation's read and keeps the store stopped while it is open.
-        let connection = try storeConnection(queue)
-        connection.withLock {
-            XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+    #if DEBUG
+        func testCancelledCompletionNeverStartsANormalPassEvenAfterACommittedChoice() async throws {
+            let gate = BulkSourceReadGate()
+            let fixture = try makeFixture(
+                HeldBulkSourceResolver(inner: ScriptedBackupResolver(defaultModified: date), gate: gate),
+                hasIdentityResolver: true)
+            defer { fixture.cleanup() }
+            fixture.controller.setEnabledForTesting()
+            fixture.controller.setAccessStateForTesting(.full)
+            fixture.controller.replacePassBodyForTesting {}
+            var starts = 0
+            fixture.controller.idleTimerHook = { if $0 { starts += 1 } }
+            try fixture.park("held", at: date)
+            let captured = await fixture.controller.prepareBackUpAgain()
+            let confirmation = try XCTUnwrap(captured)
+            XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
+            let deadline = ContinuousClock.now + .seconds(3)
+            while !(await gate.hasStarted), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let owned = try XCTUnwrap(
+                Mirror(reflecting: fixture.controller).children.first { $0.label == "_bulkCompletionTask" })
+            let completion = try XCTUnwrap(Mirror(reflecting: owned.value).children.first?.value as? Task<Void, Never>)
+            completion.cancel()
+            await gate.release()
+            await fixture.controller.bulkPhotoActions.waitUntilFinished()
+            await completion.value
+            XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, 1)
+            XCTAssertEqual(starts, 0, "A cancelled completion must not request a normal pass")
+            await fixture.controller.shutdown()
         }
-        let failed = await fixture.controller.prepareBackUpAgain()
-        connection.withLock {
-            XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+    #endif
+
+    #if DEBUG
+        func testEmptyCancelledAndRetiredCapturesDoNotShowAnError() async throws {
+            let empty = try makeFixture(ScriptedBackupResolver(defaultModified: date))
+            defer { empty.cleanup() }
+            let emptySession = empty.controller.makeProblemListSession()
+            let capturedEmpty = await empty.controller.prepareBackUpAgain()
+            XCTAssertNil(capturedEmpty)
+            XCTAssertNil(emptySession.fixedActionMessage)
+            await emptySession.shutdown()
+            await empty.controller.shutdown()
+            for retires in [false, true] {
+                let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date))
+                defer { fixture.cleanup() }
+                try fixture.park("held", at: date)
+                let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+                let connection = try XCTUnwrap(
+                    Mirror(reflecting: queue).children.first { $0.label == "connection" }?.value
+                        as? SQLiteStoreConnection)
+                let gate = BulkControllerSnapshotGate()
+                queue.onProblemReadEvent = { if case .willLock = $0 { gate.holdOnce() } }
+                let session = fixture.controller.makeProblemListSession()
+                let capture = Task { await fixture.controller.prepareBackUpAgain() }
+                let deadline = ContinuousClock.now + .seconds(3)
+                while !gate.hasStarted, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+                XCTAssertTrue(gate.hasStarted)
+                connection.withLock { connection.markFailed(resultCode: SQLITE_INTERRUPT) }
+                var shutdown: Task<Void, Never>?
+                if retires {
+                    shutdown = Task { await fixture.controller.shutdown() }
+                    while fixture.controller.isBulkBackUpAgainAvailable, ContinuousClock.now < deadline {
+                        try await Task.sleep(for: .milliseconds(5))
+                    }
+                    XCTAssertFalse(fixture.controller.isBulkBackUpAgainAvailable)
+                } else {
+                    capture.cancel()
+                }
+                gate.release()
+                let confirmation = await capture.value
+                await shutdown?.value
+                XCTAssertNil(confirmation)
+                XCTAssertNil(session.fixedActionMessage, "Cancellation and retirement are not preparation errors")
+                await session.shutdown()
+                await fixture.controller.shutdown()
+            }
         }
-        XCTAssertNil(failed)
-        XCTAssertEqual(session.fixedActionMessage, L10n.string("backup.error_local_state_unavailable"))
-        let fresh = await fixture.controller.prepareBackUpAgain()
-        XCTAssertEqual(fresh?.count, 1)
-        XCTAssertNil(session.fixedActionMessage)
-        await session.shutdown()
-        await fixture.controller.shutdown()
-    }
+    #endif
+
+    #if DEBUG
+        func testFreshPreparationClearsThePreviousFixedError() async throws {
+            let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date))
+            defer { fixture.cleanup() }
+            try fixture.park("photo", at: date)
+            let queue = try XCTUnwrap(fixture.controller.queueStoreForTesting)
+            let session = fixture.controller.makeProblemListSession()
+            // A transaction that stays open refuses the preparation's read and keeps the store stopped while it is open.
+            let connection = try storeConnection(queue)
+            connection.withLock {
+                XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+            }
+            let failed = await fixture.controller.prepareBackUpAgain()
+            connection.withLock {
+                XCTAssertEqual(sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+            }
+            XCTAssertNil(failed)
+            XCTAssertEqual(session.fixedActionMessage, L10n.string("backup.error_local_state_unavailable"))
+            let fresh = await fixture.controller.prepareBackUpAgain()
+            XCTAssertEqual(fresh?.count, 1)
+            XCTAssertNil(session.fixedActionMessage)
+            await session.shutdown()
+            await fixture.controller.shutdown()
+        }
+    #endif
 
     private struct Fixture {
         let directory: URL

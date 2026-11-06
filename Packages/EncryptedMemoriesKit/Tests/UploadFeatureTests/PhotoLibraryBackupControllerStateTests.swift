@@ -5148,358 +5148,387 @@ extension PhotoLibraryBackupControllerStateTests {
         }
     }
 
-    @MainActor private final class Restore829Fixture {
-        enum Shape: Equatable { case photo, video, live, burst }
-        let shape: Shape
-        /// Adds the edit-replacement journal to the pipeline, as the account stack does.
-        let replacesEdits: Bool
-        var journal: EditReplacementJournalFileStore?
-        let directory: URL
-        let suite: String
-        let defaults: UserDefaults
-        let server = EditScenarioServer()
-        let clock = BackupTestClock(start: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.up) + 2))
-        var controller: PhotoLibraryBackupController!
-        var pending: PendingBackupManifestStore!
-        var identities: UploadIdentityManifestStore!
-        var state: UploadBackupStateManifestStore!
-        var catalog: PhotoLibraryCatalogManifestStore!
-        var pipeline: UploadDedupePipeline!
-        var runner: BackupSyncRunner!
-        var resolver: Restore829Resolver!
-        var queue: UploadBackupSyncQueueManifestStore { controller.queueStoreForTesting! }
-        var key: PendingSourceKey { PendingSourceKey(resolver.candidate.snapshot.source) }
+    #if DEBUG
+        @MainActor private final class Restore829Fixture {
+            enum Shape: Equatable { case photo, video, live, burst }
+            let shape: Shape
+            /// Adds the edit-replacement journal to the pipeline, as the account stack does.
+            let replacesEdits: Bool
+            var journal: EditReplacementJournalFileStore?
+            let directory: URL
+            let suite: String
+            let defaults: UserDefaults
+            let server = EditScenarioServer()
+            let clock = BackupTestClock(
+                start: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.up) + 2))
+            var controller: PhotoLibraryBackupController!
+            var pending: PendingBackupManifestStore!
+            var identities: UploadIdentityManifestStore!
+            var state: UploadBackupStateManifestStore!
+            var catalog: PhotoLibraryCatalogManifestStore!
+            var pipeline: UploadDedupePipeline!
+            var runner: BackupSyncRunner!
+            var resolver: Restore829Resolver!
+            #if DEBUG
+                var queue: UploadBackupSyncQueueManifestStore { controller.queueStoreForTesting! }
+            #endif
+            var key: PendingSourceKey { PendingSourceKey(resolver.candidate.snapshot.source) }
 
-        init(shape: Shape, replacesEdits: Bool = false) throws {
-            self.shape = shape
-            self.replacesEdits = replacesEdits
-            suite = "restore-829-\(UUID().uuidString)"
-            defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-            directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try open()
-        }
+            init(shape: Shape, replacesEdits: Bool = false) throws {
+                self.shape = shape
+                self.replacesEdits = replacesEdits
+                suite = "restore-829-\(UUID().uuidString)"
+                defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try open()
+            }
 
-        private func open() throws {
-            pending = try XCTUnwrap(
-                PendingBackupManifestStore(
-                    url: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
-            identities = try XCTUnwrap(
-                UploadIdentityManifestStore(
-                    url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
-            journal =
-                replacesEdits
-                ? try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: directory)) : nil
-            pipeline = UploadDedupePipeline(
-                store: identities, checker: server, replacementJournal: journal, now: { [clock] in clock.now })
-            controller = PhotoLibraryBackupController(
-                configuration: .init(
-                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-                identityResolver: pipeline, uploader: server, pendingStore: pending, requiresPendingStore: true)
-            state = try XCTUnwrap(
-                UploadBackupStateManifestStore(
-                    url: directory.appendingPathComponent(PhotoLibraryBackupController.stateDatabaseFileName)))
-            catalog = try XCTUnwrap(
-                PhotoLibraryCatalogManifestStore(
-                    url: directory.appendingPathComponent(PhotoLibraryBackupController.catalogDatabaseFileName)))
-            let date = Date(timeIntervalSince1970: 1_720_000_000)
-            let mainRole: PhotoBackupAssetInfo.Resource.Role = shape == .video ? .originalVideo : .originalPhoto
-            var resources: [PhotoBackupAssetInfo.Resource] = [
-                .init(
-                    role: mainRole,
-                    originalFilename: shape == .video ? "MAIN.MOV" : "MAIN.HEIC",
-                    mimeType: shape == .video ? "video/quicktime" : "image/heic")
-            ]
-            if shape == .live {
-                resources.append(.init(role: .pairedVideo, originalFilename: "PAIR.MOV", mimeType: "video/quicktime"))
-            }
-            if shape == .burst {
-                resources.append(.init(role: .burstMember, originalFilename: "MEMBER.HEIC", mimeType: "image/heic"))
-            }
-            let info = PhotoBackupAssetInfo(
-                localIdentifier: "restore-asset", creationDate: date, modificationDate: date,
-                pixelWidth: 10, pixelHeight: 10, durationSeconds: shape == .video || shape == .live ? 1 : 0,
-                isLivePhoto: shape == .live, isVideo: shape == .video, resources: resources)
-            let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
-            let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
-            if try catalog.entry(for: info.localIdentifier) == nil {
-                XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)]))
-            }
-            func descriptor(_ item: PhotoBackupExportPlan.Item, primary: Bool) throws -> UploadResourceDescriptor {
-                let url = directory.appendingPathComponent(item.uploadFilename)
-                let bytes = Data("restore-829-\(item.uploadFilename)".utf8)
-                try bytes.write(to: url)
-                return UploadResourceDescriptor(
-                    source: .init(
-                        kind: .photoLibraryAsset, identifier: info.localIdentifier,
-                        resource: primary ? .primary : item.sourceResource), fileURL: url,
-                    filename: item.uploadFilename,
-                    fileSize: Int64(bytes.count), modificationDate: date,
-                    precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: url))
-            }
-            resolver = Restore829Resolver(
-                candidate: candidate, primary: try descriptor(plan.primary, primary: true),
-                secondaries: try plan.secondaries.map {
-                    BackupSecondaryResource(
-                        descriptor: try descriptor($0, primary: false), mediaType: $0.mimeType ?? "image/heic")
-                },
-                mediaType: plan.primary.mimeType ?? "image/heic")
-            runner = BackupSyncRunner(
-                queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
-                resolver: resolver, identityResolver: pipeline, uploader: server,
-                tagAdder: SpyTagAdder(),
-                configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
-                events: controller.pendingRecorder, now: { [clock] in clock.now })
-        }
-
-        func initialBackup(omittingSecondary: Bool = false) async throws -> PhotoUID {
-            resolver.omitSecondary(omittingSecondary)
-            let engine = UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue)
-            _ = try await engine.enqueueBatch([resolver.candidate])
-            await drain()
-            XCTAssertTrue(
-                try XCTUnwrap(
-                    try queue.entry(
-                        for: resolver.candidate.snapshot.source,
-                        revision: resolver.candidate.snapshot.revision)
-                ).state.isTerminalSuccess, "Initial completion must come from the real runner")
-            let main = try XCTUnwrap(identities.record(for: resolver.candidate.snapshot.source)?.remoteLinkID)
-            resolver.omitSecondary(false)
-            return PhotoUID(volumeID: "vol", nodeID: main)
-        }
-
-        func restoredState(
-            _ main: PhotoUID, retainMemberTrash: Bool = false, marker: Bool = false
-        ) throws -> PendingSourceState {
-            let excluded = try XCTUnwrap(
-                pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: main)], at: clock.now)?
-                    .first)
-            if marker { XCTAssertEqual(pending.beginRemoteOperation(.remoteTrash, for: [excluded]), [key]) }
-            for link in server.links { server.personTrash(link.uid) }
-            for link in server.links { server.personRestore(link.uid) }
-            if !marker {
-                XCTAssertTrue(
-                    pending.completeEffect(
-                        .remoteTrash, for: key, generation: excluded.generation, remoteLinkID: main.nodeID,
-                        at: clock.now))
-            }
-            XCTAssertTrue(pending.completeEffect(.queueSync, for: key, generation: excluded.generation, at: clock.now))
-            if retainMemberTrash {
-                for secondary in resolver.secondaries {
-                    var row = try XCTUnwrap(identities.record(for: secondary.descriptor.source))
-                    row.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
-                    XCTAssertTrue(identities.upsert(row))
+            private func open() throws {
+                pending = try XCTUnwrap(
+                    PendingBackupManifestStore(
+                        url: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
+                identities = try XCTUnwrap(
+                    UploadIdentityManifestStore(
+                        url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
+                journal =
+                    replacesEdits
+                    ? try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: directory)) : nil
+                pipeline = UploadDedupePipeline(
+                    store: identities, checker: server, replacementJournal: journal, now: { [clock] in clock.now })
+                controller = PhotoLibraryBackupController(
+                    configuration: .init(
+                        accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                    identityResolver: pipeline, uploader: server, pendingStore: pending, requiresPendingStore: true)
+                state = try XCTUnwrap(
+                    UploadBackupStateManifestStore(
+                        url: directory.appendingPathComponent(PhotoLibraryBackupController.stateDatabaseFileName)))
+                catalog = try XCTUnwrap(
+                    PhotoLibraryCatalogManifestStore(
+                        url: directory.appendingPathComponent(PhotoLibraryBackupController.catalogDatabaseFileName)))
+                let date = Date(timeIntervalSince1970: 1_720_000_000)
+                let mainRole: PhotoBackupAssetInfo.Resource.Role = shape == .video ? .originalVideo : .originalPhoto
+                var resources: [PhotoBackupAssetInfo.Resource] = [
+                    .init(
+                        role: mainRole,
+                        originalFilename: shape == .video ? "MAIN.MOV" : "MAIN.HEIC",
+                        mimeType: shape == .video ? "video/quicktime" : "image/heic")
+                ]
+                if shape == .live {
+                    resources.append(
+                        .init(role: .pairedVideo, originalFilename: "PAIR.MOV", mimeType: "video/quicktime"))
                 }
+                if shape == .burst {
+                    resources.append(.init(role: .burstMember, originalFilename: "MEMBER.HEIC", mimeType: "image/heic"))
+                }
+                let info = PhotoBackupAssetInfo(
+                    localIdentifier: "restore-asset", creationDate: date, modificationDate: date,
+                    pixelWidth: 10, pixelHeight: 10, durationSeconds: shape == .video || shape == .live ? 1 : 0,
+                    isLivePhoto: shape == .live, isVideo: shape == .video, resources: resources)
+                let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
+                let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
+                if try catalog.entry(for: info.localIdentifier) == nil {
+                    XCTAssertTrue(
+                        catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)]))
+                }
+                func descriptor(_ item: PhotoBackupExportPlan.Item, primary: Bool) throws -> UploadResourceDescriptor {
+                    let url = directory.appendingPathComponent(item.uploadFilename)
+                    let bytes = Data("restore-829-\(item.uploadFilename)".utf8)
+                    try bytes.write(to: url)
+                    return UploadResourceDescriptor(
+                        source: .init(
+                            kind: .photoLibraryAsset, identifier: info.localIdentifier,
+                            resource: primary ? .primary : item.sourceResource), fileURL: url,
+                        filename: item.uploadFilename,
+                        fileSize: Int64(bytes.count), modificationDate: date,
+                        precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: url))
+                }
+                resolver = Restore829Resolver(
+                    candidate: candidate, primary: try descriptor(plan.primary, primary: true),
+                    secondaries: try plan.secondaries.map {
+                        BackupSecondaryResource(
+                            descriptor: try descriptor($0, primary: false), mediaType: $0.mimeType ?? "image/heic")
+                    },
+                    mediaType: plan.primary.mimeType ?? "image/heic")
+                runner = BackupSyncRunner(
+                    queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
+                    resolver: resolver, identityResolver: pipeline, uploader: server,
+                    tagAdder: SpyTagAdder(),
+                    configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
+                    events: controller.pendingRecorder, now: { [clock] in clock.now })
             }
-            return try XCTUnwrap(pending.includeRestoredInProton([key], confirmedRemotes: [main], at: clock.now)?.first)
-        }
 
-        func drain() async {
-            clock.advance(by: 2)
-            _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        }
+            #if DEBUG
+                func initialBackup(omittingSecondary: Bool = false) async throws -> PhotoUID {
+                    resolver.omitSecondary(omittingSecondary)
+                    let engine = UploadBackupSyncEngine(
+                        preflight: UploadBackupPreflightIndex(store: state), queue: queue)
+                    _ = try await engine.enqueueBatch([resolver.candidate])
+                    await drain()
+                    XCTAssertTrue(
+                        try XCTUnwrap(
+                            try queue.entry(
+                                for: resolver.candidate.snapshot.source,
+                                revision: resolver.candidate.snapshot.revision)
+                        ).state.isTerminalSuccess, "Initial completion must come from the real runner")
+                    let main = try XCTUnwrap(identities.record(for: resolver.candidate.snapshot.source)?.remoteLinkID)
+                    resolver.omitSecondary(false)
+                    return PhotoUID(volumeID: "vol", nodeID: main)
+                }
+            #endif
 
-        /// A crop of the main photo: a real content edit with new bytes, not a metadata change.
-        func publishEditedMain() throws -> (UploadBackupAssetCandidate, Restore829Resolver) {
-            var entry = try XCTUnwrap(catalog.entry(for: key.identifier))
-            entry.modificationDate = try XCTUnwrap(entry.modificationDate).addingTimeInterval(1)
-            entry.pixelWidth += 1
-            XCTAssertTrue(catalog.upsertBatch([entry]))
-            let latest = try XCTUnwrap(
-                PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
-            XCTAssertNotEqual(latest.snapshot.revision, resolver.candidate.snapshot.revision)
-            let edited = Data("edited-restore-829-main".utf8)
-            try edited.write(to: resolver.primary.fileURL)
-            let primary = UploadResourceDescriptor(
-                source: resolver.primary.source, fileURL: resolver.primary.fileURL,
-                filename: resolver.primary.filename, fileSize: Int64(edited.count),
-                modificationDate: try XCTUnwrap(entry.modificationDate),
-                precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: resolver.primary.fileURL))
-            let next = Restore829Resolver(
-                candidate: latest, primary: primary, secondaries: resolver.secondaries, mediaType: resolver.mediaType)
-            next.omitSecondary(true)
-            return (latest, next)
-        }
-
-        /// An edit in Photos: a rendered full-size photo and adjustment data join the original. The render becomes the
-        /// main photo and the original travels as a related file, so the replacement may trash the earlier upload.
-        /// The burst member stays missing.
-        func publishPhotosEdit() throws -> (UploadBackupAssetCandidate, Restore829Resolver) {
-            let entry = try XCTUnwrap(catalog.entry(for: key.identifier))
-            var info = PhotoLibraryCatalogMapper.info(for: entry)
-            info.modificationDate = try XCTUnwrap(info.modificationDate).addingTimeInterval(1)
-            info.resources += [
-                .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.HEIC", mimeType: "image/heic"),
-                .init(role: .adjustmentData, originalFilename: "Adjustments.plist", mimeType: "application/xml"),
-            ]
-            XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)]))
-            let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
-            let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
-            XCTAssertEqual(candidate.snapshot.editRevision, .unavailable, "Photos reports a real edit")
-            func descriptor(_ item: PhotoBackupExportPlan.Item, primary: Bool) throws -> UploadResourceDescriptor {
-                let url = directory.appendingPathComponent(item.uploadFilename)
-                // The original keeps its bytes; the render and the adjustment data are new.
-                let bytes = Data(
-                    (item.role == .originalPhoto ? "restore-829-MAIN.HEIC" : "edited-829-\(item.uploadFilename)").utf8)
-                try bytes.write(to: url)
-                return UploadResourceDescriptor(
-                    source: .init(
-                        kind: .photoLibraryAsset, identifier: info.localIdentifier,
-                        resource: primary ? .primary : item.sourceResource), fileURL: url,
-                    filename: item.uploadFilename, fileSize: Int64(bytes.count),
-                    modificationDate: try XCTUnwrap(info.modificationDate),
-                    precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: url))
+            func restoredState(
+                _ main: PhotoUID, retainMemberTrash: Bool = false, marker: Bool = false
+            ) throws -> PendingSourceState {
+                let excluded = try XCTUnwrap(
+                    pending.exclude(
+                        [PendingExclusionRequest(key: key, presentation: nil, remote: main)], at: clock.now)?
+                        .first)
+                if marker { XCTAssertEqual(pending.beginRemoteOperation(.remoteTrash, for: [excluded]), [key]) }
+                for link in server.links { server.personTrash(link.uid) }
+                for link in server.links { server.personRestore(link.uid) }
+                if !marker {
+                    XCTAssertTrue(
+                        pending.completeEffect(
+                            .remoteTrash, for: key, generation: excluded.generation, remoteLinkID: main.nodeID,
+                            at: clock.now))
+                }
+                XCTAssertTrue(
+                    pending.completeEffect(.queueSync, for: key, generation: excluded.generation, at: clock.now))
+                if retainMemberTrash {
+                    for secondary in resolver.secondaries {
+                        var row = try XCTUnwrap(identities.record(for: secondary.descriptor.source))
+                        row.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
+                        XCTAssertTrue(identities.upsert(row))
+                    }
+                }
+                return try XCTUnwrap(
+                    pending.includeRestoredInProton([key], confirmedRemotes: [main], at: clock.now)?.first)
             }
-            let edited = Restore829Resolver(
-                candidate: candidate, primary: try descriptor(plan.primary, primary: true),
-                secondaries: try plan.secondaries.filter { $0.role != .burstMember }.map {
-                    BackupSecondaryResource(
-                        descriptor: try descriptor($0, primary: false), mediaType: $0.mimeType ?? "image/heic")
-                },
-                mediaType: plan.primary.mimeType ?? "image/heic")
-            return (candidate, edited)
-        }
 
-        /// Drains with a runner that resolves through `resolver` on the same pipeline and uploader.
-        func drain(with resolver: Restore829Resolver) async throws {
-            let replacement = journal.map {
-                EditedPhotoReplacement(
-                    remote: server, albums: server, relations: server, identities: identities, journal: $0)
+            func drain() async {
+                clock.advance(by: 2)
+                _ = await runner.runUntilDrained(mode: .eligibleOnly)
             }
-            let runner = BackupSyncRunner(
-                queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
-                resolver: resolver, identityResolver: pipeline, uploader: server, tagAdder: SpyTagAdder(),
-                editReplacement: replacement,
-                configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
-                events: controller.pendingRecorder, now: { [clock] in clock.now })
-            clock.advance(by: 2)
-            _ = await runner.runUntilDrained(mode: .eligibleOnly)
-            await runner.stop()
-        }
 
-        func relaunch() async throws {
-            await close()
-            try open()
-        }
+            /// A crop of the main photo: a real content edit with new bytes, not a metadata change.
+            func publishEditedMain() throws -> (UploadBackupAssetCandidate, Restore829Resolver) {
+                var entry = try XCTUnwrap(catalog.entry(for: key.identifier))
+                entry.modificationDate = try XCTUnwrap(entry.modificationDate).addingTimeInterval(1)
+                entry.pixelWidth += 1
+                XCTAssertTrue(catalog.upsertBatch([entry]))
+                let latest = try XCTUnwrap(
+                    PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
+                XCTAssertNotEqual(latest.snapshot.revision, resolver.candidate.snapshot.revision)
+                let edited = Data("edited-restore-829-main".utf8)
+                try edited.write(to: resolver.primary.fileURL)
+                let primary = UploadResourceDescriptor(
+                    source: resolver.primary.source, fileURL: resolver.primary.fileURL,
+                    filename: resolver.primary.filename, fileSize: Int64(edited.count),
+                    modificationDate: try XCTUnwrap(entry.modificationDate),
+                    precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: resolver.primary.fileURL))
+                let next = Restore829Resolver(
+                    candidate: latest, primary: primary, secondaries: resolver.secondaries,
+                    mediaType: resolver.mediaType)
+                next.omitSecondary(true)
+                return (latest, next)
+            }
 
-        func close() async {
-            await runner?.stop()
-            await controller?.shutdown()
-            state?.close()
-            catalog?.close()
-            identities?.close()
-            pending?.close()
-        }
+            /// An edit in Photos: a rendered full-size photo and adjustment data join the original. The render becomes the
+            /// main photo and the original travels as a related file, so the replacement may trash the earlier upload.
+            /// The burst member stays missing.
+            func publishPhotosEdit() throws -> (UploadBackupAssetCandidate, Restore829Resolver) {
+                let entry = try XCTUnwrap(catalog.entry(for: key.identifier))
+                var info = PhotoLibraryCatalogMapper.info(for: entry)
+                info.modificationDate = try XCTUnwrap(info.modificationDate).addingTimeInterval(1)
+                info.resources += [
+                    .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.HEIC", mimeType: "image/heic"),
+                    .init(role: .adjustmentData, originalFilename: "Adjustments.plist", mimeType: "application/xml"),
+                ]
+                XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)]))
+                let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
+                let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
+                XCTAssertEqual(candidate.snapshot.editRevision, .unavailable, "Photos reports a real edit")
+                func descriptor(_ item: PhotoBackupExportPlan.Item, primary: Bool) throws -> UploadResourceDescriptor {
+                    let url = directory.appendingPathComponent(item.uploadFilename)
+                    // The original keeps its bytes; the render and the adjustment data are new.
+                    let bytes = Data(
+                        (item.role == .originalPhoto ? "restore-829-MAIN.HEIC" : "edited-829-\(item.uploadFilename)")
+                            .utf8)
+                    try bytes.write(to: url)
+                    return UploadResourceDescriptor(
+                        source: .init(
+                            kind: .photoLibraryAsset, identifier: info.localIdentifier,
+                            resource: primary ? .primary : item.sourceResource), fileURL: url,
+                        filename: item.uploadFilename, fileSize: Int64(bytes.count),
+                        modificationDate: try XCTUnwrap(info.modificationDate),
+                        precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: url))
+                }
+                let edited = Restore829Resolver(
+                    candidate: candidate, primary: try descriptor(plan.primary, primary: true),
+                    secondaries: try plan.secondaries.filter { $0.role != .burstMember }.map {
+                        BackupSecondaryResource(
+                            descriptor: try descriptor($0, primary: false), mediaType: $0.mimeType ?? "image/heic")
+                    },
+                    mediaType: plan.primary.mimeType ?? "image/heic")
+                return (candidate, edited)
+            }
 
-        func cleanup() async {
-            await close()
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
+            /// Drains with a runner that resolves through `resolver` on the same pipeline and uploader.
+            func drain(with resolver: Restore829Resolver) async throws {
+                let replacement = journal.map {
+                    EditedPhotoReplacement(
+                        remote: server, albums: server, relations: server, identities: identities, journal: $0)
+                }
+                let runner = BackupSyncRunner(
+                    queue: queue, preflight: UploadBackupPreflightIndex(store: state, now: { [clock] in clock.now }),
+                    resolver: resolver, identityResolver: pipeline, uploader: server, tagAdder: SpyTagAdder(),
+                    editReplacement: replacement,
+                    configuration: .init(throttle: .init(baseConcurrency: 1)), clock: clock,
+                    events: controller.pendingRecorder, now: { [clock] in clock.now })
+                clock.advance(by: 2)
+                _ = await runner.runUntilDrained(mode: .eligibleOnly)
+                await runner.stop()
+            }
+
+            func relaunch() async throws {
+                await close()
+                try open()
+            }
+
+            func close() async {
+                await runner?.stop()
+                await controller?.shutdown()
+                state?.close()
+                catalog?.close()
+                identities?.close()
+                pending?.close()
+            }
+
+            func cleanup() async {
+                await close()
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: directory)
+            }
         }
-    }
+    #endif
 
     // MARK: - One pending row or one failed call never stops the backup (#982)
 
     /// Runs `sql` on the pending store through a second connection, as a newer build or a full disk leaves it.
-    private func executeOnPendingStore(_ f: Restore829Fixture, _ sql: String) throws {
-        var handle: OpaquePointer?
-        let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
-        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-        let db = try XCTUnwrap(handle)
-        defer { sqlite3_close(db) }
-        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
-    }
-
-    /// Every byte of the pending row of `identifier`.
-    private func rawPendingRow(_ f: Restore829Fixture, _ identifier: String) throws -> [Data?] {
-        var handle: OpaquePointer?
-        let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
-        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
-        let db = try XCTUnwrap(handle)
-        defer { sqlite3_close(db) }
-        var stmt: OpaquePointer?
-        XCTAssertEqual(
-            sqlite3_prepare_v2(db, "SELECT * FROM source_state WHERE source_id='\(identifier)';", -1, &stmt, nil),
-            SQLITE_OK)
-        defer { sqlite3_finalize(stmt) }
-        XCTAssertEqual(sqlite3_step(stmt), SQLITE_ROW)
-        return (0..<sqlite3_column_count(stmt)).map { column in
-            guard let bytes = sqlite3_column_blob(stmt, column) else { return nil }
-            return Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, column)))
-        }
-    }
-
-    /// Queues the fixture photo through the engine that reads the exclusions of the pending store, and drains it.
-    private func backUpWithExclusions(_ f: Restore829Fixture) async throws -> UploadBackupSyncQueueEntry {
-        let engine = UploadBackupSyncEngine(
-            preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue, exclusions: f.pending)
-        _ = try await engine.enqueueBatch([f.resolver.candidate])
-        await f.drain()
-        return try XCTUnwrap(
-            try f.queue.entry(
-                for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
-    }
-
-    /// A newer build wrote a value that this build does not know, into each of the three enum columns in turn. The
-    /// read reports the row, the row stays unchanged, and every other photo keeps backing up.
-    func testAPendingRowThatCannotBeDecodedKeepsTheBackupOfOtherPhotos() async throws {
-        for column in ["source_kind", "desired", "remote_op"] {
-            try await withRestore829Fixture(.photo) { f in
-                XCTAssertTrue(f.controller.isAvailable)
-                let other = PendingSourceKey(kind: .photoLibraryAsset, identifier: "other-asset")
-                XCTAssertNotNil(
-                    f.pending.exclude(
-                        [PendingExclusionRequest(key: other, presentation: nil, remote: nil)], at: f.clock.now))
-                try self.executeOnPendingStore(
-                    f, "UPDATE source_state SET \(column)='written-by-a-newer-build' WHERE source_id='other-asset';")
-                let before = try self.rawPendingRow(f, "other-asset")
-
-                XCTAssertFalse(f.pending.sourceStatesRead().complete, "the read reports the row (\(column))")
-                XCTAssertTrue(f.controller.isAvailable, "one row stops nothing (\(column))")
-                let entry = try await self.backUpWithExclusions(f)
-
-                XCTAssertTrue(entry.state.isTerminalSuccess, "the other photo backs up (\(column))")
-                XCTAssertTrue(f.controller.isAvailable)
-                XCTAssertEqual(try self.rawPendingRow(f, "other-asset"), before, "the row stays unchanged (\(column))")
-            }
-        }
-    }
-
-    /// Another connection holds the write lock of the pending store until the busy timeout ends, so the write of the
-    /// upload's handoff fails, as on a busy or full disk. Once the lock is free, the backup goes on without a relaunch.
-    func testATransientPendingStoreFailureStopsTheBackupOnlyUntilTheStoreAnswersAgain() async throws {
-        try await withRestore829Fixture(.photo) { f in
+    #if DEBUG
+        private func executeOnPendingStore(_ f: Restore829Fixture, _ sql: String) throws {
             var handle: OpaquePointer?
             let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
             XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-            let blocker = try XCTUnwrap(handle)
-            defer { sqlite3_close(blocker) }
-            XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
-            let stopped = try await self.backUpWithExclusions(f)
-            XCTAssertFalse(stopped.state.isTerminalSuccess, "the upload could not be recorded")
+            let db = try XCTUnwrap(handle)
+            defer { sqlite3_close(db) }
+            XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
+        }
+    #endif
 
-            XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+    /// Every byte of the pending row of `identifier`.
+    #if DEBUG
+        private func rawPendingRow(_ f: Restore829Fixture, _ identifier: String) throws -> [Data?] {
+            var handle: OpaquePointer?
+            let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+            XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+            let db = try XCTUnwrap(handle)
+            defer { sqlite3_close(db) }
+            var stmt: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(db, "SELECT * FROM source_state WHERE source_id='\(identifier)';", -1, &stmt, nil),
+                SQLITE_OK)
+            defer { sqlite3_finalize(stmt) }
+            XCTAssertEqual(sqlite3_step(stmt), SQLITE_ROW)
+            return (0..<sqlite3_column_count(stmt)).map { column in
+                guard let bytes = sqlite3_column_blob(stmt, column) else { return nil }
+                return Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, column)))
+            }
+        }
+    #endif
 
-            XCTAssertTrue(f.controller.isAvailable, "the backup is available again without a relaunch")
+    /// Queues the fixture photo through the engine that reads the exclusions of the pending store, and drains it.
+    #if DEBUG
+        private func backUpWithExclusions(_ f: Restore829Fixture) async throws -> UploadBackupSyncQueueEntry {
+            let engine = UploadBackupSyncEngine(
+                preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue, exclusions: f.pending)
+            _ = try await engine.enqueueBatch([f.resolver.candidate])
             await f.drain()
-            let entry = try XCTUnwrap(
+            return try XCTUnwrap(
                 try f.queue.entry(
                     for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
-            XCTAssertTrue(entry.state.isTerminalSuccess, "the photo backs up")
         }
-    }
+    #endif
 
-    private func withRestore829Fixture(
-        _ shape: Restore829Fixture.Shape, replacesEdits: Bool = false,
-        _ body: @MainActor (Restore829Fixture) async throws -> Void
-    ) async throws {
-        let fixture = try Restore829Fixture(shape: shape, replacesEdits: replacesEdits)
-        do { try await body(fixture) } catch {
-            await fixture.cleanup()
-            throw error
+    /// A newer build wrote a value that this build does not know, into each of the three enum columns in turn. The
+    /// read reports the row, the row stays unchanged, and every other photo keeps backing up.
+    #if DEBUG
+        func testAPendingRowThatCannotBeDecodedKeepsTheBackupOfOtherPhotos() async throws {
+            for column in ["source_kind", "desired", "remote_op"] {
+                try await withRestore829Fixture(.photo) { f in
+                    XCTAssertTrue(f.controller.isAvailable)
+                    let other = PendingSourceKey(kind: .photoLibraryAsset, identifier: "other-asset")
+                    XCTAssertNotNil(
+                        f.pending.exclude(
+                            [PendingExclusionRequest(key: other, presentation: nil, remote: nil)], at: f.clock.now))
+                    try self.executeOnPendingStore(
+                        f, "UPDATE source_state SET \(column)='written-by-a-newer-build' WHERE source_id='other-asset';"
+                    )
+                    let before = try self.rawPendingRow(f, "other-asset")
+
+                    XCTAssertFalse(f.pending.sourceStatesRead().complete, "the read reports the row (\(column))")
+                    XCTAssertTrue(f.controller.isAvailable, "one row stops nothing (\(column))")
+                    let entry = try await self.backUpWithExclusions(f)
+
+                    XCTAssertTrue(entry.state.isTerminalSuccess, "the other photo backs up (\(column))")
+                    XCTAssertTrue(f.controller.isAvailable)
+                    XCTAssertEqual(
+                        try self.rawPendingRow(f, "other-asset"), before, "the row stays unchanged (\(column))")
+                }
+            }
         }
-        await fixture.cleanup()
-    }
+    #endif
+
+    /// Another connection holds the write lock of the pending store until the busy timeout ends, so the write of the
+    /// upload's handoff fails, as on a busy or full disk. Once the lock is free, the backup goes on without a relaunch.
+    #if DEBUG
+        func testATransientPendingStoreFailureStopsTheBackupOnlyUntilTheStoreAnswersAgain() async throws {
+            try await withRestore829Fixture(.photo) { f in
+                var handle: OpaquePointer?
+                let url = f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
+                XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+                let blocker = try XCTUnwrap(handle)
+                defer { sqlite3_close(blocker) }
+                XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+                let stopped = try await self.backUpWithExclusions(f)
+                XCTAssertFalse(stopped.state.isTerminalSuccess, "the upload could not be recorded")
+
+                XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+
+                XCTAssertTrue(f.controller.isAvailable, "the backup is available again without a relaunch")
+                await f.drain()
+                let entry = try XCTUnwrap(
+                    try f.queue.entry(
+                        for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
+                XCTAssertTrue(entry.state.isTerminalSuccess, "the photo backs up")
+            }
+        }
+    #endif
+
+    #if DEBUG
+        private func withRestore829Fixture(
+            _ shape: Restore829Fixture.Shape, replacesEdits: Bool = false,
+            _ body: @MainActor (Restore829Fixture) async throws -> Void
+        ) async throws {
+            let fixture = try Restore829Fixture(shape: shape, replacesEdits: replacesEdits)
+            do { try await body(fixture) } catch {
+                await fixture.cleanup()
+                throw error
+            }
+            await fixture.cleanup()
+        }
+    #endif
 
     private enum Restore829StopFixtureError: Error {
         case invalid(String)
@@ -5619,554 +5648,590 @@ extension PhotoLibraryBackupControllerStateTests {
         }
     }
 
-    func testStopDuringRestoredBurstMemberUploadRetainsTheExactRestoreDuty() async throws {
-        try await withRestore829Fixture(.burst) { f in
-            let main = try await f.initialBackup()
-            let priorMember = try XCTUnwrap(f.resolver.secondaries.first)
-            let priorMemberUID = try XCTUnwrap(f.identities.record(for: priorMember.descriptor.source)?.remoteLinkID)
-            var catalogEntry = try XCTUnwrap(f.catalog.entry(for: f.key.identifier))
-            catalogEntry.modificationDate = try XCTUnwrap(catalogEntry.modificationDate).addingTimeInterval(1)
-            XCTAssertTrue(f.catalog.upsertBatch([catalogEntry]))
-            let latest = try XCTUnwrap(
-                PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: catalogEntry)))
-            let updatedBytes = Data("updated-owned-burst-member".utf8)
-            try updatedBytes.write(to: priorMember.descriptor.fileURL)
-            let updatedMember = UploadResourceDescriptor(
-                source: priorMember.descriptor.source, fileURL: priorMember.descriptor.fileURL,
-                filename: priorMember.descriptor.filename, fileSize: Int64(updatedBytes.count),
-                modificationDate: try XCTUnwrap(catalogEntry.modificationDate),
-                precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: priorMember.descriptor.fileURL))
-            f.resolver = Restore829Resolver(
-                candidate: latest, primary: f.resolver.primary,
-                secondaries: [.init(descriptor: updatedMember, mediaType: priorMember.mediaType)],
-                mediaType: f.resolver.mediaType)
-            let checked = try f.restoredState(main, marker: true)
-            guard !f.controller.isEnabled, f.server.uploadRequestCount == 2,
-                f.server.links.count == 2, f.server.links.first?.uid == main,
-                f.server.links.first?.state == .active, f.resolver.secondaries.count == 1,
-                checked.remote == main, checked.needsQueueSync, checked.remoteOperation == .remoteTrash,
-                let member = f.resolver.secondaries.first, member.descriptor.source.resource.isBurstMember,
-                f.identities.record(for: member.descriptor.source)?.remoteLinkID == priorMemberUID,
-                f.identities.record(for: member.descriptor.source)?.isValid(for: member.descriptor) == false,
-                f.server.links.first(where: { $0.linkID == priorMemberUID })?.state == .active
-            else { throw Restore829StopFixtureError.invalid("initial backup/restore fixture") }
-            let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting? = admission[f.key],
-                let admitted = try f.queue.entry(
-                    for: f.resolver.candidate.snapshot.source,
-                    revision: f.resolver.candidate.snapshot.revision),
-                !admitted.state.isTerminalSuccess, admitted.remoteCommitReconciliation == nil
-            else { throw Restore829StopFixtureError.invalid("restore was not admitted for a real pass") }
-            let uploader = Restore829StopUploader(
-                server: f.server,
-                memberName: ProtonPhotoNameCorrection.correctedName(for: member.descriptor.filename))
-            let runner = BackupSyncRunner(
-                queue: f.queue,
-                preflight: UploadBackupPreflightIndex(store: f.state, now: { [clock = f.clock] in clock.now }),
-                resolver: f.resolver, identityResolver: f.pipeline, uploader: uploader,
-                tagAdder: SpyTagAdder(),
-                configuration: .init(throttle: .init(baseConcurrency: 1)), clock: f.clock,
-                events: f.controller.pendingRecorder, now: { [clock = f.clock] in clock.now })
-            var drain: Task<BackupSyncProgress, Never>?
-            var stop: Task<Void, Never>?
-            @MainActor func cleanup() async {
-                // Never join a test task while its artificial upload gate remains held.
-                await uploader.close()
-                await runner.stop()
-                await stop?.value
-                _ = await drain?.value
-            }
-            do {
-                let resolutionsBefore = f.resolver.resolveCount
-                f.clock.advance(by: 2)
-                drain = Task {
-                    let result = await runner.runUntilDrained(mode: .eligibleOnly)
-                    uploader.record("drain-returned")
-                    return result
-                }
-                guard case .opened = await uploader.entered.wait(),
-                    let request = uploader.heldRequest, request.mainPhotoUID?.nodeID == main.nodeID,
-                    request.expectedSHA1 == member.descriptor.precomputedSHA1Digest,
-                    f.resolver.resolveCount > resolutionsBefore, f.queue.isOperational(),
-                    f.pending.isOperational(), f.catalog.isOperational(),
-                    f.identities.record(for: admitted.source)?.remoteLinkID == main.nodeID,
-                    let active = try f.queue.entry(for: admitted.source, revision: admitted.revision),
-                    active.state == .uploading, active.remoteCommitReconciliation == nil,
-                    case .readable(let owed?) = f.pending.sourceStateRead(for: f.key),
-                    owed.generation == checked.generation, owed.remote == main, owed.needsQueueSync,
-                    owed.remoteOperation == .remoteTrash, f.server.uploadRequestCount == 2,
-                    f.server.links.count == 2, f.server.links.first?.state == .active
-                else { throw Restore829StopFixtureError.invalid("real active member-upload prerequisite") }
-                stop = Task {
+    #if DEBUG
+        func testStopDuringRestoredBurstMemberUploadRetainsTheExactRestoreDuty() async throws {
+            try await withRestore829Fixture(.burst) { f in
+                let main = try await f.initialBackup()
+                let priorMember = try XCTUnwrap(f.resolver.secondaries.first)
+                let priorMemberUID = try XCTUnwrap(
+                    f.identities.record(for: priorMember.descriptor.source)?.remoteLinkID)
+                var catalogEntry = try XCTUnwrap(f.catalog.entry(for: f.key.identifier))
+                catalogEntry.modificationDate = try XCTUnwrap(catalogEntry.modificationDate).addingTimeInterval(1)
+                XCTAssertTrue(f.catalog.upsertBatch([catalogEntry]))
+                let latest = try XCTUnwrap(
+                    PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: catalogEntry)))
+                let updatedBytes = Data("updated-owned-burst-member".utf8)
+                try updatedBytes.write(to: priorMember.descriptor.fileURL)
+                let updatedMember = UploadResourceDescriptor(
+                    source: priorMember.descriptor.source, fileURL: priorMember.descriptor.fileURL,
+                    filename: priorMember.descriptor.filename, fileSize: Int64(updatedBytes.count),
+                    modificationDate: try XCTUnwrap(catalogEntry.modificationDate),
+                    precomputedSHA1Digest: try UploadContentSHA1.digest(ofFileAt: priorMember.descriptor.fileURL))
+                f.resolver = Restore829Resolver(
+                    candidate: latest, primary: f.resolver.primary,
+                    secondaries: [.init(descriptor: updatedMember, mediaType: priorMember.mediaType)],
+                    mediaType: f.resolver.mediaType)
+                let checked = try f.restoredState(main, marker: true)
+                guard !f.controller.isEnabled, f.server.uploadRequestCount == 2,
+                    f.server.links.count == 2, f.server.links.first?.uid == main,
+                    f.server.links.first?.state == .active, f.resolver.secondaries.count == 1,
+                    checked.remote == main, checked.needsQueueSync, checked.remoteOperation == .remoteTrash,
+                    let member = f.resolver.secondaries.first, member.descriptor.source.resource.isBurstMember,
+                    f.identities.record(for: member.descriptor.source)?.remoteLinkID == priorMemberUID,
+                    f.identities.record(for: member.descriptor.source)?.isValid(for: member.descriptor) == false,
+                    f.server.links.first(where: { $0.linkID == priorMemberUID })?.state == .active
+                else { throw Restore829StopFixtureError.invalid("initial backup/restore fixture") }
+                let admission = await f.controller.returnToBackup([checked])
+                guard case .waiting? = admission[f.key],
+                    let admitted = try f.queue.entry(
+                        for: f.resolver.candidate.snapshot.source,
+                        revision: f.resolver.candidate.snapshot.revision),
+                    !admitted.state.isTerminalSuccess, admitted.remoteCommitReconciliation == nil
+                else { throw Restore829StopFixtureError.invalid("restore was not admitted for a real pass") }
+                let uploader = Restore829StopUploader(
+                    server: f.server,
+                    memberName: ProtonPhotoNameCorrection.correctedName(for: member.descriptor.filename))
+                let runner = BackupSyncRunner(
+                    queue: f.queue,
+                    preflight: UploadBackupPreflightIndex(store: f.state, now: { [clock = f.clock] in clock.now }),
+                    resolver: f.resolver, identityResolver: f.pipeline, uploader: uploader,
+                    tagAdder: SpyTagAdder(),
+                    configuration: .init(throttle: .init(baseConcurrency: 1)), clock: f.clock,
+                    events: f.controller.pendingRecorder, now: { [clock = f.clock] in clock.now })
+                var drain: Task<BackupSyncProgress, Never>?
+                var stop: Task<Void, Never>?
+                @MainActor func cleanup() async {
+                    // Never join a test task while its artificial upload gate remains held.
+                    await uploader.close()
                     await runner.stop()
-                    uploader.record("stop-returned")
+                    await stop?.value
+                    _ = await drain?.value
                 }
-                guard case .opened = await uploader.nativeCancel.wait() else {
-                    throw Restore829StopFixtureError.invalid("native cancellation gate expired")
-                }
-                guard uploader.cancelledTokens.first == request.cancellationToken else {
-                    throw Restore829StopFixtureError.invalid("cancellation did not target the held upload")
-                }
-                await uploader.releaseUpload.finish()
-                await stop?.value
-                _ = await drain?.value
-                guard case .opened? = uploader.heldUploadEnd else {
-                    throw Restore829StopFixtureError.invalid("held upload expired before explicit release")
-                }
-                XCTAssertFalse(Task.isCancelled, "Only the real runner Stop may cancel this pass")
-                XCTAssertEqual(uploader.cancelledTokens, [request.cancellationToken])
-                let trace = uploader.trace
-                let uploadEnded = trace.firstIndex(of: "upload-ended")
-                let nativeCancelEnded = trace.firstIndex(of: "native-cancel-ended")
-                let stopReturned = trace.firstIndex(of: "stop-returned")
-                XCTAssertTrue(
-                    uploadEnded.map { end in stopReturned.map { end < $0 } ?? false } ?? false,
-                    "Stop must join the actual upload before it returns")
-                XCTAssertTrue(
-                    nativeCancelEnded.map { end in stopReturned.map { end < $0 } ?? false } ?? false,
-                    "Stop must join native cancellation before it returns")
                 do {
-                    try await runner.checkCancellation()
-                    XCTFail("The stopped restore pass must retain its cancellation")
-                } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
-                let row = try XCTUnwrap(f.queue.entry(for: admitted.source, revision: admitted.revision))
-                XCTAssertEqual(row.state, .queuedForUpload, "The interrupted compound stays runnable")
-                XCTAssertEqual(row.attempts, admitted.attempts)
-                XCTAssertNil(row.remoteCommitReconciliation)
-                XCTAssertTrue(f.queue.nextRunnableDate().map { $0 <= f.clock.now } ?? false)
-                guard f.queue.isOperational(), case .readable(let pending) = f.pending.sourceStateRead(for: f.key)
-                else {
-                    throw Restore829StopFixtureError.invalid("post-Stop local state is unreadable")
+                    let resolutionsBefore = f.resolver.resolveCount
+                    f.clock.advance(by: 2)
+                    drain = Task {
+                        let result = await runner.runUntilDrained(mode: .eligibleOnly)
+                        uploader.record("drain-returned")
+                        return result
+                    }
+                    guard case .opened = await uploader.entered.wait(),
+                        let request = uploader.heldRequest, request.mainPhotoUID?.nodeID == main.nodeID,
+                        request.expectedSHA1 == member.descriptor.precomputedSHA1Digest,
+                        f.resolver.resolveCount > resolutionsBefore, f.queue.isOperational(),
+                        f.pending.isOperational(), f.catalog.isOperational(),
+                        f.identities.record(for: admitted.source)?.remoteLinkID == main.nodeID,
+                        let active = try f.queue.entry(for: admitted.source, revision: admitted.revision),
+                        active.state == .uploading, active.remoteCommitReconciliation == nil,
+                        case .readable(let owed?) = f.pending.sourceStateRead(for: f.key),
+                        owed.generation == checked.generation, owed.remote == main, owed.needsQueueSync,
+                        owed.remoteOperation == .remoteTrash, f.server.uploadRequestCount == 2,
+                        f.server.links.count == 2, f.server.links.first?.state == .active
+                    else { throw Restore829StopFixtureError.invalid("real active member-upload prerequisite") }
+                    stop = Task {
+                        await runner.stop()
+                        uploader.record("stop-returned")
+                    }
+                    guard case .opened = await uploader.nativeCancel.wait() else {
+                        throw Restore829StopFixtureError.invalid("native cancellation gate expired")
+                    }
+                    guard uploader.cancelledTokens.first == request.cancellationToken else {
+                        throw Restore829StopFixtureError.invalid("cancellation did not target the held upload")
+                    }
+                    await uploader.releaseUpload.finish()
+                    await stop?.value
+                    _ = await drain?.value
+                    guard case .opened? = uploader.heldUploadEnd else {
+                        throw Restore829StopFixtureError.invalid("held upload expired before explicit release")
+                    }
+                    XCTAssertFalse(Task.isCancelled, "Only the real runner Stop may cancel this pass")
+                    XCTAssertEqual(uploader.cancelledTokens, [request.cancellationToken])
+                    let trace = uploader.trace
+                    let uploadEnded = trace.firstIndex(of: "upload-ended")
+                    let nativeCancelEnded = trace.firstIndex(of: "native-cancel-ended")
+                    let stopReturned = trace.firstIndex(of: "stop-returned")
+                    XCTAssertTrue(
+                        uploadEnded.map { end in stopReturned.map { end < $0 } ?? false } ?? false,
+                        "Stop must join the actual upload before it returns")
+                    XCTAssertTrue(
+                        nativeCancelEnded.map { end in stopReturned.map { end < $0 } ?? false } ?? false,
+                        "Stop must join native cancellation before it returns")
+                    do {
+                        try await runner.checkCancellation()
+                        XCTFail("The stopped restore pass must retain its cancellation")
+                    } catch { XCTAssertTrue(UploadError.isCancellation(error)) }
+                    let row = try XCTUnwrap(f.queue.entry(for: admitted.source, revision: admitted.revision))
+                    XCTAssertEqual(row.state, .queuedForUpload, "The interrupted compound stays runnable")
+                    XCTAssertEqual(row.attempts, admitted.attempts)
+                    XCTAssertNil(row.remoteCommitReconciliation)
+                    XCTAssertTrue(f.queue.nextRunnableDate().map { $0 <= f.clock.now } ?? false)
+                    guard f.queue.isOperational(), case .readable(let pending) = f.pending.sourceStateRead(for: f.key)
+                    else {
+                        throw Restore829StopFixtureError.invalid("post-Stop local state is unreadable")
+                    }
+                    let retained = try XCTUnwrap(pending, "Stop must retain the pending restore duty")
+                    XCTAssertEqual(retained.remote, main)
+                    XCTAssertEqual(retained.generation, checked.generation)
+                    XCTAssertEqual(retained.attempts, checked.attempts)
+                    XCTAssertTrue(retained.needsQueueSync)
+                    XCTAssertEqual(retained.remoteOperation, .remoteTrash)
+                    guard f.identities.record(for: admitted.source)?.remoteLinkID == main.nodeID else {
+                        throw Restore829StopFixtureError.invalid("post-Stop identity read is unavailable")
+                    }
+                    let interruptedIdentity = try XCTUnwrap(f.identities.record(for: member.descriptor.source))
+                    XCTAssertTrue(interruptedIdentity.isValid(for: member.descriptor))
+                    XCTAssertNil(interruptedIdentity.remoteLinkID)
+                    XCTAssertFalse(interruptedIdentity.provesUpload)
+                    XCTAssertEqual(f.server.uploadRequestCount, 2)
+                    XCTAssertEqual(f.server.links.count, 2)
+                    XCTAssertEqual(f.server.links.first?.uid, main)
+                    XCTAssertEqual(f.server.links.first?.state, .active)
+                    let pendingOutcome = await f.controller.returnToBackup([checked])
+                    guard case .waiting? = pendingOutcome[f.key] else {
+                        XCTFail("Stop cannot acknowledge the unfinished compound")
+                        await cleanup()
+                        return
+                    }
+                    // The same uploader now forwards the member; no competing runner is started.
+                    f.clock.advance(by: 2)
+                    drain = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
+                    _ = await drain?.value
+                    let completed = await f.controller.returnToBackup([checked])
+                    XCTAssertEqual(completed[f.key], .completed)
+                    XCTAssertEqual(f.server.uploadRequestCount, 3, "Only the updated member commits")
+                    XCTAssertEqual(
+                        f.server.links.filter { $0.mainLinkID == nil && $0.state == .active }.map(\.uid), [main])
+                    let members = f.server.links.filter { $0.mainLinkID == main.nodeID && $0.state == .active }
+                    XCTAssertEqual(members.count, 2)
+                    XCTAssertEqual(members.first(where: { $0.linkID == priorMemberUID })?.state, .active)
+                    let updated = try XCTUnwrap(members.first(where: { $0.linkID != priorMemberUID }))
+                    XCTAssertEqual(f.identities.record(for: member.descriptor.source)?.remoteLinkID, updated.linkID)
+                    XCTAssertEqual(uploader.cancelledTokens, [request.cancellationToken])
+                    if completed[f.key] == .completed {
+                        XCTAssertTrue(f.pending.finishRestoreRecheck(checked, outcome: .completed, at: f.clock.now))
+                        XCTAssertNil(
+                            f.pending.sourceState(for: f.key), "Only the later complete recheck retires the marker")
+                    }
+                } catch {
+                    await cleanup()
+                    throw error
                 }
-                let retained = try XCTUnwrap(pending, "Stop must retain the pending restore duty")
+                await cleanup()
+            }
+        }
+    #endif
+
+    #if DEBUG
+        func testRestoredPhotoVideoAndLiveWaitForRealCompoundDrainWithoutDuplicateUpload() async throws {
+            for shape in [Restore829Fixture.Shape.photo, .video, .live] {
+                try await withRestore829Fixture(shape) { f in
+                    let main = try await f.initialBackup()
+                    let checked = try f.restoredState(main, retainMemberTrash: shape == .live, marker: true)
+                    let uploads = f.server.uploadRequestCount
+                    let beforeReads = f.resolver.resolveCount
+                    let admission = await f.controller.returnToBackup([checked])
+                    guard case .waiting? = admission[f.key] else {
+                        return XCTFail("Enqueue must not report compound completion")
+                    }
+                    XCTAssertTrue(try XCTUnwrap(f.pending.sourceState(for: f.key)).needsQueueSync)
+                    XCTAssertEqual(f.pending.sourceState(for: f.key)?.remote, main)
+                    XCTAssertEqual(
+                        f.pending.sourceState(for: f.key)?.remoteOperation, .remoteTrash,
+                        "The marker stays until the real recheck")
+                    await f.drain()
+                    XCTAssertGreaterThan(f.resolver.resolveCount, beforeReads)
+                    let completed = await f.controller.returnToBackup([checked])
+                    XCTAssertEqual(completed[f.key], .completed)
+                    XCTAssertTrue(
+                        f.pending.finishRestoreRecheck(
+                            checked, outcome: try XCTUnwrap(completed[f.key]), at: f.clock.now))
+                    XCTAssertNil(f.pending.sourceState(for: f.key), "Only this verified UID/generation marker retires")
+                    XCTAssertEqual(f.server.uploadRequestCount, uploads)
+                    XCTAssertEqual(f.server.links.filter { $0.state == .active }.count, shape == .live ? 2 : 1)
+                    let reads = f.resolver.resolveCount
+                    let repeatResult = await f.controller.returnToBackup([checked])
+                    XCTAssertEqual(
+                        repeatResult[f.key], .unreadable, "An acknowledged generation cannot readmit the stale request")
+                    await f.drain()
+                    XCTAssertEqual(f.resolver.resolveCount, reads)
+                    XCTAssertEqual(f.server.uploadRequestCount, uploads)
+                }
+            }
+        }
+    #endif
+
+    #if DEBUG
+        func testRestoredBurstKeepsAnActuallyOmittedMemberPendingWithoutUpload() async throws {
+            try await withRestore829Fixture(.burst) { f in
+                let main = try await f.initialBackup(omittingSecondary: true)
+                XCTAssertEqual(
+                    f.server.uploadRequestCount, 1, "The initial resolved compound really omitted the member")
+                let checked = try f.restoredState(main)
+                let primary = f.identities.record(for: f.resolver.candidate.snapshot.source)
+                let priorState = f.state.record(
+                    for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)
+                let admission = await f.controller.returnToBackup([checked])
+                guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
+                await f.drain()
+                let outcome = await f.controller.returnToBackup([checked])
+                guard case .waiting? = outcome[f.key] else {
+                    return XCTFail("A missing member cannot complete Restore")
+                }
+                XCTAssertTrue(
+                    f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+                let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                XCTAssertTrue(retained.needsQueueSync)
                 XCTAssertEqual(retained.remote, main)
                 XCTAssertEqual(retained.generation, checked.generation)
                 XCTAssertEqual(retained.attempts, checked.attempts)
-                XCTAssertTrue(retained.needsQueueSync)
-                XCTAssertEqual(retained.remoteOperation, .remoteTrash)
-                guard f.identities.record(for: admitted.source)?.remoteLinkID == main.nodeID else {
-                    throw Restore829StopFixtureError.invalid("post-Stop identity read is unavailable")
-                }
-                let interruptedIdentity = try XCTUnwrap(f.identities.record(for: member.descriptor.source))
-                XCTAssertTrue(interruptedIdentity.isValid(for: member.descriptor))
-                XCTAssertNil(interruptedIdentity.remoteLinkID)
-                XCTAssertFalse(interruptedIdentity.provesUpload)
-                XCTAssertEqual(f.server.uploadRequestCount, 2)
-                XCTAssertEqual(f.server.links.count, 2)
-                XCTAssertEqual(f.server.links.first?.uid, main)
-                XCTAssertEqual(f.server.links.first?.state, .active)
-                let pendingOutcome = await f.controller.returnToBackup([checked])
-                guard case .waiting? = pendingOutcome[f.key] else {
-                    XCTFail("Stop cannot acknowledge the unfinished compound")
-                    await cleanup()
-                    return
-                }
-                // The same uploader now forwards the member; no competing runner is started.
-                f.clock.advance(by: 2)
-                drain = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
-                _ = await drain?.value
-                let completed = await f.controller.returnToBackup([checked])
-                XCTAssertEqual(completed[f.key], .completed)
-                XCTAssertEqual(f.server.uploadRequestCount, 3, "Only the updated member commits")
-                XCTAssertEqual(f.server.links.filter { $0.mainLinkID == nil && $0.state == .active }.map(\.uid), [main])
-                let members = f.server.links.filter { $0.mainLinkID == main.nodeID && $0.state == .active }
-                XCTAssertEqual(members.count, 2)
-                XCTAssertEqual(members.first(where: { $0.linkID == priorMemberUID })?.state, .active)
-                let updated = try XCTUnwrap(members.first(where: { $0.linkID != priorMemberUID }))
-                XCTAssertEqual(f.identities.record(for: member.descriptor.source)?.remoteLinkID, updated.linkID)
-                XCTAssertEqual(uploader.cancelledTokens, [request.cancellationToken])
-                if completed[f.key] == .completed {
-                    XCTAssertTrue(f.pending.finishRestoreRecheck(checked, outcome: .completed, at: f.clock.now))
-                    XCTAssertNil(
-                        f.pending.sourceState(for: f.key), "Only the later complete recheck retires the marker")
-                }
-            } catch {
-                await cleanup()
-                throw error
-            }
-            await cleanup()
-        }
-    }
-
-    func testRestoredPhotoVideoAndLiveWaitForRealCompoundDrainWithoutDuplicateUpload() async throws {
-        for shape in [Restore829Fixture.Shape.photo, .video, .live] {
-            try await withRestore829Fixture(shape) { f in
-                let main = try await f.initialBackup()
-                let checked = try f.restoredState(main, retainMemberTrash: shape == .live, marker: true)
-                let uploads = f.server.uploadRequestCount
-                let beforeReads = f.resolver.resolveCount
-                let admission = await f.controller.returnToBackup([checked])
-                guard case .waiting? = admission[f.key] else {
-                    return XCTFail("Enqueue must not report compound completion")
-                }
-                XCTAssertTrue(try XCTUnwrap(f.pending.sourceState(for: f.key)).needsQueueSync)
-                XCTAssertEqual(f.pending.sourceState(for: f.key)?.remote, main)
+                XCTAssertEqual(f.server.uploadRequestCount, 1, "Restore cannot upload the missing member")
+                let members = f.server.links.filter { $0.state == .active && $0.mainLinkID == main.nodeID }
+                XCTAssertEqual(members.count, 0)
+                XCTAssertNil(f.identities.record(for: try XCTUnwrap(f.resolver.secondaries.first).descriptor.source))
+                XCTAssertEqual(f.identities.record(for: f.resolver.candidate.snapshot.source), primary)
                 XCTAssertEqual(
-                    f.pending.sourceState(for: f.key)?.remoteOperation, .remoteTrash,
-                    "The marker stays until the real recheck")
-                await f.drain()
-                XCTAssertGreaterThan(f.resolver.resolveCount, beforeReads)
-                let completed = await f.controller.returnToBackup([checked])
-                XCTAssertEqual(completed[f.key], .completed)
-                XCTAssertTrue(
-                    f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(completed[f.key]), at: f.clock.now))
-                XCTAssertNil(f.pending.sourceState(for: f.key), "Only this verified UID/generation marker retires")
-                XCTAssertEqual(f.server.uploadRequestCount, uploads)
-                XCTAssertEqual(f.server.links.filter { $0.state == .active }.count, shape == .live ? 2 : 1)
-                let reads = f.resolver.resolveCount
-                let repeatResult = await f.controller.returnToBackup([checked])
+                    f.state.record(
+                        for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision),
+                    priorState)
                 XCTAssertEqual(
-                    repeatResult[f.key], .unreadable, "An acknowledged generation cannot readmit the stale request")
-                await f.drain()
-                XCTAssertEqual(f.resolver.resolveCount, reads)
-                XCTAssertEqual(f.server.uploadRequestCount, uploads)
+                    f.state.record(
+                        for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)?
+                        .pendingResourceCount, 0)
             }
         }
-    }
+    #endif
 
-    func testRestoredBurstKeepsAnActuallyOmittedMemberPendingWithoutUpload() async throws {
-        try await withRestore829Fixture(.burst) { f in
-            let main = try await f.initialBackup(omittingSecondary: true)
-            XCTAssertEqual(f.server.uploadRequestCount, 1, "The initial resolved compound really omitted the member")
-            let checked = try f.restoredState(main)
-            let primary = f.identities.record(for: f.resolver.candidate.snapshot.source)
-            let priorState = f.state.record(
-                for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)
-            let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
-            await f.drain()
-            let outcome = await f.controller.returnToBackup([checked])
-            guard case .waiting? = outcome[f.key] else { return XCTFail("A missing member cannot complete Restore") }
-            XCTAssertTrue(
-                f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
-            let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
-            XCTAssertTrue(retained.needsQueueSync)
-            XCTAssertEqual(retained.remote, main)
-            XCTAssertEqual(retained.generation, checked.generation)
-            XCTAssertEqual(retained.attempts, checked.attempts)
-            XCTAssertEqual(f.server.uploadRequestCount, 1, "Restore cannot upload the missing member")
-            let members = f.server.links.filter { $0.state == .active && $0.mainLinkID == main.nodeID }
-            XCTAssertEqual(members.count, 0)
-            XCTAssertNil(f.identities.record(for: try XCTUnwrap(f.resolver.secondaries.first).descriptor.source))
-            XCTAssertEqual(f.identities.record(for: f.resolver.candidate.snapshot.source), primary)
-            XCTAssertEqual(
-                f.state.record(
-                    for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision),
-                priorState)
-            XCTAssertEqual(
-                f.state.record(
-                    for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)?
-                    .pendingResourceCount, 0)
+    #if DEBUG
+        func testANewerEditUploadsWhileAnOlderRestoreWaits() async throws {
+            for registersRestore in [true, false] {
+                try await withRestore829Fixture(.burst) { f in
+                    let main = try await f.initialBackup(omittingSecondary: true)
+                    let checked = try f.restoredState(main)
+                    // Control: the same state without a Restore check through the controller registers no context.
+                    if registersRestore {
+                        let admission = await f.controller.returnToBackup([checked])
+                        guard case .waiting? = admission[f.key] else {
+                            return XCTFail("The omitted burst must remain pending")
+                        }
+                        await f.drain()
+                        let outcome = await f.controller.returnToBackup([checked])
+                        guard case .waiting? = outcome[f.key] else { return XCTFail("Restore must still wait") }
+                        XCTAssertTrue(
+                            f.pending.finishRestoreRecheck(
+                                checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+                    }
+                    let uploadsBefore = f.server.uploadRequestCount
+                    let (latest, resolver) = try f.publishEditedMain()
+                    let engine = UploadBackupSyncEngine(
+                        preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue)
+                    _ = try await engine.enqueueBatch([latest])
+                    try await f.drain(with: resolver)
+
+                    let row = try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
+                    XCTAssertEqual(resolver.resolveCount, 1, "The edit really reached the duplicate check")
+                    XCTAssertEqual(row?.state, .completed, "The newer edit backs up while the older Restore waits")
+                    XCTAssertEqual(f.server.uploadRequestCount, uploadsBefore + 1, "Exactly the edited main uploads")
+                    XCTAssertEqual(
+                        f.identities.record(for: resolver.primary.source)?.sha1Hex,
+                        UploadContentSHA1.hexString(digest: try XCTUnwrap(resolver.primary.precomputedSHA1Digest)))
+                }
+            }
         }
-    }
+    #endif
 
-    func testANewerEditUploadsWhileAnOlderRestoreWaits() async throws {
-        for registersRestore in [true, false] {
+    #if DEBUG
+        func testAStaleRestoreCheckEndsItsContextOnTheNextPass() async throws {
             try await withRestore829Fixture(.burst) { f in
                 let main = try await f.initialBackup(omittingSecondary: true)
                 let checked = try f.restoredState(main)
-                // Control: the same state without a Restore check through the controller registers no context.
-                if registersRestore {
-                    let admission = await f.controller.returnToBackup([checked])
-                    guard case .waiting? = admission[f.key] else {
-                        return XCTFail("The omitted burst must remain pending")
-                    }
-                    await f.drain()
-                    let outcome = await f.controller.returnToBackup([checked])
-                    guard case .waiting? = outcome[f.key] else { return XCTFail("Restore must still wait") }
-                    XCTAssertTrue(
-                        f.pending.finishRestoreRecheck(
-                            checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+                let admission = await f.controller.returnToBackup([checked])
+                guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
+                let primary = f.resolver.primary.withBackupRevision(f.resolver.candidate.snapshot.revision)
+                var guarded = false
+                do { _ = try await f.pipeline.resolve(primary) } catch {
+                    guarded = UploadError.isCancellation(error)
                 }
-                let uploadsBefore = f.server.uploadRequestCount
-                let (latest, resolver) = try f.publishEditedMain()
-                let engine = UploadBackupSyncEngine(
-                    preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue)
-                _ = try await engine.enqueueBatch([latest])
-                try await f.drain(with: resolver)
+                XCTAssertFalse(guarded, "The current context admits its own revision")
+                // A new decision replaces the generation that the registered context checked.
+                let excluded = try XCTUnwrap(
+                    f.pending.exclude(
+                        [PendingExclusionRequest(key: f.key, presentation: nil, remote: main)], at: f.clock.now)?
+                        .first)
+                XCTAssertNotNil(f.pending.includeRestoredInProton([f.key], confirmedRemotes: [main], at: f.clock.now))
+                XCTAssertNotEqual(excluded.generation, checked.generation)
+                do { _ = try await f.pipeline.resolve(primary) } catch {
+                    guarded = UploadError.isCancellation(error)
+                }
+                XCTAssertTrue(guarded, "A stale registered context still guards its own revision")
 
-                let row = try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
-                XCTAssertEqual(resolver.resolveCount, 1, "The edit really reached the duplicate check")
-                XCTAssertEqual(row?.state, .completed, "The newer edit backs up while the older Restore waits")
-                XCTAssertEqual(f.server.uploadRequestCount, uploadsBefore + 1, "Exactly the edited main uploads")
-                XCTAssertEqual(
-                    f.identities.record(for: resolver.primary.source)?.sha1Hex,
-                    UploadContentSHA1.hexString(digest: try XCTUnwrap(resolver.primary.precomputedSHA1Digest)))
+                let stale = await f.controller.returnToBackup([checked])
+                XCTAssertEqual(stale[f.key], .unreadable, "The stale check reports nothing")
+                guarded = false
+                do { _ = try await f.pipeline.resolve(primary) } catch {
+                    guarded = UploadError.isCancellation(error)
+                }
+                XCTAssertFalse(guarded, "The next pass ends the stale context")
             }
         }
-    }
-
-    func testAStaleRestoreCheckEndsItsContextOnTheNextPass() async throws {
-        try await withRestore829Fixture(.burst) { f in
-            let main = try await f.initialBackup(omittingSecondary: true)
-            let checked = try f.restoredState(main)
-            let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
-            let primary = f.resolver.primary.withBackupRevision(f.resolver.candidate.snapshot.revision)
-            var guarded = false
-            do { _ = try await f.pipeline.resolve(primary) } catch {
-                guarded = UploadError.isCancellation(error)
-            }
-            XCTAssertFalse(guarded, "The current context admits its own revision")
-            // A new decision replaces the generation that the registered context checked.
-            let excluded = try XCTUnwrap(
-                f.pending.exclude(
-                    [PendingExclusionRequest(key: f.key, presentation: nil, remote: main)], at: f.clock.now)?
-                    .first)
-            XCTAssertNotNil(f.pending.includeRestoredInProton([f.key], confirmedRemotes: [main], at: f.clock.now))
-            XCTAssertNotEqual(excluded.generation, checked.generation)
-            do { _ = try await f.pipeline.resolve(primary) } catch {
-                guarded = UploadError.isCancellation(error)
-            }
-            XCTAssertTrue(guarded, "A stale registered context still guards its own revision")
-
-            let stale = await f.controller.returnToBackup([checked])
-            XCTAssertEqual(stale[f.key], .unreadable, "The stale check reports nothing")
-            guarded = false
-            do { _ = try await f.pipeline.resolve(primary) } catch {
-                guarded = UploadError.isCancellation(error)
-            }
-            XCTAssertFalse(guarded, "The next pass ends the stale context")
-        }
-    }
+    #endif
 
     /// Only a certified stale read ends a registered restore check; an unknown read keeps it (#1004 B2 row 13).
-    func testAnUnknownRestoreCheckReadKeepsTheRegisteredContext() async throws {
-        try await withRestore829Fixture(.burst) { f in
-            let main = try await f.initialBackup(omittingSecondary: true)
-            let checked = try f.restoredState(main)
-            let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
-            let context = UploadRestoredCompoundContext(
-                source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
-                generation: checked.generation, confirmedRemote: main,
-                requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
-            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
-                return XCTFail("Fixture prerequisite: the context is registered")
-            }
+    #if DEBUG
+        func testAnUnknownRestoreCheckReadKeepsTheRegisteredContext() async throws {
+            try await withRestore829Fixture(.burst) { f in
+                let main = try await f.initialBackup(omittingSecondary: true)
+                let checked = try f.restoredState(main)
+                let admission = await f.controller.returnToBackup([checked])
+                guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
+                let context = UploadRestoredCompoundContext(
+                    source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
+                    generation: checked.generation, confirmedRemote: main,
+                    requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
+                guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                    return XCTFail("Fixture prerequisite: the context is registered")
+                }
 
-            let fault = try SQLiteReadInterrupt(
-                in: f.pending!, matching: "FROM source_state WHERE source_kind=? AND source_id=?")
-            let unknown = await f.controller.returnToBackup([checked])
-            fault.stop()
+                let fault = try SQLiteReadInterrupt(
+                    in: f.pending!, matching: "FROM source_state WHERE source_kind=? AND source_id=?")
+                let unknown = await f.controller.returnToBackup([checked])
+                fault.stop()
 
-            XCTAssertTrue(fault.fired, "The current-state read of the check failed")
-            XCTAssertEqual(unknown[f.key], .unreadable, "The unknown check reports nothing")
-            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
-                return XCTFail("An unknown read must not end the registered context")
+                XCTAssertTrue(fault.fired, "The current-state read of the check failed")
+                XCTAssertEqual(unknown[f.key], .unreadable, "The unknown check reports nothing")
+                guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                    return XCTFail("An unknown read must not end the registered context")
+                }
             }
         }
-    }
+    #endif
 
     /// An unknown catalog read in the restore check keeps the registered context too (#1004 B2 row 13).
-    func testAnUnknownRestoreCheckCatalogReadKeepsTheRegisteredContext() async throws {
-        try await withRestore829Fixture(.burst) { f in
-            let main = try await f.initialBackup(omittingSecondary: true)
-            let checked = try f.restoredState(main)
-            let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
-            let context = UploadRestoredCompoundContext(
-                source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
-                generation: checked.generation, confirmedRemote: main,
-                requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
-            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
-                return XCTFail("Fixture prerequisite: the context is registered")
-            }
-            // The controller's own catalog connection. Its health check forgets the transient fault, so only the
-            // failed read itself is unknown.
-            let catalog = try XCTUnwrap(
-                Mirror(reflecting: f.controller!).children.first { $0.label == "catalogStore" }?.value
-                    as? PhotoLibraryCatalogManifestStore)
-            // The first keyed catalog read plans the check; the second is the current-state read.
-            let fault = try SQLiteReadInterrupt(
-                in: catalog, matching: "FROM photo_catalog WHERE local_id=?", occurrence: 2)
-            let unknown = await f.controller.returnToBackup([checked])
-            fault.stop()
+    #if DEBUG
+        func testAnUnknownRestoreCheckCatalogReadKeepsTheRegisteredContext() async throws {
+            try await withRestore829Fixture(.burst) { f in
+                let main = try await f.initialBackup(omittingSecondary: true)
+                let checked = try f.restoredState(main)
+                let admission = await f.controller.returnToBackup([checked])
+                guard case .waiting? = admission[f.key] else { return XCTFail("The omitted burst must remain pending") }
+                let context = UploadRestoredCompoundContext(
+                    source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
+                    generation: checked.generation, confirmedRemote: main,
+                    requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
+                guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                    return XCTFail("Fixture prerequisite: the context is registered")
+                }
+                // The controller's own catalog connection. Its health check forgets the transient fault, so only the
+                // failed read itself is unknown.
+                let catalog = try XCTUnwrap(
+                    Mirror(reflecting: f.controller!).children.first { $0.label == "catalogStore" }?.value
+                        as? PhotoLibraryCatalogManifestStore)
+                // The first keyed catalog read plans the check; the second is the current-state read.
+                let fault = try SQLiteReadInterrupt(
+                    in: catalog, matching: "FROM photo_catalog WHERE local_id=?", occurrence: 2)
+                let unknown = await f.controller.returnToBackup([checked])
+                fault.stop()
 
-            XCTAssertTrue(fault.fired, "The current-state catalog read of the check failed")
-            XCTAssertEqual(unknown[f.key], .unreadable, "The unknown check reports nothing")
-            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
-                return XCTFail("An unknown catalog read must not end the registered context")
+                XCTAssertTrue(fault.fired, "The current-state catalog read of the check failed")
+                XCTAssertEqual(unknown[f.key], .unreadable, "The unknown check reports nothing")
+                guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                    return XCTFail("An unknown catalog read must not end the registered context")
+                }
             }
         }
-    }
+    #endif
 
-    func testAStaleOlderCheckKeepsTheNewerRestoreContext() async throws {
-        try await withRestore829Fixture(.burst) { f in
-            let main = try await f.initialBackup(omittingSecondary: true)
-            let older = try f.restoredState(main)
-            let first = await f.controller.returnToBackup([older])
-            guard case .waiting? = first[f.key] else { return XCTFail("The omitted burst must remain pending") }
-            XCTAssertNotNil(
-                f.pending.exclude(
-                    [PendingExclusionRequest(key: f.key, presentation: nil, remote: main)], at: f.clock.now))
-            let newer = try XCTUnwrap(
-                f.pending.includeRestoredInProton([f.key], confirmedRemotes: [main], at: f.clock.now)?.first)
-            XCTAssertNotEqual(newer.generation, older.generation)
-            let second = await f.controller.returnToBackup([newer])
-            guard case .waiting? = second[f.key] else { return XCTFail("The newer Restore must remain pending") }
-            let context = UploadRestoredCompoundContext(
-                source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
-                generation: newer.generation, confirmedRemote: main,
-                requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
-            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
-                return XCTFail("Fixture prerequisite: the newer context is registered")
-            }
+    #if DEBUG
+        func testAStaleOlderCheckKeepsTheNewerRestoreContext() async throws {
+            try await withRestore829Fixture(.burst) { f in
+                let main = try await f.initialBackup(omittingSecondary: true)
+                let older = try f.restoredState(main)
+                let first = await f.controller.returnToBackup([older])
+                guard case .waiting? = first[f.key] else { return XCTFail("The omitted burst must remain pending") }
+                XCTAssertNotNil(
+                    f.pending.exclude(
+                        [PendingExclusionRequest(key: f.key, presentation: nil, remote: main)], at: f.clock.now))
+                let newer = try XCTUnwrap(
+                    f.pending.includeRestoredInProton([f.key], confirmedRemotes: [main], at: f.clock.now)?.first)
+                XCTAssertNotEqual(newer.generation, older.generation)
+                let second = await f.controller.returnToBackup([newer])
+                guard case .waiting? = second[f.key] else { return XCTFail("The newer Restore must remain pending") }
+                let context = UploadRestoredCompoundContext(
+                    source: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision,
+                    generation: newer.generation, confirmedRemote: main,
+                    requiredMembers: f.resolver.secondaries.map(\.descriptor.source.resource))
+                guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                    return XCTFail("Fixture prerequisite: the newer context is registered")
+                }
 
-            let stale = await f.controller.returnToBackup([older])
-            XCTAssertEqual(stale[f.key], .unreadable, "The older check is stale")
-            guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
-                return XCTFail("A stale older check must not end the newer context")
+                let stale = await f.controller.returnToBackup([older])
+                XCTAssertEqual(stale[f.key], .unreadable, "The older check is stale")
+                guard case .waiting = try await f.pipeline.restoredPhotoOutcome(context) else {
+                    return XCTFail("A stale older check must not end the newer context")
+                }
             }
         }
-    }
+    #endif
 
-    func testRestoredLivePhotoKeepsATrashedPairedVideoPendingWithoutUpload() async throws {
-        try await withRestore829Fixture(.live) { f in
-            let main = try await f.initialBackup()
-            let checked = try f.restoredState(main, retainMemberTrash: true, marker: true)
-            let paired = try XCTUnwrap(f.resolver.secondaries.first).descriptor.source
-            let member = try XCTUnwrap(f.identities.record(for: paired)?.remoteLinkID)
-            f.server.personTrash(.init(volumeID: "vol", nodeID: member))
-            let uploads = f.server.uploadRequestCount
-            let before = f.identities.record(for: paired)
-            let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting? = admission[f.key] else { return XCTFail("A trashed paired video stays pending") }
-            await f.drain()
-            let outcome = await f.controller.returnToBackup([checked])
-            guard case .waiting? = outcome[f.key] else {
-                return XCTFail("A skipped paired video is not a complete Restore")
-            }
-            XCTAssertTrue(
-                f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
-            let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
-            XCTAssertTrue(retained.needsQueueSync)
-            XCTAssertEqual(retained.remote, main)
-            XCTAssertEqual(retained.generation, checked.generation)
-            XCTAssertEqual(retained.remoteOperation, .remoteTrash)
-            XCTAssertEqual(retained.attempts, checked.attempts)
-            XCTAssertEqual(f.identities.record(for: paired), before)
-            XCTAssertEqual(f.server.uploadRequestCount, uploads)
-            XCTAssertEqual(f.server.links.first { $0.linkID == member }?.state, .trashed)
-            XCTAssertEqual(f.server.links.first { $0.linkID == main.nodeID }?.state, .active)
-        }
-    }
-
-    func testRestoredCompoundReconstructsItsDutyAfterClosingAllAccountStores() async throws {
-        try await withRestore829Fixture(.live) { f in
-            let main = try await f.initialBackup()
-            let checked = try f.restoredState(main, retainMemberTrash: true, marker: true)
-            let admission = await f.controller.returnToBackup([checked])
-            guard case .waiting(let due)? = admission[f.key] else {
-                return XCTFail("The first return must stay pending")
-            }
-            XCTAssertTrue(f.pending.finishRestoreRecheck(checked, outcome: .waiting(until: due), at: f.clock.now))
-            let durable = try XCTUnwrap(f.pending.sourceState(for: f.key))
-            let uploads = f.server.uploadRequestCount
-            await f.runner.stop()
-            try await f.relaunch()
-            XCTAssertEqual(f.pending.sourceState(for: f.key), durable)
-            XCTAssertEqual(durable.remote, main)
-            XCTAssertEqual(durable.attempts, checked.attempts)
-            f.clock.advance(by: max(0, durable.nextAttemptAt.timeIntervalSince(f.clock.now)))
-            let firstAfterRestart = await f.controller.returnToBackup([durable])
-            guard case .waiting? = firstAfterRestart[f.key] else {
-                return XCTFail("New controller memory is not proof of a completed pass")
-            }
-            await f.drain()
-            let outcome = await f.controller.returnToBackup([durable])
-            XCTAssertEqual(outcome[f.key], .completed)
-            XCTAssertTrue(
-                f.pending.finishRestoreRecheck(durable, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
-            XCTAssertNil(f.pending.sourceState(for: f.key))
-            XCTAssertEqual(f.server.uploadRequestCount, uploads)
-            XCTAssertEqual(f.server.links.filter { $0.state == .active && $0.mainLinkID == main.nodeID }.count, 1)
-        }
-    }
-
-    func testRestoredCompoundRefusesChangedGenerationAndUIDAndPlansTheLatestCatalogRevision() async throws {
-        for change in ["generation=generation+1", "remote_link_id='newer-remote'"] {
+    #if DEBUG
+        func testRestoredLivePhotoKeepsATrashedPairedVideoPendingWithoutUpload() async throws {
             try await withRestore829Fixture(.live) { f in
                 let main = try await f.initialBackup()
-                let checked = try f.restoredState(main, retainMemberTrash: true)
-                var db: OpaquePointer?
-                XCTAssertEqual(
-                    sqlite3_open(
-                        f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName).path, &db),
-                    SQLITE_OK)
-                let handle = try XCTUnwrap(db)
-                defer { sqlite3_close(handle) }
-                XCTAssertEqual(sqlite3_exec(handle, "UPDATE source_state SET \(change);", nil, nil, nil), SQLITE_OK)
+                let checked = try f.restoredState(main, retainMemberTrash: true, marker: true)
+                let paired = try XCTUnwrap(f.resolver.secondaries.first).descriptor.source
+                let member = try XCTUnwrap(f.identities.record(for: paired)?.remoteLinkID)
+                f.server.personTrash(.init(volumeID: "vol", nodeID: member))
+                let uploads = f.server.uploadRequestCount
+                let before = f.identities.record(for: paired)
+                let admission = await f.controller.returnToBackup([checked])
+                guard case .waiting? = admission[f.key] else { return XCTFail("A trashed paired video stays pending") }
+                await f.drain()
+                let outcome = await f.controller.returnToBackup([checked])
+                guard case .waiting? = outcome[f.key] else {
+                    return XCTFail("A skipped paired video is not a complete Restore")
+                }
+                XCTAssertTrue(
+                    f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+                let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                XCTAssertTrue(retained.needsQueueSync)
+                XCTAssertEqual(retained.remote, main)
+                XCTAssertEqual(retained.generation, checked.generation)
+                XCTAssertEqual(retained.remoteOperation, .remoteTrash)
+                XCTAssertEqual(retained.attempts, checked.attempts)
+                XCTAssertEqual(f.identities.record(for: paired), before)
+                XCTAssertEqual(f.server.uploadRequestCount, uploads)
+                XCTAssertEqual(f.server.links.first { $0.linkID == member }?.state, .trashed)
+                XCTAssertEqual(f.server.links.first { $0.linkID == main.nodeID }?.state, .active)
+            }
+        }
+    #endif
+
+    #if DEBUG
+        func testRestoredCompoundReconstructsItsDutyAfterClosingAllAccountStores() async throws {
+            try await withRestore829Fixture(.live) { f in
+                let main = try await f.initialBackup()
+                let checked = try f.restoredState(main, retainMemberTrash: true, marker: true)
+                let admission = await f.controller.returnToBackup([checked])
+                guard case .waiting(let due)? = admission[f.key] else {
+                    return XCTFail("The first return must stay pending")
+                }
+                XCTAssertTrue(f.pending.finishRestoreRecheck(checked, outcome: .waiting(until: due), at: f.clock.now))
+                let durable = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                let uploads = f.server.uploadRequestCount
+                await f.runner.stop()
+                try await f.relaunch()
+                XCTAssertEqual(f.pending.sourceState(for: f.key), durable)
+                XCTAssertEqual(durable.remote, main)
+                XCTAssertEqual(durable.attempts, checked.attempts)
+                f.clock.advance(by: max(0, durable.nextAttemptAt.timeIntervalSince(f.clock.now)))
+                let firstAfterRestart = await f.controller.returnToBackup([durable])
+                guard case .waiting? = firstAfterRestart[f.key] else {
+                    return XCTFail("New controller memory is not proof of a completed pass")
+                }
+                await f.drain()
+                let outcome = await f.controller.returnToBackup([durable])
+                XCTAssertEqual(outcome[f.key], .completed)
+                XCTAssertTrue(
+                    f.pending.finishRestoreRecheck(durable, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+                XCTAssertNil(f.pending.sourceState(for: f.key))
+                XCTAssertEqual(f.server.uploadRequestCount, uploads)
+                XCTAssertEqual(f.server.links.filter { $0.state == .active && $0.mainLinkID == main.nodeID }.count, 1)
+            }
+        }
+    #endif
+
+    #if DEBUG
+        func testRestoredCompoundRefusesChangedGenerationAndUIDAndPlansTheLatestCatalogRevision() async throws {
+            for change in ["generation=generation+1", "remote_link_id='newer-remote'"] {
+                try await withRestore829Fixture(.live) { f in
+                    let main = try await f.initialBackup()
+                    let checked = try f.restoredState(main, retainMemberTrash: true)
+                    var db: OpaquePointer?
+                    XCTAssertEqual(
+                        sqlite3_open(
+                            f.directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName).path, &db),
+                        SQLITE_OK)
+                    let handle = try XCTUnwrap(db)
+                    defer { sqlite3_close(handle) }
+                    XCTAssertEqual(sqlite3_exec(handle, "UPDATE source_state SET \(change);", nil, nil, nil), SQLITE_OK)
+                    let before = try XCTUnwrap(
+                        try f.queue.entry(
+                            for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision)
+                    )
+                    let outcome = await f.controller.returnToBackup([checked])
+                    XCTAssertEqual(outcome[f.key], .unreadable)
+                    XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
+                }
+            }
+            try await withRestore829Fixture(.photo) { f in
+                let main = try await f.initialBackup()
+                let checked = try f.restoredState(main)
+                var entry = try XCTUnwrap(f.catalog.entry(for: f.key.identifier))
+                entry.modificationDate = try XCTUnwrap(entry.modificationDate).addingTimeInterval(1)
+                XCTAssertTrue(f.catalog.upsertBatch([entry]))
                 let before = try XCTUnwrap(
                     try f.queue.entry(
                         for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
                 let outcome = await f.controller.returnToBackup([checked])
-                XCTAssertEqual(outcome[f.key], .unreadable)
+                guard case .waiting? = outcome[f.key] else {
+                    return XCTFail("A later local revision owes a fresh recheck")
+                }
+                let latest = try XCTUnwrap(
+                    PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
+                XCTAssertNotEqual(latest.snapshot.revision, before.revision)
+                XCTAssertNotNil(try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision))
                 XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
             }
         }
-        try await withRestore829Fixture(.photo) { f in
-            let main = try await f.initialBackup()
-            let checked = try f.restoredState(main)
-            var entry = try XCTUnwrap(f.catalog.entry(for: f.key.identifier))
-            entry.modificationDate = try XCTUnwrap(entry.modificationDate).addingTimeInterval(1)
-            XCTAssertTrue(f.catalog.upsertBatch([entry]))
-            let before = try XCTUnwrap(
-                try f.queue.entry(
-                    for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
-            let outcome = await f.controller.returnToBackup([checked])
-            guard case .waiting? = outcome[f.key] else { return XCTFail("A later local revision owes a fresh recheck") }
-            let latest = try XCTUnwrap(
-                PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
-            XCTAssertNotEqual(latest.snapshot.revision, before.revision)
-            XCTAssertNotNil(try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision))
-            XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
-        }
-    }
+    #endif
 
-    func testRestoredCompoundDetectsALateAppliedTrashBeforeQueueMutation() async throws {
-        try await withRestore829Fixture(.live) { f in
-            let main = try await f.initialBackup()
-            let checked = try f.restoredState(main, retainMemberTrash: true)
-            f.server.personTrash(main)
-            let uploads = f.server.uploadRequestCount
-            let before = try XCTUnwrap(
-                try f.queue.entry(
-                    for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
-            let outcome = await f.controller.returnToBackup([checked])
-            XCTAssertEqual(outcome[f.key], .remoteTrashed)
-            XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
-            XCTAssertTrue(
-                f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
-            let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
-            XCTAssertTrue(retained.remoteTrashed)
-            XCTAssertTrue(retained.needsRemoteRestore, "A trash that applies late still owes the real compensation")
-            XCTAssertTrue(retained.needsQueueSync)
-            XCTAssertEqual(retained.remote, main)
-            XCTAssertEqual(f.server.uploadRequestCount, uploads)
+    #if DEBUG
+        func testRestoredCompoundDetectsALateAppliedTrashBeforeQueueMutation() async throws {
+            try await withRestore829Fixture(.live) { f in
+                let main = try await f.initialBackup()
+                let checked = try f.restoredState(main, retainMemberTrash: true)
+                f.server.personTrash(main)
+                let uploads = f.server.uploadRequestCount
+                let before = try XCTUnwrap(
+                    try f.queue.entry(
+                        for: f.resolver.candidate.snapshot.source, revision: f.resolver.candidate.snapshot.revision))
+                let outcome = await f.controller.returnToBackup([checked])
+                XCTAssertEqual(outcome[f.key], .remoteTrashed)
+                XCTAssertEqual(try f.queue.entry(for: before.source, revision: before.revision), before)
+                XCTAssertTrue(
+                    f.pending.finishRestoreRecheck(checked, outcome: try XCTUnwrap(outcome[f.key]), at: f.clock.now))
+                let retained = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                XCTAssertTrue(retained.remoteTrashed)
+                XCTAssertTrue(retained.needsRemoteRestore, "A trash that applies late still owes the real compensation")
+                XCTAssertTrue(retained.needsQueueSync)
+                XCTAssertEqual(retained.remote, main)
+                XCTAssertEqual(f.server.uploadRequestCount, uploads)
+            }
         }
-    }
+    #endif
 
-    func testRestoredContextEndsOnShutdownAndDoesNotCrossAccountPipelines() async throws {
-        try await withRestore829Fixture(.live) { f in
-            let main = try await f.initialBackup()
-            let checked = try f.restoredState(main, retainMemberTrash: true)
-            _ = await f.controller.returnToBackup([checked])
-            let context = UploadRestoredCompoundContext(
-                source: f.resolver.candidate.snapshot.source,
-                revision: f.resolver.candidate.snapshot.revision, generation: checked.generation, confirmedRemote: main,
-                requiredMembers: f.resolver.secondaries.map { $0.descriptor.source.resource })
-            let active = try await f.pipeline.restoredPhotoOutcome(context)
-            XCTAssertEqual(active, .completed)
-            let other = UploadDedupePipeline(store: FakeIdentityStore(), checker: f.server)
-            let foreign = try await other.restoredPhotoOutcome(context)
-            XCTAssertEqual(foreign, .unreadable, "An account-local registration never crosses pipeline instances")
-            await f.controller.shutdown()
-            let ended = try await f.pipeline.restoredPhotoOutcome(context)
-            XCTAssertEqual(ended, .unreadable)
-            XCTAssertTrue(try XCTUnwrap(f.pending.sourceState(for: f.key)).needsQueueSync)
+    #if DEBUG
+        func testRestoredContextEndsOnShutdownAndDoesNotCrossAccountPipelines() async throws {
+            try await withRestore829Fixture(.live) { f in
+                let main = try await f.initialBackup()
+                let checked = try f.restoredState(main, retainMemberTrash: true)
+                _ = await f.controller.returnToBackup([checked])
+                let context = UploadRestoredCompoundContext(
+                    source: f.resolver.candidate.snapshot.source,
+                    revision: f.resolver.candidate.snapshot.revision, generation: checked.generation,
+                    confirmedRemote: main,
+                    requiredMembers: f.resolver.secondaries.map { $0.descriptor.source.resource })
+                let active = try await f.pipeline.restoredPhotoOutcome(context)
+                XCTAssertEqual(active, .completed)
+                let other = UploadDedupePipeline(store: FakeIdentityStore(), checker: f.server)
+                let foreign = try await other.restoredPhotoOutcome(context)
+                XCTAssertEqual(foreign, .unreadable, "An account-local registration never crosses pipeline instances")
+                await f.controller.shutdown()
+                let ended = try await f.pipeline.restoredPhotoOutcome(context)
+                XCTAssertEqual(ended, .unreadable)
+                XCTAssertTrue(try XCTUnwrap(f.pending.sourceState(for: f.key)).needsQueueSync)
+            }
         }
-    }
+    #endif
 }
 
 extension PhotoLibraryBackupControllerStateTests {
@@ -6197,112 +6262,121 @@ extension PhotoLibraryBackupControllerStateTests {
         func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .permanentFailure }
     }
 
-    func testAnEditThatReplacesTheRestoredPhotoEndsRestoreWithoutCompensation() async throws {
-        try await withRestore829Fixture(.burst, replacesEdits: true) { f in
-            @MainActor func makeCoordinator() throws -> PendingBackupCoordinator {
-                PendingBackupCoordinator(
-                    store: f.pending, queues: [.photoLibraryAsset: f.queue],
-                    metadataProvider: try XCTUnwrap(f.controller.pendingMetadataProvider),
-                    effects: Restore829ControllerEffects(controller: f.controller, server: f.server),
-                    recorder: f.controller.pendingRecorder, replacementJournal: f.journal, relations: f.server,
-                    now: { [clock = f.clock] in clock.now }
-                )
-            }
-            let restored = try await f.initialBackup(omittingSecondary: true)
-            _ = try f.restoredState(restored)
-            let coordinator = try makeCoordinator()
-            do {
-                await coordinator.start()
-                let pending = await coordinator.restoreSources(ofRemote: [restored])
-                guard case .waiting? = pending.outcomes[f.key] else {
-                    await coordinator.close()
-                    return XCTFail("Fixture prerequisite: Restore waits for the missing burst member")
+    #if DEBUG
+        func testAnEditThatReplacesTheRestoredPhotoEndsRestoreWithoutCompensation() async throws {
+            try await withRestore829Fixture(.burst, replacesEdits: true) { f in
+                @MainActor func makeCoordinator() throws -> PendingBackupCoordinator {
+                    PendingBackupCoordinator(
+                        store: f.pending, queues: [.photoLibraryAsset: f.queue],
+                        metadataProvider: try XCTUnwrap(f.controller.pendingMetadataProvider),
+                        effects: Restore829ControllerEffects(controller: f.controller, server: f.server),
+                        recorder: f.controller.pendingRecorder, replacementJournal: f.journal, relations: f.server,
+                        now: { [clock = f.clock] in clock.now }
+                    )
                 }
-                XCTAssertEqual(f.pending.sourceState(for: f.key)?.remote, restored)
+                let restored = try await f.initialBackup(omittingSecondary: true)
+                _ = try f.restoredState(restored)
+                let coordinator = try makeCoordinator()
+                do {
+                    await coordinator.start()
+                    let pending = await coordinator.restoreSources(ofRemote: [restored])
+                    guard case .waiting? = pending.outcomes[f.key] else {
+                        await coordinator.close()
+                        return XCTFail("Fixture prerequisite: Restore waits for the missing burst member")
+                    }
+                    XCTAssertEqual(f.pending.sourceState(for: f.key)?.remote, restored)
 
-                let (latest, edited) = try f.publishPhotosEdit()
-                let engine = UploadBackupSyncEngine(
-                    preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue)
-                _ = try await engine.enqueueBatch([latest])
-                try await f.drain(with: edited)
-                let row = try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
-                let replacing = f.identities.record(for: edited.primary.source)?.remoteLinkID
-                let oldState = f.server.links.first { $0.uid.nodeID == restored.nodeID }?.state
-                let retired: [String] = f.journal?.entry(for: edited.primary.source).retired ?? []
-                guard row?.state.isTerminalSuccess == true, oldState == .trashed, retired == [restored.nodeID],
-                    let replacing, replacing != restored.nodeID
-                else {
+                    let (latest, edited) = try f.publishPhotosEdit()
+                    let engine = UploadBackupSyncEngine(
+                        preflight: UploadBackupPreflightIndex(store: f.state), queue: f.queue)
+                    _ = try await engine.enqueueBatch([latest])
+                    try await f.drain(with: edited)
+                    let row = try f.queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)
+                    let replacing = f.identities.record(for: edited.primary.source)?.remoteLinkID
+                    let oldState = f.server.links.first { $0.uid.nodeID == restored.nodeID }?.state
+                    let retired: [String] = f.journal?.entry(for: edited.primary.source).retired ?? []
+                    guard row?.state.isTerminalSuccess == true, oldState == .trashed, retired == [restored.nodeID],
+                        let replacing, replacing != restored.nodeID
+                    else {
+                        await coordinator.close()
+                        return XCTFail(
+                            "Fixture prerequisite: the edit uploads and the replacement trashes the old main")
+                    }
+
+                    let due = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                    f.clock.advance(by: max(0, due.nextAttemptAt.timeIntervalSince(f.clock.now)) + 1)
+                    // An unrelated trigger runs a real reconcile pass, as a timer or another Restore would.
+                    _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
+                    let finalState = f.server.links.first { $0.uid.nodeID == restored.nodeID }?.state
+                    XCTAssertEqual(finalState, .trashed, "The photo the edit replaced must stay in the Proton trash")
+                    XCTAssertEqual(f.server.links.first { $0.linkID == replacing }?.state, .active)
+                    XCTAssertNil(
+                        f.pending.sourceState(for: f.key), "The edit ends the Restore duty of the replaced photo")
+                    XCTAssertTrue(
+                        f.server.steps.allSatisfy(\.violations.isEmpty), "\(f.server.steps.map(\.violations))")
+                } catch {
                     await coordinator.close()
-                    return XCTFail("Fixture prerequisite: the edit uploads and the replacement trashes the old main")
+                    throw error
                 }
-
-                let due = try XCTUnwrap(f.pending.sourceState(for: f.key))
-                f.clock.advance(by: max(0, due.nextAttemptAt.timeIntervalSince(f.clock.now)) + 1)
-                // An unrelated trigger runs a real reconcile pass, as a timer or another Restore would.
-                _ = await coordinator.restoreSources(ofRemote: [.init(volumeID: "vol", nodeID: "unrelated")])
-                let finalState = f.server.links.first { $0.uid.nodeID == restored.nodeID }?.state
-                XCTAssertEqual(finalState, .trashed, "The photo the edit replaced must stay in the Proton trash")
-                XCTAssertEqual(f.server.links.first { $0.linkID == replacing }?.state, .active)
-                XCTAssertNil(f.pending.sourceState(for: f.key), "The edit ends the Restore duty of the replaced photo")
-                XCTAssertTrue(f.server.steps.allSatisfy(\.violations.isEmpty), "\(f.server.steps.map(\.violations))")
-            } catch {
                 await coordinator.close()
-                throw error
             }
-            await coordinator.close()
         }
-    }
+    #endif
 
-    func testCoordinatorReconstructsAndAcknowledgesOnlyARealCompoundPassAfterRestart() async throws {
-        try await withRestore829Fixture(.live) { f in
-            @MainActor func makeCoordinator() throws -> PendingBackupCoordinator {
-                PendingBackupCoordinator(
-                    store: f.pending, queues: [.photoLibraryAsset: f.queue],
-                    metadataProvider: try XCTUnwrap(f.controller.pendingMetadataProvider),
-                    effects: Restore829ControllerEffects(controller: f.controller, server: f.server),
-                    recorder: f.controller.pendingRecorder, relations: f.server, now: { [clock = f.clock] in clock.now }
-                )
-            }
-            let main = try await f.initialBackup()
-            let checked = try f.restoredState(main, retainMemberTrash: true, marker: true)
-            let uploads = f.server.uploadRequestCount
-            var coordinator = try makeCoordinator()
-            do {
-                await coordinator.start()
-                let pending = await coordinator.restoreSources(ofRemote: [main])
-                guard case .waiting? = pending.outcomes[f.key] else {
-                    await coordinator.close()
-                    return XCTFail("An enqueue is not an acknowledged compound pass")
+    #if DEBUG
+        func testCoordinatorReconstructsAndAcknowledgesOnlyARealCompoundPassAfterRestart() async throws {
+            try await withRestore829Fixture(.live) { f in
+                @MainActor func makeCoordinator() throws -> PendingBackupCoordinator {
+                    PendingBackupCoordinator(
+                        store: f.pending, queues: [.photoLibraryAsset: f.queue],
+                        metadataProvider: try XCTUnwrap(f.controller.pendingMetadataProvider),
+                        effects: Restore829ControllerEffects(controller: f.controller, server: f.server),
+                        recorder: f.controller.pendingRecorder, relations: f.server,
+                        now: { [clock = f.clock] in clock.now }
+                    )
                 }
-                let durable = try XCTUnwrap(f.pending.sourceState(for: f.key))
-                XCTAssertEqual(durable.remote, main)
-                XCTAssertEqual(durable.attempts, checked.attempts)
-                XCTAssertTrue(durable.needsQueueSync)
-                XCTAssertEqual(durable.remoteOperation, .remoteTrash)
+                let main = try await f.initialBackup()
+                let checked = try f.restoredState(main, retainMemberTrash: true, marker: true)
+                let uploads = f.server.uploadRequestCount
+                var coordinator = try makeCoordinator()
+                do {
+                    await coordinator.start()
+                    let pending = await coordinator.restoreSources(ofRemote: [main])
+                    guard case .waiting? = pending.outcomes[f.key] else {
+                        await coordinator.close()
+                        return XCTFail("An enqueue is not an acknowledged compound pass")
+                    }
+                    let durable = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                    XCTAssertEqual(durable.remote, main)
+                    XCTAssertEqual(durable.attempts, checked.attempts)
+                    XCTAssertTrue(durable.needsQueueSync)
+                    XCTAssertEqual(durable.remoteOperation, .remoteTrash)
+                    await coordinator.close()
+                    try await f.relaunch()
+                    XCTAssertEqual(f.pending.sourceState(for: f.key), durable)
+                    f.clock.advance(by: max(0, durable.nextAttemptAt.timeIntervalSince(f.clock.now)))
+                    coordinator = try makeCoordinator()
+                    await coordinator.start()
+                    XCTAssertTrue(try XCTUnwrap(f.pending.sourceState(for: f.key)).needsQueueSync)
+                    await f.drain()
+                    let recheck = try XCTUnwrap(f.pending.sourceState(for: f.key))
+                    f.clock.advance(by: max(0, recheck.nextAttemptAt.timeIntervalSince(f.clock.now)))
+                    let completed = await coordinator.restoreSources(ofRemote: [main])
+                    XCTAssertEqual(completed.outcomes[f.key], .completed)
+                    XCTAssertNil(
+                        f.pending.sourceState(for: f.key),
+                        "Only a real, fresh, same-UID/generation recheck retires the marker")
+                    XCTAssertEqual(f.server.uploadRequestCount, uploads)
+                    XCTAssertEqual(
+                        f.server.links.filter { $0.state == .active && $0.mainLinkID == main.nodeID }.count, 1)
+                } catch {
+                    await coordinator.close()
+                    throw error
+                }
                 await coordinator.close()
-                try await f.relaunch()
-                XCTAssertEqual(f.pending.sourceState(for: f.key), durable)
-                f.clock.advance(by: max(0, durable.nextAttemptAt.timeIntervalSince(f.clock.now)))
-                coordinator = try makeCoordinator()
-                await coordinator.start()
-                XCTAssertTrue(try XCTUnwrap(f.pending.sourceState(for: f.key)).needsQueueSync)
-                await f.drain()
-                let recheck = try XCTUnwrap(f.pending.sourceState(for: f.key))
-                f.clock.advance(by: max(0, recheck.nextAttemptAt.timeIntervalSince(f.clock.now)))
-                let completed = await coordinator.restoreSources(ofRemote: [main])
-                XCTAssertEqual(completed.outcomes[f.key], .completed)
-                XCTAssertNil(
-                    f.pending.sourceState(for: f.key),
-                    "Only a real, fresh, same-UID/generation recheck retires the marker")
-                XCTAssertEqual(f.server.uploadRequestCount, uploads)
-                XCTAssertEqual(f.server.links.filter { $0.state == .active && $0.mainLinkID == main.nodeID }.count, 1)
-            } catch {
-                await coordinator.close()
-                throw error
             }
-            await coordinator.close()
         }
-    }
+    #endif
 }
 
 /// The lines of a recorded background log.

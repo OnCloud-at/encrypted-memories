@@ -329,23 +329,25 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
     }
 
-    func testAWindowThatStartsRightAfterTheSignOutFlagWritesNothingAfterThePurge() throws {
-        let purge = try makePurge()
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: purge.suite))
-        let ledger = makeLedger(purgeSuite: purge.suite)
-        let started = LockedValue<BackgroundWindowStart>()
-        let startedAt = minute(0)
-        BackupLocalDataPurge.afterPendingMarkForTesting = { started.set(ledger.begin(.photoBackup, at: startedAt)) }
-        defer { BackupLocalDataPurge.afterPendingMarkForTesting = nil }
+    #if DEBUG
+        func testAWindowThatStartsRightAfterTheSignOutFlagWritesNothingAfterThePurge() throws {
+            let purge = try makePurge()
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: purge.suite))
+            let ledger = makeLedger(purgeSuite: purge.suite)
+            let started = LockedValue<BackgroundWindowStart>()
+            let startedAt = minute(0)
+            BackupLocalDataPurge.afterPendingMarkForTesting = { started.set(ledger.begin(.photoBackup, at: startedAt)) }
+            defer { BackupLocalDataPurge.afterPendingMarkForTesting = nil }
 
-        BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
-        XCTAssertTrue(BackupLocalDataPurge.purgeIfSignOutRequested(defaults: defaults, roots: purge.roots))
-        ledger.end(try XCTUnwrap(started.value), with: .ran)
+            BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
+            XCTAssertTrue(BackupLocalDataPurge.purgeIfSignOutRequested(defaults: defaults, roots: purge.roots))
+            ledger.end(try XCTUnwrap(started.value), with: .ran)
 
-        XCTAssertFalse(
-            FileManager.default.fileExists(atPath: fileURL.path),
-            "a window that starts between the flag and the generation must not bring the file back")
-    }
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: fileURL.path),
+                "a window that starts between the flag and the generation must not bring the file back")
+        }
+    #endif
 
     func testAWindowThatStartsWhileASignOutPurgeIsPendingWritesNothingAtItsEnd() throws {
         let purge = try makePurge()

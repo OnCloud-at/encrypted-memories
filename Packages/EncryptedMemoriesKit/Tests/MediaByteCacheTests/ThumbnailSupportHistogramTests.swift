@@ -88,46 +88,50 @@ import Testing
         #expect(probe.entryReads == 0)
     }
 
-    @Test func actualStopPredicatesPreventEnumeratorCreation() async throws {
-        for mode in 0..<3 {
+    #if DEBUG
+        @Test func actualStopPredicatesPreventEnumeratorCreation() async throws {
+            for mode in 0..<3 {
+                let (root, cache) = try fixture(derivative: "thumbnail", sizes: [1])
+                defer { try? FileManager.default.removeItem(at: root) }
+                let probe = IteratorProbe()
+                let start = ContinuousClock.now
+                let deadline = start.advanced(by: .seconds(30))
+                let task = Task {
+                    await cache.supportSnapshotForTesting(
+                        deadline: deadline, onEntry: {},
+                        iteratorProbe: { step in
+                            probe.observe(step)
+                            if step == .rootReadCompleted {
+                                if mode == 0 { withUnsafeCurrentTask { $0?.cancel() } }
+                                if mode == 1 { probe.advanceClock() }
+                                if mode == 2 { cache.clearForSignOut() }
+                            }
+                        }, now: { probe.clockAdvanced ? deadline : start })
+                }
+                _ = await task.value
+                #expect(probe.rootReads == 1)
+                #expect(probe.enumeratorAttempts == 0)
+                #expect(probe.nextAttempts == 0)
+                #expect(probe.entryReads == 0)
+            }
+        }
+    #endif
+
+    #if DEBUG
+        @Test func cancelledAdmissionNeverCapturesLease() async throws {
             let (root, cache) = try fixture(derivative: "thumbnail", sizes: [1])
             defer { try? FileManager.default.removeItem(at: root) }
             let probe = IteratorProbe()
-            let start = ContinuousClock.now
-            let deadline = start.advanced(by: .seconds(30))
-            let task = Task {
-                await cache.supportSnapshotForTesting(
-                    deadline: deadline, onEntry: {},
-                    iteratorProbe: { step in
-                        probe.observe(step)
-                        if step == .rootReadCompleted {
-                            if mode == 0 { withUnsafeCurrentTask { $0?.cancel() } }
-                            if mode == 1 { probe.advanceClock() }
-                            if mode == 2 { cache.clearForSignOut() }
-                        }
-                    }, now: { probe.clockAdvanced ? deadline : start })
-            }
-            _ = await task.value
-            #expect(probe.rootReads == 1)
-            #expect(probe.enumeratorAttempts == 0)
-            #expect(probe.nextAttempts == 0)
-            #expect(probe.entryReads == 0)
+            let result = await Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                return await cache.supportSnapshotForTesting(
+                    deadline: .now.advanced(by: .seconds(30)), onEntry: {},
+                    afterLease: { probe.observe(.rootRead) })
+            }.value
+            #expect(result == .unavailable)
+            #expect(probe.rootReads == 0)
         }
-    }
-
-    @Test func cancelledAdmissionNeverCapturesLease() async throws {
-        let (root, cache) = try fixture(derivative: "thumbnail", sizes: [1])
-        defer { try? FileManager.default.removeItem(at: root) }
-        let probe = IteratorProbe()
-        let result = await Task {
-            withUnsafeCurrentTask { $0?.cancel() }
-            return await cache.supportSnapshotForTesting(
-                deadline: .now.advanced(by: .seconds(30)), onEntry: {},
-                afterLease: { probe.observe(.rootRead) })
-        }.value
-        #expect(result == .unavailable)
-        #expect(probe.rootReads == 0)
-    }
+    #endif
 
     @Test func negativeSizeReportsErrorWithoutCountingBlob() async throws {
         let (root, cache) = try fixture(derivative: "thumbnail", sizes: [])

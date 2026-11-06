@@ -19,69 +19,75 @@ import Testing
 /// renderer metrics, and an inverted switch fails it.
 @MainActor
 @Suite struct TimelineViewRetryVisibilityTests {
-    @Test func onlineRetryButtonFollowsTheFailureFlagByDirection() async throws {
-        // The real first-load failure route: the repository throws and `load()` mirrors the failure.
-        let shownFeed = makeFeed()
-        let shownModel = TimelineViewModel(repository: FailingStartupRepository(), feed: shownFeed.feedCore)
-        await shownModel.load()
-        guard case .failed(let message, let retryable) = shownModel.state else {
-            Issue.record("A thrown first load must surface the failure state")
-            return
-        }
-        #expect(retryable, "The production route must record a thrown first read as retryable")
-        let shown = try renderedPixels(of: shownModel, feed: shownFeed)
-        let shownRepeated = try renderedPixels(of: shownModel, feed: shownFeed)
-        #expect(
-            Self.differingPixels(shown, shownRepeated) == 0,
-            "Renders of the same failure state must be identical")
-
-        // Only the Retry affordance may change the render. Its layout height makes the centered stack
-        // taller, so the first ink row (the title symbol) sits higher; whether the renderer also draws
-        // the glass button itself does not matter. Strict inequalities hold for any metrics, and an
-        // inverted switch flips both of them.
-        let bare = try renderReplayedFailure(message: message, retryable: false)
-        let bareRepeated = try renderReplayedFailure(message: message, retryable: false)
-        let withButton = try renderReplayedFailure(message: message, retryable: true)
-        #expect(
-            Self.differingPixels(bare, bareRepeated) == 0,
-            "Renders of the failure without the Retry button must be identical")
-        #expect(
-            Self.differingPixels(withButton, bare) > 0,
-            "The retryable flag must change the render")
-        #expect(
-            Self.firstInkRow(withButton) < Self.firstInkRow(bare),
-            "The retryable flag must add the Retry button's layout height (first ink rows: \(Self.firstInkRow(withButton)) vs \(Self.firstInkRow(bare)))"
-        )
-        #expect(
-            Self.firstInkRow(shown) < Self.firstInkRow(bare),
-            "The real failure route must draw the Retry button (first ink rows: \(Self.firstInkRow(shown)) vs \(Self.firstInkRow(bare)))"
-        )
-    }
-
-    @Test func theErrorMessageDrawsOnTheErrorScreen() throws {
-        // A different description text must change the drawn pixels; this proves the failure text
-        // renders on macOS and the screen is not just the static background.
-        let first = try renderReplayedFailure(message: "First fixture failure", retryable: true)
-        let second = try renderReplayedFailure(message: "Second fixture failure", retryable: true)
-        #expect(
-            Self.differingPixels(first, second) > 300,
-            "The failure message must draw ink")
-    }
-
-    @Test func provisionalEmptyGridPreservesFailureRetryability() {
-        for retryable in [false, true] {
-            let feed = makeFeed()
-            let model = TimelineViewModel(repository: NoopRepository(), feed: feed.feedCore)
-            model.applyIsolatedInitialLoadEventsForTesting([.failed(message: "Failure", retryable: retryable)])
-            model.state = .empty
-            guard case .failed(let message, let actualRetryable) = model.gridState else {
-                Issue.record("A provisional empty grid must surface the first-load failure")
-                continue
+    #if DEBUG
+        @Test func onlineRetryButtonFollowsTheFailureFlagByDirection() async throws {
+            // The real first-load failure route: the repository throws and `load()` mirrors the failure.
+            let shownFeed = makeFeed()
+            let shownModel = TimelineViewModel(repository: FailingStartupRepository(), feed: shownFeed.feedCore)
+            await shownModel.load()
+            guard case .failed(let message, let retryable) = shownModel.state else {
+                Issue.record("A thrown first load must surface the failure state")
+                return
             }
-            #expect(message == "Failure")
-            #expect(actualRetryable == retryable)
+            #expect(retryable, "The production route must record a thrown first read as retryable")
+            let shown = try renderedPixels(of: shownModel, feed: shownFeed)
+            let shownRepeated = try renderedPixels(of: shownModel, feed: shownFeed)
+            #expect(
+                Self.differingPixels(shown, shownRepeated) == 0,
+                "Renders of the same failure state must be identical")
+
+            // Only the Retry affordance may change the render. Its layout height makes the centered stack
+            // taller, so the first ink row (the title symbol) sits higher; whether the renderer also draws
+            // the glass button itself does not matter. Strict inequalities hold for any metrics, and an
+            // inverted switch flips both of them.
+            let bare = try renderReplayedFailure(message: message, retryable: false)
+            let bareRepeated = try renderReplayedFailure(message: message, retryable: false)
+            let withButton = try renderReplayedFailure(message: message, retryable: true)
+            #expect(
+                Self.differingPixels(bare, bareRepeated) == 0,
+                "Renders of the failure without the Retry button must be identical")
+            #expect(
+                Self.differingPixels(withButton, bare) > 0,
+                "The retryable flag must change the render")
+            #expect(
+                Self.firstInkRow(withButton) < Self.firstInkRow(bare),
+                "The retryable flag must add the Retry button's layout height (first ink rows: \(Self.firstInkRow(withButton)) vs \(Self.firstInkRow(bare)))"
+            )
+            #expect(
+                Self.firstInkRow(shown) < Self.firstInkRow(bare),
+                "The real failure route must draw the Retry button (first ink rows: \(Self.firstInkRow(shown)) vs \(Self.firstInkRow(bare)))"
+            )
         }
-    }
+    #endif
+
+    #if DEBUG
+        @Test func theErrorMessageDrawsOnTheErrorScreen() throws {
+            // A different description text must change the drawn pixels; this proves the failure text
+            // renders on macOS and the screen is not just the static background.
+            let first = try renderReplayedFailure(message: "First fixture failure", retryable: true)
+            let second = try renderReplayedFailure(message: "Second fixture failure", retryable: true)
+            #expect(
+                Self.differingPixels(first, second) > 300,
+                "The failure message must draw ink")
+        }
+    #endif
+
+    #if DEBUG
+        @Test func provisionalEmptyGridPreservesFailureRetryability() {
+            for retryable in [false, true] {
+                let feed = makeFeed()
+                let model = TimelineViewModel(repository: NoopRepository(), feed: feed.feedCore)
+                model.applyIsolatedInitialLoadEventsForTesting([.failed(message: "Failure", retryable: retryable)])
+                model.state = .empty
+                guard case .failed(let message, let actualRetryable) = model.gridState else {
+                    Issue.record("A provisional empty grid must surface the first-load failure")
+                    continue
+                }
+                #expect(message == "Failure")
+                #expect(actualRetryable == retryable)
+            }
+        }
+    #endif
 
     // MARK: - Helpers
 
@@ -101,12 +107,14 @@ import Testing
     }
 
     /// Replays a first-load failure through the production reducer seam and renders its error screen.
-    private func renderReplayedFailure(message: String, retryable: Bool) throws -> [UInt8] {
-        let feed = makeFeed()
-        let model = TimelineViewModel(repository: NoopRepository(), feed: feed.feedCore)
-        model.applyIsolatedInitialLoadEventsForTesting([.failed(message: message, retryable: retryable)])
-        return try renderedPixels(of: model, feed: feed)
-    }
+    #if DEBUG
+        private func renderReplayedFailure(message: String, retryable: Bool) throws -> [UInt8] {
+            let feed = makeFeed()
+            let model = TimelineViewModel(repository: NoopRepository(), feed: feed.feedCore)
+            model.applyIsolatedInitialLoadEventsForTesting([.failed(message: message, retryable: retryable)])
+            return try renderedPixels(of: model, feed: feed)
+        }
+    #endif
 
     /// Offsets of pixels whose color differs between two same-sized RGBA renders.
     private static func differingPixelOffsets(_ lhs: [UInt8], _ rhs: [UInt8]) -> [Int] {
