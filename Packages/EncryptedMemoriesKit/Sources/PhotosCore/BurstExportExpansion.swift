@@ -84,6 +84,27 @@ public enum BurstExportExpansion {
         return .success(items: expanded, expandedSingleSeries: expandedSingleSeries)
     }
 
+    /// Decides which photos an iOS viewer share carries for the currently shown photo of a
+    /// burst series, from the filmstrip state the viewer already holds.
+    ///
+    /// A cached `filmstripLoadFailed` is the truth: the share must not re-read the group
+    /// (a loaded filmstrip stays shareable offline), but a failed read must block the
+    /// share instead of silently sending only the tapped photo. Even a partially seeded
+    /// filmstrip cannot rescue a failed read.
+    public static func expandViewerBurst(
+        current: PhotoItem,
+        filmstripItems: [PhotoItem],
+        filmstripLoadFailed: Bool
+    ) -> Result {
+        if filmstripLoadFailed {
+            return .burstReadFailed(failedSources: [current])
+        }
+        if filmstripItems.count > 1 {
+            return .success(items: filmstripItems, expandedSingleSeries: true)
+        }
+        return .success(items: [current], expandedSingleSeries: false)
+    }
+
     /// A cancelled read reaches this function as Swift's `CancellationError`, as the
     /// raw `URLError(.cancelled)` the URLSession transport rethrows, or as any
     /// error thrown while the surrounding task is already cancelled. None of
