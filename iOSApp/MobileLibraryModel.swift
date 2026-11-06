@@ -616,7 +616,7 @@ final class MobileLibraryModel {
         favoriteUIDs: [PhotoUID],
         onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void
     ) async throws {
-        guard let dissolution = facade?.seriesDissolution else { throw SeriesDissolutionError.notOwnLibrary }
+        guard let dissolution = facade?.seriesDissolution else { throw SeriesDissolutionError.libraryUnavailable }
         runningSeriesDissolutions += 1
         defer { runningSeriesDissolutions -= 1 }
         try await removeFromVisibleLibrary(Set(seriesUIDs)) {

@@ -142,6 +142,40 @@ final class MobileSeriesFavoritesTests: XCTestCase {
         XCTAssertEqual(probe.keepOnlyCalls.count, 1)
     }
 
+    @MainActor func testAMissingLibraryServiceReportsItsOwnReasonAndOffersNoRetry() async {
+        // The real route: a library model without a backend has no dissolution service. The failure is the
+        // missing service, not an own-library refusal, and a retry cannot bring the service back.
+        let libraryModel = MobileLibraryModel()
+        let seriesUID = PhotoUID(volumeID: "fixture", nodeID: "series-0")
+        do {
+            try await libraryModel.keepOnlySeriesFavorites(
+                seriesMainUID: seriesUID,
+                seriesUIDs: [seriesUID],
+                favoriteUIDs: [seriesUID]
+            ) { _ in }
+            XCTFail("Without a backend the operation must fail")
+        } catch {
+            let presentation = SeriesFailurePresentation(error: error)
+            XCTAssertEqual(
+                presentation.message, SeriesDissolutionError.libraryUnavailable.errorDescription
+            )
+            XCTAssertFalse(presentation.canRetry)
+        }
+    }
+
+    @MainActor func testTheOwnLibraryRefusalKeepsItsReasonAndRetry() async {
+        let probe = FlowProbe()
+        probe.injectedFailure = SeriesDissolutionError.notOwnLibrary
+        let model = probe.makeModel(canKeepOnlyFavorites: true)
+        model.toggleFavorite(probe.items[0].uid)
+
+        await model.keepOnlyMarkedFavorites()
+
+        XCTAssertEqual(model.failureMessage, SeriesDissolutionError.notOwnLibrary.errorDescription)
+        XCTAssertEqual(model.failureAlertMessage, SeriesDissolutionError.notOwnLibrary.errorDescription)
+        XCTAssertTrue(model.canRetryFailure)
+    }
+
     @MainActor func testTransientAndAmbiguousFailuresKeepRetryAndMarks() async {
         let failures: [SeriesDissolutionError] = [
             .notOwnLibrary, .alreadyRunning, .blockedByForeignDraft("example.jpg"),

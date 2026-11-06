@@ -157,6 +157,9 @@ extension SeriesAlbumCarryOver {
 public enum SeriesDissolutionError: LocalizedError, Equatable {
     /// The series is not in the account's own library (a shared album, or a foreign volume).
     case notOwnLibrary
+    /// The library service is missing, for example because uploads are off or the session closed mid-flow.
+    /// A retry cannot bring the service back, so no retry is offered.
+    case libraryUnavailable
     /// The selection is empty or names a photo outside the series.
     case invalidSelection
     case alreadyRunning
@@ -169,6 +172,7 @@ public enum SeriesDissolutionError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .notOwnLibrary: L10n.string("error.series_not_own_library")
+        case .libraryUnavailable: L10n.string("error.series_library_unavailable")
         case .invalidSelection: L10n.string("error.series_invalid_selection")
         case .alreadyRunning: L10n.string("error.series_already_running")
         case .blockedByForeignDraft(let name): L10n.string("error.series_draft_blocked \(name)")

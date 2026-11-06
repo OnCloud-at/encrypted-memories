@@ -5,8 +5,8 @@ import XCTest
 
 final class SeriesFailurePresentationTests: XCTestCase {
     private let failures: [SeriesDissolutionError] = [
-        .invalidSelection, .notOwnLibrary, .alreadyRunning, .blockedByForeignDraft("example.jpg"),
-        .copyNotConfirmed, .trashNotConfirmed,
+        .invalidSelection, .notOwnLibrary, .libraryUnavailable, .alreadyRunning,
+        .blockedByForeignDraft("example.jpg"), .copyNotConfirmed, .trashNotConfirmed,
     ]
 
     func testTypedFailuresKeepTheirExistingReason() {
@@ -25,6 +25,14 @@ final class SeriesFailurePresentationTests: XCTestCase {
 
     func testInvalidSelectionDoesNotOfferRetry() {
         XCTAssertFalse(SeriesFailurePresentation(error: SeriesDissolutionError.invalidSelection).canRetry)
+    }
+
+    func testAMissingLibraryDoesNotOfferRetry() {
+        let presentation = SeriesFailurePresentation(error: SeriesDissolutionError.libraryUnavailable)
+        XCTAssertFalse(presentation.canRetry)
+        XCTAssertEqual(presentation.message, SeriesDissolutionError.libraryUnavailable.errorDescription)
+        // The own-library refusal is a different situation, so the two reasons must never read alike.
+        XCTAssertNotEqual(presentation.message, SeriesDissolutionError.notOwnLibrary.errorDescription)
     }
 
     func testTransientAndAmbiguousFailuresKeepRetry() {

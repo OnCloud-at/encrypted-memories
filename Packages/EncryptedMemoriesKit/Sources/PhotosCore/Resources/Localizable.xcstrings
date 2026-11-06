@@ -4418,6 +4418,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Nur Serien in deiner eigenen Mediathek lassen sich auf Favoriten reduzieren." } }
       }
     },
+    "error.series_library_unavailable": {
+      "extractionState": "manual",
+      "comment": "Keep Only Favorites failed: the library's upload service is missing, for example because uploads are off. No retry is offered.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The library is not available right now." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Bibliothek ist gerade nicht verfügbar." } }
+      }
+    },
     "error.series_invalid_selection": {
       "extractionState": "manual",
       "localizations": {
