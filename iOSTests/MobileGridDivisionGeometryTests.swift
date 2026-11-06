@@ -32,20 +32,29 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
         host.configure(items: items, thumbnailFeed: feed, fillOrder: .topLeading, initialViewportPlacement: .oldest)
         host.layoutIfNeeded()
         let sourceProfile = host.currentProfile()
+        XCTAssertEqual(sourceProfile.id, "touchRegularTimeline")
+        XCTAssertEqual(sourceProfile.defaultLevel, 1)
         let sourceEngine = host.currentEngine(profile: sourceProfile)
         let sourceWidth = UIKitTimelineGridProfileAdapter.layoutSize(
             forBounds: host.bounds, safeAreaInsets: host.safeAreaInsets
         ).width
-        let sourceLevel = sourceProfile.defaultLevel
+        XCTAssertEqual(sourceWidth, 867)
+        // Touch-regular level 1 uses 6 columns with a gap of 3, so its tile side is (867 - 3 x 5) / 6 = 142.
+        XCTAssertEqual(
+            sourceEngine.resolvedMetrics(level: 1, width: sourceWidth).slotSide, 142, accuracy: 0.001)
         host.frame.size.width = 402
         let targetProfile = host.currentProfile()
+        XCTAssertEqual(targetProfile.id, "touchCompactTimeline")
         let targetEngine = host.currentEngine(profile: targetProfile)
         let targetWidth = UIKitTimelineGridProfileAdapter.layoutSize(
             forBounds: host.bounds, safeAreaInsets: host.safeAreaInsets
         ).width
-        let expected = sourceEngine.closestVisualLevel(
-            sourceLevel: sourceLevel, sourceWidth: sourceWidth, in: targetEngine, targetWidth: targetWidth)
-        XCTAssertEqual(host.interactiveLevel, expected, "Profile changes compare the tile sizes actually displayed")
+        XCTAssertEqual(targetWidth, 402)
+        // Touch-compact tile sides at 402 are 201, (402 - 3 x 2) / 3 = 132, 78.4 and 55.71, so level 1 stays
+        // the closest match to the 142 pt tiles of the source profile.
+        XCTAssertEqual(
+            targetEngine.resolvedMetrics(level: 1, width: targetWidth).slotSide, 132, accuracy: 0.001)
+        XCTAssertEqual(host.interactiveLevel, 1, "Profile changes compare the tile sizes actually displayed")
     }
 
     @MainActor func testGridUsesFullWidthAndKeepsHitTargetsInBothLayoutDirections() throws {
