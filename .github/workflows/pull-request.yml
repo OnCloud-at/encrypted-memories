@@ -348,7 +348,10 @@ jobs:
     name: iOS UI verification
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: xcode-27
-    timeout-minutes: 90
+    # The slowest finished queue run took 88 minutes, and another was cancelled at the 90-minute
+    # job limit although no test failed; the merge queue then removed the pull request. 120 minutes
+    # gives a slow runner the same headroom that ios-verification already has. Refs #1197.
+    timeout-minutes: 120
     outputs:
       ui: ${{ steps.ui.outcome }}
     steps:
