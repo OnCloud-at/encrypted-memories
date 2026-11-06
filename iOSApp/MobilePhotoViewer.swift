@@ -849,11 +849,30 @@ struct MobilePhotoViewer: View {
     private func shareCurrentItem() {
         guard let base = currentBaseItem, libraryModel.backend != nil else { return }
         let item = editedOriginal.displayed(base)
-        let items = burstBelongsToCurrentPage ? burstSelection.exportItems(current: item) : [item]
-        selection.startShare(
-            items: items, backend: libraryModel.viewerMedia,
-            failureMessage: String(localized: "viewer.share_failed")
-        )
+        let result: BurstExportExpansion.Result
+        if burstBelongsToCurrentPage {
+            result = BurstExportExpansion.expandViewerBurst(
+                current: item,
+                filmstripItems: burstSelection.items,
+                filmstripLoadFailed: burstSelection.loadFailed
+            )
+        } else {
+            // A burst that does not belong to the current page shares the single photo.
+            result = .success(items: [item], expandedSingleSeries: false)
+        }
+        switch result {
+        case .success(let items, _):
+            selection.startShare(
+                items: items, backend: libraryModel.viewerMedia,
+                failureMessage: String(localized: "viewer.share_failed")
+            )
+        case .burstReadFailed:
+            // Nothing leaves the app for a burst the viewer could not read completely.
+            selection.actionError = MobileSelectionError(
+                message: String(localized: "viewer.share_failed"))
+        case .cancelled:
+            break
+        }
     }
 
     private func requestViewerMutation() {

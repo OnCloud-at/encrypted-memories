@@ -191,6 +191,61 @@ final class BurstExportExpansionTests: XCTestCase {
 
         XCTAssertEqual(result, .success(items: items, expandedSingleSeries: true))
     }
+
+    // MARK: - Viewer share with a cached filmstrip state (#1177)
+
+    func testBurstShareWithAFailedFilmstripReadIsNeverASingleShare() {
+        let current = item("burst", burst: true)
+        let seeded = group(count: 2, around: current)
+
+        let result = BurstExportExpansion.expandViewerBurst(
+            current: current,
+            filmstripItems: seeded,
+            filmstripLoadFailed: true
+        )
+
+        // A failed filmstrip read must block the share even though a partial
+        // seeded filmstrip is present: sharing only the tapped photo would leak
+        // an incomplete burst.
+        XCTAssertEqual(result, .burstReadFailed(failedSources: [current]))
+    }
+
+    func testFailedFilmstripReadWithoutSeededItemsStillBlocksTheShare() {
+        let current = item("burst", burst: true)
+
+        let result = BurstExportExpansion.expandViewerBurst(
+            current: current,
+            filmstripItems: [],
+            filmstripLoadFailed: true
+        )
+
+        XCTAssertEqual(result, .burstReadFailed(failedSources: [current]))
+    }
+
+    func testLoadedFilmstripSharesEveryMember() {
+        let current = item("burst", burst: true)
+        let filmstrip = group(count: 3, around: current)
+
+        let result = BurstExportExpansion.expandViewerBurst(
+            current: current,
+            filmstripItems: filmstrip,
+            filmstripLoadFailed: false
+        )
+
+        XCTAssertEqual(result, .success(items: filmstrip, expandedSingleSeries: true))
+    }
+
+    func testFilmstripWithoutMultipleItemsSharesOnlyTheCurrentPhoto() {
+        let current = item("burst", burst: true)
+
+        let result = BurstExportExpansion.expandViewerBurst(
+            current: current,
+            filmstripItems: [current],
+            filmstripLoadFailed: false
+        )
+
+        XCTAssertEqual(result, .success(items: [current], expandedSingleSeries: false))
+    }
 }
 
 private enum TestError: Error {

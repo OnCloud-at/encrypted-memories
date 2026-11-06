@@ -135,6 +135,89 @@ final class BurstSelectionModelTests: XCTestCase {
         XCTAssertEqual(selection.gridReturnCandidates(current: selected, base: base).map(\.uid.nodeID), ["c", "b"])
     }
 
+    /// #1177 evidence: for every state `BurstSelectionModel` can reach through its own
+    /// mutations, `hasFilmstrip` and the core's `count > 1` rule agree, and the viewer
+    /// entry keeps today's success behavior exactly wherever nothing failed.
+    func testViewerBurstEntryAgreesWithHasFilmstripInEveryModelState() {
+        let current = item("b", members: ["a", "b", "c"])
+        let complete = [
+            item("a", members: ["a", "b", "c"]),
+            current,
+            item("c", members: ["a", "b", "c"]),
+        ]
+
+        func makeStates() -> [(String, BurstSelectionModel)] {
+            var states: [(String, BurstSelectionModel)] = []
+
+            var empty = BurstSelectionModel()
+            states.append(("empty", empty))
+
+            var seeded = BurstSelectionModel()
+            seeded.seedKnownGroup(for: current, knownItems: complete)
+            states.append(("seeded", seeded))
+
+            var partialSeed = BurstSelectionModel()
+            partialSeed.seedKnownGroup(for: current, knownItems: Array(complete.prefix(2)))
+            states.append(("partially seeded", partialSeed))
+
+            var loaded = BurstSelectionModel()
+            _ = loaded.beginLoadingIfCandidate(current)
+            loaded.applyLoadedGroup(complete, containing: current)
+            states.append(("loaded", loaded))
+
+            var singletonLoad = BurstSelectionModel()
+            _ = singletonLoad.beginLoadingIfCandidate(current)
+            singletonLoad.applyLoadedGroup([current], containing: current)
+            states.append(("singleton load", singletonLoad))
+
+            var emptyLoad = BurstSelectionModel()
+            _ = emptyLoad.beginLoadingIfCandidate(current)
+            emptyLoad.applyLoadedGroup([], containing: current)
+            states.append(("empty provider result", emptyLoad))
+
+            var failedSeeded = BurstSelectionModel()
+            failedSeeded.seedKnownGroup(for: current, knownItems: complete)
+            _ = failedSeeded.beginLoadingIfCandidate(current)
+            failedSeeded.failLoading()
+            states.append(("failed with seeded items", failedSeeded))
+
+            var failedEmpty = BurstSelectionModel()
+            _ = failedEmpty.beginLoadingIfCandidate(current)
+            failedEmpty.failLoading()
+            states.append(("failed without seeded items", failedEmpty))
+
+            var loading = BurstSelectionModel()
+            _ = loading.beginLoadingIfCandidate(current)
+            states.append(("still loading", loading))
+
+            return states
+        }
+
+        for (name, selection) in makeStates() {
+            XCTAssertTrue(selection.hasFilmstrip == (selection.items.count > 1), name)
+
+            let result = BurstExportExpansion.expandViewerBurst(
+                current: current,
+                filmstripItems: selection.items,
+                filmstripLoadFailed: selection.loadFailed
+            )
+
+            if selection.loadFailed {
+                XCTAssertEqual(
+                    result, .burstReadFailed(failedSources: [current]),
+                    "state: \(name)")
+            } else {
+                XCTAssertEqual(
+                    result,
+                    .success(
+                        items: selection.exportItems(current: current),
+                        expandedSingleSeries: selection.hasFilmstrip
+                    ),
+                    "state: \(name)")
+            }
+        }
+    }
+
     private func item(_ id: String, volume: String = "v", members: [String] = []) -> PhotoItem {
         PhotoItem(
             uid: PhotoUID(volumeID: volume, nodeID: id),
