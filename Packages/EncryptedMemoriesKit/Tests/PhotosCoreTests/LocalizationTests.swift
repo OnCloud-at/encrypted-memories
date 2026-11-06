@@ -118,6 +118,21 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    /// Pins the English and German text of the missing-library reason of Keep Only Favorites.
+    func testSeriesLibraryUnavailableCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            (
+                "error.series_library_unavailable",
+                "The library is not available right now.",
+                "Die Bibliothek ist gerade nicht verfügbar."
+            )
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
     func testBurstExportFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
         let texts: [(String, String, String)] = [
             (
