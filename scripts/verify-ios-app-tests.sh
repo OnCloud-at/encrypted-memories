@@ -204,15 +204,7 @@ else
   encryptedmemories_pin_generated_project_packages "$ROOT"
 
   echo "[ios-tests] resolving pinned packages into shared cache"
-  xcrun xcodebuild \
-    -resolvePackageDependencies \
-    -project "$ROOT/EncryptedMemories.xcodeproj" \
-    -scheme "$SCHEME" \
-    -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
-    -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
-    -packageAuthorizationProvider netrc \
-    -onlyUsePackageVersionsFromResolvedFile
-
+  encryptedmemories_resolve_xcode_packages "$SCHEME" "$ROOT/EncryptedMemories.xcodeproj"
 fi
 
 # After a prepared build, the test run starts from the test run file of that build. That skips loading the project and

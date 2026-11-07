@@ -87,6 +87,15 @@ exit {status}
         result = self.run_script('check-swift-format.sh', self.sample, SWIFT_FORMAT_EXECUTABLE=str(tool_path))
         self.assertEqual(result.returncode, 1)
 
+    def test_an_empty_selection_exits_cleanly_in_the_system_bash(self):
+        # An empty file array under `set -u` was an unbound variable error in bash 3.2 and in 4.0 to 4.3, so this runs
+        # /bin/bash on purpose; it only matters where that is an old bash (macOS).
+        env = {key: value for key, value in os.environ.items() if key != 'SWIFT_FORMAT_EXECUTABLE'}
+        result = subprocess.run(['/bin/bash', str(ROOT / 'scripts' / 'check-swift-format.sh'), '--diff', 'HEAD', 'HEAD'],
+                                capture_output=True, text=True, env=env, cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('No Swift files require a format check.', result.stdout)
+
     def canary_swiftlint(self, fires=True):
         # The canary file has a forbidden comment: a working SwiftLint reports it with exit 2.
         body = f'''if [[ "$1" == "version" ]]; then echo 0.65.1; exit 0; fi

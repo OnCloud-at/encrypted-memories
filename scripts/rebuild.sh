@@ -43,12 +43,7 @@ xcodegen generate >/dev/null
 encryptedmemories_pin_generated_project_packages "$ROOT"
 
 echo "Resolving pinned packages into shared cache"
-xcodebuild -resolvePackageDependencies \
-    -project "$PROJECT" -scheme "$MAC_SCHEME" \
-    -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
-    -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
-    -packageAuthorizationProvider netrc \
-    -onlyUsePackageVersionsFromResolvedFile
+encryptedmemories_resolve_xcode_packages "$MAC_SCHEME" "$PROJECT"
 
 SIGNING_IDENTITY_HASH="${ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY:-}"
 MAC_SIGN_ARGS=(CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM")

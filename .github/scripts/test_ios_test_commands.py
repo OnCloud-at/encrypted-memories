@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,7 +23,7 @@ ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES="$TEST_ROOT/packages"
 ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE="$TEST_ROOT/cache"
 encryptedmemories_acquire_build_lock() { :; }
 encryptedmemories_pin_generated_project_packages() { :; }
-''')
+''' + self.resolver_function())
         (self.root / 'BuildSupport').mkdir()
         (self.root / 'BuildSupport/Package.resolved').write_text('{}')
         pinned = self.root / 'EncryptedMemories.xcodeproj/project.xcworkspace/xcshareddata/swiftpm'
@@ -62,6 +63,14 @@ if sys.argv[1:2] == ['xcodebuild']:
             command = self.root / 'bin' / name
             command.write_text(launcher)
             command.chmod(0o755)
+
+    @staticmethod
+    def resolver_function():
+        """The real package-resolve helper of scripts/build-paths.sh, so the script under test runs it unchanged."""
+        text = (Path(__file__).resolve().parents[2] / 'scripts/build-paths.sh').read_text()
+        match = re.search(r'^encryptedmemories_resolve_xcode_packages\(\) \{.*?^\}\n', text, re.S | re.M)
+        assert match, 'encryptedmemories_resolve_xcode_packages is missing in scripts/build-paths.sh'
+        return match.group(0)
 
     def tearDown(self):
         self.scratch.cleanup()
