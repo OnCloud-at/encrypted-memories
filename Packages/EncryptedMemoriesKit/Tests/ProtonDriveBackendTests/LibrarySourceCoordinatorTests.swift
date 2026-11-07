@@ -26,8 +26,8 @@ struct LibrarySourceCoordinatorTests {
         #expect(result.itemErrors[uid] == nil)
         #expect(delivered.data(for: trashUID) != nil)
         let during = await coordinator.snapshot()
-        #expect(during.selectedProjection.timeline.uids == before.selectedProjection.timeline.uids)
-        #expect(during.retentionProjection.timeline.uids == before.retentionProjection.timeline.uids)
+        #expect(during.selectedScope.orderedUIDs == before.selectedScope.orderedUIDs)
+        #expect(during.retentionScope.orderedUIDs == before.retentionScope.orderedUIDs)
         #expect(during.selectedScope.uids == before.selectedScope.uids)
         #expect(during.analysisScope.uids == before.analysisScope.uids)
         #expect(during.retentionScope.uids == before.retentionScope.uids)
@@ -121,7 +121,7 @@ struct LibrarySourceCoordinatorTests {
         #expect(change.selectedScope.uids == [primaryUID])
         #expect(change.analysisScope.uids == [primaryUID, remoteUID])
         #expect(change.thumbnailRetentionScope.uids == [primaryUID, remoteUID])
-        #expect(change.selectedProjection.timeline.uids == [primaryUID])
+        #expect(change.selectedScope.orderedUIDs == [primaryUID])
         await coordinator.shutdown()
     }
 

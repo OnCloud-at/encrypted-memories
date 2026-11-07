@@ -64,21 +64,20 @@ final class LibrarySourceGraphTests: XCTestCase {
         edited.timelineOrder = .init(exactCaptureTime: Date(timeIntervalSince1970: 500.8))
         var graph = LibrarySourceGraph()
         _ = install(firstSource, items: [edited, earlier], in: &graph)
-        XCTAssertEqual(graph.selectedProjection().timeline.uids, [earlier.uid, edited.uid])
-        XCTAssertEqual(
-            graph.selectedProjection().timeline.snapshot.item(for: edited.uid)?.timelineOrder, edited.timelineOrder)
+        XCTAssertEqual(graph.snapshot().selectedScope.orderedUIDs, [earlier.uid, edited.uid])
 
         // An overlapping source without order evidence must not erase the refined primary capture order.
         _ = install(secondSource, items: [item("0-edited", time: 500), item("z-earlier", time: 500)], in: &graph)
-        XCTAssertEqual(graph.selectedProjection().timeline.uids, [earlier.uid, edited.uid])
-        XCTAssertEqual(
-            graph.selectedProjection().timeline.snapshot.item(for: edited.uid)?.timelineOrder, edited.timelineOrder)
+        XCTAssertEqual(graph.snapshot().selectedScope.orderedUIDs, [earlier.uid, edited.uid])
+        let merged = LibrarySourceGraph.merge(
+            preferred: .complete(edited), fallback: .complete(item("0-edited", time: 500)))
+        XCTAssertEqual(merged.item.timelineOrder, edited.timelineOrder)
 
         var fallbackGraph = LibrarySourceGraph()
         _ = install(
             firstSource, items: [item("0-edited", time: 500), item("z-earlier", time: 500)], in: &fallbackGraph)
         _ = install(secondSource, items: [edited, earlier], in: &fallbackGraph)
-        XCTAssertEqual(fallbackGraph.selectedProjection().timeline.uids, [earlier.uid, edited.uid])
+        XCTAssertEqual(fallbackGraph.snapshot().selectedScope.orderedUIDs, [earlier.uid, edited.uid])
     }
 
     func testRenewalAfterAMetadataRefreshKeepsTheRouteAndTheSource() throws {
@@ -187,17 +186,19 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertNil(second.renewed(lease), "a lease never crosses an account or session")
     }
 
-    func testProjectionDeduplicatesResourceIdentityAndKeepsEveryMembership() throws {
+    func testSelectedOrderDeduplicatesResourceIdentityAndKeepsEveryMembership() throws {
         let duplicate = item("same", time: 10)
         var graph = LibrarySourceGraph()
         _ = install(firstSource, items: [duplicate, item("first-only", time: 20)], in: &graph)
         _ = install(secondSource, items: [duplicate, item("second-only", time: 30)], in: &graph)
 
-        let projection = graph.selectedProjection()
+        let scope = graph.snapshot().selectedScope
 
-        XCTAssertEqual(projection.timeline.uids.map(\.nodeID), ["same", "first-only", "second-only"])
-        XCTAssertEqual(projection.sourceIDs(for: duplicate.uid), [firstSource.id, secondSource.id])
-        XCTAssertEqual(projection.timeline.snapshot.count, 3)
+        XCTAssertEqual(scope.orderedUIDs.map(\.nodeID), ["same", "first-only", "second-only"])
+        XCTAssertEqual(scope.uids.count, 3)
+        for source in [firstSource, secondSource] {
+            XCTAssertEqual(graph.inventory(for: source.id)?.items.contains { $0.uid == duplicate.uid }, true)
+        }
     }
 
     func testHigherPrecedenceCompleteMetadataWinsWithoutCrossSourceTagLeakage() throws {
@@ -220,11 +221,7 @@ final class LibrarySourceGraphTests: XCTestCase {
             tags: [.videos],
             burstMemberIDs: ["b", "c"]
         )
-        var graph = LibrarySourceGraph()
-        _ = install(secondSource, items: [fallback], in: &graph)
-        _ = install(firstSource, items: [preferred], in: &graph)
-
-        let merged = try XCTUnwrap(graph.selectedProjection().timeline.snapshot.item(for: preferred.uid))
+        let merged = LibrarySourceGraph.merge(preferred: .complete(preferred), fallback: .complete(fallback)).item
 
         XCTAssertEqual(merged.captureTime, preferred.captureTime)
         XCTAssertEqual(merged.mediaType, "image/heic")
@@ -233,6 +230,13 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertNil(merged.durationSeconds)
         XCTAssertEqual(merged.tags, [.favorites])
         XCTAssertEqual(merged.burstMemberIDs, ["a", "b"])
+
+        // Through the graph, the higher-precedence capture time decides the position, whatever the install order.
+        let middle = item("middle", time: 50)
+        var graph = LibrarySourceGraph()
+        _ = install(secondSource, items: [fallback, middle], in: &graph)
+        _ = install(firstSource, items: [preferred], in: &graph)
+        XCTAssertEqual(graph.snapshot().selectedScope.orderedUIDs.map(\.nodeID), ["same", "middle"])
     }
 
     func testKnownLowerPrecedenceFieldsFillOnlyExplicitlyUnknownMetadata() throws {
@@ -252,30 +256,11 @@ final class LibrarySourceGraphTests: XCTestCase {
             tags: [.videos],
             burstMemberIDs: ["a", "b"]
         )
-        var graph = LibrarySourceGraph()
-        let sourceSetLease = graph.beginSourceSetRefresh()
-        _ = try XCTUnwrap(graph.commitSourceSet([firstSource, secondSource], using: sourceSetLease))
-        let preferredLease = try XCTUnwrap(graph.beginRefresh(firstSource.id))
-        _ = try XCTUnwrap(
-            graph.commit(
-                [
-                    LibrarySourceItem(
-                        item: preferred,
-                        knownFields: [.captureTime, .mediaType]
-                    )
-                ],
-                validationToken: nil,
-                using: preferredLease
-            )
+        let metadata = LibrarySourceGraph.merge(
+            preferred: LibrarySourceItem(item: preferred, knownFields: [.captureTime, .mediaType]),
+            fallback: .complete(fallback)
         )
-        let fallbackLease = try XCTUnwrap(graph.beginRefresh(secondSource.id))
-        _ = try XCTUnwrap(
-            graph.commit([.complete(fallback)], validationToken: nil, using: fallbackLease)
-        )
-
-        let projection = graph.selectedProjection()
-        let merged = try XCTUnwrap(projection.timeline.snapshot.item(for: preferred.uid))
-        let metadata = try XCTUnwrap(projection.metadata(for: preferred.uid))
+        let merged = metadata.item
 
         XCTAssertEqual(merged.captureTime, preferred.captureTime)
         XCTAssertEqual(merged.mediaType, preferred.mediaType)
@@ -297,7 +282,8 @@ final class LibrarySourceGraphTests: XCTestCase {
 
         XCTAssertTrue(firstRemoval.orphanedUIDs.isEmpty)
         XCTAssertEqual(firstRemoval.retentionScope.uids, [duplicate.uid])
-        XCTAssertEqual(firstRemoval.selectedProjection.sourceIDs(for: duplicate.uid), [secondSource.id])
+        XCTAssertEqual(firstRemoval.selectedScope.orderedUIDs, [duplicate.uid])
+        XCTAssertEqual(firstRemoval.selectedScope.sourceIDs, [secondSource.id])
 
         let finalRemoval = try XCTUnwrap(graph.removeSource(secondSource.id))
 
@@ -321,7 +307,7 @@ final class LibrarySourceGraphTests: XCTestCase {
                 using: staleLease
             )
         )
-        XCTAssertTrue(graph.retentionProjection().timeline.snapshot.isEmpty)
+        XCTAssertTrue(graph.snapshot().retentionScope.orderedUIDs.isEmpty)
     }
 
     func testTransientFailureRetainsCachedInventoryButDefersDestructiveReconciliation() throws {
@@ -332,7 +318,7 @@ final class LibrarySourceGraphTests: XCTestCase {
 
         let change = try XCTUnwrap(graph.failRefresh(using: lease))
 
-        XCTAssertEqual(change.selectedProjection.timeline.uids, [cached.uid])
+        XCTAssertEqual(change.selectedScope.orderedUIDs, [cached.uid])
         XCTAssertEqual(change.selectedScope.uids, [cached.uid])
         XCTAssertFalse(change.selectedScope.isAuthoritative)
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.accessState, .temporarilyUnavailable)
@@ -361,8 +347,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         _ = try XCTUnwrap(graph.commitSourceSet([firstSource], using: catalogLease))
 
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.source.isIncluded, false)
-        XCTAssertTrue(graph.selectedProjection().timeline.snapshot.isEmpty)
-        XCTAssertEqual(graph.retentionProjection().timeline.uids, [retained.uid])
+        XCTAssertTrue(graph.snapshot().selectedScope.orderedUIDs.isEmpty)
+        XCTAssertEqual(graph.snapshot().retentionScope.orderedUIDs, [retained.uid])
     }
 
     func testCapabilityRoutingUsesHighestPrecedenceEligibleMembership() throws {
@@ -376,11 +362,9 @@ final class LibrarySourceGraphTests: XCTestCase {
         _ = install(firstSource, items: [duplicate], in: &graph)
         _ = install(writableFallback, items: [duplicate], in: &graph)
 
-        let projection = graph.selectedProjection()
-
-        XCTAssertEqual(projection.preferredSourceID(for: duplicate.uid, requiring: .readContent), firstSource.id)
-        XCTAssertEqual(projection.preferredSourceID(for: duplicate.uid, requiring: .writeContent), secondSource.id)
-        XCTAssertNil(projection.preferredSourceID(for: duplicate.uid, requiring: .removeSource))
+        XCTAssertEqual(graph.accessLease(for: duplicate.uid, requiring: .readContent)?.sourceID, firstSource.id)
+        XCTAssertEqual(graph.accessLease(for: duplicate.uid, requiring: .writeContent)?.sourceID, secondSource.id)
+        XCTAssertNil(graph.accessLease(for: duplicate.uid, requiring: .removeSource))
     }
 
     func testProjectionOrderIsCanonicalRegardlessOfSourceRegistrationOrder() throws {
@@ -396,16 +380,14 @@ final class LibrarySourceGraphTests: XCTestCase {
         _ = install(secondSource, items: [earlier, tieLow], in: &two)
         _ = install(firstSource, items: [tieHigh], in: &two)
 
-        XCTAssertEqual(one.selectedProjection().timeline.snapshot, two.selectedProjection().timeline.snapshot)
-        XCTAssertEqual(one.selectedProjection().timeline.uids.map(\.nodeID), ["z", "a", "b"])
-        XCTAssertEqual(one.selectedDerivedDataScope().orderedUIDs.map(\.nodeID), ["z", "a", "b"])
+        XCTAssertEqual(one.snapshot().selectedScope.orderedUIDs.map(\.nodeID), ["z", "a", "b"])
         XCTAssertEqual(
-            one.selectedDerivedDataScope().orderedUIDs,
-            two.selectedDerivedDataScope().orderedUIDs
+            one.snapshot().selectedScope.orderedUIDs,
+            two.snapshot().selectedScope.orderedUIDs
         )
         XCTAssertEqual(
-            one.selectedDerivedDataScope().isAuthoritative,
-            two.selectedDerivedDataScope().isAuthoritative
+            one.snapshot().selectedScope.isAuthoritative,
+            two.snapshot().selectedScope.isAuthoritative
         )
     }
 
@@ -421,7 +403,9 @@ final class LibrarySourceGraphTests: XCTestCase {
 
         XCTAssertEqual(change.orphanedUIDs, [removedFromFirst.uid])
         XCTAssertEqual(change.retentionScope.uids, [shared.uid])
-        XCTAssertEqual(change.selectedProjection.sourceIDs(for: shared.uid), [secondSource.id])
+        XCTAssertEqual(change.selectedScope.orderedUIDs, [shared.uid])
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [])
+        XCTAssertEqual(graph.inventory(for: secondSource.id)?.items.map(\.uid), [shared.uid])
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.validationToken, "next")
     }
 
@@ -452,7 +436,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         var graph = LibrarySourceGraph()
         let previous = install(firstSource, items: [a, b], in: &graph).selectedScope
         _ = try XCTUnwrap(graph.beginRefresh(firstSource.id))
-        let partial = graph.selectedDerivedDataScope()
+        let partial = graph.snapshot().selectedScope
 
         XCTAssertEqual(partial.delta(from: previous).removedUIDs, [])
         XCTAssertFalse(partial.delta(from: previous).allowsDestructiveReconciliation)
@@ -473,8 +457,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         let restored = try JSONDecoder().decode(LibrarySourceInventory.self, from: data)
         let graph = try LibrarySourceGraph(restoring: [restored])
 
-        XCTAssertEqual(graph.selectedProjection().timeline.uids.map(\.nodeID), ["cached"])
-        XCTAssertFalse(graph.selectedDerivedDataScope().isAuthoritative)
+        XCTAssertEqual(graph.snapshot().selectedScope.orderedUIDs.map(\.nodeID), ["cached"])
+        XCTAssertFalse(graph.snapshot().selectedScope.isAuthoritative)
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.validationToken, "token")
     }
 
@@ -489,14 +473,14 @@ final class LibrarySourceGraphTests: XCTestCase {
 
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.accessState, .temporarilyUnavailable)
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.authority, .cached)
-        XCTAssertFalse(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertFalse(graph.snapshot().retentionScope.isAuthoritative)
     }
 
     func testEmptyUndiscoveredGraphCannotAuthorizeGlobalDeletion() {
         let graph = LibrarySourceGraph()
 
-        XCTAssertTrue(graph.retentionDerivedDataScope().uids.isEmpty)
-        XCTAssertFalse(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertTrue(graph.snapshot().retentionScope.uids.isEmpty)
+        XCTAssertFalse(graph.snapshot().retentionScope.isAuthoritative)
     }
 
     func testCachedEmptyInventoryCannotAuthorizeDeletionAfterSourceDiscovery() throws {
@@ -506,8 +490,8 @@ final class LibrarySourceGraphTests: XCTestCase {
 
         _ = graph.installCachedInventory([], for: firstSource.id)
 
-        XCTAssertTrue(graph.retentionDerivedDataScope().uids.isEmpty)
-        XCTAssertFalse(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertTrue(graph.snapshot().retentionScope.uids.isEmpty)
+        XCTAssertFalse(graph.snapshot().retentionScope.isAuthoritative)
 
         let authoritativeRefresh = try XCTUnwrap(graph.beginRefresh(firstSource.id))
         let accepted = try XCTUnwrap(
@@ -522,11 +506,11 @@ final class LibrarySourceGraphTests: XCTestCase {
         var graph = LibrarySourceGraph()
         _ = install(firstSource, items: [retained], in: &graph)
         XCTAssertEqual(graph.sourceSetAuthority, .authoritative)
-        XCTAssertTrue(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertTrue(graph.snapshot().retentionScope.isAuthoritative)
 
         let failedRefresh = graph.beginSourceSetRefresh()
         XCTAssertEqual(graph.sourceSetAuthority, .hydrating)
-        XCTAssertFalse(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertFalse(graph.snapshot().retentionScope.isAuthoritative)
 
         let restored = try XCTUnwrap(graph.failSourceSetRefresh(using: failedRefresh))
         XCTAssertEqual(graph.sourceSetAuthority, .authoritative)
@@ -595,7 +579,7 @@ final class LibrarySourceGraphTests: XCTestCase {
 
         XCTAssertNil(graph.commitSourceSet([firstSource], using: staleCatalog))
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.accessState, .accessLost)
-        XCTAssertTrue(graph.retentionProjection().timeline.snapshot.isEmpty)
+        XCTAssertTrue(graph.snapshot().retentionScope.orderedUIDs.isEmpty)
     }
 
     func testAcceptedSourceSetDiscoveryLeaseCannotBeReplayed() throws {
@@ -620,13 +604,13 @@ final class LibrarySourceGraphTests: XCTestCase {
             graph.commit([.complete(replacement)], validationToken: nil, using: accepted)
         )
         XCTAssertNil(graph.commit([.complete(original)], validationToken: nil, using: accepted))
-        XCTAssertEqual(graph.retentionProjection().timeline.uids, [replacement.uid])
+        XCTAssertEqual(graph.snapshot().retentionScope.orderedUIDs, [replacement.uid])
 
         let failed = try XCTUnwrap(graph.beginRefresh(firstSource.id))
         _ = try XCTUnwrap(graph.failRefresh(using: failed))
         XCTAssertNil(graph.failRefresh(using: failed))
         XCTAssertNil(graph.commit([.complete(original)], validationToken: nil, using: failed))
-        XCTAssertEqual(graph.retentionProjection().timeline.uids, [replacement.uid])
+        XCTAssertEqual(graph.snapshot().retentionScope.orderedUIDs, [replacement.uid])
     }
 
     func testLeasesCannotCrossGraphEpochsWithMatchingNumericGenerations() throws {
@@ -690,7 +674,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertNotNil(graph.inventory(for: thumbnailOnly.id))
         XCTAssertEqual(change.analysisScope.uids, [partial.uid])
         XCTAssertTrue(change.analysisScope.isAuthoritative)
-        XCTAssertTrue(change.selectedProjection.timeline.uids.isEmpty)
+        XCTAssertTrue(change.selectedScope.orderedUIDs.isEmpty)
     }
 
     func testRestoredThumbnailOnlyInventoryKeepsPartialAnalysisMembership() throws {
@@ -714,9 +698,9 @@ final class LibrarySourceGraphTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(graph.analysisDerivedDataScope().uids, [partial.uid])
-        XCTAssertFalse(graph.analysisDerivedDataScope().isAuthoritative)
-        XCTAssertTrue(graph.selectedProjection().timeline.uids.isEmpty)
+        XCTAssertEqual(graph.snapshot().analysisScope.uids, [partial.uid])
+        XCTAssertFalse(graph.snapshot().analysisScope.isAuthoritative)
+        XCTAssertTrue(graph.snapshot().selectedScope.orderedUIDs.isEmpty)
     }
 
     func testThumbnailOnlySourceDoesNotBlockVideoRetentionAuthority() throws {
@@ -789,14 +773,14 @@ final class LibrarySourceGraphTests: XCTestCase {
         let partialChange = graph.commit([incomplete], validationToken: nil, using: incompleteLease)
         XCTAssertEqual(partialChange?.analysisScope.uids, [resource.uid])
         XCTAssertTrue(partialChange?.analysisScope.isAuthoritative == true)
-        XCTAssertTrue(partialChange?.selectedProjection.timeline.uids.isEmpty == true)
+        XCTAssertTrue(partialChange?.selectedScope.orderedUIDs.isEmpty == true)
 
         let duplicateLease = try! XCTUnwrap(graph.beginRefresh(firstSource.id))
         let complete = LibrarySourceItem.complete(resource)
         XCTAssertNil(
             graph.commit([complete, complete], validationToken: nil, using: duplicateLease)
         )
-        XCTAssertFalse(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertFalse(graph.snapshot().retentionScope.isAuthoritative)
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [incomplete])
     }
 
@@ -810,8 +794,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         )
         let graph = try LibrarySourceGraph(restoring: [removed])
 
-        XCTAssertTrue(graph.retentionProjection().timeline.snapshot.isEmpty)
-        XCTAssertFalse(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertTrue(graph.snapshot().retentionScope.orderedUIDs.isEmpty)
+        XCTAssertFalse(graph.snapshot().retentionScope.isAuthoritative)
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [])
         XCTAssertNil(graph.inventory(for: firstSource.id)?.validationToken)
     }
@@ -951,13 +935,6 @@ final class LibrarySourceGraphTests: XCTestCase {
         )
         XCTAssertTrue(change.videoRetentionScope.isAuthoritative)
         XCTAssertTrue(change.thumbnailRetentionScope.isAuthoritative)
-        XCTAssertEqual(
-            change.selectedProjection.sourceID(
-                for: preferred.uid,
-                metadataField: .livePhotoRelationship
-            ),
-            firstSource.id
-        )
         XCTAssertNil(graph.accessLease(for: motionFirst, requiring: .readContent))
 
         let firstMotionLease = try XCTUnwrap(
@@ -1054,35 +1031,6 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertEqual(resolved, count)
         // A UID index keeps this O(items). A per-lease inventory scan would be O(items squared).
         XCTAssertLessThan(elapsed, .seconds(2))
-    }
-
-    func testCombinedSnapshotMatchesIndependentScopesAcrossInclusionAndCapabilityChanges() throws {
-        var graph = LibrarySourceGraph()
-        let primary = item("same", time: 10, isLivePhoto: true, relatedVideoID: "motion", burstMemberIDs: ["burst"])
-        let thumbnailOnly = LibrarySource(id: SourceID("thumbnail-only"), capabilities: [.readThumbnail])
-        func checkSnapshot() {
-            let change = graph.snapshot()
-            XCTAssertEqual(change.selectedProjection.timeline.snapshot, graph.selectedProjection().timeline.snapshot)
-            XCTAssertEqual(change.retentionProjection.timeline.snapshot, graph.retentionProjection().timeline.snapshot)
-            XCTAssertEqual(change.selectedScope, graph.selectedDerivedDataScope())
-            XCTAssertEqual(change.analysisScope, graph.analysisDerivedDataScope())
-            XCTAssertEqual(change.retentionScope, graph.retentionDerivedDataScope())
-            XCTAssertEqual(change.thumbnailRetentionScope, graph.thumbnailRetentionDerivedDataScope())
-            XCTAssertEqual(change.videoRetentionScope, graph.videoRetentionDerivedDataScope())
-        }
-        checkSnapshot()
-        _ = install(firstSource, items: [primary, item("earlier", time: 1)], in: &graph)
-        checkSnapshot()
-        _ = install(thumbnailOnly, items: [item("same", time: 20), item("additional", time: 30)], in: &graph)
-        checkSnapshot()
-        _ = graph.setIncluded(false, for: thumbnailOnly.id)
-        checkSnapshot()
-        _ = graph.setIncluded(false, for: firstSource.id)
-        checkSnapshot()
-        _ = graph.removeSource(firstSource.id)
-        checkSnapshot()
-        _ = graph.removeSource(thumbnailOnly.id)
-        checkSnapshot()
     }
 
     func testPersistenceSignatureIgnoresNoOpRefreshChurnButTracksPayloadAndOverlayChanges() throws {
