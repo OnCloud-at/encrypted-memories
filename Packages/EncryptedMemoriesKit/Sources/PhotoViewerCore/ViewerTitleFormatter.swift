@@ -1,6 +1,6 @@
 import Foundation
 
-/// Derives the Apple-Photos-style two-line center title for the viewer top bar.
+/// Derives the two-line center title for the viewer top bar.
 ///
 /// Line one prefers location, then capture date/time, then filename, and finally a localized fallback.
 /// Line two shows date/time with location when available; otherwise it shows the position.

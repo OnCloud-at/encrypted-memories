@@ -656,23 +656,6 @@ final class EditedPhotoOriginalLookupTests: XCTestCase {
     private struct NotAsked: Error {}
     private struct NoStart: Error {}
 
-    /// Holds a call of the provider open until the test opens the gate.
-    private actor Gate {
-        private var isOpen = false
-        private var waiters: [CheckedContinuation<Void, Never>] = []
-
-        func wait() async {
-            if isOpen { return }
-            await withCheckedContinuation { waiters.append($0) }
-        }
-
-        func open() {
-            isOpen = true
-            for waiter in waiters { waiter.resume() }
-            waiters = []
-        }
-    }
-
     private actor Provider: EditedPhotoOriginalProviding {
         let original: PhotoItem?
         private let gate: Gate?

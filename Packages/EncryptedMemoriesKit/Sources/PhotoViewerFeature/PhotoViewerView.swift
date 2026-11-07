@@ -14,8 +14,7 @@ private final class DismissableAVPlayerView: AVPlayerView {
     var onPinchDismissEnded: (Bool) -> Void = { _ in }
     var onPageSwipe: (ViewerPageSwipeDirection) -> Void = { _ in }
 
-    private var dismissing = false
-    private var dismissProgress: CGFloat = 0
+    private var pinchDismiss = AppKitPinchDismissTracker()
     private var pageSwipeTracker = ViewerPageSwipeTracker()
     private weak var posterView: NSImageView?
     private var displayReadinessObservation: NSKeyValueObservation?
@@ -81,36 +80,17 @@ private final class DismissableAVPlayerView: AVPlayerView {
 
     override func magnify(with event: NSEvent) {
         // Only a pinch-OUT flies the video closed; pinch-in / anything else falls through to AVKit.
-        guard dismissing || event.magnification < 0 else {
+        guard pinchDismiss.claims(magnification: event.magnification) else {
             super.magnify(with: event)
             return
         }
-        switch event.phase {
-        case .began:
-            dismissing = true
-            dismissProgress = 0
-            onPinchDismissBegan()
-        case .changed:
-            dismissProgress = max(0, dismissProgress - event.magnification)  // outward pinch = negative
-            onPinchDismissChanged(max(0, min(1, 1 - dismissProgress)))  // 1 = fullscreen, 0 = the grid cell
-        case .ended, .cancelled:
-            let shouldClose = event.phase == .ended && dismissProgress > 0.07  // a small/quick pinch is enough
-            dismissing = false
-            onPinchDismissEnded(shouldClose)
-        default:
-            break
-        }
+        let outcome = pinchDismiss.handle(phase: event.phase, magnification: event.magnification)
+        outcome.report(began: onPinchDismissBegan, changed: onPinchDismissChanged, ended: onPinchDismissEnded)
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard let update = AppKitViewerPageSwipeAdapter.consume(event, with: &pageSwipeTracker)
-        else {
-            super.scrollWheel(with: event)
-            return
-        }
-
-        if let direction = update.direction { onPageSwipe(direction) }
-        if !update.consumesEvent { super.scrollWheel(with: event) }
+        let routing = AppKitViewerPageSwipeAdapter.route(event, with: &pageSwipeTracker)
+        if routing.deliver(to: onPageSwipe) { super.scrollWheel(with: event) }
     }
 }
 
@@ -526,9 +506,9 @@ public struct PhotoViewerView: View {
         if let error = model.videoState.error {
             failureCard(error)
         } else if model.videoState.isBusy && !model.videoState.hasPlayer {
-            // Resolving/downloading have no player yet, so they're a centered blocking spinner.
+            // Resolving has no player yet, so it is a centered blocking spinner.
             // Buffering/seeking use the live AVKit surface and its native spinner instead.
-            busyOverlay
+            MediaLoadingSpinner()
                 .allowsHitTesting(false)
         } else if model.livePhotoReadiness == .loading {
             imageLoadingOverlay
@@ -558,18 +538,9 @@ public struct PhotoViewerView: View {
         .glassEffect(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
-    private var busyOverlay: some View {
-        let isDownloading = if case .downloading = model.videoState { true } else { false }
-        return progressIndicator(model.videoState.progress, isDownloading: isDownloading)
-    }
-
-    private var imageLoadingOverlay: some View {
-        progressIndicator(model.originalProgress, isDownloading: true)
-    }
-
     /// A native determinate indicator with a percentage while bytes arrive, otherwise the indeterminate spinner.
-    private func progressIndicator(_ progress: Double, isDownloading: Bool) -> some View {
-        MediaLoadingSpinner(fraction: MediaLoadingSpinner.visibleFraction(progress, isDownloading: isDownloading))
+    private var imageLoadingOverlay: some View {
+        MediaLoadingSpinner(fraction: MediaLoadingSpinner.visibleFraction(model.originalProgress))
     }
 
     private var livePhotoLoadFailureOverlay: some View {

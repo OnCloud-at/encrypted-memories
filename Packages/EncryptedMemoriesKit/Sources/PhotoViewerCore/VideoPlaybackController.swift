@@ -49,8 +49,8 @@ public final class VideoPlaybackController {
     private var playbackActivity: LibraryRuntimeActivityRegistration?
     private let runtimeState: LibraryRuntimeState
 
-    /// Seconds to wait for initial playback before declaring the attempt stuck. The public label remains
-    /// source-compatible with existing callers even though the timer measures startup, not display readiness.
+    /// Seconds to wait for initial playback before declaring the attempt stuck. The timer measures startup, not
+    /// display readiness.
     private let startupDeadline: TimeInterval
     private let diagnostics: VideoPlaybackDiagnosticSink?
 
@@ -67,7 +67,6 @@ public final class VideoPlaybackController {
     // MARK: - State the model pushes in (resolution phase, before a player exists)
 
     public func setResolving() { transition(.resolving) }
-    public func setDownloading(_ progress: Double) { transition(.downloading(progress)) }
 
     /// Resets to idle and tears down any player - used when navigating to a new item or when a
     /// stream-resolve turns out to be an image.
@@ -123,27 +122,6 @@ public final class VideoPlaybackController {
                 let error = observed.error
                 Task { @MainActor in
                     box.value?.onStatus(raw, error: error, uid: uid, identity: identity)
-                }
-            })
-        observations.append(
-            item.observe(\.isPlaybackBufferEmpty, options: [.new]) { observed, _ in
-                let empty = observed.isPlaybackBufferEmpty
-                Task { @MainActor in
-                    box.value?.onBufferEmpty(empty, uid: uid, identity: identity)
-                }
-            })
-        observations.append(
-            item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { observed, _ in
-                let likely = observed.isPlaybackLikelyToKeepUp
-                Task { @MainActor in
-                    box.value?.onLikelyToKeepUp(likely, uid: uid, identity: identity)
-                }
-            })
-        observations.append(
-            item.observe(\.loadedTimeRanges, options: [.new]) { observed, _ in
-                let ranges = observed.loadedTimeRanges.map(\.timeRangeValue)
-                Task { @MainActor in
-                    box.value?.onLoadedRanges(ranges, uid: uid, identity: identity)
                 }
             })
         observations.append(
@@ -222,33 +200,6 @@ public final class VideoPlaybackController {
         default:
             break
         }
-    }
-
-    private func onBufferEmpty(
-        _: Bool,
-        uid: PhotoUID,
-        identity: VideoPlaybackAttachmentIdentity
-    ) {
-        guard isCurrent(uid: uid, identity: identity), let player else { return }
-        logPlayer(item: player.currentItem, player: player)
-    }
-
-    private func onLikelyToKeepUp(
-        _: Bool,
-        uid: PhotoUID,
-        identity: VideoPlaybackAttachmentIdentity
-    ) {
-        guard isCurrent(uid: uid, identity: identity), let player else { return }
-        logPlayer(item: player.currentItem, player: player)
-    }
-
-    private func onLoadedRanges(
-        _: [CMTimeRange],
-        uid: PhotoUID,
-        identity: VideoPlaybackAttachmentIdentity
-    ) {
-        guard isCurrent(uid: uid, identity: identity), let player else { return }
-        logPlayer(item: player.currentItem, player: player)
     }
 
     /// `timeControlStatus` is authoritative for native play, pause, replay, and waiting. This handler only
@@ -423,9 +374,10 @@ public final class VideoPlaybackController {
     }
 }
 
-/// Sendable weak box so the `@Sendable` KVO / notification closures can hop back to the
-/// `@MainActor` controller without capturing it directly under Swift 6 concurrency.
-private final class Weak<T: AnyObject>: @unchecked Sendable {
-    weak var value: T?
-    init(_ value: T) { self.value = value }
+/// Sendable weak box so the `@Sendable` KVO / notification / progress closures can hop back to a
+/// `@MainActor` owner (this controller, the viewer model) without capturing it directly under Swift 6
+/// concurrency. All access happens inside a `@MainActor` Task.
+package final class Weak<T: AnyObject>: @unchecked Sendable {
+    package weak var value: T?
+    package init(_ value: T) { self.value = value }
 }

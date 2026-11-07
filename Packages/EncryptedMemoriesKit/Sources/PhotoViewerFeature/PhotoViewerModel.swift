@@ -97,7 +97,7 @@ public final class PhotoViewerModel {
     /// Encrypted disk cache for full-resolution originals (offline library). Viewer page appearance does not read
     /// this whole-file representation; explicit unbounded fallback loads may write it when enabled.
     private let originalsCache: ThumbnailCache?
-    /// Whether to persist newly-downloaded originals through the legacy whole-file fallback.
+    /// Whether to persist newly-downloaded originals through the whole-file path of the Offline Library.
     private let cacheOriginals: Bool
     private let originalsCapBytes: Int64?
     /// Stable leases for every cache owned by this viewer. They fail closed when account configuration changes.
@@ -388,7 +388,7 @@ public final class PhotoViewerModel {
     // MARK: - Live Photo motion playback
 
     /// Plays the paired motion clip with sound. The Live badge hover and force-click actions call this method.
-    /// the E2EE-safe preload/playback logic lives in the shared `LivePhotoMotionController`.
+    /// The E2EE-safe preload/playback logic lives in the shared `LivePhotoMotionController`.
     public func playMotion() {
         let item = current
         motion.play(for: item, streamer: streamer) { [weak self] in self?.isDisplaying(item) ?? false }
@@ -544,7 +544,7 @@ public final class PhotoViewerModel {
         else {
             return maxPixelSize == nil ? NSImage(data: data) : nil
         }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        return appKitImage(cg)
     }
 
     private nonisolated static func decodePreviewImage(_ data: Data) -> NSImage? {
@@ -554,21 +554,11 @@ public final class PhotoViewerModel {
                 maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize
             )
         else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        return appKitImage(cg)
     }
 
-    private nonisolated static func decodeStreamedImage(
-        _ provider: any OriginalByteStreamProvider,
-        uid: PhotoUID,
-        maxPixelSize: Int?,
-        onProgress: @escaping @Sendable (Double) -> Void
-    ) async throws -> CGImage? {
-        return try await ViewerFullImageDecoder.decodeStreamedCGImage(
-            from: provider,
-            uid: uid,
-            maxPixelSize: maxPixelSize,
-            onProgress: onProgress
-        )
+    private nonisolated static func appKitImage(_ cg: CGImage) -> NSImage {
+        NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
     /// Recognizes text in the displayed still once the sharp image is shown. The view restarts it whenever the
@@ -754,17 +744,11 @@ public final class PhotoViewerModel {
         for item: PhotoItem, needsDisplayFallback: Bool, silentRetries: Int
     ) async -> Duration? {
         guard sessionIsCurrent() else { return nil }
-        let shouldLoadBoundedStill = item.isLivePhoto || needsDisplayFallback
         guard let streamer else {
             if item.isVideo {
                 video.fail(.streamURLUnavailable, uid: item.uid)
-            } else if shouldLoadBoundedStill {
-                await loadOriginalBytes(
-                    for: item,
-                    expecting: .image,
-                    maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
-                    useOfflineOriginalCache: needsDisplayFallback
-                )
+            } else {
+                await loadBoundedStillIfNeeded(for: item, needsDisplayFallback: needsDisplayFallback)
             }
             return nil
         }
@@ -786,14 +770,7 @@ public final class PhotoViewerModel {
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return nil }
             video.reset()
             logViewer(item, strategy: "image", kind: .image)
-            if shouldLoadBoundedStill {
-                await loadOriginalBytes(
-                    for: item,
-                    expecting: .image,
-                    maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
-                    useOfflineOriginalCache: needsDisplayFallback
-                )
-            }
+            await loadBoundedStillIfNeeded(for: item, needsDisplayFallback: needsDisplayFallback)
         } catch {
             // A real video (or unknown) whose stream setup failed stays failed rather than writing a
             // decrypted full-video temp file.
@@ -803,25 +780,28 @@ public final class PhotoViewerModel {
                 let failure = VideoPlaybackError.classify(error)
                 if let delay = silentRetryDelays(failure).dropFirst(silentRetries).first { return delay }
                 video.fail(failure, uid: item.uid)
-            } else if shouldLoadBoundedStill {
-                await loadOriginalBytes(
-                    for: item,
-                    expecting: .image,
-                    maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
-                    useOfflineOriginalCache: needsDisplayFallback
-                )
+            } else {
+                await loadBoundedStillIfNeeded(for: item, needsDisplayFallback: needsDisplayFallback)
             }
         }
         return nil
     }
 
-    private enum Expecting: Equatable { case unknown, image, video }
+    /// Loads the bounded still of a Live Photo or of an item that needs the display fallback; any other item keeps
+    /// its preview.
+    private func loadBoundedStillIfNeeded(for item: PhotoItem, needsDisplayFallback: Bool) async {
+        guard item.isLivePhoto || needsDisplayFallback else { return }
+        await loadOriginalBytes(
+            for: item,
+            maxPixelSize: ViewerImageLoadPolicy.maxDisplayPixelSize,
+            useOfflineOriginalCache: needsDisplayFallback
+        )
+    }
 
     /// Loads an original representation on demand. A byte-stream provider feeds the incremental decoder in bounded
-    /// chunks; the legacy `Data` path remains only for hosts without that capability.
+    /// chunks. The whole-file `Data` path serves hosts without that capability and the Offline Library cache.
     private func loadOriginalBytes(
         for item: PhotoItem,
-        expecting: Expecting,
         maxPixelSize: Int? = nil,
         useOfflineOriginalCache: Bool = false
     ) async {
@@ -832,17 +812,15 @@ public final class PhotoViewerModel {
         requestedSharpPixelSize = max(requestedSharpPixelSize, targetPixelSize)
         isLoadingOriginal = true
         originalLoadFailed = false
-        if expecting == .video { video.setDownloading(0) }
         let progressAdmission = ViewerProgressAdmission()
         defer { progressAdmission.close() }
-        let ref = WeakViewerRef(self)
+        let ref = Weak(self)
         // Without a writer generation, a local pending original neither reads nor fills the originals cache.
         let originalWriterGeneration = item.uid.isLocalPending ? nil : originalsCache?.captureWriterGeneration()
         do {
             let full: NSImage?
             let data: Data?
             if useOfflineOriginalCache,
-                expecting != .video,
                 let cached = await cachedOriginalImage(
                     for: item,
                     maxPixelSize: maxPixelSize,
@@ -852,35 +830,32 @@ public final class PhotoViewerModel {
                 full = cached
                 data = nil
             } else if let originalByteStreamer, !(cacheOriginals && useOfflineOriginalCache) {
-                let cg = try await Self.decodeStreamedImage(
-                    originalByteStreamer,
+                let cg = try await ViewerFullImageDecoder.decodeStreamedCGImage(
+                    from: originalByteStreamer,
                     uid: item.uid,
                     maxPixelSize: maxPixelSize,
                     onProgress: { p in
                         guard let sample = progressAdmission.admit(p) else { return }
                         Task { @MainActor in
                             guard progressAdmission.isCurrent(sample) else { return }
-                            ref.model?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
+                            ref.value?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
                         }
                     }
                 )
-                full = cg.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
+                full = cg.map(Self.appKitImage)
                 data = nil
             } else {
                 let original = try await media.originalData(for: item.uid) { p in
                     guard let sample = progressAdmission.admit(p) else { return }
                     Task { @MainActor in
                         guard progressAdmission.isCurrent(sample) else { return }
-                        ref.model?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
+                        ref.value?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
                     }
                 }
                 data = original
-                full =
-                    expecting != .video
-                    ? await Task.detached(priority: .userInitiated) {
-                        Self.decodeFullImage(original, maxPixelSize: maxPixelSize)
-                    }.value
-                    : nil
+                full = await Task.detached(priority: .userInitiated) {
+                    Self.decodeFullImage(original, maxPixelSize: maxPixelSize)
+                }.value
             }
             guard !Task.isCancelled, originalLoadGeneration == generation,
                 self.isDisplaying(item), self.sessionIsCurrent()
@@ -908,7 +883,7 @@ public final class PhotoViewerModel {
                 }
             } else {
                 requestedSharpPixelSize = loadedSharpPixelSize
-                originalLoadFailed = expecting != .video
+                originalLoadFailed = true
                 // A host with a streamer got here, so a later fetch or decode can still succeed: keep Retry.
                 video.fail(.unknown(detail: "originalDecodeFailed"), uid: item.uid)
                 logViewer(item, strategy: "streamRequired", kind: .video)
@@ -921,12 +896,8 @@ public final class PhotoViewerModel {
             guard originalLoadGeneration == generation else { return }
             isLoadingOriginal = false
             requestedSharpPixelSize = loadedSharpPixelSize
-            originalLoadFailed = expecting != .video
-            if expecting == .video {
-                video.fail(.classify(error), uid: item.uid)
-                logViewer(item, strategy: "streamRequired", kind: .video)
-            }
-            // Image case: keep showing the best interim image (thumbnail/preview).
+            originalLoadFailed = true
+            // Keep showing the best interim image (thumbnail/preview).
         }
     }
 
@@ -966,7 +937,6 @@ public final class PhotoViewerModel {
         loadTask = Task { [weak self] in
             await self?.loadOriginalBytes(
                 for: item,
-                expecting: .image,
                 maxPixelSize: maxPixelSize,
                 useOfflineOriginalCache: true
             )
@@ -984,7 +954,6 @@ public final class PhotoViewerModel {
     private func updateDownloadProgress(_ p: Double, for item: PhotoItem, generation: UInt64) {
         guard originalLoadGeneration == generation, current.uid == item.uid else { return }
         originalProgress = p
-        if case .downloading = videoState { video.setDownloading(p) }
     }
 
     private func logViewer(_ item: PhotoItem, strategy: String, kind: MediaKind?) {
@@ -1001,12 +970,4 @@ public final class PhotoViewerModel {
                 error: nil
             ))
     }
-}
-
-/// Sendable weak handle to the (MainActor, non-Sendable) view model, so the AVFoundation progress +
-/// KVO `@Sendable` callbacks can route back to it without capturing it directly under Swift 6
-/// concurrency. All access happens inside a `@MainActor` Task.
-private final class WeakViewerRef: @unchecked Sendable {
-    weak var model: PhotoViewerModel?
-    init(_ model: PhotoViewerModel) { self.model = model }
 }

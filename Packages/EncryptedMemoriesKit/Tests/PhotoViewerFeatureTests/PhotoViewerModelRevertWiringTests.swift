@@ -140,31 +140,3 @@ private actor Events {
     var count: Int { all.count }
     func add(_ event: String) { all.append(event) }
 }
-
-/// Holds the revert open until the test lets it go; the wait for the start is bounded, so a revert that never starts
-/// fails an assertion and does not hang the suite.
-private actor Gate {
-    private var entered = false
-    private var isOpen = false
-    private var openWaiters: [CheckedContinuation<Void, Never>] = []
-
-    func wait() async {
-        entered = true
-        guard !isOpen else { return }
-        await withCheckedContinuation { openWaiters.append($0) }
-    }
-
-    func waitUntilEntered() async -> Bool {
-        for _ in 0..<200 {
-            if entered { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return entered
-    }
-
-    func open() {
-        isOpen = true
-        openWaiters.forEach { $0.resume() }
-        openWaiters = []
-    }
-}
