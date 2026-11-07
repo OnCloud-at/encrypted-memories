@@ -234,6 +234,9 @@ final class BackupProblemListSessionTests: XCTestCase {
     func testCompletedEmptyReadWithPositiveSummaryUsesExistingUnavailableState() async {
         let session = BackupProblemListSession(read: { self.snapshot(0) })
         XCTAssertEqual(session.presentation(expectsItems: true), .loading)
+        XCTAssertEqual(
+            session.presentation(expectsItems: false), .loading,
+            "no answer that nobody read yet: never empty before a read")
         session.requestRefresh()
         await session.waitUntilIdle()
         XCTAssertEqual(session.presentation(expectsItems: true), .unavailable)

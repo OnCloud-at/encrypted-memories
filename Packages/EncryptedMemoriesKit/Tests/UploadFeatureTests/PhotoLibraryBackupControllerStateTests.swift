@@ -484,14 +484,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let decision = decisionItem("photo", issue: .deletedElsewhere)
             // The photo failed again with another reason; the summary counts it.
             let failedAgain = decisionItem("photo", issue: .network)
-            let model = BackupProblemListModel()
+            var shown: [[BackupFailedItem]] = []
             let clock = BackupTestClock()
             var unavailable = 0
             await fixture.controller.readProblemList(
                 using: { [failedAgain] }, afterDecision: decision, expectingItems: { true }, clock: clock,
-                { model.replaceItems($0) }, { unavailable += 1 })
-            XCTAssertEqual(model.items, [failedAgain], "the re-read shows the photo that failed again")
-            XCTAssertEqual(model.presentation(expectsItems: true), .list)
+                { shown.append($0) }, { unavailable += 1 })
+            XCTAssertEqual(shown, [[], [failedAgain]], "the re-read shows the photo that failed again")
             XCTAssertEqual(clock.sleeps, [0.25])
             XCTAssertEqual(unavailable, 0)
             await fixture.controller.shutdown()
@@ -500,14 +499,17 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         func testADecisionReadThatStaysEmptyWhileTheSummaryCountsItemsEndsUnavailable() async throws {
             let fixture = try makeControllerFixture(prefix: "backup-problem-decision-unavailable")
             defer { fixture.cleanup() }
-            let model = BackupProblemListModel()
-            model.replaceItems([decisionItem("photo", issue: .deletedElsewhere)])
+            var shown: [[BackupFailedItem]] = []
+            var unavailableAfterApplies: [Int] = []
             let clock = BackupTestClock()
             await fixture.controller.readProblemList(
                 using: { [] }, afterDecision: decisionItem("photo", issue: .deletedElsewhere),
-                expectingItems: { true }, clock: clock, { model.replaceItems($0) }, { model.markUnavailable() })
+                expectingItems: { true }, clock: clock, { shown.append($0) },
+                { unavailableAfterApplies.append(shown.count) })
+            XCTAssertEqual(shown, Array(repeating: [], count: 6), "every read ends empty")
             XCTAssertEqual(
-                model.presentation(expectsItems: true), .unavailable, "never a spinner without a reader behind it")
+                unavailableAfterApplies, [6],
+                "never a spinner without a reader behind it: unavailable comes once, after the last read")
             XCTAssertEqual(clock.sleeps, [0.25, 0.5, 1, 2, 4])
             await fixture.controller.shutdown()
         }
@@ -515,37 +517,38 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         func testADecisionReadKeepsAnUnresolvedDecisionAndRemovesAResolvedOne() async throws {
             let fixture = try makeControllerFixture(prefix: "backup-problem-decision-filter")
             defer { fixture.cleanup() }
-            let model = BackupProblemListModel()
+            var shown: [BackupFailedItem]?
             let decision = decisionItem("decision", issue: .deletedElsewhere)
             let waiting = decisionItem("waiting", issue: .network)
             await fixture.controller.readProblemList(
                 using: { [decision, waiting] }, afterDecision: decision, expectingItems: { false },
-                clock: BackupTestClock(), { model.replaceItems($0) }, {})
-            XCTAssertEqual(model.items, [decision, waiting], "a decision that is still open stays")
+                clock: BackupTestClock(), { shown = $0 }, {})
+            XCTAssertEqual(shown, [decision, waiting], "a decision that is still open stays")
 
             let reopened = decisionItem("decision", issue: .network)
             await fixture.controller.readProblemList(
                 using: { [reopened, waiting] }, afterDecision: decision, expectingItems: { false },
-                clock: BackupTestClock(), { model.replaceItems($0) }, {})
-            XCTAssertEqual(model.items, [waiting], "the resolved decision leaves at once")
+                clock: BackupTestClock(), { shown = $0 }, {})
+            XCTAssertEqual(shown, [waiting], "the resolved decision leaves at once")
 
             // Reading without a decision filters nothing.
             await fixture.controller.readProblemList(
                 using: { [reopened, waiting] }, expectingItems: { false }, clock: BackupTestClock(),
-                { model.replaceItems($0) }, {})
-            XCTAssertEqual(model.items, [reopened, waiting])
+                { shown = $0 }, {})
+            XCTAssertEqual(shown, [reopened, waiting])
             await fixture.controller.shutdown()
         }
 
         func testADecisionReadOfAnEmptyQueueShowsNothingNeedsAttention() async throws {
             let fixture = try makeControllerFixture(prefix: "backup-problem-decision-empty")
             defer { fixture.cleanup() }
-            let model = BackupProblemListModel()
-            XCTAssertEqual(model.presentation(expectsItems: false), .loading)
+            var shown: [[BackupFailedItem]] = []
+            var unavailable = 0
             await fixture.controller.readProblemList(
                 using: { [] }, afterDecision: decisionItem("photo", issue: .deletedElsewhere),
-                expectingItems: { false }, clock: BackupTestClock(), { model.replaceItems($0) }, {})
-            XCTAssertEqual(model.presentation(expectsItems: false), .empty)
+                expectingItems: { false }, clock: BackupTestClock(), { shown.append($0) }, { unavailable += 1 })
+            XCTAssertEqual(shown, [[]], "one empty read answers: nothing needs attention")
+            XCTAssertEqual(unavailable, 0)
             await fixture.controller.shutdown()
         }
 
