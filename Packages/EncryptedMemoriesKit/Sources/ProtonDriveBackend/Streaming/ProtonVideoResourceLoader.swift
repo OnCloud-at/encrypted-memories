@@ -440,24 +440,35 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     private func scheduleEncryptedWarm(_ block: VideoBlock, reason: String) {
         let key = NSNumber(value: block.index)
         guard decryptedCache.object(forKey: key) == nil else { return }
-        let scheduled = lock.withLock { () -> Bool in
+        let scheduled = startPrefetchTask(for: block) { loader in
+            do {
+                try await loader.admitted { [loader] in
+                    _ = try await loader.sharedEncryptedBlock(block, priority: .foregroundPrefetch)
+                }
+            } catch is CancellationError {
+            } catch {
+                loader.emitDiagnostics(
+                    [
+                        "strategy": "deepWarm",
+                        "block": "\(block.index)", "reason": reason,
+                        "error": String(describing: type(of: error)),
+                    ], throttleSeconds: 0.5)
+            }
+        }
+        if scheduled { PhotoDiagnostics.shared.increment("perf.videoDeepWarmScheduled") }
+    }
+
+    /// Registers one background task for `block` unless the loader is closed or already works on that block, and
+    /// removes the registration when `work` ends. Returns whether the task started.
+    private func startPrefetchTask(
+        for block: VideoBlock, work: @escaping @Sendable (ProtonVideoResourceLoader) async -> Void
+    ) -> Bool {
+        lock.withLock { () -> Bool in
             guard !isClosed, prefetchTasks[block.index] == nil else { return false }
             let taskID = UUID()
             let task = Task { [weak self] in
                 guard let self else { return }
-                do {
-                    try await self.admitted { [self] in
-                        _ = try await self.sharedEncryptedBlock(block, priority: .foregroundPrefetch)
-                    }
-                } catch is CancellationError {
-                } catch {
-                    emitDiagnostics(
-                        [
-                            "strategy": "deepWarm",
-                            "block": "\(block.index)", "reason": reason,
-                            "error": String(describing: type(of: error)),
-                        ], throttleSeconds: 0.5)
-                }
+                await work(self)
                 self.lock.withLock {
                     guard self.prefetchTasks[block.index]?.id == taskID else { return }
                     self.prefetchTasks.removeValue(forKey: block.index)
@@ -466,7 +477,6 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             prefetchTasks[block.index] = PrefetchTask(id: taskID, task: task)
             return true
         }
-        if scheduled { PhotoDiagnostics.shared.increment("perf.videoDeepWarmScheduled") }
     }
 
     private func schedulePrefetch(
@@ -480,39 +490,28 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             return
         }
 
-        let scheduled = lock.withLock { () -> Bool in
-            guard !isClosed, prefetchTasks[block.index] == nil else { return false }
-            let taskID = UUID()
-            let task = Task { [weak self] in
-                guard let self else { return }
-                do {
-                    let (_, hit) = try await self.admitted { [self] in
-                        try await self.decryptedBlock(block, priority: priority)
-                    }
-                    emitDiagnostics(
-                        [
-                            "strategy": "prefetch",
-                            "block": "\(block.index)",
-                            "reason": reason,
-                            "cacheHit": "\(hit)",
-                        ], throttleSeconds: 0.5)
-                } catch is CancellationError {
-                } catch {
-                    emitDiagnostics(
-                        [
-                            "strategy": "prefetch",
-                            "block": "\(block.index)",
-                            "reason": reason,
-                            "error": String(describing: type(of: error)),
-                        ], throttleSeconds: 0.5)
+        let scheduled = startPrefetchTask(for: block) { loader in
+            do {
+                let (_, hit) = try await loader.admitted { [loader] in
+                    try await loader.decryptedBlock(block, priority: priority)
                 }
-                self.lock.withLock {
-                    guard self.prefetchTasks[block.index]?.id == taskID else { return }
-                    self.prefetchTasks.removeValue(forKey: block.index)
-                }
+                loader.emitDiagnostics(
+                    [
+                        "strategy": "prefetch",
+                        "block": "\(block.index)",
+                        "reason": reason,
+                        "cacheHit": "\(hit)",
+                    ], throttleSeconds: 0.5)
+            } catch is CancellationError {
+            } catch {
+                loader.emitDiagnostics(
+                    [
+                        "strategy": "prefetch",
+                        "block": "\(block.index)",
+                        "reason": reason,
+                        "error": String(describing: type(of: error)),
+                    ], throttleSeconds: 0.5)
             }
-            prefetchTasks[block.index] = PrefetchTask(id: taskID, task: task)
-            return true
         }
         if scheduled {
             PhotoDiagnostics.shared.increment("perf.videoPrefetchScheduled")

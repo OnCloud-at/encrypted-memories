@@ -1461,10 +1461,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         guard main.volumeID == root.volumeID, original.volumeID == root.volumeID,
             let shareID = photosShareID, let keySource = try? await fileSource()
         else { return nil }
-        var links: [AlbumPhotoLinkBody] = []
-        for batch in Self.metadataBatches([main.nodeID, original.nodeID]) {
-            links += try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
-        }
+        let links = try await driveSession.fetchPhotoLinksMetadata(
+            shareID: shareID, linkIDs: [main.nodeID, original.nodeID])
         // Photos are children of the photos root, whose key decrypts their names.
         let rootKey = try await keySource.nodeKey(ofLinkID: root.nodeID)
         let files = Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
@@ -2452,8 +2450,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             TimelineSection(id: sectionID, date: photos.first?.captureTime ?? .distantPast, title: "", items: photos)
         ]
     }
-
-    // MARK: - PhotoMetadataProvider
 
     // MARK: - EditedPhotoOriginalProviding
 

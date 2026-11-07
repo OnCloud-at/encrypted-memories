@@ -1290,8 +1290,6 @@ enum ProtonRemoteContentIndexLookup {
     }
 }
 
-// MARK: - Wire models (PascalCase JSON)
-
 // MARK: - Duplicates endpoint (DriveSession)
 
 /// One row of `DuplicateHashes` from the find-duplicates endpoint. `linkState`: 0 = draft,

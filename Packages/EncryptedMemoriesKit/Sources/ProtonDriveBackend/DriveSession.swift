@@ -53,9 +53,6 @@ final class DriveSession: @unchecked Sendable {
         return URL(string: config.baseURL.absoluteString + p) ?? config.baseURL
     }
 
-    /// Auth headers for an arbitrary request (used by the SDK HTTP client too).
-    func authHeaders() -> [String: String] { authorization().headers }
-
     /// Auth headers and the credential generation they belong to, read together.
     func authorization() -> (headers: [String: String], generation: UInt64) {
         let (s, generation) = lock.withLock { (session, credentialGeneration) }
@@ -352,7 +349,7 @@ extension DriveSession {
         if let token {
             req.setValue(token, forHTTPHeaderField: "pm-storage-token")
         } else if isTrustedAPIURL(u) {
-            for (k, v) in authHeaders() { req.setValue(v, forHTTPHeaderField: k) }
+            for (k, v) in authorization().headers { req.setValue(v, forHTTPHeaderField: k) }
         }
         let permit = try await requestGovernor.acquire(
             scope: .storageDownload, priority: priority, priorityHandle: priorityHandle,
@@ -381,7 +378,8 @@ extension DriveSession {
         return data
     }
 
-    private func isTrustedAPIURL(_ url: URL) -> Bool {
+    /// True for an https URL on the host of the Proton API; only such a request may carry the session credentials.
+    func isTrustedAPIURL(_ url: URL) -> Bool {
         guard url.scheme == "https",
             let host = url.host?.lowercased(),
             let expected = config.baseURL.host?.lowercased()
