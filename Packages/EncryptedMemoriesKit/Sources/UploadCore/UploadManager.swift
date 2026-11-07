@@ -78,6 +78,10 @@ public actor UploadManager: UploadManaging {
         var generation: UInt64 = 0
         var settlementRecord: UploadManualSettlementRecord?
         var remoteCommitReceipt: UploadRemoteCommitReceipt?
+        /// The receipt row that the store refused right after the remote commit (#1226). The
+        /// receipt then exists only in memory. The receipt catch of `run`, Retry and shutdown write
+        /// this row again.
+        var unwrittenReceiptRecord: UploadManualSettlementRecord? = nil
         var resolvedAlbumID: String?
         var task: Task<Void, Never>?
         var controlTask: Task<Void, Never>? = nil
@@ -93,7 +97,8 @@ public actor UploadManager: UploadManaging {
 
         /// The row offers Retry only when a settlement step can run again in this session (#1104).
         /// A proven-terminal record is settled. An unsettled record stays retryable while the store
-        /// can work, because Retry then settles the still-pending durable row; with a lasting store
+        /// can work, because Retry then settles the still-pending durable row; an unwritten receipt
+        /// row stays retryable too, because Retry then writes it (#1226). With a lasting store
         /// failure no step can run before a relaunch.
         func snapshot(settlementWaitsForRelaunch: Bool) -> UploadItem {
             var snapshot = item
@@ -712,12 +717,15 @@ public actor UploadManager: UploadManaging {
         }
     }
 
-    /// The job has an unsettled record and the settlement store cannot work again before a
-    /// relaunch (#1104). No settlement step can run for the job in this session: Retry would only
-    /// read the failed store again. Its durable row is still pending; a later launch settles it
-    /// once the store can read it again.
+    /// The job has an unsettled record or an unwritten receipt row, and the settlement store
+    /// cannot work again before a relaunch (#1104, #1226). No settlement step and no row write can
+    /// run for the job in this session: Retry would only read the failed store again. An unsettled
+    /// record's durable row is still pending, and a later launch settles it once the store can read
+    /// it again. An unwritten receipt row has no durable copy.
     private func settlementWaitsForRelaunch(_ id: UploadQueueItemID) -> Bool {
-        guard jobs[id]?.hasUnsettledRecord == true else { return false }
+        guard jobs[id]?.hasUnsettledRecord == true || jobs[id]?.unwrittenReceiptRecord != nil else {
+            return false
+        }
         return settlementStore?.hasLastingFailure() ?? false
     }
 
@@ -762,10 +770,12 @@ public actor UploadManager: UploadManaging {
             // no step can run before a relaunch, so Clear finished drops the job and keeps the row.
             return !record.isProvenTerminal && !settlementWaitsForRelaunch(id)
         }
-        // A receipt without a record exists only in memory, so the job stays. A job with neither
+        // A receipt without a record exists only in memory. The job stays while the store can
+        // work, because Retry can still write its row (#1226); with a lasting store failure the row
+        // cannot be written before a relaunch, so Clear finished drops the job. A job with neither
         // has no durable row, as `claimActiveCancellation` explains: decide from memory and never
         // read the store for it (#1104).
-        return jobs[id]?.remoteCommitReceipt != nil
+        return jobs[id]?.remoteCommitReceipt != nil && !settlementWaitsForRelaunch(id)
     }
 
     private func persistDurableSettlement(
@@ -793,14 +803,49 @@ public actor UploadManager: UploadManaging {
             stage: .manifestPending,
             updatedAt: now()
         )
-        guard settlementStore.upsert(record) else {
-            // Keep the receipt in the live job even when SQLite failed. The current process must
-            // not retry bytes after a remote commit whose durable settlement could not be written.
-            jobs[id]?.remoteCommitReceipt = receipt
+        guard writeReceiptRow(record, to: settlementStore) else {
             throw UploadError.backend("Manual upload receipt could not be persisted.")
         }
+    }
+
+    /// Writes the receipt row of a live job and caches the record in the same actor step. When
+    /// the store refuses the write, the job keeps the receipt and the record in memory only: the
+    /// current process must not retry bytes after a remote commit whose durable settlement could
+    /// not be written, and the receipt catch of `run`, Retry or shutdown writes the row again
+    /// (#1226).
+    private func writeReceiptRow(
+        _ record: UploadManualSettlementRecord,
+        to settlementStore: any UploadManualSettlementStoreProtocol
+    ) -> Bool {
+        let id = record.queueItemID
+        jobs[id]?.remoteCommitReceipt = record.receipt
+        guard settlementStore.upsert(record) else {
+            jobs[id]?.unwrittenReceiptRecord = record
+            return false
+        }
         jobs[id]?.settlementRecord = record
-        jobs[id]?.remoteCommitReceipt = receipt
+        jobs[id]?.unwrittenReceiptRecord = nil
+        return true
+    }
+
+    /// Writes an unwritten receipt row again (#1226). Call it only after `durableSettlement(for:)`
+    /// answered `.absent`, so the write never replaces a row that exists. Returns the written record.
+    private func writeUnwrittenReceiptRow(_ id: UploadQueueItemID) -> UploadManualSettlementRecord? {
+        guard let settlementStore, let record = jobs[id]?.unwrittenReceiptRecord,
+            writeReceiptRow(record, to: settlementStore)
+        else { return nil }
+        return record
+    }
+
+    /// Settles a pending receipt row in this session: metadata and album only, never bytes.
+    private func settleReceiptRow(_ record: UploadManualSettlementRecord) {
+        let id = record.queueItemID
+        guard settlementTasks[id] == nil else { return }
+        jobs[id]?.retryRequested = true
+        jobs[id]?.item.state = .finalizing
+        jobs[id]?.item.uploadedUID = record.uploadedUID
+        notify()
+        scheduleDurableSettlement(record, manifestAlreadyRecorded: false)
     }
 
     // MARK: - Scheduler
@@ -988,9 +1033,21 @@ public actor UploadManager: UploadManaging {
                 updateDurableItemAsFinalizing(persisted)
                 scheduleDurableSettlement(persisted, manifestAlreadyRecorded: false)
                 recordSettlementFailure(persisted, message: settlement.settlementMessage)
+            case .absent where jobs[id]?.unwrittenReceiptRecord != nil:
+                // The read above heals a transient store failure first, so the store has just
+                // answered. Write the refused receipt row now, in the same actor step, and settle
+                // it (#1226). When the write fails again, keep the item failed with its receipt.
+                if let written = writeUnwrittenReceiptRow(id) {
+                    settleReceiptRow(written)
+                } else if jobs[id]?.resolvedAlbumID != nil {
+                    markPartialFailure(id, message: settlement.settlementMessage)
+                } else {
+                    transition(id, to: .failed(message: settlement.settlementMessage))
+                }
             case .absent, .unreadable:
-                // Without a readable record the receipt exists only in memory. Keep the item in a
-                // retryable failure state; an unreadable row is never treated as absence (#1104).
+                // Without a readable record the receipt exists only in memory. Keep the item
+                // failed: Retry writes its row again while the store can work (#1226). An
+                // unreadable row is never treated as absence (#1104).
                 if jobs[id]?.resolvedAlbumID != nil {
                     markPartialFailure(id, message: settlement.settlementMessage)
                 } else {
@@ -1180,10 +1237,10 @@ public actor UploadManager: UploadManaging {
     private func claimActiveCancellation(
         _ id: UploadQueueItemID
     ) -> (uploadTask: Task<Void, Never>?, nativeTask: Task<Void, Never>)? {
-        // Decide from memory only (#1104). A job's durable row is written by
-        // `persistDurableSettlement`, which caches the record in the same actor step, or restored
-        // by the replay, which caches it too. A job without a cached record or receipt has no
-        // durable row, so a failed store read must never block its cancellation.
+        // Decide from memory only (#1104). A job's durable row is written by `writeReceiptRow`,
+        // which caches the record in the same actor step, or restored by the replay, which caches
+        // it too. A job without a cached record or receipt has no durable row, so a failed store
+        // read must never block its cancellation.
         guard jobs[id]?.remoteCommitReceipt == nil, jobs[id]?.settlementRecord == nil else { return nil }
         guard activeIDs.contains(id), var job = jobs[id], !job.item.state.isTerminal else { return nil }
         guard !job.cancellationRequested else { return nil }
@@ -1340,6 +1397,12 @@ public actor UploadManager: UploadManaging {
                 await task.value
             }
         }
+        // The account session ends here. Write every receipt row that the store refused before
+        // (#1226). When the account data stays, the next launch settles the row.
+        for id in order where jobs[id]?.unwrittenReceiptRecord != nil {
+            guard case .absent = durableSettlement(for: id) else { continue }
+            _ = writeUnwrittenReceiptRow(id)
+        }
         settlementStore?.close()
         activeIDs.removeAll()
         jobs.removeAll()
@@ -1360,12 +1423,19 @@ public actor UploadManager: UploadManaging {
         // A job without a cached record or receipt has no durable row, as
         // `claimActiveCancellation` explains. Decide from memory, so a store that cannot be read
         // never blocks its Retry; the byte gate still refuses bytes while the store cannot be read.
-        let durable: UploadManualSettlementReadOutcome =
+        var durable: UploadManualSettlementReadOutcome =
             job.settlementRecord == nil && job.remoteCommitReceipt == nil ? .absent : durableSettlement(for: id)
         if jobs[id]?.remoteCommitReceipt != nil, case .absent = durable {
-            // The receipt lives only in memory while the store has no row for it. This split
-            // state has no safe retry; let the settlement tasks own the item.
-            return
+            // The receipt lives only in memory: the store refused its row after the remote commit
+            // (#1226). Write the row now. A store whose transient failure healed accepts it, and the
+            // item then settles from the row like a replayed one, without a byte upload. When the
+            // write fails again, the item stays failed. Publish the row again: a lasting failure
+            // removes its Retry.
+            guard let written = writeUnwrittenReceiptRow(id) else {
+                notify()
+                return
+            }
+            durable = .found(written)
         }
         switch durable {
         case .found(let persisted) where !persisted.isPending:
@@ -1374,17 +1444,14 @@ public actor UploadManager: UploadManaging {
         // Receipt-backed rows retry only metadata and album settlement. They must never return to
         // the byte-upload path, even when the previous process stopped during manifest recording.
         case .found(let persisted):
-            guard settlementTasks[id] == nil else { return }
-            jobs[id]?.retryRequested = true
-            jobs[id]?.item.state = .finalizing
-            jobs[id]?.item.uploadedUID = persisted.uploadedUID
-            notify()
-            scheduleDurableSettlement(persisted, manifestAlreadyRecorded: false)
+            settleReceiptRow(persisted)
             return
 
         case .unreadable:
             // An unreadable read is not proof that the row is absent. Fail closed: never fall
-            // through to the byte-upload retry path while the store cannot be read (#1104).
+            // through to the byte-upload retry path while the store cannot be read (#1104). The
+            // failed read can be lasting, so publish the row again: it may no longer offer Retry.
+            notify()
             return
 
         case .absent:

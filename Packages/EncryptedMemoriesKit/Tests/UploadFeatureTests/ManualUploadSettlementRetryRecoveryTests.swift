@@ -124,10 +124,17 @@ final class HoldingAlbumAttaching: AlbumAttaching, @unchecked Sendable {
 final class StateHistory: @unchecked Sendable {
     private let lock = NSLock()
     private var states: [UploadItemState] = []
+    private var latest: [UploadItem] = []
 
     func record(_ items: [UploadItem]) {
-        lock.withLock { states.append(contentsOf: items.map(\.state)) }
+        lock.withLock {
+            states.append(contentsOf: items.map(\.state))
+            latest = items
+        }
     }
+
+    /// The items of the last published snapshot.
+    var lastItems: [UploadItem] { lock.withLock { latest } }
 
     var count: Int { lock.withLock { states.count } }
 
@@ -353,6 +360,273 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         let saved = try XCTUnwrap(relaunchedStore.record(for: try XCTUnwrap(fixture.ids.first)))
         XCTAssertEqual(saved.terminalState, .completed)
         await relaunched.shutdown()
+    }
+
+    // MARK: A receipt row that could not be written (#1226)
+
+    func testTheReceiptCatchWritesTheLibraryRowAfterOneTransientWriteFailure() async throws {
+        try await receiptCatchWritesTheRow(destination: .library)
+    }
+
+    func testTheReceiptCatchWritesTheAlbumRowAfterOneTransientWriteFailure() async throws {
+        try await receiptCatchWritesTheRow(
+            destination: UploadDestination(target: .existingAlbum(id: "album", title: "Album")))
+    }
+
+    /// The receipt row write fails once after the remote commit. The read in the receipt catch
+    /// heals the transient failure, so the catch writes the row in the same actor step and settles
+    /// it without a Retry: the manifest is recorded once, the album attaches once, and the bytes
+    /// never upload again.
+    private func receiptCatchWritesTheRow(destination: UploadDestination) async throws {
+        let albums = MockAlbumAttaching()
+        let fixture = try Fixture(receiptWriteFaultShots: 1, destination: destination, albums: albums)
+        defer { fixture.cleanup() }
+
+        let ids = await fixture.enqueue()
+        let id = try XCTUnwrap(ids.first)
+        let settled = await fixture.waitForCompletion()
+        let settledItem = try XCTUnwrap(settled)
+        XCTAssertTrue(fixture.faultFired, "The armed interrupt really failed the receipt write")
+        XCTAssertEqual(settledItem.state, .completed, "The catch settles the row it wrote, without a Retry")
+        XCTAssertEqual(fixture.uploader.requests.count, 1, "Committed bytes must never upload again")
+        XCTAssertEqual(
+            fixture.identityResolver.recordedUploads.count, 1,
+            "The settlement records the manifest that the failed receipt write skipped")
+        let uid = try XCTUnwrap(settledItem.uploadedUID)
+        if case .library = destination.target {
+            XCTAssertTrue(albums.addedSnapshot.isEmpty)
+        } else {
+            XCTAssertEqual(albums.addedSnapshot.map(\.0), [uid], "The album attaches exactly once")
+            XCTAssertEqual(albums.addedSnapshot.map(\.1), ["album"])
+        }
+        let saved = try XCTUnwrap(fixture.backingStore.record(for: id))
+        XCTAssertEqual(saved.stage, .terminal)
+        XCTAssertEqual(saved.terminalState, .completed)
+        XCTAssertEqual(saved.uploadedUID, uid)
+        await fixture.manager.shutdown()
+    }
+
+    /// The receipt row write fails, and the write of the receipt catch fails too. The item stays
+    /// failed with its receipt and offers Retry. The store heals the transient failure, so Retry
+    /// writes the row and settles the item from it, without a byte upload.
+    func testRetryWritesTheReceiptRowWhenTheCatchWriteFailedToo() async throws {
+        let fixture = try Fixture(receiptWriteFaultShots: 2, destination: .library)
+        defer { fixture.cleanup() }
+
+        let item = try await fixture.enqueueAndWaitForFailure()
+        let id = try XCTUnwrap(fixture.ids.first)
+        XCTAssertNotNil(item.uploadedUID, "The receipt survived the failed writes in memory")
+        XCTAssertNil(fixture.backingStore.record(for: id), "No receipt row exists before Retry")
+        XCTAssertEqual(fixture.uploader.requests.count, 1)
+        XCTAssertFalse(fixture.backingStore.hasLastingFailure(), "An interrupted write is transient")
+        XCTAssertEqual(
+            UploadQueuePresentation.rowActions(for: item, capabilities: fixture.uploader.capabilities),
+            [.retry],
+            "The store failure is transient, so Retry can write the row")
+
+        await fixture.manager.retry(id)
+
+        let settled = await fixture.waitForCompletion()
+        let settledItem = try XCTUnwrap(settled)
+        XCTAssertEqual(settledItem.state, .completed, "Retry settles the item from the written row")
+        XCTAssertEqual(settledItem.uploadedUID, item.uploadedUID)
+        XCTAssertEqual(fixture.uploader.requests.count, 1, "Committed bytes must never upload again")
+        XCTAssertEqual(fixture.identityResolver.recordedUploads.count, 1)
+        let saved = try XCTUnwrap(fixture.backingStore.record(for: id))
+        XCTAssertEqual(saved.stage, .terminal)
+        XCTAssertEqual(saved.terminalState, .completed)
+        await fixture.manager.shutdown()
+    }
+
+    /// An album upload: the receipt write, the catch write and the first Retry write all fail. The
+    /// album-only Retry branch must not run while no row exists, so the first Retry attaches
+    /// nothing and the item keeps its Retry. The next Retry writes the row and the settlement
+    /// attaches the album exactly once.
+    func testARetryWhoseWriteFailsKeepsRetryAndTheNextRetryAttachesTheAlbumOnce() async throws {
+        let albums = MockAlbumAttaching()
+        let fixture = try Fixture(
+            receiptWriteFaultShots: 3,
+            destination: UploadDestination(target: .existingAlbum(id: "album", title: "Album")),
+            albums: albums)
+        defer { fixture.cleanup() }
+
+        let item = try await fixture.enqueueAndWaitForFailure()
+        let id = try XCTUnwrap(fixture.ids.first)
+        XCTAssertTrue(item.partialSuccess, "The album item shows the attachment-only failure")
+
+        await fixture.manager.retry(id)
+        let afterFailedRetry = await fixture.manager.snapshot()
+        XCTAssertEqual(afterFailedRetry, [item], "A Retry whose write fails leaves the item as it was")
+        XCTAssertEqual(
+            UploadQueuePresentation.rowActions(for: item, capabilities: fixture.uploader.capabilities),
+            [.retry],
+            "The store failure is transient, so the row keeps its Retry")
+        XCTAssertTrue(albums.addedSnapshot.isEmpty, "No album step runs before the row exists")
+        XCTAssertNil(fixture.backingStore.record(for: id))
+
+        await fixture.manager.retry(id)
+        let settled = await fixture.waitForCompletion()
+        let settledItem = try XCTUnwrap(settled)
+        XCTAssertEqual(settledItem.state, .completed)
+        let uid = try XCTUnwrap(item.uploadedUID)
+        XCTAssertEqual(albums.addedSnapshot.map(\.0), [uid], "The album attaches exactly once")
+        XCTAssertEqual(albums.addedSnapshot.map(\.1), ["album"])
+        XCTAssertEqual(fixture.uploader.requests.count, 1, "Committed bytes must never upload again")
+        XCTAssertEqual(fixture.identityResolver.recordedUploads.count, 1)
+        await fixture.manager.shutdown()
+    }
+
+    /// The receipt row is unwritten and the item offers Retry. The store then gets a lasting failure
+    /// without a new publish. Retry reads the store, the read fails, and Retry publishes the row
+    /// again: the published row no longer offers Retry.
+    func testARetryThatFindsALastingReadFailurePublishesTheRowWithoutRetry() async throws {
+        let fixture = try Fixture(receiptWriteFaultShots: 2, destination: .library)
+        defer { fixture.cleanup() }
+        let published = StateHistory()
+        await fixture.manager.setOnChange { items, _ in published.record(items) }
+
+        let item = try await fixture.enqueueAndWaitForFailure()
+        let id = try XCTUnwrap(fixture.ids.first)
+        XCTAssertEqual(
+            published.lastItems.map {
+                UploadQueuePresentation.rowActions(for: $0, capabilities: fixture.uploader.capabilities)
+            },
+            [[.retry]])
+
+        // A transaction that stays open on the store's own handle is a lasting condition.
+        try executeOnStoreConnection("BEGIN IMMEDIATE;", store: fixture.backingStore)
+        await fixture.manager.retry(id)
+        XCTAssertTrue(fixture.backingStore.hasLastingFailure())
+        XCTAssertEqual(published.lastItems.map(\.state), [item.state], "The item stays failed")
+        XCTAssertEqual(
+            published.lastItems.map {
+                UploadQueuePresentation.rowActions(for: $0, capabilities: fixture.uploader.capabilities)
+            },
+            [[]],
+            "The published row offers no Retry once the store cannot work before a relaunch")
+        try executeOnStoreConnection("ROLLBACK;", store: fixture.backingStore)
+        XCTAssertEqual(fixture.uploader.requests.count, 1)
+        await fixture.manager.shutdown()
+    }
+
+    /// The receipt row is unwritten and the item offers Retry. A lasting fault then refuses every
+    /// settlement insert. Retry reads the store, finds no row and writes it; the write fails with
+    /// the lasting fault, and Retry publishes the row again without Retry.
+    func testARetryWhoseWriteHitsALastingFailurePublishesTheRowWithoutRetry() async throws {
+        let fixture = try Fixture(receiptWriteFaultShots: 2, destination: .library)
+        defer { fixture.cleanup() }
+        let published = StateHistory()
+        await fixture.manager.setOnChange { items, _ in published.record(items) }
+
+        let item = try await fixture.enqueueAndWaitForFailure()
+        let id = try XCTUnwrap(fixture.ids.first)
+        try executeSideSQL(
+            """
+            CREATE TRIGGER refuse_settlement_insert BEFORE INSERT ON manual_upload_settlement
+            BEGIN SELECT RAISE(FAIL, 'settlement insert refused'); END;
+            """,
+            at: fixture.databaseURL)
+
+        await fixture.manager.retry(id)
+        XCTAssertTrue(fixture.backingStore.hasLastingFailure(), "The refused insert is a lasting failure")
+        XCTAssertNil(fixture.backingStore.record(for: id))
+        XCTAssertEqual(published.lastItems.map(\.state), [item.state], "The item stays failed")
+        XCTAssertEqual(
+            published.lastItems.map {
+                UploadQueuePresentation.rowActions(for: $0, capabilities: fixture.uploader.capabilities)
+            },
+            [[]],
+            "The published row offers no Retry once the store cannot work before a relaunch")
+        XCTAssertEqual(fixture.uploader.requests.count, 1)
+        await fixture.manager.shutdown()
+    }
+
+    /// The receipt write and the catch write fail, and the person never taps Retry. The account
+    /// session then ends without deleting its data: shutdown writes the row before it closes the
+    /// store, so the next launch attaches the photo to its album without uploading the bytes again.
+    func testShutdownWritesTheReceiptRowSoTheNextLaunchAttachesTheAlbum() async throws {
+        let fixture = try Fixture(
+            receiptWriteFaultShots: 2,
+            destination: UploadDestination(target: .existingAlbum(id: "album", title: "Album")))
+        defer { fixture.cleanup() }
+
+        let item = try await fixture.enqueueAndWaitForFailure()
+        let id = try XCTUnwrap(fixture.ids.first)
+        XCTAssertTrue(fixture.faultFired, "The armed interrupt really failed the receipt write")
+        XCTAssertNil(fixture.backingStore.record(for: id), "No receipt row exists before shutdown")
+
+        await fixture.manager.shutdown()
+        // Shutdown closed the store's connection, so a separate connection reads the file.
+        let reader = try XCTUnwrap(UploadManualSettlementStore(url: fixture.databaseURL))
+        let saved = reader.record(for: id)
+        reader.close()
+        XCTAssertEqual(saved?.stage, .manifestPending, "Shutdown writes the receipt row the session kept")
+
+        let albums = MockAlbumAttaching()
+        let relaunched = fixture.makeRelaunchedManager(openingNewStore: true, albums: albums)
+        let settled = await fixture.waitForCompletion()
+        let settledItem = try XCTUnwrap(settled)
+        XCTAssertEqual(settledItem.state, .completed, "The next launch settles the written row")
+        XCTAssertEqual(settledItem.uploadedUID, item.uploadedUID)
+        XCTAssertEqual(albums.addedSnapshot.map(\.1), ["album"], "The next launch attaches the album")
+        XCTAssertEqual(albums.addedSnapshot.map(\.0), [try XCTUnwrap(item.uploadedUID)])
+        XCTAssertEqual(fixture.uploader.requests.count, 1, "Committed bytes must never upload again")
+        await relaunched.shutdown()
+    }
+
+    /// A lasting fault refuses every receipt write. Shutdown reads the store before it writes a kept
+    /// row; the read fails with the lasting failure, so shutdown skips the write, returns and writes
+    /// nothing. No bytes upload again.
+    func testShutdownUnderALastingFailureWritesNothingAndReturns() async throws {
+        let fixture = try Fixture(refuseSettlementInserts: true, destination: .library)
+        defer { fixture.cleanup() }
+
+        _ = try await fixture.enqueueAndWaitForFailure()
+        let id = try XCTUnwrap(fixture.ids.first)
+        await fixture.manager.shutdown()
+
+        // The store refuses to open a file with the test trigger, so a plain connection counts rows.
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(fixture.databaseURL.path, &handle, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_prepare_v2(
+                handle, "SELECT count(*) FROM manual_upload_settlement WHERE queue_item_id = ?;", -1,
+                &statement, nil),
+            SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, id.uuidString, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 0, "A lasting fault leaves no row")
+        XCTAssertEqual(fixture.uploader.requests.count, 1, "Committed bytes must never upload again")
+    }
+
+    /// A lasting fault refuses the receipt row. No write can succeed before a relaunch, so the row
+    /// offers no Retry and keeps its reason. Clear finished removes it; no bytes upload again.
+    func testLastingReceiptWriteFailureHidesRetryAndClearFinishedRemovesTheItem() async throws {
+        let fixture = try Fixture(refuseSettlementInserts: true, destination: .library)
+        defer { fixture.cleanup() }
+
+        let item = try await fixture.enqueueAndWaitForFailure()
+        let id = try XCTUnwrap(fixture.ids.first)
+        XCTAssertNotNil(item.uploadedUID)
+        XCTAssertTrue(fixture.backingStore.hasLastingFailure(), "A refused insert is a lasting failure")
+        XCTAssertEqual(
+            UploadQueuePresentation.rowActions(for: item, capabilities: fixture.uploader.capabilities),
+            [],
+            "No receipt write can succeed before a relaunch, so the row offers no Retry")
+
+        await fixture.manager.retry(id)
+        let afterRetry = await fixture.manager.snapshot()
+        XCTAssertEqual(afterRetry, [item], "A Retry call that still arrives changes nothing")
+        XCTAssertEqual(fixture.uploader.requests.count, 1, "Committed bytes must never upload again")
+
+        await fixture.manager.clearFinished()
+        let afterClear = await fixture.manager.snapshot()
+        XCTAssertEqual(afterClear, [], "Clear finished removes an item whose row cannot be written")
+        await fixture.manager.shutdown()
+        XCTAssertEqual(fixture.uploader.requests.count, 1)
     }
 
     // MARK: Startup replay retries a failing first read
@@ -728,6 +1002,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         static let libraryMessage = "Manual upload settlement could not be persisted."
         static let albumMessage =
             UploadError.albumStep("Manual album settlement could not be persisted.").errorDescription
+        static let receiptMessage = "Manual upload receipt could not be persisted."
+        static let albumReceiptMessage = UploadError.albumStep(receiptMessage).errorDescription
 
         let backingStore: UploadManualSettlementStore
         let uploader = MockUploader(deliverProgress: false)
@@ -751,10 +1027,17 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         ///     pending-restore write, the double-write fault of the clear-finished issue (#1104).
         ///   - refuseAllSettlementUpdates: installs a trigger that raises FAIL on every
         ///     settlement update, a lasting fault the store cannot heal inside this session.
+        ///   - receiptWriteFaultShots: arms SQLITE_INTERRUPT on this many consecutive settlement
+        ///     inserts, starting with the receipt row written right after the remote commit (#1226).
+        ///     The second insert is the write of the receipt catch, the third the write of a Retry.
+        ///   - refuseSettlementInserts: installs a trigger that raises FAIL on every settlement
+        ///     insert, so the receipt row fails with a lasting fault (#1226).
         init(
             terminalWriteInterrupt: Bool = false,
             terminalWriteInterruptShots: Int = 1,
             refuseAllSettlementUpdates: Bool = false,
+            receiptWriteFaultShots: Int = 0,
+            refuseSettlementInserts: Bool = false,
             destination: UploadDestination = .library,
             albums: (any AlbumAttaching)? = nil
         ) throws {
@@ -769,10 +1052,11 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
             }
             backingStore = backing
             files = try makeTempFiles(["photo.jpg"], in: directory)
+            let receiptFails = receiptWriteFaultShots > 0 || refuseSettlementInserts
             if case .library = destination.target {
-                expectedFailureMessage = Self.libraryMessage
+                expectedFailureMessage = receiptFails ? Self.receiptMessage : Self.libraryMessage
             } else {
-                guard let message = Self.albumMessage else {
+                guard let message = receiptFails ? Self.albumReceiptMessage : Self.albumMessage else {
                     throw UploadError.backend("The album step message is unavailable")
                 }
                 expectedFailureMessage = message
@@ -786,6 +1070,21 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
                     END;
                     """,
                     at: databaseURL)
+            }
+            if refuseSettlementInserts {
+                try executeSideSQL(
+                    """
+                    CREATE TRIGGER refuse_settlement_insert BEFORE INSERT ON manual_upload_settlement
+                    BEGIN
+                        SELECT RAISE(FAIL, 'settlement insert refused');
+                    END;
+                    """,
+                    at: databaseURL)
+            }
+            if receiptWriteFaultShots > 0 {
+                self.terminalWriteInterrupt = try SQLiteReadInterrupt(
+                    in: backing, matching: "INSERT INTO manual_upload_settlement", occurrence: 1,
+                    shots: receiptWriteFaultShots)
             }
             if terminalWriteInterrupt {
                 var occurrence = 2
@@ -807,7 +1106,9 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
 
         /// Simulates a relaunch: a new manager over the same database. `openingNewStore` opens a
         /// fresh store connection, as a real relaunch does; the old connection stays untouched.
-        func makeRelaunchedManager(openingNewStore: Bool = false) -> UploadManager {
+        func makeRelaunchedManager(
+            openingNewStore: Bool = false, albums: MockAlbumAttaching = MockAlbumAttaching()
+        ) -> UploadManager {
             let store: any UploadManualSettlementStoreProtocol
             if openingNewStore, let fresh = UploadManualSettlementStore(url: databaseURL) {
                 relaunchedStore = fresh
@@ -817,7 +1118,7 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
             }
             let relaunched = UploadManager(
                 uploader: uploader,
-                albums: MockAlbumAttaching(),
+                albums: albums,
                 identityResolver: identityResolver,
                 settlementStore: store,
                 requiresDurableSettlement: true,
@@ -869,6 +1170,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
             }
             return first
         }
+
+        var faultFired: Bool { terminalWriteInterrupt?.fired ?? false }
 
         func cleanup() {
             terminalWriteInterrupt?.stop()

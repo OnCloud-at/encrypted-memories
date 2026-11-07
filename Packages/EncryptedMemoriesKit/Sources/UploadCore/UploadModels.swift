@@ -152,8 +152,8 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
     /// photo is not lost. Retry only the album step to recover from the failure.
     public var partialSuccess: Bool
     /// True when no settlement step can run for the item in this session: its manual-settlement
-    /// record is proven terminal, or the record is not proven terminal while the settlement store
-    /// cannot work again before a relaunch.
+    /// record is proven terminal, or the record is not proven terminal or its receipt row was never
+    /// written, while the settlement store cannot work again before a relaunch.
     public var hasTerminalSettlement: Bool
 
     public init(
