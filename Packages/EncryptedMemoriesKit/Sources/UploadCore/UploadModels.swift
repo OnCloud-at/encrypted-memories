@@ -151,9 +151,10 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
     /// Set when the file uploaded to the library but a later step (album add / cover) failed - the
     /// photo is not lost. Retry only the album step to recover from the failure.
     public var partialSuccess: Bool
-    /// True when no settlement step can run for the item in this session: its manual-settlement
-    /// record is proven terminal, or the record is not proven terminal or its receipt row was never
-    /// written, while the settlement store cannot work again before a relaunch.
+    /// True when Retry cannot work for the item in this session: its manual-settlement record is
+    /// proven terminal; or the record is not proven terminal or its receipt row was never written,
+    /// while the settlement store cannot work again before a relaunch; or Retry would upload bytes
+    /// while the byte gate refuses every byte upload before a relaunch.
     public var hasTerminalSettlement: Bool
 
     public init(
@@ -322,7 +323,7 @@ public enum UploadQueuePresentation {
         for item: UploadItem, capabilities: UploadBackendCapabilities
     ) -> [UploadQueueRowAction] {
         switch item.state {
-        case .failed where item.hasTerminalSettlement:
+        case .failed where item.hasTerminalSettlement, .cancelled where item.hasTerminalSettlement:
             return []
         case .failed where item.uploadedUID == nil && !SupportedMedia.isSupported(item.fileURL):
             return []

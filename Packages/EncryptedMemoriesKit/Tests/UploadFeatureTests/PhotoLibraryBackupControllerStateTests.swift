@@ -267,6 +267,42 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    /// A user retry whose reopen fails must not look complete (#1228). The interrupted UPDATE records a transient
+    /// failure, and the health probe after the loop forgets it once the database answers again. Only the recorded
+    /// failure count shows that the row was not reopened, so the retry reports the unavailable local state.
+    func testUserResolvableRetryReportsAReopenThatFailed() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-retry-reopen-failure")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let future = Date().addingTimeInterval(3_600)
+        let entry = UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+            originalFilename: "quota", state: .failed, attempts: 8,
+            lastError: BackupIssueRecord(kind: .accountStorage, detail: "detail", nextAttemptAt: future).persistedValue,
+            updatedAt: future)
+        XCTAssertTrue(queue.upsert(entry))
+        XCTAssertTrue(fixture.controller.failedItems().offersUserRetry)
+        let controllerQueue = try XCTUnwrap(
+            Mirror(reflecting: fixture.controller).children.first { $0.label == "queueStore" }?.value
+                as? UploadBackupSyncQueueManifestStore)
+        let interrupt = try SQLiteReadInterrupt(
+            in: controllerQueue, matching: "UPDATE backup_sync_queue SET state = 'discovered', attempts = ?")
+        defer { interrupt.stop() }
+
+        await fixture.controller.retryUserResolvableWork()
+
+        XCTAssertTrue(interrupt.fired, "The armed interrupt really failed the reopen")
+        XCTAssertEqual(
+            fixture.controller.lastMessage, L10n.string("backup.error_local_state_unavailable"),
+            "A reopen that failed must not look like a finished retry")
+        let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .failed, "The row was not reopened")
+        XCTAssertEqual(row.attempts, 8)
+        await fixture.controller.shutdown()
+    }
+
     func testAPhotoThePersonCanFixLeadsTheListBehindThousandsOfWaitingPhotos() async throws {
         let fixture = try makeControllerFixture(prefix: "backup-problem-offline-library")
         defer { fixture.cleanup() }

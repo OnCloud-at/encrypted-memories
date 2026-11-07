@@ -99,11 +99,12 @@ public actor UploadManager: UploadManaging {
         /// A proven-terminal record is settled. An unsettled record stays retryable while the store
         /// can work, because Retry then settles the still-pending durable row; an unwritten receipt
         /// row stays retryable too, because Retry then writes it (#1226). With a lasting store
-        /// failure no step can run before a relaunch.
-        func snapshot(settlementWaitsForRelaunch: Bool) -> UploadItem {
+        /// failure no step can run before a relaunch. A Retry that would upload bytes waits for a
+        /// relaunch while the byte gate refuses every byte upload (#1228).
+        func snapshot(retryWaitsForRelaunch: Bool) -> UploadItem {
             var snapshot = item
             snapshot.hasTerminalSettlement =
-                (settlementRecord?.isProvenTerminal ?? false) || settlementWaitsForRelaunch
+                (settlementRecord?.isProvenTerminal ?? false) || retryWaitsForRelaunch
             return snapshot
         }
     }
@@ -729,15 +730,29 @@ public actor UploadManager: UploadManaging {
         return settlementStore?.hasLastingFailure() ?? false
     }
 
+    /// Retry of the job would upload bytes, and the byte gate refuses every byte upload before a
+    /// relaunch (#1228): the job has no settlement record, no receipt and no uploaded file, and the
+    /// manager requires durable settlement without a store, or its store has a lasting failure.
+    private func byteRetryWaitsForRelaunch(_ id: UploadQueueItemID) -> Bool {
+        guard let job = jobs[id], job.settlementRecord == nil, job.remoteCommitReceipt == nil,
+            job.item.uploadedUID == nil
+        else { return false }
+        guard let settlementStore else { return requiresDurableSettlement }
+        return settlementStore.hasLastingFailure()
+    }
+
     private func itemSnapshot(_ id: UploadQueueItemID) -> UploadItem? {
-        jobs[id]?.snapshot(settlementWaitsForRelaunch: settlementWaitsForRelaunch(id))
+        jobs[id]?.snapshot(
+            retryWaitsForRelaunch: settlementWaitsForRelaunch(id) || byteRetryWaitsForRelaunch(id))
     }
 
     private func byteUploadGate(for id: UploadQueueItemID) -> ByteUploadGate {
         if jobs[id]?.settlementRecord != nil || jobs[id]?.remoteCommitReceipt != nil {
             return .receiptBacked
         }
-        guard let settlementStore else { return .allowed }
+        // Without a store no commit callback can write the receipt. A manager that requires durable
+        // settlement refuses the bytes, like enqueue does (#1228).
+        guard let settlementStore else { return requiresDurableSettlement ? .settlementUnavailable : .allowed }
         switch settlementStore.readOutcome(for: id) {
         case .found(let record):
             jobs[id]?.settlementRecord = record
@@ -1420,6 +1435,12 @@ public actor UploadManager: UploadManaging {
         // prior task has settled, or a later cancel would target a different transport.
         guard !activeIDs.contains(id) else { return }
         guard !job.retryRequested else { return }
+        // A Retry that cannot pass the byte gate before a relaunch only fails again (#1228). The store
+        // failure can be new since the last publish, so publish the row again: it no longer offers Retry.
+        guard !byteRetryWaitsForRelaunch(id) else {
+            notify()
+            return
+        }
         // A job without a cached record or receipt has no durable row, as
         // `claimActiveCancellation` explains. Decide from memory, so a store that cannot be read
         // never blocks its Retry; the byte gate still refuses bytes while the store cannot be read.
