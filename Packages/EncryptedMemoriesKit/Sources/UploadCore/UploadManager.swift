@@ -1,23 +1,10 @@
 import Foundation
 import PhotosCore
 
-/// App-facing upload queue. UI binds to this; it never touches the SDK/HTTP layer directly.
-public protocol UploadManaging: Sendable {
-    @discardableResult
-    func enqueueFiles(_ urls: [URL], destination: UploadDestination) async -> [UploadQueueItemID]
-    @discardableResult
-    func enqueueFolder(_ url: URL, destination: UploadDestination) async throws -> [UploadQueueItemID]
-    func pause(_ id: UploadQueueItemID) async
-    func resume(_ id: UploadQueueItemID) async
-    func cancel(_ id: UploadQueueItemID) async
-    func retry(_ id: UploadQueueItemID) async
-    func snapshot() async -> [UploadItem]
-}
-
 /// Bounded-concurrency upload queue with a strict per-item state machine, album orchestration, and
 /// partial-success handling. Pure of any SDK/HTTP concern - all transport goes through the injected
 /// `PhotoUploading` (and optional `AlbumAttaching`) seams, which keeps the whole thing unit-testable.
-public actor UploadManager: UploadManaging {
+public actor UploadManager {
     private enum ScopedUploadOutcome: Sendable {
         case uploaded(PhotoUID)
         case skipped(UploadSkipReason)
@@ -112,7 +99,6 @@ public actor UploadManager: UploadManaging {
     private var jobs: [UploadQueueItemID: Job] = [:]
     private var order: [UploadQueueItemID] = []  // enqueue order - the stable display order
     private var activeIDs: Set<UploadQueueItemID> = []
-    private var globalPaused = false
     private var nextOrdinal = 0
     private var settlementReplayStarted = false
     private var settlementTasks: [UploadQueueItemID: Task<Void, Never>] = [:]
@@ -866,7 +852,7 @@ public actor UploadManager: UploadManaging {
     // MARK: - Scheduler
 
     private func pump() {
-        guard !isShuttingDown, !globalPaused else {
+        guard !isShuttingDown else {
             notify()
             return
         }
@@ -1125,7 +1111,7 @@ public actor UploadManager: UploadManaging {
         try await albums.addPhoto(uid, to: albumID)
         switch cover {
         case .firstUploaded:
-            // Set cover to the first item (lowest ordinal) that has uploaded in this album.
+            // The cover is the first photo of this album whose upload finished.
             if isFirstUploadedInAlbum(uid, albumID: albumID) {
                 try? await albums.setCover(albumID: albumID, photo: uid)
             }
@@ -1137,9 +1123,10 @@ public actor UploadManager: UploadManaging {
     }
 
     private func isFirstUploadedInAlbum(_ uid: PhotoUID, albumID: String) -> Bool {
-        let earlier = order.compactMap { jobs[$0] }
-            .filter { $0.resolvedAlbumID == albumID && $0.item.uploadedUID != nil && $0.item.uploadedUID != uid }
-        return earlier.isEmpty
+        !order.contains { id in
+            guard let job = jobs[id] else { return false }
+            return job.resolvedAlbumID == albumID && job.item.uploadedUID != nil && job.item.uploadedUID != uid
+        }
     }
 
     private func finish(_ id: UploadQueueItemID) {
@@ -1236,8 +1223,7 @@ public actor UploadManager: UploadManaging {
                 uploadedUID: uid,
                 displayName: job.item.displayName,
                 destination: job.destination,
-                resolvedAlbumID: job.resolvedAlbumID,
-                completedAt: now()
+                resolvedAlbumID: job.resolvedAlbumID
             ))
     }
 
@@ -1358,7 +1344,6 @@ public actor UploadManager: UploadManaging {
         if !isShuttingDown {
             isShuttingDown = true
             lifecycleGeneration &+= 1
-            globalPaused = true
         }
         await shutdownGate.run { [weak self] in
             await self?.performShutdown()
@@ -1366,8 +1351,6 @@ public actor UploadManager: UploadManaging {
     }
 
     private func performShutdown() async {
-        globalPaused = true
-
         let resolutions = Array(albumResolutionTasks.values)
         albumResolutionTasks.removeAll()
         resolutions.forEach { $0.cancel() }
@@ -1579,11 +1562,12 @@ public actor UploadManager: UploadManaging {
         pump()
     }
 
-    public func resumeAll() {
-        guard !isShuttingDown else { return }
-        globalPaused = false
-        pump()
-    }
+    #if DEBUG
+        /// Runs one scheduling pass, as a new item or a finished upload does. Tests check what a pass leaves alone.
+        package func pumpForTesting() {
+            pump()
+        }
+    #endif
 
     public func clearFinished() {
         guard !isShuttingDown else { return }
@@ -1611,7 +1595,7 @@ public actor UploadManager: UploadManaging {
     public func snapshot() -> [UploadItem] {
         guard !isShuttingDown else { return [] }
         if !settlementReplayStarted {
-            // `snapshot` is async at the protocol boundary, but this actor method cannot await
+            // `snapshot` is async for callers outside the actor, but this actor method cannot await
             // itself. The handler registrations, `notify()` and the enqueue functions start the replay
             // too; a snapshot that comes first starts it here, without a notification.
             startDurableSettlementReplaySynchronouslyIfNeeded()
@@ -1656,7 +1640,6 @@ public actor UploadManager: UploadManaging {
         var items: [UploadItem] = []
         items.reserveCapacity(order.count)
         var stats = UploadQueueStats()
-        stats.concurrency = maxConcurrent
         stats.persistenceUnavailable =
             requiresDurableSettlement && !(settlementStore?.isOperational() ?? false)
         for id in order {

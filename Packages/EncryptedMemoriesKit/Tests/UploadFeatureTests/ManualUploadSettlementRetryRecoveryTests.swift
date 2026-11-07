@@ -206,21 +206,23 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         return fixture
     }
 
-    /// resumeAll resumes paused byte uploads; it must never adopt a failed settlement itself.
+    /// A scheduling pass starts queued byte uploads; it must never adopt a failed settlement itself.
     /// The Retry path is the single in-session recovery entry.
-    func testResumeAllLeavesAReceiptBackedFailureToRetry() async throws {
+    func testASchedulingPassLeavesAReceiptBackedFailureToRetry() async throws {
         let fixture = try Fixture(terminalWriteInterrupt: true, destination: .library)
         defer { fixture.cleanup() }
 
         let item = try await fixture.enqueueAndWaitForFailure()
         XCTAssertEqual(fixture.uploader.requests.count, 1)
 
-        for _ in 0..<3 { await fixture.manager.resumeAll() }
+        #if DEBUG
+            for _ in 0..<3 { await fixture.manager.pumpForTesting() }
+        #endif
         let afterResume = await fixture.manager.snapshot()
         XCTAssertEqual(
             try XCTUnwrap(afterResume.first).state, item.state,
-            "resumeAll must not change a failed receipt-backed item")
-        XCTAssertEqual(fixture.uploader.requests.count, 1, "resumeAll must not re-upload bytes")
+            "a scheduling pass must not change a failed receipt-backed item")
+        XCTAssertEqual(fixture.uploader.requests.count, 1, "a scheduling pass must not re-upload bytes")
 
         await fixture.manager.retry(try XCTUnwrap(fixture.ids.first))
         let settled = await fixture.waitForCompletion()
@@ -676,12 +678,12 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         await relaunched.shutdown()
     }
 
-    // MARK: resumeAll guards
+    // MARK: Scheduling pass guards
 
-    /// resumeAll publishes the live snapshot exactly once through pump(). A second `.finalizing`
+    /// A scheduling pass publishes the live snapshot exactly once through pump(). A second `.finalizing`
     /// publish would mean a sweep adopted a settlement a live task still owns. The gate parking is
     /// deterministic: `awaitFirstEntry` resolves only when the album step really entered.
-    func testResumeAllDoesNotRepublishAnOwnedLiveSettlement() async throws {
+    func testASchedulingPassDoesNotRepublishAnOwnedLiveSettlement() async throws {
         let attaching = HoldingAlbumAttaching()
         let fixture = try Fixture(
             destination: UploadDestination(target: .existingAlbum(id: "album", title: "Album")),
@@ -697,10 +699,12 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         XCTAssertEqual(attaching.gate.enterCount, 1, "The album settlement reached the photo-add step")
 
         history.reset()
-        await fixture.manager.resumeAll()
+        #if DEBUG
+            await fixture.manager.pumpForTesting()
+        #endif
         XCTAssertEqual(
             history.finalizingCount, 1,
-            "resumeAll republished an owned live settlement: expected one snapshot publish")
+            "a scheduling pass republished an owned live settlement: expected one snapshot publish")
 
         attaching.gate.release()
         let settled = await fixture.waitForCompletion()
@@ -714,8 +718,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         await fixture.manager.shutdown()
     }
 
-    /// A completed item keeps its terminal record; resumeAll must not replay it as finalizing.
-    func testResumeAllLeavesCompletedSettlementsUntouched() async throws {
+    /// A completed item keeps its terminal record; a scheduling pass must not replay it as finalizing.
+    func testASchedulingPassLeavesCompletedSettlementsUntouched() async throws {
         let fixture = try Fixture(destination: .library)
         defer { fixture.cleanup() }
 
@@ -726,7 +730,9 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(settled).state, .completed)
 
         history.reset()
-        await fixture.manager.resumeAll()
+        #if DEBUG
+            await fixture.manager.pumpForTesting()
+        #endif
         XCTAssertEqual(history.finalizingCount, 0, "A completed settlement must not replay as finalizing")
         let after = await fixture.manager.snapshot()
         XCTAssertEqual(try XCTUnwrap(after.first).state, .completed)

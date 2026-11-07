@@ -823,7 +823,6 @@ final class ManualUploadSettlementTests: XCTestCase {
         await manager.setCoordinatorCallbacks(onChange: { _, _, _ in }, onCompleted: { _ in })
         _ = await manager.enqueueFiles([try file()], destination: .library)
         _ = try await manager.enqueueFolder(tempDir, destination: .library)
-        await manager.resumeAll()
         await manager.clearFinished()
 
         XCTAssertTrue(items.isEmpty)

@@ -192,22 +192,19 @@ public struct UploadCompletedEvent: Identifiable, Sendable, Equatable {
     public let displayName: String
     public let destination: UploadDestination
     public let resolvedAlbumID: String?
-    public let completedAt: Date
 
     public init(
         id: UploadQueueItemID,
         uploadedUID: PhotoUID,
         displayName: String,
         destination: UploadDestination,
-        resolvedAlbumID: String?,
-        completedAt: Date
+        resolvedAlbumID: String?
     ) {
         self.id = id
         self.uploadedUID = uploadedUID
         self.displayName = displayName
         self.destination = destination
         self.resolvedAlbumID = resolvedAlbumID
-        self.completedAt = completedAt
     }
 }
 
@@ -225,7 +222,6 @@ public struct UploadQueueStats: Sendable, Equatable {
     public var failed = 0
     public var cancelled = 0
     public var paused = 0
-    public var concurrency = 0
     /// Durable upload state could not be opened. The queue must not present this as an empty history.
     public var persistenceUnavailable = false
 
@@ -253,11 +249,9 @@ public struct UploadPreparationStatus: Sendable, Equatable {
     public var total = 0
     public var waiting = 0
     public var checking = 0
-    public var checked = 0
     public var skippedDuplicates = 0
     public var skippedRemoteDeletions = 0
     public var failed = 0
-    public var cancelled = 0
     public var paused = 0
 
     public init() {}
@@ -270,10 +264,9 @@ public struct UploadPreparationStatus: Sendable, Equatable {
                 waiting += 1
             case .hashing:
                 checking += 1
-            case .uploading, .finalizing, .completed:
-                checked += 1
+            case .uploading, .finalizing, .completed, .cancelled:
+                break
             case .skipped(let reason):
-                checked += 1
                 if reason.countsAsBackedUp {
                     skippedDuplicates += 1
                 } else {
@@ -281,8 +274,6 @@ public struct UploadPreparationStatus: Sendable, Equatable {
                 }
             case .failed:
                 failed += 1
-            case .cancelled:
-                cancelled += 1
             case .paused:
                 paused += 1
             }
@@ -302,10 +293,6 @@ public struct UploadPreparationStatus: Sendable, Equatable {
     public var progressFraction: Double {
         guard total > 0 else { return 0 }
         return Double(resolved) / Double(total)
-    }
-
-    public var needsAttention: Int {
-        failed + cancelled + paused
     }
 }
 

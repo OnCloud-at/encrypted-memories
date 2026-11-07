@@ -421,7 +421,7 @@ final class UploadManagerTests: XCTestCase {
         XCTAssertEqual(uploader.cancelCount, 1, "joined shutdown callers must share one native cancel")
     }
 
-    func testShutdownClosesAdmissionBeforeFirstAwaitAndBlocksResumeAndEnqueue() async throws {
+    func testShutdownClosesAdmissionBeforeFirstAwaitAndBlocksSchedulingAndEnqueue() async throws {
         let (_, urls) = try jpegs(["active", "queued", "late"])
         let uploader = ShutdownControlledUploader()
         let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
@@ -431,10 +431,12 @@ final class UploadManagerTests: XCTestCase {
         let shutdown = Task { await manager.shutdown() }
         await uploader.cancelStarted.wait()
 
-        await manager.resumeAll()
+        #if DEBUG
+            await manager.pumpForTesting()
+        #endif
         let lateIDs = await manager.enqueueFiles([urls[2]], destination: .library)
         XCTAssertTrue(lateIDs.isEmpty, "shutdown must reject enqueue after admission closes")
-        XCTAssertEqual(uploader.requestCount, 1, "resumeAll must not restart work during shutdown")
+        XCTAssertEqual(uploader.requestCount, 1, "a scheduling pass must not restart work during shutdown")
 
         await uploader.cancelRelease.signal()
         await uploader.uploadRelease.signal()
@@ -894,7 +896,6 @@ final class UploadManagerTests: XCTestCase {
         XCTAssertEqual(status.total, 5)
         XCTAssertEqual(status.waiting, 1)
         XCTAssertEqual(status.checking, 1)
-        XCTAssertEqual(status.checked, 2)
         XCTAssertEqual(status.skippedDuplicates, 1)
         XCTAssertEqual(status.failed, 1)
         XCTAssertEqual(status.resolved, 3)
