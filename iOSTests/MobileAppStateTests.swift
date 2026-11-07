@@ -50,6 +50,62 @@ private actor MobileRetryLifecycleLatch {
     func hasEntered(_ ownerID: String) -> Bool { entered.contains(ownerID) }
 }
 
+private struct MobileOwnerEventTimeout: LocalizedError {
+    let what: String
+    let bound: TimeInterval
+
+    var errorDescription: String? {
+        "The safety net tripped after \(Int(bound)) s waiting for \(what); the completion never happened"
+    }
+}
+
+/// The one-shot flag shared by the two racers of `waitForOwnerEvent`: exactly one racer wins.
+private final class MobileOwnerEventFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var won = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !won else { return false }
+        won = true
+        return true
+    }
+}
+
+/// Bounds a completion-event wait of the sign-out owner adapter tests. The suite gates on events that
+/// the production code produces, so a broken path would otherwise hang the test and hold a queue
+/// slot without a failing line. The bound is a failure safety net only: no behavior depends on it,
+/// and it sits far above the few seconds a loaded teardown needs. When the event does not complete
+/// within `bound`, the wait fails with a message naming the awaited event. A task-group race cannot
+/// do this: awaiting the never-completing `.value` of a task ignores the group's cancellation, so
+/// the group would hang. Both racers therefore resume one shared continuation and the losing racer
+/// is left behind instead of joined. When the event wins, the timer is cancelled and ends at once.
+/// On the timeout path the parked wait task cannot be cancelled and stays suspended until the test
+/// process ends; it holds no resource beyond its own frame.
+private func waitForOwnerEvent(
+    _ what: String, bound: TimeInterval = 90,
+    _ wait: @escaping @MainActor () async -> Void
+) async throws {
+    let flag = MobileOwnerEventFlag()
+    let completed: Bool = await withCheckedContinuation { continuation in
+        let timer = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: UInt64(bound * 1_000_000_000)) } catch { return }
+            if flag.claim() { continuation.resume(returning: false) }
+        }
+        Task { @MainActor in
+            await wait()
+            if flag.claim() {
+                timer.cancel()
+                continuation.resume(returning: true)
+            }
+        }
+    }
+    if !completed {
+        throw MobileOwnerEventTimeout(what: what, bound: bound)
+    }
+}
+
 private actor MobileTimelineLoadCount {
     private(set) var count = 0
     func record() { count += 1 }
@@ -1541,17 +1597,20 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         let latch = MobileRetryLifecycleLatch()
         defer { Task { await latch.release("load") } }
+        let retirement = MobileRetryLifecycleLatch()
+        model.backendRetirementForTesting = { await retirement.record("backend-retired") }
         model.installIsolatedInitialLoadForTesting { await latch.block("load") }
-        let loadEntered = await waitForMobileOwner { await latch.hasEntered("load") }
-        XCTAssertTrue(loadEntered)
-        guard loadEntered else { return }
+        try await waitForOwnerEvent("the initial load to enter its hold") {
+            await latch.waitUntilEntered("load")
+        }
         let revision = model.scopePresentationRevision
         model.refreshAfterLocalUpload()
-        let retirementStarted = await waitForMobileOwner {
-            model.backend == nil && model.isRecoveringScope
+        // The scope recovery retires the backend before it rebuilds a fresh one.
+        try await waitForOwnerEvent("the scope recovery to retire the backend") {
+            await retirement.waitUntilEntered("backend-retired")
         }
-        XCTAssertTrue(retirementStarted)
-        guard retirementStarted else { return }
+        XCTAssertTrue(model.isRecoveringScope)
+        XCTAssertNil(model.backend)
         XCTAssertEqual(model.scopePresentationRevision, revision &+ 1)
 
         // The hosted test owns this synthetic account and marker; it never opens a network backend.
@@ -1572,8 +1631,8 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(completedWhileHeld)
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
         await latch.release("load")
-        let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
-        XCTAssertTrue(completed)
+        let teardownTask = try XCTUnwrap(model.signOutTeardownTaskForTesting)
+        try await waitForOwnerEvent("the sign-out teardown to end") { await teardownTask.value }
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
         XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
@@ -1605,9 +1664,9 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
             keyPassword: "key")
         let leaseBefore = model.locationStoreLeaseForTesting
         model.configure(session: session, store: SessionKeychainStore())
-        let closing = await waitForMobileOwner { await latch.hasEntered("close") }
-        XCTAssertTrue(closing, "the first start closes the live pending pair")
-        guard closing else { return }
+        try await waitForOwnerEvent("the first start to close the live pending pair") {
+            await latch.waitUntilEntered("close")
+        }
         let configuredWhileClosing = await waitForMobileOwner(timeout: .milliseconds(300)) {
             model.locationStoreLeaseForTesting != leaseBefore
         }
@@ -1633,8 +1692,9 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertTrue(pending.store.isOperational())
 
         await latch.release("close")
-        let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
-        XCTAssertTrue(completed)
+        let teardownTask = try XCTUnwrap(model.signOutTeardownTaskForTesting)
+        try await waitForOwnerEvent("the sign-out teardown to end") { await teardownTask.value }
+        XCTAssertFalse(model.isSigningOut)
         XCTAssertFalse(model.signOutCleanupFailed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertFalse(pending.store.isOperational(), "the close ends with the pending store closed")
@@ -1656,22 +1716,26 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
             keyPassword: "key")
         let leaseBefore = model.locationStoreLeaseForTesting
         model.configure(session: session, store: SessionKeychainStore())
-        let closing = await waitForMobileOwner { await latch.hasEntered("close") }
-        XCTAssertTrue(closing, "the first start closes the live pending pair")
-        guard closing else { return }
+        try await waitForOwnerEvent("the first start to close the live pending pair") {
+            await latch.waitUntilEntered("close")
+        }
         // The second start cancels the first load. Its own retired pair is empty, so it opens the
         // store without waiting for the held close.
+        let leaseOpened = MobileRetryLifecycleLatch()
+        model.locationLeaseOpenedForTesting = { await leaseOpened.record("lease-opened") }
         model.configure(session: session, store: SessionKeychainStore())
-        let openedByNewerLoad = await waitForMobileOwner {
-            model.locationStoreLeaseForTesting != leaseBefore
+        try await waitForOwnerEvent("the newer load to open the location store") {
+            await leaseOpened.waitUntilEntered("lease-opened")
         }
-        XCTAssertTrue(openedByNewerLoad, "the newer load opens the location store")
-        guard openedByNewerLoad else { return }
         let newerLease = model.locationStoreLeaseForTesting
+        XCTAssertNotEqual(newerLease, leaseBefore, "the newer load opens the location store")
+        // Join the held close itself instead of polling the store it closes.
+        let heldCloses = model.pendingGridClosesForTesting
         await latch.release("close")
-        let closed = await waitForMobileOwner { !pending.store.isOperational() }
-        XCTAssertTrue(closed, "the held close of the retired pair ends")
-        guard closed else { return }
+        try await waitForOwnerEvent("the held close of the retired pair to end") {
+            for close in heldCloses { await close.value }
+        }
+        XCTAssertFalse(pending.store.isOperational(), "the held close of the retired pair ends")
         let reopenedByCancelledLoad = await waitForMobileOwner(timeout: .milliseconds(500)) {
             model.locationStoreLeaseForTesting != newerLease
         }
@@ -1689,20 +1753,28 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertTrue(initiallyOpen)
         let latch = MobileRetryLifecycleLatch()
         defer { Task { await latch.release("load") } }
+        let retirement = MobileRetryLifecycleLatch()
+        model.backendRetirementForTesting = { [weak model] in
+            guard let model else { return }
+            // The hook runs after every synchronous retirement assignment, so the observable state matches
+            // what the ordering guarantees: no owner is left installed while the backend is retired.
+            XCTAssertNil(model.facade, "backend retirement must observe a cleared facade")
+            XCTAssertNil(model.photoBackup, "backend retirement must observe a stopped photo backup")
+            XCTAssertNil(model.albumSync, "backend retirement must observe a cleared album sync")
+            XCTAssertNil(model.thumbnailFeed, "backend retirement must observe a cleared thumbnail feed")
+            await retirement.record("backend-retired")
+        }
         model.installIsolatedInitialLoadForTesting {
             await latch.block("load")
             await latch.record(Task.isCancelled ? "load-cancelled" : "load-uncancelled")
         }
-        let loadEntered = await waitForMobileOwner { await latch.hasEntered("load") }
-        XCTAssertTrue(loadEntered)
-        guard loadEntered else { return }
+        try await waitForOwnerEvent("the initial load to enter its hold") {
+            await latch.waitUntilEntered("load")
+        }
         let retry = startRetry ? Task { @MainActor in await model.retry() } : nil
         if startRetry {
-            let retirementStarted = await waitForMobileOwner { model.backend == nil }
-            XCTAssertTrue(retirementStarted)
-            guard retirementStarted else {
-                retry?.cancel()
-                return
+            try await waitForOwnerEvent("the retry to retire the backend") {
+                await retirement.waitUntilEntered("backend-retired")
             }
         }
 
@@ -1736,8 +1808,8 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(completedWhileHeld)
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
         await latch.release("load")
-        let completed = await waitForMobileOwner { !model.isSigningOut || model.signOutCleanupFailed }
-        XCTAssertTrue(completed)
+        let teardownTask = try XCTUnwrap(model.signOutTeardownTaskForTesting)
+        try await waitForOwnerEvent("the sign-out teardown to end") { await teardownTask.value }
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(model.isSigningOut, model.signOutCleanupFailed)
         XCTAssertEqual(BackupLocalDataPurge.isPurgePending(), model.signOutCleanupFailed)
@@ -1748,7 +1820,37 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         XCTAssertFalse(stillOpen, "sign-out must close the captured pending session")
         XCTAssertTrue(closedBeforePurge, "the session must close before the store and the purge")
         XCTAssertFalse(pending.store.isOperational())
-        if completed { await retry?.value } else { retry?.cancel() }
+        try await waitForOwnerEvent("the retry to end") { await retry?.value }
+    }
+
+    /// Pins the safety net of this suite: a never-arriving event fails the wait with a message naming the
+    /// awaited event. The call runs in its own task and the test waits for it through an expectation that does
+    /// not depend on the helper, so a broken safety net fails this test within seconds instead of hanging it.
+    @MainActor func testTheSafetyNetFailsAWaitWhoseEventNeverArrives() async {
+        let ended = expectation(description: "the bounded wait ended")
+        let call = Task { @MainActor () -> Error? in
+            defer { ended.fulfill() }
+            do {
+                try await waitForOwnerEvent("the never-arriving event", bound: 0.25) {
+                    await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+                }
+                return nil
+            } catch {
+                return error
+            }
+        }
+        let result = await XCTWaiter().fulfillment(of: [ended], timeout: 10)
+        guard result == .completed else {
+            XCTFail("The safety net did not end a wait whose event never arrives within 10 s")
+            return
+        }
+        guard let error = await call.value else {
+            XCTFail("The safety net must trip when the awaited event never arrives")
+            return
+        }
+        XCTAssertTrue(
+            error.localizedDescription.contains("the never-arriving event"),
+            "The failure must name the awaited event: \(error.localizedDescription)")
     }
 }
 

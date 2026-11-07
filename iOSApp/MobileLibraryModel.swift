@@ -415,6 +415,12 @@ final class MobileLibraryModel {
     #if DEBUG
         /// Runs in the close of a retired pending grid pair, after its session closed and before its store closes.
         @ObservationIgnored var pendingGridCloseHoldForTesting: (@MainActor () async -> Void)?
+        /// Runs when a retry or a scope recovery retires the current backend, so a hosted test can await the
+        /// retirement instead of polling `backend`.
+        @ObservationIgnored var backendRetirementForTesting: (@MainActor () async -> Void)?
+        /// Runs when a load configures the location store, so a hosted test can await the store opening
+        /// instead of polling `locationStoreLeaseForTesting`.
+        @ObservationIgnored var locationLeaseOpenedForTesting: (@MainActor () async -> Void)?
     #endif
     /// Serializes account replacement: a newly authenticated session never opens SQLite stores
     /// until the previous facade has closed every handle and completed an explicit sign-out purge.
@@ -1394,6 +1400,9 @@ final class MobileLibraryModel {
         photoBackup = nil
         albumSync = nil
         thumbnailFeed = nil
+        #if DEBUG
+            await backendRetirementForTesting?()
+        #endif
 
         let coordinator: AccountTeardownCoordinator
         do {
@@ -1579,6 +1588,9 @@ final class MobileLibraryModel {
                 let locationStore = self.locationStore
                 let locationLease = locationStore.configure(
                     accountUID: cacheContext.accountUID, key: cacheContext.encryptionKey)
+                #if DEBUG
+                    await locationLeaseOpenedForTesting?()
+                #endif
                 let savedLocations = await Task.detached(priority: .utility) {
                     locationStore.loadSnapshot()
                 }.value
@@ -2080,6 +2092,14 @@ final class MobileLibraryModel {
     extension MobileLibraryModel {
         /// The session lease of the location store, so a hosted test sees when a load configures the store.
         var locationStoreLeaseForTesting: PhotoLocationStore.SessionLease? { locationStore.captureSessionLease() }
+
+        /// The task that runs the ordered sign-out teardown and clears `isSigningOut`, so a hosted test awaits
+        /// the end of sign-out instead of polling model state. Debug builds only.
+        var signOutTeardownTaskForTesting: Task<Void, Never>? { teardownTask }
+
+        /// The running closes of retired pending grid pairs, so a hosted test joins the end of a pair close
+        /// instead of polling the store. A finished close removes itself, so snapshot before releasing a hold.
+        var pendingGridClosesForTesting: [Task<Void, Never>] { Array(pendingGridCloses.values) }
 
         /// Installs a deterministic, already loaded account into this model without any network or keychain
         /// access. The production composition above it (scene roots, tab shell, timeline screens, grids, viewer)
