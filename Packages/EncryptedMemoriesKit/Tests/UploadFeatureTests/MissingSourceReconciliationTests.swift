@@ -1882,8 +1882,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             inner.completeMissingSourceSweep(generation: generation)
         }
         func entry(for id: String) throws -> PhotoLibraryCatalogEntry? { try inner.entry(for: id) }
-        func classify(_ e: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange { inner.classify(e) }
-        func upsert(_ e: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange { inner.upsert(e) }
+        func classifyBatch(_ e: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] { inner.classifyBatch(e) }
         func upsertBatch(_ e: [PhotoLibraryCatalogEntry]) -> Bool { inner.upsertBatch(e) }
         func markRemoved(_ ids: [String], removedAt: Date) -> PhotoLibraryCatalogMutationResult {
             inner.markRemoved(ids, removedAt: removedAt)

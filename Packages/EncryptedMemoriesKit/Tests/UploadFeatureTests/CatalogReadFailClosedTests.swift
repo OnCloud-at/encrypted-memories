@@ -189,6 +189,32 @@ final class CatalogReadFailClosedTests: XCTestCase {
             "an unknown page is not the end of the catalog")
     }
 
+    // MARK: - Short classification (#1161)
+
+    /// After a transient read failure the batch classification answers shorter, and the probe clears the failure.
+    /// The scan must stop before it records the observation, so the next scan still enqueues the new photo.
+    func testAShortClassificationStopsTheScanBeforeItRecordsTheObservation() async throws {
+        let store = try makeCatalog()
+        let engine = Enqueuer()
+        let fault = try SQLiteReadInterrupt(
+            in: store, matching: "SELECT content_fingerprint, metadata_revision, is_removed FROM photo_catalog")
+        do {
+            _ = try await sync(store, infos: [photo("a")]).run(engine: engine, identifiers: ["a"])
+            XCTFail("a short classification must stop the chunk")
+        } catch let error as UploadError {
+            XCTAssertEqual(error, .backend("Photo library catalog classification was incomplete"))
+        }
+        fault.stop()
+
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(store.isOperational(), "the probe clears the transient interrupt")
+        XCTAssertNil(try store.entry(for: "a"), "the catalog records no observation that no classification covered")
+        XCTAssertTrue(engine.enqueued.isEmpty)
+
+        _ = try await sync(store, infos: [photo("a")]).run(engine: engine, identifiers: ["a"])
+        XCTAssertEqual(engine.enqueued, ["a"], "the next scan classifies and enqueues the photo")
+    }
+
     // MARK: - Late render (H6)
 
     func testAFailedStoredEntryReadNeverSkipsALateRenderReopening() async throws {

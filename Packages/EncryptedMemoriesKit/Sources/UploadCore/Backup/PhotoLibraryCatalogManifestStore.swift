@@ -162,28 +162,9 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         }
     }
 
-    public func classify(_ entry: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange {
-        classifyBatch([entry]).first ?? .changed
-    }
-
     public func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] {
         guard !entries.isEmpty else { return [] }
         return connection.withLock { classifyBatchLocked(entries) }
-    }
-
-    @discardableResult
-    public func upsert(_ entry: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange {
-        connection.withLock {
-            let change = classifyBatchLocked([entry]).first ?? .changed
-            var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK)
-            else {
-                return change
-            }
-            defer { sqlite3_finalize(stmt) }
-            _ = requireOperational(persist(entry, using: stmt))
-            return change
-        }
     }
 
     @discardableResult
