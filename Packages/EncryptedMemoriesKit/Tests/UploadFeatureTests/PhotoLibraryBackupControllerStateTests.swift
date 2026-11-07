@@ -6241,7 +6241,7 @@ extension PhotoLibraryBackupControllerStateTests {
         func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool {
             await controller.removeFromBackup(identifiers: identifiers)
         }
-        func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool { false }
+        func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> { [] }
         func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
             await controller.returnToBackup(states)
         }

@@ -50,20 +50,21 @@ import UploadCore
         let calls = ChangeCounter()
         let files = PendingFileSource(
             queue: queue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true },
-            returnToBackup: { _ in
+            returnToBackup: { paths in
                 if holdTransaction {
-                    return connection.withLock {
+                    let began = connection.withLock {
                         sqlite3_exec(connection.database, "BEGIN;", nil, nil, nil) == SQLITE_OK
                     }
+                    return began ? Set(paths) : []
                 }
                 do {
                     calls.readFault = try SQLiteReadInterrupt(
                         in: queue,
                         matching: "SELECT source_kind, source_id, resource, revision_us, state", afterRows: 2)
-                    return true
+                    return Set(paths)
                 } catch {
                     Issue.record(error)
-                    return false
+                    return []
                 }
             })
         let session = try #require(
@@ -81,6 +82,61 @@ import UploadCore
         #expect(fixture.store.sourceState(for: key)?.needsQueueSync == true)
         calls.readFault?.stop()
         if holdTransaction { connection.withLock { connection.rollBack() } }
+        await session.close()
+        await fixture.controller.shutdown()
+        fixture.store.close()
+        queue.close()
+    }
+
+    /// A restored file settles only on the file source's answer for its own path. Finished queue rows of an
+    /// earlier upload do not stand in for a refused return.
+    @Test func aRefusedRestoredFileKeepsTheRestoreDuty() async throws {
+        try await assertRestoredFileReturn(fileSourceReturnsThePath: false)
+    }
+
+    @Test func aReturnedRestoredFileWithFinishedRowsSettlesTheRestoreDuty() async throws {
+        try await assertRestoredFileReturn(fileSourceReturnsThePath: true)
+    }
+
+    private func assertRestoredFileReturn(fileSourceReturnsThePath: Bool) async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let key = PendingSourceKey(
+            kind: .fileURL, identifier: fixture.directory.appendingPathComponent("photo.heic").path)
+        let remote = PhotoUID(volumeID: "volume", nodeID: "remote")
+        _ = try #require(fixture.store.exclude([.init(key: key, presentation: nil, remote: remote)], at: Date()))
+        let queue = try #require(
+            UploadBackupSyncQueueManifestStore(url: fixture.directory.appendingPathComponent("files.sqlite")))
+        #expect(
+            queue.upsert(
+                .init(
+                    source: .init(kind: .fileURL, identifier: key.identifier),
+                    revision: .init(rawValue: 1), originalFilename: "photo.heic", state: .completed,
+                    updatedAt: Date(timeIntervalSince1970: 1_000))))
+        let calls = ChangeCounter()
+        let files = PendingFileSource(
+            queue: queue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true },
+            returnToBackup: { paths in
+                calls.count += 1
+                return fileSourceReturnsThePath ? Set(paths) : []
+            })
+        let session = try #require(
+            PendingGridSession(
+                store: fixture.store, photoBackup: fixture.controller,
+                remote: NoRemoteEffects(), files: files))
+
+        #expect(await session.restore([key.localUID]))
+
+        #expect(calls.count >= 1, "the restored file reaches the file source")
+        let after = fixture.store.sourceState(for: key)
+        if fileSourceReturnsThePath {
+            #expect(after?.needsQueueSync != true, "a returned file with finished rows settles its restore duty")
+        } else {
+            #expect(after?.desired == .included)
+            #expect(
+                after?.needsQueueSync == true,
+                "a file the file source did not return keeps its restore duty, whatever earlier rows say")
+        }
         await session.close()
         await fixture.controller.shutdown()
         fixture.store.close()
@@ -127,9 +183,9 @@ import UploadCore
         let files = adapterResult.map { result in
             PendingFileSource(
                 queue: queue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true },
-                returnToBackup: { _ in
+                returnToBackup: { paths in
                     calls.count += 1
-                    return result
+                    return result ? Set(paths) : []
                 })
         }
         let session = try #require(
@@ -358,7 +414,7 @@ import UploadCore
                     state: .queuedForUpload, updatedAt: Date(timeIntervalSince1970: 1_700_000_000))))
         let metadata = UnknownUntilReadableMetadata()
         let files = PendingFileSource(
-            queue: fileQueue, metadata: metadata, removeFromBackup: { _ in true }, returnToBackup: { _ in true })
+            queue: fileQueue, metadata: metadata, removeFromBackup: { _ in true }, returnToBackup: { Set($0) })
         let connection = PendingGridConnection()
         let started = connection.start(store: fixture.store) {
             PendingGridSession(store: $0, photoBackup: fixture.controller, remote: NoRemoteEffects(), files: files)
@@ -397,7 +453,7 @@ import UploadCore
                     state: .queuedForUpload, updatedAt: Date(timeIntervalSince1970: 1_700_000_000))))
         let files = PendingFileSource(
             queue: fileQueue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true },
-            returnToBackup: { _ in true })
+            returnToBackup: { Set($0) })
         let connection = PendingGridConnection()
         let started = connection.start(store: fixture.store) {
             PendingGridSession(store: $0, photoBackup: fixture.controller, remote: NoRemoteEffects(), files: files)
@@ -649,7 +705,7 @@ import UploadCore
             uids.append(PendingSourceKey(kind: .fileURL, identifier: source.identifier).localUID)
         }
         let files = PendingFileSource(
-            queue: queue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true }, returnToBackup: { _ in true })
+            queue: queue, metadata: AllFilesMetadata(), removeFromBackup: { _ in true }, returnToBackup: { Set($0) })
         return (files, uids, queue)
     }
 

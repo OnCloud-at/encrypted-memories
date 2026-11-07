@@ -234,7 +234,7 @@ final class FolderBackupController {
             queue: queueStore,
             metadata: PendingFolderMetadataProvider(access: pendingAccess),
             removeFromBackup: { [weak self] paths in await self?.removeFromBackup(paths: paths) ?? false },
-            returnToBackup: { [weak self] paths in await self?.returnToBackup(paths: paths) ?? false }
+            returnToBackup: { [weak self] paths in await self?.returnToBackup(paths: paths) ?? [] }
         )
     }
 
@@ -245,11 +245,11 @@ final class FolderBackupController {
         return queueStore?.holdsNoRows(kind: .fileURL, identifiers: paths) == true
     }
 
-    /// Enqueues restored files again and starts a pass. A file that is gone needs nothing and
-    /// counts as done; a file whose attributes cannot be read does not count as returned, so its
-    /// queue duty stays and the next backoff tries it again.
-    private func returnToBackup(paths: [String]) async -> Bool {
-        guard let engine else { return false }
+    /// Enqueues restored files again, starts a pass and returns the paths that count as returned.
+    /// A file that is gone needs nothing and counts as done; a file whose attributes cannot be
+    /// read does not count as returned, so its queue duty stays and the next backoff tries it again.
+    private func returnToBackup(paths: [String]) async -> Set<String> {
+        guard let engine else { return [] }
         let batch = await FolderBackupCatalog.returnToBackup(
             paths: paths,
             resolve: { [pendingAccess] path in pendingAccess.fileURL(forPath: path) },
@@ -257,7 +257,7 @@ final class FolderBackupController {
         )
         refreshFromQueue()
         if batch.queuedCount > 0 { syncNow() }
-        return batch.allDone
+        return batch.returnedPaths
     }
 
     private func persistFolders() {

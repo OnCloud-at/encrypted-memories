@@ -114,15 +114,16 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
 
     /// What a batch of returned watched files did.
     public struct ReturnBatch: Sendable, Equatable {
-        /// True when every file is gone (done) or was submitted to the queue.
-        public let allDone: Bool
+        /// The paths that count as returned: gone, outside the watched folders, or submitted to
+        /// the queue. Every other path keeps its queue duty.
+        public let returnedPaths: Set<String>
         /// How many files were submitted to the queue. The queue itself may still drop a row,
         /// for example an excluded source or a dismissed recheck, so this does not promise the
         /// row survived.
         public let queuedCount: Int
 
-        public init(allDone: Bool, queuedCount: Int) {
-            self.allDone = allDone
+        public init(returnedPaths: Set<String>, queuedCount: Int) {
+            self.returnedPaths = returnedPaths
             self.queuedCount = queuedCount
         }
     }
@@ -130,28 +131,35 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
     /// Returns excluded watched files to the backup queue. A file outside the watched folders and
     /// a file that is gone need nothing and count as done. A file whose attributes cannot be read
     /// does not count as returned, so its queue duty stays with the coordinator. Readable files
-    /// are enqueued even when another file of the batch could not be read.
+    /// are enqueued even when another file of the batch could not be read. When the queue refuses
+    /// the batch, no file counts as returned.
     public static func returnToBackup(
         paths: [String],
         resolve: @Sendable (String) -> URL?,
         engine: UploadBackupSyncEngine
     ) async -> ReturnBatch {
         var candidates: [UploadBackupAssetCandidate] = []
-        var allDone = true
+        var returned = Set<String>()
+        var queuedPaths = Set<String>()
         for path in paths {
-            guard let url = resolve(path) else { continue }
+            guard let url = resolve(path) else {
+                returned.insert(path)
+                continue
+            }
             switch returnOutcome(for: url) {
-            case .gone: continue
-            case .unreadable: allDone = false
-            case .readable(let candidate): candidates.append(candidate)
+            case .gone: returned.insert(path)
+            case .unreadable: continue
+            case .readable(let candidate):
+                candidates.append(candidate)
+                queuedPaths.insert(path)
             }
         }
-        guard !candidates.isEmpty else { return ReturnBatch(allDone: allDone, queuedCount: 0) }
+        guard !candidates.isEmpty else { return ReturnBatch(returnedPaths: returned, queuedCount: 0) }
         do {
             _ = try await engine.enqueueBatch(candidates)
         } catch {
-            return ReturnBatch(allDone: false, queuedCount: 0)
+            return ReturnBatch(returnedPaths: [], queuedCount: 0)
         }
-        return ReturnBatch(allDone: allDone, queuedCount: candidates.count)
+        return ReturnBatch(returnedPaths: returned.union(queuedPaths), queuedCount: candidates.count)
     }
 }
