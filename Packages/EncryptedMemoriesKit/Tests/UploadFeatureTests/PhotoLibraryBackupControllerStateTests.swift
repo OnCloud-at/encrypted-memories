@@ -4268,6 +4268,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
 
         /// The person's retry waits for Wi-Fi, which is back. The refresh window must not start that upload pass.
+        /// In the foreground, the end of the scan starts the app's own pass, and that pass resumes the retry (#1183).
         func testARefreshScanNeverStartsTheResumedManualRetry() async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: true)
             let fixture = try makeWiFiWaitFixture(
@@ -4275,8 +4276,14 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let owners = OwnerRecorder()
+            let releaseFollowUp = LockedFlag(false)
             controller.replaceScanForTesting {
-                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+                let owner = await MainActor.run { controller.executionOwnerForTesting }
+                // The retry's pass after the refresh scan waits here until the test has read the retry and the scan.
+                if owner == .manual, owners.values.contains(.iOSRefreshTask) {
+                    while !releaseFollowUp.value, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+                }
+                owners.record(owner)
             }
             await controller.retryUserResolvableWork()
             let waiting = await waitUntil { controller.status.phase == .waitingForWiFi && !controller.isSyncing }
@@ -4288,6 +4295,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             XCTAssertEqual(end, .scanned)
             XCTAssertEqual(owners.values, [.manual, .iOSRefreshTask])
+
+            // The app is in the foreground, so the end of the scan starts the app's pass, which resumes the retry.
+            // Later passes, for example the automatic resume, can follow it.
+            releaseFollowUp.value = true
+            let resumed = await waitUntil(timeout: .seconds(30)) { owners.values.count >= 3 }
+            XCTAssertTrue(resumed, "the app's pass after the scan ran")
+            XCTAssertEqual(Array(owners.values.prefix(3)), [.manual, .iOSRefreshTask, .manual])
             await controller.shutdown()
         }
 
