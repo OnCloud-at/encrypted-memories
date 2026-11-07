@@ -15,7 +15,7 @@ func storeConnection(_ store: Any) throws -> SQLiteStoreConnection {
 /// Pending-grid effects that succeed without doing anything.
 struct InertPendingEffects: PendingBackupEffects {
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool { true }
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool { true }
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> { Set(keys) }
     func photosVolumeID() async -> String? { "volume" }
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }

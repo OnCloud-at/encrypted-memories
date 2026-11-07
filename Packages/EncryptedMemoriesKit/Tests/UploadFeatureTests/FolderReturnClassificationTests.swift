@@ -86,18 +86,13 @@ import UploadCore
         #expect(
             after?.needsQueueSync == true,
             "no partial success: the unreadable member of a mixed batch keeps its queue duty")
-        // The restore result covers the whole group, so the readable and gone siblings also keep
-        // their queue duty until the unreadable file resolves. Follow-up: #1184.
-        let readableAfter = fixture.store.sourceState(for: readableKey)
-        #expect(readableAfter?.desired == .included, "the readable sibling stays included")
+        // Each file settles on its own result, so the unreadable file does not hold back its siblings.
         #expect(
-            readableAfter?.needsQueueSync == true,
-            "the readable sibling keeps its queue duty until the unreadable file resolves (#1184)")
-        let goneAfter = fixture.store.sourceState(for: goneKey)
-        #expect(goneAfter?.desired == .included, "the gone sibling stays included")
+            fixture.store.sourceState(for: readableKey) == nil,
+            "a queued sibling of an unreadable file owes no queue duty")
         #expect(
-            goneAfter?.needsQueueSync == true,
-            "the gone sibling keeps its queue duty until the unreadable file resolves (#1184)")
+            fixture.store.sourceState(for: goneKey) == nil,
+            "a gone sibling of an unreadable file owes no queue duty")
         await session.close()
         await fixture.shutdown()
     }
@@ -172,7 +167,7 @@ import UploadCore
             resolve: { URL(fileURLWithPath: $0) },
             engine: fixture.engine)
 
-        #expect(batch == FolderBackupCatalog.ReturnBatch(allDone: true, queuedCount: 0))
+        #expect(batch == FolderBackupCatalog.ReturnBatch(returnedPaths: [], queuedCount: 0))
         #expect(try fixture.queueRowCount(for: fixture.path("Watched/photo.heic")) == 0)
         await fixture.shutdown()
     }
@@ -188,7 +183,8 @@ import UploadCore
             resolve: { _ in nil },
             engine: fixture.engine)
 
-        #expect(batch == FolderBackupCatalog.ReturnBatch(allDone: true, queuedCount: 0))
+        #expect(
+            batch == FolderBackupCatalog.ReturnBatch(returnedPaths: ["/outside/watched/photo.heic"], queuedCount: 0))
         #expect(try fixture.queueRowCount(for: "/outside/watched/photo.heic") == 0)
         await fixture.shutdown()
     }
@@ -318,7 +314,7 @@ private struct ReturnFixture {
                     paths: paths,
                     resolve: { URL(fileURLWithPath: $0) },
                     engine: engine
-                ).allDone
+                ).returnedPaths
             })
         return try #require(
             PendingGridSession(store: store, photoBackup: controller, remote: NoRemoteEffects(), files: files))

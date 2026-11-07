@@ -366,14 +366,15 @@ public struct PendingFileSource: Sendable {
     public let metadata: any PendingSourceMetadataProviding
     /// Removes excluded files (standardized paths) from queued and in-flight backup work.
     public let removeFromBackup: @Sendable ([String]) async -> Bool
-    /// Enqueues restored files again.
-    public let returnToBackup: @Sendable ([String]) async -> Bool
+    /// Enqueues restored files again and returns the paths whose return is settled. Every other path keeps its
+    /// queue duty.
+    public let returnToBackup: @Sendable ([String]) async -> Set<String>
 
     public init(
         queue: any UploadBackupSyncQueueObserving,
         metadata: any PendingSourceMetadataProviding,
         removeFromBackup: @escaping @Sendable ([String]) async -> Bool,
-        returnToBackup: @escaping @Sendable ([String]) async -> Bool
+        returnToBackup: @escaping @Sendable ([String]) async -> Set<String>
     ) {
         self.queue = queue
         self.metadata = metadata
@@ -431,14 +432,20 @@ private struct SessionEffects: PendingBackupEffects {
         }
     }
 
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
-        let photos = keys.filter { $0.kind == .photoLibraryAsset }.map(\.identifier)
-        let fileKeys = keys.filter { $0.kind == .fileURL }.map(\.identifier)
-        guard fileKeys.isEmpty || files != nil else { return false }
-        var succeeded = true
-        if !photos.isEmpty { succeeded = await photoBackup.returnToBackup(identifiers: photos) }
-        if !fileKeys.isEmpty, let files { succeeded = await files.returnToBackup(fileKeys) && succeeded }
-        return succeeded
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> {
+        let photoKeys = keys.filter { $0.kind == .photoLibraryAsset }
+        let fileKeys = keys.filter { $0.kind == .fileURL }
+        guard fileKeys.isEmpty || files != nil else { return [] }
+        var returned = Set<PendingSourceKey>()
+        // The photo backup answers for the whole batch.
+        if !photoKeys.isEmpty, await photoBackup.returnToBackup(identifiers: photoKeys.map(\.identifier)) {
+            returned.formUnion(photoKeys)
+        }
+        if !fileKeys.isEmpty, let files {
+            let paths = await files.returnToBackup(fileKeys.map(\.identifier))
+            returned.formUnion(fileKeys.filter { paths.contains($0.identifier) })
+        }
+        return returned
     }
 
     func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
@@ -446,7 +453,8 @@ private struct SessionEffects: PendingBackupEffects {
         for state in states where state.key.kind == .fileURL {
             outcomes[state.key] = .unreadable
             guard let files, let queue = files.queue as? UploadBackupSyncQueueManifestStore, queue.isOperational(),
-                await files.returnToBackup([state.key.identifier]), queue.isOperational()
+                await files.returnToBackup([state.key.identifier]).contains(state.key.identifier),
+                queue.isOperational()
             else { continue }
             guard let rows = try? queue.decisionRows(kind: .fileURL, identifiers: [state.key.identifier]),
                 queue.isOperational(), !rows.isEmpty

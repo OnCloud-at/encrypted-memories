@@ -581,8 +581,8 @@ private final class EffectScheduleEffects: PendingBackupEffects, @unchecked Send
         }
     }
 
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
-        true
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> {
+        Set(keys)
     }
 
     func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {

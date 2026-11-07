@@ -1548,7 +1548,7 @@ private struct EditPendingMetadata: PendingSourceMetadataProviding {
 
 private struct EditPendingEffects: PendingBackupEffects {
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool { true }
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool { true }
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> { Set(keys) }
     func photosVolumeID() async -> String? { "vol" }
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
