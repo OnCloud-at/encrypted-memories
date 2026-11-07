@@ -399,10 +399,10 @@ struct ProtonRequestGovernorTests {
         await governor.finish(resumed, statusCode: 200)
     }
 
-    @Test func structuredPriorityScopeSurvivesWatchdogAndEndsOnCompletion() async throws {
+    @Test func priorityScopeSurvivesElapsedTimeAndEndsOnCompletion() async throws {
         let clock = TestClock()
         let governor = ProtonRequestGovernor(
-            configuration: Self.configuration(initial: 1, maximum: 1, priorityLifetime: 1),
+            configuration: Self.configuration(initial: 1, maximum: 1),
             now: { clock.now }
         )
         let activeUpload = try await governor.acquire(scope: .storageUpload, priority: .background)
@@ -432,31 +432,6 @@ struct ProtonRequestGovernorTests {
         #expect(await governor.snapshot().storageUpload.queued == 1)
         await complete.open()
         await interactive.value
-        let resumed = try await queuedUpload.value
-        await governor.finish(resumed, statusCode: 200)
-        #expect(await governor.snapshot().storageUpload.inFlight == 0)
-    }
-
-    @Test func unstructuredPriorityScopeExpiresAndResumesQueuedUploads() async throws {
-        let clock = TestClock()
-        let governor = ProtonRequestGovernor(
-            configuration: Self.configuration(initial: 1, maximum: 1, priorityLifetime: 1),
-            now: { clock.now }
-        )
-        let activeUpload = try await governor.acquire(scope: .storageUpload, priority: .background)
-        _ = await governor.beginUnstructuredPriorityScope(
-            .immediate,
-            promoting: [.api, .storageDownload],
-            suspending: [.storageUpload]
-        )
-        let queuedUpload = Task {
-            try await governor.acquire(scope: .storageUpload, priority: .background)
-        }
-        try await Self.waitUntil { await governor.snapshot().storageUpload.queued == 1 }
-
-        await governor.finish(activeUpload, statusCode: 200)
-        clock.now = clock.now.addingTimeInterval(2)
-        _ = await governor.snapshot()
         let resumed = try await queuedUpload.value
         await governor.finish(resumed, statusCode: 200)
         #expect(await governor.snapshot().storageUpload.inFlight == 0)
@@ -610,7 +585,6 @@ struct ProtonRequestGovernorTests {
         initial: Int,
         maximum: Int,
         successWindow: Int = 32,
-        priorityLifetime: TimeInterval = 60,
         recoveryInterval: TimeInterval = 5
     ) -> ProtonRequestGovernor.Configuration {
         let scope = ProtonRequestGovernor.Configuration.Scope(
@@ -623,7 +597,6 @@ struct ProtonRequestGovernorTests {
             storageUpload: scope,
             successWindowForIncrease: successWindow,
             starvationPromotionInterval: 10,
-            priorityScopeLifetime: priorityLifetime,
             rateLimitRecoveryInterval: recoveryInterval
         )
     }

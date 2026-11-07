@@ -120,9 +120,8 @@ enum TrashedRelatedPhotos {
     ) async throws -> [CheckedLink] {
         let ids = Array(Set(ids)).sorted()
         var result: [CheckedLink] = []
-        for offset in stride(from: 0, to: ids.count, by: 150) {
+        for chunk in ids.chunked(by: 150) {
             try Task.checkCancellation()
-            let chunk = Array(ids[offset..<min(offset + 150, ids.count)])
             let data = try await session.send(
                 "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": chunk],
                 retryOnRateLimit: retryOnRateLimit)

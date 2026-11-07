@@ -1,4 +1,3 @@
-import AppleSecurityCore
 import CryptoKit
 import Foundation
 import PhotosCore
@@ -27,7 +26,7 @@ struct SharedPhotosRootMaterialTests {
         }
         let session = DriveSession(
             session: ProtonSession(uid: "root-fixture", accessToken: "synthetic", refreshToken: "", keyPassword: ""),
-            store: SessionKeychainStore(service: "root-fixture", account: "fixture", keychain: RootMaterialKeychain()),
+            store: SessionKeychainStore(service: "root-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory, urlProtocolClasses: [RootMaterialHTTP.self])
         let resolver = PhotosRootMaterialResolver()
         let album = ProtonAlbumWriteService(session: session, crypto: fixture.crypto, rootMaterialResolver: resolver) {
@@ -523,7 +522,7 @@ private final class RootEnvironment: @unchecked Sendable {
     private static func session(_ directory: URL, uid: String = "root-fixture") -> DriveSession {
         DriveSession(
             session: ProtonSession(uid: uid, accessToken: "synthetic", refreshToken: "", keyPassword: ""),
-            store: SessionKeychainStore(service: "root-fixture", account: "fixture", keychain: RootMaterialKeychain()),
+            store: SessionKeychainStore(service: "root-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory, urlProtocolClasses: [RootMaterialHTTP.self])
     }
     func makeSession() -> DriveSession { Self.session(directory, uid: "root-other-fixture") }
@@ -714,12 +713,4 @@ private struct RootMaterialUnusedSDK: SDKPhotoDuplicatesClient {
         throw URLError(.unsupportedURL)
     }
     func cancelFindPhotoDuplicates(cancellationToken: UUID) async throws {}
-}
-
-private struct RootMaterialKeychain: AppleKeychainStoring {
-    func data(for item: AppleKeychainItem) throws -> Data? { throw CocoaError(.userCancelled) }
-    func setData(_ data: Data, for item: AppleKeychainItem) throws { throw CocoaError(.userCancelled) }
-    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data { throw CocoaError(.userCancelled) }
-    func removeData(for item: AppleKeychainItem) throws { throw CocoaError(.userCancelled) }
-    func removeAllData(service: String) throws { throw CocoaError(.userCancelled) }
 }

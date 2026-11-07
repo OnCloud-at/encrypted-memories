@@ -1,4 +1,3 @@
-import AppleSecurityCore
 import Foundation
 import ProtonAuth
 import Testing
@@ -695,7 +694,7 @@ struct SDKSmallUploadTests {
         return ProtonRequestGovernor(
             configuration: .init(
                 api: scope, storageDownload: scope, storageUpload: scope,
-                successWindowForIncrease: 32, starvationPromotionInterval: 10, priorityScopeLifetime: 60))
+                successWindowForIncrease: 32, starvationPromotionInterval: 10))
     }
 
     private func waitFor(_ condition: () async -> Bool) async -> Bool {
@@ -858,35 +857,6 @@ private final class SmallUploadURLProtocol: URLProtocol {
             if count <= 0 { return result }
             result.append(contentsOf: buffer.prefix(count))
         }
-    }
-}
-
-private final class MemoryKeychainStore: AppleKeychainStoring, @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [AppleKeychainItem: Data] = [:]
-
-    func data(for item: AppleKeychainItem) throws -> Data? {
-        lock.withLock { storage[item] }
-    }
-
-    func setData(_ data: Data, for item: AppleKeychainItem) throws {
-        lock.withLock { storage[item] = data }
-    }
-
-    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data {
-        lock.withLock {
-            if let existing = storage[item] { return existing }
-            storage[item] = data
-            return data
-        }
-    }
-
-    func removeData(for item: AppleKeychainItem) throws {
-        lock.withLock { _ = storage.removeValue(forKey: item) }
-    }
-
-    func removeAllData(service: String) throws {
-        lock.withLock { storage = storage.filter { $0.key.service != service } }
     }
 }
 
