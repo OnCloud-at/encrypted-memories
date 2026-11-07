@@ -30,19 +30,16 @@ struct DedupeXAttr: Decodable {
 
     struct Lineage: Decodable {
         let version: Int
-        let reason: String?
         let replaces: [String]
 
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             version = try values.decode(Int.self, forKey: .version)
             replaces = try values.decode([String].self, forKey: .replaces)
-            reason = try? values.decode(String.self, forKey: .reason)
         }
 
         enum CodingKeys: String, CodingKey {
             case version = "V"
-            case reason = "Reason"
             case replaces = "Replaces"
         }
     }

@@ -5636,9 +5636,6 @@ private final class MemberCompoundRaceChecker: UploadDuplicateChecking, @uncheck
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
         try await base.externalIdentifier(ofMainLink: linkID)
     }
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
-        try await base.modificationDate(ofMainLink: linkID)
-    }
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         try await base.replacedLinkIDs(ofReplacingMain: linkID)
     }

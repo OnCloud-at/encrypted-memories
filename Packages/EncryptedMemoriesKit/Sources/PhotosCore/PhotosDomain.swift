@@ -198,9 +198,6 @@ public protocol PhotosRepository: Sendable {
     /// photos, tags, or series read returns nil, so the caller uses the server load. Implementations that cannot provide an
     /// atomic pair should return a nil token so validation fails closed.
     func cachedTimelineSnapshot() async -> CachedTimelineSnapshot?
-    /// Opaque server revision captured atomically with the cached timeline. A caller may present the
-    /// cached frame as authoritative only after this equals the provider's current change token.
-    func cachedTimelineValidationToken() async -> String?
 }
 
 public extension PhotosRepository {
@@ -218,7 +215,6 @@ public extension PhotosRepository {
         guard let sections = await cachedTimeline() else { return nil }
         return CachedTimelineSnapshot(sections: sections, validationToken: nil)
     }
-    func cachedTimelineValidationToken() async -> String? { nil }
 }
 
 /// Cheap, opaque server-side library revision used to notice changes made by another device.
@@ -227,8 +223,7 @@ public protocol LibraryChangeTokenProvider: Sendable {
     func libraryChangeToken() async throws -> String
     /// Same opaque token, requested on the user-visible launch path. Backends with a shared request governor
     /// may raise this above speculative/background traffic; providers without priorities use the default.
-    func launchValidationToken() async throws -> String
-    /// Allows a backend to use scope already present in the cached inventory (for example its volume ID),
+    /// A backend may use scope already present in the cached inventory (for example its volume ID),
     /// avoiding an unrelated root-discovery request on the user-visible launch path.
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String
     /// Adapts a validated persisted revision without another listing. The validated remote cursor remains the baseline.
@@ -249,12 +244,8 @@ public extension LibraryChangeTokenProvider {
             validatedRemoteRevision: remoteRevision, observedMonitorToken: observed)
     }
 
-    func launchValidationToken() async throws -> String {
-        try await libraryChangeToken()
-    }
-
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String {
-        try await launchValidationToken()
+        try await libraryChangeToken()
     }
 }
 

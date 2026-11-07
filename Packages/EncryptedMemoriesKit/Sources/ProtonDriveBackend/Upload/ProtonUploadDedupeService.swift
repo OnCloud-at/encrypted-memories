@@ -256,21 +256,6 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         return try JSONDecoder().decode(DedupeXAttr.self, from: data)
     }
 
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
-        let material = try await resolveMaterial()
-        let metadata = try await session.fetchPhotoLinksMetadata(
-            shareID: material.context.shareID, linkIDs: [linkID])
-        guard let main = metadata.first(where: { $0.linkID == linkID }), main.state == 1,
-            let photo = main.fileProperties?.activeRevision?.photo, photo.mainPhotoLinkID == nil,
-            let raw = try attributes(of: main, material: material)?.iOSPhotos?.modificationTime
-        else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return fractional.date(from: raw) ?? standard.date(from: raw)
-    }
-
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
         let material = try await resolveMaterial()
         let metadata = try await session.fetchAlbumPhotoMetadata(
@@ -1286,14 +1271,6 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
 /// Narrow availability-first rule: an exact indexed match still wins; a readable index with remote
 /// rows missing encrypted SHA-1 metadata permits upload on a content miss; local index failure does not.
 enum ProtonRemoteContentIndexLookup {
-    static func duplicate(
-        contentHash: String,
-        record: UploadRemoteContentIndexRecord?,
-        health: UploadRemoteContentIndexHealth
-    ) throws -> RemotePhotoDuplicate? {
-        try duplicates(contentHash: contentHash, records: record.map { [$0] } ?? [], health: health).first
-    }
-
     static func duplicates(
         contentHash: String,
         records: [UploadRemoteContentIndexRecord],
