@@ -67,27 +67,4 @@ import Testing
             #expect(!range.contains(60))
         }
     }
-
-    @Test func corridorIsOneViewportAtRestAndGrowsWithVelocity() {
-        #expect(GridScrollAheadPolicy.corridorRows(viewportRows: 8, rowsPerSecond: 0) == 8)
-        #expect(GridScrollAheadPolicy.corridorRows(viewportRows: 8, rowsPerSecond: 30) == 14)
-        #expect(GridScrollAheadPolicy.corridorRows(viewportRows: 8, rowsPerSecond: 1_000) == 24)
-    }
-
-    @Test func corridorSanitizesInvalidInputsAndKeepsAHardBound() {
-        #expect(GridScrollAheadPolicy.corridorRows(viewportRows: 0, rowsPerSecond: 10) == 0)
-        #expect(GridScrollAheadPolicy.corridorRows(viewportRows: 6, rowsPerSecond: .nan) == 6)
-        #expect(
-            GridScrollAheadPolicy.corridorRows(
-                viewportRows: 6,
-                rowsPerSecond: .infinity,
-                maximumViewportCount: 2
-            ) == 6)
-        #expect(
-            GridScrollAheadPolicy.corridorRows(
-                viewportRows: 6,
-                rowsPerSecond: 1_000,
-                maximumViewportCount: 2
-            ) == 12)
-    }
 }

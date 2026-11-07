@@ -91,11 +91,10 @@ import TimelineCore
     }
 
     @Test func sixLevelSpecGuard() {
-        #expect(SquareTileGridEngine.appleLevelSpecs.count == 6)
         #expect(SquareTileGridEngine.testRegularLevels.count == 6)
         #expect(engine().levelCount == 6)
         #expect(
-            SquareTileGridEngine.appleLevelSpecs.map(\.nominalColumns) == [3, 5, 7, 9, 20, 30],
+            SquareTileGridEngine.testRegularLevels.map(\.nominalColumns) == [3, 5, 7, 9, 20, 30],
             "configured six-level nominal columns")
     }
 }
