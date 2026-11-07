@@ -47,6 +47,22 @@ enum MobileViewerMediaRoute {
     }
 }
 
+/// Names what a viewer share could not prepare. The items are the photos of the shared decision,
+/// counted before their files: a Live Photo or the original of an edited photo is one photo.
+enum MobileViewerShareFailureText {
+    static func message(
+        for items: [PhotoItem], expandedSingleSeries: Bool, resolvedKinds: [PhotoUID: MediaKind]
+    ) -> String {
+        if expandedSingleSeries { return String(localized: "viewer.share_failed_photos") }
+        if items.count == 1, let item = items.first,
+            MobileViewerMediaRoute.isVideo(item: item, resolvedKind: resolvedKinds[item.uid])
+        {
+            return String(localized: "viewer.share_failed_video")
+        }
+        return String(localized: "viewer.share_failed")
+    }
+}
+
 /// Identifies Live Photo preparation without tying it to changing viewport geometry.
 struct MobileLivePhotoMotionTaskID: Equatable {
     let item: PhotoItem

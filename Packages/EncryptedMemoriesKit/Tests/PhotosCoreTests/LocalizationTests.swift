@@ -161,6 +161,32 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    /// One share failure text for each content: a series, one photo (also a Live Photo or the
+    /// original of an edited photo), or one video.
+    func testViewerShareFailureCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            (
+                "viewer.share_failed_photos",
+                "The photos couldn’t be prepared for sharing.",
+                "Die Fotos konnten nicht zum Teilen vorbereitet werden."
+            ),
+            (
+                "viewer.share_failed",
+                "The photo couldn’t be prepared for sharing.",
+                "Das Foto konnte nicht zum Teilen vorbereitet werden."
+            ),
+            (
+                "viewer.share_failed_video",
+                "The video couldn’t be prepared for sharing.",
+                "Das Video konnte nicht zum Teilen vorbereitet werden."
+            ),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: mobileCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: mobileCatalog), german, key)
+        }
+    }
+
     func testBulkRestoreCopyUsesTheApprovedEnglishAndGermanText() throws {
         let texts: [(String, String, String)] = [
             ("albumsync.bulk_action %@", "Restore All (%@)", "Alle wiederherstellen (%@)"),

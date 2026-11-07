@@ -19,6 +19,20 @@ private enum ViewerShareSample {
         captureTime: Date(timeIntervalSince1970: 1_700_000_000),
         mediaType: "image/jpeg"
     )
+    static let livePhoto = PhotoItem(
+        uid: PhotoUID(volumeID: "fixture", nodeID: "share-live"),
+        captureTime: Date(timeIntervalSince1970: 1_700_000_000),
+        mediaType: "image/heic",
+        isLivePhoto: true,
+        relatedVideoID: "share-live-motion"
+    )
+    /// The fixture backend answers video metadata only for its video node, so the viewer resolves this item as a video.
+    static let video = PhotoItem(
+        uid: PhotoUID(volumeID: "fixture", nodeID: MobileSignedInFixture.videoNodeID),
+        captureTime: Date(timeIntervalSince1970: 1_700_000_000),
+        mediaType: "video/quicktime",
+        durationSeconds: 4
+    )
 
     private static func burstItem(_ nodeID: String, afterReference seconds: TimeInterval) -> PhotoItem {
         PhotoItem(
@@ -71,7 +85,7 @@ final class MobileViewerShareWiringTests: XCTestCase {
                     ViewerShareSample.lead.uid.nodeID, ViewerShareSample.second.uid.nodeID,
                     ViewerShareSample.third.uid.nodeID,
                 ],
-                failureMessage: String(localized: "viewer.share_failed"))
+                failureMessage: String(localized: "viewer.share_failed_photos"))
         ]
         gate.open()
         let enabledWhenSettled = try await fixture.waitForShareEnabledState(true)
@@ -145,7 +159,7 @@ final class MobileViewerShareWiringTests: XCTestCase {
 
         gate.open()
         let wholeShare = MobileViewerShareDecisionProbe.Event.shared(
-            nodeIDs: whole.map(\.uid.nodeID), failureMessage: String(localized: "viewer.share_failed"))
+            nodeIDs: whole.map(\.uid.nodeID), failureMessage: String(localized: "viewer.share_failed_photos"))
         try await waitUntil { !fixture.probe.events.isEmpty }
         XCTAssertEqual(fixture.probe.events, [wholeShare], "the tap shares the whole series once it is read")
         XCTAssertTrue(fixture.alertControllers().isEmpty, "a successful read shows no failure")
@@ -271,6 +285,34 @@ final class MobileViewerShareWiringTests: XCTestCase {
                 failureMessage: String(localized: "viewer.share_failed"))
         ]
         try await waitUntil { fixture.probe.events.contains(where: { $0 == plainShare[0] }) }
+        XCTAssertEqual(fixture.probe.events.filter(\.isShared), plainShare, "one photo names the photo")
+    }
+
+    func testALivePhotoSharesAsOnePhoto() async throws {
+        let fixture = try await Fixture(items: [ViewerShareSample.livePhoto], burstLoader: { _ in [] })
+        defer { fixture.close() }
+
+        let reacted = try await activateShareWhenEnabled(fixture)
+        XCTAssertTrue(reacted)
+        // The still and its motion file are one photo to the person, so the failure names a photo.
+        let liveShare = MobileViewerShareDecisionProbe.Event.shared(
+            nodeIDs: [ViewerShareSample.livePhoto.uid.nodeID],
+            failureMessage: String(localized: "viewer.share_failed"))
+        try await waitUntil { fixture.probe.events.contains(liveShare) }
+        XCTAssertEqual(fixture.probe.events.filter(\.isShared), [liveShare])
+    }
+
+    func testASingleVideoNamesTheVideoWhenSharingFails() async throws {
+        let fixture = try await Fixture(items: [ViewerShareSample.video], burstLoader: { _ in [] })
+        defer { fixture.close() }
+
+        let reacted = try await activateShareWhenEnabled(fixture)
+        XCTAssertTrue(reacted)
+        let videoShare = MobileViewerShareDecisionProbe.Event.shared(
+            nodeIDs: [ViewerShareSample.video.uid.nodeID],
+            failureMessage: String(localized: "viewer.share_failed_video"))
+        try await waitUntil { fixture.probe.events.contains(videoShare) }
+        XCTAssertEqual(fixture.probe.events.filter(\.isShared), [videoShare])
     }
 
     // MARK: - Harness
@@ -653,5 +695,37 @@ extension MobileViewerShareDecisionProbe.Event {
     var isBurstReadFailed: Bool {
         if case .burstReadFailed = self { return true }
         return false
+    }
+}
+
+/// The share failure text names what the share carries. The resolved media kind decides before the
+/// timeline hint, like the viewer page does.
+final class MobileViewerShareFailureTextTests: XCTestCase {
+    private static func item(_ nodeID: String, mediaType: String) -> PhotoItem {
+        PhotoItem(
+            uid: PhotoUID(volumeID: "fixture", nodeID: nodeID),
+            captureTime: Date(timeIntervalSince1970: 1_700_000_000),
+            mediaType: mediaType)
+    }
+
+    func testTheTextFollowsTheSeriesAndTheResolvedKind() {
+        let photo = Self.item("photo", mediaType: "image/jpeg")
+        let video = Self.item("video", mediaType: "video/quicktime")
+        let photos = String(localized: "viewer.share_failed_photos")
+        let onePhoto = String(localized: "viewer.share_failed")
+        let oneVideo = String(localized: "viewer.share_failed_video")
+        let cases: [(String, [PhotoItem], Bool, [PhotoUID: MediaKind], String)] = [
+            ("a video whose hint says photo", [photo], false, [photo.uid: .video], oneVideo),
+            ("a photo whose hint says video", [video], false, [video.uid: .image], onePhoto),
+            ("an unresolved video", [video], false, [:], oneVideo),
+            ("an unresolved photo", [photo], false, [:], onePhoto),
+            ("a series with a video", [photo, video], true, [video.uid: .video], photos),
+            ("no item", [], false, [:], onePhoto),
+        ]
+        for (name, items, series, kinds, expected) in cases {
+            XCTAssertEqual(
+                MobileViewerShareFailureText.message(for: items, expandedSingleSeries: series, resolvedKinds: kinds),
+                expected, name)
+        }
     }
 }
