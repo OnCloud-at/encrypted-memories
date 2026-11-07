@@ -524,11 +524,6 @@ extension UploadIdentityStore {
     public func isNeededElsewhere(_ linkIDs: Set<String>, by source: UploadSourceIdentity) -> Bool {
         isNeededElsewhere(linkIDs) { row, _ in row.kind == source.kind && row.identifier == source.identifier }
     }
-
-    /// One row of `trustedRecords`.
-    public func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
-        trustedRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
-    }
 }
 
 /// One active remote photo identity retained by the local content index. The hash is already keyed
@@ -786,13 +781,6 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     /// `remoteContentDuplicateGroups(hashKeyEpoch:)`, with the same links left out. A hash without a manifest row is
     /// missing. Nil when the read fails.
     func remoteContentDuplicateSizes(hashKeyEpoch: String) -> [String: Int64]?
-}
-
-extension UploadRemoteContentIndexStore {
-    /// One record of `remoteContentRecords`.
-    public func remoteContentRecord(contentHash: String, hashKeyEpoch: String) -> UploadRemoteContentIndexRecord? {
-        remoteContentRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
-    }
 }
 
 /// Local content hashing with streaming SHA-1.

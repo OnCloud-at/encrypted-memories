@@ -46,8 +46,9 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         defer { reopened.close() }
         let current = try XCTUnwrap(reopened.prepare(scope: scope, eventID: "event"))
         XCTAssertEqual(current, snapshot)
-        XCTAssertEqual(reopened.fingerprints(for: group.members, in: current), expected)
-        XCTAssertEqual(reopened.prefilter(group, in: current), [])
+        let saved = try XCTUnwrap(reopened.fingerprints(for: group.members, in: current))
+        XCTAssertEqual(saved, expected)
+        XCTAssertEqual(group.split(by: saved), [])
     }
 
     func testEqualMetadataSurvivesButAnUnknownMemberKeepsTheWholeGroup() throws {
@@ -55,12 +56,12 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         defer { store.close() }
         let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
         XCTAssertTrue(store.store([first: details(), second: details()], for: snapshot))
-        XCTAssertEqual(store.prefilter(group, in: snapshot).map(\.members), [group.members])
+        let saved = try XCTUnwrap(store.fingerprints(for: group.members, in: snapshot))
+        XCTAssertEqual(group.split(by: saved).map(\.members), [group.members])
         let unknown = PhotoUID(volumeID: "volume", nodeID: "unknown")
         let partial = ExactDuplicateGroup(
             contentHash: "content", hashKeyEpoch: "epoch", members: [first, second, unknown])
         XCTAssertNil(store.fingerprints(for: partial.members, in: snapshot))
-        XCTAssertEqual(store.prefilter(partial, in: snapshot), [partial])
     }
 
     func testEverySDKFieldAndNodeOnlyIdentitySurvivesPersistence() throws {
@@ -78,7 +79,8 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
             XCTAssertEqual(store.fingerprints(for: [first], in: snapshot), [first: expected])
         }
         XCTAssertTrue(store.store([first: .matchingOnly(first), second: .matchingOnly(second)], for: snapshot))
-        XCTAssertEqual(store.prefilter(group, in: snapshot), [])
+        let matchingOnly = try XCTUnwrap(store.fingerprints(for: group.members, in: snapshot))
+        XCTAssertEqual(group.split(by: matchingOnly), [])
     }
 
     func testEachScopeComponentAndCursorChangeDiscardsThePreviousSnapshot() throws {
@@ -159,7 +161,6 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         XCTAssertNil(store.prepare(scope: scope, eventID: "event"))
         XCTAssertFalse(store.store([first: details()], for: snapshot))
         XCTAssertNil(store.fingerprints(for: [first], in: snapshot))
-        XCTAssertEqual(store.prefilter(group, in: snapshot), [group])
     }
 
     func testAGroupCannotUseDetailsOfAnotherEpochOrVolume() throws {
@@ -169,7 +170,7 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         XCTAssertTrue(store.store([first: details(), second: details("different")], for: snapshot))
         let otherEpoch = ExactDuplicateGroup(
             contentHash: "content", hashKeyEpoch: "other-epoch", members: group.members)
-        XCTAssertEqual(store.prefilter(otherEpoch, in: snapshot), [otherEpoch])
+        XCTAssertEqual(store.fingerprints(ofGroups: [otherEpoch], in: snapshot), [:])
         let foreign = PhotoUID(volumeID: "foreign-volume", nodeID: first.nodeID)
         XCTAssertNil(store.fingerprints(for: [foreign], in: snapshot))
     }
@@ -184,7 +185,6 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         defer { reopened.close() }
         let current = try XCTUnwrap(reopened.prepare(scope: scope, eventID: "event"))
         XCTAssertNil(reopened.fingerprints(for: group.members, in: current))
-        XCTAssertEqual(reopened.prefilter(group, in: current), [group])
         reopened.close()
         try changeDatabase("PRAGMA user_version=2;")
         let unknownVersion = try open()

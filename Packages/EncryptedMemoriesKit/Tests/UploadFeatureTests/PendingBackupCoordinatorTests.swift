@@ -5411,6 +5411,8 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
     func settleGone(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws {}
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
+    func supersededSourceIdentifiers() -> Set<String> { [] }
+    func namesAnyLink(_ linkIDs: Set<String>) -> Bool { true }
 }
 
 extension PendingBackupCoordinatorTests {

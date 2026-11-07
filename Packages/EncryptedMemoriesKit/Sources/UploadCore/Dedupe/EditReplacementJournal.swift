@@ -177,14 +177,8 @@ public protocol EditReplacementJournaling: Sendable {
     /// Removes photos from `retired`: the person restored them, so they are in the library again.
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
     /// True when an entry names one of `linkIDs`. The edit replacement still owns such a link, so the merge of exact
-    /// duplicates leaves it.
+    /// duplicates leaves it. A journal that cannot list its links protects every link.
     func namesAnyLink(_ linkIDs: Set<String>) -> Bool
-}
-
-extension EditReplacementJournaling {
-    public func supersededSourceIdentifiers() -> Set<String> { [] }
-    /// A journal that cannot list its links protects every link.
-    public func namesAnyLink(_ linkIDs: Set<String>) -> Bool { true }
 }
 
 /// A log of JSON lines in the account data directory, so the sign-out purge removes it with the other stores. Each

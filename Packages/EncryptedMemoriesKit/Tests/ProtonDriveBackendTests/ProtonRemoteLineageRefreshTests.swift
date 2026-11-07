@@ -176,7 +176,9 @@ extension DriveSessionStubSuite {
                 routeEmptyEvents(from: "one", to: "two")
                 try await refresh(content: content, lineage: lineage)
                 #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
-                #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+                #expect(
+                    content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?
+                        .remoteLinkID == "main")
                 #expect(StubURLProtocol.requests().map(\.path) == ["/drive/volumes/vol1/events/one"])
                 if let lineage {
                     #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")) == .incomplete)
@@ -723,7 +725,8 @@ extension DriveSessionStubSuite {
             let service = makeService(content: content, lineage: nil)
             await service.recordUploaded(contentHash: "early", remoteLinkID: "link-early")
             #expect(
-                content.remoteContentRecord(contentHash: "early", hashKeyEpoch: "epoch") != nil, "before the shutdown")
+                content.remoteContentRecords(contentHash: "early", hashKeyEpoch: "epoch", limit: 1).first != nil,
+                "before the shutdown")
             // A new record ends a staged build, so the build starts after it.
             #expect(
                 content.beginRemoteContentIndexBuild(
@@ -739,7 +742,7 @@ extension DriveSessionStubSuite {
                 content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch") != nil,
                 "the invalidation after the shutdown leaves the staged build alone")
             #expect(
-                content.remoteContentRecord(contentHash: "late", hashKeyEpoch: "epoch") == nil,
+                content.remoteContentRecords(contentHash: "late", hashKeyEpoch: "epoch", limit: 1).first == nil,
                 "no write after the shutdown")
         }
 
@@ -985,7 +988,9 @@ extension DriveSessionStubSuite {
             routeEmptyEvents(from: "two", to: "three")
             try await refresh(content: content, lineage: lineage)
             #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "three")
-            #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+            #expect(
+                content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?.remoteLinkID
+                    == "main")
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("three")) == .incomplete)
             #expect(
                 StubURLProtocol.requests().map(\.path) == [
@@ -1415,7 +1420,9 @@ extension DriveSessionStubSuite {
                 "GET /drive/volumes/vol1/photos",
                 json: #"{"Code":1000,"Photos":[{"LinkID":"main","CaptureTime":1,"Tags":[],"RelatedPhotos":[]}]}"#)
             try await refresh(content: content, lineage: lineage)
-            #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+            #expect(
+                content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?.remoteLinkID
+                    == "main")
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")) == .incomplete)
             #expect(StubURLProtocol.requests().map(\.path).filter { $0.contains("fetch_metadata") }.isEmpty)
             #expect(StubURLProtocol.requests().filter { $0.path.hasPrefix("/drive/volumes/vol1/photos") }.count == 2)
@@ -1768,7 +1775,9 @@ extension DriveSessionStubSuite {
                 try await refresh(content: content, lineage: lineage)
             }
             #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "one")
-            #expect(content.remoteContentRecord(contentHash: "hash", hashKeyEpoch: "epoch")?.remoteLinkID == "main")
+            #expect(
+                content.remoteContentRecords(contentHash: "hash", hashKeyEpoch: "epoch", limit: 1).first?.remoteLinkID
+                    == "main")
             #expect(lineage.hasCheckpoint(hashKeyEpoch: "epoch", eventID: "one"))
             #expect(lineage.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch") == ["main"])
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")) == .complete)
@@ -2107,10 +2116,8 @@ extension DriveSessionStubSuite {
                 fingerprintCache: cache)
             let snapshot = try #require(cache.currentSnapshot())
             #expect(snapshot.eventID == "two")
-            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
-            #expect(
-                cache.store.fingerprints(for: [photo("photo-b")], in: snapshot)
-                    == [photo("photo-b"): fingerprint("camera-b")])
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot) == [photo("photo-b"): fingerprint("camera-b")])
         }
 
         /// An edited file loses its old fingerprint: an edit names the link as active, so the fingerprint of the
@@ -2132,10 +2139,8 @@ extension DriveSessionStubSuite {
                 fingerprintCache: cache)
             let snapshot = try #require(cache.currentSnapshot())
             #expect(snapshot.eventID == "two")
-            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
-            #expect(
-                cache.store.fingerprints(for: [photo("photo-b")], in: snapshot)
-                    == [photo("photo-b"): fingerprint("camera-b")])
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot) == [photo("photo-b"): fingerprint("camera-b")])
         }
 
         /// A changed hash key starts a fresh index, so no fingerprint of the old key epoch survives it.
@@ -2180,8 +2185,8 @@ extension DriveSessionStubSuite {
             let snapshot = try #require(cache.currentSnapshot())
             #expect(snapshot.eventID == "two")
             #expect(fingerprintRowCount(fixture.directory) == 0)
-            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
-            #expect(cache.store.fingerprints(for: [photo("photo-b")], in: snapshot) == nil)
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot).isEmpty)
         }
 
         /// A launch without a fingerprint store (unreadable or absent) keeps the refresh working unchanged.
@@ -2216,10 +2221,8 @@ extension DriveSessionStubSuite {
                 fingerprintCache: cache)
             let snapshot = try #require(cache.currentSnapshot())
             #expect(snapshot.eventID == "two")
-            #expect(cache.store.fingerprints(for: [photo("photo-a")], in: snapshot) == nil)
-            #expect(
-                cache.store.fingerprints(for: [photo("photo-b")], in: snapshot)
-                    == [photo("photo-b"): fingerprint("camera-b")])
+            #expect(savedDetails("photo-a", in: cache, at: snapshot).isEmpty)
+            #expect(savedDetails("photo-b", in: cache, at: snapshot) == [photo("photo-b"): fingerprint("camera-b")])
         }
 
         /// Counts the saved detail rows without touching the store, so an assertion cannot destroy its own evidence.
@@ -2247,6 +2250,16 @@ extension DriveSessionStubSuite {
         }
 
         private func photo(_ linkID: String) -> PhotoUID { PhotoUID(volumeID: "vol1", nodeID: linkID) }
+
+        /// The saved details of one link through the group read of the Duplicates screen. Empty when it has none.
+        private func savedDetails(
+            _ linkID: String, in cache: ExactDuplicateFingerprintCache,
+            at snapshot: ExactDuplicateFingerprintStore.Snapshot
+        ) -> [PhotoUID: ExactDuplicateFingerprint] {
+            let group = ExactDuplicateGroup(
+                contentHash: linkID, hashKeyEpoch: snapshot.scope.hashKeyEpoch, members: [photo(linkID)])
+            return cache.store.fingerprints(ofGroups: [group], in: snapshot)
+        }
 
         private func fingerprint(_ device: String) -> ExactDuplicateFingerprint {
             ExactDuplicateFingerprint(

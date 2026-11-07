@@ -1109,18 +1109,6 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         }
     }
 
-    /// Row count - surfaced for tests and a future cache-status UI.
-    public func count() -> Int {
-        connection.withLock {
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM upload_identity;", -1, &stmt, nil) == SQLITE_OK else {
-                return 0
-            }
-            defer { sqlite3_finalize(stmt) }
-            return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
-        }
-    }
-
     private func writeRemoteContentRecordsLocked(_ records: [UploadRemoteContentIndexRecord]) -> Bool {
         guard !records.isEmpty else { return true }
         var stmt: OpaquePointer?
