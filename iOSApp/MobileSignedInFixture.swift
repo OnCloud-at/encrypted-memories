@@ -156,15 +156,18 @@ import os
                 let groups = (0..<1_500).map { index in
                     (0..<(index.isMultiple(of: 3) ? 3 : 2)).map { items[(index * 3 + $0) % items.count].uid }
                 }
+                // A held scan or check keeps its screen for 300 s, longer than any test (the longest takes about
+                // 31 s). No test waits for the end of the hold, so a slow runner cannot lose the screen.
+                let hold = Duration.seconds(300)
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(
                         groups: groups,
                         captureDates: Dictionary(
                             items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
                         scanDelay: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesSlowScan") ? .seconds(5) : nil,
+                            "-EncryptedMemoriesDuplicatesSlowScan") ? hold : nil,
                         rankDelay: ProcessInfo.processInfo.arguments.contains(
-                            "-EncryptedMemoriesDuplicatesSlowCheck") ? .seconds(5) : nil,
+                            "-EncryptedMemoriesDuplicatesSlowCheck") ? hold : nil,
                         // Each batch of Merge All takes a while, so a UI test can stop it.
                         mergeDelay: ProcessInfo.processInfo.arguments.contains(
                             "-EncryptedMemoriesDuplicatesSlowMerge") ? .milliseconds(500) : nil))
