@@ -1833,7 +1833,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let firstPathWait = holdFirstNetworkPathWait(of: controller)
             defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
-            controller.replaceScanForTesting { _ = scans.increment() }
+            // The photo still waits after the pass, so the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
+            controller.replaceScanForTesting {
+                await followUps.enter()
+                _ = scans.increment()
+            }
 
             controller.syncNow()
             _ = await waitUntil { firstPathWait.isWaiting }
@@ -1843,9 +1849,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
 
-            let finished = await waitUntil(timeout: .seconds(5)) { scans.count == 1 && !controller.isSyncing }
+            let finished = await waitUntil(timeout: .seconds(5)) {
+                scans.count == 1 && (!controller.isSyncing || followUps.isHolding)
+            }
             XCTAssertTrue(finished, "the first path reports Wi-Fi and the pass starts at once")
             XCTAssertNotEqual(controller.status.phase, .waitingForWiFi)
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -1887,13 +1896,22 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 defer { fixture.cleanup() }
                 let controller = fixture.controller
                 let scans = PassCounter()
-                controller.replaceScanForTesting { _ = scans.increment() }
+                // The photo still waits after the pass, so the app's own passes can follow it.
+                let followUps = FollowUpPassGate(admitting: 1)
+                defer { followUps.release() }
+                controller.replaceScanForTesting {
+                    await followUps.enter()
+                    _ = scans.increment()
+                }
 
                 controller.syncNow()
 
-                let finished = await waitUntil(timeout: .seconds(10)) { scans.count == 1 && !controller.isSyncing }
+                let finished = await waitUntil(timeout: .seconds(10)) {
+                    scans.count == 1 && (!controller.isSyncing || followUps.isHolding)
+                }
                 XCTAssertTrue(finished, "mobile data on starts at once, determined: \(initial.isDetermined)")
                 XCTAssertNotEqual(controller.status.phase, .waitingForWiFi)
+                followUps.release()
                 await controller.shutdown()
             }
         }
@@ -1914,7 +1932,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let firstPathWait = holdFirstNetworkPathWait(of: controller)
             defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
-            controller.replaceScanForTesting { _ = scans.increment() }
+            // The photo still waits after the pass, so the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
+            controller.replaceScanForTesting {
+                await followUps.enter()
+                _ = scans.increment()
+            }
 
             controller.syncNow()
             _ = await waitUntil { firstPathWait.isWaiting }
@@ -1923,8 +1947,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             usesMobileData.value = true
             controller.mobileDataSettingDidChange()
 
-            let finished = await waitUntil(timeout: .seconds(5)) { scans.count == 1 && !controller.isSyncing }
+            let finished = await waitUntil(timeout: .seconds(5)) {
+                scans.count == 1 && (!controller.isSyncing || followUps.isHolding)
+            }
             XCTAssertTrue(finished, "turning mobile data on ends the wait for the first path")
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -1939,7 +1966,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let firstPathWait = holdFirstNetworkPathWait(of: controller)
             defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
-            controller.replaceScanForTesting { _ = scans.increment() }
+            // After the Wi-Fi wait ends, the photo still waits, so the app's own passes can follow the second pass.
+            let followUps = FollowUpPassGate(admitting: 2)
+            defer { followUps.release() }
+            controller.replaceScanForTesting {
+                await followUps.enter()
+                _ = scans.increment()
+            }
 
             controller.syncNow()
             _ = await waitUntil { firstPathWait.isWaiting }
@@ -1955,6 +1988,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
             let resumed = await waitUntil(timeout: .seconds(10)) { scans.count == 2 }
             XCTAssertTrue(resumed, "a first path that arrives late ends the Wi-Fi wait")
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -2042,7 +2076,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let scans = PassCounter()
             let owners = OwnerRecorder()
             let releaseScan = LockedFlag(!returnsDuringScan)
+            // The resumed retry clears the index backoff, so the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: 2)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 let pass = scans.increment()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
                 if pass == 1 {
@@ -2095,6 +2133,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                     XCTAssertNil(
                         queue.runtimeIssue(for: .remoteIndexPreparation),
                         "the window's pass keeps the retry's right to prepare the index before its backoff date")
+                    followUps.release()
                     await controller.shutdown()
                     return
                 }
@@ -2106,10 +2145,16 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             releaseScan.value = true
 
-            let resumed = await waitUntil { scans.count >= 2 && !controller.isSyncing }
+            let resumed = await waitUntil { scans.count >= 2 && (!controller.isSyncing || followUps.isHolding) }
             XCTAssertTrue(resumed, "The manual retry must resume before the one-hour index retry date")
             XCTAssertEqual(owners.values, [.manual, .manual])
             XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation), "The resumed pass prepares the index")
+            // A pass that followed the retry can prepare the index again, so the later backoff is saved after it.
+            followUps.release()
+            let settled = await waitUntil(timeout: .seconds(30)) { !controller.isSyncing }
+            XCTAssertTrue(settled, "a pass that followed the retry ends")
+            // The passes after the retry are automatic, so a second manual pass would be a second resume.
+            XCTAssertEqual(owners.values.filter { $0 == .manual }.count, 2, "the retry resumed exactly once")
             XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
             controller.syncNow()
             XCTAssertFalse(controller.isSyncing, "The admitted manual retry cannot bypass a later automatic backoff")
@@ -2125,7 +2170,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let controller = fixture.controller
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 _ = scans.increment()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
             }
@@ -2139,10 +2187,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
             signals.announceChange()
 
-            let finished = await waitUntil { scans.count >= 1 && !controller.isSyncing }
+            let finished = await waitUntil { scans.count >= 1 && (!controller.isSyncing || followUps.isHolding) }
             XCTAssertTrue(finished)
             XCTAssertEqual(windowRuns.count, 0, "The window never owns or expires the deferred manual pass")
             XCTAssertEqual(owners.values, [.manual])
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -2160,7 +2209,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(lock.acquire(owner: .background, runID: "other-live-run").didAcquire)
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            // The manual pass clears the index backoff, so the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 _ = scans.increment()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
             }
@@ -2175,9 +2228,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             controller.syncNow()
 
-            let finished = await waitUntil { scans.count == 1 && !controller.isSyncing }
+            let finished = await waitUntil { scans.count == 1 && (!controller.isSyncing || followUps.isHolding) }
             XCTAssertTrue(finished, "A declined admission must not consume the person's retry intent")
             XCTAssertEqual(owners.values, [.manual])
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -2207,7 +2261,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            // The resumed retry clears the index backoff, so the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: 2)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 _ = scans.increment()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
             }
@@ -2247,10 +2305,17 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 XCTAssertTrue(lock.release(runID: "other-live-run"))
                 controller.syncNow()
             }
-            let resumed = await waitUntil { scans.count == 2 && !controller.isSyncing }
+            // The retry's pass has ended when no pass runs, or when the next pass waits at its scan.
+            let resumed = await waitUntil { scans.count == 2 && (!controller.isSyncing || followUps.isHolding) }
             XCTAssertTrue(resumed, "The first offline manual pass must retain its retry past the saved index backoff")
-            XCTAssertEqual(owners.values, [.manual, .manual])
+            XCTAssertEqual(owners.values, [.manual, .manual], "the retry resumes as the person's pass")
             XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation))
+            // A pass that followed the retry can prepare the index again, so the later backoff is saved after it.
+            followUps.release()
+            let settled = await waitUntil(timeout: .seconds(30)) { !controller.isSyncing }
+            XCTAssertTrue(settled, "a pass that followed the retry ends")
+            // The passes after the retry are automatic, so a second manual pass would be a second resume.
+            XCTAssertEqual(owners.values.filter { $0 == .manual }.count, 2, "the retry resumed exactly once")
             XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
             controller.syncNow()
             XCTAssertFalse(controller.isSyncing, "A completed retry consumes its backoff bypass")
@@ -2309,7 +2374,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let scans = PassCounter()
             let owners = OwnerRecorder()
             let releaseOfflineScan = LockedFlag(!wiFiReturnsDuringScan)
+            // The resumed retry clears the index backoff, so the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: retryWhileOffline ? 3 : 2)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
                 if scans.increment() == 2 {
                     while !releaseOfflineScan.value, !Task.isCancelled {
@@ -2354,9 +2423,17 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             releaseOfflineScan.value = true
 
-            let resumed = await waitUntil { scans.count > offlinePassCount && !controller.isSyncing }
+            let resumed = await waitUntil {
+                scans.count > offlinePassCount && (!controller.isSyncing || followUps.isHolding)
+            }
             XCTAssertTrue(resumed, "The retry survives the offline path and resumes without the index backoff")
             XCTAssertEqual(owners.values, Array(repeating: .manual, count: offlinePassCount + 1))
+            followUps.release()
+            let settled = await waitUntil(timeout: .seconds(30)) { !controller.isSyncing }
+            XCTAssertTrue(settled, "a pass that followed the retry ends")
+            // The passes after the retry are automatic, so another manual pass would be a second resume.
+            XCTAssertEqual(
+                owners.values.filter { $0 == .manual }.count, offlinePassCount + 1, "the retry resumed exactly once")
             await controller.shutdown()
         }
 
@@ -2418,7 +2495,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let firstPathWait = holdFirstNetworkPathWait(of: controller)
             defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
-            controller.replaceScanForTesting { _ = scans.increment() }
+            // The explicit pass passes the system issue; the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
+            controller.replaceScanForTesting {
+                await followUps.enter()
+                _ = scans.increment()
+            }
             // A system issue with a later retry date holds automatic passes; only an explicit action passes it.
             let queue = try XCTUnwrap(
                 UploadBackupSyncQueueManifestStore(
@@ -2437,6 +2520,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 }
             XCTAssertTrue(started, "the first path starts the explicit pass, which passes the system issue")
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -2461,7 +2545,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             defer { firstPathWait.releaseAll() }
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            // The app is in the foreground, so its own passes can follow the window's pass.
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 _ = scans.increment()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
             }
@@ -2490,6 +2578,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let end = await window.value
             XCTAssertEqual(end, .done, "the pass ran after the path came or the first-path wait ended")
             XCTAssertEqual(windowEnds.count, 1, "the window ends exactly once")
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -2558,7 +2647,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let scans = PassCounter()
-            controller.replaceScanForTesting { _ = scans.increment() }
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
+            controller.replaceScanForTesting {
+                await followUps.enter()
+                _ = scans.increment()
+            }
             controller.syncNow()
             var admitted: [String] = []
             var received: [String] = []
@@ -2575,6 +2669,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(ran, "the foreground pass that waited for the path runs")
             XCTAssertEqual(admitted, [], "a window must not protect a pass that it does not own")
             XCTAssertEqual(received, [])
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -3186,7 +3281,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let controller = fixture.controller
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 // The owner is recorded before the count rises, so a wait for the count also sees the owner.
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
                 _ = scans.increment()
@@ -3207,6 +3305,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 }
             XCTAssertTrue(started, "the foreground pass that waited for the path still runs")
             XCTAssertEqual(owners.values, [.foreground])
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -3219,7 +3318,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let controller = fixture.controller
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 // The owner is recorded before the count rises, so a wait for the count also sees the owner.
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
                 _ = scans.increment()
@@ -3242,6 +3344,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(owners.values, [.manual])
             let end = await window.value
             XCTAssertEqual(end, .done, "the path came; the explicit pass runs on its own")
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -3282,7 +3385,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let controller = fixture.controller
             let scans = PassCounter()
             let owners = OwnerRecorder()
+            // The manual pass clears the index backoff, so the app's own passes can follow it.
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 _ = scans.increment()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
             }
@@ -3296,6 +3403,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 && owners.values.count == 1 }
             XCTAssertTrue(started, "the explicit action that waited behind the automatic start runs")
             XCTAssertEqual(owners.values, [.manual])
+            followUps.release()
             await controller.shutdown()
         }
 
@@ -3638,6 +3746,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         ) async {
             let controller = launch.controller
             let scan = launch.scan
+            // The photo still waits after the automatic pass, so the app's own passes can follow it.
+            scan.followUps.admit(1)
             scan.open.value = true
             launch.releaseResume()
             _ = await waitUntil { controller.launchResumeEndedForTesting }
@@ -3663,9 +3773,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 line: line)
             signals.setAppInBackground(false)
             signals.announceChange()
-            let ran = await waitUntil(timeout: .seconds(5)) { scan.completions.count == 1 && !controller.isSyncing }
+            let ran = await waitUntil(timeout: .seconds(5)) {
+                scan.completions.count == 1 && (!controller.isSyncing || scan.followUps.isHolding)
+            }
             XCTAssertTrue(ran, "the observer starts the automatic pass", file: file, line: line)
             XCTAssertEqual(scan.owners.values, [.foreground], file: file, line: line)
+            scan.followUps.release()
             await controller.shutdown()
         }
 
@@ -3676,6 +3789,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             defer { launch.cleanup() }
             let controller = launch.controller
             let scan = launch.scan
+            // The photo still waits after the automatic pass, so the app's own passes can follow it.
+            scan.followUps.admit(1)
             scan.open.value = true
             launch.releaseResume()
             _ = await waitUntil { controller.launchResumeEndedForTesting }
@@ -3689,6 +3804,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(window.record.runIDs, [], "a window never owns the pass of an open app")
             XCTAssertEqual(scan.owners.values, [.foreground])
             await window.task.value
+            scan.followUps.release()
             await controller.shutdown()
         }
 
@@ -3699,6 +3815,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             defer { launch.cleanup() }
             let controller = launch.controller
             let scan = launch.scan
+            // The photo still waits after the automatic pass, so the app's own passes can follow it.
+            scan.followUps.admit(1)
             scan.open.value = true
             launch.releaseResume()
             _ = await waitUntil { controller.launchResumeEndedForTesting }
@@ -3711,6 +3829,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(window.record.runIDs, [], "a window never owns the pass of an open app")
             XCTAssertEqual(scan.owners.values, [.foreground])
             await window.task.value
+            scan.followUps.release()
             await controller.shutdown()
         }
 
@@ -3862,6 +3981,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             func cleanup() {
                 gate.releaseAll()
                 scan.open.value = true
+                scan.followUps.release()
                 fixture.cleanup()
             }
         }
@@ -3920,7 +4040,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let owners = OwnerRecorder()
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
             }
             let before = try queueSummary(fixture)
@@ -3938,26 +4061,44 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             // window starts a pass (#832), so the ordinary pass starts in the foreground.
             runtime.update { $0.executionOpportunity = .foregroundActive }
             controller.syncNow()
-            let drained = await waitUntil { controller.reconcileStartsForTesting == 1 }
+            let drained = await waitUntil { followUps.isHolding }
             XCTAssertTrue(drained, "an ordinary pass starts the reconcile loop")
+            // The loop starts before the scan. End this pass in the background so no later pass adds to its count.
+            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            followUps.release()
+            let finished = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(finished, "the ordinary pass finishes after its scan is released")
+            XCTAssertEqual(controller.reconcileStartsForTesting, 1, "exactly one ordinary pass drained the queue")
             await controller.shutdown()
         }
 
         /// A scene came to the foreground during the scan and found the pass busy. The end of the scan then plans the
         /// next pass as every pass does, so the person's backup does not wait for the next change.
         func testARefreshScanThatEndsInTheForegroundPlansTheNextPassAsBefore() async throws {
-            let fixture = try makeRefreshFixture(prefix: "refresh-scan-foreground", inForeground: true)
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeRefreshFixture(
+                prefix: "refresh-scan-foreground", inForeground: true, runtime: runtime)
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let scans = PassCounter()
-            controller.replaceScanForTesting { _ = scans.increment() }
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
+            controller.replaceScanForTesting {
+                await followUps.enter()
+                _ = scans.increment()
+            }
 
             let end = await controller.backgroundRefreshScan()
 
             XCTAssertEqual(end, .scanned)
             XCTAssertEqual(controller.consecutiveNoProgressRunsForTesting, 0, "a scan is no pass without progress")
-            let passStarted = await waitUntil { controller.reconcileStartsForTesting == 1 }
+            let passStarted = await waitUntil { followUps.isHolding }
             XCTAssertTrue(passStarted, "the person's pass starts after the scan")
+            runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            followUps.release()
+            let finished = await waitUntil { scans.count == 2 && !controller.isSyncing }
+            XCTAssertTrue(finished, "the person's pass finishes after its scan is released")
+            XCTAssertEqual(controller.reconcileStartsForTesting, 1, "exactly one pass follows the refresh scan")
             await controller.shutdown()
         }
 
@@ -4194,7 +4335,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let scans = PassCounter()
             let owners = OwnerRecorder()
             let release = LockedFlag(false)
+            let followUps = FollowUpPassGate(admitting: 1)
+            defer { followUps.release() }
             controller.replaceScanForTesting {
+                await followUps.enter()
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
                 if scans.increment() == 1 {
                     while !release.value, !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
@@ -4209,8 +4353,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let refreshEnd = await refresh.value
             XCTAssertEqual(refreshEnd, .scanned)
 
-            let started = await waitUntil { controller.reconcileStartsForTesting == 1 && !controller.isSyncing }
+            let started = await waitUntil { followUps.isHolding }
             XCTAssertTrue(started, "the person's pass runs after the scan")
+            parked.runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            followUps.release()
+            let finished = await waitUntil { scans.count == 2 && !controller.isSyncing }
+            XCTAssertTrue(finished, "the person's pass finishes after its scan is released")
+            XCTAssertEqual(controller.reconcileStartsForTesting, 1, "exactly one pass follows the refresh scan")
             XCTAssertEqual(owners.values, [.iOSRefreshTask, .foreground])
             XCTAssertNil(controller.deferredStartOwnerForTesting)
             await controller.shutdown()
@@ -5122,10 +5271,13 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
         let completions = PassCounter()
         let owners = OwnerRecorder()
         let open = LockedFlag(false)
+        /// Admits every pass unless a test sets a limit.
+        let followUps = FollowUpPassGate()
 
         @MainActor
         func install(on controller: PhotoLibraryBackupController) {
             controller.replaceScanForTesting { [self] in
+                await followUps.enter()
                 // The owner is recorded before the count rises, so a wait for the count also sees the owner.
                 owners.record(await MainActor.run { controller.executionOwnerForTesting })
                 _ = starts.increment()
@@ -5167,6 +5319,39 @@ private final class OwnerRecorder: @unchecked Sendable {
     var values: [BackupExecutionOwner?] { lock.withLock { recorded } }
 
     func record(_ owner: BackupExecutionOwner?) { lock.withLock { recorded.append(owner) } }
+}
+
+/// Holds each pass after the first `limit` passes at its scan until `release()`. After the passes that a test drives, the
+/// app can start its own passes (the automatic resume, the pass after a retry or a scan). Under load such a pass can run
+/// before the test reads the passes; held at its scan, it does not change the counts, owners or `isSyncing` that the
+/// test waits for. A held pass also ends when its task is cancelled.
+private final class FollowUpPassGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var limit: Int
+    private var entered = 0
+    private var released = false
+    private var holding = false
+
+    init(admitting limit: Int = .max) { self.limit = limit }
+
+    /// True while a pass after the limit waits at its scan.
+    var isHolding: Bool { lock.withLock { holding } }
+
+    func admit(_ limit: Int) { lock.withLock { self.limit = limit } }
+
+    func release() { lock.withLock { released = true } }
+
+    /// Call first in the scan.
+    func enter() async {
+        let waits = lock.withLock { () -> Bool in
+            entered += 1
+            holding = entered > limit && !released
+            return holding
+        }
+        guard waits else { return }
+        while !lock.withLock({ released }), !Task.isCancelled { try? await Task.sleep(for: .milliseconds(10)) }
+        lock.withLock { holding = false }
+    }
 }
 
 private final class LockedFlag: @unchecked Sendable {
