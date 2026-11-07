@@ -24,6 +24,10 @@
         private(set) var membershipUpdateCount = 0
 
         var onOpen: ((PhotoItem) -> Void)?
+        #if DEBUG
+            /// Elements that UI tests read after the photos, such as the exposed scroll date label.
+            var testElements: (() -> [Any])?
+        #endif
         var onToggleSelection: ((PhotoItem) -> Void)?
 
         init(container: UIView) {
@@ -118,6 +122,9 @@
                 membershipUpdateCount += 1
                 replaceElements(nextElements)
             }
+            #if DEBUG
+                if testElements != nil { replaceElements(elements) }  // The test elements can change on their own.
+            #endif
 
             for (slot, element) in zip(validSlots, elements) {
                 let item = items[slot.index]
@@ -140,6 +147,12 @@
 
         private func replaceElements(_ next: [UIKitTimelineGridAccessibilityElement]) {
             elements = next
+            #if DEBUG
+                if let testElements {
+                    container?.accessibilityElements = next + testElements()
+                    return
+                }
+            #endif
             container?.accessibilityElements = next
         }
     }

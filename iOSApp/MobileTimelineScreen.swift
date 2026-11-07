@@ -513,6 +513,11 @@ struct MobileTimelineScreen: View {
                     restoreScrollSignal: projectionRestoreSignal,
                     contentTransitionSignal: contentTransitionSignal,
                     prefersReducedMotion: reduceMotion,
+                    showsScrollDateLabel: TimelineScrollDateLabelEligibility.showsLabel(
+                        isLoading: showsLibraryLoadingCover || showsSearchLanding,
+                        hasFailure: model.loadState.failure != nil,
+                        hasProjectionCriteria: hasProjectionCriteria,
+                        resolvedProjection: resolvedSearchProjection),
                     allowsPhotoActions: !model.isProvisionalPresentation,
                     isProvisionalPresentation: model.isProvisionalPresentation,
                     allowsPlaceholderContentReady: model.loadState.allowsPlaceholderContentReady,

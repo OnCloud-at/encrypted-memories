@@ -5,6 +5,7 @@ import MediaByteCache
 import MediaCache
 import PhotosCore
 import Testing
+import TimelineCore
 
 @testable import TimelineFeature
 
@@ -68,15 +69,30 @@ import Testing
         #expect(Set(markers.map(\.text)).count == 3, "each month label is distinct")
     }
 
+    /// The Mac scrubber and month pills read these markers. A photo without a usable date joins the month before it
+    /// (or the first month when it leads the list) instead of starting a marker of its own.
+    @Test func monthMarkersSkipPhotosWithoutAUsableDate() {
+        let unusable = { (id: String) in
+            PhotoItem(
+                uid: PhotoUID(volumeID: "v", nodeID: id), captureTime: Date(timeIntervalSinceReferenceDate: .nan),
+                mediaType: "image/jpeg")
+        }
+        let items = [unusable("lead")] + sampleSections()[0].items + [unusable("inner")] + sampleSections()[1].items
+        let section = TimelineSection(id: "s", date: day(2026, 1, 10), title: "s", items: items)
+        let markers = MetalGridProductionAdapter.monthMarkers(sections: [section])
+        #expect(markers.map(\.index) == [1, 7], "January starts at the first dated photo, February after the gap")
+        #expect(Set(markers.map(\.text)).count == 2)
+    }
+
     @Test func productionDateMarkersSupportDayMonthYearGranularity() {
         let sections = sampleSections()
-        let days = MetalGridProductionAdapter.dateMarkers(
+        let days = TimelineDateMarkers.markers(
             sections: sections, granularity: .day,
             calendar: Self.calendar, locale: Locale(identifier: "en_US_POSIX"))
-        let months = MetalGridProductionAdapter.dateMarkers(
+        let months = TimelineDateMarkers.markers(
             sections: sections, granularity: .month,
             calendar: Self.calendar, locale: Locale(identifier: "en_US_POSIX"))
-        let years = MetalGridProductionAdapter.dateMarkers(
+        let years = TimelineDateMarkers.markers(
             sections: sections, granularity: .year,
             calendar: Self.calendar, locale: Locale(identifier: "en_US_POSIX"))
 

@@ -35,6 +35,9 @@ public struct TimelineSearchProjection: Sendable {
     /// Stable display order for top-leading filter results. Core builds the reversed array once per projection,
     /// so repeated SwiftUI selection and chrome updates do not allocate another full result array.
     public let presentationItems: [PhotoItem]
+    /// False when `presentationItems` lead with file-name matches, so their order is not a date order. Date labels
+    /// such as the scroll date label must not describe such a list.
+    public let isDateOrdered: Bool
     public let revision: UInt64
 
     public init(key: TimelineSearchProjectionKey, sections: [TimelineSection], revision: UInt64 = 0) {
@@ -53,19 +56,22 @@ public struct TimelineSearchProjection: Sendable {
         if key.refinement.isActive || !TimelineSearchQuery(key.query).isEmpty || key.requiredUIDs != nil
             || (key.context.activeFilter != nil && key.context.activeFilter != .all)
         {
-            presentationItems = Self.namesFirst(Array(projection.snapshot.items.reversed()), key: key)
+            (presentationItems, isDateOrdered) = Self.namesFirst(Array(projection.snapshot.items.reversed()), key: key)
         } else {
             presentationItems = projection.snapshot.items
+            isDateOrdered = true
         }
         self.revision = revision
     }
 
     /// For a query that reads as a file name, the photos whose name matches lead, newest first; the other results
-    /// follow in their own order. Every other query keeps the date order.
-    private static func namesFirst(_ items: [PhotoItem], key: TimelineSearchProjectionKey) -> [PhotoItem] {
+    /// follow in their own order. Every other query keeps the date order. The flag is false when both groups exist.
+    private static func namesFirst(
+        _ items: [PhotoItem], key: TimelineSearchProjectionKey
+    ) -> (items: [PhotoItem], isDateOrdered: Bool) {
         guard key.requiredUIDs == nil, let names = key.context.photoNames, !names.isEmpty,
             TimelineSearchQuery.looksLikeFileName(key.query)
-        else { return items }
+        else { return (items, true) }
         let query = TimelineSearchQuery(key.query)
         var named: [PhotoItem] = []
         var others: [PhotoItem] = []
@@ -77,7 +83,8 @@ public struct TimelineSearchProjection: Sendable {
                 others.append(item)
             }
         }
-        return named + others
+        guard !named.isEmpty, !others.isEmpty else { return (items, true) }
+        return (named + others, false)
     }
 }
 

@@ -2,7 +2,7 @@ import Foundation
 import PhotosCore
 import Testing
 
-@testable import TimelineFeature
+@testable import TimelineCore
 
 /// Compares the optimized date-marker pass with a per-item reference implementation.
 @Suite struct DateMarkerEquivalenceTests {
@@ -59,7 +59,7 @@ import Testing
         _ granularity: TimelineDateMarker.Granularity,
         _ label: String
     ) {
-        let produced = MetalGridProductionAdapter.dateMarkers(
+        let produced = TimelineDateMarkers.markers(
             items: items, granularity: granularity, calendar: Self.calendar, locale: Self.locale)
         let reference = referenceMarkers(items, granularity)
         #expect(produced.map(\.index) == reference.map(\.index), "\(label): indices [\(granularity)]")
@@ -114,10 +114,10 @@ import Testing
         let items = [date(2026, 1, 1), date(2026, 1, 2), date(2026, 2, 1), date(2026, 2, 2)]
             .enumerated().map { item($0.offset, $0.element) }
         let section = TimelineSection(id: "s", date: items[0].captureTime, title: "s", items: items)
-        let viaItems = MetalGridProductionAdapter.dateMarkers(
+        let viaItems = TimelineDateMarkers.markers(
             items: items, granularity: .month,
             calendar: Self.calendar, locale: Self.locale)
-        let viaSections = MetalGridProductionAdapter.dateMarkers(
+        let viaSections = TimelineDateMarkers.markers(
             sections: [section], granularity: .month,
             calendar: Self.calendar, locale: Self.locale)
         #expect(viaItems == viaSections)
@@ -125,7 +125,7 @@ import Testing
 
     @Test func emptyItemsProduceNoMarkers() {
         #expect(
-            MetalGridProductionAdapter.dateMarkers(
+            TimelineDateMarkers.markers(
                 items: [], granularity: .month,
                 calendar: Self.calendar, locale: Self.locale
             ).isEmpty)

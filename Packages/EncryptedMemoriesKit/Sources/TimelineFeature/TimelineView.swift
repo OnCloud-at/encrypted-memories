@@ -347,7 +347,7 @@ public struct TimelineView: View {
         monthMarkerRevision = nil
         let items = displayedItems
         let task = Task.detached(priority: .userInitiated) {
-            MetalGridProductionAdapter.dateMarkers(items: items, granularity: .month)
+            TimelineDateMarkers.markers(items: items, granularity: .month)
         }
         let markers = await withTaskCancellationHandler {
             await task.value
