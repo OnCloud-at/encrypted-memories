@@ -9,7 +9,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
-TAG = "0.32.1"
+TAG = "0.33.0"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 CONNECTION_ERROR = (
@@ -159,7 +159,7 @@ class UpdateProtonSdkScriptTests(unittest.TestCase):
         self.assertEqual(self.clone_attempts(), 2)
         self.assertIn("attempt 1 of 3", result.stderr)
         self.assertIn(CONNECTION_ERROR, result.stderr)
-        self.assertIn("sdk-swift now at: 0.32.1", result.stdout)
+        self.assertIn("sdk-swift now at: 0.33.0", result.stdout)
         # The pin check still runs after the retried clone and checks out the pinned revision.
         self.assertIn(
             f"git -C Vendor/sdk-swift rev-parse refs/tags/{TAG}^{{commit}}",
@@ -191,7 +191,7 @@ class UpdateProtonSdkScriptTests(unittest.TestCase):
         self.assertEqual(self.fetch_attempts(), 2)
         self.assertIn("attempt 1 of 3", result.stderr)
         self.assertIn(CONNECTION_ERROR, result.stderr)
-        self.assertIn("sdk-swift now at: 0.32.1", result.stdout)
+        self.assertIn("sdk-swift now at: 0.33.0", result.stdout)
         # The pin check still runs after the retried fetch and checks out the pinned revision.
         self.assertIn(
             f"git -C Vendor/sdk-swift rev-parse refs/tags/{TAG}^{{commit}}",

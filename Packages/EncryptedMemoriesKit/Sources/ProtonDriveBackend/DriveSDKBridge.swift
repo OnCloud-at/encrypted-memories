@@ -2991,7 +2991,7 @@ extension DriveSDKBridge: PhotoUploading {
                 name: request.name,
                 fileURL: request.fileURL,
                 fileSize: request.fileSize,
-                modificationDate: request.modificationDate,
+                modificationTime: try SDKModificationTime.string(from: request.modificationDate),
                 captureTime: request.captureTime,
                 mainPhotoUid: mainPhotoUid,
                 mediaType: request.mediaType,
