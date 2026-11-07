@@ -151,7 +151,9 @@ public struct UploadItem: Identifiable, Sendable, Equatable {
     /// Set when the file uploaded to the library but a later step (album add / cover) failed - the
     /// photo is not lost. Retry only the album step to recover from the failure.
     public var partialSuccess: Bool
-    /// True when the manager holds a terminal manual-settlement record.
+    /// True when no settlement step can run for the item in this session: its manual-settlement
+    /// record is proven terminal, or the record is not proven terminal while the settlement store
+    /// cannot work again before a relaunch.
     public var hasTerminalSettlement: Bool
 
     public init(

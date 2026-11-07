@@ -40,6 +40,17 @@ public actor UploadManager: UploadManaging {
         case restored
     }
 
+    /// Result of one durable settlement run. The detached task hands it back to the actor, which
+    /// releases ownership and publishes the outcome in one synchronous block.
+    private enum DurableSettlementOutcome {
+        /// Nothing to replay: the record is already terminal, or no store is attached.
+        case untouched
+        /// The record reached its durable terminal state.
+        case settled(UploadManualSettlementRecord)
+        /// The settlement failed; the item must stay visibly failed.
+        case failed(UploadManualSettlementRecord, message: String)
+    }
+
     // MARK: Injected backends + config
 
     private let uploader: any PhotoUploading
@@ -73,9 +84,21 @@ public actor UploadManager: UploadManaging {
         var controlID: UUID? = nil
         var nativeCancellationTask: Task<Void, Never>? = nil
 
-        var snapshot: UploadItem {
+        /// The job has a settlement record that is not proven terminal: a pending record, or a
+        /// terminal copy whose terminal write failed. Its durable row is still pending (#1104).
+        var hasUnsettledRecord: Bool {
+            guard let settlementRecord else { return false }
+            return !settlementRecord.isProvenTerminal
+        }
+
+        /// The row offers Retry only when a settlement step can run again in this session (#1104).
+        /// A proven-terminal record is settled. An unsettled record stays retryable while the store
+        /// can work, because Retry then settles the still-pending durable row; with a lasting store
+        /// failure no step can run before a relaunch.
+        func snapshot(settlementWaitsForRelaunch: Bool) -> UploadItem {
             var snapshot = item
-            snapshot.hasTerminalSettlement = settlementRecord?.isPending == false
+            snapshot.hasTerminalSettlement =
+                (settlementRecord?.isProvenTerminal ?? false) || settlementWaitsForRelaunch
             return snapshot
         }
     }
@@ -162,7 +185,8 @@ public actor UploadManager: UploadManaging {
         let generation = lifecycleGeneration
         ensureDurableSettlementReplay()
         guard lifecycleIsCurrent(generation) else { return [] }
-        let settlementAvailable = settlementStore?.isOperational() ?? !requiresDurableSettlement
+        let settlementAvailable =
+            settlementStore?.isOperationalAllowingTransientRecovery() ?? !requiresDurableSettlement
         guard settlementAvailable else {
             let message = UploadError.backend("Durable manual upload settlement is unavailable.").errorDescription!
             let ids = urls.map {
@@ -296,7 +320,8 @@ public actor UploadManager: UploadManaging {
         ensureDurableSettlementReplay()
         guard lifecycleIsCurrent(generation) else { return [] }
 
-        let settlementAvailable = settlementStore?.isOperational() ?? !requiresDurableSettlement
+        let settlementAvailable =
+            settlementStore?.isOperationalAllowingTransientRecovery() ?? !requiresDurableSettlement
         let settlementFailure =
             settlementAvailable
             ? nil
@@ -465,18 +490,29 @@ public actor UploadManager: UploadManaging {
         guard !isShuttingDown, record.isPending, settlementTasks[record.queueItemID] == nil else { return }
         restoreJobIfNeeded(for: record)
         let task = Task.detached(priority: .utility) { [weak self] in
-            await self?.runDurableSettlement(
-                record,
-                manifestAlreadyRecorded: manifestAlreadyRecorded
-            )
-            await self?.durableSettlementDidFinish(record.queueItemID)
+            let outcome =
+                await self?.runDurableSettlement(
+                    record,
+                    manifestAlreadyRecorded: manifestAlreadyRecorded
+                ) ?? .untouched
+            await self?.durableSettlementDidFinish(record.queueItemID, outcome: outcome)
         }
         settlementTasks[record.queueItemID] = task
     }
 
-    private func durableSettlementDidFinish(_ id: UploadQueueItemID) {
+    /// Releases ownership and publishes the settlement result in one synchronous actor block, so a
+    /// Retry that sees the published failure also finds the settlement owner released.
+    private func durableSettlementDidFinish(_ id: UploadQueueItemID, outcome: DurableSettlementOutcome) {
         jobs[id]?.retryRequested = false
         settlementTasks[id] = nil
+        switch outcome {
+        case .untouched:
+            return
+        case .settled(let record):
+            applyDurableTerminal(record)
+        case .failed(let record, let message):
+            recordSettlementFailure(record, message: message)
+        }
     }
 
     /// Replays the exact evidence order used by backup reconciliation: manifest first, album second,
@@ -485,29 +521,24 @@ public actor UploadManager: UploadManaging {
     private func runDurableSettlement(
         _ original: UploadManualSettlementRecord,
         manifestAlreadyRecorded: Bool
-    ) async {
+    ) async -> DurableSettlementOutcome {
         guard let settlementStore else {
-            recordSettlementFailure(original, message: "Durable manual upload settlement is unavailable.")
-            return
+            return .failed(original, message: "Durable manual upload settlement is unavailable.")
         }
-        guard settlementStore.isOperational() else {
-            recordSettlementFailure(original, message: "Durable manual upload settlement could not be read.")
-            return
-        }
-        guard let current = settlementStore.record(for: original.queueItemID) else {
-            let message =
-                settlementStore.isOperational()
-                ? "Durable manual upload settlement record is missing."
-                : "Durable manual upload settlement could not be read."
-            recordSettlementFailure(original, message: message)
-            return
+        let current: UploadManualSettlementRecord
+        switch settlementStore.readOutcome(for: original.queueItemID) {
+        case .found(let record):
+            current = record
+        case .absent:
+            return .failed(original, message: "Durable manual upload settlement record is missing.")
+        case .unreadable:
+            return .failed(original, message: "Durable manual upload settlement could not be read.")
         }
         guard current.isPending else {
-            return
+            return .untouched
         }
         guard let descriptor = current.descriptor.descriptor else {
-            recordSettlementFailure(current, message: "Durable upload descriptor is invalid.")
-            return
+            return .failed(current, message: "Durable upload descriptor is invalid.")
         }
 
         // A replayed receipt proves the bytes reached the library even when local metadata
@@ -529,11 +560,10 @@ public actor UploadManager: UploadManaging {
                 )
             } catch {
                 await identityResolver?.remoteCommitNeedsReconciliation(descriptor)
-                recordSettlementFailure(
+                return .failed(
                     record,
                     message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 )
-                return
             }
         }
 
@@ -543,11 +573,9 @@ public actor UploadManager: UploadManaging {
             record.lastError = nil
             record.updatedAt = now()
             guard settlementStore.upsert(record) else {
-                recordSettlementFailure(record, message: "Manual upload settlement could not be persisted.")
-                return
+                return .failed(record, message: "Manual upload settlement could not be persisted.")
             }
-            applyDurableTerminal(record)
-            return
+            return .settled(record)
         }
 
         record.stage = .albumPending
@@ -555,8 +583,7 @@ public actor UploadManager: UploadManaging {
         record.lastError = nil
         record.updatedAt = now()
         guard settlementStore.upsert(record) else {
-            recordSettlementFailure(record, message: "Manual album settlement could not be persisted.")
-            return
+            return .failed(record, message: "Manual album settlement could not be persisted.")
         }
         updateDurableItemAsFinalizing(record)
 
@@ -567,11 +594,10 @@ public actor UploadManager: UploadManaging {
                 cover: record.destination.cover.destinationCover
             )
         } catch {
-            recordSettlementFailure(
+            return .failed(
                 record,
                 message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             )
-            return
         }
 
         record.stage = .terminal
@@ -579,10 +605,9 @@ public actor UploadManager: UploadManaging {
         record.lastError = nil
         record.updatedAt = now()
         guard settlementStore.upsert(record) else {
-            recordSettlementFailure(record, message: "Manual album settlement could not be persisted.")
-            return
+            return .failed(record, message: "Manual album settlement could not be persisted.")
         }
-        applyDurableTerminal(record)
+        return .settled(record)
     }
 
     private func updateDurableItemAsFinalizing(_ record: UploadManualSettlementRecord) {
@@ -601,12 +626,34 @@ public actor UploadManager: UploadManaging {
         failed.lastError = message
         failed.terminalState = nil
         failed.updatedAt = now()
+        // Keep the stage pending. A later launch or an explicit retry must replay
+        // metadata/album only. Never turn a receipt-backed failure into a fresh byte upload.
+        // The pending stage is adopted only when the store durably wrote it. A transient store
+        // failure heals at the store's next operation (#1104), so this write usually succeeds and
+        // Retry settles the item in the same session. When this write fails too, the cached copy
+        // keeps the terminal stage without a terminal state: while the store failure is transient,
+        // Retry re-reads the still-pending durable row; while it is lasting, the row offers no
+        // Retry and Clear finished drops the item but keeps its durable row. A later launch
+        // settles that row once the store can read it again.
+        if failed.stage == .terminal {
+            failed.stage = failed.resolvedAlbumID != nil ? .albumPending : .manifestPending
+            guard settlementStore.upsert(failed) else {
+                failed.stage = .terminal
+                adoptSettlementFailure(failed, message: message)
+                return
+            }
+        } else {
+            _ = settlementStore.upsert(failed)
+        }
+        adoptSettlementFailure(failed, message: message)
+    }
+
+    private func adoptSettlementFailure(
+        _ failed: UploadManualSettlementRecord, message: String
+    ) {
         jobs[failed.queueItemID]?.settlementRecord = failed
         jobs[failed.queueItemID]?.remoteCommitReceipt = failed.receipt
         jobs[failed.queueItemID]?.retryRequested = false
-        // Keep the stage pending. A later launch or an explicit retry must replay metadata/album
-        // only. Never turn a receipt-backed failure into a fresh byte upload.
-        _ = settlementStore.upsert(failed)
         restoreJobIfNeeded(for: failed)
         jobs[failed.queueItemID]?.item.uploadedUID = failed.uploadedUID
         if failed.resolvedAlbumID != nil {
@@ -640,16 +687,42 @@ public actor UploadManager: UploadManaging {
         notify(includingShuttingDown: true)
     }
 
-    private func durableSettlement(for id: UploadQueueItemID) -> UploadManualSettlementRecord? {
+    private func durableSettlement(for id: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
         if let record = jobs[id]?.settlementRecord {
-            return record
+            // A pending copy is safe to serve. After a failed write its stage or last error can
+            // differ from the durable row, but both copies are pending, and every settlement
+            // run (`runDurableSettlement`) reads the durable row again before it acts. A terminal
+            // copy without a terminal state is not proven terminal (#1104): after a failed
+            // terminal write the in-memory copy can say `.terminal` while the durable row is
+            // still pending. Re-read the store so it can refute the stale copy.
+            if record.isPending || record.isProvenTerminal {
+                return .found(record)
+            }
         }
-        guard let settlementStore, settlementStore.isOperational() else { return nil }
-        guard let record = settlementStore.record(for: id) else { return nil }
-        guard settlementStore.isOperational() else { return nil }
-        jobs[id]?.settlementRecord = record
-        jobs[id]?.remoteCommitReceipt = record.receipt
-        return record
+        guard let settlementStore else { return .absent }
+        switch settlementStore.readOutcome(for: id) {
+        case .found(let record):
+            jobs[id]?.settlementRecord = record
+            jobs[id]?.remoteCommitReceipt = record.receipt
+            return .found(record)
+        case .absent:
+            return .absent
+        case .unreadable:
+            return .unreadable
+        }
+    }
+
+    /// The job has an unsettled record and the settlement store cannot work again before a
+    /// relaunch (#1104). No settlement step can run for the job in this session: Retry would only
+    /// read the failed store again. Its durable row is still pending; a later launch settles it
+    /// once the store can read it again.
+    private func settlementWaitsForRelaunch(_ id: UploadQueueItemID) -> Bool {
+        guard jobs[id]?.hasUnsettledRecord == true else { return false }
+        return settlementStore?.hasLastingFailure() ?? false
+    }
+
+    private func itemSnapshot(_ id: UploadQueueItemID) -> UploadItem? {
+        jobs[id]?.snapshot(settlementWaitsForRelaunch: settlementWaitsForRelaunch(id))
     }
 
     private func byteUploadGate(for id: UploadQueueItemID) -> ByteUploadGate {
@@ -657,14 +730,18 @@ public actor UploadManager: UploadManaging {
             return .receiptBacked
         }
         guard let settlementStore else { return .allowed }
-        guard settlementStore.isOperational() else { return .settlementUnavailable }
-        if let record = settlementStore.record(for: id) {
-            guard settlementStore.isOperational() else { return .settlementUnavailable }
+        switch settlementStore.readOutcome(for: id) {
+        case .found(let record):
             jobs[id]?.settlementRecord = record
             jobs[id]?.remoteCommitReceipt = record.receipt
             return .receiptBacked
+        case .absent:
+            return .allowed
+        case .unreadable:
+            // A read that failed is never proof that no receipt exists, even when a later
+            // store operation has already healed the recorded failure (#1104).
+            return .settlementUnavailable
         }
-        return settlementStore.isOperational() ? .allowed : .settlementUnavailable
     }
 
     private func ensureByteUploadAllowed(_ id: UploadQueueItemID) throws {
@@ -680,22 +757,15 @@ public actor UploadManager: UploadManaging {
 
     private func hasPendingSettlement(_ id: UploadQueueItemID) -> Bool {
         if let record = jobs[id]?.settlementRecord {
-            return record.isPending
+            // An unsettled record keeps the job visible while the store can work (#1104): its
+            // durable row is still pending, and Retry can settle it. With a lasting store failure
+            // no step can run before a relaunch, so Clear finished drops the job and keeps the row.
+            return !record.isProvenTerminal && !settlementWaitsForRelaunch(id)
         }
-        if jobs[id]?.remoteCommitReceipt != nil {
-            return true
-        }
-        guard let settlementStore else { return false }
-        guard settlementStore.isOperational() else {
-            // A failed store read is never proof that the row is absent. Keep the job visible.
-            return true
-        }
-        guard let record = settlementStore.record(for: id) else {
-            return !settlementStore.isOperational()
-        }
-        jobs[id]?.settlementRecord = record
-        jobs[id]?.remoteCommitReceipt = record.receipt
-        return record.isPending
+        // A receipt without a record exists only in memory, so the job stays. A job with neither
+        // has no durable row, as `claimActiveCancellation` explains: decide from memory and never
+        // read the store for it (#1104).
+        return jobs[id]?.remoteCommitReceipt != nil
     }
 
     private func persistDurableSettlement(
@@ -857,9 +927,23 @@ public actor UploadManager: UploadManaging {
                 // UID is durable evidence: emit the library completion, and keep an album item as
                 // attachment-only partial success so retry never sends the bytes again.
                 emitCompletedUpload(id)
-                if let settlement = durableSettlement(for: id) {
+                switch durableSettlement(for: id) {
+                case .found(let settlement):
                     updateDurableItemAsFinalizing(settlement)
                     scheduleDurableSettlement(settlement, manifestAlreadyRecorded: true)
+                    finish(id)
+                    return
+                case .absent:
+                    break
+                case .unreadable:
+                    // The store cannot confirm that no settlement record exists. Never treat the
+                    // unreadable row as absence: album attachment and completion would duplicate
+                    // a settlement that a later read can still see. Keep the item retryable.
+                    if jobs[id]?.resolvedAlbumID != nil {
+                        markPartialFailure(id, message: "Durable manual upload settlement could not be read.")
+                    } else {
+                        transition(id, to: .failed(message: "Durable manual upload settlement could not be read."))
+                    }
                     finish(id)
                     return
                 }
@@ -899,14 +983,19 @@ public actor UploadManager: UploadManaging {
             )
             setUploadedUID(id, uid)
             emitCompletedUpload(id)
-            if let persisted = durableSettlement(for: id) {
+            switch durableSettlement(for: id) {
+            case .found(let persisted):
                 updateDurableItemAsFinalizing(persisted)
                 scheduleDurableSettlement(persisted, manifestAlreadyRecorded: false)
                 recordSettlementFailure(persisted, message: settlement.settlementMessage)
-            } else if jobs[id]?.resolvedAlbumID != nil {
-                markPartialFailure(id, message: settlement.settlementMessage)
-            } else {
-                transition(id, to: .failed(message: settlement.settlementMessage))
+            case .absent, .unreadable:
+                // Without a readable record the receipt exists only in memory. Keep the item in a
+                // retryable failure state; an unreadable row is never treated as absence (#1104).
+                if jobs[id]?.resolvedAlbumID != nil {
+                    markPartialFailure(id, message: settlement.settlementMessage)
+                } else {
+                    transition(id, to: .failed(message: settlement.settlementMessage))
+                }
             }
         } catch is CancellationError {
             transition(id, to: .cancelled)
@@ -1091,7 +1180,11 @@ public actor UploadManager: UploadManaging {
     private func claimActiveCancellation(
         _ id: UploadQueueItemID
     ) -> (uploadTask: Task<Void, Never>?, nativeTask: Task<Void, Never>)? {
-        guard jobs[id]?.remoteCommitReceipt == nil, durableSettlement(for: id) == nil else { return nil }
+        // Decide from memory only (#1104). A job's durable row is written by
+        // `persistDurableSettlement`, which caches the record in the same actor step, or restored
+        // by the replay, which caches it too. A job without a cached record or receipt has no
+        // durable row, so a failed store read must never block its cancellation.
+        guard jobs[id]?.remoteCommitReceipt == nil, jobs[id]?.settlementRecord == nil else { return nil }
         guard activeIDs.contains(id), var job = jobs[id], !job.item.state.isTerminal else { return nil }
         guard !job.cancellationRequested else { return nil }
         job.cancellationRequested = true
@@ -1109,7 +1202,9 @@ public actor UploadManager: UploadManaging {
 
     public func pause(_ id: UploadQueueItemID) async {
         guard !isShuttingDown else { return }
-        if jobs[id]?.remoteCommitReceipt != nil || durableSettlement(for: id)?.isPending == true { return }
+        // A receipt or a pending record is the irreversible boundary. Decide from memory only, as
+        // `claimActiveCancellation` explains: a failed store read must never block a pause (#1104).
+        if jobs[id]?.remoteCommitReceipt != nil || jobs[id]?.settlementRecord?.isPending == true { return }
         guard let state = jobs[id]?.item.state else { return }
         switch state {
         case .queued:
@@ -1161,8 +1256,9 @@ public actor UploadManager: UploadManaging {
     public func cancel(_ id: UploadQueueItemID) async {
         guard !isShuttingDown else { return }
         // A persisted receipt is the irreversible boundary. Cancellation cannot demote its
-        // manifest/album replay, even when the transport task still appears active.
-        if jobs[id]?.remoteCommitReceipt != nil || durableSettlement(for: id)?.isPending == true { return }
+        // manifest/album replay, even when the transport task still appears active. Decide from
+        // memory only, as `claimActiveCancellation` explains (#1104).
+        if jobs[id]?.remoteCommitReceipt != nil || jobs[id]?.settlementRecord?.isPending == true { return }
         guard let state = jobs[id]?.item.state, !state.isTerminal else { return }
         if let claim = claimActiveCancellation(id) {
             await claim.nativeTask.value
@@ -1261,28 +1357,38 @@ public actor UploadManager: UploadManaging {
         // prior task has settled, or a later cancel would target a different transport.
         guard !activeIDs.contains(id) else { return }
         guard !job.retryRequested else { return }
-        if jobs[id]?.remoteCommitReceipt != nil && durableSettlement(for: id) == nil { return }
-        if let persisted = durableSettlement(for: id), !persisted.isPending {
+        // A job without a cached record or receipt has no durable row, as
+        // `claimActiveCancellation` explains. Decide from memory, so a store that cannot be read
+        // never blocks its Retry; the byte gate still refuses bytes while the store cannot be read.
+        let durable: UploadManualSettlementReadOutcome =
+            job.settlementRecord == nil && job.remoteCommitReceipt == nil ? .absent : durableSettlement(for: id)
+        if jobs[id]?.remoteCommitReceipt != nil, case .absent = durable {
+            // The receipt lives only in memory while the store has no row for it. This split
+            // state has no safe retry; let the settlement tasks own the item.
             return
         }
+        switch durable {
+        case .found(let persisted) where !persisted.isPending:
+            return
 
         // Receipt-backed rows retry only metadata and album settlement. They must never return to
         // the byte-upload path, even when the previous process stopped during manifest recording.
-        if let persisted = durableSettlement(for: id), persisted.isPending {
+        case .found(let persisted):
             guard settlementTasks[id] == nil else { return }
-            guard settlementStore?.isOperational() ?? true else {
-                recordSettlementFailure(
-                    persisted,
-                    message: "Durable manual upload settlement could not be read."
-                )
-                return
-            }
             jobs[id]?.retryRequested = true
             jobs[id]?.item.state = .finalizing
             jobs[id]?.item.uploadedUID = persisted.uploadedUID
             notify()
             scheduleDurableSettlement(persisted, manifestAlreadyRecorded: false)
             return
+
+        case .unreadable:
+            // An unreadable read is not proof that the row is absent. Fail closed: never fall
+            // through to the byte-upload retry path while the store cannot be read (#1104).
+            return
+
+        case .absent:
+            break
         }
 
         if job.item.partialSuccess, let uid = job.item.uploadedUID, let albumID = job.resolvedAlbumID {
@@ -1400,7 +1506,10 @@ public actor UploadManager: UploadManaging {
         }
         let keepIDs = Set(keep)
         for id in order where !keepIDs.contains(id) {
-            if durableSettlement(for: id)?.stage == .terminal {
+            // Only a proven-terminal record has finished settlement, so only its durable row is
+            // removed. Every other job dropped here has no durable row (no record and no receipt)
+            // or keeps its still-pending row for a later launch (#1104).
+            if jobs[id]?.settlementRecord?.isProvenTerminal == true {
                 _ = settlementStore?.remove(queueItemID: id)
             }
             jobs[id] = nil
@@ -1419,22 +1528,34 @@ public actor UploadManager: UploadManaging {
             // too; a snapshot that comes first starts it here, without a notification.
             startDurableSettlementReplaySynchronouslyIfNeeded()
         }
-        return order.compactMap { jobs[$0]?.snapshot }
+        return order.compactMap { itemSnapshot($0) }
     }
 
     /// Loads durable rows once per manager lifetime and schedules only the metadata/album replay
     /// stages. This path never calls `PhotoUploading.upload`. It never notifies and the caller decides
-    /// from the result. Four places start it: `snapshot()`, `notify()`, both handler registrations (they
+    /// from the result. Five places start it: `snapshot()`, `notify()`, both handler registrations (they
     /// notify after the start) and `ensureDurableSettlementReplay()`, the only one that uses the result.
     @discardableResult
     private func startDurableSettlementReplaySynchronouslyIfNeeded() -> DurableSettlementReplayStart {
         guard !isShuttingDown, !settlementReplayStarted else { return .skipped }
-        settlementReplayStarted = true
         guard let settlementStore else { return .skipped }
-        let records = settlementStore.allRecords()
-        guard settlementStore.isOperational() else { return .storeUnavailable }
-        for record in records { restoreJobIfNeeded(for: record) }
-        for record in records where record.isPending {
+        let records: [UploadManualSettlementRecord]
+        switch settlementStore.readAllOutcome() {
+        case .records(let rows):
+            records = rows
+        case .unreadable:
+            // Latching the flag on a failed sweep would skip the replay for the whole
+            // session (#1104). Leave it unset so the next trigger retries the sweep
+            // after the transient store failure heals.
+            return .storeUnavailable
+        }
+        settlementReplayStarted = true
+        // A row whose job already lives in this session belongs to that job: its live upload or
+        // its settlement task owns it. A sweep that succeeds late must not start a second owner,
+        // which would record the manifest twice (#1104).
+        let restored = records.filter { jobs[$0.queueItemID] == nil }
+        for record in restored { restoreJobIfNeeded(for: record) }
+        for record in restored where record.isPending {
             scheduleDurableSettlement(record, manifestAlreadyRecorded: false)
         }
         return .restored
@@ -1451,7 +1572,7 @@ public actor UploadManager: UploadManaging {
         stats.persistenceUnavailable =
             requiresDurableSettlement && !(settlementStore?.isOperational() ?? false)
         for id in order {
-            guard let item = jobs[id]?.snapshot else { continue }
+            guard let item = itemSnapshot(id) else { continue }
             items.append(item)
             switch item.state {
             case .queued: stats.queued += 1

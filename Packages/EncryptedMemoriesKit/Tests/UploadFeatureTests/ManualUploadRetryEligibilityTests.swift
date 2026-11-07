@@ -5,11 +5,11 @@ import UploadCore
 import XCTest
 
 final class ManualUploadRetryEligibilityTests: XCTestCase {
-    func testLibraryTerminalWriteFailureHidesRetryAndRecoversAfterRestart() async throws {
+    func testLibraryLastingTerminalWriteFailureHidesRetryUntilRelaunch() async throws {
         try await terminalWriteFailure(destination: .library)
     }
 
-    func testAlbumTerminalWriteFailureHidesRetryAndRecoversAfterRestart() async throws {
+    func testAlbumLastingTerminalWriteFailureHidesRetryUntilRelaunch() async throws {
         try await terminalWriteFailure(
             destination: UploadDestination(target: .existingAlbum(id: "album", title: "Album")))
     }
@@ -98,8 +98,11 @@ final class ManualUploadRetryEligibilityTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 1)
         XCTAssertEqual(resolver.recordedUploads.count, 1)
         XCTAssertFalse(store.isOperational())
+        XCTAssertTrue(store.hasLastingFailure(), "The refused terminal write is a lasting failure")
         XCTAssertEqual(
-            UploadQueuePresentation.rowActions(for: item, capabilities: uploader.capabilities), [])
+            UploadQueuePresentation.rowActions(for: item, capabilities: uploader.capabilities),
+            [],
+            "No settlement can run again before a relaunch, so the row offers no Retry (#1104)")
         let deliveryDeadline = ContinuousClock.now + .seconds(5)
         while await coordinator.items.first?.state != item.state, ContinuousClock.now < deliveryDeadline {
             try await Task.sleep(for: .milliseconds(5))
