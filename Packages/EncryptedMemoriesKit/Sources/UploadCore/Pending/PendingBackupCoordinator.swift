@@ -1137,6 +1137,19 @@ public actor PendingBackupCoordinator {
         dirty.formUnion(keys)
     }
 
+    /// Reloads the keys and publishes the shown lists when a source that was unreadable reads again.
+    private func reloadSourceStatesPublishingHeals(_ keys: [PendingSourceKey]) {
+        let degradedBefore = unreadableSourceStates
+        reloadSourceStates(keys)
+        if degradedBefore.contains(where: { !unreadableSourceStates.contains($0) }) {
+            // A recovered read can change the shown lists: the stale trash tile of a failed
+            // `removeFromTrashList` reload (issue #913) leaves only when this publish runs, so
+            // the repair does not wait for the next membership event. Same pattern as `finish`.
+            listsDirty = true
+            scheduleMembershipPublish()
+        }
+    }
+
     /// Retires exactly the acknowledged revisions; a newer revision of the same source keeps its state.
     private func retire(_ items: [(PendingSourceKey, UploadBackupRevision)]) {
         guard !closed else { return }
@@ -1565,15 +1578,7 @@ public actor PendingBackupCoordinator {
             queueLaterTrashRecovery()
         }
         if !unreadableSourceStates.isEmpty {
-            let degradedBefore = unreadableSourceStates
-            reloadSourceStates(Array(degradedBefore))
-            if degradedBefore.contains(where: { !unreadableSourceStates.contains($0) }) {
-                // A recovered read can change the shown lists: the stale trash tile of a failed
-                // `removeFromTrashList` reload (issue #913) leaves only when this publish runs, so
-                // the repair does not wait for the next membership event. Same pattern as `finish`.
-                listsDirty = true
-                scheduleMembershipPublish()
-            }
+            reloadSourceStatesPublishingHeals(Array(unreadableSourceStates))
         }
         let laterTrashKeys = retryLaterTrash ? Array(unreadableLaterTrashKeys) : []
         retryPendingWrites()
@@ -1681,7 +1686,7 @@ public actor PendingBackupCoordinator {
             case .unchanged: unreadableLaterTrashKeys.remove(key)
             }
         }
-        reloadSourceStates(keys)
+        reloadSourceStatesPublishingHeals(keys)
         return needsReconcile
     }
 

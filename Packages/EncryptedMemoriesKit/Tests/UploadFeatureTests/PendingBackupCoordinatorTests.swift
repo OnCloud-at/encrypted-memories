@@ -127,6 +127,47 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         return snapshot
     }
 
+    /// Runs `action` and returns the first published snapshot that matches, so the wait ends on the publish itself
+    /// instead of polling a deadline. The listener can start after `action`; the stream keeps the newest snapshot
+    /// (`.bufferingNewest(1)`), so this is safe only for a predicate that stays true once it is true. A caller whose
+    /// predicate can turn false again could miss its match. A pass already in flight can only cause a false pass,
+    /// never a false failure; without the reconcile heal publish the target test fails, so the fired timer path is
+    /// the one exercised. The timeout only stops a test whose publish never comes.
+    private func publishedSnapshot(
+        _ description: String,
+        after action: () -> Void,
+        where predicate: @escaping @Sendable (PendingBackupSnapshot) -> Bool
+    ) async throws -> PendingBackupSnapshot {
+        let published = expectation(description: description)
+        let snapshots = coordinator.snapshots
+        let listener = Task { () -> PendingBackupSnapshot? in
+            for await snapshot in snapshots where predicate(snapshot) {
+                published.fulfill()
+                return snapshot
+            }
+            return nil
+        }
+        action()
+        await fulfillment(of: [published], timeout: 30)
+        listener.cancel()
+        let snapshot = await listener.value
+        return try XCTUnwrap(snapshot, description)
+    }
+
+    /// Waits until `clock` holds a live wait of `duration`. The wait ends on the registration itself; the timeout only
+    /// stops a test whose timer never registers.
+    private func waitForLiveWait(
+        _ duration: Duration, on clock: ResultWriteClock, _ description: String
+    ) async {
+        let registered = expectation(description: description)
+        let waiter = Task {
+            await clock.waitForLiveWait(duration)
+            registered.fulfill()
+        }
+        await fulfillment(of: [registered], timeout: 30)
+        waiter.cancel()
+    }
+
     private func tileIDs(_ snapshot: PendingBackupSnapshot) -> [String] {
         snapshot.tiles.map(\.key.identifier)
     }
@@ -3327,22 +3368,53 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     private final class ResultWriteClock: @unchecked Sendable {
         private let lock = NSLock()
         private var value: Date
-        private var recorded: [Duration] = []
-        private var sleeping: [(Date, OpenGate)] = []
+        private enum WaitState { case live, fired, cancelled }
+        private var recorded: [(duration: Duration, state: WaitState)] = []
+        private var sleeping: [(due: Date, gate: OpenGate, index: Int)] = []
+        private var registrationWaiters: [(duration: Duration, gate: OpenGate)] = []
         var now: Date { lock.withLock { value } }
-        var waits: [Duration] { lock.withLock { recorded } }
+        var waits: [Duration] { lock.withLock { recorded.map(\.duration) } }
+        /// Only the waits that can still fire: neither cancelled by their timer task nor already
+        /// released by `advance` or `releaseAll`.
+        var liveWaits: [Duration] {
+            lock.withLock { recorded.filter { $0.state == .live }.map(\.duration) }
+        }
 
         init(_ date: Date) { value = date }
 
+        /// Returns once a live wait of `duration` exists: at once when one is already live, otherwise when `sleep`
+        /// registers it. A timer task registers its wait only when it starts, after the call that scheduled it.
+        func waitForLiveWait(_ duration: Duration) async {
+            let gate = OpenGate()
+            let live = lock.withLock { () -> Bool in
+                if recorded.contains(where: { $0.duration == duration && $0.state == .live }) { return true }
+                registrationWaiters.append((duration, gate))
+                return false
+            }
+            if !live { await gate.wait() }
+        }
+
         func sleep(_ duration: Duration) async throws {
             let gate = OpenGate()
-            lock.withLock {
-                recorded.append(duration)
+            let (index, registered) = lock.withLock { () -> (Int, [OpenGate]) in
+                recorded.append((duration, .live))
                 let parts = duration.components
                 let seconds = Double(parts.seconds) + Double(parts.attoseconds) / 1e18
-                sleeping.append((value.addingTimeInterval(seconds), gate))
+                sleeping.append((value.addingTimeInterval(seconds), gate, recorded.count - 1))
+                let registered = registrationWaiters.filter { $0.duration == duration }.map(\.gate)
+                registrationWaiters.removeAll { $0.duration == duration }
+                return (recorded.count - 1, registered)
             }
-            await gate.wait()
+            registered.forEach { $0.open() }
+            await withTaskCancellationHandler {
+                await gate.wait()
+            } onCancel: {
+                lock.withLock {
+                    if recorded[index].state == .live { recorded[index].state = .cancelled }
+                    sleeping.removeAll { $0.index == index }
+                }
+                gate.open()
+            }
             try Task.checkCancellation()
         }
 
@@ -3351,17 +3423,22 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 let parts = duration.components
                 value = value.addingTimeInterval(Double(parts.seconds) + Double(parts.attoseconds) / 1e18)
                 guard wakingTimers else { return [] }
-                let due = sleeping.filter { $0.0 <= value }.map(\.1)
-                sleeping.removeAll { $0.0 <= value }
-                return due
+                let due = sleeping.filter { $0.due <= value }
+                sleeping.removeAll { $0.due <= value }
+                due.forEach { recorded[$0.index].state = .fired }
+                return due.map(\.gate)
             }
             due.forEach { $0.open() }
         }
 
         func releaseAll() {
             let gates = lock.withLock {
-                defer { sleeping.removeAll() }
-                return sleeping.map(\.1)
+                defer {
+                    sleeping.removeAll()
+                    registrationWaiters.removeAll()
+                }
+                sleeping.forEach { recorded[$0.index].state = .fired }
+                return sleeping.map(\.gate) + registrationWaiters.map(\.gate)
             }
             gates.forEach { $0.open() }
         }
@@ -4797,6 +4874,12 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             connection.withLock { _ = sqlite3_trace_v2(connection.database, 0, nil, nil) }
         }
 
+        /// Matching reads answer again from now on, as a recovered disk would: the remaining
+        /// budget drops to zero, so no read is interrupted again.
+        func recover() {
+            lock.withLock { limit = 0 }
+        }
+
         static func connection(of store: PendingBackupManifestStore) throws -> SQLiteStoreConnection {
             try XCTUnwrap(
                 Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value
@@ -6066,7 +6149,9 @@ extension PendingBackupCoordinatorTests {
         }
 
         // Arms after the unlist UPDATE, so the keyed read inside `unlistFromTrash` itself stays readable.
-        let failure = KeyedReadFailure(limit: 1, armAfter: "listed_in_trash=0")
+        // Without a limit, every later keyed read also fails until `recover()`: a pass that startup or
+        // another route still has in flight cannot repair the stale tile before the retry fires.
+        let failure = KeyedReadFailure(armAfter: "listed_in_trash=0")
         try failure.install(on: store)
         defer { failure.remove(from: store) }
 
@@ -6091,22 +6176,22 @@ extension PendingBackupCoordinatorTests {
         // The repair (#913): the degraded 60 s retry is scheduled, as startup recovery does in the same
         // situation, so the stale tile repairs itself instead of staying until another trigger.
         let backoffDelay = Duration.seconds(60)
-        try await waitUntil { clock.waits.contains(backoffDelay) }
+        await waitForLiveWait(backoffDelay, on: clock, "the degraded 60 s retry must register its wait")
         XCTAssertTrue(
-            clock.waits.contains(backoffDelay),
+            clock.liveWaits.contains(backoffDelay),
             "issue #913: removeFromTrashList must schedule the degraded 60 s retry after its reload failed, "
                 + "as startup recovery does")
 
-        // Firing the retry repairs the tile: the interrupt budget is spent, the keyed read answers
-        // again, and the trash list drops the stale tile.
-        clock.advance(by: .seconds(60))
+        // Firing the retry repairs the tile: the reads recover first, so the keyed read of the fired
+        // pass answers, and the trash list drops the stale tile.
+        failure.recover()
 
-        // The membership interval is zero, so publishing does not sleep on the fake clock. A further
-        // advance is harmless and releases any remaining timer that still sleeps.
-        clock.advance(by: .seconds(2))
-        let repairedSnapshot = await waitForSnapshot("the fired 60 s retry must repair the stale trash tile") {
-            $0.trashTiles.allSatisfy { $0.key != trashKey }
-        }
+        // The membership interval is zero, so the publish after the fired timer needs no further
+        // clock step; the wait ends on the published repair instead of a guessed delay.
+        let repairedSnapshot = try await publishedSnapshot(
+            "the fired 60 s retry must repair the stale trash tile",
+            after: { clock.advance(by: backoffDelay) },
+            where: { $0.trashTiles.allSatisfy { $0.key != trashKey } })
         XCTAssertTrue(
             repairedSnapshot.excludedTiles.contains { $0.key == key("t") },
             "the source stays excluded and keeps its settings tile after the repair")
@@ -6149,6 +6234,75 @@ extension PendingBackupCoordinatorTests {
         XCTAssertEqual(
             clock.waits.filter { $0 < Duration.seconds(130) }, [],
             "the healthy route must not record any degraded backoff wait")
+
+        await coordinator.close()
+        clock.releaseAll()
+    }
+
+    /// A recovery-path heal must publish the shown lists: the source stayed unreadable in the
+    /// later-trash set, so its duty is retried by `resumeLaterTrash`, whose keyed reload then
+    /// succeeds while the generic heal block's read stays interrupted. Without the publish of
+    /// that heal the stale trash tile survives the fired retry that read the source.
+    func testRecoveryHealOfUnreadableLaterTrashPublishesMembership() async throws {
+        try excludedAndRemoteTracked("k", tile: true, newerHandoff: false)
+
+        // Startup recovery's handoff read fails, so the source enters the unreadable later-trash
+        // set while its keyed state reads stay readable. The read can also be retried by the
+        // startup reconcile, so the fault budget covers both passes.
+        let handoffFailure = KeyedReadFailure(matching: Self.latestHandoffRead, limit: 2)
+        try handoffFailure.install(on: store)
+        let clock = ResultWriteClock(date)
+        coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
+
+        await coordinator.start()
+        let trashKey = self.key("k")
+        _ = await waitForSnapshot("the fixture must first show the source in the trash list") {
+            $0.trashTiles.contains { $0.key == trashKey }
+        }
+        try await waitUntil { handoffFailure.count >= 1 }
+        XCTAssertGreaterThanOrEqual(
+            handoffFailure.count, 1, "startup recovery must read the source's handoff")
+        try await settle()
+        handoffFailure.remove(from: store)
+
+        // The unlist commits and its keyed reload fails, so the shown list keeps the stale tile
+        // and the source state degrades, while the unreadable later-trash duty keeps its retry.
+        let reloadFailure = KeyedReadFailure(limit: 2, armAfter: "listed_in_trash=0")
+        try reloadFailure.install(on: store)
+        defer { reloadFailure.remove(from: store) }
+
+        let result = await coordinator.removeFromTrashList([
+            PhotoUID(localPending: .photoLibrary, identifier: "k")
+        ])
+        XCTAssertTrue(
+            result, "removeFromTrashList must return true when the unlist succeeds despite the reload failure")
+        XCTAssertEqual(
+            sqlScalar("SELECT listed_in_trash FROM source_state WHERE source_id='k';"), "0",
+            "the unlist must be committed in the store")
+
+        try await settle()
+        let staleSnapshot = await coordinator.currentSnapshot()
+        XCTAssertTrue(
+            staleSnapshot.trashTiles.contains { $0.key == trashKey },
+            "the failed reload must keep the stale trash tile")
+
+        // Fire the single live degraded retry timer. Its reconcile must heal the source in the
+        // recovery reload, because the generic heal block's keyed read stays interrupted.
+        let retryDelay = Duration.seconds(60)
+        await waitForLiveWait(retryDelay, on: clock, "the degraded 60 s retry must register its wait")
+        XCTAssertEqual(
+            clock.liveWaits, [retryDelay], "the degraded regime must keep exactly one live timer: the 60 s retry")
+
+        let repairedSnapshot = try await publishedSnapshot(
+            "the recovery-path heal must publish the membership and drop the stale trash tile",
+            after: { clock.advance(by: retryDelay) },
+            where: { $0.trashTiles.allSatisfy { $0.key != trashKey } })
+        XCTAssertTrue(
+            repairedSnapshot.excludedTiles.contains { $0.key == trashKey },
+            "the source stays excluded and keeps its settings tile after the recovery heal")
+        XCTAssertEqual(
+            reloadFailure.count, 2,
+            "the generic heal block's keyed read must stay interrupted, so only the recovery reload can heal")
 
         await coordinator.close()
         clock.releaseAll()
