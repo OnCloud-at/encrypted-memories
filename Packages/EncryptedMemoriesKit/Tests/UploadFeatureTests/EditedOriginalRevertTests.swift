@@ -966,15 +966,15 @@ final class EditedOriginalRevertTests: XCTestCase {
         XCTAssertNil(try journalStore.journal(forEditedMain: editedMain), "the finished run leaves no journal")
     }
 
-    /// F18: `abandon` removes an undecodable journal instead of leaving the photo a dead end, and the count
-    /// makes the removal visible to the host.
+    /// F18: `abandon` removes an undecodable journal instead of leaving the photo a dead end.
     func testAbandonRemovesAnUndecodableJournal() async throws {
         try corruptTheJournalFile()
-        XCTAssertEqual(try journalStore.undecodableJournalCount(), 1)
+        XCTAssertThrowsError(
+            try journalStore.journal(forEditedMain: editedMain), "the file is undecodable, not absent")
 
         try await makeOrchestrator().abandon(editedMain: editedMain)
 
-        XCTAssertEqual(try journalStore.undecodableJournalCount(), 0)
+        XCTAssertNil(try journalStore.journal(forEditedMain: editedMain), "abandon removed the file")
         XCTAssertEqual(try journalStore.pendingJournals().count, 0)
     }
 
@@ -1047,7 +1047,6 @@ private final class RacingJournalStore: EditedOriginalRevertJournalStore, @unche
     func decodableJournal(forEditedMain mainUID: PhotoUID) throws -> EditedOriginalRevertJournal? {
         try base.decodableJournal(forEditedMain: mainUID)
     }
-    func undecodableJournalCount() throws -> Int { try base.undecodableJournalCount() }
     func save(_ journal: EditedOriginalRevertJournal) throws { try base.save(journal) }
     func remove(forEditedMain mainUID: PhotoUID) throws { try base.remove(forEditedMain: mainUID) }
     func pendingJournals() throws -> [EditedOriginalRevertJournal] {

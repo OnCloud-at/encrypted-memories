@@ -1629,7 +1629,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(controller.status.dismissedFailures, 1)
             XCTAssertEqual(controller.status.needsAttentionCount, 0)
             XCTAssertEqual(controller.status.waitingRetry, 0)
-            XCTAssertEqual(controller.status.notBackedUpCount, 1)
+            XCTAssertEqual(controller.status.totalConsidered, 1)
+            XCTAssertEqual(controller.status.backedUp, 0)
             XCTAssertEqual(controller.status.outstandingCount, 1)
             await controller.shutdown()
         }

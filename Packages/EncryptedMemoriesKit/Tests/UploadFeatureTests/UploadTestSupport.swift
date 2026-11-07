@@ -320,6 +320,15 @@ final class UploadCompletionRecorder: @unchecked Sendable {
     }
 }
 
+extension UploadBackupSyncQueueStore {
+    /// Read-only view of every runnable row through the store's own state reads; claiming would change the rows.
+    func runnableEntries() -> [UploadBackupSyncQueueEntry] {
+        UploadBackupSyncQueueManifestStore.runnableStates.flatMap {
+            entries(in: UploadBackupSyncQueueState(rawValue: $0)!, updatedBefore: .distantFuture, limit: .max)
+        }
+    }
+}
+
 extension XCTestCase {
     /// Polls `manager.snapshot()` until `predicate` holds or the timeout elapses.
     @discardableResult

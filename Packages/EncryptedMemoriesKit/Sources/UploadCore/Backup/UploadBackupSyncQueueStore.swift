@@ -311,44 +311,6 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    public func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] {
-        let clampedLimit = max(1, limit)
-        return connection.withLock {
-            var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
-                               state, attempts, last_error, updated_at, remote_commit_reconciliation
-                        FROM backup_sync_queue
-                        WHERE state IN (\(Self.runnableStateList))
-                        ORDER BY revision_us DESC, updated_at ASC
-                        LIMIT ?;
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
-            else { return [] }
-            defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_int(stmt, 1, Int32(clampedLimit))
-            var entries: [UploadBackupSyncQueueEntry] = []
-            var stepResult = sqlite3_step(stmt)
-            while stepResult == SQLITE_ROW {
-                guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                    connection.markFailed()
-                    return []
-                }
-                let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
-                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return [] }
-                entries.append(entry)
-                stepResult = sqlite3_step(stmt)
-            }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
-            return entries
-        }
-    }
-
     public func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
         (try? runnableDate(excludingSourcesOf: excludedSources, requireComplete: false)) ?? nil
     }
@@ -382,7 +344,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    private static let runnableStates: [String] = ["discovered", "queuedForUpload", "needsRemoteReconciliation"]
+    /// Internal, not private: test reads of the runnable rows use this same list.
+    static let runnableStates: [String] = ["discovered", "queuedForUpload", "needsRemoteReconciliation"]
     /// SQL literal of `runnableStates`; every runnable-set query interpolates this one list.
     private static let runnableStateList = runnableStates.map { "'\($0)'" }.joined(separator: ", ")
 
