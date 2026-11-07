@@ -2571,11 +2571,29 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             return Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
         }
         burstFrameVerdicts.merge(checked.verdicts)
-        let memberIDs = checked.frames
-        guard memberIDs.count > 1 else { return [] }
+        return Self.seriesAnswer(
+            frames: checked.frames, containing: uid.nodeID, entriesByID: entriesByID, burstEntries: burstEntries,
+            volumeID: root.volumeID)
+    }
+
+    /// The read answer for the frames of a series, as `BurstGroupProvider` states it: every frame when two or more
+    /// are left, the photo alone with only itself as a member when it is the one frame left, otherwise nothing.
+    static func seriesAnswer(
+        frames memberIDs: [String],
+        containing nodeID: String,
+        entriesByID: [String: PhotosListEntry],
+        burstEntries: [PhotosListEntry],
+        volumeID: String
+    ) -> [PhotoItem] {
+        guard memberIDs.count > 1 else {
+            // The other related files are no frames, so the photo is its own series. An empty answer would
+            // read as a burst that could not be loaded.
+            guard memberIDs == [nodeID], let entry = entriesByID[nodeID] else { return [] }
+            return [Self.photoItem(from: entry, volumeID: volumeID, burstMemberIDs: memberIDs)]
+        }
 
         let anchorEntry =
-            entriesByID[uid.nodeID]
+            entriesByID[nodeID]
             ?? burstEntries.first { entry in
                 memberIDs.contains(entry.linkID)
             }
@@ -2583,11 +2601,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
         return memberIDs.enumerated().map { offset, id in
             if let entry = entriesByID[id] {
-                return Self.photoItem(from: entry, volumeID: root.volumeID, burstMemberIDs: memberIDs)
+                return Self.photoItem(from: entry, volumeID: volumeID, burstMemberIDs: memberIDs)
             }
             return Self.syntheticBurstMember(
                 id: id,
-                volumeID: root.volumeID,
+                volumeID: volumeID,
                 memberIDs: memberIDs,
                 anchorTime: anchorTime,
                 offset: offset
