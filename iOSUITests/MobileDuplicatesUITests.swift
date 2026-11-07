@@ -53,7 +53,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture")
 
         XCTAssertTrue(app.staticTexts["Checking Your Library"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].exists)
+        XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].waitForExistence(timeout: 10))
         let progress = app.progressIndicators["duplicates.checkProgress"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 5), "the check shows its progress")
         XCTAssertGreaterThanOrEqual(progress.frame.width, 120)
@@ -121,7 +121,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         app.buttons["duplicates.merge.0"].tap()
         let retry = app.buttons["Try again"].firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
+        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].waitForExistence(timeout: 10))
         XCTAssertFalse(group(0).exists, "invalidated rows stay hidden")
         XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
         keepScreenshot("duplicates-ios-reload-failed")
@@ -130,7 +130,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(1).waitForExistence(timeout: 10), "Retry restores the checked list")
         XCTAssertTrue(app.buttons["duplicates.mergeAll"].isEnabled)
         XCTAssertFalse(retry.exists)
-        XCTAssertTrue(app.staticTexts["4 identical copies"].exists)
+        XCTAssertTrue(app.staticTexts["4 identical copies"].waitForExistence(timeout: 10))
     }
 
     func testRetryRestartsTheLibraryCheckAfterTwoServiceInterruptions() {
@@ -139,7 +139,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             extra: ["-EncryptedMemoriesDuplicatesInterruptedCheck"])
         let retry = app.buttons["Try again"].firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 10), "two interruptions must end waiting")
-        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].exists)
+        XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["Duplicates appear here when it is done."].exists)
         keepScreenshot("duplicates-ios-interrupted-check")
 
@@ -222,7 +222,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
         let progress = app.progressIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].waitForExistence(timeout: 10))
         XCTAssertFalse(group(0).exists, "unchecked candidates have no rows or per-group merge")
         XCTAssertFalse(app.staticTexts["No Duplicates"].exists)
         XCTAssertFalse(app.staticTexts["duplicates.copyCount"].exists)
@@ -257,16 +257,17 @@ final class MobileDuplicatesUITests: XCTestCase {
     private func assertWaitingLayout() {
         let progress = app.progressIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].waitForExistence(timeout: 10))
         XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == 'Checking duplicates'")).count, 1)
-        XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
+        XCTAssertTrue(
+            app.staticTexts["Looking for identical copies in your library."].waitForExistence(timeout: 10))
         XCTAssertGreaterThanOrEqual(progress.frame.width, 120)
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertLessThanOrEqual(
             progress.frame.width, app.staticTexts["Looking for identical copies in your library."].frame.width)
         XCTAssertEqual(progress.label, "Checking duplicates", "VoiceOver names the bar after the waiting state")
         let percent = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH '%'")).firstMatch
-        XCTAssertTrue(percent.exists)
+        XCTAssertTrue(percent.waitForExistence(timeout: 10))
         XCTAssertEqual(percent.frame.midX, progress.frame.midX, accuracy: 1, "the percentage stays centered")
         print(
             "[Duplicates layout] window=\(app.windows.firstMatch.frame.width) bar=\(progress.frame.width) percentMidX=\(percent.frame.midX) barMidX=\(progress.frame.midX)"
@@ -279,8 +280,9 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowScan"])
         let progress = app.activityIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["Checking duplicates"].exists)
-        XCTAssertTrue(app.staticTexts["Looking for identical copies in your library."].exists)
+        XCTAssertTrue(app.staticTexts["Checking duplicates"].waitForExistence(timeout: 10))
+        XCTAssertTrue(
+            app.staticTexts["Looking for identical copies in your library."].waitForExistence(timeout: 10))
         XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
         XCTAssertFalse(group(0).exists)
         XCTAssertEqual(
@@ -431,7 +433,9 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(keep.waitForExistence(timeout: 10), "a tap opens the photo with the merge tools")
         XCTAssertEqual(keep.label, "Keep This Copy")
         for action in ["Favorite", "Info"] {
-            XCTAssertTrue(app.buttons[action].firstMatch.exists, "the viewer keeps the library action \(action)")
+            XCTAssertTrue(
+                app.buttons[action].firstMatch.waitForExistence(timeout: 10),
+                "the viewer keeps the library action \(action)")
         }
         keep.tap()
         waitUntil(keep, "label == 'Kept'", "the shown photo is kept")
