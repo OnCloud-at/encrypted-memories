@@ -115,6 +115,66 @@ final class MobileViewerShareWiringTests: XCTestCase {
         XCTAssertTrue(failureShown, "the burst failure must become visible to the person")
     }
 
+    func testShareAfterAFailedReadReadsTheBurstAgainAndSharesTheWholeSeries() async throws {
+        struct ReadFailure: Error {}
+        let whole = [ViewerShareSample.lead, ViewerShareSample.second, ViewerShareSample.third]
+        let gate = AsyncGate()
+        let reads = ReadCounter()
+        // The first read fails; the read that the Share tap starts succeeds once the gate opens.
+        let fixture = try await Fixture(
+            items: [ViewerShareSample.lead, ViewerShareSample.second],
+            burstLoader: { _ in
+                if reads.next() == 1 { throw ReadFailure() }
+                await gate.arriveAndWait()
+                return whole
+            },
+            releaseOnClose: { gate.open() })
+        defer { fixture.close() }
+
+        try await waitUntil { reads.count == 1 }
+        let enabledAfterFailure = try await fixture.waitForShareEnabledState(true)
+        XCTAssertTrue(enabledAfterFailure, "Share is available after the failed read")
+        XCTAssertTrue(fixture.tryActivatingShare())
+
+        // The tap reads the burst again, and Share is dimmed while that read runs.
+        try await waitUntil { gate.arrivals >= 1 }
+        XCTAssertEqual(reads.count, 2, "a Share tap after a failed read must read the burst again")
+        let dimmedWhileReading = try await fixture.waitForShareEnabledState(false)
+        XCTAssertTrue(dimmedWhileReading, "Share must be dimmed while the burst is read again")
+        XCTAssertEqual(fixture.probe.events, [], "nothing is shared or refused while the read runs")
+
+        gate.open()
+        let wholeShare = MobileViewerShareDecisionProbe.Event.shared(
+            nodeIDs: whole.map(\.uid.nodeID), failureMessage: String(localized: "viewer.share_failed"))
+        try await waitUntil { !fixture.probe.events.isEmpty }
+        XCTAssertEqual(fixture.probe.events, [wholeShare], "the tap shares the whole series once it is read")
+        XCTAssertTrue(fixture.alertControllers().isEmpty, "a successful read shows no failure")
+    }
+
+    func testShareAfterAFailedReadShowsTheNoticeAgainWhenTheNewReadFails() async throws {
+        struct ReadFailure: Error {}
+        let reads = ReadCounter()
+        let fixture = try await Fixture(
+            items: [ViewerShareSample.lead, ViewerShareSample.second],
+            burstLoader: { _ in
+                _ = reads.next()
+                throw ReadFailure()
+            })
+        defer { fixture.close() }
+
+        try await waitUntil { reads.count == 1 }
+        let enabledAfterFailure = try await fixture.waitForShareEnabledState(true)
+        XCTAssertTrue(enabledAfterFailure, "Share is available after the failed read")
+        XCTAssertTrue(fixture.tryActivatingShare())
+
+        let failure = String(localized: "viewer.share_burst_load_failed")
+        try await waitUntil { !fixture.probe.events.isEmpty }
+        XCTAssertEqual(reads.count, 2, "a Share tap after a failed read must read the burst again")
+        XCTAssertEqual(fixture.probe.events, [.burstReadFailed(message: failure)])
+        let failureShown = try await fixture.waitForAlert(containing: failure)
+        XCTAssertTrue(failureShown, "a failed new read shows the burst notice again")
+    }
+
     func testASinglePlainPhotoKeepsTheGenericShareRoute() async throws {
         let fixture = try await Fixture(items: [ViewerShareSample.plain], burstLoader: { _ in [] })
         defer { fixture.close() }
@@ -172,6 +232,22 @@ final class MobileViewerShareWiringTests: XCTestCase {
                 guard !isOpen else { return false }
                 waiters.append(continuation)
                 return true
+            }
+        }
+    }
+
+    /// Counts burst-group reads across the fixture backend's concurrent calls.
+    private final class ReadCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        var count: Int { lock.withLock { value } }
+
+        /// Records one read and returns its number, starting at 1.
+        func next() -> Int {
+            lock.withLock {
+                value += 1
+                return value
             }
         }
     }
