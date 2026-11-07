@@ -2,6 +2,42 @@ import Foundation
 import OSLog
 import SQLite3
 
+/// The schema version of a store that keeps it in the `schema` row of an info table. `verify` and `stamp` are the
+/// version checks that `SQLiteStoreSchemaGate.openCurrentStore` takes.
+public struct SQLiteInfoTableVersion: Sendable {
+    public let table: String
+    public let version: Int
+    /// True: `stamp` replaces an existing `schema` row. False: `stamp` is a plain INSERT and fails on an existing row,
+    /// so an open that finds a row written by another connection fails closed. Each store keeps the form it always had.
+    public let stampReplacesExistingRow: Bool
+
+    public init(table: String, version: Int, stampReplacesExistingRow: Bool) {
+        self.table = table
+        self.version = version
+        self.stampReplacesExistingRow = stampReplacesExistingRow
+    }
+
+    /// True when the `schema` row holds `version`. The read uses `sqlite3_column_int`.
+    public func verify(_ db: OpaquePointer?) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM \(table) WHERE key='schema';", -1, &stmt, nil) == SQLITE_OK
+        else { return false }
+        var onDisk: Int?
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
+        sqlite3_finalize(stmt)
+        return result == SQLITE_ROW && onDisk == version
+    }
+
+    /// Writes `version` into the `schema` row.
+    public func stamp(_ db: OpaquePointer?) -> Bool {
+        let conflict = stampReplacesExistingRow ? " ON CONFLICT(key) DO UPDATE SET value=excluded.value" : ""
+        return sqlite3_exec(
+            db, "INSERT INTO \(table)(key, value) VALUES('schema', \(version))\(conflict);", nil, nil, nil
+        ) == SQLITE_OK
+    }
+}
+
 /// Classifies an opened SQLite connection before a store applies persistent pragmas or schema DDL.
 public enum SQLiteStoreSchemaState: Sendable, Equatable {
     case empty

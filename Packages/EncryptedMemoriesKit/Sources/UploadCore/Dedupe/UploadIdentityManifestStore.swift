@@ -32,6 +32,8 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
     private static let schemaVersion = 8
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "manifest_info", version: schemaVersion, stampReplacesExistingRow: false)
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
@@ -152,31 +154,9 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             at: url,
             schemaSQL: schema,
             policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: schemaVersionRow.verify,
+            stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(handle, "SELECT value FROM manifest_info WHERE key='schema';", -1, &stmt, nil)
-                == SQLITE_OK
-        else {
-            return false
-        }
-        let result = sqlite3_step(stmt)
-        let onDisk = result == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : nil
-        sqlite3_finalize(stmt)
-        return result == SQLITE_ROW && onDisk == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        sqlite3_exec(
-            handle,
-            "INSERT INTO manifest_info(key, value) VALUES('schema', \(schemaVersion));",
-            nil, nil, nil
-        ) == SQLITE_OK
     }
 
     // MARK: UploadIdentityStore

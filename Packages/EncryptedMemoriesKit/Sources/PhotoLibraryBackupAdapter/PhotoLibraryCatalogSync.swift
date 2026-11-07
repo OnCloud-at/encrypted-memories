@@ -74,14 +74,7 @@ public struct PhotoKitAssetEnumerator: PhotoLibraryAssetEnumerator {
         let chunkSize = max(1, chunkSize)
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .utility) {
-                let fetchResult: PHFetchResult<PHAsset>
-                if let identifiers {
-                    fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
-                } else {
-                    let options = PHFetchOptions()
-                    options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-                    fetchResult = PHAsset.fetchAssets(with: options)
-                }
+                let fetchResult = PhotoKitAssetMapper.fetchAssets(identifiers: identifiers)
 
                 let total = fetchResult.count
                 // Resume point: skip assets already observed by an earlier run of this scan epoch.
@@ -116,9 +109,7 @@ public struct PhotoKitAssetEnumerator: PhotoLibraryAssetEnumerator {
         let chunkSize = max(1, chunkSize)
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .utility) {
-                let options = PHFetchOptions()
-                options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-                let result = PHAsset.fetchAssets(with: options)
+                let result = PhotoKitAssetMapper.fetchAssets()
                 var index = 0
                 while index < result.count {
                     if Task.isCancelled {

@@ -282,10 +282,6 @@ public final class AlbumSyncController {
         startObservingChangesIfNeeded()
     }
 
-    public func refreshAccessState() {
-        accessState = currentAccessState()
-    }
-
     // MARK: - Selection
 
     /// Applies the picker result: `ids` becomes the new selection. Removed albums keep their

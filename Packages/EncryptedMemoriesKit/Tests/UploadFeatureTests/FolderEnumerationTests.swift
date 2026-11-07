@@ -375,9 +375,9 @@ final class PhotoLibraryChangeMonitorTests: XCTestCase {
             }
         )
 
-        monitor.startObserving {}
+        let subscription = monitor.subscribe {}
         let ranOnMain = await probe.wait()
-        monitor.stopObserving()
+        subscription.cancel()
 
         XCTAssertFalse(ranOnMain)
     }
