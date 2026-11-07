@@ -547,7 +547,9 @@ import Testing
 
         _ = await service.indexQuantum(
             [uid("tree"), uid("water")],
+            libraryGeneration: 1,
             maximumAssets: 1,
+            shouldContinue: { true },
             observer: MLIndexPassObserver()
         )
         #expect(releases.value == 0)
@@ -570,7 +572,9 @@ import Testing
 
         let outcome = await service.indexQuantum(
             [uid("tree")],
+            libraryGeneration: 1,
             maximumAssets: 1,
+            shouldContinue: { true },
             observer: MLIndexPassObserver()
         )
 

@@ -296,8 +296,13 @@ import Testing
         /// The double simulates a restored library whose OCR index already holds one entry.
         func hasIndexedTextEntries() -> Bool { true }
 
-        func index(
+        func indexQuantum(
             assets: [MLPipelineAssetRevision],
+            libraryGeneration: UInt64,
+            allowsDestructiveReconciliation: Bool,
+            destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
+            maximumAssets: Int,
+            maximumConcurrentAssets: Int,
             shouldContinue: @escaping @Sendable () -> Bool,
             observer: MLDerivedPipelineObserver
         ) -> MLDerivedPipelinePassOutcome {
