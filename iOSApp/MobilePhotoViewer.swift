@@ -855,7 +855,21 @@ struct MobilePhotoViewer: View {
     }
 
     private func shareCurrentItem() {
-        guard libraryModel.backend != nil, let result = shareDecision else { return }
+        guard libraryModel.backend != nil, let page = currentBaseItem, let result = shareDecision else { return }
+        guard case .burstReadFailed = result else {
+            share(result)
+            return
+        }
+        // A tap after a failed burst read reads the burst again. Share is dimmed while the read
+        // runs, and the share then follows the new read: the whole series, or the notice.
+        Task { @MainActor in
+            await loadBurst(for: page)
+            guard currentBaseItem?.uid == page.uid, let reread = shareDecision else { return }
+            share(reread)
+        }
+    }
+
+    private func share(_ result: BurstExportExpansion.Result) {
         switch result {
         case .success(let items, _):
             let failureMessage = String(localized: "viewer.share_failed")
