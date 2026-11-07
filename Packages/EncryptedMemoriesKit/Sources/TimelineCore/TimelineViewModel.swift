@@ -571,7 +571,7 @@ public final class TimelineViewModel {
     /// Commits a trash that another feature already did on the server, such as the merge of duplicates. A photo that
     /// no listing has shown yet still stays hidden from every later listing; Recently Deleted gets the known ones.
     public func commitTrash(uids: Set<PhotoUID>) async {
-        await commitTrash(uids, knownItems: wholeLibraryItemsForViewer.filter { uids.contains($0.uid) })
+        await commitTrash(uids, knownItems: allLibraryItems(matching: uids))
     }
 
     private func commitTrash(_ uids: Set<PhotoUID>, knownItems items: [PhotoItem]) async {

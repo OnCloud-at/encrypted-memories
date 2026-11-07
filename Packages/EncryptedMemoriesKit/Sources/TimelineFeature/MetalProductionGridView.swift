@@ -332,7 +332,7 @@ struct MetalProductionGridView: NSViewRepresentable {
 
         func receiveContent(
             items: [PhotoItem], revision: Int, routeGeneration: Int,
-            initialViewport: GridInitialViewport, markers: [(index: Int, text: String)],
+            initialViewport: GridInitialViewport, markers: @autoclosure () -> [(index: Int, text: String)],
             isProvisionalPresentation: Bool = false,
             makeSource: @escaping () -> MetalGridDataSource
         ) {
@@ -350,7 +350,7 @@ struct MetalProductionGridView: NSViewRepresentable {
             if !routePending, deferredOrderUpdate?.revision == revision { return }
             let update = OrderUpdate(
                 preservesVisibleAnchor: provisionalUpdate && !routePending,
-                items: items, revision: revision, markers: markers, makeSource: makeSource)
+                items: items, revision: revision, markers: markers(), makeSource: makeSource)
             let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
             let decision: TimelineOrderRefinementPolicy.Decision =
                 routePending
