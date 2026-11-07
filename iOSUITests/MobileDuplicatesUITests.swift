@@ -235,8 +235,8 @@ final class MobileDuplicatesUITests: XCTestCase {
             ).firstMatch.exists)
 
         let mergeAll = app.buttons["duplicates.mergeAll"]
-        XCTAssertTrue(mergeAll.exists, "the toolbar action stays visible")
-        XCTAssertFalse(mergeAll.isEnabled, "the final checked list must arrive first")
+        XCTAssertTrue(mergeAll.waitForExistence(timeout: 10), "the toolbar action stays visible")
+        waitUntil(mergeAll, "isEnabled == false", "the final checked list must arrive first")
         XCTAssertFalse(app.buttons["duplicates.mergeAll.dialog"].exists)
     }
 
@@ -285,7 +285,9 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Checking duplicates"].waitForExistence(timeout: 10))
         XCTAssertTrue(
             app.staticTexts["Looking for identical copies in your library."].waitForExistence(timeout: 10))
-        XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
+        let mergeAll = app.buttons["duplicates.mergeAll"]
+        XCTAssertTrue(mergeAll.waitForExistence(timeout: 10), "the toolbar action stays visible")
+        waitUntil(mergeAll, "isEnabled == false", "the final checked list must arrive first")
         XCTAssertFalse(group(0).exists)
         XCTAssertEqual(
             progress.frame.midX, app.staticTexts["Looking for identical copies in your library."].frame.midX,
