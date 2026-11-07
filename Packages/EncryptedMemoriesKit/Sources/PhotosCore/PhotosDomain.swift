@@ -10,6 +10,11 @@ public struct PhotoUID: Hashable, Sendable, Codable {
         self.volumeID = volumeID
         self.nodeID = nodeID
     }
+
+    /// This photo with `volumeID` when it names no volume. An empty volume ID means the person's photos volume.
+    public func inVolume(_ volumeID: String) -> PhotoUID {
+        self.volumeID.isEmpty ? PhotoUID(volumeID: volumeID, nodeID: nodeID) : self
+    }
 }
 
 // MARK: - Models

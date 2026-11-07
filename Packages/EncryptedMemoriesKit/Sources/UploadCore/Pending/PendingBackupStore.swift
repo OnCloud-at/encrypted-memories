@@ -61,19 +61,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
-    /// Removes evidence of sources that settled or left the backup set.
-    @discardableResult
-    public func removeEvidence(for keys: [PendingSourceKey]) -> Bool {
-        guard !keys.isEmpty else { return true }
-        return connection.withLock {
-            transaction {
-                keys.allSatisfy { key in
-                    execute("DELETE FROM upload_evidence WHERE source_kind=? AND source_id=?;") { bindKey($0, key) }
-                }
-            }
-        }
-    }
-
     /// Removes the evidence of exactly these revisions, so a newer revision keeps its own evidence.
     @discardableResult
     public func removeEvidence(_ revisions: [(PendingSourceKey, UploadBackupRevision)]) -> Bool {
@@ -391,11 +378,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         }
                     ) { stmt in
                         guard let identifier = columnText(stmt, 1) else { return }
-                        let rowKind = sourceStateEnumText(stmt, 0).flatMap(UploadSourceIdentity.Kind.init(rawValue:))
-                        let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:))
+                        let rowKind = columnText(stmt, 0, roundTrip: true).flatMap(
+                            UploadSourceIdentity.Kind.init(rawValue:))
+                        let desired = columnText(stmt, 2, roundTrip: true).flatMap(PendingDesiredState.init(rawValue:))
                         let operationReadable =
                             sqlite3_column_type(stmt, 3) == SQLITE_NULL
-                            || sourceStateEnumText(stmt, 3).flatMap(PendingSourceEffect.init(rawValue:)) != nil
+                            || columnText(stmt, 3, roundTrip: true).flatMap(PendingSourceEffect.init(rawValue:)) != nil
                         guard let rowKind, let desired, operationReadable else {
                             Self.noteUndecodableRow()
                             result[identifier] = .unreadable
@@ -740,13 +728,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 }
                 guard updated else { return false }
                 if effect != .queueSync, !clearOperationBinding(for: key) { return false }
-                return execute(
-                    """
-                    DELETE FROM source_state
-                    WHERE source_kind=? AND source_id=? AND desired='included' AND remote_op IS NULL
-                      AND needs_queue_sync=0 AND needs_remote_trash=0 AND needs_remote_restore=0;
-                    """
-                ) { bindKey($0, key) }
+                return deleteSettledIncludedLocked(key)
             }
             guard committed else { return .failed }
             guard movesOn else { return .saved }
@@ -1002,6 +984,18 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
+    /// Deletes the row of an included source once it owes nothing: no queue sync, no remote trash or restore, and no
+    /// remote operation in flight. A row with any open effect stays.
+    private func deleteSettledIncludedLocked(_ key: PendingSourceKey) -> Bool {
+        execute(
+            """
+            DELETE FROM source_state
+            WHERE source_kind=? AND source_id=? AND desired='included' AND remote_op IS NULL
+              AND needs_queue_sync=0 AND needs_remote_trash=0 AND needs_remote_restore=0;
+            """
+        ) { bindKey($0, key) }
+    }
+
     private func clearOperationBinding(for key: PendingSourceKey) -> Bool {
         execute("DELETE FROM remote_operation WHERE source_kind=? AND source_id=?;") { bindKey($0, key) }
     }
@@ -1093,12 +1087,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 else { return false }
                 guard outcome == .completed else { return true }
                 guard clearOperationBinding(for: checked.key) else { return false }
-                return execute(
-                    """
-                    DELETE FROM source_state WHERE source_kind=? AND source_id=? AND desired='included'
-                      AND needs_queue_sync=0 AND needs_remote_trash=0 AND needs_remote_restore=0 AND remote_op IS NULL;
-                    """
-                ) { bindKey($0, checked.key) }
+                return deleteSettledIncludedLocked(checked.key)
             }
         }
     }
@@ -1257,10 +1246,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             + (condition.map { " WHERE \($0)" } ?? "") + " ORDER BY source_kind, source_id;"
         let queried = query(sql, bind: bind) { stmt in
             let remoteOperationIsNull = sqlite3_column_type(stmt, 20) == SQLITE_NULL
-            let remoteOperation = sourceStateEnumText(stmt, 20).flatMap(PendingSourceEffect.init(rawValue:))
-            guard let kind = sourceStateEnumText(stmt, 0).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
+            let remoteOperation = columnText(stmt, 20, roundTrip: true).flatMap(PendingSourceEffect.init(rawValue:))
+            guard let kind = columnText(stmt, 0, roundTrip: true).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
                 let identifier = columnText(stmt, 1),
-                let desired = sourceStateEnumText(stmt, 2).flatMap(PendingDesiredState.init(rawValue:)),
+                let desired = columnText(stmt, 2, roundTrip: true).flatMap(PendingDesiredState.init(rawValue:)),
                 remoteOperationIsNull || remoteOperation != nil
             else {
                 Self.noteUndecodableRow()
@@ -1311,14 +1300,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// read reports it as incomplete, and the other rows keep working (#982).
     private static func noteUndecodableRow() {
         PhotoDiagnostics.shared.increment("pending.undecodableRow")
-    }
-
-    /// Enum raw values must include every persisted byte, including any embedded NUL.
-    private func sourceStateEnumText(_ stmt: OpaquePointer?, _ column: Int32) -> String? {
-        guard let text = sqlite3_column_text(stmt, column) else { return nil }
-        return String(
-            bytes: UnsafeBufferPointer(start: text, count: Int(sqlite3_column_bytes(stmt, column))),
-            encoding: .utf8)
     }
 
     private func handoffsLocked(where condition: String, bind: ((OpaquePointer?) -> Void)? = nil) -> [PendingHandoff] {

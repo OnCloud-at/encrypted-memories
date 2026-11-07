@@ -41,7 +41,7 @@ enum PendingStoreTransactionFault: Equatable {
                             return SQLITE_OK
                         }, nil), SQLITE_OK)
             }
-            XCTAssertFalse(store.removeEvidence(for: [key]))
+            XCTAssertFalse(store.removeEvidence([(key, UploadBackupRevision(rawValue: 1))]))
         }
         connection.withLock {
             sqlite3_set_authorizer(connection.database, nil, nil)
@@ -1044,7 +1044,6 @@ final class PendingBackupStoreTests: XCTestCase {
             store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: nil)], at: date))
         store.close()
         XCTAssertFalse(store.isOperational())
-        XCTAssertTrue(store.removeEvidence(for: []))
         XCTAssertTrue(store.removeEvidence([(PendingSourceKey, UploadBackupRevision)]()))
         XCTAssertTrue(store.acknowledgeHandoffs([]))
         XCTAssertTrue(store.unlistFromTrash([], at: date))

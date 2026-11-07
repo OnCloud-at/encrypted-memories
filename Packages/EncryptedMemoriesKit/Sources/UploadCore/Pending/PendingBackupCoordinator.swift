@@ -870,7 +870,7 @@ public actor PendingBackupCoordinator {
         // keeps the tile. Rows that had settled before only drop their state; there can be many of them.
         let wasActive = gone.filter { key in
             guard let state = previousRows[key]?.state else { return false }
-            return state != .completed && state != .alreadyBackedUp
+            return !Self.isBackedUp(state)
         }
         for key in gone.subtracting(wasActive) where handoffs[key] == nil { dropSourceState(key) }
         let reload = Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current).union(wasActive)
@@ -990,6 +990,20 @@ public actor PendingBackupCoordinator {
         }
     }
 
+    /// The queue settled the row with a backup: uploaded now or found already backed up. A row that the queue skipped
+    /// as deleted remotely is not backed up.
+    private static func isBackedUp(_ state: UploadBackupSyncQueueState) -> Bool {
+        state == .completed || state == .alreadyBackedUp
+    }
+
+    /// Notes each source that `fetched` shows backed up at an earlier revision than its current row.
+    private func noteBackedUpBefore(_ fetched: [UploadBackupQueueRowState]) {
+        for row in fetched where Self.isBackedUp(row.state) {
+            let key = PendingSourceKey(row.source)
+            if let newest = rows[key]?.revision, row.revision < newest { backedUpBefore.insert(key) }
+        }
+    }
+
     private func absorb(_ row: UploadBackupQueueRowState) {
         let key = PendingSourceKey(row.source)
         // A compound has one row per source; with several revisions, the newest owns the tile.
@@ -1015,10 +1029,7 @@ public actor PendingBackupCoordinator {
             reloadOwed.subtract(kindKeys)
             for key in kindKeys { rows[key] = nil }
             for row in fetched { absorb(row) }
-            for row in fetched where row.state == .completed || row.state == .alreadyBackedUp {
-                let key = PendingSourceKey(row.source)
-                if let newest = rows[key]?.revision, row.revision < newest { backedUpBefore.insert(key) }
-            }
+            noteBackedUpBefore(fetched)
             // The keyed read returned every revision of these sources.
             earlierRevisionsUnknown.subtract(kindKeys)
             rememberDurableHandoffs(for: kindKeys)
@@ -1075,10 +1086,7 @@ public actor PendingBackupCoordinator {
             let answered = earlierRevisionsUnknown.intersection(keys)
             earlierRevisionsUnknown.subtract(answered)
             dirty.formUnion(answered)
-            for row in fetched where row.state == .completed || row.state == .alreadyBackedUp {
-                let key = PendingSourceKey(row.source)
-                if let newest = rows[key]?.revision, row.revision < newest { backedUpBefore.insert(key) }
-            }
+            noteBackedUpBefore(fetched)
         }
     }
 
@@ -1088,7 +1096,7 @@ public actor PendingBackupCoordinator {
     private func rememberDurableHandoffs(for keys: [PendingSourceKey]) {
         let settled = keys.filter { key in
             guard let row = rows[key] else { return handoffs[key] == nil }
-            guard row.state == .completed || row.state == .alreadyBackedUp else { return false }
+            guard Self.isBackedUp(row.state) else { return false }
             return handoffs[key]?.revision != row.revision
         }
         guard !settled.isEmpty else { return }
@@ -1282,7 +1290,7 @@ public actor PendingBackupCoordinator {
             )
         }
         let handoff = handoffs[key].flatMap { $0.revision == row.revision ? $0.remote : nil }
-        let settled = row.state == .completed || row.state == .alreadyBackedUp
+        let settled = Self.isBackedUp(row.state)
         let replaces = replacements[key]?[row.revision] ?? (settled ? [] : earlierUploads(of: key))
         let badge: PendingUploadBadge =
             switch row.state {
@@ -1994,8 +2002,7 @@ public actor PendingBackupCoordinator {
     }
 
     private static func normalized(_ uid: PhotoUID?, volume: String) -> PhotoUID? {
-        guard let uid else { return nil }
-        return uid.volumeID.isEmpty ? PhotoUID(volumeID: volume, nodeID: uid.nodeID) : uid
+        uid?.inVolume(volume)
     }
 
     // MARK: - Deferred actions
