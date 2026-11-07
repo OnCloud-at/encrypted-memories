@@ -175,6 +175,90 @@ final class MobileViewerShareWiringTests: XCTestCase {
         XCTAssertTrue(failureShown, "a failed new read shows the burst notice again")
     }
 
+    func testClosingTheViewerDuringTheShareRereadSharesNothing() async throws {
+        struct ReadFailure: Error {}
+        let whole = [ViewerShareSample.lead, ViewerShareSample.second, ViewerShareSample.third]
+        let gate = AsyncGate()
+        let reads = ReadCounter()
+        // The first read fails; the read that the Share tap starts waits until the viewer is closed.
+        let fixture = try await Fixture(
+            items: [ViewerShareSample.lead, ViewerShareSample.second],
+            burstLoader: { _ in
+                if reads.next() == 1 { throw ReadFailure() }
+                await gate.arriveAndWait()
+                return whole
+            },
+            releaseOnClose: { gate.open() })
+        defer { fixture.close() }
+
+        try await waitUntil { reads.count == 1 }
+        let enabledAfterFailure = try await fixture.waitForShareEnabledState(true)
+        XCTAssertTrue(enabledAfterFailure, "Share is available after the failed read")
+        XCTAssertTrue(fixture.tryActivatingShare())
+        try await waitUntil { gate.arrivals >= 1 }
+
+        fixture.router.presentation = nil
+        try await waitUntil { fixture.root.presentedViewController == nil }
+        XCTAssertNil(fixture.root.presentedViewController, "the viewer closed while the read ran")
+
+        // The read finishes after the viewer closed; its result must not share anything.
+        gate.open()
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(fixture.probe.events, [], "a closed viewer shares nothing")
+    }
+
+    func testShareOfAPartlyKnownBurstThatTheReadDoesNotConfirmShowsTheBurstFailure() async throws {
+        // The filmstrip seeds two of the three members, and the read answers with no photo.
+        let fixture = try await Fixture(
+            items: [ViewerShareSample.lead, ViewerShareSample.second],
+            burstLoader: { _ in [] })
+        defer { fixture.close() }
+
+        let failure = String(localized: "viewer.share_burst_load_failed")
+        let start = ContinuousClock.now
+        while start.duration(to: .now) < .seconds(15) {
+            _ = fixture.tryActivatingShare()
+            if !fixture.probe.events.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+
+        XCTAssertEqual(
+            fixture.probe.events, [.burstReadFailed(message: failure)],
+            "two of three photos must not be shared as the whole burst")
+        let failureShown = try await fixture.waitForAlert(containing: failure)
+        XCTAssertTrue(failureShown, "the burst failure must become visible to the person")
+    }
+
+    func testAPhotoWhoseOnlyOtherMemberIsNoFrameSharesThePhoto() async throws {
+        // The photo declares itself and the adjustment data of its edit; the read finds one frame.
+        let page = PhotoItem(
+            uid: PhotoUID(volumeID: "fixture", nodeID: "share-edited"),
+            captureTime: Date(timeIntervalSince1970: 1_700_000_000),
+            mediaType: "image/jpeg",
+            tags: [.bursts],
+            burstMemberIDs: ["share-edited", "share-edit-data"]
+        )
+        let loneFrame = PhotoItem(
+            uid: page.uid, captureTime: page.captureTime, mediaType: "image/jpeg", tags: [.bursts],
+            burstMemberIDs: ["share-edited"])
+        let fixture = try await Fixture(items: [page], burstLoader: { _ in [loneFrame] })
+        defer { fixture.close() }
+
+        // Share is dimmed while the read runs, so keep offering the press until the share happens.
+        let photoShare = MobileViewerShareDecisionProbe.Event.shared(
+            nodeIDs: [page.uid.nodeID], failureMessage: String(localized: "viewer.share_failed"))
+        let start = ContinuousClock.now
+        while start.duration(to: .now) < .seconds(15) {
+            _ = fixture.tryActivatingShare()
+            if !fixture.probe.events.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertEqual(fixture.probe.events.filter(\.isShared), [photoShare])
+        XCTAssertFalse(
+            fixture.probe.events.contains(where: \.isBurstReadFailed),
+            "one frame shares the photo without a burst notice")
+    }
+
     func testASinglePlainPhotoKeepsTheGenericShareRoute() async throws {
         let fixture = try await Fixture(items: [ViewerShareSample.plain], burstLoader: { _ in [] })
         defer { fixture.close() }

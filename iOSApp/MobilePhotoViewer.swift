@@ -82,6 +82,9 @@ struct MobilePhotoViewer: View {
     @State private var titleMetadataCoordinator: ViewerTitleMetadataCoordinator
     /// Ties the loaded series to its library page so an index change can never show the previous page's series.
     @State private var burstBaseUID: PhotoUID?
+    /// The burst read that a Share tap starts after a failed or unconfirmed read. A page change or the
+    /// closed viewer cancels it, so its share never reaches another page or a closed viewer.
+    @State private var shareReread: Task<Void, Never>?
     /// The presented "Select Favorites" mode of the current series.
     @State private var seriesModel: MobileSeriesFavoritesModel?
     /// Bounded, shared image loader for the pages (thumbnail to screen-bounded preview, off-main and cached).
@@ -258,6 +261,7 @@ struct MobilePhotoViewer: View {
             }
         }
         .task(id: currentBaseItem?.uid) {
+            shareReread?.cancel()
             guard let currentBaseItem else { return }
             await loadBurst(for: currentBaseItem)
         }
@@ -350,6 +354,7 @@ struct MobilePhotoViewer: View {
         .onAppear { visibleThumbnail?.reopen(currentBaseItem?.uid) }
         .onAppear { lookUpEditedOriginal() }
         .onDisappear {
+            shareReread?.cancel()
             cancelViewerMutationPresentation()
             titleMetadataCoordinator.cancelAll()
             visibleThumbnail?.end()
@@ -860,11 +865,12 @@ struct MobilePhotoViewer: View {
             share(result)
             return
         }
-        // A tap after a failed burst read reads the burst again. Share is dimmed while the read
-        // runs, and the share then follows the new read: the whole series, or the notice.
-        Task { @MainActor in
+        // A tap after a failed or unconfirmed burst read reads the burst again. Share is dimmed while
+        // the read runs, and the share then follows the new read: the whole series, or the notice.
+        shareReread?.cancel()
+        shareReread = Task { @MainActor in
             await loadBurst(for: page)
-            guard currentBaseItem?.uid == page.uid, let reread = shareDecision else { return }
+            guard !Task.isCancelled, currentBaseItem?.uid == page.uid, let reread = shareDecision else { return }
             share(reread)
         }
     }

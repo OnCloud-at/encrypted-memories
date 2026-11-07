@@ -101,6 +101,75 @@ final class BurstExportExpansionTests: XCTestCase {
         XCTAssertEqual(result, .success(items: [burst], expandedSingleSeries: false))
     }
 
+    func testDeclaredBurstWhoseGroupAnswerMissesItsMembersFailsTheRequest() async {
+        let declared = PhotoItem(
+            uid: PhotoUID(volumeID: "vol", nodeID: "a"),
+            captureTime: base,
+            mediaType: "image/jpeg",
+            tags: [.bursts],
+            burstMemberIDs: ["a", "b", "c"]
+        )
+        for (name, answer) in [("empty answer", [PhotoItem]()), ("single-photo answer", [declared])] {
+            let result = await BurstExportExpansion.expand(
+                sourceItems: [declared],
+                preferredSeriesNameSource: declared,
+                burstGroupReader: { _ in answer }
+            )
+
+            // The photo declares three members; one photo or none is not the burst.
+            XCTAssertEqual(result, .burstReadFailed(failedSources: [declared]), name)
+        }
+    }
+
+    func testPhotoWhoseOnlyOtherMemberIsNoFrameExportsAsOnePhoto() async {
+        // The photo declares itself and the adjustment data of its edit; the read finds one frame.
+        let declared = PhotoItem(
+            uid: PhotoUID(volumeID: "vol", nodeID: "main"),
+            captureTime: base,
+            mediaType: "image/jpeg",
+            tags: [.bursts],
+            burstMemberIDs: ["main", "edit-data"]
+        )
+        let loneFrame = PhotoItem(
+            uid: declared.uid, captureTime: base, mediaType: "image/jpeg", tags: [.bursts], burstMemberIDs: ["main"])
+
+        let single = await BurstExportExpansion.expand(
+            sourceItems: [declared],
+            preferredSeriesNameSource: declared,
+            burstGroupReader: { _ in [loneFrame] }
+        )
+        XCTAssertEqual(single, .success(items: [declared], expandedSingleSeries: false))
+
+        // An empty answer still contradicts the two declared members.
+        let empty = await BurstExportExpansion.expand(
+            sourceItems: [declared],
+            preferredSeriesNameSource: declared,
+            burstGroupReader: { _ in [] }
+        )
+        XCTAssertEqual(empty, .burstReadFailed(failedSources: [declared]))
+    }
+
+    func testOneFrameAnswerOfAnotherPhotoFailsTheRequest() async {
+        // The photo declares three members, and the read answers with another photo as a lone frame.
+        let declared = PhotoItem(
+            uid: PhotoUID(volumeID: "vol", nodeID: "p"),
+            captureTime: base,
+            mediaType: "image/jpeg",
+            tags: [.bursts],
+            burstMemberIDs: ["p", "q", "r"]
+        )
+        let other = PhotoItem(
+            uid: PhotoUID(volumeID: "vol", nodeID: "x"), captureTime: base, mediaType: "image/jpeg",
+            tags: [.bursts], burstMemberIDs: ["x"])
+
+        let result = await BurstExportExpansion.expand(
+            sourceItems: [declared],
+            preferredSeriesNameSource: declared,
+            burstGroupReader: { _ in [other] }
+        )
+        XCTAssertEqual(result, .burstReadFailed(failedSources: [declared]))
+    }
+
     func testMixedSelectionWithOneFailingBurstFailsTheWholeRequest() async {
         let burst = item("burst", burst: true)
         let plainA = item("plain-a")

@@ -139,7 +139,8 @@ final class BurstSelectionModelTests: XCTestCase {
 
     /// For every state `BurstSelectionModel` can reach through its own mutations,
     /// `hasFilmstrip` and the `count > 1` rule agree, and the viewer decision follows its
-    /// order: loading waits, a failed read fails, otherwise the series or the photo.
+    /// order: loading waits, a failed read or an unconfirmed partial filmstrip fails, otherwise
+    /// the confirmed series or the photo.
     func testViewerBurstEntryAgreesWithHasFilmstripInEveryModelState() {
         let current = item("b", members: ["a", "b", "c"])
         let complete = [
@@ -171,6 +172,18 @@ final class BurstSelectionModelTests: XCTestCase {
             _ = singletonLoad.beginLoadingIfCandidate(current)
             singletonLoad.applyLoadedGroup([current], containing: current)
             states.append(("singleton load", singletonLoad))
+
+            var partialSeedEmptyAnswer = BurstSelectionModel()
+            partialSeedEmptyAnswer.seedKnownGroup(for: current, knownItems: Array(complete.prefix(2)))
+            _ = partialSeedEmptyAnswer.beginLoadingIfCandidate(current)
+            partialSeedEmptyAnswer.applyLoadedGroup([], containing: current)
+            states.append(("partial seed, empty answer", partialSeedEmptyAnswer))
+
+            var partialSeedSingleAnswer = BurstSelectionModel()
+            partialSeedSingleAnswer.seedKnownGroup(for: current, knownItems: Array(complete.prefix(2)))
+            _ = partialSeedSingleAnswer.beginLoadingIfCandidate(current)
+            partialSeedSingleAnswer.applyLoadedGroup([current], containing: current)
+            states.append(("partial seed, single-photo answer", partialSeedSingleAnswer))
 
             var emptyLoad = BurstSelectionModel()
             _ = emptyLoad.beginLoadingIfCandidate(current)
@@ -204,7 +217,8 @@ final class BurstSelectionModelTests: XCTestCase {
                 // While the read is in flight the decision must not guess from the
                 // partly known state; the viewer waits instead.
                 XCTAssertEqual(result, .burstLoading, "state: \(name)")
-            } else if selection.loadFailed {
+            } else if selection.loadFailed || (selection.hasFilmstrip && !selection.isGroupConfirmed) {
+                // A failed read, or a partial filmstrip that no group read confirmed.
                 XCTAssertEqual(result, .burstReadFailed(failedSources: [current]), "state: \(name)")
             } else if selection.hasFilmstrip {
                 XCTAssertEqual(result, .success(items: selection.items, expandedSingleSeries: true), "state: \(name)")
@@ -276,6 +290,132 @@ final class BurstSelectionModelTests: XCTestCase {
         XCTAssertEqual(
             selection.viewerExportDecision(current: plain, page: plain, belongsToPage: false),
             .success(items: [plain], expandedSingleSeries: false))
+    }
+
+    func testGroupAnswerThatDoesNotConfirmAPartialSeedIsNeverAPartialExport() {
+        let members = ["a", "b", "c"]
+        let page = item("a", members: members)
+        let seed = [page, item("b", members: members)]
+        // The provider answers with no photo, or with one photo only.
+        for (name, answer) in [("empty answer", [PhotoItem]()), ("single-photo answer", [page])] {
+            var selection = BurstSelectionModel()
+            selection.seedKnownGroup(for: page, knownItems: seed)
+            XCTAssertTrue(selection.beginLoadingIfCandidate(page), name)
+            selection.applyLoadedGroup(answer, containing: page)
+
+            // The seed stays visible, but nothing confirms that it holds the whole burst.
+            XCTAssertTrue(selection.hasFilmstrip, name)
+            XCTAssertEqual(
+                selection.viewerExportDecision(current: page, page: page, belongsToPage: true),
+                .burstReadFailed(failedSources: [page]), name)
+        }
+    }
+
+    func testCompleteSeedStaysExportableWithoutAGroupRead() {
+        let members = ["a", "b", "c"]
+        let complete = members.map { item($0, members: members) }
+        var selection = BurstSelectionModel()
+        selection.seedKnownGroup(for: complete[0], knownItems: complete)
+        XCTAssertFalse(selection.beginLoadingIfCandidate(complete[0]))
+
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: complete[0], page: complete[0], belongsToPage: true),
+            .success(items: complete, expandedSingleSeries: true))
+    }
+
+    /// The photo declares three members, and the read answers with two frames: the third member is no
+    /// frame (for example the adjustment data of an edit), so the two frames are the whole series.
+    func testTwoFrameAnswerConfirmsTheSeriesWhenAThirdDeclaredMemberIsNoFrame() {
+        let page = item("a", members: ["a", "b", "c"])
+        let partialSeed = [page, item("b", members: ["a", "b", "c"])]
+        let answer = [page, item("b", members: ["a", "b", "c"])]
+        var selection = BurstSelectionModel()
+        selection.seedKnownGroup(for: page, knownItems: partialSeed)
+        XCTAssertTrue(selection.beginLoadingIfCandidate(page))
+        selection.applyLoadedGroup(answer, containing: page)
+
+        // The group read is the source of truth: two photos from the provider are the whole series.
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: page, page: page, belongsToPage: true),
+            .success(items: answer, expandedSingleSeries: true))
+    }
+
+    func testPartialSeedWithoutAGroupReadIsNeverAPartialExport() {
+        let members = ["a", "b", "c"]
+        let page = item("a", members: members)
+        var selection = BurstSelectionModel()
+        // No provider reads the group, so nothing confirms the two seeded photos.
+        selection.seedKnownGroup(for: page, knownItems: [page, item("b", members: members)])
+
+        XCTAssertTrue(selection.hasFilmstrip)
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: page, page: page, belongsToPage: true),
+            .burstReadFailed(failedSources: [page]))
+    }
+
+    func testGroupAnswerThatMissesTheDeclaredMembersIsAFailedRead() {
+        let page = item("a", members: ["a", "b", "c"])
+        for (name, answer) in [("empty answer", [PhotoItem]()), ("single-photo answer", [page])] {
+            var selection = BurstSelectionModel()
+            XCTAssertTrue(selection.beginLoadingIfCandidate(page), name)
+            selection.applyLoadedGroup(answer, containing: page)
+
+            XCTAssertTrue(selection.loadFailed, name)
+            XCTAssertEqual(
+                selection.viewerExportDecision(current: page, page: page, belongsToPage: true),
+                .burstReadFailed(failedSources: [page]), name)
+        }
+    }
+
+    func testOneFrameAnswerOfAPhotoWithANonFrameMemberIsOnePhoto() {
+        // The photo declares itself and the adjustment data of its edit; the read finds one frame.
+        let page = item("main", members: ["main", "edit-data"])
+        let loneFrame = item("main", members: ["main"])
+        var selection = BurstSelectionModel()
+        XCTAssertTrue(selection.beginLoadingIfCandidate(page))
+        selection.applyLoadedGroup([loneFrame], containing: page)
+
+        XCTAssertFalse(selection.loadFailed)
+        XCTAssertFalse(selection.hasFilmstrip, "one frame opens no filmstrip")
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: page, page: page, belongsToPage: true),
+            .success(items: [page], expandedSingleSeries: false))
+
+        // An empty answer for the same photo stays a failed read.
+        var empty = BurstSelectionModel()
+        XCTAssertTrue(empty.beginLoadingIfCandidate(page))
+        empty.applyLoadedGroup([], containing: page)
+        XCTAssertTrue(empty.loadFailed)
+    }
+
+    func testOneFrameAnswerOfAnotherPhotoIsAFailedRead() {
+        // The page declares three members, and the read answers with another photo as a lone frame.
+        let page = item("p", members: ["p", "q", "r"])
+        var selection = BurstSelectionModel()
+        XCTAssertTrue(selection.beginLoadingIfCandidate(page))
+        selection.applyLoadedGroup([item("x", members: ["x"])], containing: page)
+
+        XCTAssertTrue(selection.loadFailed)
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: page, page: page, belongsToPage: true),
+            .burstReadFailed(failedSources: [page]))
+    }
+
+    func testTagOnlyBurstWithASinglePhotoAnswerStaysASinglePhoto() {
+        // The photo carries the burst tag but declares no members, so one photo is its whole answer.
+        let tagged = PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "tagged"),
+            captureTime: Date(timeIntervalSince1970: 0),
+            mediaType: "image/jpeg",
+            tags: [.bursts])
+        var selection = BurstSelectionModel()
+        XCTAssertTrue(selection.beginLoadingIfCandidate(tagged))
+        selection.applyLoadedGroup([tagged], containing: tagged)
+
+        XCTAssertFalse(selection.loadFailed)
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: tagged, page: tagged, belongsToPage: true),
+            .success(items: [tagged], expandedSingleSeries: false))
     }
 
     func testPlainPhotoIsExportedAsItself() {

@@ -5,14 +5,16 @@ import Foundation
 ///
 /// The hosts pass their backend's burst-group lookup as a closure and present the returned
 /// result; they never interpret burst semantics themselves. A burst candidate whose group read
-/// throws is an export failure, not a silent single-photo export.
+/// throws, or answers without the members the photo declares, is an export failure, not a silent
+/// single-photo export.
 public enum BurstExportExpansion {
     /// The expansion outcome of one export request.
     public enum Result: Equatable, Sendable {
         /// The deduplicated items to export, and whether a single burst series was expanded
         /// (which names the ZIP after that series instead of the generic container).
         case success(items: [PhotoItem], expandedSingleSeries: Bool)
-        /// At least one burst candidate's group read threw; nothing must be exported.
+        /// At least one burst candidate's group read threw or answered without its declared
+        /// members; nothing must be exported.
         case burstReadFailed(failedSources: [PhotoItem])
         /// The viewer's knowledge about the shown burst is still being read; nothing
         /// must be exported yet, and no failure happened. The viewer waits for the read.
@@ -78,6 +80,8 @@ public enum BurstExportExpansion {
                 if group.count > 1 {
                     group.forEach(appendUnique)
                     expandedSingleSeries = true
+                } else if answerMissesDeclaredMembers(group, of: item) {
+                    failedSources.append(item)
                 } else {
                     appendUnique(item)
                 }
@@ -88,5 +92,20 @@ public enum BurstExportExpansion {
             return .burstReadFailed(failedSources: failedSources)
         }
         return .success(items: expanded, expandedSingleSeries: expandedSingleSeries)
+    }
+
+    /// True when a group read answered with fewer than two photos for a photo that declares two or
+    /// more members. The answer then contradicts the photo, so the read did not load the burst.
+    ///
+    /// One answer is not a contradiction: the photo itself, naming only itself as a frame
+    /// (`BurstGroupProvider`). Its other members are then related files that are no frames, such as
+    /// the adjustment data of an edit. A photo that only carries the burst tag declares no members
+    /// and keeps its single-photo export.
+    public static func answerMissesDeclaredMembers(_ group: [PhotoItem], of item: PhotoItem) -> Bool {
+        guard group.count < 2 else { return false }
+        if let lone = group.first, lone.uid == item.uid, lone.burstMemberIDs == [item.uid.nodeID] {
+            return false
+        }
+        return item.burstMemberIDs.count > 1
     }
 }

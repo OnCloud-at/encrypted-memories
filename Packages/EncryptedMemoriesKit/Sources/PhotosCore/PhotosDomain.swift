@@ -362,5 +362,11 @@ public extension FullMediaProvider {
 /// Optional metadata provider for Proton burst/series groups. The viewer calls this lazily only when
 /// an item is tagged/enriched as a burst candidate, so the main timeline path stays fast and SDK-agnostic.
 public protocol BurstGroupProvider: Sendable {
+    /// Reads the series of the photo `uid`.
+    ///
+    /// - Returns: every frame of the series in presentation order when it has two or more frames. When
+    ///   one frame is left after the related files that are no frames are dropped (such as the
+    ///   adjustment data of an edit), the photo alone, with `burstMemberIDs` that name only that frame.
+    ///   An empty list when the read knows no series for the photo.
     func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem]
 }

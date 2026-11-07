@@ -190,6 +190,91 @@ final class BurstFilmstripArchitectureTests: XCTestCase {
     }
 
     @MainActor
+    func testViewerDownloadOfAPartlySeededBurstReadsAgainWhenTheGroupAnswerIsIncomplete() async {
+        let members = ["a", "b", "c"]
+        let complete = members.map { makeItem($0, burstMembers: members) }
+        // The page holds two of the three members; the provider answers with no photo, or with
+        // the page photo only.
+        for (name, answer) in [("empty answer", [PhotoItem]()), ("single-photo answer", [complete[0]])] {
+            let model = PhotoViewerModel(
+                items: Array(complete.prefix(2)),
+                index: 0,
+                feed: ThumbnailFeed(
+                    cache: ThumbnailCache(
+                        namespace: "burst-unconfirmed-download-\(UUID().uuidString)",
+                        rootDirectory: Self.cacheRoot("burst-unconfirmed-download")),
+                    loader: EmptyThumbnailLoader()
+                ),
+                media: FailingMediaProvider(),
+                burstProvider: StaticBurstProvider(items: answer)
+            )
+            model.start()
+            defer { model.stop() }
+            XCTAssertTrue(model.isLoadingBurst, "opening a partly seeded burst starts its read: \(name)")
+            for _ in 0..<200 where model.isLoadingBurst {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertFalse(model.isLoadingBurst, name)
+            XCTAssertEqual(model.burstItems.count, 2, "the seed stays visible: \(name)")
+
+            // Download hands the page photo, never the two seeded photos, to the export route.
+            XCTAssertTrue(model.canDownloadCurrentSelection, name)
+            XCTAssertEqual(model.exportItemsForDownload, [complete[0]], name)
+
+            // The same incomplete answer on the export route is a failed read, not one photo.
+            let incompleteAgain = await BurstExportExpansion.expand(
+                sourceItems: model.exportItemsForDownload,
+                preferredSeriesNameSource: model.baseCurrent,
+                burstGroupReader: { _ in answer }
+            )
+            XCTAssertEqual(incompleteAgain, .burstReadFailed(failedSources: [complete[0]]), name)
+
+            // The export route reads the group again and saves the whole burst once it is known.
+            let recovered = await BurstExportExpansion.expand(
+                sourceItems: model.exportItemsForDownload,
+                preferredSeriesNameSource: model.baseCurrent,
+                burstGroupReader: { _ in complete }
+            )
+            XCTAssertEqual(recovered, .success(items: complete, expandedSingleSeries: true), name)
+        }
+    }
+
+    @MainActor
+    func testViewerOfAPhotoWhoseOnlyOtherMemberIsNoFrameDownloadsThePhoto() async {
+        // The photo declares itself and the adjustment data of its edit; the read finds one frame.
+        let page = makeItem("main", burstMembers: ["main", "edit-data"])
+        let loneFrame = makeItem("main", burstMembers: ["main"])
+        let model = PhotoViewerModel(
+            items: [page],
+            index: 0,
+            feed: ThumbnailFeed(
+                cache: ThumbnailCache(
+                    namespace: "burst-lone-frame-\(UUID().uuidString)",
+                    rootDirectory: Self.cacheRoot("burst-lone-frame")),
+                loader: EmptyThumbnailLoader()
+            ),
+            media: FailingMediaProvider(),
+            burstProvider: StaticBurstProvider(items: [loneFrame])
+        )
+        model.start()
+        defer { model.stop() }
+        for _ in 0..<200 where model.isLoadingBurst {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(model.isLoadingBurst)
+        XCTAssertTrue(model.burstItems.isEmpty, "one frame shows no filmstrip")
+        XCTAssertTrue(model.canDownloadCurrentSelection)
+        XCTAssertEqual(model.exportItemsForDownload, [page])
+
+        let exported = await BurstExportExpansion.expand(
+            sourceItems: model.exportItemsForDownload,
+            preferredSeriesNameSource: model.baseCurrent,
+            burstGroupReader: { _ in [loneFrame] }
+        )
+        XCTAssertEqual(exported, .success(items: [page], expandedSingleSeries: false))
+    }
+
+    @MainActor
     func testViewerDownloadWaitsWhileTheBurstReadIsInFlight() async {
         let members = ["a", "b", "c"]
         let pages = members.prefix(2).map { makeItem($0, burstMembers: members) }
