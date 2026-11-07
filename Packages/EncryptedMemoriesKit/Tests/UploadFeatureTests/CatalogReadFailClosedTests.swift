@@ -431,6 +431,145 @@ final class CatalogReadFailClosedTests: XCTestCase {
         XCTAssertEqual(try store.entry(for: "a")?.isRemoved, false)
         XCTAssertEqual(try store.entry(for: "b")?.isRemoved, false)
     }
+
+    // MARK: - An undecodable catalog row is its own unknown, not the page's (#1160)
+
+    /// One payload-undecodable row stops neither the store nor the later pages of the same pass.
+    func testAnUndecodableCatalogRowStopsNeitherTheStoreNorItsLaterPages() throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch(["a", "broken", "c"].map { entry(photo($0)) }))
+        try corrupt("broken", in: store)
+
+        _ = store.presentEntries(afterLocalIdentifier: nil, limit: 10)
+        XCTAssertTrue(store.isOperational(), "an undecodable row is its own unknown, not a store failure")
+        XCTAssertEqual(
+            store.presentEntries(afterLocalIdentifier: "a", limit: 10)?.entries.map(\.localIdentifier), ["c"])
+    }
+
+    /// The late-render pass queues every row past an undecodable one, and keeps its one-time flag
+    /// withheld so the next pass tries the unknown row again.
+    func testLateRenderReconciliationReachesRowsPastAnUndecodableOneAndWithholdsItsFlag() async throws {
+        let store = try makeCatalog()
+        let infos = ["a", "b", "c"].map { edit($0) } + [photo("d")]
+        XCTAssertTrue(store.upsertBatch(infos.map { entry($0) }))
+        try corrupt("b", in: store)
+        let engine = Enqueuer()
+        let counted = PhotoDiagnostics.shared.counter("backup.lateRenders.undecodableRow")
+
+        try await sync(store, infos: [], chunkSize: 1).reconcileLateRendersOnce(engine: engine)
+
+        XCTAssertEqual(engine.reopened, ["a", "c"], "the pass reaches rows past the undecodable one")
+        XCTAssertEqual(
+            PhotoDiagnostics.shared.counter("backup.lateRenders.undecodableRow"), counted + 1,
+            "the pass counts the undecodable row once")
+        XCTAssertFalse(store.hasReconciledLateRenders(), "the flag stays withheld while a row is unknown")
+        XCTAssertTrue(store.isOperational())
+        XCTAssertEqual(
+            store.lateRenderSweepResumePoint(), "a", "the checkpoint stays before the first unknown page")
+    }
+
+    /// The missing-source sweep recovers every row past an undecodable one, and stays owed so the
+    /// next sweep tries the unknown row again.
+    func testMissingSourceSweepReachesRowsPastAnUndecodableOneAndStaysOwed() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch(["a", "broken", "c"].map { entry(photo($0)) }))
+        try corrupt("broken", in: store)
+        let engine = Enqueuer()
+        let counted = PhotoDiagnostics.shared.counter("backup.missingSources.undecodableRow")
+
+        try await sync(store, infos: [], chunkSize: 1).reconcileMissingSources(engine: engine)
+
+        XCTAssertEqual(engine.recovered, ["a", "c"], "the sweep reaches rows past the undecodable one")
+        XCTAssertEqual(
+            PhotoDiagnostics.shared.counter("backup.missingSources.undecodableRow"), counted + 1,
+            "the sweep counts the undecodable row once")
+        XCTAssertNil(
+            store.reconciledMissingSourceGeneration(), "the sweep stays owed while a row is unknown")
+        XCTAssertTrue(store.isOperational())
+        XCTAssertEqual(
+            store.missingSourceSweepProgress()?.afterLocalIdentifier, "a",
+            "the checkpoint stays before the first unknown page")
+    }
+
+    /// The catalog replay queues every row past an undecodable one, keeps its marker in progress so
+    /// the next launch tries the unknown row again, and a later converging run writes no duplicates.
+    func testCatalogReplayReachesRowsPastAnUndecodableOneAndStaysInProgress() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch(["a", "broken", "c"].map { entry(photo($0)) }))
+        try corrupt("broken", in: store)
+        let (queue, engine) = try await makeReplayQueue()
+        let counted = PhotoDiagnostics.shared.counter("backup.catalogReplay.undecodableRow")
+
+        try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
+            catalogStore: store, queueStore: queue, engine: engine)
+
+        XCTAssertEqual(queue.count(), 2, "the replay queues the rows around the undecodable one")
+        XCTAssertEqual(
+            PhotoDiagnostics.shared.counter("backup.catalogReplay.undecodableRow"), counted + 1,
+            "the replay counts the undecodable row once")
+        XCTAssertEqual(queue.catalogReplayState(), .inProgress, "the marker stays unfinished")
+        XCTAssertTrue(store.isOperational())
+
+        try corrupt("broken", in: store, repair: true)
+        try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
+            catalogStore: store, queueStore: queue, engine: engine)
+        XCTAssertEqual(queue.count(), 3)
+        XCTAssertEqual(queue.catalogReplayState(), .completed)
+        try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
+            catalogStore: store, queueStore: queue, engine: engine)
+        XCTAssertEqual(queue.count(), 3, "a converged replay writes no duplicate queue rows")
+    }
+
+    /// A clean page after the page with the undecodable row does not let the replay record itself completed.
+    func testCatalogReplayStaysInProgressWhenCleanPagesFollowTheUndecodableRow() async throws {
+        let store = try makeCatalog()
+        let ids = (0...500).map { String(format: "p%04d", $0) }
+        XCTAssertTrue(store.upsertBatch(ids.map { entry(photo($0)) }))
+        try corrupt("p0001", in: store)
+        let (queue, engine) = try await makeReplayQueue()
+
+        try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
+            catalogStore: store, queueStore: queue, engine: engine)
+
+        XCTAssertEqual(queue.count(), 500, "the replay queues every row on both pages but the undecodable one")
+        XCTAssertEqual(queue.catalogReplayState(), .inProgress, "the clean second page does not finish the replay")
+    }
+
+    /// A discard after the sweep saved its progress can drop photos on earlier pages. While a row stays
+    /// unknown, the sweep then starts again on the first page for the new generation.
+    func testMissingSourceSweepStartsAgainForANewGenerationWhileARowStaysUnknown() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch(["a", "broken", "c"].map { entry(photo($0)) }))
+        try corrupt("broken", in: store)
+        let engine = Enqueuer()
+        try await sync(store, infos: [], chunkSize: 1).reconcileMissingSources(engine: engine)
+        XCTAssertEqual(store.missingSourceSweepProgress()?.afterLocalIdentifier, "a")
+
+        engine.discardGeneration = Enqueuer.generation + 1
+        try await sync(store, infos: [], chunkSize: 1).reconcileMissingSources(engine: engine)
+        XCTAssertEqual(
+            store.missingSourceSweepProgress(),
+            PhotoLibraryMissingSourceSweepProgress(generation: Enqueuer.generation + 1),
+            "the next sweep starts on the first page for the new generation")
+
+        try await sync(store, infos: [], chunkSize: 1).reconcileMissingSources(engine: engine)
+        XCTAssertEqual(
+            engine.recovered, ["a", "c", "c", "a", "c"],
+            "the new generation checks the page before the saved progress again")
+        XCTAssertNil(store.reconciledMissingSourceGeneration(), "the sweep stays owed while a row is unknown")
+    }
+
+    private func makeReplayQueue() async throws -> (UploadBackupSyncQueueManifestStore, UploadBackupSyncEngine) {
+        let queueURL = directory.appendingPathComponent(
+            await PhotoLibraryBackupController.queueDatabaseFileName)
+        let stateURL = directory.appendingPathComponent(
+            await PhotoLibraryBackupController.stateDatabaseFileName)
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
+        closers.append { queue.close() }
+        let state = try XCTUnwrap(UploadBackupStateManifestStore(url: stateURL))
+        closers.append { state.close() }
+        return (queue, UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue))
+    }
 }
 
 // MARK: - Fixtures
@@ -547,6 +686,11 @@ private final class Enqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendab
     private var _enqueued: [String] = []
     private var _reopened: [String] = []
     private var _recovered: [String] = []
+    private var _discardGeneration = Enqueuer.generation
+    var discardGeneration: Int64 {
+        get { lock.withLock { _discardGeneration } }
+        set { lock.withLock { _discardGeneration = newValue } }
+    }
     var enqueued: [String] { lock.withLock { _enqueued } }
     var reopened: [String] { lock.withLock { _reopened } }
     var recovered: [String] { lock.withLock { _recovered } }
@@ -567,6 +711,6 @@ private final class Enqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendab
         lock.withLock { _recovered += candidates.map(\.snapshot.source.identifier) }
     }
 
-    func missingSourceDiscardGeneration() async throws -> Int64 { Self.generation }
+    func missingSourceDiscardGeneration() async throws -> Int64 { discardGeneration }
     func synchronizeQueueToDisk() async -> Bool { true }
 }

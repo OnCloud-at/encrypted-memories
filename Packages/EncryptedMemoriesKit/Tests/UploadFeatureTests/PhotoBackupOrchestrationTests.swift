@@ -672,9 +672,9 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             var after: String?
             while true {
                 let page = try XCTUnwrap(survivingCatalog.presentEntries(afterLocalIdentifier: after, limit: 500))
-                guard let last = page.last else { break }
-                identifiers.formUnion(page.map(\.localIdentifier))
-                after = last.localIdentifier
+                guard let last = page.lastLocalIdentifier else { break }
+                identifiers.formUnion(page.entries.map(\.localIdentifier))
+                after = last
             }
             largestCatalog = max(largestCatalog, identifiers.count)
             let withoutQueueRow = try identifiers.filter {

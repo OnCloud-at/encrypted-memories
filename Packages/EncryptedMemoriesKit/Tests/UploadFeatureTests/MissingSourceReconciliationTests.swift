@@ -1861,11 +1861,11 @@ final class MissingSourceReconciliationTests: XCTestCase {
         var maximumPageSize: Int { lock.withLock { metrics.maximum } }
         var usedMainThread: Bool { lock.withLock { metrics.main } }
         init(inner: PhotoLibraryCatalogManifestStore) { self.inner = inner }
-        func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry]? {
+        func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage? {
             let page = inner.presentEntries(afterLocalIdentifier: afterLocalIdentifier, limit: limit)
             lock.withLock {
                 metrics.pages += 1
-                if let page { metrics.maximum = max(metrics.maximum, page.count) }
+                if let page { metrics.maximum = max(metrics.maximum, page.entries.count) }
                 metrics.main = metrics.main || Thread.isMainThread
             }
             return page

@@ -1591,25 +1591,28 @@ public final class PhotoLibraryBackupController {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
 
-        var cursor: String?
+        var progress = PhotoLibraryCatalogPassProgress()
         while true {
             try Task.checkCancellation()
-            guard let entries = catalogStore.presentEntries(afterLocalIdentifier: cursor, limit: 500),
+            guard let page = catalogStore.presentEntries(afterLocalIdentifier: progress.cursor, limit: 500),
                 catalogStore.isOperational()
             else {
                 throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
             }
-            guard !entries.isEmpty else {
+            guard case .advanced = progress.advance(past: page) else {
+                // While a row is unknown, the replay stays in progress and retries the row on the next event (#1160).
+                guard progress.mayComplete(countingUnknownRowsAs: "backup.catalogReplay.undecodableRow") else {
+                    return
+                }
                 guard queueStore.setCatalogReplayState(.completed) else {
                     throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
                 }
                 return
             }
-            let candidates = entries.compactMap {
+            let candidates = page.entries.compactMap {
                 PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
             }
             _ = try await engine.enqueueBatch(candidates)
-            cursor = entries.last?.localIdentifier
         }
     }
 

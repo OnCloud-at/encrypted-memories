@@ -110,7 +110,9 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     /// Stable keyset page of present inventory rows. Returns nil when the page could not be read; nil means
     /// the result is unknown, not an empty page. A caller must not treat nil as the end of the catalog (#1004).
-    public func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry]? {
+    /// A row whose content could not be decoded is unknown for that row only: its readable identifier is
+    /// collected and the page keeps stepping (#1160).
+    public func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage? {
         let clampedLimit = max(1, limit)
         // The primary-key range keeps pages bounded; the removal index would sort the remaining library per page.
         let frontier = afterLocalIdentifier == nil ? "" : " AND local_id>?"
@@ -138,18 +140,25 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 requireBound(
                     sqlite3_bind_int(stmt, afterLocalIdentifier == nil ? 1 : 2, Int32(clamping: clampedLimit)))
             else { return nil }
-            var entries: [PhotoLibraryCatalogEntry] = []
+            var page = PhotoLibraryCatalogPage()
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
                 guard let entry = decodeEntry(stmt, localIdentifierColumn: 0, valueOffset: 1) else {
-                    connection.markFailed()
-                    return nil
+                    // A readable key whose row content could not decode is unknown for that row only (#1160);
+                    // an unreadable key column means deeper damage, and the page itself stays unknown.
+                    guard let undecodableIdentifier = exactKeyText(stmt, 0) else {
+                        connection.markFailed()
+                        return nil
+                    }
+                    page.undecodableIdentifiers.append(undecodableIdentifier)
+                    stepResult = sqlite3_step(stmt)
+                    continue
                 }
-                entries.append(entry)
+                page.entries.append(entry)
                 stepResult = sqlite3_step(stmt)
             }
             guard requireOperational(stepResult == SQLITE_DONE) else { return nil }
-            return entries
+            return page
         }
     }
 
@@ -790,7 +799,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         let result = sqlite3_step(stmt)
         if result == SQLITE_DONE { return nil }
         guard requireOperational(result == SQLITE_ROW) else { throw SQLiteStoreUnknownReadError() }
-        // `decodeEntry` records the lasting failure of an undecodable row; the row is unknown, not absent.
+        // An undecodable row is unknown, not absent; the strict read still throws instead of proving absence (#1160).
         guard let entry = decodeEntry(stmt, localIdentifier: localIdentifier, valueOffset: 0) else {
             throw SQLiteStoreUnknownReadError()
         }
@@ -813,7 +822,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             let mediaKindRaw = columnText(stmt, valueOffset + 6),
             let mediaKind = PhotoLibraryCatalogMediaKind(rawValue: mediaKindRaw)
         else {
-            connection.markFailed()
+            // Undecodable content is a condition of this row, not of the store: the caller reports the
+            // row as unknown for its identifier, and the connection stays operational (#1160).
             return nil
         }
         return PhotoLibraryCatalogEntry(
@@ -1055,6 +1065,17 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             return nil
         }
         return String(cString: text)
+    }
+
+    /// The key column as its exact stored text, or nil when it is NULL, not valid UTF-8, or holds a NUL byte. Such a
+    /// key cannot be bound back unchanged as a page cursor, so a pass could never move past it (#1160).
+    private func exactKeyText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
+        guard sqlite3_column_type(stmt, index) != SQLITE_NULL, let text = sqlite3_column_text(stmt, index) else {
+            return nil
+        }
+        let bytes = UnsafeBufferPointer(start: text, count: Int(sqlite3_column_bytes(stmt, index)))
+        guard !bytes.contains(0) else { return nil }
+        return String(validating: bytes, as: UTF8.self)
     }
 
     private func columnDate(_ stmt: OpaquePointer?, _ index: Int32) -> Date? {

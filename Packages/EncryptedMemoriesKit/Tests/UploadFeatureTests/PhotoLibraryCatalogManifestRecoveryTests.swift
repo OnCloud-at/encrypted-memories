@@ -96,7 +96,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
     func testLegacyPageReadsHealthyRowsAfterAnUnrelatedDecodeFailure() throws {
         try assertLegacyCatalogRead {
             XCTAssertEqual(
-                $0.presentEntries(afterLocalIdentifier: "broken", limit: 10)?.map(\.localIdentifier), ["known"])
+                $0.presentEntries(afterLocalIdentifier: "broken", limit: 10)?.entries.map(\.localIdentifier), ["known"])
         }
     }
 
@@ -118,7 +118,11 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         }
         XCTAssertThrowsError(try store!.entry(for: "broken"), "An undecodable row is unknown, not absent")
         XCTAssertNotNil(try store!.entry(for: "known"), "The requested row remains readable")
-        XCTAssertFalse(store!.isOperational(), "The unrelated decode failure remains sticky")
+        XCTAssertTrue(store!.isOperational(), "An undecodable row no longer poisons the store")
+        try read(store!)
+        // Legacy readers keep answering their own successful SQL after a lasting failure, too.
+        try withDeniedSQLiteSelect(in: store!) { XCTAssertNil(store!.count(), "the denied read fails") }
+        XCTAssertFalse(store!.isOperational(), "The lasting failure remains sticky")
         try read(store!)
         connection.withLock {
             XCTAssertEqual(sqlite3_exec(connection.database, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
@@ -195,7 +199,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         }
     }
 
-    func testUndecodableCatalogRowsNeverCompleteAPage() throws {
+    func testUndecodableCatalogRowsAreTheirOwnUnknownsAndLeaveTheStoreOperational() throws {
         for paged in [false, true] {
             store = try makeStore(file: "decode-\(paged).sqlite")
             XCTAssertTrue(store!.upsertBatch([entry("known")]))
@@ -205,11 +209,17 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
                 image[range.lowerBound] = UInt8(ascii: "!")
             }
             if paged {
-                XCTAssertNil(store!.presentEntries(afterLocalIdentifier: nil, limit: 10))
+                let page = try XCTUnwrap(store!.presentEntries(afterLocalIdentifier: nil, limit: 10))
+                XCTAssertEqual(
+                    page.undecodableIdentifiers, ["known"],
+                    "the undecodable row reports itself, not the page")
+                XCTAssertTrue(page.entries.isEmpty, "no undecodable row masquerades as decoded")
             } else {
-                XCTAssertNil(store!.presentEntries(for: ["known"]))
+                XCTAssertNil(
+                    store!.presentEntries(for: ["known"]),
+                    "an unknown requested row keeps the whole answer unknown")
             }
-            XCTAssertFalse(store!.isOperational())
+            XCTAssertTrue(store!.isOperational(), "an undecodable row is its own unknown, not a store failure")
             store!.close()
         }
     }
@@ -322,7 +332,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertEqual(store!.snapshot()?.total, 0, "The successful legacy read confirms the rollback")
         XCTAssertEqual(store!.count(), 0)
         XCTAssertEqual(store!.presentEntries(for: [entry.localIdentifier])?.count, 0)
-        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.count, 0)
+        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.entries.count, 0)
         XCTAssertTrue(store!.upsertBatch([self.entry("later")]), "later calls answer on their own")
     }
 
@@ -339,8 +349,8 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertEqual(store!.snapshot()?.total, 1, "The legacy snapshot read still answers")
         XCTAssertEqual(store!.count(), 1, "The legacy count read still answers")
         XCTAssertEqual(store!.presentEntries(for: [entry.localIdentifier])?.keys.sorted(), [entry.localIdentifier])
-        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.count, 1)
-        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: entry.localIdentifier, limit: 10)?.count, 0)
+        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.entries.count, 1)
+        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: entry.localIdentifier, limit: 10)?.entries.count, 0)
         XCTAssertFalse(store!.isOperational(), "the open transaction keeps the store stopped")
 
         connection.withLock {
@@ -352,7 +362,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
             store!.presentEntries(for: [entry.localIdentifier])?.keys.sorted(), [entry.localIdentifier],
             "the presence read answers again")
         XCTAssertEqual(
-            store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.map(\.localIdentifier),
+            store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.entries.map(\.localIdentifier),
             [entry.localIdentifier],
             "the paged read answers again")
         XCTAssertTrue(store!.isOperational())
@@ -380,7 +390,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
         XCTAssertFalse(store!.isOperational(), "a lasting failure stays recorded")
         XCTAssertEqual(store!.presentEntries(for: [entry.localIdentifier])?.keys.sorted(), [entry.localIdentifier])
         XCTAssertEqual(store!.count(), 2, "The legacy count still answers its own successful SQL")
-        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.count, 2)
+        XCTAssertEqual(store!.presentEntries(afterLocalIdentifier: nil, limit: 10)?.entries.count, 2)
         XCTAssertTrue(store!.upsertBatch([self.entry("after-denial")]), "later calls answer on their own")
         XCTAssertEqual(store!.presentEntries(for: ["after-denial"])?.keys.sorted(), ["after-denial"])
 
