@@ -60,7 +60,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertLessThanOrEqual(progress.frame.width, 320)
         XCTAssertTrue(
             app.staticTexts.matching(NSPredicate(format: "label CONTAINS '1,234 of 15,000 photos'"))
-                .firstMatch.exists
+                .firstMatch.waitForExistence(timeout: 10)
                 || (progress.value as? String)?.contains("1,234 of 15,000 photos") == true,
             "the progress counts the checked photos")
         XCTAssertFalse(app.staticTexts["No Duplicates"].exists)
@@ -123,12 +123,12 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(retry.waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].waitForExistence(timeout: 10))
         XCTAssertFalse(group(0).exists, "invalidated rows stay hidden")
-        XCTAssertFalse(app.buttons["duplicates.mergeAll"].isEnabled)
+        waitUntil(app.buttons["duplicates.mergeAll"], "isEnabled == false", "Merge All stays off")
         keepScreenshot("duplicates-ios-reload-failed")
 
         retry.tap()
         XCTAssertTrue(group(1).waitForExistence(timeout: 10), "Retry restores the checked list")
-        XCTAssertTrue(app.buttons["duplicates.mergeAll"].isEnabled)
+        waitUntil(app.buttons["duplicates.mergeAll"], "isEnabled == true", "Retry turns Merge All on again")
         XCTAssertFalse(retry.exists)
         XCTAssertTrue(app.staticTexts["4 identical copies"].waitForExistence(timeout: 10))
     }
@@ -158,7 +158,8 @@ final class MobileDuplicatesUITests: XCTestCase {
             let confirmation = app.alerts.firstMatch
             XCTAssertTrue(confirmation.waitForExistence(timeout: 10))
             let confirm = confirmation.buttons["duplicates.mergeAll.dialog"].firstMatch
-            XCTAssertTrue(confirm.isHittable)
+            XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+            waitUntil(confirm, "isHittable == true", "the alert is ready for a tap")
             confirm.tap()
             let title =
                 language == "de"
@@ -192,7 +193,8 @@ final class MobileDuplicatesUITests: XCTestCase {
         let confirmation = app.alerts.firstMatch
         XCTAssertTrue(confirmation.waitForExistence(timeout: 10))
         let confirm = confirmation.buttons["duplicates.mergeAll.dialog"].firstMatch
-        XCTAssertTrue(confirm.isHittable)
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+        waitUntil(confirm, "isHittable == true", "the alert is ready for a tap")
         confirm.tap()
         let warning = app.alerts["Some duplicates were not merged"]
         XCTAssertTrue(warning.waitForExistence(timeout: 15))
@@ -214,7 +216,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         merge.tap()
 
         waitUntilGone(group(1), "the merged group leaves the list")
-        XCTAssertTrue(group(0).exists, "the other group stays")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the other group stays")
     }
 
     func testTheInitialCheckHidesCandidatesAndDisablesMergeAll() {
@@ -308,8 +310,8 @@ final class MobileDuplicatesUITests: XCTestCase {
             XCTAssertTrue(confirm.exists)
             XCTAssertEqual(confirm.label, language == "de" ? "Zusammenführen" : "Merge")
             XCTAssertTrue(confirm.isEnabled)
-            XCTAssertTrue(confirm.isHittable)
-            XCTAssertTrue(cancel.isHittable)
+            waitUntil(confirm, "isHittable == true", "the Merge action is ready for a tap")
+            waitUntil(cancel, "isHittable == true", "the Cancel action is ready for a tap")
             // SwiftUI exposes the Merge action and its same-frame child as two accessibility buttons.
             let visibleActions = Set(
                 alert.buttons.allElementsBoundByIndex.map { "\($0.label)|\($0.frame)" })
@@ -423,7 +425,8 @@ final class MobileDuplicatesUITests: XCTestCase {
         let ranked = member(0, 0)
         let other = member(0, 1)
         XCTAssertTrue(other.waitForExistence(timeout: 5))
-        XCTAssertTrue(ranked.isSelected, "the ranked photo is kept first")
+        XCTAssertTrue(ranked.waitForExistence(timeout: 10))
+        waitUntil(ranked, "isSelected == true", "the ranked photo is kept first")
         XCTAssertFalse(other.isSelected)
         XCTAssertTrue(other.label.hasPrefix("Copy 2 of 2"), "each copy says its position, got \(other.label)")
 
@@ -431,6 +434,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         let keep = app.buttons["duplicates.viewer.keep"]
         XCTAssertTrue(keep.waitForExistence(timeout: 10), "a tap opens the photo with the merge tools")
+        waitUntil(keep, "label == 'Keep This Copy'", "the Keep button names its action")
         XCTAssertEqual(keep.label, "Keep This Copy")
         for action in ["Favorite", "Info"] {
             XCTAssertTrue(
@@ -444,6 +448,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(other.waitForExistence(timeout: 10))
         waitUntil(other, "isSelected == true", "the list keeps the photo chosen in the viewer")
         XCTAssertFalse(ranked.isSelected)
+        waitUntil(other, "label CONTAINS ', kept'", "the kept copy says so")
         XCTAssertTrue(other.label.contains(", kept"), "the kept copy says so, got \(other.label)")
     }
 
@@ -459,7 +464,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         waitUntilGone(merge, "the viewer closes")
         waitUntilGone(group(1), "the merged group leaves the list")
-        XCTAssertTrue(group(0).exists, "the other group stays")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the other group stays")
     }
 
     func testSwipingDownClosesTheViewerOfAGroupLikeTheLibraryViewer() {
@@ -552,6 +557,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         let copy = member(1, 0)
         XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        XCTAssertTrue(member(1, 1).waitForExistence(timeout: 10))
         XCTAssertTrue(isOnScreen(member(1, 1)), "both copies fit")
         let copyX = copy.frame.minX
         dragLeft(group(1))
