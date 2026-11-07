@@ -1507,6 +1507,23 @@
         }
       }
     },
+    "viewer.share_burst_load_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos der Serie konnten nicht zum Teilen geladen werden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The burst photos couldn’t be loaded for sharing."
+          }
+        }
+      }
+    },
     "viewer.share_failed": {
       "extractionState": "manual",
       "localizations": {

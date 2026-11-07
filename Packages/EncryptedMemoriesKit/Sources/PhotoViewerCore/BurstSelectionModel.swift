@@ -36,8 +36,31 @@ public struct BurstSelectionModel: Equatable, Sendable {
         return items[selectedIndex]
     }
 
-    public func exportItems(current: PhotoItem) -> [PhotoItem] {
-        hasFilmstrip ? items : [current]
+    /// Decides what a viewer export or share of the shown page carries. Every platform viewer asks
+    /// this one rule, so a burst leaves the viewer only when all its photos are known.
+    ///
+    /// - Parameters:
+    ///   - current: the photo the page shows (a filmstrip member or the original of an edit).
+    ///   - page: the page's own photo, which owns the burst read.
+    ///   - belongsToPage: false while this model still holds another page's state, for example
+    ///     right after a swipe and before the new page's read has started.
+    /// - Returns: `.burstLoading` while the burst of the page is not known yet,
+    ///   `.burstReadFailed` with the page photo after its read failed (an export can read the
+    ///   whole group again from it), otherwise `.success` with the loaded series or the photo.
+    public func viewerExportDecision(
+        current: PhotoItem,
+        page: PhotoItem,
+        belongsToPage: Bool
+    ) -> BurstExportExpansion.Result {
+        guard belongsToPage else {
+            return page.isBurstCandidate ? .burstLoading : .success(items: [current], expandedSingleSeries: false)
+        }
+        if isLoading { return .burstLoading }
+        // A filmstrip whose group read failed is partial knowledge: its items would silently
+        // carry only part of the series.
+        if loadFailed { return .burstReadFailed(failedSources: [page]) }
+        if hasFilmstrip { return .success(items: items, expandedSingleSeries: true) }
+        return .success(items: [current], expandedSingleSeries: false)
     }
 
     public func gridReturnCandidates(current: PhotoItem, base: PhotoItem) -> [PhotoItem] {

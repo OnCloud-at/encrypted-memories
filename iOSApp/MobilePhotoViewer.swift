@@ -48,6 +48,7 @@ struct MobilePhotoViewer: View {
     #if DEBUG
         @Environment(\.mobileViewerIsDividedForTesting) private var dividedArrangementForTesting
         @Environment(\.mobileViewerTransportChromeForTesting) private var transportChromeForTesting
+        @Environment(\.mobileViewerShareProbeForTesting) private var shareProbeForTesting
     #endif
     @State private var burstSelection = BurstSelectionModel()
     @State private var editedOriginal = EditedPhotoOriginalState()
@@ -614,7 +615,7 @@ struct MobilePhotoViewer: View {
                 Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
             }
         }
-        .disabled(currentBaseItem == nil || selection.isBusy)
+        .disabled(currentBaseItem == nil || selection.isBusy || shareDecision == .burstLoading)
         .accessibilityLabel(String(localized: "viewer.share_action"))
     }
 
@@ -712,7 +713,7 @@ struct MobilePhotoViewer: View {
         } label: {
             Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
         }
-        .disabled(currentBaseItem == nil || selection.isBusy)
+        .disabled(currentBaseItem == nil || selection.isBusy || shareDecision == .burstLoading)
 
         if let base = currentBaseItem, editedOriginal.canShowOriginal(of: base.uid) {
             let showing = editedOriginal.isShowingOriginal(of: base.uid)
@@ -845,31 +846,37 @@ struct MobilePhotoViewer: View {
         }
     }
 
-    /// Shares what the page shows: the original of an edited photo while it is shown.
+    /// What Share carries for the shown page, from the shared viewer rule: the original of an
+    /// edited photo while it is shown, the whole loaded series, or nothing yet.
+    private var shareDecision: BurstExportExpansion.Result? {
+        guard let base = currentBaseItem else { return nil }
+        return burstSelection.viewerExportDecision(
+            current: editedOriginal.displayed(base), page: base, belongsToPage: burstBelongsToCurrentPage)
+    }
+
     private func shareCurrentItem() {
-        guard let base = currentBaseItem, libraryModel.backend != nil else { return }
-        let item = editedOriginal.displayed(base)
-        let result: BurstExportExpansion.Result
-        if burstBelongsToCurrentPage {
-            result = BurstExportExpansion.expandViewerBurst(
-                current: item,
-                filmstripItems: burstSelection.items,
-                filmstripLoadFailed: burstSelection.loadFailed
-            )
-        } else {
-            // A burst that does not belong to the current page shares the single photo.
-            result = .success(items: [item], expandedSingleSeries: false)
-        }
+        guard libraryModel.backend != nil, let result = shareDecision else { return }
         switch result {
         case .success(let items, _):
-            selection.startShare(
-                items: items, backend: libraryModel.viewerMedia,
-                failureMessage: String(localized: "viewer.share_failed")
-            )
+            let failureMessage = String(localized: "viewer.share_failed")
+            #if DEBUG
+                shareProbeForTesting?.record(
+                    .shared(nodeIDs: items.map(\.uid.nodeID), failureMessage: failureMessage))
+            #endif
+            selection.startShare(items: items, backend: libraryModel.viewerMedia, failureMessage: failureMessage)
         case .burstReadFailed:
             // Nothing leaves the app for a burst the viewer could not read completely.
-            selection.actionError = MobileSelectionError(
-                message: String(localized: "viewer.share_failed"))
+            let message = String(localized: "viewer.share_burst_load_failed")
+            #if DEBUG
+                shareProbeForTesting?.record(.burstReadFailed(message: message))
+            #endif
+            selection.actionError = MobileSelectionError(message: message)
+        case .burstLoading:
+            // The filmstrip has not settled yet; the Share control is dimmed while this
+            // window lasts, so a share that still arrives is refused without an alert.
+            #if DEBUG
+                shareProbeForTesting?.record(.burstUnsettled)
+            #endif
         case .cancelled:
             break
         }

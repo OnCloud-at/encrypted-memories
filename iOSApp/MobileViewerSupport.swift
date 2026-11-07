@@ -62,6 +62,25 @@ struct MobileLivePhotoMotionTaskID: Equatable {
         static let defaultValue: Bool? = nil
     }
 
+    private struct MobileViewerShareProbeTestKey: EnvironmentKey {
+        static let defaultValue: MobileViewerShareDecisionProbe? = nil
+    }
+
+    /// Records the viewer's share decisions so hosted tests can observe them without reaching
+    /// into the private selection controller. Production builds inject nothing and record nothing.
+    @MainActor
+    final class MobileViewerShareDecisionProbe {
+        enum Event: Equatable {
+            case shared(nodeIDs: [String], failureMessage: String)
+            case burstReadFailed(message: String)
+            case burstUnsettled
+        }
+
+        private(set) var events: [Event] = []
+
+        func record(_ event: Event) { events.append(event) }
+    }
+
     extension EnvironmentValues {
         var mobileViewerTransportChromeForTesting: Bool? {
             get { self[MobileViewerTransportChromeTestKey.self] }
@@ -72,6 +91,12 @@ struct MobileLivePhotoMotionTaskID: Equatable {
         var mobileViewerIsDividedForTesting: Bool? {
             get { self[MobileViewerDividedTestKey.self] }
             set { self[MobileViewerDividedTestKey.self] = newValue }
+        }
+
+        /// Injects the share-decision recorder used by the hosted viewer wiring tests.
+        var mobileViewerShareProbeForTesting: MobileViewerShareDecisionProbe? {
+            get { self[MobileViewerShareProbeTestKey.self] }
+            set { self[MobileViewerShareProbeTestKey.self] = newValue }
         }
     }
 #endif

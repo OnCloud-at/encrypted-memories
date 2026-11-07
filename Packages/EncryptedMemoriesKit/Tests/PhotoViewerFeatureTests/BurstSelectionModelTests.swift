@@ -131,13 +131,15 @@ final class BurstSelectionModelTests: XCTestCase {
         let group = [item("a"), base, selected]
         let selection = BurstSelectionModel(items: group, selectedIndex: 2)
 
-        XCTAssertEqual(selection.exportItems(current: selected).map(\.uid.nodeID), ["a", "b", "c"])
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: selected, page: base, belongsToPage: true),
+            .success(items: group, expandedSingleSeries: true))
         XCTAssertEqual(selection.gridReturnCandidates(current: selected, base: base).map(\.uid.nodeID), ["c", "b"])
     }
 
-    /// #1177 evidence: for every state `BurstSelectionModel` can reach through its own
-    /// mutations, `hasFilmstrip` and the core's `count > 1` rule agree, and the viewer
-    /// entry keeps today's success behavior exactly wherever nothing failed.
+    /// For every state `BurstSelectionModel` can reach through its own mutations,
+    /// `hasFilmstrip` and the `count > 1` rule agree, and the viewer decision follows its
+    /// order: loading waits, a failed read fails, otherwise the series or the photo.
     func testViewerBurstEntryAgreesWithHasFilmstripInEveryModelState() {
         let current = item("b", members: ["a", "b", "c"])
         let complete = [
@@ -196,26 +198,93 @@ final class BurstSelectionModelTests: XCTestCase {
         for (name, selection) in makeStates() {
             XCTAssertTrue(selection.hasFilmstrip == (selection.items.count > 1), name)
 
-            let result = BurstExportExpansion.expandViewerBurst(
-                current: current,
-                filmstripItems: selection.items,
-                filmstripLoadFailed: selection.loadFailed
-            )
+            let result = selection.viewerExportDecision(current: current, page: current, belongsToPage: true)
 
-            if selection.loadFailed {
-                XCTAssertEqual(
-                    result, .burstReadFailed(failedSources: [current]),
-                    "state: \(name)")
+            if selection.isLoading {
+                // While the read is in flight the decision must not guess from the
+                // partly known state; the viewer waits instead.
+                XCTAssertEqual(result, .burstLoading, "state: \(name)")
+            } else if selection.loadFailed {
+                XCTAssertEqual(result, .burstReadFailed(failedSources: [current]), "state: \(name)")
+            } else if selection.hasFilmstrip {
+                XCTAssertEqual(result, .success(items: selection.items, expandedSingleSeries: true), "state: \(name)")
             } else {
-                XCTAssertEqual(
-                    result,
-                    .success(
-                        items: selection.exportItems(current: current),
-                        expandedSingleSeries: selection.hasFilmstrip
-                    ),
-                    "state: \(name)")
+                XCTAssertEqual(result, .success(items: [current], expandedSingleSeries: false), "state: \(name)")
             }
         }
+    }
+
+    // MARK: - Viewer export and share decision
+
+    func testFailedReadWithAPartialFilmstripIsNeverAPartialExport() {
+        let page = item("a", members: ["a", "b", "c"])
+        let shown = item("b", members: ["a", "b", "c"])
+        var selection = BurstSelectionModel()
+        selection.seedKnownGroup(for: page, knownItems: [page, shown])
+        XCTAssertTrue(selection.beginLoadingIfCandidate(page))
+        XCTAssertEqual(selection.selectIndex(1)?.uid.nodeID, "b")
+        selection.failLoading()
+
+        // The page photo, not the shown filmstrip member, goes back to the export: only the
+        // page photo carries the burst, so the export reads the whole group again from it.
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: shown, page: page, belongsToPage: true),
+            .burstReadFailed(failedSources: [page]))
+    }
+
+    func testFailedReadWithoutAFilmstripFailsInsteadOfASinglePhoto() {
+        let page = item("a", members: ["a", "b", "c"])
+        var selection = BurstSelectionModel()
+        XCTAssertTrue(selection.beginLoadingIfCandidate(page))
+        selection.failLoading()
+
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: page, page: page, belongsToPage: true),
+            .burstReadFailed(failedSources: [page]))
+    }
+
+    func testPartialFilmstripWaitsWhileTheReadIsInFlight() {
+        let page = item("a", members: ["a", "b", "c"])
+        var selection = BurstSelectionModel()
+        selection.seedKnownGroup(for: page, knownItems: [page, item("b", members: ["a", "b", "c"])])
+        XCTAssertTrue(selection.beginLoadingIfCandidate(page))
+
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: page, page: page, belongsToPage: true), .burstLoading)
+    }
+
+    func testBurstPageRightAfterASwipeWaitsWhileTheModelHoldsThePreviousPage() {
+        // The model still holds the previous page's loaded series; the swiped-to burst page
+        // has not started its own read.
+        let previous = item("p", members: ["p", "q"])
+        var selection = BurstSelectionModel()
+        _ = selection.beginLoadingIfCandidate(previous)
+        selection.applyLoadedGroup([previous, item("q", members: ["p", "q"])], containing: previous)
+        let swipedTo = item("x", members: ["x", "y", "z"])
+
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: swipedTo, page: swipedTo, belongsToPage: false), .burstLoading)
+    }
+
+    func testPlainPageRightAfterASwipeSharesItsPhoto() {
+        let previous = item("p", members: ["p", "q"])
+        var selection = BurstSelectionModel()
+        _ = selection.beginLoadingIfCandidate(previous)
+        selection.failLoading()
+        let plain = item("plain")
+
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: plain, page: plain, belongsToPage: false),
+            .success(items: [plain], expandedSingleSeries: false))
+    }
+
+    func testPlainPhotoIsExportedAsItself() {
+        let plain = item("plain")
+        let selection = BurstSelectionModel()
+
+        XCTAssertEqual(
+            selection.viewerExportDecision(current: plain, page: plain, belongsToPage: true),
+            .success(items: [plain], expandedSingleSeries: false))
     }
 
     private func item(_ id: String, volume: String = "v", members: [String] = []) -> PhotoItem {
