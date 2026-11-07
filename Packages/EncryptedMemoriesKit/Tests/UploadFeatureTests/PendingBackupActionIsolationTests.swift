@@ -264,9 +264,9 @@ private actor IsolationEffects: PendingBackupEffects {
         events.append(.remove(identifiers))
         return true
     }
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> {
         events.append(.returned(keys))
-        return true
+        return Set(keys)
     }
     func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
         events.append(.returned(states.map(\.key)))

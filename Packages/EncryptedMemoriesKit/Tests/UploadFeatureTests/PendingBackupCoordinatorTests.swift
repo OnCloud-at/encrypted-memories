@@ -5079,7 +5079,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     }
     private var _onReturn: (@Sendable () -> Void)?
 
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey> {
         let hook = lock.withLock {
             _returned.append(keys.sorted())
             _order.append("return")
@@ -5087,7 +5087,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
             return _onReturn
         }
         hook?()
-        return true
+        return Set(keys)
     }
 
     var typedReturnOverride: [PendingSourceKey: PendingBackupReturnOutcome]? {
@@ -5097,9 +5097,10 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     private var _typedReturnOverride: [PendingSourceKey: PendingBackupReturnOutcome]?
 
     func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome] {
-        let succeeded = await returnToBackup(states.map(\.key))
+        let returned = await returnToBackup(states.map(\.key))
         if let override = typedReturnOverride { return override }
-        return Dictionary(uniqueKeysWithValues: states.map { ($0.key, succeeded ? .completed : .unreadable) })
+        return Dictionary(
+            uniqueKeysWithValues: states.map { ($0.key, returned.contains($0.key) ? .completed : .unreadable) })
     }
 
     /// Runs once at the next volume lookup, which comes after a delete is stored and before its trash is sent.

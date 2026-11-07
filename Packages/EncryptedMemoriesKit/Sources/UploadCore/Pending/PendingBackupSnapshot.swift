@@ -161,8 +161,9 @@ public struct PendingBatchEffectResult: Sendable, Equatable {
 public protocol PendingBackupEffects: Sendable {
     /// Removes the sources from queued and in-flight backup work.
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool
-    /// Enqueues the sources again after a restore.
-    func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool
+    /// Enqueues the sources again after a restore. Returns the keys whose return is settled; every other key
+    /// keeps its queue duty and is tried again.
+    func returnToBackup(_ keys: [PendingSourceKey]) async -> Set<PendingSourceKey>
     /// Settles the exact included decisions, including their restored-photo provenance.
     func returnToBackup(_ states: [PendingSourceState]) async -> [PendingSourceKey: PendingBackupReturnOutcome]
     /// The account's photos volume, used for link-only handoffs. Nil while unknown.

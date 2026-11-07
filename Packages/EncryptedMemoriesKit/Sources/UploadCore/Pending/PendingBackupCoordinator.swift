@@ -1702,12 +1702,13 @@ public actor PendingBackupCoordinator {
             guard !closed else { return }
             finish(.queueSync, group, succeeded: ok, at: date)
         }
-        // Each kind returns on its own, so a missing or failing adapter of one kind keeps only its own duty.
+        // Each kind returns on its own, so a missing or failing adapter of one kind keeps only its own duty. Within
+        // a kind each source settles on its own result, so one unreadable file does not hold back the others.
         let included = states.filter { $0.desired == .included && $0.remote == nil }
         for (_, group) in Dictionary(grouping: included, by: \.key.kind) {
-            let ok = await effects.returnToBackup(group.map(\.key))
+            let returned = await effects.returnToBackup(group.map(\.key))
             guard !closed else { return }
-            finish(.queueSync, group, succeeded: ok, at: date)
+            finish(.queueSync, group, at: date) { returned.contains($0.key) }
         }
         for state in states where state.desired == .included && state.remote != nil {
             let previous = restoreRecheckCounts[state.key]
