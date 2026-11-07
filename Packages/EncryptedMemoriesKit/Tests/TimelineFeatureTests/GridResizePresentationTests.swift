@@ -11,7 +11,6 @@ import TimelineCore
 
 @MainActor
 final class PresentationTestDataSource: MetalGridDataSource {
-    let label = "presentation-test"
     let sectionCounts: [Int]
     let flatUIDs: [PhotoUID]
     var onImagesAvailable: (() -> Void)?

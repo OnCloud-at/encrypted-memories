@@ -211,7 +211,7 @@ struct MetalProductionGridView: NSViewRepresentable {
         if MetalGridAccessibilityProvider.badgesChangeLabels(from: previousBadges, to: uploadBadges) {
             coord.a11y?.invalidate()
         }
-        // Honour a genuine external (+/- / keyboard / programmatic) level change, but ignore a stale `level`
+        // Honour a genuine external (+/- / programmatic) level change, but ignore a stale `level`
         // binding value left over from a host-led pinch commit - re-driving it would re-anchor at the viewport
         // centre and jump a different photo under the cursor. See `LevelBindingReconciler`.
         host.reconcileLevelBinding(level)

@@ -31,9 +31,6 @@ final class MetalGridScrollHost: NSView {
     var documentSpacer: NSView { spacer }
     private weak var wiredImageAvailabilitySource: MetalGridDataSource?
 
-    var onHUD: ((MetalGridHUD) -> Void)? {
-        didSet { coordinator.onHUD = onHUD }
-    }
     /// Production click routing (content point, click count, modifiers).
     var onCellClick: ((CGPoint, Int, GridClickModifiers) -> Void)?
     /// Routes drag selection in engine layout coordinates.
@@ -811,7 +808,7 @@ final class MetalGridScrollHost: NSView {
         setLevel(target)
     }
 
-    /// Toolbar/keyboard command entry point. Start the renderer-owned click transition immediately,
+    /// Toolbar command entry point. Start the renderer-owned click transition immediately,
     /// then mirror its committed level back to SwiftUI; waiting for an updateNSView round-trip could
     /// expose a settled target frame before the transition was armed.
     func performDiscreteZoom(to target: Int) {
@@ -821,7 +818,7 @@ final class MetalGridScrollHost: NSView {
     }
 
     /// Reconcile a SwiftUI `level`-binding value delivered to `updateNSView` against the host's authoritative
-    /// `coordinator.level`. Drives `animateToLevel` for a genuine external (+/- / keyboard / programmatic)
+    /// `coordinator.level`. Drives `animateToLevel` for a genuine external (+/- / programmatic)
     /// change; IGNORES a stale echo of a host-led pinch commit (which would otherwise re-issue a viewport-centre
     /// zoom and jump a different photo under the cursor). Pure decision in `LevelBindingReconciler`.
     func reconcileLevelBinding(_ bindingLevel: Int) {
