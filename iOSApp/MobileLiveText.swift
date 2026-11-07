@@ -1,7 +1,6 @@
 import PhotosCore
 import UIKit
 import VisionKit
-import os
 
 /// On-device Live Text for the photo viewer. Only text and machine-readable codes are requested. Visual Look Up and
 /// subject lifting stay off, so recognizing text never sends image content to a service.
@@ -22,9 +21,6 @@ enum MobileLiveText {
                 image, orientation: image.imageOrientation, configuration: configuration)
             return analysis.hasResults(for: [.text, .machineReadableCode]) ? analysis : nil
         } catch {
-            if MobileViewerLog.isEnabled, !(error is CancellationError) {
-                MobileViewerLog.logger.notice("[LiveText] analysis unavailable")
-            }
             return nil
         }
     }
