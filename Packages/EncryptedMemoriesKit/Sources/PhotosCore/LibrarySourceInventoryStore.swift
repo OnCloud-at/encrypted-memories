@@ -301,40 +301,14 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
     }
 
     /// Reconciles one complete snapshot with changed-row writes and authoritative anti-join sweeps.
-    @discardableResult
-    public func save(
-        _ inventories: [LibrarySourceInventory],
-        sourceSetAuthority: SourceSetAuthority,
-        using lease: WriteLease
-    ) async throws -> LibrarySourceInventorySaveResult {
-        try await save(
-            inventories,
-            sourceSetAuthority: sourceSetAuthority,
-            persistenceSignature: nil,
-            using: lease
-        )
-    }
-
-    /// Graph-owned save path with an exact, session-local snapshot identity. A repeated identity
+    ///
+    /// The graph-owned save path passes an exact, session-local snapshot identity. A repeated identity
     /// advances write ordering without encoding, encrypting, probing, or writing every item again.
+    @discardableResult
     package func save(
         _ inventories: [LibrarySourceInventory],
         sourceSetAuthority: SourceSetAuthority,
-        persistenceSignature: LibrarySourcePersistenceSignature,
-        using lease: WriteLease
-    ) async throws -> LibrarySourceInventorySaveResult {
-        try await save(
-            inventories,
-            sourceSetAuthority: sourceSetAuthority,
-            persistenceSignature: Optional(persistenceSignature),
-            using: lease
-        )
-    }
-
-    private func save(
-        _ inventories: [LibrarySourceInventory],
-        sourceSetAuthority: SourceSetAuthority,
-        persistenceSignature: LibrarySourcePersistenceSignature?,
+        persistenceSignature: LibrarySourcePersistenceSignature? = nil,
         using lease: WriteLease
     ) async throws -> LibrarySourceInventorySaveResult {
         try await perform {
