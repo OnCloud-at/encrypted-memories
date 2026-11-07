@@ -1081,81 +1081,81 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         var externalIdentitiesByLinkID: [String: UploadBackupExternalIdentity] = [:]
         externalIdentitiesByLinkID.reserveCapacity(expectedActiveFileIDs.count)
         var lineageRows = RemotePhotoLineageRows()
-        for id in expectedActiveFileIDs {
-            try Task.checkCancellation()
-            guard let link = links[id] else {
-                unresolved.append(issue(id, endpointFailureIDs.contains(id) ? .endpointFailure : .missingLinkMetadata))
-                lineageRows.unresolvedLinkIDs.insert(id)
-                continue
+        // One parent ring for the links of this call; it is cleared when the call ends, also on a throw.
+        try crypto.withParentRing(material.rootKey) { parentRing in
+            for id in expectedActiveFileIDs {
+                try Task.checkCancellation()
+                guard let link = links[id] else {
+                    unresolved.append(
+                        issue(id, endpointFailureIDs.contains(id) ? .endpointFailure : .missingLinkMetadata))
+                    lineageRows.unresolvedLinkIDs.insert(id)
+                    continue
+                }
+                if link.type == nil || link.type == 2,
+                    let state = link.state, RemotePhotoLineageRows.isUnknown(state: state)
+                {
+                    lineageRows.unresolvedLinkIDs.insert(id)
+                }
+                guard link.type == nil || link.type == 2,
+                    link.state == nil || link.state == 1
+                else {
+                    continue
+                }
+                guard let nodeKey = link.nodeKey, let nodePassphrase = link.nodePassphrase else {
+                    unresolved.append(issue(id, .missingKeyMetadata))
+                    lineageRows.unresolvedLinkIDs.insert(id)
+                    continue
+                }
+                guard let armoredXAttr = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr else {
+                    unresolved.append(issue(id, .missingEncryptedAttributes))
+                    lineageRows.unresolvedLinkIDs.insert(id)
+                    continue
+                }
+                let fileKey: UnlockableKey
+                let data: Data
+                do {
+                    fileKey = try parentRing.unlockNode(key: nodeKey, passphrase: nodePassphrase)
+                    measurement?.record(.unlockSucceeded)
+                    data = try crypto.decryptXAttr(armoredXAttr, node: fileKey)
+                    measurement?.record(.decryptSucceeded)
+                } catch {
+                    unresolved.append(issue(id, .decryptFailure))
+                    lineageRows.unresolvedLinkIDs.insert(id)
+                    continue
+                }
+                let attributes: DedupeXAttr
+                do {
+                    attributes = try JSONDecoder().decode(DedupeXAttr.self, from: data)
+                } catch {
+                    unresolved.append(issue(id, .invalidAttributes))
+                    lineageRows.unresolvedLinkIDs.insert(id)
+                    continue
+                }
+                lineageRows.merge(
+                    RemotePhotoLineageRows(
+                        attributes: attributes, link: link, remoteLinkID: id, hashKeyEpoch: material.epoch))
+                if let iOSPhotos = attributes.iOSPhotos,
+                    let cloudID = iOSPhotos.iCloudID,
+                    !cloudID.isEmpty,
+                    let rawDate = iOSPhotos.modificationTime,
+                    let modificationDate = modificationTimes.date(from: rawDate)
+                {
+                    externalIdentitiesByLinkID[id] = UploadBackupExternalIdentity(
+                        identifier: cloudID,
+                        modificationDate: modificationDate
+                    )
+                }
+                guard let sha1 = attributes.common?.digests?.sha1?.lowercased(), !sha1.isEmpty else {
+                    unresolved.append(issue(id, .missingContentHash))
+                    continue
+                }
+                records.append(
+                    UploadRemoteContentIndexRecord(
+                        contentHash: ProtonPhotoHMAC.hex(message: sha1, key: material.hashKey),
+                        hashKeyEpoch: material.epoch,
+                        remoteLinkID: id
+                    ))
             }
-            if link.type == nil || link.type == 2,
-                let state = link.state, RemotePhotoLineageRows.isUnknown(state: state)
-            {
-                lineageRows.unresolvedLinkIDs.insert(id)
-            }
-            guard link.type == nil || link.type == 2,
-                link.state == nil || link.state == 1
-            else {
-                continue
-            }
-            guard let nodeKey = link.nodeKey, let nodePassphrase = link.nodePassphrase else {
-                unresolved.append(issue(id, .missingKeyMetadata))
-                lineageRows.unresolvedLinkIDs.insert(id)
-                continue
-            }
-            guard let armoredXAttr = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr else {
-                unresolved.append(issue(id, .missingEncryptedAttributes))
-                lineageRows.unresolvedLinkIDs.insert(id)
-                continue
-            }
-            let fileKey: UnlockableKey
-            let data: Data
-            do {
-                fileKey = try crypto.unlockNode(
-                    key: nodeKey,
-                    passphrase: nodePassphrase,
-                    parent: material.rootKey
-                )
-                measurement?.record(.unlockSucceeded)
-                data = try crypto.decryptXAttr(armoredXAttr, node: fileKey)
-                measurement?.record(.decryptSucceeded)
-            } catch {
-                unresolved.append(issue(id, .decryptFailure))
-                lineageRows.unresolvedLinkIDs.insert(id)
-                continue
-            }
-            let attributes: DedupeXAttr
-            do {
-                attributes = try JSONDecoder().decode(DedupeXAttr.self, from: data)
-            } catch {
-                unresolved.append(issue(id, .invalidAttributes))
-                lineageRows.unresolvedLinkIDs.insert(id)
-                continue
-            }
-            lineageRows.merge(
-                RemotePhotoLineageRows(
-                    attributes: attributes, link: link, remoteLinkID: id, hashKeyEpoch: material.epoch))
-            if let iOSPhotos = attributes.iOSPhotos,
-                let cloudID = iOSPhotos.iCloudID,
-                !cloudID.isEmpty,
-                let rawDate = iOSPhotos.modificationTime,
-                let modificationDate = modificationTimes.date(from: rawDate)
-            {
-                externalIdentitiesByLinkID[id] = UploadBackupExternalIdentity(
-                    identifier: cloudID,
-                    modificationDate: modificationDate
-                )
-            }
-            guard let sha1 = attributes.common?.digests?.sha1?.lowercased(), !sha1.isEmpty else {
-                unresolved.append(issue(id, .missingContentHash))
-                continue
-            }
-            records.append(
-                UploadRemoteContentIndexRecord(
-                    contentHash: ProtonPhotoHMAC.hex(message: sha1, key: material.hashKey),
-                    hashKeyEpoch: material.epoch,
-                    remoteLinkID: id
-                ))
         }
 
         return RemoteContentIndexRows(
@@ -1181,17 +1181,19 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         try Task.checkCancellation()
         guard !rows.unresolvedIssues.isEmpty else { return }
         var linkIDsByNameHash: [String: Set<String>] = [:]
-        for index in rows.unresolvedIssues.indices {
-            rows.unresolvedIssues[index].lastRepairAttemptAt = attemptedAt
-            let id = rows.unresolvedIssues[index].remoteLinkID
-            guard let armoredName = links[id]?.name else { continue }
-            do {
-                let clearName = try crypto.decryptName(armoredName, parent: material.rootKey)
-                let corrected = ProtonPhotoNameCorrection.correctedName(for: clearName)
-                let nameHash = ProtonPhotoHMAC.hex(message: corrected, key: material.hashKey)
-                linkIDsByNameHash[nameHash, default: []].insert(id)
-            } catch {
-                rows.unresolvedIssues[index].reason = .decryptFailure
+        crypto.withParentRing(material.rootKey) { parentRing in
+            for index in rows.unresolvedIssues.indices {
+                rows.unresolvedIssues[index].lastRepairAttemptAt = attemptedAt
+                let id = rows.unresolvedIssues[index].remoteLinkID
+                guard let armoredName = links[id]?.name else { continue }
+                do {
+                    let clearName = try parentRing.decryptName(armoredName)
+                    let corrected = ProtonPhotoNameCorrection.correctedName(for: clearName)
+                    let nameHash = ProtonPhotoHMAC.hex(message: corrected, key: material.hashKey)
+                    linkIDsByNameHash[nameHash, default: []].insert(id)
+                } catch {
+                    rows.unresolvedIssues[index].reason = .decryptFailure
+                }
             }
         }
 

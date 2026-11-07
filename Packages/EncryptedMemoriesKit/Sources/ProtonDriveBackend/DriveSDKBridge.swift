@@ -1306,9 +1306,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 }
                 changed = changed || (result?.changedRows ?? 0) > 0
                 if let photoNames, let nameKey = try await passRootKey(context) {
-                    let names = PhotoNameFill.names(
-                        in: links, requested: Set(candidates.map(\.uid.nodeID)), volumeID: context.volumeID,
-                        decrypt: { try? self.crypto.decryptName($0, parent: nameKey) })
+                    let names = crypto.withParentRing(nameKey) { ring in
+                        PhotoNameFill.names(
+                            in: links, requested: Set(candidates.map(\.uid.nodeID)), volumeID: context.volumeID,
+                            decrypt: { try? ring.decryptName($0) })
+                    }
                     // A failed or superseded write leaves the photos without rows; the name backfill reads them.
                     if photoNames.record(names, unlessForgottenSince: nameToken) == .failed {
                         DebugLog.log("timeline: file names not saved count=\(names.count); backfill retries")
@@ -1318,29 +1320,33 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 if candidates.contains(where: \.needsOrder) {
                     _ = try await passRootKey(context)
                     let requested = Dictionary(uniqueKeysWithValues: candidates.map { ($0.uid.nodeID, $0) })
-                    for link in links {
-                        try Task.checkCancellation()
-                        guard let id = link.linkID, let candidate = requested[id], candidate.needsOrder,
-                            link.state == nil || link.state == 1
-                        else { continue }
-                        do {
-                            if let xattr = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr {
-                                guard let key = link.nodeKey, let passphrase = link.nodePassphrase, let rootKey else {
-                                    continue
+                    // One parent ring for the links of this page; cleared when the page's loop ends or throws.
+                    try await crypto.withOptionalParentRing(rootKey) { parentRing in
+                        for link in links {
+                            try Task.checkCancellation()
+                            guard let id = link.linkID, let candidate = requested[id], candidate.needsOrder,
+                                link.state == nil || link.state == 1
+                            else { continue }
+                            do {
+                                if let xattr = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr {
+                                    guard let key = link.nodeKey, let passphrase = link.nodePassphrase, let parentRing
+                                    else {
+                                        continue
+                                    }
+                                    let unlocked = try parentRing.unlockNode(key: key, passphrase: passphrase)
+                                    measurement?.record(.unlockSucceeded)
+                                    let decrypted = try crypto.decryptXAttr(xattr, node: unlocked)
+                                    measurement?.record(.decryptSucceeded)
+                                    order[candidate.uid] = decoder.decode(decrypted)
+                                } else {
+                                    order[candidate.uid] = TimelineOrderMetadata()
                                 }
-                                let unlocked = try crypto.unlockNode(key: key, passphrase: passphrase, parent: rootKey)
-                                measurement?.record(.unlockSucceeded)
-                                let decrypted = try crypto.decryptXAttr(xattr, node: unlocked)
-                                measurement?.record(.decryptSucceeded)
-                                order[candidate.uid] = decoder.decode(decrypted)
-                            } else {
-                                order[candidate.uid] = TimelineOrderMetadata()
+                            } catch {
+                                // A failed decryption stays unknown, so a later pass retries it. MIME evidence is independent.
+                                PhotoDiagnostics.shared.increment("timeline.order.decryptFailure")
                             }
-                        } catch {
-                            // A failed decryption stays unknown, so a later pass retries it. MIME evidence is independent.
-                            PhotoDiagnostics.shared.increment("timeline.order.decryptFailure")
+                            await Task.yield()
                         }
-                        await Task.yield()
                     }
                 }
                 try Task.checkCancellation()

@@ -107,6 +107,31 @@ extension DriveSessionStubSuite {
             #expect(!exported.contains("bad-decrypt") && !exported.contains("good"))
         }
 
+        /// An event page with several photos unlocks the parent key once for the whole page, not once per photo.
+        @Test func anEventPageUnlocksTheRootKeyOncePerPageNotOncePerPhoto() async throws {
+            let fixture = try RepairFixture(unresolved: [])
+            defer { fixture.close() }
+            let ids = (0..<8).map { "page-photo-\($0)" }
+            let events = ids.map {
+                #"{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"\#($0)","Type":2,"State":1}}"#
+            }.joined(separator: ",")
+            routeEventPage(
+                from: "one",
+                json: #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[\#(events)]}"#)
+            try routeMetadata(
+                ids.map {
+                    try fixture.keys.activePhoto($0, attributes: #"{"Common":{"Digests":{"SHA1":"abcd"}}}"#)
+                })
+
+            try await ProtonUploadDedupeService.refreshRemoteContentIndex(
+                material: Self.material(rootKey: fixture.keys.root), session: makeSession(),
+                crypto: fixture.keys.crypto, store: fixture.content, lineageStore: fixture.lineage,
+                progress: { _ in })
+
+            #expect(fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            #expect(fixture.keys.probe.builds == 1, "eight photos, one unlock of the root key")
+        }
+
         @Test func diagnosticsSeparateEventCryptoFromLineageRepairCrypto() async throws {
             let fixture = try RepairFixture(unresolved: ["repair-photo"])
             defer { fixture.close() }
@@ -2520,12 +2545,17 @@ extension DriveSessionStubSuite {
 
         /// A photos root key and one photo node key, so a repair can decrypt the attributes of an active photo.
         private struct LineageKeys: Sendable {
-            let crypto = DriveCrypto(addressKeys: [], signers: [])
+            let probe: ParentRingProbe
+            let crypto: DriveCrypto
             let root: UnlockableKey
             private let node: UnlockableKey
 
             init() throws {
                 _ = lineageCryptoReady
+                let probe = ParentRingProbe()
+                self.probe = probe
+                crypto = DriveCrypto(
+                    addressKeys: [], signers: [], buildParentRing: probe.build, clearParentRing: probe.clear)
                 root = UnlockableKey(
                     armored: try crypto.generateLockedNodeKey(passphrase: "root-pass"), passphrase: "root-pass")
                 node = UnlockableKey(
