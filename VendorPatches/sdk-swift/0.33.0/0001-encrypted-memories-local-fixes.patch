@@ -1,5 +1,5 @@
 diff --git a/Package.swift b/Package.swift
-index 9d2cadb..f5f052c 100644
+index f87a772..09ecdfa 100644
 --- a/Package.swift
 +++ b/Package.swift
 @@ -3,0 +4 @@
@@ -117,7 +117,7 @@ index f8ba40e..220a08a 100644
 +        await freeTask().value
 +    }
 diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-index a5cb60e..9371fb1 100644
+index 7850e70..5bde7e9 100644
 --- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 +++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 @@ -57,0 +58,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
@@ -182,23 +182,23 @@ index a5cb60e..9371fb1 100644
 +                "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
 +                category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
 +            )
-@@ -444,0 +476 @@ extension EncryptedMemoriesClient {
+@@ -446,0 +478 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -460,0 +493 @@ extension EncryptedMemoriesClient {
+@@ -462,0 +495 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
-@@ -475,0 +509 @@ extension EncryptedMemoriesClient {
+@@ -477,0 +511 @@ extension EncryptedMemoriesClient {
 +        try operation.claimStart()
-@@ -495,0 +530 @@ extension EncryptedMemoriesClient {
+@@ -499,0 +534 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -518,0 +554 @@ extension EncryptedMemoriesClient {
+@@ -522,0 +558 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
 diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index 8fd4ed7..a767448 100644
+index 3e78958..9b7176c 100644
 --- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 +++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-@@ -362,0 +363 @@ extension ProtonDriveClient {
+@@ -366,0 +367 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
-@@ -394,0 +396 @@ extension ProtonDriveClient {
+@@ -400,0 +402 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
 diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
 index 367242f..f6b161f 100644
@@ -318,7 +318,7 @@ index 367242f..f6b161f 100644
 +        activeDownloads[cancellationToken] = activeDownload
 +        return activeDownload
 diff --git a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
-index 81cd6ad..7b3f27d 100644
+index 9c487da..3944e58 100644
 --- a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
 +++ b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
 @@ -9 +9 @@ actor PhotoUploadsManager {
@@ -341,7 +341,7 @@ index 81cd6ad..7b3f27d 100644
 -        let uploaderHandle = try await buildUploader(
 -            name: name,
 -            fileSize: fileSize,
--            modificationDate: modificationDate,
+-            modificationTime: modificationTime,
 -            mediaType: mediaType,
 -            captureTime: captureTime,
 -            mainPhotoUid: mainPhotoUid,
@@ -377,7 +377,7 @@ index 81cd6ad..7b3f27d 100644
 +            let uploaderHandle = try await buildUploader(
 +                name: name,
 +                fileSize: fileSize,
-+                modificationDate: modificationDate,
++                modificationTime: modificationTime,
 +                mediaType: mediaType,
 +                captureTime: captureTime,
 +                mainPhotoUid: mainPhotoUid,
@@ -877,7 +877,7 @@ index 134a46e..c7fc881 100644
 -    private static func freeUploadController(_ uploadControllerHandle: Int64, logger: Logger?) async {
 +    static func freeUploadController(_ uploadControllerHandle: Int64, logger: Logger?) async {
 diff --git a/Sources/FileOperations/Uploads/UploadsManager.swift b/Sources/FileOperations/Uploads/UploadsManager.swift
-index e9fb939..320a2a8 100644
+index 93c4262..102d39a 100644
 --- a/Sources/FileOperations/Uploads/UploadsManager.swift
 +++ b/Sources/FileOperations/Uploads/UploadsManager.swift
 @@ -9 +9 @@ actor UploadsManager {
@@ -900,7 +900,7 @@ index e9fb939..320a2a8 100644
 -            name: name,
 -            mediaType: mediaType,
 -            fileSize: fileSize,
--            modificationDate: modificationDate,
+-            modificationTime: modificationTime,
 -            overrideExistingDraft: overrideExistingDraft,
 -            cancellationHandle: cancellationHandle,
 -            logger: logger
@@ -934,7 +934,7 @@ index e9fb939..320a2a8 100644
 +                name: name,
 +                mediaType: mediaType,
 +                fileSize: fileSize,
-+                modificationDate: modificationDate,
++                modificationTime: modificationTime,
 +                overrideExistingDraft: overrideExistingDraft,
 +                cancellationHandle: cancellationTokenSource.handle,
 +                logger: logger
@@ -991,13 +991,13 @@ index e9fb939..320a2a8 100644
 -        let uploaderHandle = try await getRevisionUploader(
 -            currentActiveRevisionUid: currentActiveRevisionUid,
 -            fileSize: fileSize,
--            modificationDate: modificationDate,
+-            modificationTime: modificationTime,
 -            cancellationHandle: cancellationHandle
 -        )
 +            let uploaderHandle = try await getRevisionUploader(
 +                currentActiveRevisionUid: currentActiveRevisionUid,
 +                fileSize: fileSize,
-+                modificationDate: modificationDate,
++                modificationTime: modificationTime,
 +                cancellationHandle: cancellationTokenSource.handle
 +            )
 +            let logger = self.logger

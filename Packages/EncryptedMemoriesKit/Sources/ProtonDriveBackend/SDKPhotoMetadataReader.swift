@@ -92,9 +92,7 @@ enum SDKPhotoMetadataReader {
             filename: name,
             mediaType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
             captureTime: captureDate,
-            modificationDate: revision.claimedModificationTime.flatMap {
-                $0.isFinite ? Date(timeIntervalSince1970: $0) : nil
-            } ?? captureDate,
+            modificationDate: revision.claimedModificationTime.flatMap(SDKModificationTime.date(from:)) ?? captureDate,
             additionalMetadata: (revision.claimedAdditionalMetadata ?? [])
                 .filter { $0.name != "iOS.photos" && !$0.name.hasPrefix("EncryptedMemories.") }
                 .map { PhotoUploadAdditionalMetadata(name: $0.name, utf8JsonValue: $0.utf8JsonValue) }
@@ -124,9 +122,7 @@ enum SDKPhotoMetadataReader {
         let media = decode(Media.self, name: "Media")
         let camera = decode(Camera.self, name: "Camera")
         let location = decode(Location.self, name: "Location")
-        let modificationTime = revision.claimedModificationTime.flatMap {
-            $0.isFinite ? Date(timeIntervalSince1970: $0) : nil
-        }
+        let modificationTime = revision.claimedModificationTime.flatMap(SDKModificationTime.date(from:))
         return PhotoMetadata(
             filename: try? name.get(),
             mimeType: mimeType.isEmpty ? nil : mimeType,

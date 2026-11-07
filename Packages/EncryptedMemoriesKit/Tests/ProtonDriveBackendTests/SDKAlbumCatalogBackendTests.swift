@@ -239,7 +239,7 @@ struct SDKAlbumCatalogBackendTests {
             uid: SDKRevisionUid(volumeID: "foreign", nodeID: "photo", revisionID: "revision"),
             state: .active, creationTime: 1, storageSize: 9999, claimedSize: 1234,
             claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
-            claimedModificationTime: 123, thumbnails: [],
+            claimedModificationTime: "1970-01-01T00:02:03.0000000+00:00", thumbnails: [],
             claimedAdditionalMetadata: [
                 AdditionalMetadata(
                     name: "Media", utf8JsonValue: Data(#"{"Width":4032,"Height":3024,"Duration":2.5}"#.utf8)),
@@ -331,7 +331,7 @@ struct SDKAlbumCatalogBackendTests {
             uid: SDKRevisionUid(volumeID: "own", nodeID: "member", revisionID: "revision"),
             state: .active, creationTime: 1, storageSize: 10, claimedSize: 10,
             claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
-            claimedModificationTime: 123, thumbnails: [],
+            claimedModificationTime: "1970-01-01T00:02:03.0000000+00:00", thumbnails: [],
             claimedAdditionalMetadata: [
                 AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"iPhone"}"#.utf8)),
                 AdditionalMetadata(name: "iOS.photos", utf8JsonValue: Data(#"{"ICloudID":"cloud"}"#.utf8)),

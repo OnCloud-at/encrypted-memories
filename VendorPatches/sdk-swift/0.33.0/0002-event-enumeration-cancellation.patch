@@ -1,5 +1,5 @@
 diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-index 9371fb1..999dfb6 100644
+index 5bde7e9..d99e767 100644
 --- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 +++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 @@ -57,0 +58 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
@@ -28,7 +28,7 @@ index 9371fb1..999dfb6 100644
 +            await state.completeAndRelease()
 +        }
 +    }
-@@ -853,4 +875,4 @@ extension EncryptedMemoriesClient {
+@@ -857,4 +879,4 @@ extension EncryptedMemoriesClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateEvents(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .enumerateEvents(cancellationToken))
@@ -37,7 +37,7 @@ index 9371fb1..999dfb6 100644
 +        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
 +        let cancellationState = EventEnumerationCancellationState(tokenSource: cancellationTokenSource)
 +        activeEventEnumerations[identifier] = cancellationState
-@@ -869,7 +891,29 @@ extension EncryptedMemoriesClient {
+@@ -873,7 +895,29 @@ extension EncryptedMemoriesClient {
 -        let _: Void = try await SDKRequestHandler.send(
 -            request,
 -            state: WeakReference(value: callbackState),
@@ -74,7 +74,7 @@ index 9371fb1..999dfb6 100644
 +            )
 +            throw error
 +        }
-@@ -879 +923,7 @@ extension EncryptedMemoriesClient {
+@@ -883 +927,7 @@ extension EncryptedMemoriesClient {
 -        try await cancelOperation(identifier: .enumerateEvents(cancellationToken))
 +        let identifier = OperationIdentifier.enumerateEvents(cancellationToken)
 +        guard let state = activeEventEnumerations.removeValue(forKey: identifier) else {
@@ -143,7 +143,7 @@ index 0000000..b8d0022
 +    }
 +}
 diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index a767448..68c6a93 100644
+index 9b7176c..d460df7 100644
 --- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 +++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 @@ -80,0 +81 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
@@ -176,7 +176,7 @@ index a767448..68c6a93 100644
 +        }
 +    }
 +
-@@ -583,4 +608,4 @@ extension ProtonDriveClient {
+@@ -593,4 +618,4 @@ extension ProtonDriveClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateEvents(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .enumerateEvents(cancellationToken))
@@ -185,7 +185,7 @@ index a767448..68c6a93 100644
 +        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
 +        let cancellationState = EventEnumerationCancellationState(tokenSource: cancellationTokenSource)
 +        activeEventEnumerations[identifier] = cancellationState
-@@ -599,7 +624,29 @@ extension ProtonDriveClient {
+@@ -609,7 +634,29 @@ extension ProtonDriveClient {
 -        let _: Void = try await SDKRequestHandler.send(
 -            request,
 -            state: WeakReference(value: callbackState),
@@ -222,7 +222,7 @@ index a767448..68c6a93 100644
 +            )
 +            throw error
 +        }
-@@ -609 +656,7 @@ extension ProtonDriveClient {
+@@ -619 +666,7 @@ extension ProtonDriveClient {
 -        try await cancelOperation(identifier: .enumerateEvents(cancellationToken))
 +        let identifier = OperationIdentifier.enumerateEvents(cancellationToken)
 +        guard let state = activeEventEnumerations.removeValue(forKey: identifier) else {
