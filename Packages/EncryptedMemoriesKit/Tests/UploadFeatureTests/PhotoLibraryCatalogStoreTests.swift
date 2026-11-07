@@ -523,6 +523,33 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         try assertKeyLeavesItsWholePageUnknown("local_id=CAST(X'6B6579006B6579' AS TEXT), resources_json=X'7B'")
     }
 
+    /// A key that is not valid UTF-8 on a row whose content decodes would come back repaired as the next cursor, and
+    /// `local_id>?` would return the row again, so a pass could never end (#1212).
+    func testOpenCatalogRowWithAnInvalidUTF8KeyAndDecodableContentLeavesItsWholePageUnknown() throws {
+        try assertKeyLeavesItsWholePageUnknown("local_id=CAST(X'6B6579FF' AS TEXT)")
+    }
+
+    /// A key with a NUL byte on a row whose content decodes would come back cut short as the next cursor (#1212).
+    func testOpenCatalogRowWithANULInItsKeyAndDecodableContentLeavesItsWholePageUnknown() throws {
+        try assertKeyLeavesItsWholePageUnknown("local_id=CAST(X'6B6579006B6579' AS TEXT)")
+    }
+
+    /// A key stored as a BLOB sorts after every text key, so `local_id>?` would return it again after its own text as
+    /// the cursor (#1212).
+    func testOpenCatalogRowWithABlobKeyLeavesItsWholePageUnknown() throws {
+        try assertKeyLeavesItsWholePageUnknown("local_id=X'7A7A'")
+    }
+
+    /// An INTEGER key sorts before every text key and would come back as its decimal text (#1212).
+    func testOpenCatalogRowWithAnIntegerKeyLeavesItsWholePageUnknown() throws {
+        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        try assertKeyLeavesItsWholePageUnknown { store in
+            store.close()
+            try storeIntegerCatalogKey(5, replacing: "damaged", inClosedCatalogAt: url)
+            return try makeStore()
+        }
+    }
+
     /// An undecodable row last on a mixed page still moves the cursor past it.
     func testMixedPageEndsOnItsLastUndecodableRow() throws {
         let store = try makeStore()
@@ -541,16 +568,27 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
     /// A row whose key cannot be read exactly cannot be reported per row: its page is unknown, not shorter,
     /// and the failure stays recorded on the open store.
     private func assertKeyLeavesItsWholePageUnknown(_ assignment: String) throws {
-        let store = try makeStore()
-        defer { store.close() }
+        try assertKeyLeavesItsWholePageUnknown { store in
+            try updateCatalogFile("UPDATE photo_catalog SET \(assignment) WHERE local_id='damaged';")
+            return store
+        }
+    }
+
+    /// `damage` returns the store to check: the same one, or one opened again on the damaged file.
+    private func assertKeyLeavesItsWholePageUnknown(
+        damage: (PhotoLibraryCatalogManifestStore) throws -> PhotoLibraryCatalogManifestStore
+    ) throws {
+        let seeded = try makeStore()
+        defer { seeded.close() }
         XCTAssertTrue(
-            store.upsertBatch([
+            seeded.upsertBatch([
                 entry(from: photoInfo(id: "damaged"), at: 100), entry(from: photoInfo(id: "later"), at: 100),
             ]))
-        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
-        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["kept"]))
-        XCTAssertTrue(store.synchronizeToDisk())
-        try updateCatalogFile("UPDATE photo_catalog SET \(assignment) WHERE local_id='damaged';")
+        XCTAssertTrue(seeded.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(seeded.appendFullScanSnapshotIdentifiers(["kept"]))
+        XCTAssertTrue(seeded.synchronizeToDisk())
+        let store = try damage(seeded)
+        defer { store.close() }
 
         XCTAssertNil(
             store.presentEntries(afterLocalIdentifier: nil, limit: 10),

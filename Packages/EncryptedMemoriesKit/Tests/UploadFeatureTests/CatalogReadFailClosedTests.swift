@@ -585,6 +585,221 @@ final class CatalogReadFailClosedTests: XCTestCase {
         XCTAssertNil(store.reconciledMissingSourceGeneration(), "the sweep stays owed while a row is unknown")
     }
 
+    // MARK: - Unknown rows on the other catalog paths (#1212)
+
+    /// Photos now lists the rendered file of an edit whose stored row cannot be decoded. The unknown row may have
+    /// recorded the original as main photo, so the scan re-opens the edit, and it goes on with the other photos.
+    func testAnUndecodableStoredRowReopensTheLateRenderAndKeepsTheScanGoing() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch(["a", "b"].map { entry(photo($0)) }))
+        try corrupt("a", in: store)
+        let engine = Enqueuer()
+
+        _ = try await sync(store, infos: ["a", "b"].map { edit($0, modified: 1_700_000_200) }, at: 200)
+            .run(engine: engine, identifiers: ["a", "b"])
+
+        XCTAssertEqual(engine.reopened, ["a", "b"], "the unknown row re-opens like a known row without the render")
+        XCTAssertEqual(engine.enqueued, ["a", "b"], "the unknown row holds back no photo")
+        XCTAssertTrue(store.isOperational())
+        let rewritten = try XCTUnwrap(try store.entry(for: "a"), "the chunk rewrites the unknown row")
+        XCTAssertTrue(PhotoBackupAssetPlanner.listsRender(PhotoLibraryCatalogMapper.info(for: rewritten)))
+    }
+
+    /// The upload metadata reads the cloud identifier that the catalog holds. An unknown row answers nil, so the
+    /// metadata asks Photos, and the row changes neither the store nor the answer for another photo.
+    func testAnUnknownRowLeavesTheCloudIdentifierToPhotos() throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(
+            store.upsertBatch(
+                ["a", "b"].map {
+                    var info = photo($0)
+                    info.cloudIdentifier = "cloud-\($0)"
+                    return entry(info)
+                }))
+        try corrupt("a", in: store)
+
+        XCTAssertNil(store.cachedCloudIdentifier(for: "a"))
+        XCTAssertTrue(store.isOperational(), "an undecodable row is its own unknown, not a store failure")
+        XCTAssertEqual(store.cachedCloudIdentifier(for: "b"), "cloud-b")
+    }
+
+    /// A key that is not valid UTF-8, on a row whose content decodes, would come back repaired as the next cursor, and
+    /// `local_id>?` would return the row again. The pass must stop with an unknown page instead of paging forever.
+    func testAHealthyRowWithADamagedKeyStopsTheLateRenderPassInsteadOfLooping() async throws {
+        try await assertDamagedKeyStopsTheLateRenderPass(reaching: ["a"]) { store in
+            try changeCatalog(store, "UPDATE photo_catalog SET local_id=CAST(X'7AFF' AS TEXT) WHERE local_id='z';")
+            return store
+        }
+    }
+
+    /// A key stored as a BLOB with valid UTF-8 sorts after every text key. Read as text, it would become the cursor,
+    /// and `local_id>?` would return the same BLOB again.
+    func testAHealthyRowWithABlobKeyStopsTheLateRenderPassInsteadOfLooping() async throws {
+        try await assertDamagedKeyStopsTheLateRenderPass(reaching: ["a"]) { store in
+            try changeCatalog(store, "UPDATE photo_catalog SET local_id=X'7A7A' WHERE local_id='z';")
+            return store
+        }
+    }
+
+    /// An INTEGER key sorts before every text key, so the first page meets it before any other row.
+    func testAHealthyRowWithAnIntegerKeyStopsTheLateRenderPass() async throws {
+        try await assertDamagedKeyStopsTheLateRenderPass(reaching: []) { store in
+            try reopen(store) { try storeIntegerCatalogKey(5, replacing: "z", inClosedCatalogAt: $0) }
+        }
+    }
+
+    /// `local_id>?` never returns a row without a key. A late-render pass that resumes after a saved key must not
+    /// reach the end past that row and record itself complete.
+    func testARowWithoutAKeyKeepsAResumedLateRenderPassOwed() async throws {
+        try await assertKeyBeforeTextKeepsAResumedLateRenderPassOwed { store in
+            try changeCatalog(store, "UPDATE photo_catalog SET local_id=NULL WHERE local_id='c';")
+            return store
+        }
+    }
+
+    /// An INTEGER key sorts before every text key, so `local_id>?` never returns it either.
+    func testARowWithAnIntegerKeyKeepsAResumedLateRenderPassOwed() async throws {
+        try await assertKeyBeforeTextKeepsAResumedLateRenderPassOwed { store in
+            try reopen(store) { try storeIntegerCatalogKey(5, replacing: "c", inClosedCatalogAt: $0) }
+        }
+    }
+
+    /// Closes `store`, lets `damage` change its file, and opens the catalog again.
+    private func reopen(
+        _ store: PhotoLibraryCatalogManifestStore, after damage: (URL) throws -> Void
+    ) throws -> PhotoLibraryCatalogManifestStore {
+        store.close()
+        try damage(directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName))
+        return try makeCatalog()
+    }
+
+    /// Damages the key of the last of the edits "a" and "z", then runs one late-render pass for at most 10 seconds.
+    /// `damage` returns the store to use: the same one, or one opened again on the damaged file.
+    private func assertDamagedKeyStopsTheLateRenderPass(
+        reaching reached: [String],
+        damage: (PhotoLibraryCatalogManifestStore) throws -> PhotoLibraryCatalogManifestStore,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let seeded = try makeCatalog()
+        XCTAssertTrue(seeded.upsertBatch(["a", "z"].map { entry(edit($0)) }), file: file, line: line)
+        XCTAssertTrue(seeded.synchronizeToDisk(), file: file, line: line)
+        let store = try damage(seeded)
+        let pass = sync(store, chunkSize: 1)
+        let engine = Enqueuer()
+
+        let outcome = await boundedRun(seconds: 10) { try await pass.reconcileLateRendersOnce(engine: engine) }
+
+        guard case .failure(let error) = try XCTUnwrap(outcome, "the pass must end, not page the same row forever")
+        else { return XCTFail("a damaged key must stop the pass", file: file, line: line) }
+        XCTAssertEqual(
+            error as? UploadError, .backend("Photo library catalog could not be read"), file: file, line: line)
+        XCTAssertEqual(
+            engine.reopened, reached, "the pass reached the rows before the damaged key", file: file, line: line)
+        XCTAssertFalse(store.hasReconciledLateRenders(), file: file, line: line)
+        XCTAssertFalse(
+            store.isOperational(), "a damaged key means deeper damage and keeps the store failed", file: file,
+            line: line)
+    }
+
+    /// Resumes a late-render pass after "a" over the edits "a", "b" and "c", with the key of "c" damaged.
+    /// `damage` returns the store to use: the same one, or one opened again on the damaged file.
+    private func assertKeyBeforeTextKeepsAResumedLateRenderPassOwed(
+        damage: (PhotoLibraryCatalogManifestStore) throws -> PhotoLibraryCatalogManifestStore,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let seeded = try makeCatalog()
+        XCTAssertTrue(seeded.upsertBatch(["a", "b", "c"].map { entry(edit($0)) }), file: file, line: line)
+        XCTAssertTrue(seeded.recordLateRenderSweepResumePoint("a"), file: file, line: line)
+        XCTAssertTrue(seeded.synchronizeToDisk(), file: file, line: line)
+        let store = try damage(seeded)
+        let engine = Enqueuer()
+
+        do {
+            try await sync(store, chunkSize: 1).reconcileLateRendersOnce(engine: engine)
+            XCTFail("a key before every text key leaves the end of the catalog unknown", file: file, line: line)
+        } catch {
+            XCTAssertEqual(
+                error as? UploadError, .backend("Photo library catalog could not be read"), file: file, line: line)
+        }
+
+        XCTAssertEqual(
+            engine.reopened, ["b"], "the pass still reached the rows before the end", file: file, line: line)
+        XCTAssertFalse(store.hasReconciledLateRenders(), "the pass stays owed", file: file, line: line)
+        XCTAssertFalse(
+            store.isOperational(), "a damaged key means deeper damage and keeps the store failed", file: file,
+            line: line)
+    }
+
+    /// The missing-source sweep resumes after its saved key, too, and must not complete past a row without a key.
+    func testARowWithoutAKeyKeepsAResumedMissingSourceSweepOwed() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch(["a", "b", "c"].map { entry(photo($0)) }))
+        XCTAssertTrue(
+            store.recordMissingSourceSweepProgress(
+                PhotoLibraryMissingSourceSweepProgress(generation: Enqueuer.generation, afterLocalIdentifier: "a")))
+        try changeCatalog(store, "UPDATE photo_catalog SET local_id=NULL WHERE local_id='c';")
+        let engine = Enqueuer()
+
+        do {
+            try await sync(store, chunkSize: 1).reconcileMissingSources(engine: engine)
+            XCTFail("a row without a key leaves the end of the catalog unknown")
+        } catch {
+            XCTAssertEqual(error as? UploadError, .backend("Photo library catalog could not be read"))
+        }
+
+        XCTAssertEqual(engine.recovered, ["b"], "the sweep still reached the rows before the end")
+        XCTAssertNotEqual(store.reconciledMissingSourceGeneration(), Enqueuer.generation, "the sweep stays owed")
+    }
+
+    /// A failed check for rows without a key is unknown, not "no such row": the resumed pass stays owed, and the next
+    /// pass completes once the check reads.
+    func testAFailedCheckForRowsWithoutAKeyNeverCompletesTheResumedPass() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch(["a", "b"].map { entry(edit($0)) }))
+        XCTAssertTrue(store.recordLateRenderSweepResumePoint("a"))
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT typeof(local_id) FROM photo_catalog")
+        do {
+            try await sync(store, chunkSize: 1).reconcileLateRendersOnce(engine: Enqueuer())
+            XCTFail("an unknown end must stop the pass")
+        } catch {}
+        fault.stop()
+
+        XCTAssertTrue(fault.fired)
+        XCTAssertFalse(store.hasReconciledLateRenders(), "an unknown end is not the end of the catalog")
+        XCTAssertTrue(store.isOperational(), "the probe clears the transient interrupt")
+        try await sync(store, chunkSize: 1).reconcileLateRendersOnce(engine: Enqueuer())
+        XCTAssertTrue(store.hasReconciledLateRenders(), "the next pass completes once the check reads")
+    }
+
+    /// Runs `sql` on the store's own connection, as damage from outside the store would leave the file.
+    private func changeCatalog(_ store: PhotoLibraryCatalogManifestStore, _ sql: String) throws {
+        let connection = try storeConnection(store)
+        XCTAssertEqual(connection.withLock { sqlite3_exec(connection.database, sql, nil, nil, nil) }, SQLITE_OK)
+    }
+
+    /// Runs `pass` for at most `seconds`. Nil when it did not end in time; the pass is then cancelled.
+    private func boundedRun(
+        seconds: Int, _ pass: @escaping @Sendable () async throws -> Void
+    ) async -> Result<Void, any Error>? {
+        await withTaskGroup(of: Result<Void, any Error>?.self) { group in
+            group.addTask {
+                do {
+                    try await pass()
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(seconds))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
     private func makeReplayQueue() async throws -> (UploadBackupSyncQueueManifestStore, UploadBackupSyncEngine) {
         let queueURL = directory.appendingPathComponent(
             await PhotoLibraryBackupController.queueDatabaseFileName)

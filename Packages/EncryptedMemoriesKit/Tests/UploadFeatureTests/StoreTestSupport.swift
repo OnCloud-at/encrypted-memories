@@ -117,3 +117,44 @@ final class SQLiteRecordedFailure {
         }
     }
 }
+
+/// Stores `key` as an INTEGER in `local_id` of the catalog row `localIdentifier`, as only damage to the file can: SQL
+/// converts a number to text for a TEXT column, and this SQLite refuses `writable_schema`. With the store closed, the
+/// declared type in the file becomes BLOB, which has the same length, for one update, and then TEXT again.
+func storeIntegerCatalogKey(_ key: Int, replacing localIdentifier: String, inClosedCatalogAt url: URL) throws {
+    func withDatabase<Value>(_ body: (OpaquePointer) throws -> Value) throws -> Value {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        let database = try XCTUnwrap(handle)
+        defer { sqlite3_close(database) }
+        return try body(database)
+    }
+    func run(_ sql: String) throws {
+        try withDatabase { database in
+            XCTAssertEqual(
+                sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK, String(cString: sqlite3_errmsg(database)))
+        }
+    }
+    func text(_ sql: String) throws -> String? {
+        try withDatabase { database in
+            var stmt: OpaquePointer?
+            XCTAssertEqual(sqlite3_prepare_v2(database, sql, -1, &stmt, nil), SQLITE_OK)
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW, let value = sqlite3_column_text(stmt, 0) else { return nil }
+            return String(cString: value)
+        }
+    }
+    func declare(_ from: String, as to: String) throws {
+        try run("PRAGMA wal_checkpoint(TRUNCATE);")
+        var image = try Data(contentsOf: url)
+        let range = try XCTUnwrap(image.range(of: Data(from.utf8)), "the file declares \(from)")
+        image.replaceSubrange(range, with: Data(to.utf8))
+        try image.write(to: url)
+    }
+    let textKey = "local_id            TEXT PRIMARY KEY"
+    let blobKey = "local_id            BLOB PRIMARY KEY"
+    try declare(textKey, as: blobKey)
+    try run("UPDATE photo_catalog SET local_id=\(key) WHERE local_id='\(localIdentifier)';")
+    try declare(blobKey, as: textKey)
+    XCTAssertEqual(try text("SELECT local_id FROM photo_catalog WHERE typeof(local_id)='integer';"), "\(key)")
+}
