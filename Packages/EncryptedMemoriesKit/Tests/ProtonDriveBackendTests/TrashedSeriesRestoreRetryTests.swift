@@ -11,11 +11,9 @@ extension DriveSessionStubSuite {
         @Test(arguments: [false, true])
         func aFailedFrameCheckLeavesTheMainInTrashAndReportsTheExistingError(knownFrames: Bool) async throws {
             let main = PhotoUID(volumeID: "own-volume", nodeID: "main")
-            var deleted = RecentlyDeletedIdentities(listing: nil)
-            if knownFrames {
-                deleted.listedRelatedPhotos([main: [PhotoUID(volumeID: "own-volume", nodeID: "frame")]])
-            }
-            let fixture = try await RestoreWithoutTrashListingTests.Fixture(frameTrashTime: 1001, deleted: deleted)
+            let fixture = try await RestoreWithoutTrashListingTests.Fixture(
+                frameTrashTime: 1001,
+                checkedCandidates: knownFrames ? [main: [PhotoUID(volumeID: "own-volume", nodeID: "frame")]] : nil)
             defer { fixture.close() }
             StubURLProtocol.fail(
                 knownFrames
@@ -256,9 +254,9 @@ extension DriveSessionStubSuite {
             "partial", "missingLinks", "missingState", "unknownState", "missingPhoto", "omittedFrame", "duplicate",
         ])
         func incompletePreflightNeverSendsAMainRestore(kind: String) async throws {
-            var deleted = RecentlyDeletedIdentities(listing: nil)
-            deleted.listedRelatedPhotos([main: [PhotoUID(volumeID: "own-volume", nodeID: "frame")]])
-            let fixture = try await RestoreWithoutTrashListingTests.Fixture(frameTrashTime: 1001, deleted: deleted)
+            let fixture = try await RestoreWithoutTrashListingTests.Fixture(
+                frameTrashTime: 1001,
+                checkedCandidates: [main: [PhotoUID(volumeID: "own-volume", nodeID: "frame")]])
             defer { fixture.close() }
             let valid = metadata(mainState: 2)
             let body: String

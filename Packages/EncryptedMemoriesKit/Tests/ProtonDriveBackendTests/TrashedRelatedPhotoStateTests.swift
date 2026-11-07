@@ -31,9 +31,8 @@ extension DriveSessionStubSuite {
         private func checkReread(_ mainJSON: String, expectedRestores: [[String]]) async throws {
             let main = PhotoUID(volumeID: "own-volume", nodeID: "main")
             let frame = PhotoUID(volumeID: "own-volume", nodeID: "frame")
-            var deleted = RecentlyDeletedIdentities(listing: nil)
-            deleted.listedRelatedPhotos([main: [frame]])
-            let fixture = try await RestoreWithoutTrashListingTests.Fixture(frameTrashTime: 1001, deleted: deleted)
+            let fixture = try await RestoreWithoutTrashListingTests.Fixture(
+                frameTrashTime: 1001, checkedCandidates: [main: [frame]])
             defer { fixture.close() }
             let before = #"""
                 {"Code":1000,"Links":[

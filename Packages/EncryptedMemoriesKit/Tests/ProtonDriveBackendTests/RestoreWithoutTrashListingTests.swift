@@ -53,21 +53,18 @@ extension DriveSessionStubSuite {
 
         // MARK: When the listing is not needed
 
-        @Test func aListingThatAppliedInThisSessionCostsNoSecondListing() async throws {
-            var deleted = RecentlyDeletedIdentities(listing: nil)
-            let ticket = deleted.beginListing()
-            _ = deleted.received([], ticket: ticket)
-            let fixture = try await Fixture(frameTrashTime: 1001, deleted: deleted)
+        @Test func checkedCandidatesWithoutAFrameCostNoListing() async throws {
+            let fixture = try await Fixture(frameTrashTime: 1001, checkedCandidates: [:])
             defer { fixture.close() }
             _ = await fixture.effects.restore([main])
             #expect(fixture.listings() == 0)
-            #expect(try fixture.restoredLinkIDs() == [["main"]], "the applied listing knew no frame")
+            #expect(try fixture.restoredLinkIDs() == [["main"]], "the checked listing knew no frame")
         }
 
         @Test func aKnownFrameCostsNoListing() async throws {
-            var deleted = RecentlyDeletedIdentities(listing: nil)
-            deleted.listedRelatedPhotos([main: [PhotoUID(volumeID: "own-volume", nodeID: "frame")]])
-            let fixture = try await Fixture(frameTrashTime: 1001, deleted: deleted)
+            let fixture = try await Fixture(
+                frameTrashTime: 1001,
+                checkedCandidates: [main: [PhotoUID(volumeID: "own-volume", nodeID: "frame")]])
             defer { fixture.close() }
             _ = await fixture.effects.restore([main])
             #expect(fixture.listings() == 0)
@@ -160,7 +157,7 @@ extension DriveSessionStubSuite {
             private let removesDirectoryOnClose: Bool
 
             init(
-                frameTrashTime: Int64, deleted: RecentlyDeletedIdentities = RecentlyDeletedIdentities(listing: nil),
+                frameTrashTime: Int64, checkedCandidates: [PhotoUID: [PhotoUID]]? = nil,
                 listingStatus: Int = 200, rateLimited: RateLimited? = nil, hangListing: Bool = false,
                 ownedDirectory: URL? = nil, seriesRestoreRetry: BackupRetryPolicy = .init(baseDelay: 60, maxDelay: 900)
             ) async throws {
@@ -187,10 +184,7 @@ extension DriveSessionStubSuite {
                 let activeMetadata = metadata.replacingOccurrences(
                     of: "\"LinkID\":\"main\",\"Type\":2,\"State\":2", with: "\"LinkID\":\"main\",\"Type\":2,\"State\":1"
                 )
-                let preflightReads =
-                    deleted.hasAppliedListing
-                        || !deleted.trashedRelatedPhotos(of: [PhotoUID(volumeID: "own-volume", nodeID: "main")]).isEmpty
-                    ? 1 : 2
+                let preflightReads = checkedCandidates == nil ? 2 : 1
                 StubURLProtocol.routeSequence(
                     RestoreWithoutTrashListingTests.metadataRoute,
                     responses: rateLimited == .metadata
@@ -232,11 +226,10 @@ extension DriveSessionStubSuite {
                         photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
                         recentlyDeletedStore: RecentlyDeletedListingStore(
                             directory: directory, accountUID: "fixture", keyPassword: ""),
-                        photoNames: nil, recentlyDeleted: deleted,
+                        photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
                         uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
                         uploadManifestPolicy: .conservative), seriesRestoreRetry: seriesRestoreRetry,
-                    checkedSeriesRestoreCandidates: preflightReads == 1
-                        ? deleted.trashedRelatedPhotos(of: [PhotoUID(volumeID: "own-volume", nodeID: "main")]) : nil)
+                    checkedSeriesRestoreCandidates: checkedCandidates)
                 let albums = NoAlbumBackend()
                 effects = ProtonPendingRemoteEffects(
                     trashProvider: bridge, favorites: nil,
