@@ -87,17 +87,41 @@ actor PhotoVideoStreamSource {
     private var shareKey: UnlockableKey?
     private var nodeKeyCache: [String: UnlockableKey] = [:]
 
-    init(session: DriveSession, crypto: DriveCrypto, shareID: String) {
+    /// How long after `prefetchEncrypted` resolved a clip the next `prepare` of the same clip reuses that answer.
+    /// The block addresses in the answer age with it; the lifetime of Proton block URLs is not stated in this
+    /// repository, so this value is a cautious guess. A shorter window needs only this constant.
+    nonisolated static let prefetchReuseWindow: Duration = .seconds(20)
+    private let prepareFile: (@Sendable (PhotoUID) async throws -> PreparedVideo)?
+    private let now: @Sendable () -> ContinuousClock.Instant
+    /// The clip that the last `prefetchEncrypted` prepared. One `prepare` of that clip takes it, once, within the window.
+    private var prefetched: (video: PreparedVideo, until: ContinuousClock.Instant)?
+
+    /// `prepareFile` and `now` are test seams; production resolves the file through the key chain and the clock.
+    init(
+        session: DriveSession, crypto: DriveCrypto, shareID: String,
+        prepareFile: (@Sendable (PhotoUID) async throws -> PreparedVideo)? = nil,
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
+    ) {
         self.session = session
         self.crypto = crypto
         self.shareID = shareID
+        self.prepareFile = prepareFile
+        self.now = now
     }
 
     /// Resolves keys + block map for the file `uid`. Throws `.notAVideo` if the link isn't a video
     /// (after the full key/XAttr resolve, since the UTI comes from the resolved link), so the viewer
     /// can fall back to the image path.
     func prepare(uid: PhotoUID) async throws -> PreparedVideo {
-        let prepared = try await prepareAnyFile(uid: uid)
+        if let kept = prefetched {
+            prefetched = nil
+            if kept.video.uid == uid, now() < kept.until { return kept.video }
+        }
+        return try await prepareVideo(uid: uid)
+    }
+
+    private func prepareVideo(uid: PhotoUID) async throws -> PreparedVideo {
+        let prepared = try await resolveFile(uid: uid)
         guard
             prepared.contentTypeUTI.hasPrefix("public.movie")
                 || prepared.contentTypeUTI.hasPrefix("public.video")
@@ -166,6 +190,11 @@ actor PhotoVideoStreamSource {
             throw StreamingError.incompleteStream(streamed: streamed, expected: prepared.totalSize)
         }
         onProgress(1)
+    }
+
+    private func resolveFile(uid: PhotoUID) async throws -> PreparedVideo {
+        if let prepareFile { return try await prepareFile(uid) }
+        return try await prepareAnyFile(uid: uid)
     }
 
     private func prepareAnyFile(uid: PhotoUID) async throws -> PreparedVideo {
@@ -310,11 +339,15 @@ actor PhotoVideoStreamSource {
 
     /// Fully downloads the clip's encrypted blocks into the shared range cache (no plaintext written anywhere),
     /// so a later streaming play serves entirely from local encrypted bytes. Used after a Live Photo motion
-    /// request and before playback starts. Idempotent: skips blocks already cached.
+    /// request and before playback starts. Idempotent: skips blocks already cached. A completed prefetch keeps the
+    /// prepared clip for one `prepare` of the same clip until `prefetchReuseWindow` after the prefetch started to
+    /// resolve it, so the player does not resolve the same link and revision again. A prefetch always resolves the
+    /// clip itself and never takes the clip that an earlier prefetch kept.
     func prefetchEncrypted(uid: PhotoUID) async throws {
         let cache = VideoByteRangeCache.shared
         let ownerGeneration = cache.captureOwnerGeneration()
-        let prepared = try await prepare(uid: uid)
+        let started = now()
+        let prepared = try await prepareVideo(uid: uid)
         for block in prepared.blocks {
             try Task.checkCancellation()
             let lookup = await cache.lookupAsync(uid: prepared.uid, block: block.index)
@@ -328,6 +361,8 @@ actor PhotoVideoStreamSource {
                 ownerGeneration: ownerGeneration
             )
         }
+        // The streaming asset that follows prepares the same clip: hand it this answer instead of two more requests.
+        prefetched = (prepared, started + Self.prefetchReuseWindow)
     }
 
     // MARK: - Key chain
