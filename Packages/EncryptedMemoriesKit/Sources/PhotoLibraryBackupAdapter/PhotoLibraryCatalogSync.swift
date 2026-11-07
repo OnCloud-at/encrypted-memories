@@ -410,17 +410,17 @@ public struct PhotoLibraryCatalogSync: Sendable {
     public func reconcileLateRendersOnce(engine: any UploadBackupCandidateEnqueueing) async throws {
         guard !store.hasReconciledLateRenders() else { return }
         // A failed read leaves the store not operational, and the first page below throws.
-        var cursor = store.lateRenderSweepResumePoint()
+        var progress = PhotoLibraryCatalogPassProgress(after: store.lateRenderSweepResumePoint())
         while true {
             try Task.checkCancellation()
             // An unknown page is not the end of the catalog; the pass stays owed (#1004).
-            guard let page = store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize),
+            guard let page = store.presentEntries(afterLocalIdentifier: progress.cursor, limit: chunkSize),
                 store.isOperational()
             else {
                 throw UploadError.backend("Photo library catalog could not be read")
             }
-            guard let last = page.last else { break }
-            let reopenings = page.compactMap { entry -> UploadBackupReopening? in
+            guard case .advanced(let resumePoint) = progress.advance(past: page) else { break }
+            let reopenings = page.entries.compactMap { entry -> UploadBackupReopening? in
                 let info = PhotoLibraryCatalogMapper.info(for: entry)
                 // The catalog keeps no adjustment state; a listed rendered file next to the original marks the edit.
                 guard PhotoBackupAssetPlanner.listsRender(info),
@@ -438,11 +438,16 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 }
                 if !pending.isEmpty { _ = try await engine.enqueueBatch(pending) }
             }
-            cursor = last.localIdentifier
-            guard store.recordLateRenderSweepResumePoint(last.localIdentifier) else {
-                throw UploadError.backend("Photo library catalog could not be updated")
+            // After a page with an unknown row, the saved resume point stays before it, so the next pass reads it
+            // again and retries the row (#1160).
+            if let resumePoint {
+                guard store.recordLateRenderSweepResumePoint(resumePoint) else {
+                    throw UploadError.backend("Photo library catalog could not be updated")
+                }
             }
         }
+        // While a row is unknown, the pass cannot be recorded as reconciled; it stays owed (#1160).
+        guard progress.mayComplete(countingUnknownRowsAs: "backup.lateRenders.undecodableRow") else { return }
         guard store.markLateRendersReconciled() else {
             throw UploadError.backend("Photo library catalog could not be updated")
         }
@@ -454,11 +459,11 @@ public struct PhotoLibraryCatalogSync: Sendable {
     public func reconcileMissingSources(engine: any UploadBackupCandidateEnqueueing) async throws {
         let generation = try await engine.missingSourceDiscardGeneration()
         let completed = store.reconciledMissingSourceGeneration()
-        let progress = store.missingSourceSweepProgress()
+        let savedProgress = store.missingSourceSweepProgress()
         guard store.isOperational() else { throw UploadError.backend("Photo library catalog could not be read") }
         var sweep: PhotoLibraryMissingSourceSweepProgress
-        if let progress {
-            sweep = progress
+        if let savedProgress {
+            sweep = savedProgress
         } else {
             guard completed != generation else { return }
             sweep = PhotoLibraryMissingSourceSweepProgress(generation: generation)
@@ -466,22 +471,39 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 throw UploadError.backend("Photo library catalog could not be updated")
             }
         }
+        var progress = PhotoLibraryCatalogPassProgress(after: sweep.afterLocalIdentifier)
         while true {
             try Task.checkCancellation()
             // An unknown page is not the end of the catalog; the sweep stays owed (#1004).
-            guard let page = store.presentEntries(afterLocalIdentifier: sweep.afterLocalIdentifier, limit: chunkSize),
+            guard let page = store.presentEntries(afterLocalIdentifier: progress.cursor, limit: chunkSize),
                 store.isOperational()
             else { throw UploadError.backend("Photo library catalog could not be read") }
-            guard let last = page.last else { break }
-            let candidates = page.compactMap {
+            guard case .advanced(let resumePoint) = progress.advance(past: page) else { break }
+            let candidates = page.entries.compactMap {
                 PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
             }
             try await engine.enqueueMissingSources(candidates)
-            sweep.afterLocalIdentifier = last.localIdentifier
-            guard store.recordMissingSourceSweepProgress(sweep) else {
-                throw UploadError.backend("Photo library catalog could not be updated")
+            // After a page with an unknown row, the saved progress stays before it, so the next sweep reads it
+            // again and retries the row (#1160).
+            if let resumePoint {
+                sweep.afterLocalIdentifier = resumePoint
+                guard store.recordMissingSourceSweepProgress(sweep) else {
+                    throw UploadError.backend("Photo library catalog could not be updated")
+                }
             }
             await Task.yield()
+        }
+        // While a row is unknown, the sweep cannot record itself complete; it stays owed (#1160).
+        guard progress.mayComplete(countingUnknownRowsAs: "backup.missingSources.undecodableRow") else {
+            // A discard since this sweep began can drop photos on pages before the saved progress. The next sweep
+            // then starts again on the first page for the current generation and still reads the unknown row.
+            if generation != sweep.generation {
+                let restart = PhotoLibraryMissingSourceSweepProgress(generation: generation)
+                guard store.recordMissingSourceSweepProgress(restart) else {
+                    throw UploadError.backend("Photo library catalog could not be updated")
+                }
+            }
+            return
         }
         guard store.completeMissingSourceSweep(generation: sweep.generation) else {
             throw UploadError.backend("Photo library catalog could not be updated")

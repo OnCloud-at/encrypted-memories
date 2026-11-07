@@ -170,9 +170,9 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertTrue(store.markRemoved(["B"], removedAt: Date()).succeeded)
 
         let first = try XCTUnwrap(store.presentEntries(afterLocalIdentifier: nil, limit: 1))
-        let second = try XCTUnwrap(store.presentEntries(afterLocalIdentifier: first.last?.localIdentifier, limit: 10))
+        let second = try XCTUnwrap(store.presentEntries(afterLocalIdentifier: first.lastLocalIdentifier, limit: 10))
 
-        XCTAssertEqual((first + second).map(\.localIdentifier), ["A", "C"])
+        XCTAssertEqual((first.entries + second.entries).map(\.localIdentifier), ["A", "C"])
     }
 
     func testTwentyThousandCatalogBatchStructuralSmoke() throws {
@@ -450,7 +450,9 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertEqual(try store.fullScanProgress()?.cursor, 0, "the stable frontier must not pass unqueued work")
     }
 
-    func testOpenCatalogDecodeFailureStaysStickyAcrossSuccessfulSQLAndRejectsDurabilityAndAppend() throws {
+    /// An undecodable row is unknown for its own identifier only: the strict single read still throws,
+    /// and the open store stays operational for durability, snapshot appends, and every other row (#1160).
+    func testOpenCatalogDecodeFailureStaysUnknownForItsRowWhileTheStoreStaysOperational() throws {
         let store = try makeStore()
         defer { store.close() }
         XCTAssertTrue(store.upsertBatch([entry(from: photoInfo(id: "corrupt"), at: 100)]))
@@ -473,16 +475,93 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
 
         XCTAssertThrowsError(
             try store.entry(for: "corrupt"), "a malformed resource blob is unknown on the open store, not absent")
-        XCTAssertFalse(store.isOperational())
-        XCTAssertFalse(store.synchronizeToDisk(), "an open handle with a recorded failure cannot prove durability")
-        XCTAssertFalse(store.appendFullScanSnapshotIdentifiers(["rejected"]))
-        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept"])
+        XCTAssertTrue(store.isOperational(), "an undecodable row is its own unknown, not a store failure")
+        XCTAssertTrue(store.synchronizeToDisk(), "an operational handle can still prove durability")
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["accepted"]))
+        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept", "accepted"])
+        let page = try XCTUnwrap(store.presentEntries(afterLocalIdentifier: nil, limit: 10))
+        XCTAssertEqual(
+            page.undecodableIdentifiers, ["corrupt"], "the undecodable row reports itself, not the page")
 
         let later = entry(from: photoInfo(id: "later"), at: 200)
         XCTAssertTrue(store.upsertBatch([later]), "successful SQL predicates retain their existing result")
         XCTAssertEqual(try store.entry(for: "later"), later, "the handle remains open and can execute SQL")
+        XCTAssertTrue(store.isOperational(), "decoding another row keeps the store operational")
+        let secondPage = try XCTUnwrap(store.presentEntries(afterLocalIdentifier: nil, limit: 10))
+        XCTAssertEqual(secondPage.entries.map(\.localIdentifier), ["later"], "healthy rows still page")
+        XCTAssertEqual(secondPage.undecodableIdentifiers, ["corrupt"])
+        XCTAssertEqual(secondPage.lastLocalIdentifier, "later", "unknown rows keep the keyset frontier moving")
+        XCTAssertTrue(store.synchronizeToDisk())
+    }
+
+    func testOpenCatalogRowWithoutAReadableKeyLeavesItsWholePageUnknown() throws {
+        try assertKeyLeavesItsWholePageUnknown("local_id=NULL")
+    }
+
+    /// A key that is not valid UTF-8 would come back repaired and sort before the stored key, so the
+    /// cursor could never move past it (#1160).
+    func testOpenCatalogRowWithAnInvalidUTF8KeyLeavesItsWholePageUnknown() throws {
+        try assertKeyLeavesItsWholePageUnknown("local_id=CAST(X'6B6579FF' AS TEXT), resources_json=X'7B'")
+    }
+
+    /// A key with a NUL byte would bind back cut short as a cursor, so the pass could never move past it (#1160).
+    func testOpenCatalogRowWithANULInItsKeyLeavesItsWholePageUnknown() throws {
+        try assertKeyLeavesItsWholePageUnknown("local_id=CAST(X'6B6579006B6579' AS TEXT), resources_json=X'7B'")
+    }
+
+    /// An undecodable row last on a mixed page still moves the cursor past it.
+    func testMixedPageEndsOnItsLastUndecodableRow() throws {
+        let store = try makeStore()
+        defer { store.close() }
+        XCTAssertTrue(store.upsertBatch(["a", "b", "c"].map { entry(from: photoInfo(id: $0), at: 100) }))
+        XCTAssertTrue(store.synchronizeToDisk())
+        try updateCatalogFile("UPDATE photo_catalog SET resources_json=X'7B' WHERE local_id='c';")
+
+        let page = try XCTUnwrap(store.presentEntries(afterLocalIdentifier: nil, limit: 10))
+        XCTAssertEqual(page.entries.map(\.localIdentifier), ["a", "b"])
+        XCTAssertEqual(page.undecodableIdentifiers, ["c"])
+        XCTAssertEqual(page.lastLocalIdentifier, "c", "the cursor moves past the undecodable last row")
+        XCTAssertTrue(store.isOperational())
+    }
+
+    /// A row whose key cannot be read exactly cannot be reported per row: its page is unknown, not shorter,
+    /// and the failure stays recorded on the open store.
+    private func assertKeyLeavesItsWholePageUnknown(_ assignment: String) throws {
+        let store = try makeStore()
+        defer { store.close() }
+        XCTAssertTrue(
+            store.upsertBatch([
+                entry(from: photoInfo(id: "damaged"), at: 100), entry(from: photoInfo(id: "later"), at: 100),
+            ]))
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["kept"]))
+        XCTAssertTrue(store.synchronizeToDisk())
+        try updateCatalogFile("UPDATE photo_catalog SET \(assignment) WHERE local_id='damaged';")
+
+        XCTAssertNil(
+            store.presentEntries(afterLocalIdentifier: nil, limit: 10),
+            "a row without an exact key cannot be reported per row, so its page is unknown, not shorter")
+        XCTAssertFalse(store.isOperational(), "the damaged key keeps the store failed")
+        XCTAssertFalse(
+            store.synchronizeToDisk(), "an open handle with a recorded failure cannot prove durability")
+        XCTAssertFalse(store.appendFullScanSnapshotIdentifiers(["rejected"]))
+        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10), ["kept"])
+
+        let after = entry(from: photoInfo(id: "after"), at: 200)
+        XCTAssertTrue(store.upsertBatch([after]), "successful SQL predicates retain their existing result")
+        XCTAssertEqual(try store.entry(for: "after"), after, "the handle remains open and can execute SQL")
         XCTAssertFalse(store.isOperational(), "successful SQL must not reset the recorded failure")
         XCTAssertFalse(store.synchronizeToDisk())
+    }
+
+    /// Runs `sql` on the catalog file through a second connection, as damage from outside the store would.
+    private func updateCatalogFile(_ sql: String) throws {
+        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        let database = try XCTUnwrap(handle)
+        defer { sqlite3_close(database) }
+        XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
     }
 
     func testSnapshotAppendRejectsEmptyIdentifiersWithoutAppendingOrRecordingFailure() throws {
