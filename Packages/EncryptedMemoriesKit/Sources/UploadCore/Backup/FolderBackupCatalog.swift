@@ -5,13 +5,23 @@ import Foundation
 public struct FolderBackupCatalog: UploadBackupAssetCatalog {
     public let folder: URL
     public let includeHidden: Bool
+    let readAttributes: AttributeReader
+
+    /// Reads the file attributes of one path.
+    typealias AttributeReader = @Sendable (String) throws -> [FileAttributeKey: Any]
 
     public init(folder: URL, includeHidden: Bool = false) {
+        self.init(folder: folder, includeHidden: includeHidden, readAttributes: Self.readAttributes(atPath:))
+    }
+
+    init(folder: URL, includeHidden: Bool, readAttributes: @escaping AttributeReader) {
         self.folder = folder
         self.includeHidden = includeHidden
+        self.readAttributes = readAttributes
     }
 
     public func candidates() -> AsyncThrowingStream<UploadBackupAssetCandidate, any Error> {
+        let readAttributes = readAttributes
         let iterator = FolderEnumerator.stream(
             folder,
             includeHidden: includeHidden
@@ -20,7 +30,12 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
             while let entry = try await iterator.next() {
                 try Task.checkCancellation()
                 if entry.isSupported {
-                    return try Self.candidate(for: entry.url)
+                    do {
+                        return try Self.candidate(for: entry.url, readAttributes: readAttributes)
+                    } catch {
+                        if try FolderEnumerator.skipUnreadableEntry(error, in: entry.parent) { continue }
+                        throw error
+                    }
                 }
             }
             return nil
@@ -29,9 +44,21 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
 
     /// Creates one candidate from one file and reports attribute failures to the caller.
     public static func candidate(for url: URL) throws -> UploadBackupAssetCandidate {
+        try candidate(for: url, readAttributes: readAttributes(atPath:))
+    }
+
+    @Sendable
+    private static func readAttributes(atPath path: String) throws -> [FileAttributeKey: Any] {
+        try FileManager.default.attributesOfItem(atPath: path)
+    }
+
+    static func candidate(
+        for url: URL,
+        readAttributes: AttributeReader
+    ) throws -> UploadBackupAssetCandidate {
         let attributes: [FileAttributeKey: Any]
         do {
-            attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            attributes = try readAttributes(url.path)
         } catch {
             throw FolderEnumerationError(
                 operation: .attributes,
