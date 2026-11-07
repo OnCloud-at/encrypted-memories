@@ -88,9 +88,8 @@ final class EditedOriginalRevertJournalTests: XCTestCase {
     }
 
     /// F18: `decodableJournal` treats a file that was read but cannot be decoded as missing, so `revert`
-    /// starts a fresh run and `abandon` removes the file; `undecodableJournalCount` makes the skip visible.
-    /// A file that still decodes reads as present and does not count.
-    func testDecodableJournalTreatsAnUndecodableFileAsMissingAndCountsIt() throws {
+    /// starts a fresh run and `abandon` removes the file. A file that still decodes reads as present.
+    func testDecodableJournalTreatsAnUndecodableFileAsMissing() throws {
         let store = EditedOriginalRevertJournalFileStore(accountDataDirectory: tempDir)
         try store.save(.init(editedMainUID: main, originalLinkID: "original"))
         let directory = tempDir.appendingPathComponent(
@@ -101,18 +100,15 @@ final class EditedOriginalRevertJournalTests: XCTestCase {
         XCTAssertThrowsError(try store.journal(forEditedMain: main))
 
         XCTAssertNil(try store.decodableJournal(forEditedMain: main))
-        XCTAssertEqual(try store.undecodableJournalCount(), 1)
 
         let other = PhotoUID(volumeID: "volume", nodeID: "other")
         let healthy = EditedOriginalRevertJournal(editedMainUID: other, originalLinkID: "original")
         try store.save(healthy)
         XCTAssertEqual(try store.decodableJournal(forEditedMain: other), healthy)
-        XCTAssertEqual(try store.undecodableJournalCount(), 1, "only the undecodable file counts")
 
-        // An account with no journal directory at all has no undecodable files.
+        // An account with no journal directory at all has no journal.
         let empty = EditedOriginalRevertJournalFileStore(
             accountDataDirectory: tempDir.appendingPathComponent("does-not-exist"))
-        XCTAssertEqual(try empty.undecodableJournalCount(), 0)
         XCTAssertNil(try empty.decodableJournal(forEditedMain: main))
     }
 
@@ -132,9 +128,8 @@ final class EditedOriginalRevertJournalTests: XCTestCase {
 
         XCTAssertThrowsError(try store.journal(forEditedMain: main))
         XCTAssertThrowsError(try store.decodableJournal(forEditedMain: main))
-        // A resume does not silently skip the unreadable file, and the counter does not count it.
+        // A resume does not silently skip the unreadable file.
         XCTAssertThrowsError(try store.pendingJournals())
-        XCTAssertThrowsError(try store.undecodableJournalCount())
         // The path still exists: nothing removed or replaced it.
         var isDirectory: ObjCBool = false
         XCTAssertTrue(

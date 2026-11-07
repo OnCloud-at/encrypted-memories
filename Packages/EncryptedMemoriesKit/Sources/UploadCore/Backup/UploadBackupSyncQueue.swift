@@ -190,21 +190,6 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
         alreadyBackedUp + uploaded
     }
 
-    /// Successful queue outcomes, including an explicit remote deletion the backup policy respects.
-    /// `resolved` stays narrower because UI may call only actually-present items "backed up".
-    public var settledSuccessfully: Int {
-        resolved + skippedRemoteDeletions
-    }
-
-    public var progressFraction: Double {
-        guard total > 0 else { return 0 }
-        return Double(settledSuccessfully) / Double(total)
-    }
-
-    public var hasWork: Bool {
-        total > 0 && settledSuccessfully < total
-    }
-
     public mutating func include(_ state: UploadBackupSyncQueueState, count: Int = 1) {
         let count = max(0, count)
         total += count
@@ -292,12 +277,11 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry]
-    func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry]
     /// Earliest persisted eligibility time for any runnable row outside `excludedSources` (same kind and identifier,
     /// as in `claimRunnable`). Retry delays survive process death, so a restarted runner can wait for due work
     /// instead of declaring the queue drained.
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date?
-    /// Earliest eligible/backoff row for status and scheduling. Unlike `nextRunnable(limit:)`, this
+    /// Earliest eligible/backoff row for status and scheduling. Unlike `claimRunnable`, this
     /// is ordered by eligibility rather than newest-photo execution priority.
     func earliestRunnableEntry() -> UploadBackupSyncQueueEntry?
     func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry?
@@ -401,8 +385,6 @@ public extension UploadBackupSyncQueueStore {
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
     ) -> Bool? { nil }
 
-    func isOperational() -> Bool { true }
-
     func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         remove(source: source, revision: revision)
     }
@@ -421,10 +403,6 @@ public extension UploadBackupSyncQueueStore {
 
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         entries.allSatisfy(upsert)
-    }
-
-    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? {
-        nextRunnable(limit: Int.max).min { $0.updatedAt < $1.updatedAt }
     }
 
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry] {
@@ -532,12 +510,6 @@ public extension UploadBackupSyncQueueStore {
         return changed
     }
 
-    func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool { false }
-
-    func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
-        true
-    }
-
     func removeUnsavedEarlierRevisions(
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool {
@@ -553,8 +525,6 @@ public extension UploadBackupSyncQueueStore {
         }
         return true
     }
-
-    func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int { 0 }
 
     @discardableResult
     func dismissPermanentFailure(

@@ -75,9 +75,6 @@ public protocol EditedOriginalRevertJournalStore: Sendable {
     /// `abandon` use it, so an undecodable journal is not a dead end for its photo: `revert` starts a
     /// fresh run over it, and `abandon` removes the file. A file that cannot be read still throws.
     func decodableJournal(forEditedMain mainUID: PhotoUID) throws -> EditedOriginalRevertJournal?
-    /// The number of stored files that cannot be decoded. The host can surface the count after a resume, so a
-    /// journal that `pendingJournals` skipped is visible instead of silent.
-    func undecodableJournalCount() throws -> Int
     func save(_ journal: EditedOriginalRevertJournal) throws
     func remove(forEditedMain mainUID: PhotoUID) throws
     /// Operations that a crash or an error interrupted. After account activation the host resumes only
@@ -110,19 +107,6 @@ public struct EditedOriginalRevertJournalFileStore: EditedOriginalRevertJournalS
         return try? JSONDecoder().decode(EditedOriginalRevertJournal.self, from: data)
     }
 
-    public func undecodableJournalCount() throws -> Int {
-        guard FileManager.default.fileExists(atPath: directory.path) else { return 0 }
-        var count = 0
-        for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        where url.pathExtension == "json" {
-            // A read error still throws, so only content that was read but cannot be decoded is counted.
-            let data = try Data(contentsOf: url)
-            let decoded = try? JSONDecoder().decode(EditedOriginalRevertJournal.self, from: data)
-            if decoded == nil { count += 1 }
-        }
-        return count
-    }
-
     public func save(_ journal: EditedOriginalRevertJournal) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(journal).write(to: fileURL(for: journal.editedMainUID), options: .atomic)
@@ -144,7 +128,7 @@ public struct EditedOriginalRevertJournalFileStore: EditedOriginalRevertJournalS
             let data = try Data(contentsOf: url)
             // Undecodable but readable content skips only this journal: its edited photo stays untouched in
             // the library. The photo is not stuck: `revert` starts a fresh run over the undecodable file, and
-            // `abandon` removes it, and `undecodableJournalCount` makes the skip visible to the host.
+            // `abandon` removes it.
             if let journal = try? JSONDecoder().decode(EditedOriginalRevertJournal.self, from: data) {
                 pending.append(journal)
             }

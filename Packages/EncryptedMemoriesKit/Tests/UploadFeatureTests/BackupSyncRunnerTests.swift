@@ -561,7 +561,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         try inner.containsAny(in: states)
     }
 
-    func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
+    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? { inner.earliestRunnableEntry() }
 
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
         if failsRunnableDateRead {
@@ -676,7 +676,7 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
         try inner.containsAny(in: states)
     }
 
-    func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
+    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? { inner.earliestRunnableEntry() }
     func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
         inner.nextRunnableDate(excludingSourcesOf: excludedSources)
     }
@@ -1955,7 +1955,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(summary.failed, 0)
         XCTAssertEqual(summary.dismissedFailures, 0)
         XCTAssertEqual(summary.pendingSourceRechecks, 0)
-        XCTAssertFalse(summary.hasWork)
+        XCTAssertEqual(summary.total, 1)
         XCTAssertFalse(row.isDismissedSourceRecheck)
     }
 
@@ -2235,15 +2235,6 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolved?.secondaries.map(\.descriptor.filename), ["live.mov"])
         XCTAssertEqual(
             resolver.omissionRequests(for: entry.source.identifier), [], "the default resolves the whole entry")
-
-        // The composite forwards the runner's permission to the resolver of the source kind.
-        resolver.setPairedVideoReportedMissing("live.mov", for: entry.source.identifier)
-        let composite = CompositeBackupResourceResolver([.fileURL: resolver])
-        let omitted = try await composite.resolve(
-            entry, onPreparationProgress: { _ in }, readAdmission: {}, omittingMissingPairedVideo: true)
-        XCTAssertEqual(omitted?.omitsMissingPairedVideo, true)
-        XCTAssertEqual(omitted?.secondaries.isEmpty, true)
-        XCTAssertEqual(resolver.omissionRequests(for: entry.source.identifier), [true])
     }
 
     // MARK: - The first index build and the timeline order pass
@@ -6318,24 +6309,6 @@ final class BackupSyncRunnerTests: XCTestCase {
                 .init(phase: .preparing),
             ]
         )
-    }
-
-    func testCompositeResolverRoutesAndRejectsUnknownKinds() async throws {
-        let composite = CompositeBackupResourceResolver([.fileURL: resolver])
-        let fileEntry = seedEntry("routed.jpg")
-        let resolved = try await composite.resolve(fileEntry)
-        XCTAssertEqual(resolved?.descriptor.filename, "routed.jpg")
-
-        let photoEntry = UploadBackupSyncQueueEntry(
-            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-1"),
-            revision: UploadBackupRevision(rawValue: 1),
-            originalFilename: "IMG.HEIC",
-            updatedAt: clock.now
-        )
-        do {
-            _ = try await composite.resolve(photoEntry)
-            XCTFail("unregistered source kinds must fail loudly, not guess")
-        } catch {}
     }
 
     func testUploadConcurrencyRespectsThrottleLimit() async throws {

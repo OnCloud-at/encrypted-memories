@@ -739,7 +739,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(projection.progress.dismissedFailures, 1)
         XCTAssertEqual(projection.progress.outstanding.count, 1, "The scheduler still owes a check")
         XCTAssertEqual(projection.status.needsAttentionCount, 0)
-        XCTAssertEqual(projection.status.notBackedUpCount, 1)
+        XCTAssertEqual(projection.status.totalConsidered, 1)
+        XCTAssertEqual(projection.status.backedUp, 0)
         XCTAssertTrue((try queue.decisionUnsettledRows()).isEmpty)
         XCTAssertEqual(
             try queue.decisionRows(kind: .photoLibraryAsset, identifiers: [offered.snapshot.source.identifier]).map(
@@ -1218,18 +1219,14 @@ final class MissingSourceReconciliationTests: XCTestCase {
     }
 
     func testSourceRecheckNetworkFallbackRechecksAdmissionAfterItsLocalReadFails() async throws {
-        try await verifySourceRecheckNetworkFallback(permissionCloses: true, composite: false)
-    }
-
-    func testCompositeSourceRecheckRetainsAdmissionAtTheNetworkFallback() async throws {
-        try await verifySourceRecheckNetworkFallback(permissionCloses: true, composite: true)
+        try await verifySourceRecheckNetworkFallback(permissionCloses: true)
     }
 
     func testSourceRecheckNetworkFallbackStillReadsWithPermission() async throws {
-        try await verifySourceRecheckNetworkFallback(permissionCloses: false, composite: false)
+        try await verifySourceRecheckNetworkFallback(permissionCloses: false)
     }
 
-    private func verifySourceRecheckNetworkFallback(permissionCloses: Bool, composite: Bool) async throws {
+    private func verifySourceRecheckNetworkFallback(permissionCloses: Bool) async throws {
         let offered = try candidate("gated-network-recheck")
         let clock = BackupTestClock()
         let queue = try XCTUnwrap(self.queue)
@@ -1239,11 +1236,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let allowFallback = UploadTestBarrier(participantCount: 2)
         let fallback = NetworkFallbackAvailabilityResolver(
             inner: AvailabilityResolver(candidate: offered), locallyRead: locallyRead, allowFallback: allowFallback)
-        let resolver: any BackupResourceResolving =
-            composite
-            ? CompositeBackupResourceResolver([.photoLibraryAsset: fallback]) : fallback
         let network = BackupNetworkBox(.unconstrained)
-        let runner = availabilityRunner(clock: clock, resolver: resolver, network: network)
+        let runner = availabilityRunner(clock: clock, resolver: fallback, network: network)
         let run = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
         await locallyRead.arriveAndWait()
         XCTAssertEqual(fallback.requests, [false])
@@ -1513,7 +1507,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(projection.progress.outstanding.count, 1)
         XCTAssertEqual(projection.progress.outstanding.nextAttemptAt, due)
         XCTAssertEqual(projection.status.needsAttentionCount, 0)
-        XCTAssertEqual(projection.status.notBackedUpCount, 1)
+        XCTAssertEqual(projection.status.totalConsidered, 1)
+        XCTAssertEqual(projection.status.backedUp, 0)
         XCTAssertEqual(
             BackupAutomaticRetryPlanner.nextAttempt(
                 outstandingCount: projection.progress.outstanding.count,
@@ -1791,7 +1786,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertFalse(tracked.usedMainThread)
         XCTAssertEqual(enqueuer.firstIdentifiers.count, 500)
         XCTAssertEqual(queue.count(), 2)
-        XCTAssertEqual(queue.nextRunnable(limit: 2).map(\.source.identifier).sorted(), ["000000", "099999"])
+        XCTAssertEqual(queue.runnableEntries().map(\.source.identifier).sorted(), ["000000", "099999"])
     }
 
     private func sql(_ url: URL, _ statement: String) throws {

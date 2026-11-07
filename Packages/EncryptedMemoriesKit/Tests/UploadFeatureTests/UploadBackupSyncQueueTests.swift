@@ -349,7 +349,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         store.upsert(old)
 
         XCTAssertEqual(try store.entry(for: old.source, revision: old.revision), old)
-        XCTAssertEqual(store.nextRunnable(limit: 2).map(\.source.identifier), ["old"])
+        XCTAssertEqual(store.runnableEntries().map(\.source.identifier), ["old"])
         XCTAssertEqual(store.summary()!.total, 3)
         XCTAssertEqual(store.summary()!.waiting, 1)
         XCTAssertEqual(store.summary()!.active, 1)
@@ -583,7 +583,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
 
         XCTAssertEqual(store.count(), 20_000)
         XCTAssertEqual(store.summary()!.waiting, 20_000)
-        XCTAssertEqual(store.nextRunnable(limit: 1).first?.source.identifier, "19999")
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date())?.first?.source.identifier, "19999")
         let formattedElapsedMs = String(format: "%.2f", elapsedMs)
         print("[BackupDBMicroPerf] queue20k saveMs=\(formattedElapsedMs)")
     }
@@ -606,11 +606,10 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         store.upsert(oldBacklog)
         store.upsert(justTaken)
 
+        let claimed = try XCTUnwrap(store.claimRunnable(limit: 2, claimedAt: Date(timeIntervalSince1970: 9_000_001)))
         XCTAssertEqual(
-            store.nextRunnable(limit: 2).map(\.source.identifier), ["fresh", "backlog"],
+            claimed.map(\.source.identifier), ["fresh", "backlog"],
             "newest photo (highest revision) drains first, even though it was enqueued last")
-        let claimed = try XCTUnwrap(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 9_000_001)))
-        XCTAssertEqual(claimed.map(\.source.identifier), ["fresh"], "claim also prioritizes the newest photo")
     }
 
     func testSQLiteQueueUpdatesStateWithoutRewritingDescriptor() throws {
@@ -1143,7 +1142,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(try store.entry(for: source("fresh-uploading"), revision: revision(20))?.state, .uploading)
         XCTAssertEqual(try store.entry(for: source("done"), revision: revision(30))?.state, .completed)
         XCTAssertEqual(
-            Set(store.nextRunnable(limit: 10).map(\.source.identifier)),
+            Set(store.runnableEntries().map(\.source.identifier)),
             Set(staleStates.map { $0.0 }),
             "recovered rows must become runnable again; stale uploading/finalizing may not disappear"
         )
@@ -1490,7 +1489,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         store.close()
 
         XCTAssertFalse(store.isOperational())
-        XCTAssertTrue(store.nextRunnable(limit: 10).isEmpty)
+        XCTAssertTrue(store.runnableEntries().isEmpty)
         XCTAssertFalse(store.isOperational(), "an empty read after a DB failure must not mean drained")
         XCTAssertFalse(
             store.upsert(
@@ -1510,19 +1509,19 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         let index = UploadBackupPreflightIndex(store: backupStore, now: { now })
         let known = candidate(id: "known", revision: 10)
         try await index.markBackedUp(known.snapshot)
-        let trustedDrift = candidate(id: "known", revision: 20, editRevision: .trustedNoContentEdits)
+        let unchangedEdit = candidate(id: "known", revision: 20, editRevision: .revision(revision(10)))
         let newAsset = candidate(id: "new", revision: 30)
         let unknownEdit = candidate(id: "known", revision: 40, editRevision: .revision(revision(35)))
         let engine = UploadBackupSyncEngine(preflight: index, queue: queue, now: { now })
 
-        let result = try await engine.scan(StaticCatalog(items: [trustedDrift, newAsset, unknownEdit]))
+        let result = try await engine.scan(StaticCatalog(items: [unchangedEdit, newAsset, unknownEdit]))
 
         XCTAssertEqual(result.scanned, 3)
         XCTAssertEqual(result.alreadyBackedUp, 1)
         XCTAssertEqual(result.queuedForWork, 2)
         XCTAssertEqual(result.backendChecksRequired, 1)
         XCTAssertEqual(
-            try queue.entry(for: trustedDrift.snapshot.source, revision: trustedDrift.snapshot.revision)?.state,
+            try queue.entry(for: unchangedEdit.snapshot.source, revision: unchangedEdit.snapshot.revision)?.state,
             .alreadyBackedUp)
         XCTAssertEqual(
             try queue.entry(for: newAsset.snapshot.source, revision: newAsset.snapshot.revision)?.state, .discovered)

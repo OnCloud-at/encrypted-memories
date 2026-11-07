@@ -820,7 +820,7 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertFalse(malformedStore.isOperational(), "a malformed receipt marks the reading store failed")
         malformedStore.close()
         let ordinaryReader = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: malformedURL))
-        XCTAssertTrue(ordinaryReader.nextRunnable(limit: 1).isEmpty)
+        XCTAssertTrue(ordinaryReader.runnableEntries().isEmpty)
         XCTAssertFalse(ordinaryReader.isOperational(), "malformed receipt must not become ordinary runnable work")
         ordinaryReader.close()
         XCTAssertEqual(try receiptCount(in: "backup_sync_queue", at: malformedURL), 1)

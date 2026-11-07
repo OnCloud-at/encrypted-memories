@@ -285,7 +285,7 @@ final class DeletedPhotoTests: XCTestCase {
             store: identities, hasher: FakeHasher(), checker: checker, replacementJournal: journal)
         let uploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
         let resolver = ScriptedBackupResolver(defaultModified: date)
-        resolver.setEditRevision(.trustedNoContentEdits, for: source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(date: date)), for: source.identifier)
         let replacement = EditedPhotoReplacement(
             remote: FakeEditReplacementRemote(), albums: FakeAlbumCarryOver(), relations: checker,
             identities: identities, journal: journal)
@@ -332,7 +332,7 @@ final class DeletedPhotoTests: XCTestCase {
             store: identities, hasher: hasher, checker: checker, replacementJournal: journal)
         let uploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
         let resolver = ScriptedBackupResolver(defaultModified: date)
-        resolver.setEditRevision(.trustedNoContentEdits, for: source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(date: date)), for: source.identifier)
         let replacement = EditedPhotoReplacement(
             remote: FakeEditReplacementRemote(), albums: FakeAlbumCarryOver(), relations: checker,
             identities: identities, journal: journal)
@@ -391,7 +391,7 @@ final class DeletedPhotoTests: XCTestCase {
             store: identities, hasher: FakeHasher(), checker: checker, replacementJournal: journal)
         let uploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
         let resolver = ScriptedBackupResolver(defaultModified: date)
-        resolver.setEditRevision(.trustedNoContentEdits, for: source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(date: date)), for: source.identifier)
         let replacement = EditedPhotoReplacement(
             remote: FakeEditReplacementRemote(), albums: FakeAlbumCarryOver(), relations: checker,
             identities: identities, journal: journal)
