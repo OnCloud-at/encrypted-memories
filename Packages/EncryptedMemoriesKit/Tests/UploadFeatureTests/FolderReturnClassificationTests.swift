@@ -97,6 +97,69 @@ import UploadCore
         await fixture.shutdown()
     }
 
+    /// Issue #1227: while the folder backup is shut down, no watched folder is known, so a returned
+    /// file can be neither read nor proven outside. Every file keeps its queue duty, even one that
+    /// exists and one that is gone, and nothing enters the queue.
+    @Test func whileTheWatchedFoldersAreUnknownNoReturnedFileSettles() async throws {
+        var fixture = try ReturnFixture()
+        defer { fixture.remove() }
+        let readable = try fixture.makeReadableFile("Watched/photo.heic", bytes: "readable-bytes")
+        let gone = fixture.path("Watched/vanished.heic")
+        let elsewhere = try fixture.makeReadableFile("Elsewhere/photo.heic", bytes: "elsewhere-bytes")
+        let keys = try [
+            fixture.seedDuty(for: readable, displayName: "photo.heic"),
+            fixture.seedDuty(for: gone, displayName: "vanished.heic"),
+            fixture.seedDuty(for: elsewhere, displayName: "photo.heic"),
+        ]
+
+        let session = try fixture.makeSession(scope: .unavailable)
+        #expect(await session.restore(keys.map(\.localUID)))
+
+        for key in keys {
+            let after = fixture.store.sourceState(for: key)
+            #expect(after?.desired == .included, "\(key.identifier) stays included")
+            #expect(
+                after?.needsQueueSync == true,
+                "\(key.identifier) must not count as returned while no watched folder is known")
+            #expect(try fixture.queueRowCount(for: key.identifier) == 0, "\(key.identifier) enters no queue")
+        }
+        await session.close()
+        await fixture.shutdown()
+    }
+
+    /// Issue #1227: a registered folder that needs a new bookmark is not readable, but its files are
+    /// still watched. They keep their queue duty; a readable sibling is queued and a path outside
+    /// every registered folder settles.
+    @Test func aFolderThatNeedsANewBookmarkKeepsTheDutyOfItsFiles() async throws {
+        var fixture = try ReturnFixture()
+        defer { fixture.remove() }
+        let readable = try fixture.makeReadableFile("Watched/photo.heic", bytes: "readable-bytes")
+        let renewal = try fixture.makeReadableFile("Renewal/photo.heic", bytes: "renewal-bytes")
+        let outside = try fixture.makeReadableFile("Elsewhere/photo.heic", bytes: "elsewhere-bytes")
+        let readableKey = try fixture.seedDuty(for: readable, displayName: "photo.heic")
+        let renewalKey = try fixture.seedDuty(for: renewal, displayName: "photo.heic")
+        let outsideKey = try fixture.seedDuty(for: outside, displayName: "photo.heic")
+
+        let session = try fixture.makeSession(
+            scope: WatchedFolderScope(
+                readable: [URL(fileURLWithPath: fixture.path("Watched"))],
+                registered: [fixture.path("Watched"), fixture.path("Renewal")]))
+        #expect(await session.restore([readableKey, renewalKey, outsideKey].map(\.localUID)))
+
+        #expect(fixture.store.sourceState(for: readableKey) == nil, "a queued file owes no queue duty")
+        #expect(try fixture.queueRowCount(for: readable) == 1, "a file in a readable folder is queued")
+        let after = fixture.store.sourceState(for: renewalKey)
+        #expect(after?.desired == .included, "a file of a folder that needs a new bookmark stays included")
+        #expect(
+            after?.needsQueueSync == true,
+            "a file of a folder that needs a new bookmark must not count as outside the watched folders")
+        #expect(try fixture.queueRowCount(for: renewal) == 0, "an unreadable folder's file enters no queue")
+        #expect(fixture.store.sourceState(for: outsideKey) == nil, "a path outside every registered folder is done")
+        #expect(try fixture.queueRowCount(for: outside) == 0, "a path outside the folders enters no queue")
+        await session.close()
+        await fixture.shutdown()
+    }
+
     @Test func anEmptyRestoreTouchesNoFileSource() async throws {
         var fixture = try ReturnFixture()
         defer { fixture.remove() }
@@ -164,7 +227,7 @@ import UploadCore
 
         let batch = await FolderBackupCatalog.returnToBackup(
             paths: [],
-            resolve: { URL(fileURLWithPath: $0) },
+            scope: fixture.watchedScope,
             engine: fixture.engine)
 
         #expect(batch == FolderBackupCatalog.ReturnBatch(returnedPaths: [], queuedCount: 0))
@@ -172,15 +235,15 @@ import UploadCore
         await fixture.shutdown()
     }
 
-    /// A path outside the watched folders cannot reach a file the person no longer shared;
-    /// it needs nothing and counts as done, exactly as the host resolver reports nil.
+    /// A path outside every registered folder cannot reach a file the person no longer shared;
+    /// it needs nothing and counts as done.
     @Test func aPathOutsideTheWatchedFoldersCountsAsDone() async throws {
         var fixture = try ReturnFixture()
         defer { fixture.remove() }
 
         let batch = await FolderBackupCatalog.returnToBackup(
             paths: ["/outside/watched/photo.heic"],
-            resolve: { _ in nil },
+            scope: fixture.watchedScope,
             engine: fixture.engine)
 
         #expect(
@@ -188,11 +251,50 @@ import UploadCore
         #expect(try fixture.queueRowCount(for: "/outside/watched/photo.heic") == 0)
         await fixture.shutdown()
     }
+
+    /// Issue #1227: a registered folder without a known path could hold any path, so no path that
+    /// the app cannot read counts as outside.
+    @Test func aRegisteredFolderWithoutAKnownPathProvesNoPathOutside() {
+        let scope = WatchedFolderScope(readable: [URL(fileURLWithPath: "/Volumes/A")], registered: ["/Volumes/A", "?"])
+
+        #expect(scope.location(ofPath: "/Volumes/B/photo.heic") == .unavailable)
+        #expect(
+            scope.location(ofPath: "/Volumes/A/photo.heic") == .readable(URL(fileURLWithPath: "/Volumes/A/photo.heic")))
+    }
+
+    /// Issue #1227: a folder registry that could not be read proves no path outside; a readable
+    /// folder stays readable.
+    @Test func anUnreadableFolderRegistryProvesNoPathOutside() {
+        let scope = WatchedFolderScope(readable: [URL(fileURLWithPath: "/Volumes/A")], registered: nil)
+
+        #expect(scope.location(ofPath: "/Volumes/B/photo.heic") == .unavailable)
+        #expect(
+            scope.location(ofPath: "/Volumes/A/photo.heic") == .readable(URL(fileURLWithPath: "/Volumes/A/photo.heic")))
+    }
+
+    /// Issue #1227: no saved folder list is a known empty registry, but a saved value of another
+    /// type is damaged and leaves the registry unknown.
+    @Test func aDamagedFolderListLeavesTheRegistryUnknown() {
+        let bookmark = Data("bookmark".utf8)
+
+        #expect(WatchedFolderScope.registeredBookmarks(storedValue: nil) == [])
+        #expect(WatchedFolderScope.registeredBookmarks(storedValue: [bookmark]) == [bookmark])
+        #expect(WatchedFolderScope.registeredBookmarks(storedValue: "damaged") == nil)
+        #expect(WatchedFolderScope.registeredBookmarks(storedValue: [bookmark, "damaged"] as [Any]) == nil)
+    }
+
+    /// A folder root matches whole path components only: `/Volumes/A2` is not inside `/Volumes/A`.
+    @Test func aSiblingFolderWithTheSamePrefixIsOutside() {
+        let scope = WatchedFolderScope(readable: [], registered: ["/Volumes/A"])
+
+        #expect(scope.location(ofPath: "/Volumes/A2/photo.heic") == .outside)
+        #expect(scope.location(ofPath: "/Volumes/A/photo.heic") == .unavailable)
+        #expect(scope.readableURL(forPath: "/Volumes/A/photo.heic") == nil)
+    }
 }
 
-/// Drives the real batch function of the package (`FolderBackupCatalog.returnToBackup`). The
-/// path-to-URL resolver stays with the host by design; the tests stand in for it exactly as
-/// `App/FolderBackupController` does. No host code is mirrored here.
+/// Drives the real batch function of the package (`FolderBackupCatalog.returnToBackup`) with the
+/// real `WatchedFolderScope`. The host only supplies the folder lists; no host code is mirrored here.
 private final class CallCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var _calls = 0
@@ -301,8 +403,14 @@ private struct ReturnFixture {
         return key
     }
 
-    func makeSession(callCounter: CallCounter? = nil) throws -> PendingGridSession {
+    /// The watched folders of most tests: `Watched` is registered and readable.
+    var watchedScope: WatchedFolderScope {
+        WatchedFolderScope(readable: [URL(fileURLWithPath: path("Watched"))], registered: [path("Watched")])
+    }
+
+    func makeSession(callCounter: CallCounter? = nil, scope: WatchedFolderScope? = nil) throws -> PendingGridSession {
         let engine = self.engine
+        let scope = scope ?? watchedScope
         let counter = callCounter
         let files = PendingFileSource(
             queue: queueStore,
@@ -312,7 +420,7 @@ private struct ReturnFixture {
                 counter?.add()
                 return await FolderBackupCatalog.returnToBackup(
                     paths: paths,
-                    resolve: { URL(fileURLWithPath: $0) },
+                    scope: scope,
                     engine: engine
                 ).returnedPaths
             })

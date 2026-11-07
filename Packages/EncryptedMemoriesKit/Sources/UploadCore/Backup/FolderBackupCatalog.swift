@@ -114,8 +114,8 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
 
     /// What a batch of returned watched files did.
     public struct ReturnBatch: Sendable, Equatable {
-        /// The paths that count as returned: gone, outside the watched folders, or submitted to
-        /// the queue. Every other path keeps its queue duty.
+        /// The paths that count as returned: gone, outside every registered folder, or submitted
+        /// to the queue. Every other path keeps its queue duty.
         public let returnedPaths: Set<String>
         /// How many files were submitted to the queue. The queue itself may still drop a row,
         /// for example an excluded source or a dismissed recheck, so this does not promise the
@@ -128,23 +128,27 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
         }
     }
 
-    /// Returns excluded watched files to the backup queue. A file outside the watched folders and
-    /// a file that is gone need nothing and count as done. A file whose attributes cannot be read
-    /// does not count as returned, so its queue duty stays with the coordinator. Readable files
-    /// are enqueued even when another file of the batch could not be read. When the queue refuses
-    /// the batch, no file counts as returned.
+    /// Returns excluded watched files to the backup queue. A file outside every registered folder
+    /// and a file that is gone need nothing and count as done. A file in a folder the app cannot
+    /// read now, and a file whose attributes cannot be read, do not count as returned, so their
+    /// queue duty stays with the coordinator. Readable files are enqueued even when another file
+    /// of the batch could not be read. When the queue refuses the batch, no file counts as returned.
     public static func returnToBackup(
         paths: [String],
-        resolve: @Sendable (String) -> URL?,
+        scope: WatchedFolderScope,
         engine: UploadBackupSyncEngine
     ) async -> ReturnBatch {
         var candidates: [UploadBackupAssetCandidate] = []
         var returned = Set<String>()
         var queuedPaths = Set<String>()
         for path in paths {
-            guard let url = resolve(path) else {
+            let url: URL
+            switch scope.location(ofPath: path) {
+            case .outside:
                 returned.insert(path)
                 continue
+            case .unavailable: continue
+            case .readable(let readable): url = readable
             }
             switch returnOutcome(for: url) {
             case .gone: returned.insert(path)
