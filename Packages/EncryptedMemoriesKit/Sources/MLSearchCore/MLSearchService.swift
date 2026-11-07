@@ -157,7 +157,7 @@ public actor MLSearchService {
     }
 
     public func releaseMemory() async {
-        await searchEngine.purgeCachedBlocks()
+        await searchEngine.purgePromptEmbeddings()
         await releaseInferenceResources?()
     }
 }

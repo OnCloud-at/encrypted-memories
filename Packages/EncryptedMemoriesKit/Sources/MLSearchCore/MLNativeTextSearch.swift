@@ -66,12 +66,11 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
 
     public init(
         accountIdentifier: String,
-        capabilitySnapshot: MLNativeAnalysisCapabilitySnapshot,
-        enabledKinds: Set<MLNativeAnalysisKind> = Set(Self.indexedStillImageKinds)
+        capabilitySnapshot: MLNativeAnalysisCapabilitySnapshot
     ) throws {
         var mapping: [MLDerivedArtifactIdentity: MLSearchBackend] = [:]
         var artifacts: Set<MLDerivedArtifactIdentity> = []
-        for stage in Self.analysisStages where enabledKinds.contains(stage.kind) {
+        for stage in Self.analysisStages {
             let kind = stage.kind
             guard let capability = capabilitySnapshot.capability(for: kind),
                 capability.isAvailable,
@@ -93,7 +92,7 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
                 schemaEpoch: stage.schemaEpoch
             )
             artifacts.insert(artifact)
-            if let backend = stage.backend { mapping[artifact] = backend }
+            mapping[artifact] = stage.backend
         }
         guard !artifacts.isEmpty else { throw MLNativeSearchConfigurationError.noSearchableCapabilities }
         executionKey = try MLPipelineExecutionKey(
@@ -149,23 +148,17 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
         )
     }
 
-    /// Search scheduling contains only stages with a serving backend. The capability inventory
-    /// remains broader so on-demand and qualification evidence can still name every Vision stage.
-    public static let indexedStillImageKinds: [MLNativeAnalysisKind] = analysisStages.compactMap { stage in
-        stage.backend == nil ? nil : stage.kind
-    }
-
     private struct AnalysisStage: Sendable {
         let kind: MLNativeAnalysisKind
         let output: MLAnalysisOutputDescriptor
-        let backend: MLSearchBackend?
+        let backend: MLSearchBackend
         let stageID: String
         let schemaEpoch: Int
 
         init(
             kind: MLNativeAnalysisKind,
             output: MLAnalysisOutputDescriptor,
-            backend: MLSearchBackend?,
+            backend: MLSearchBackend,
             stageID: String,
             schemaEpoch: Int = 1
         ) {
@@ -177,59 +170,14 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
         }
     }
 
+    /// Search scheduling contains only stages with a serving backend. The capability inventory
+    /// is broader so on-demand and qualification evidence can still name every Vision stage.
     private static let analysisStages: [AnalysisStage] = [
         .init(kind: .textRecognition, output: .recognizedText, backend: .recognizedText, stageID: "recognized-text"),
         .init(
             kind: .documentRecognition, output: .structuredDocument, backend: .documentText,
             stageID: "structured-document"),
         .init(kind: .barcodeDetection, output: .barcodePayload, backend: .barcodePayload, stageID: "barcode-payload"),
-        .init(kind: .documentSegmentation, output: .geometry, backend: nil, stageID: "document-region"),
-        .init(kind: .imageClassification, output: .classifications, backend: nil, stageID: "classifications"),
-        .init(
-            kind: .animalRecognition,
-            output: .regions(labels: ["cat", "dog"], species: [.cat, .dog], landmarkSchema: nil), backend: nil,
-            stageID: "animals"),
-        .init(
-            kind: .humanDetection, output: .regions(labels: ["human"], species: [.human], landmarkSchema: nil),
-            backend: nil, stageID: "humans"),
-        .init(kind: .imageFeaturePrint, output: .featurePrint, backend: nil, stageID: "feature-print"),
-        .init(
-            kind: .faceDetection, output: .regions(labels: ["face"], species: [.human], landmarkSchema: nil),
-            backend: nil, stageID: "faces"),
-        .init(
-            kind: .faceLandmarks,
-            output: .regions(labels: ["face"], species: [.human], landmarkSchema: "apple-face-landmarks"), backend: nil,
-            stageID: "face-landmarks"),
-        .init(kind: .faceCaptureQuality, output: .qualityMetrics, backend: nil, stageID: "face-quality"),
-        .init(
-            kind: .animalBodyPose,
-            output: .regions(labels: ["animal-pose"], species: [.cat, .dog], landmarkSchema: "apple-animal-pose"),
-            backend: nil, stageID: "animal-pose"),
-        .init(
-            kind: .foregroundInstanceMask, output: .mask(format: .label8), backend: nil, stageID: "foreground-instances"
-        ),
-        .init(kind: .personInstanceMask, output: .mask(format: .label8), backend: nil, stageID: "person-instances"),
-        .init(kind: .personSegmentation, output: .mask(format: .alpha8), backend: nil, stageID: "person-segmentation"),
-        .init(kind: .imageAesthetics, output: .qualityMetrics, backend: nil, stageID: "aesthetics"),
-        .init(kind: .attentionSaliency, output: .saliency, backend: nil, stageID: "attention-saliency"),
-        .init(kind: .objectnessSaliency, output: .saliency, backend: nil, stageID: "objectness-saliency"),
-        .init(kind: .lensSmudgeDetection, output: .qualityMetrics, backend: nil, stageID: "lens-smudge"),
-        .init(
-            kind: .humanBodyPose,
-            output: .regions(labels: ["human-pose"], species: [.human], landmarkSchema: "apple-human-body-pose"),
-            backend: nil, stageID: "human-body-pose"),
-        .init(
-            kind: .humanHandPose,
-            output: .regions(labels: ["hand-pose"], species: [.human], landmarkSchema: "apple-human-hand-pose"),
-            backend: nil, stageID: "human-hand-pose"),
-        .init(
-            kind: .humanBodyPose3D,
-            output: .regions(labels: ["human-pose-3d"], species: [.human], landmarkSchema: "apple-human-body-pose-3d"),
-            backend: nil, stageID: "human-body-pose-3d"),
-        .init(kind: .contours, output: .geometry, backend: nil, stageID: "contours"),
-        .init(kind: .horizon, output: .geometry, backend: nil, stageID: "horizon"),
-        .init(kind: .rectangles, output: .geometry, backend: nil, stageID: "rectangles"),
-        .init(kind: .textRectangles, output: .geometry, backend: nil, stageID: "text-regions"),
     ]
 }
 

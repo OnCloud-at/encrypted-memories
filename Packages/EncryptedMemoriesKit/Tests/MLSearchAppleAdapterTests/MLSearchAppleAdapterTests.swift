@@ -633,6 +633,13 @@ import Testing
         #expect(a1.withUnsafeBytes { Data($0) } != b.withUnsafeBytes { Data($0) })
     }
 
+    /// Rows that the store delivers through its bounded query path.
+    private func storedRowCount(_ store: SQLiteMLIndexStore, _ descriptor: MLModelDescriptor) throws -> Int {
+        var rows = 0
+        try store.forEachVectorBlock(for: descriptor, maximumRows: 2_048) { rows += $0.count }
+        return rows
+    }
+
     @Test func sqliteStoreRejectsWrongAccountCipher() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ml-encrypted-store-\(UUID().uuidString)", isDirectory: true)
@@ -649,13 +656,12 @@ import Testing
         let wrong = CryptoKitMLVectorCipher(key: key, accountUID: "account-b")
         let wrongStore = try #require(SQLiteMLIndexStore(url: url, cipher: wrong))
         #expect(wrongStore.count(for: descriptor) == 1)
-        #expect(wrongStore.allRecords(for: descriptor).isEmpty)
-        #expect(wrongStore.vectorBlock(for: descriptor).isEmpty)
+        #expect(try storedRowCount(wrongStore, descriptor) == 0)
         #expect(wrongStore.count(for: descriptor) == 0)
         wrongStore.close()
 
         let reopened = try #require(SQLiteMLIndexStore(url: url, cipher: correct))
-        #expect(reopened.allRecords(for: descriptor).isEmpty)
+        #expect(try storedRowCount(reopened, descriptor) == 0)
         reopened.close()
     }
 
@@ -683,7 +689,7 @@ import Testing
             #expect(store.upsert(records).indexed == records.count)
         }
 
-        #expect(store.vectorBlock(for: smokeDescriptor).count == 20_000)
+        #expect(try storedRowCount(store, smokeDescriptor) == 20_000)
     }
 
     @Test func accelerateScorerRanksCorrectly() {
