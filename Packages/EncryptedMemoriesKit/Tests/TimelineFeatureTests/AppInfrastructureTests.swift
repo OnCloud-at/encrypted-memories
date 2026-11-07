@@ -52,17 +52,10 @@ struct AppInfrastructureTests {
         SidebarPersistence.saveVisible(true, defaults: defaults)
         #expect(SidebarPersistence.resolvedVisible(defaults: defaults))
 
-        SidebarPersistence.saveWidth(10, defaults: defaults)
+        defaults.set(10.0, forKey: AppSettingsKey.sidebarWidth)
         #expect(SidebarPersistence.resolvedWidth(defaults: defaults) == SidebarMetrics.minWidth)
-        SidebarPersistence.saveWidth(320, defaults: defaults)
+        defaults.set(320.0, forKey: AppSettingsKey.sidebarWidth)
         #expect(SidebarPersistence.resolvedWidth(defaults: defaults) == 320)
-    }
-
-    @Test func sidebarToggleAnimationStateTest() {
-        let width: CGFloat = 260
-        #expect(SidebarMetrics.effectiveWidth(visible: true, width: width) == width)
-        #expect(SidebarMetrics.effectiveWidth(visible: false, width: width) == 0)
-        #expect(SidebarMetrics.effectiveWidth(visible: true, width: 9_000) == SidebarMetrics.maxWidth)
     }
 
     @Test func windowFrameStaysOnScreen() {

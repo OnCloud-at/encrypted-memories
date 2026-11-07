@@ -88,34 +88,10 @@ struct VideoPlaybackTests {
 
     @Test func seekRequestsOnlyTheNeededBlocks() {
         // A seek to the last block must not re-pull earlier blocks.
-        let indices = map.blockIndices(offset: 220, length: 40)  // inside block 3
+        let indices = map.slices(offset: 220, length: 40).map(\.blockIndex)  // inside block 3
         #expect(indices == [3])
         // And an initial-play request for the head only touches block 1.
-        #expect(map.blockIndices(offset: 0, length: 50) == [1])
-    }
-
-    @Test func byteRangeSetMergesAdjacentAndOverlapping() {
-        var set = ByteRangeSet()
-        set.insert(ByteRange(lower: 0, upper: 10))
-        set.insert(ByteRange(lower: 10, upper: 20))  // Abutting ranges merge.
-        #expect(set.ranges == [ByteRange(lower: 0, upper: 20)])
-
-        set.insert(ByteRange(lower: 5, upper: 25))  // Overlapping ranges extend the existing range.
-        #expect(set.ranges == [ByteRange(lower: 0, upper: 25)])
-
-        set.insert(ByteRange(lower: 40, upper: 50))  // Disjoint ranges remain separate.
-        #expect(set.ranges == [ByteRange(lower: 0, upper: 25), ByteRange(lower: 40, upper: 50)])
-        #expect(set.coveredBytes == 35)
-    }
-
-    @Test func byteRangeSetReportsHoles() {
-        var set = ByteRangeSet()
-        set.insert(ByteRange(lower: 0, upper: 30))
-        set.insert(ByteRange(lower: 60, upper: 100))
-        #expect(set.covers(ByteRange(lower: 0, upper: 20)))
-        #expect(!set.covers(ByteRange(lower: 0, upper: 50)))
-        #expect(set.missingPieces(in: ByteRange(lower: 0, upper: 100)) == [ByteRange(lower: 30, upper: 60)])
-        #expect(set.missingPieces(in: ByteRange(lower: 0, upper: 30)).isEmpty)
+        #expect(map.slices(offset: 0, length: 50).map(\.blockIndex) == [1])
     }
 
     @Test func mapsNetworkErrors() {

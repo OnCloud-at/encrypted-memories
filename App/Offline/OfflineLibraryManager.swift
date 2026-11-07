@@ -134,7 +134,7 @@ final class OfflineLibraryManager {
         self.statsProvider = stats
         markStatusDirty()
         Task {
-            await feed.setPrefetchEnabled(OfflineLibraryPolicy.shouldCrawlThumbnails(offlineEnabled: offlineEnabled))
+            await feed.setPrefetchEnabled(true)
         }
     }
 
@@ -387,7 +387,7 @@ final class OfflineLibraryManager {
 
     /// Persists the Offline Photo Library setting. Enabled mode stores viewed originals in the encrypted
     /// `originals` cache; disabled mode stops retention and lets Settings purge existing originals.
-    /// Thumbnail crawling remains enabled by `OfflineLibraryPolicy`.
+    /// Thumbnail crawling stays enabled in both modes.
     func setOfflineEnabled(_ enabled: Bool) {
         guard enabled != offlineEnabled else { return }
         offlineEnabled = enabled

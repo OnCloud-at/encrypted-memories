@@ -998,7 +998,7 @@ public actor ThumbnailCache {
 
     private static let lowercaseHexDigits = Array("0123456789abcdef".utf8)
 
-    private nonisolated static func lowercaseHex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
+    package nonisolated static func lowercaseHex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
         var output: [UInt8] = []
         output.reserveCapacity(64)
         for byte in bytes {
