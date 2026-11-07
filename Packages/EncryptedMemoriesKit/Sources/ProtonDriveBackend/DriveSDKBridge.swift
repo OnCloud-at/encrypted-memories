@@ -2317,7 +2317,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let files = try await driveSession.listTrash(volumeID: root.volumeID, retryOnRateLimit: retryOnRateLimit)
             .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
         // Hide related photos (Live Photo videos, series frames), like the timeline; a restore of the main takes them.
-        let (links, related) = TrashedRelatedPhotos.split(files, volumeID: root.volumeID)
+        let links = TrashedRelatedPhotos.split(files, volumeID: root.volumeID).shown
         let photos =
             links
             .compactMap { l -> PhotoItem? in
@@ -2336,7 +2336,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         switch recentlyDeleted.received(photos, ticket: ticket) {
         case .applied:
             checkedSeriesRestoreCandidates = nil
-            recentlyDeleted.listedRelatedPhotos(related)
         case .overtakenByChange:
             // Photos that left the library meanwhile may still lack a listing. A background listing follows; when
             // this is the background listing itself, the next library refresh starts it.

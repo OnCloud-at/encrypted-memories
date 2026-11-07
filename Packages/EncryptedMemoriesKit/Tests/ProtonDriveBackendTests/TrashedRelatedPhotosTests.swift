@@ -250,23 +250,6 @@ struct TrashedRelatedPhotosTests {
         #expect(shown.compactMap(\.linkID) == ["main", "single"])
         #expect(related == [main: [Self.uid("f1"), Self.uid("f2")]])
     }
-
-    @Test func theRelatedPhotosOfARestoredMainPhotoLeaveTheListing() {
-        var listing = RecentlyDeletedIdentities(listing: nil)
-        let other = Self.uid("other")
-        let related = [main: [Self.uid("f1")], other: [Self.uid("o1")]]
-        listing.listedRelatedPhotos(related)
-        let stored = listing.persisted
-
-        #expect(listing.trashedRelatedPhotos(of: [main]) == [main: [Self.uid("f1")]])
-        #expect(stored == RecentlyDeletedIdentities(listing: nil).persisted, "the related photos are never stored")
-
-        listing.restored([main])
-        #expect(listing.trashedRelatedPhotos(of: [main, other]) == [other: [Self.uid("o1")]])
-
-        listing.emptied()
-        #expect(listing.trashedRelatedPhotos(of: [other]).isEmpty)
-    }
 }
 
 /// Proton's trash for the restore seam: trash times by link, and the restore that brings links back to the library.

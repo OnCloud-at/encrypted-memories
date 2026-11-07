@@ -308,8 +308,6 @@ extension DriveSessionStubSuite {
             let crypto = DriveCrypto(addressKeys: [], signers: [])
             let gate = TimelineMetadataStartGate()
             let main = PhotoUID(volumeID: "own-volume", nodeID: "trash")
-            var deleted = RecentlyDeletedIdentities(listing: nil)
-            deleted.listedRelatedPhotos([main: [.init(volumeID: "own-volume", nodeID: "frame")]])
             let bridge = DriveSDKBridge(
                 prepared: .init(
                     photosClient: client, uploadClientUID: "fixture", driveSession: session, requestGovernor: governor,
@@ -319,7 +317,7 @@ extension DriveSessionStubSuite {
                     photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
                     recentlyDeletedStore: RecentlyDeletedListingStore(
                         directory: directory, accountUID: "fixture", keyPassword: ""),
-                    photoNames: nil, recentlyDeleted: deleted,
+                    photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
                     uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
                     uploadManifestPolicy: .conservative),
                 checkedSeriesRestoreCandidates: [main: [.init(volumeID: "own-volume", nodeID: "frame")]])
