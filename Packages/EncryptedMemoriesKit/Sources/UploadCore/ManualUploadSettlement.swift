@@ -260,7 +260,6 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
     private var db: OpaquePointer? { connection.database }
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private let transient = SQLiteStoreSchemaGate.transientDestructor
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         try? FileManager.default.createDirectory(
@@ -334,9 +333,14 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                 return false
             }
             defer { sqlite3_finalize(statement) }
-            bindText(statement, 1, record.queueItemID.uuidString)
-            bindText(statement, 2, record.stage.rawValue)
-            bindText(statement, 3, String(decoding: payload, as: UTF8.self))
+            // A failed bind leaves its parameter NULL; it records the failure and fails the write (#1194).
+            do {
+                try connection.bindText(statement, 1, record.queueItemID.uuidString)
+                try connection.bindText(statement, 2, record.stage.rawValue)
+                try connection.bindText(statement, 3, String(decoding: payload, as: UTF8.self))
+            } catch {
+                return false
+            }
             sqlite3_bind_double(statement, 4, record.updatedAt.timeIntervalSince1970)
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 connection.markFailed(resultCode: sqlite3_extended_errcode(db))
@@ -375,7 +379,8 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                 return .unreadable
             }
             defer { sqlite3_finalize(statement) }
-            bindText(statement, 1, queueItemID.uuidString)
+            // A key that does not bind is no proof that the row is absent (#1194).
+            do { try connection.bindText(statement, 1, queueItemID.uuidString) } catch { return .unreadable }
             let result = sqlite3_step(statement)
             guard result == SQLITE_ROW else {
                 if result != SQLITE_DONE {
@@ -428,7 +433,8 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                 return false
             }
             defer { sqlite3_finalize(statement) }
-            bindText(statement, 1, queueItemID.uuidString)
+            // A key that does not bind removes nothing; that is no successful removal (#1194).
+            do { try connection.bindText(statement, 1, queueItemID.uuidString) } catch { return false }
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 connection.markFailed(resultCode: sqlite3_extended_errcode(db))
                 return false
@@ -533,10 +539,6 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             nil,
             nil
         ) == SQLITE_OK
-    }
-
-    private func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String) {
-        sqlite3_bind_text(statement, index, value, -1, transient)
     }
 
     private func columnText(_ statement: OpaquePointer?, _ index: Int32) -> String? {
