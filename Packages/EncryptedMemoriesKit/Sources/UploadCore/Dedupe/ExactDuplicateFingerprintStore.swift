@@ -135,24 +135,6 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         } ?? false
     }
 
-    /// Read only the requested members. Missing, corrupt, foreign, or stale details leave the whole group unknown.
-    public func fingerprints(
-        for members: [PhotoUID], in snapshot: Snapshot
-    ) -> [PhotoUID: ExactDuplicateFingerprint]? {
-        guard members.allSatisfy({ $0.volumeID == snapshot.scope.volumeID }) else { return nil }
-        return transaction(writing: false) { db in
-            guard self.current(db) == snapshot else { return nil }
-            var result: [PhotoUID: ExactDuplicateFingerprint] = [:]
-            for uid in members {
-                guard let data = self.read(db, "SELECT payload FROM fingerprint WHERE link_id=?;", text: uid.nodeID),
-                    let saved = try? JSONDecoder().decode(SavedFingerprint.self, from: data)
-                else { return nil }
-                result[uid] = saved.fingerprint(for: uid)
-            }
-            return result
-        }
-    }
-
     /// The details of every member of each group in `groups` whose members all have current details, in one read.
     /// A group with a missing, corrupt, foreign or stale member is left out whole, so it keeps the ranking path.
     public func fingerprints(
@@ -177,14 +159,6 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
             }
             return result
         } ?? [:]
-    }
-
-    /// Missing or invalid details keep the complete group on the existing ranking path.
-    public func prefilter(_ group: ExactDuplicateGroup, in snapshot: Snapshot) -> [ExactDuplicateGroup] {
-        guard group.hashKeyEpoch == snapshot.scope.hashKeyEpoch,
-            let saved = fingerprints(for: group.members, in: snapshot)
-        else { return [group] }
-        return group.split(by: saved)
     }
 
     private func transaction<Result>(writing: Bool = true, _ body: (OpaquePointer) -> Result?) -> Result? {

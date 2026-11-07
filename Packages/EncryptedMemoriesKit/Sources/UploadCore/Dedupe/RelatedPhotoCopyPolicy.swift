@@ -1,10 +1,8 @@
 import Foundation
 
-/// Selects a reusable standalone copy or a safe upload action for a related photo.
-///
-/// The rule generalises the series dissolution copy rule so that the revert of an edited photo
-/// reuses the same dedupe path. The series dissolution passes the member's link ID and the
-/// series link IDs unchanged.
+/// Selects a reusable standalone copy or a safe upload action for a related photo. The series dissolution and the
+/// revert of an edited photo use the same rule. The series dissolution passes the member's link ID and the series link
+/// IDs unchanged.
 ///
 /// The standard upload dedupe cannot be used here. The source's bytes already exist remotely as the source
 /// itself, so the standard rule would answer "active duplicate" and link the copy to the very photo that is
@@ -22,9 +20,7 @@ import Foundation
 ///    now, so an older deletion of an identical file must not remove it from the result.
 /// 5. A row with the same name and other content is another photo. The copy uploads under the same name.
 ///
-/// Difference from the earlier series-only rule: a row with an empty link ID no longer hides an adoptable
-/// active copy that follows it in the list. Such a row cannot be adopted itself, but it does not stop the
-/// search for a valid copy behind it.
+/// A row with an empty link ID cannot be adopted itself, but it does not stop the search for a valid copy behind it.
 public enum RelatedPhotoCopyPolicy {
     public enum Decision: Sendable, Equatable {
         case adopt(remoteLinkID: String)

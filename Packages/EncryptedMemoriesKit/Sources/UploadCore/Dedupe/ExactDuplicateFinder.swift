@@ -43,20 +43,6 @@ public enum ExactDuplicateRelatedFileTransferError: Error, Sendable, Equatable {
     }
 }
 
-extension ExactDuplicateRemote {
-    /// Fails before any file or remote operation until the backend implements related-file downloads.
-    public func downloadRelatedFile(
-        _ uid: PhotoUID, to destination: URL, allowsExpensiveNetwork: Bool
-    ) async throws -> SeriesMemberSource {
-        throw ExactDuplicateRelatedFileTransferError.unavailable
-    }
-
-    /// Fails before any file or remote operation until the backend implements related-file uploads.
-    public func uploadRelatedFile(_ request: PhotoUploadRequest) async throws -> PhotoUID {
-        throw ExactDuplicateRelatedFileTransferError.unavailable
-    }
-}
-
 /// What one node read tells about a photo.
 public struct ExactDuplicateNodeFacts: Sendable, Equatable {
     /// The person shares the photo with other people or by a link.
@@ -336,13 +322,9 @@ public struct ExactDuplicateFinder: Sendable {
     /// The groups of the current key epoch, largest first. The scan reads the index as it is: `prepareIndex` builds
     /// it, and the scan reports `.indexing` until a build has finished. The coverage comes from the local index, so a
     /// running build never holds the scan. A merge that waits for the check of its kept photo is checked first.
-    public func duplicateGroups() async throws -> ExactDuplicateScan {
-        try await duplicateGroups(progress: { _ in })
-    }
-
-    /// `duplicateGroups()` that reports how many candidate photos the visibility read has covered.
+    /// `progress` receives how many candidate photos the visibility read has covered.
     public func duplicateGroups(
-        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void = { _ in }
     ) async throws -> ExactDuplicateScan {
         await resolvePendingMerges()
         let start = ContinuousClock.now
@@ -449,14 +431,6 @@ public struct ExactDuplicateFinder: Sendable {
     /// The capture dates of `members` that the device already knows, without a request. Unknown photos are left out.
     public func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] {
         await remote.captureDates(of: members)
-    }
-
-    /// The members of each group by group ID, the photo to keep first. A group whose facts could not be read is left
-    /// out, so it keeps its fallback order.
-    public func rankedMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
-        let collected = RankingCollector()
-        await rankMembers(of: groups) { await collected.add($0.members) }
-        return await collected.members
     }
 
     /// Ranks the members of each group, page by page, and hands each page to `ranked`. One favorites listing, one
@@ -1603,15 +1577,6 @@ public struct ExactDuplicateFinder: Sendable {
                 try await Task.sleep(for: keptReadRetryDelay)
             }
         }
-    }
-}
-
-/// Collects the pages of a ranking.
-private actor RankingCollector {
-    private(set) var members: [String: [PhotoUID]] = [:]
-
-    func add(_ page: [String: [PhotoUID]]) {
-        members.merge(page) { _, new in new }
     }
 }
 
