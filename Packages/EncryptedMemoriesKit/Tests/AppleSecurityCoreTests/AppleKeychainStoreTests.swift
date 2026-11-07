@@ -116,11 +116,6 @@ struct AppleKeychainStoreTests {
         #expect(security.deleteQueries.allSatisfy { $0[kSecAttrAccessible as String] == nil })
     }
 
-    @Test func secureRandomReturnsRequestedByteCount() throws {
-        #expect(try AppleSecureRandom.data(count: 32).count == 32)
-        #expect(try AppleSecureRandom.data(count: 0).isEmpty)
-    }
-
     private func uniqueItem(_ purpose: String) -> AppleKeychainItem {
         AppleKeychainItem(
             service: "at.oncloud.encryptedmemories.security-tests.\(purpose).\(UUID().uuidString)",

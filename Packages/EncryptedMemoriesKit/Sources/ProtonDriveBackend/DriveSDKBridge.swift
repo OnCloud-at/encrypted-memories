@@ -1389,8 +1389,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Splits links into the web client's `fetch_metadata` batch size, which every metadata read stays within.
     private static func metadataBatches<Element>(_ items: [Element]) -> [[Element]] {
-        let size = UploadDedupePipeline.protonDuplicateBatchSize
-        return stride(from: 0, to: items.count, by: size).map { Array(items[$0..<min($0 + size, items.count)]) }
+        items.chunked(by: UploadDedupePipeline.protonDuplicateBatchSize)
     }
 
     /// The MIME types that a `fetch_metadata` batch names, by link ID.

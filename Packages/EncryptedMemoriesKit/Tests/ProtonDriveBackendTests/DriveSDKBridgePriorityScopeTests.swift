@@ -1,4 +1,3 @@
-import AppleSecurityCore
 import Foundation
 import PhotosCore
 import ProtonAuth
@@ -82,7 +81,7 @@ struct DriveSDKBridgePriorityScopeTests {
     static func makeBridge(directory: URL, governor: ProtonRequestGovernor) async throws -> DriveSDKBridge {
         let session = DriveSession(
             session: ProtonSession(uid: "scope-fixture", accessToken: "", refreshToken: "", keyPassword: ""),
-            store: SessionKeychainStore(service: "scope-fixture", account: "fixture", keychain: ScopeDenyKeychain()),
+            store: SessionKeychainStore(service: "scope-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory, requestGovernor: governor, urlProtocolClasses: [ScopeDenyHTTP.self])
         let client = try await EncryptedMemoriesClient(
             configuration: ProtonDriveClientConfiguration(baseURL: "https://fixture.invalid/", clientUID: "fixture"),
@@ -115,12 +114,4 @@ final class ScopeDenyHTTP: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() { client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet)) }
     override func stopLoading() {}
-}
-
-struct ScopeDenyKeychain: AppleKeychainStoring {
-    func data(for item: AppleKeychainItem) throws -> Data? { throw CocoaError(.userCancelled) }
-    func setData(_ data: Data, for item: AppleKeychainItem) throws { throw CocoaError(.userCancelled) }
-    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data { throw CocoaError(.userCancelled) }
-    func removeData(for item: AppleKeychainItem) throws { throw CocoaError(.userCancelled) }
-    func removeAllData(service: String) throws { throw CocoaError(.userCancelled) }
 }

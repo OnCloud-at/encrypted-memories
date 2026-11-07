@@ -475,11 +475,6 @@ extension DriveSession {
     /// The web client's chunk size for `links/fetch_metadata`.
     private static let metadataBatchSize = 150
 
-    /// Moves photos to trash (batch). Volume-keyed, on the `v2` path.
-    ///
-    /// This endpoint is a multistatus batch. It returns HTTP 200 with per-item result codes
-    /// in `Responses[].Response`. A failed move must be detected from the body; ignoring it turns every
-    /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
     /// The state and the main photo of each link. A link that the server no longer knows is absent from the result.
     /// `retryOnRateLimit` false answers a rate limit with an error at once, for a read that has a cheaper fallback.
     /// `requiresCompleteResponse` true throws on an answer that is not complete: there, an omitted link and a
@@ -488,7 +483,7 @@ extension DriveSession {
         shareID: String, linkIDs: [String], retryOnRateLimit: Bool = true, requiresCompleteResponse: Bool = false
     ) async throws -> [String: TimelineRemoteVisibilityRequirement.Link] {
         var result: [String: TimelineRemoteVisibilityRequirement.Link] = [:]
-        for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
+        for chunk in linkIDs.chunked(by: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let response = try await linkVisibilityResponse(
                 shareID: shareID, linkIDs: chunk, retryOnRateLimit: retryOnRateLimit)
@@ -522,7 +517,7 @@ extension DriveSession {
     func fetchLinkStateSnapshot(shareID: String, linkIDs: [String]) async throws -> UploadLinkStateSnapshot {
         var states: [String: Int] = [:]
         var complete = true
-        for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
+        for chunk in linkIDs.chunked(by: Self.metadataBatchSize) {
             try Task.checkCancellation()
             let response = try await linkVisibilityResponse(shareID: shareID, linkIDs: chunk, retryOnRateLimit: true)
             complete = complete && response.code == 1000 && response.envelope.isComplete
@@ -541,6 +536,11 @@ extension DriveSession {
         return UploadLinkStateSnapshot(states: states, complete: complete)
     }
 
+    /// Moves photos to trash (batch). Volume-keyed, on the `v2` path.
+    ///
+    /// This endpoint is a multistatus batch. It returns HTTP 200 with per-item result codes
+    /// in `Responses[].Response`. A failed move must be detected from the body; ignoring it turns every
+    /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
     func trash(volumeID: String, linkIDs: [String]) async throws {
         try await batchLinkAction(
             "trash", volumeID: volumeID, linkIDs: linkIDs,
@@ -566,7 +566,7 @@ extension DriveSession {
         var refused = 0
         var retryable = Set<String>()
         var firstError: String?
-        let chunks = Self.chunked(linkIDs, size: Self.batchRequestSize)
+        let chunks = linkIDs.chunked(by: Self.batchRequestSize)
         for (index, chunk) in chunks.enumerated() {
             let data: Data
             do {
@@ -657,7 +657,7 @@ extension DriveSession {
         }
         var all: [TrashLink] = []
         for (shareID, ids) in idsByShare {
-            for chunk in Self.chunked(ids, size: Self.metadataBatchSize) {
+            for chunk in ids.chunked(by: Self.metadataBatchSize) {
                 try Task.checkCancellation()
                 let data = try await send(
                     "/drive/shares/\(shareID)/links/fetch_metadata",
@@ -673,10 +673,6 @@ extension DriveSession {
         let totalIDs = seenByShare.values.reduce(0) { $0 + $1.count }
         DebugLog.log("listTrash: vol=\(volumeID.prefix(8))… trashedIDs=\(totalIDs) resolved=\(all.count)")
         return all
-    }
-
-    private static func chunked(_ items: [String], size: Int) -> [[String]] {
-        stride(from: 0, to: items.count, by: size).map { Array(items[$0..<min($0 + size, items.count)]) }
     }
 
     /// Lists the photos contained in an album (same per-photo shape as the timeline).
@@ -747,8 +743,8 @@ private struct VolumeTrashResponse: Decodable {
     enum CodingKeys: String, CodingKey { case trash = "Trash" }
 }
 
-/// `POST /drive/shares/{shareID}/links/fetch_metadata` response.
-/// `links/fetch_metadata` fields that decide whether a photos listing can show a link.
+/// `POST /drive/shares/{shareID}/links/fetch_metadata` response: the fields that decide whether a
+/// photos listing can show a link.
 private struct LinkVisibilityResponse: Decodable {
     let code: Int?
     /// What the shape of the answer says about its completeness; see `protonMetadataEnvelope`.
@@ -995,7 +991,6 @@ private struct UsersResponse: Decodable {
         let maxSpace: Int64?
         let usedDriveSpace: Int64?
         let maxDriveSpace: Int64?
-        let usedBaseSpace: Int64?
         let maxBaseSpace: Int64?
         enum CodingKeys: String, CodingKey {
             case keys = "Keys"
@@ -1003,7 +998,6 @@ private struct UsersResponse: Decodable {
             case maxSpace = "MaxSpace"
             case usedDriveSpace = "UsedDriveSpace"
             case maxDriveSpace = "MaxDriveSpace"
-            case usedBaseSpace = "UsedBaseSpace"
             case maxBaseSpace = "MaxBaseSpace"
         }
     }

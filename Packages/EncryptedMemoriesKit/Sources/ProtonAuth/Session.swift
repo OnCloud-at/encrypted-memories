@@ -154,20 +154,9 @@ public enum SessionKeychainError: Error, LocalizedError, Sendable, Equatable {
 
 /// Full app-private Keychain reset shared by macOS, iOS and iPadOS.
 public enum ProtonAuthLocalDataPurge {
-    /// Performs the shared file + Keychain transaction. The durable request is completed only when
-    /// both halves succeed, so an interrupted or partially-failed logout is retried before the next
-    /// session can open account-owned stores.
-    @discardableResult
-    public static func perform(
-        claim: BackupLocalDataPurge.Claim,
-        defaults: UserDefaults = .standard
-    ) -> Bool {
-        perform(claim: claim, defaults: defaults, networkStores: .current) {
-            try purgeKeychain()
-        }
-    }
-
-    /// Runs the same ordered purge away from the UI executor. The caller still awaits completion, so a
+    /// Performs the shared file + Keychain transaction away from the UI executor. The durable request is
+    /// completed only when both halves succeed, so an interrupted or partially-failed logout is retried
+    /// before the next session can open account-owned stores. The caller still awaits completion, so a
     /// new account cannot open stores while deletion is in flight.
     @discardableResult
     public static func performOffMain(

@@ -955,13 +955,12 @@ extension DriveSession {
     /// each successful batch as atomic because the response has no reliable per-photo result contract.
     func removeFromAlbum(volumeID: String, albumLinkID: String, linkIDs: [String]) async throws {
         guard !linkIDs.isEmpty else { return }
-        for start in stride(from: 0, to: linkIDs.count, by: 10) {
+        for chunk in linkIDs.chunked(by: 10) {
             try Task.checkCancellation()
-            let end = min(start + 10, linkIDs.count)
             _ = try await send(
                 "/drive/photos/volumes/\(volumeID)/albums/\(albumLinkID)/remove-multiple",
                 method: "POST",
-                body: ["LinkIDs": Array(linkIDs[start..<end])]
+                body: ["LinkIDs": chunk]
             )
         }
     }

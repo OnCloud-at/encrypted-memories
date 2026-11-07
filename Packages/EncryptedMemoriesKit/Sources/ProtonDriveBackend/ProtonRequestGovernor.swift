@@ -104,7 +104,6 @@ actor ProtonRequestGovernor {
         let storageUpload: Scope
         let successWindowForIncrease: Int
         let starvationPromotionInterval: TimeInterval
-        let priorityScopeLifetime: TimeInterval
         /// Without a new 429, each interval of this length halves the admission interval and adds one
         /// concurrent request, up to the initial concurrency. A quiet app sends too few requests to reach
         /// `successWindowForIncrease`, so success-based recovery alone kept a 2 s pacing for minutes.
@@ -115,8 +114,7 @@ actor ProtonRequestGovernor {
             storageDownload: Scope(initialConcurrency: 4, maximumConcurrency: 8),
             storageUpload: Scope(initialConcurrency: 2, maximumConcurrency: 4),
             successWindowForIncrease: 32,
-            starvationPromotionInterval: 10,
-            priorityScopeLifetime: 60
+            starvationPromotionInterval: 10
         )
 
         func scope(_ value: ProtonRequestScope) -> Scope {
@@ -184,10 +182,8 @@ actor ProtonRequestGovernor {
         [UUID: (
             priority: ProtonRequestPriority,
             promotedScopes: Set<ProtonRequestScope>,
-            suspendedScopes: Set<ProtonRequestScope>,
-            expiresAt: Date?
+            suspendedScopes: Set<ProtonRequestScope>
         )] = [:]
-    private var priorityWakeTask: Task<Void, Never>?
 
     init(
         configuration: Configuration = .production,
@@ -223,7 +219,6 @@ actor ProtonRequestGovernor {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 sequence &+= 1
-                prunePriorityScopes()
                 let requestedPriority = priority ?? ProtonRequestContext.priority
                 let scopedPriority = priorityScopes.values
                     .filter { $0.promotedScopes.contains(scope) }
@@ -270,41 +265,16 @@ actor ProtonRequestGovernor {
     func beginPriorityScope(
         _ priority: ProtonRequestPriority,
         promoting promotedScopes: Set<ProtonRequestScope> = Set(ProtonRequestScope.allCases),
-        suspending suspendedScopes: Set<ProtonRequestScope> = [],
-        expiresAfter: TimeInterval? = nil
-    ) -> PriorityScope {
-        let scope = PriorityScope(id: UUID())
-        priorityScopes[scope.id] = (
-            priority,
-            promotedScopes,
-            suspendedScopes,
-            expiresAfter.map { now().addingTimeInterval($0) }
-        )
-        schedulePriorityWake()
-        return scope
-    }
-
-    /// Starts a scope for an SDK callback path that might not report completion.
-    ///
-    /// Structured operations must use `beginPriorityScope` and end the returned lease explicitly.
-    /// This watchdog is limited to the unstructured callback boundary.
-    func beginUnstructuredPriorityScope(
-        _ priority: ProtonRequestPriority,
-        promoting promotedScopes: Set<ProtonRequestScope> = Set(ProtonRequestScope.allCases),
         suspending suspendedScopes: Set<ProtonRequestScope> = []
     ) -> PriorityScope {
-        beginPriorityScope(
-            priority,
-            promoting: promotedScopes,
-            suspending: suspendedScopes,
-            expiresAfter: configuration.priorityScopeLifetime
-        )
+        let scope = PriorityScope(id: UUID())
+        priorityScopes[scope.id] = (priority, promotedScopes, suspendedScopes)
+        return scope
     }
 
     func endPriorityScope(_ scope: PriorityScope) {
         priorityScopes.removeValue(forKey: scope.id)
         drainAllScopes()
-        schedulePriorityWake()
     }
 
     /// Runs one bounded request with targeted promotion and admission suspension.
@@ -399,7 +369,6 @@ actor ProtonRequestGovernor {
     }
 
     func snapshot() -> ProtonRequestGovernorSnapshot {
-        prunePriorityScopes()
         let timestamp = now()
         return ProtonRequestGovernorSnapshot(
             api: snapshot(.api, now: timestamp),
@@ -579,18 +548,6 @@ actor ProtonRequestGovernor {
         drain(scope)
     }
 
-    private func prunePriorityScopes() {
-        let timestamp = now()
-        let before = priorityScopes.count
-        priorityScopes = priorityScopes.filter { entry in
-            guard let expiresAt = entry.value.expiresAt else { return true }
-            return expiresAt > timestamp
-        }
-        if before != priorityScopes.count {
-            drainAllScopes()
-        }
-    }
-
     private func isAdmissionSuspended(_ scope: ProtonRequestScope) -> Bool {
         return priorityScopes.values.contains { $0.suspendedScopes.contains(scope) }
     }
@@ -599,26 +556,6 @@ actor ProtonRequestGovernor {
         for scope in ProtonRequestScope.allCases {
             drain(scope)
         }
-    }
-
-    private func schedulePriorityWake() {
-        priorityWakeTask?.cancel()
-        guard let earliest = priorityScopes.values.compactMap({ $0.expiresAt }).min() else {
-            priorityWakeTask = nil
-            return
-        }
-        let delay = max(0, earliest.timeIntervalSince(now()))
-        priorityWakeTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled else { return }
-            await self?.priorityWake()
-        }
-    }
-
-    private func priorityWake() {
-        priorityWakeTask = nil
-        prunePriorityScopes()
-        schedulePriorityWake()
     }
 
     private static func prune(_ state: inout ScopeState, now: Date) {
