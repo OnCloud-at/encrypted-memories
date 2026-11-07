@@ -154,7 +154,7 @@ package enum MetalGridFrameComposer {
             cache.uploadVisible(
                 wanted: wanted,
                 revealStartedAt: now,
-                revealIDs: Set(visibleIDs)
+                revealIDs: wanted.isEmpty ? [] : Set(visibleIDs)
             ) { provideImage($0) }
         }
         // A pending photo's new revision replaces its texture in place, also while scrolling.

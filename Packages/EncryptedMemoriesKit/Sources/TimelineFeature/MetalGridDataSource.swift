@@ -84,8 +84,8 @@ final class RealMetalGridDataSource: MetalGridDataSource {
         feed: ThumbnailFeed,
         metadataProvider: (any PhotoMetadataProvider)? = nil
     ) {
-        let uids = sections.flatMap { $0.items.map(\.uid) }
         let items = sections.flatMap(\.items)
+        let uids = items.map(\.uid)
         self.flatUIDs = uids
         self.sectionCounts = uids.isEmpty ? [] : [uids.count]  // one continuous section (production photo wall)
         self.feed = feed
