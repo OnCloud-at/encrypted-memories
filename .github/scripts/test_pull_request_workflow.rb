@@ -23,7 +23,7 @@ class PullRequestWorkflowTests < Minitest::Test
     # These workflow expressions contain only context lookups and boolean operators.
     source = expression.sub(/\A\$\{\{\s*/, "").sub(/\s*\}\}\z/, "")
     source = source.gsub("always()", "true").gsub("!cancelled()", "true")
-    source = source.gsub(/(?:github|inputs|runner|needs)\.[a-z_.\-]+/) { |path| context.fetch(path, nil).inspect }
+    source = source.gsub(/(?:github|inputs|runner|needs|steps)\.[a-z_.\-]+/) { |path| context.fetch(path, nil).inspect }
     eval(source)
   end
 
@@ -510,6 +510,46 @@ class PullRequestWorkflowTests < Minitest::Test
     refute evaluate(package.fetch("if"), {"github.event_name" => "pull_request"})
     tests = package.fetch("steps").find { |step| step["id"] == "tests" }
     refute evaluate(tests.fetch("if"), {"github.event_name" => "pull_request"})
+  end
+
+  # `swift test -c release` alone does not build (ModuleNotTestable), so the release compile of the tests needs
+  # `-Xswiftc -enable-testing`. A test that uses a Debug-only seam outside `#if DEBUG` breaks only this build (#1101),
+  # and every other gate builds Debug.
+  def test_the_package_job_compiles_the_package_tests_in_release_and_its_result_requires_it
+    package = @workflow.fetch("jobs").fetch("package-verification")
+    steps = package.fetch("steps")
+    build = steps.find { |step| step["id"] == "release-test-build" }
+    refute_nil build, "The package job must build the package tests in the Release configuration"
+    command = build.fetch("run").gsub(/\s*\\\n\s*/, " ")
+    assert_includes command, "xcrun swift build --package-path Packages/EncryptedMemoriesKit"
+    # The scratch and cache of the package tests, so that the job creates no second build directory.
+    assert_includes command, '--scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE"'
+    assert_includes command, "--force-resolved-versions"
+    assert_includes command, "--build-tests -c release -Xswiftc -enable-testing"
+    refute_includes command, "swift test"
+    # A red Release build turns the step red: strict shell, no swallowed exit status, no continue-on-error.
+    assert_includes build.fetch("run"), "set -euo pipefail"
+    refute_match(/\|\||;\s*true/, command)
+    refute build.key?("continue-on-error"), "The Release build must not continue on error"
+    # It runs after a failed Debug run too, so one run reports both results.
+    assert_includes build.fetch("if"), "!cancelled()"
+    # It builds after the dependencies are ready and after the Debug tests, and it runs even when those tests fail.
+    assert_operator steps.index { |step| step["id"] == "prepare" }, :<, steps.index(build)
+    assert_operator steps.index { |step| step["id"] == "tests" }, :<, steps.index(build)
+    {"merge_group" => true, "workflow_dispatch" => true, "pull_request" => false}.each do |event, expected|
+      [["success", expected], ["failure", false]].each do |prepared, runs|
+        context = {"github.event_name" => event, "steps.prepare.outcome" => prepared}
+        assert_equal runs, evaluate(build.fetch("if"), context), "#{event}, prepare #{prepared}"
+      end
+    end
+    # The required check "Swift package tests" and the architecture check read this one output. A red Release
+    # build must turn it red, and a red Debug run must keep it red.
+    outcomes = %w[success failure skipped cancelled]
+    outcomes.product(outcomes).each do |debug, release|
+      context = {"steps.tests.outcome" => debug, "steps.release-test-build.outcome" => release}
+      verdict = evaluate(package.fetch("outputs").fetch("tests"), context)
+      assert_equal debug == "success" && release == "success", verdict == "success", "Debug #{debug}, Release #{release}"
+    end
   end
 
   def test_simulator_build_includes_both_test_bundles

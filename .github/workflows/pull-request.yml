@@ -239,7 +239,7 @@ jobs:
     timeout-minutes: 90
     outputs:
       style: ${{ steps.style.outcome }}
-      tests: ${{ steps.tests.outcome }}
+      tests: ${{ steps.tests.outcome == 'success' && steps.release-test-build.outcome == 'success' && 'success' || 'failure' }}
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -267,6 +267,22 @@ jobs:
         id: tests
         if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.prepare.outcome == 'success' }}
         run: bash ./scripts/verify-tests.sh
+      # The Debug tests do not see a test that uses a Debug-only seam outside `#if DEBUG` (#1101). This step compiles
+      # the same tests in Release. `swift test -c release` alone does not build (ModuleNotTestable), so it builds
+      # with -Xswiftc -enable-testing. It uses the scratch and cache of the Debug tests, and it runs after them,
+      # also when they fail, so one run reports both results. The `tests` output below requires both.
+      - name: Build the package tests in the Release configuration
+        id: release-test-build
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.prepare.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          source ./scripts/build-paths.sh
+          xcrun swift build \
+            --package-path Packages/EncryptedMemoriesKit \
+            --scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" \
+            --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+            --force-resolved-versions \
+            --build-tests -c release -Xswiftc -enable-testing
       - if: ${{ always() && github.event_name != 'pull_request' }}
         run: bash ./scripts/report-build-storage.sh
 
