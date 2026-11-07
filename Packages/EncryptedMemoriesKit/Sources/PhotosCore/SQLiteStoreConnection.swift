@@ -1,6 +1,27 @@
 import Foundation
 import SQLite3
 
+/// The one implementation that binds TEXT and BLOB values for the SQLite stores (#1194). It returns the bind's own
+/// result code. A failed bind leaves its parameter NULL, so a caller that steps anyway reads "no row" or stores NULL:
+/// check the result, or use `SQLiteStoreConnection.bindText` and `bindBlob`, which record the failure and throw.
+public enum SQLiteBinding {
+    /// Binds `value` as TEXT, or SQL NULL for nil. SQLite copies the text before the call returns.
+    public static func text(_ statement: OpaquePointer?, _ index: Int32, _ value: String?) -> Int32 {
+        guard let value else { return sqlite3_bind_null(statement, index) }
+        return sqlite3_bind_text(statement, index, value, -1, SQLiteStoreSchemaGate.transientDestructor)
+    }
+
+    /// Binds `value` as a BLOB, or SQL NULL for nil. SQLite copies the bytes before the call returns.
+    public static func blob(_ statement: OpaquePointer?, _ index: Int32, _ value: Data?) -> Int32 {
+        guard let value else { return sqlite3_bind_null(statement, index) }
+        return value.withUnsafeBytes { bytes in
+            sqlite3_bind_blob64(
+                statement, index, bytes.baseAddress, sqlite3_uint64(bytes.count),
+                SQLiteStoreSchemaGate.transientDestructor)
+        }
+    }
+}
+
 /// Owns an already-verified store handle. Opening and connection tuning stay in SQLiteStoreSchemaGate.
 /// Access the handle and failure state only inside `withLock`. Finalize each statement before that closure returns.
 /// `close` and `isOperational` take the same nonrecursive lock; do not call them inside `withLock`.
@@ -60,6 +81,18 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
             markFailed(resultCode: resultCode)
             throw SQLiteStoreUnknownReadError()
         }
+    }
+
+    /// Call inside `withLock`. Binds TEXT, or SQL NULL for nil, through `SQLiteBinding` (#1194). A failed bind is
+    /// recorded with its own code and throws `SQLiteStoreUnknownReadError`, for a read and for a write alike: the
+    /// caller must not step the statement.
+    public func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String?) throws {
+        try requireReadableBinding(resultCode: SQLiteBinding.text(statement, index, value))
+    }
+
+    /// Call inside `withLock`. Binds a BLOB, or SQL NULL for nil, as `bindText` binds TEXT (#1194).
+    public func bindBlob(_ statement: OpaquePointer?, _ index: Int32, _ value: Data?) throws {
+        try requireReadableBinding(resultCode: SQLiteBinding.blob(statement, index, value))
     }
 
     /// Call inside `withLock`. Ends the open transaction. Only a transaction that stays open records a failure: after a

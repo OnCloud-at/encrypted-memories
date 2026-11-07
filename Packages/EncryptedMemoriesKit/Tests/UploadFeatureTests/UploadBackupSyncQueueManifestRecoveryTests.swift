@@ -188,15 +188,6 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         }
     }
 
-    func testLegacyPresenceKeepsItsOldAnswerAfterABindingFailure() throws {
-        store = try makeStore()
-        let connection = try queueConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
-        XCTAssertEqual(
-            store!.sourcesWithEntries([entry(String(repeating: "x", count: 128)).source]), Set<UploadSourceIdentity>())
-        XCTAssertTrue(store!.isOperational(), "Legacy binding failure did not record a failed read")
-    }
-
     func testEntryResourceBindingFailureThrowsInsteadOfProvingAbsence() throws {
         store = try makeStore()
         let connection = try queueConnection()

@@ -380,6 +380,63 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
     }
 
+    /// The shared binds record a failed bind with its own code and throw, so no caller steps a statement whose
+    /// parameter silently became NULL (#1194).
+    func testSharedBindsRecordAFailedBindAndThrow() throws {
+        for kind in ["text", "blob"] {
+            let connection = try makeConnection()
+            defer { connection.close() }
+            var statement: OpaquePointer?
+            connection.withLock {
+                XCTAssertEqual(sqlite3_prepare_v2(connection.database, "SELECT ?;", -1, &statement, nil), SQLITE_OK)
+                _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32)
+                XCTAssertEqual(sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, -1), 32, "the limit applies")
+            }
+            defer { sqlite3_finalize(statement) }
+            let long = String(repeating: "x", count: 128)
+            XCTAssertThrowsError(
+                try connection.withLock {
+                    if kind == "text" {
+                        try connection.bindText(statement, 1, long)
+                    } else {
+                        try connection.bindBlob(statement, 1, Data(long.utf8))
+                    }
+                }
+            ) { XCTAssertTrue($0 is SQLiteStoreUnknownReadError, "\(kind)") }
+            connection.withLock {
+                XCTAssertTrue(connection.operationFailed, "the failed \(kind) bind is recorded")
+                XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure")
+            }
+            XCTAssertEqual(SQLiteBinding.text(statement, 1, long), SQLITE_TOOBIG, "the shared bind reports its code")
+            XCTAssertEqual(SQLiteBinding.blob(statement, 1, Data(long.utf8)), SQLITE_TOOBIG)
+        }
+    }
+
+    func testSharedBindsBindValuesAndNull() throws {
+        let connection = try makeConnection()
+        defer { connection.close() }
+        var statement: OpaquePointer?
+        connection.withLock {
+            XCTAssertEqual(
+                sqlite3_prepare_v2(connection.database, "SELECT ?, ?, typeof(?), typeof(?);", -1, &statement, nil),
+                SQLITE_OK)
+        }
+        defer { sqlite3_finalize(statement) }
+        XCTAssertNoThrow(
+            try connection.withLock {
+                try connection.bindText(statement, 1, "text")
+                try connection.bindBlob(statement, 2, Data([1, 2, 3]))
+                try connection.bindText(statement, 3, nil)
+                try connection.bindBlob(statement, 4, nil)
+            })
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 0)), "text")
+        XCTAssertEqual(sqlite3_column_bytes(statement, 1), 3)
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 2)), "null")
+        XCTAssertEqual(String(cString: sqlite3_column_text(statement, 3)), "null")
+        connection.withLock { XCTAssertFalse(connection.operationFailed) }
+    }
+
     private func makeConnection() throws -> SQLiteStoreConnection {
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open(":memory:", &handle), SQLITE_OK)
