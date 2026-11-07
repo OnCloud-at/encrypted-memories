@@ -564,12 +564,21 @@ public struct PhotoLibraryCatalogSync: Sendable {
     }
 
     /// An edit whose rendered file Photos lists only now. When Photos leaves the dates alone, its revision can
-    /// equal one that an earlier build recorded as complete with the original as main photo. An unknown stored row
-    /// stops the chunk: answering false would record the render without its reopening (#1004).
+    /// equal one that an earlier build recorded as complete with the original as main photo. A failed read of the
+    /// stored row stops the chunk: answering false would record the render without its reopening (#1004).
+    /// A stored row that cannot be decoded may have recorded the original as main photo, so the edit re-opens. The
+    /// engine keeps a backup that already holds the render, and the chunk then rewrites the row (#1212).
     private func rendersLate(_ info: PhotoBackupAssetInfo) throws -> Bool {
-        guard PhotoBackupAssetPlanner.listsRender(info),
-            let stored = try readOrUnavailable({ try store.entry(for: info.localIdentifier) })
-        else { return false }
+        guard PhotoBackupAssetPlanner.listsRender(info) else { return false }
+        let stored: PhotoLibraryCatalogEntry?
+        do {
+            stored = try store.entry(for: info.localIdentifier)
+        } catch is PhotoLibraryCatalogUndecodableRowError {
+            return true
+        } catch {
+            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+        }
+        guard let stored else { return false }
         return !PhotoBackupAssetPlanner.listsRender(PhotoLibraryCatalogMapper.info(for: stored))
     }
 

@@ -187,6 +187,21 @@ public struct PhotoLibraryCatalogPresence: Sendable, Equatable {
     }
 }
 
+/// A stored catalog row exists, but its content could not be decoded. The row is unknown for that row only (#1160):
+/// the store stays operational, and each caller decides what an unknown row means for its own work (#1212).
+public struct PhotoLibraryCatalogUndecodableRowError: Error, Equatable, Sendable {
+    public init() {}
+}
+
+public extension PhotoLibraryCatalogStore {
+    /// The cloud identifier that the catalog holds for `localIdentifier`, or nil when it holds none. An unknown row
+    /// also answers nil: the upload metadata then asks Photos, which owns the identifier, so an unknown row never
+    /// stands for a missing identifier (#1212).
+    func cachedCloudIdentifier(for localIdentifier: String) -> String? {
+        (try? entry(for: localIdentifier))?.cloudIdentifier
+    }
+}
+
 /// One stable keyset page of present inventory rows: the rows that decoded, plus the readable identifiers whose
 /// own row could not be decoded. Each undecodable identifier is unknown for that row only and is retried by the
 /// next pass that scans it (#1160). An identifier in neither list is absent or removed.
@@ -265,12 +280,15 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// this remains true; scanners must stop rather than advance a cursor on a failed read.
     func isOperational() -> Bool
     /// Reads one row. Throws `SQLiteStoreUnknownReadError` when the read could not run, so a caller never mistakes
-    /// a failed read for a real absence (#1004).
+    /// a failed read for a real absence (#1004). Throws `PhotoLibraryCatalogUndecodableRowError` when the row exists
+    /// but its content could not be decoded (#1212).
     func entry(for localIdentifier: String) throws -> PhotoLibraryCatalogEntry?
     /// Stable keyset page of present inventory rows. Used to rebuild or enrich the durable backup
     /// queue without touching PhotoKit bytes when the queue is incomplete after an app upgrade.
     /// Nil means the page is unknown, not empty; a caller must not treat it as the end of the catalog (#1004).
     /// Rows whose content could not be decoded are reported per row in `undecodableIdentifiers` (#1160).
+    /// A row whose key is not exact text makes its page unknown. A NULL, INTEGER or REAL key also makes the empty
+    /// last page of a pass with a cursor unknown (#1212).
     func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage?
     /// Read-only classification of observations against the stored rows, without writing. The sync
     /// driver uses this to decide whether to enqueue a backup candidate before it advances the

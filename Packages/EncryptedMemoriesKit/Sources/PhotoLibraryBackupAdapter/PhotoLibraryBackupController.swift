@@ -403,7 +403,7 @@ public final class PhotoLibraryBackupController {
             configuration.bulkResourceResolver
             ?? PhotoLibraryResourceResolver(
                 tempStore: tempStore,
-                cloudIdentifierProvider: { (try? catalogStore?.entry(for: $0))?.cloudIdentifier })
+                cloudIdentifierProvider: { catalogStore?.cachedCloudIdentifier(for: $0) })
         lockStore = BackupExecutionLockManifestStore(
             url: directory.appendingPathComponent(Self.lockDatabaseFileName),
             policy: configuration.databasePolicy,
@@ -423,9 +423,7 @@ public final class PhotoLibraryBackupController {
                 preflight: preflight,
                 resolver: PhotoLibraryResourceResolver(
                     tempStore: tempStore,
-                    cloudIdentifierProvider: { localIdentifier in
-                        (try? catalogStore.entry(for: localIdentifier))?.cloudIdentifier
-                    }
+                    cloudIdentifierProvider: { catalogStore.cachedCloudIdentifier(for: $0) }
                 ),
                 identityResolver: identityResolver,
                 uploader: uploader,
