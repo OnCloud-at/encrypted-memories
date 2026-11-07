@@ -197,25 +197,39 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         guard !keys.isEmpty else { return [:] }
         return connection.withLock {
             var result: [PendingSourceKey: PendingHandoffRead] = [:]
+            var stmt: OpaquePointer?
+            guard prepare(Self.latestHandoffSQL, &stmt) else {
+                // As before, the failed prepare answers the first key; every other key prepares again.
+                result[keys[0]] = .unreadable
+                for key in keys.dropFirst() { result[key] = latestHandoffLocked(key) }
+                return result
+            }
+            defer { sqlite3_finalize(stmt) }
+            // One statement serves every key. Each key starts from a reset statement without bindings.
             for key in keys {
-                result[key] = latestHandoffLocked(key)
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                result[key] = latestHandoffLocked(key, stmt)
             }
             return result
         }
     }
 
+    private static let latestHandoffSQL = """
+        SELECT source_kind, source_id, revision_us, remote_volume_id, remote_link_id, kind,
+               created_at, acknowledged
+        FROM handoff WHERE source_kind=? AND source_id=?
+        ORDER BY created_at DESC, revision_us DESC LIMIT 1;
+        """
+
     private func latestHandoffLocked(_ key: PendingSourceKey) -> PendingHandoffRead {
         var stmt: OpaquePointer?
-        guard
-            prepare(
-                """
-                SELECT source_kind, source_id, revision_us, remote_volume_id, remote_link_id, kind,
-                       created_at, acknowledged
-                FROM handoff WHERE source_kind=? AND source_id=?
-                ORDER BY created_at DESC, revision_us DESC LIMIT 1;
-                """, &stmt)
-        else { return .unreadable }
+        guard prepare(Self.latestHandoffSQL, &stmt) else { return .unreadable }
         defer { sqlite3_finalize(stmt) }
+        return latestHandoffLocked(key, stmt)
+    }
+
+    private func latestHandoffLocked(_ key: PendingSourceKey, _ stmt: OpaquePointer?) -> PendingHandoffRead {
         bindKey(stmt, key)
         switch sqlite3_step(stmt) {
         case SQLITE_ROW:

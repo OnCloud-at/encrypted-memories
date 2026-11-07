@@ -1495,6 +1495,58 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(store.savedFromAppIdentifiers(), ["saved-1"])
     }
 
+    // MARK: - Latest handoffs of many sources
+
+    /// One call answers each source exactly as a call for that source alone does: the newest handoff, an absent
+    /// handoff, and an unreadable row that leaves the sources after it readable.
+    func testLatestHandoffsAnswerEachSourceAsItsOwnReadDoes() throws {
+        func source(_ name: String) -> PendingSourceKey { PendingSourceKey(kind: .photoLibraryAsset, identifier: name) }
+        func handoff(
+            _ source: PendingSourceKey, revision: Int64, link: String, at offset: TimeInterval
+        )
+            -> PendingHandoff
+        {
+            PendingHandoff(
+                key: source, revision: UploadBackupRevision(rawValue: revision),
+                remote: PhotoUID(volumeID: "vol", nodeID: link), kind: .uploaded,
+                createdAt: date.addingTimeInterval(offset))
+        }
+        let edited = source("edited")
+        let absent = source("absent")
+        let damaged = source("damaged")
+        let plain = source("plain")
+        XCTAssertEqual(store.recordHandoff(handoff(edited, revision: 7, link: "edited-old", at: 0)), .recorded)
+        XCTAssertEqual(store.recordHandoff(handoff(edited, revision: 8, link: "edited-new", at: 60)), .recorded)
+        XCTAssertEqual(store.recordHandoff(handoff(damaged, revision: 7, link: "damaged", at: 0)), .recorded)
+        XCTAssertEqual(store.recordHandoff(handoff(plain, revision: 7, link: "plain", at: 0)), .recorded)
+        try withRawPendingDatabase {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE handoff SET kind='invalid' WHERE source_id='damaged';", nil, nil, nil),
+                SQLITE_OK)
+        }
+        let keys = [damaged, edited, absent, plain]
+
+        let together = store.latestHandoffsRead(for: keys)
+
+        XCTAssertEqual(
+            together,
+            [
+                damaged: .unreadable,
+                edited: .readable(handoff(edited, revision: 8, link: "edited-new", at: 60)),
+                absent: .readable(nil),
+                plain: .readable(handoff(plain, revision: 7, link: "plain", at: 0)),
+            ])
+        for key in keys {
+            XCTAssertEqual(store.latestHandoffsRead(for: [key]), [key: together[key]!], "\(key.identifier) alone")
+        }
+        XCTAssertEqual(store.latestHandoffsRead(for: []), [:])
+
+        store.close()
+        XCTAssertEqual(
+            store.latestHandoffsRead(for: [edited, plain]), [edited: .unreadable, plain: .unreadable],
+            "a closed store reads nothing")
+    }
+
     // MARK: - Text that does not round-trip
 
     func testHandoffReadRejectsAnEmbeddedNULRemoteVolumeID() throws {
