@@ -492,12 +492,7 @@ private struct MobilePhotoBackupSections: View {
 /// An album row opens the same sheet with its last-run photos and restores a trashed copy through the shared
 /// controller. Sync now on the album row retries the album.
 struct MobileFailedBackupSheet: View {
-    enum Source {
-        case backup(PhotoLibraryBackupController)
-        case album(AlbumSyncController, albumID: String)
-    }
-
-    let source: Source
+    let source: BackupProblemSheetSource
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var pagedList: BackupProblemListSession
@@ -507,15 +502,17 @@ struct MobileFailedBackupSheet: View {
     @State private var personReadTask: Task<Void, Never>?
 
     init(controller: PhotoLibraryBackupController) {
-        source = .backup(controller)
-        _pagedList = State(initialValue: controller.makeProblemListSession())
-        _sessionSourceID = State(initialValue: "backup-\(ObjectIdentifier(controller))")
+        self.init(source: .backup(controller))
     }
 
     init(albumSync: AlbumSyncController, albumID: String) {
-        source = .album(albumSync, albumID: albumID)
-        _pagedList = State(initialValue: albumSync.makeProblemListSession(albumID: albumID))
-        _sessionSourceID = State(initialValue: "album-\(ObjectIdentifier(albumSync))-\(albumID)")
+        self.init(source: .album(albumSync, albumID: albumID))
+    }
+
+    private init(source: BackupProblemSheetSource) {
+        self.source = source
+        _pagedList = State(initialValue: source.makeSession())
+        _sessionSourceID = State(initialValue: source.id)
     }
 
     private static func makePreviews() -> BackupProblemPreviewModel {
@@ -532,71 +529,20 @@ struct MobileFailedBackupSheet: View {
             ).listThumbnail(for:))
     }
 
-    private var controller: PhotoLibraryBackupController? {
-        if case .backup(let controller) = source { controller } else { nil }
-    }
+    private var controller: PhotoLibraryBackupController? { source.backupController }
 
-    private var sourceID: String {
-        switch source {
-        case .backup(let controller): "backup-\(ObjectIdentifier(controller))"
-        case .album(let controller, let albumID): "album-\(ObjectIdentifier(controller))-\(albumID)"
-        }
-    }
+    private var sourceID: String { source.id }
 
-    private var sourceIsSelected: Bool {
-        if case .album(let controller, let albumID) = source {
-            return controller.selectedAlbumIDs.contains(albumID)
-        }
-        return true
-    }
+    private var items: [BackupFailedItem] { source.items(of: pagedList, madeFor: sessionSourceID) }
 
-    private struct FollowKey: Equatable {
-        let session: ObjectIdentifier
-        let source: String
-        let backup: BackupStatus.ProblemListKey?
-        let album: UUID?
-    }
-
-    private var followKey: FollowKey {
-        let albumRevision: UUID?
-        if case .album(let controller, _) = source {
-            albumRevision = controller.problemListRevision
-        } else {
-            albumRevision = nil
-        }
-        return FollowKey(
-            session: ObjectIdentifier(pagedList), source: sourceID,
-            backup: controller?.status.problemListKey, album: albumRevision)
-    }
-
-    private var items: [BackupFailedItem] {
-        guard sessionSourceID == sourceID, sourceIsSelected else { return [] }
-        return pagedList.rows.map(\.item)
-    }
-
-    private var presentation: BackupProblemListModel.Presentation {
-        guard sessionSourceID == sourceID else { return .loading }
-        guard sourceIsSelected else { return .empty }
-        let expectsItems: Bool
-        switch source {
-        case .backup(let controller): expectsItems = controller.status.needsAttentionCount > 0
-        case .album(let controller, let albumID):
-            expectsItems = controller.selectedAlbums.first { $0.id == albumID }?.hasNeedsAttention == true
-        }
-        return pagedList.presentation(expectsItems: expectsItems)
-    }
-
-    private func makeSession() -> BackupProblemListSession {
-        switch source {
-        case .backup(let controller): controller.makeProblemListSession()
-        case .album(let controller, let albumID): controller.makeProblemListSession(albumID: albumID)
-        }
+    private var presentation: BackupProblemListPresentation {
+        source.presentation(of: pagedList, madeFor: sessionSourceID)
     }
 
     private func prepareSession() {
-        guard sessionSourceID != sourceID || pagedList.isRetired else { return }
+        guard source.needsNewSession(pagedList, madeFor: sessionSourceID) else { return }
         let previous = pagedList
-        pagedList = makeSession()
+        pagedList = source.makeSession()
         sessionSourceID = sourceID
         personReadTask?.cancel()
         Task { await previous.shutdown() }
@@ -649,8 +595,8 @@ struct MobileFailedBackupSheet: View {
             }
             // Inside the stack, so the List insets its last rows above the fixed area instead of under it.
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                BackupProblemActionArea(message: sessionSourceID == sourceID ? pagedList.fixedActionMessage : nil) {
-                    if sessionSourceID == sourceID, let controller {
+                BackupProblemActionArea(message: source.owns(sessionSourceID) ? pagedList.fixedActionMessage : nil) {
+                    if source.owns(sessionSourceID), let controller {
                         BulkPhotoActionControls(
                             runner: controller.bulkPhotoActions, count: pagedList.decisionCount,
                             isAvailable: { controller.isBulkBackUpAgainAvailable },
@@ -658,7 +604,7 @@ struct MobileFailedBackupSheet: View {
                             start: { controller.startBackUpAgain($0) }
                         )
                         .id(ObjectIdentifier(controller))
-                    } else if sessionSourceID == sourceID, case .album(let albumSync, let albumID) = source {
+                    } else if source.owns(sessionSourceID), case .album(let albumSync, let albumID) = source {
                         BulkPhotoActionControls(
                             runner: albumSync.bulkPhotoActions, action: .restore, count: pagedList.decisionCount,
                             isAvailable: { albumSync.isBulkRestoreAvailable(albumID: albumID) },
@@ -711,14 +657,8 @@ struct MobileFailedBackupSheet: View {
             Button(L10n.string("action.cancel"), role: .cancel) { deletionItem = nil }
         }
         .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.large] : [.medium, .large])
-        .task(id: followKey) {
-            guard sessionSourceID == sourceID, sourceIsSelected else { return }
-            switch source {
-            case .backup(let controller): await controller.followProblemList(session: pagedList)
-            case .album:
-                pagedList.requestRefresh()
-                await pagedList.waitUntilIdle()
-            }
+        .task(id: source.followKey(for: pagedList)) {
+            await source.follow(pagedList, madeFor: sessionSourceID)
         }
         .onAppear { prepareSession() }
         .onChange(of: sourceID) { _, _ in prepareSession() }

@@ -29,14 +29,6 @@ final class AlbumSyncRowAfterListTests: XCTestCase {
             from: backup, id: incomplete ? AlbumSyncProblemList.incompleteIDPrefix + identifier : nil)
     }
 
-    private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(10)
-        while !condition() {
-            guard Date() < deadline else { return XCTFail("The condition did not hold within 10 seconds") }
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-    }
-
     func testTheRowNeverCombinesTheNewCountWithThePreviousListWhenARunEnds() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("album-row-after-list-\(UUID().uuidString)", isDirectory: true)
@@ -65,7 +57,7 @@ final class AlbumSyncRowAfterListTests: XCTestCase {
             configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative),
             identityResolver: nil, uploader: MockUploader(), remoteOps: NoRemoteAlbums())
         addTeardownBlock { await controller.shutdown() }
-        try await waitUntil { controller.selectedAlbums.first?.problems.count == 1 }
+        try await pollUntilOrFail { controller.selectedAlbums.first?.problems.count == 1 }
         let row = { try XCTUnwrap(controller.selectedAlbums.first) }
         let before = try row().localizedRowStatusDescription
         XCTAssertEqual(before, L10n.string("albumsync.detail_not_in_album \(1)"))

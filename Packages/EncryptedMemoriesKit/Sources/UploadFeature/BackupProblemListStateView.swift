@@ -1,16 +1,17 @@
 import DesignSystemCore
 import PhotosCore
 import SwiftUI
+import UploadCore
 
 /// What the failed-items sheet shows when it has no list to draw: the loading state, the state after a list that
 /// could not be read, with the shared Try again button, and the one state that says nothing needs attention. The
 /// list itself stays with each platform's native `List`, so the `.list` presentation draws nothing here. macOS and
 /// iOS place the view themselves and supply what Try again does.
 public struct BackupProblemListStateView: View {
-    private let presentation: BackupProblemListModel.Presentation
+    private let presentation: BackupProblemListPresentation
     private let retry: () -> Void
 
-    public init(_ presentation: BackupProblemListModel.Presentation, retry: @escaping () -> Void) {
+    public init(_ presentation: BackupProblemListPresentation, retry: @escaping () -> Void) {
         self.presentation = presentation
         self.retry = retry
     }

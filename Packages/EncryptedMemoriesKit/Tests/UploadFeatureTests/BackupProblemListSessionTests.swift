@@ -1,5 +1,4 @@
 import Foundation
-import UploadFeature
 import XCTest
 
 @testable import UploadCore
