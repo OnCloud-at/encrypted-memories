@@ -935,3 +935,122 @@ private final class SynchronousCompletionProbe: @unchecked Sendable {
         lock.withLock { completed = true }
     }
 }
+
+/// How a refresh enumerates the items of the additional library sources: at most four at once, every source ends
+/// with an answer or with none, and a source without an answer makes the refresh retryable without hiding the others.
+@Suite(.serialized)
+struct LibrarySourceEnumerationTests {
+    @Test func sourcesAreEnumeratedFourAtATimeAndAllArePublished() async throws {
+        let locators = (0..<6).map { AlbumNodeIdentifier(volumeID: "remote", nodeID: "album-\($0)") }
+        let remote = EnumerationRemote(locators: locators, delay: .milliseconds(40))
+        let coordinator = LibrarySourceCoordinator(remote: remote, thumbnailLoader: NoThumbnails(), inventoryStore: nil)
+        await coordinator.prepare()
+        let recorder = LibrarySourceChangeRecorder()
+        _ = await coordinator.attach { change in await recorder.store(change) }
+
+        #expect(await coordinator.refresh() == .complete)
+
+        #expect(await remote.peak == 4, "four sources run at once, never more")
+        #expect(await remote.calls == 6)
+        let latest = try #require(await recorder.latest())
+        for locator in locators {
+            #expect(latest.analysisScope.uids.contains(EnumerationRemote.uid(of: locator)), "\(locator.nodeID)")
+        }
+        await coordinator.shutdown()
+    }
+
+    @Test(arguments: [0, 3, 5])
+    func eachSourceReceivesTheAnswerOfItsOwnRead(revoked: Int) async throws {
+        let locators = (0..<6).map { AlbumNodeIdentifier(volumeID: "remote", nodeID: "album-\($0)") }
+        // The first sources are the slowest, so the reads end in another order than the sources start.
+        let remote = EnumerationRemote(locators: locators, delay: .milliseconds(10), skew: true)
+        let coordinator = LibrarySourceCoordinator(remote: remote, thumbnailLoader: NoThumbnails(), inventoryStore: nil)
+        await coordinator.prepare()
+        let recorder = LibrarySourceChangeRecorder()
+        _ = await coordinator.attach { change in await recorder.store(change) }
+        #expect(await coordinator.refresh() == .complete)
+        let all = Set(locators.map(EnumerationRemote.uid(of:)))
+        #expect(try #require(await recorder.latest()).analysisScope.uids == all)
+
+        // Revoking one source removes exactly the item that this source's own read returned.
+        await coordinator.revokeAdditionalSource(for: locators[revoked])
+
+        let remaining = try #require(await recorder.latest()).analysisScope.uids
+        #expect(remaining == all.subtracting([EnumerationRemote.uid(of: locators[revoked])]))
+        await coordinator.shutdown()
+    }
+
+    @Test func aSourceWithoutAnAnswerMakesTheRefreshRetryableAndHidesNoOtherSource() async throws {
+        let locators = (0..<6).map { AlbumNodeIdentifier(volumeID: "remote", nodeID: "album-\($0)") }
+        let failing = locators[2]
+        let remote = EnumerationRemote(locators: locators, delay: .milliseconds(5), failing: [failing])
+        let coordinator = LibrarySourceCoordinator(remote: remote, thumbnailLoader: NoThumbnails(), inventoryStore: nil)
+        await coordinator.prepare()
+        let recorder = LibrarySourceChangeRecorder()
+        _ = await coordinator.attach { change in await recorder.store(change) }
+
+        #expect(await coordinator.refresh() == .retryableFailure)
+
+        let latest = try #require(await recorder.latest())
+        for locator in locators where locator != failing {
+            #expect(latest.analysisScope.uids.contains(EnumerationRemote.uid(of: locator)), "\(locator.nodeID)")
+        }
+        #expect(!latest.analysisScope.uids.contains(EnumerationRemote.uid(of: failing)))
+        await coordinator.shutdown()
+    }
+}
+
+private actor EnumerationRemote: LibrarySourceRemoteBackend {
+    private let locators: [AlbumNodeIdentifier]
+    private let delay: Duration
+    private let failing: Set<AlbumNodeIdentifier>
+    private var inFlight = 0
+    private(set) var peak = 0
+    private(set) var calls = 0
+
+    private let skew: Bool
+
+    init(
+        locators: [AlbumNodeIdentifier], delay: Duration, failing: Set<AlbumNodeIdentifier> = [], skew: Bool = false
+    ) {
+        self.locators = locators
+        self.delay = delay
+        self.failing = failing
+        self.skew = skew
+    }
+
+    static func uid(of locator: AlbumNodeIdentifier) -> PhotoUID {
+        PhotoUID(volumeID: locator.volumeID, nodeID: "photo-of-\(locator.nodeID)")
+    }
+
+    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] { locators }
+
+    func librarySourceItems(for album: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] {
+        calls += 1
+        inFlight += 1
+        peak = max(peak, inFlight)
+        defer { inFlight -= 1 }
+        // With `skew` the first sources are the slowest, so the reads end in the reverse order.
+        let position = locators.firstIndex(of: album) ?? 0
+        let wait = skew ? delay * (locators.count - position) : delay
+        try await Task.sleep(for: wait)
+        if failing.contains(album) { throw URLError(.timedOut) }
+        return [
+            LibrarySourceItem(
+                item: PhotoItem(
+                    uid: Self.uid(of: album), captureTime: Date(timeIntervalSince1970: 2), mediaType: ""),
+                knownFields: [.captureTime])
+        ]
+    }
+}
+
+private struct NoThumbnails: PriorityThumbnailBatchLoader {
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult { .delivered }
+
+    func loadThumbnails(
+        for uids: [PhotoUID], priority: ThumbnailPriority,
+        onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult { .delivered }
+}

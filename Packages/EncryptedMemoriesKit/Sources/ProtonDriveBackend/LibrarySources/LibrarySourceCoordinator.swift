@@ -356,7 +356,7 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader, Provisional
         let results = await enumerate(jobs)
         guard isCurrentRefresh(generation) else { return .cancelled }
         var needsRetry = false
-        for result in results.sorted(by: { $0.index < $1.index }) {
+        for result in results {
             needsRetry = needsRetry || result.items == nil
             _ = graph.finishRefreshWithoutProjection(
                 result.items,
@@ -377,7 +377,6 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader, Provisional
     }
 
     private struct SourceRefreshResult: Sendable {
-        let index: Int
         let job: SourceRefreshJob
         let items: [LibrarySourceItem]?
     }
@@ -385,32 +384,11 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader, Provisional
     private func enumerate(_ jobs: [SourceRefreshJob]) async -> [SourceRefreshResult] {
         guard !jobs.isEmpty else { return [] }
         let remote = self.remote
-        return await withTaskGroup(
-            of: SourceRefreshResult.self,
-            returning: [SourceRefreshResult].self
-        ) { group in
-            var nextIndex = 0
-            var results: [SourceRefreshResult] = []
-            results.reserveCapacity(jobs.count)
-
-            func addNext() {
-                guard nextIndex < jobs.count else { return }
-                let index = nextIndex
-                let job = jobs[index]
-                nextIndex += 1
-                group.addTask {
-                    let items = try? await remote.librarySourceItems(for: job.locator)
-                    return SourceRefreshResult(index: index, job: job, items: items)
-                }
-            }
-
-            for _ in 0..<min(4, jobs.count) { addNext() }
-            while let result = await group.next() {
-                results.append(result)
-                addNext()
-            }
-            return results
+        let answers = await BoundedConcurrency.map(jobs, limit: 4) { job in
+            try? await remote.librarySourceItems(for: job.locator)
         }
+        // A source that never started (the run was cancelled) has no answer, like one whose read failed.
+        return zip(jobs, answers).map { SourceRefreshResult(job: $0, items: $1 ?? nil) }
     }
 
     private func persistAdditionalInventories() async {

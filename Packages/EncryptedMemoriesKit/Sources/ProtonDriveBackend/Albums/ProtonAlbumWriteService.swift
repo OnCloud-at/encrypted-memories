@@ -338,40 +338,15 @@ actor ProtonAlbumWriteService {
         crypto: DriveCrypto,
         maximumConcurrency: Int
     ) async throws -> [PreparedPhotoGroupOutcome] {
-        guard !items.isEmpty else { return [] }
-
-        return try await withThrowingTaskGroup(
-            of: (Int, PreparedPhotoGroupOutcome).self,
-            returning: [PreparedPhotoGroupOutcome].self
-        ) { group in
-            var nextIndex = 0
-            var ordered = [(Int, PreparedPhotoGroupOutcome)?](repeating: nil, count: items.count)
-
-            func addNext() {
-                guard nextIndex < items.count else { return }
-                let index = nextIndex
-                nextIndex += 1
-                group.addTask {
-                    let outcome = try await Self.prepareGroup(
-                        item: items[index],
-                        metadata: metadata,
-                        root: root,
-                        album: album,
-                        signer: signer,
-                        crypto: crypto
-                    )
-                    return (index, outcome)
-                }
-            }
-
-            for _ in 0..<min(max(1, maximumConcurrency), items.count) {
-                addNext()
-            }
-            while let (index, outcome) = try await group.next() {
-                ordered[index] = (index, outcome)
-                addNext()
-            }
-            return ordered.compactMap { $0?.1 }
+        try await BoundedConcurrency.throwingMap(items, limit: maximumConcurrency) { item in
+            try await Self.prepareGroup(
+                item: item,
+                metadata: metadata,
+                root: root,
+                album: album,
+                signer: signer,
+                crypto: crypto
+            )
         }
     }
 
