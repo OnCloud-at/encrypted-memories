@@ -1218,7 +1218,7 @@ final class DeletedPhotoTests: XCTestCase {
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
         for id in [source.identifier, plain.identifier] {
-            _ = catalog.upsert(PhotoLibraryCatalogMapper.entry(for: info(id), observedAt: date))
+            XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info(id), observedAt: date)]))
         }
         catalog.close()
         try addEarlierUpload()
@@ -1250,7 +1250,7 @@ final class DeletedPhotoTests: XCTestCase {
         let catalog = try XCTUnwrap(
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
-        _ = catalog.upsert(PhotoLibraryCatalogMapper.entry(for: info, observedAt: date))
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)]))
         XCTAssertTrue(catalog.markRemoved([source.identifier], removedAt: date.addingTimeInterval(60)).succeeded)
         catalog.close()
         let controller = PhotoLibraryBackupController(
@@ -1285,7 +1285,7 @@ final class DeletedPhotoTests: XCTestCase {
             PhotoLibraryCatalogManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
         let entry = PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)
-        _ = catalog.upsert(entry)
+        XCTAssertTrue(catalog.upsertBatch([entry]))
         catalog.close()
         let candidate = try XCTUnwrap(
             PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))

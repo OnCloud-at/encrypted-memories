@@ -272,17 +272,12 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// Nil means the page is unknown, not empty; a caller must not treat it as the end of the catalog (#1004).
     /// Rows whose content could not be decoded are reported per row in `undecodableIdentifiers` (#1160).
     func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage?
-    /// Read-only classification of an observation against the stored row, without writing. The sync
+    /// Read-only classification of observations against the stored rows, without writing. The sync
     /// driver uses this to decide whether to enqueue a backup candidate before it advances the
-    /// catalog, so the durable queue row is always written first.
-    func classify(_ entry: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange
-    /// Batched form used by large scans. Stores should reuse one prepared statement and avoid
-    /// decoding complete rows when only fingerprint, revision, and removal state are needed.
+    /// catalog, so the durable queue row is always written first. Stores should reuse one prepared
+    /// statement and avoid decoding complete rows when only fingerprint, revision, and removal state
+    /// are needed. An answer shorter than `entries` means a read failed; the caller must stop (#1004).
     func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange]
-    /// Records one observation, preserving `firstSeenAt` and clearing any removed marker, and
-    /// returns how it classified against the prior row.
-    @discardableResult
-    func upsert(_ entry: PhotoLibraryCatalogEntry) -> PhotoLibraryCatalogChange
     /// Persists batched observations in one transaction. False means no catalog advancement was
     /// committed; callers must stop before advancing a scan cursor or change token.
     @discardableResult
@@ -370,10 +365,6 @@ public extension PhotoLibraryCatalogStore {
 
     /// An unimplemented page reader cannot prove the catalog empty; nil reports unknown, not absence (#1004).
     func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage? { nil }
-
-    func classifyBatch(_ entries: [PhotoLibraryCatalogEntry]) -> [PhotoLibraryCatalogChange] {
-        entries.map(classify)
-    }
 
     /// Photos lists no asset for this source any more: the person deleted it, or it lies outside a narrowed
     /// limited-access selection. The entry leaves the present inventory, so missing-source recovery does not queue it
