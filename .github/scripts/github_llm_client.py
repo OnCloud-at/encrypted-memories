@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import ssl
 import time
@@ -83,6 +84,20 @@ _CONTEXT_LIMIT_RE = re.compile(
     r"(?:prompt|input) is too long|reduce the length"
 )
 MAX_LLM_ERROR_BODY_BYTES = 8 * 1024
+
+
+def llm_configuration() -> tuple[str, str, str | None]:
+    api_url = os.environ.get("LLM_API_URL", "").strip()
+    model = os.environ.get("LLM_MODEL", "").strip()
+    reasoning_effort = os.environ.get("LLM_REASONING_EFFORT", "").strip() or None
+    parsed_url = urlsplit(api_url)
+    if parsed_url.scheme != "https" or not parsed_url.netloc:
+        raise RuntimeError("LLM_API_URL must be an absolute HTTPS URL")
+    if parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
+        raise RuntimeError("LLM_API_URL must not contain credentials, a query, or a fragment")
+    if not model:
+        raise RuntimeError("LLM_MODEL must identify a compatible chat model")
+    return api_url, model, reasoning_effort
 
 
 class RequestFailure(RuntimeError):

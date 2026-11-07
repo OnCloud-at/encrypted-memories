@@ -54,13 +54,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          # No checkout has run yet, so the helper file is absent.
+          release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+          retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
             release_fail configuration \
               "Manual retry used ref '$GITHUB_REF'; expected refs/heads/main." \
@@ -98,13 +94,7 @@ jobs:
           REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           tag="${EVENT_TAG:-$REQUESTED_TAG}"
           [[ -n "$tag" ]] || release_fail configuration \
             "The release tag input was empty; expected a published GitHub release tag." \
@@ -139,13 +129,7 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           release_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
           git merge-base --is-ancestor "$release_sha" "$AUTOMATION_SHA" || release_fail configuration \
             "The release tag must point to a commit on main. Tag '$RELEASE_TAG' resolves to '$release_sha', which is not an ancestor of trusted automation '$AUTOMATION_SHA'." \
@@ -1022,13 +1006,7 @@ jobs:
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           for secret_name in APP_STORE_CONNECT_APP_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64; do
             [[ -n "${!secret_name:-}" ]] || release_fail configuration \
               "Secret or variable $secret_name was empty." \
@@ -1044,13 +1022,7 @@ jobs:
           PROCESSING_STATE: ${{ steps.build.outputs.processing_state }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           case "$PROCESSING_STATE" in
             FAILED|INVALID)
               release_fail app-store-connect \
@@ -1085,13 +1057,7 @@ jobs:
           ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           for secret_name in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64; do
             [[ -n "${!secret_name:-}" ]] || release_fail configuration \
               "Secret $secret_name was empty." \
@@ -1194,13 +1160,10 @@ jobs:
           NOTES_MACOS_EN_BASE64: ${{ needs.prepare.outputs.notes_macos_en_base64 }}
         run: |
           mkdir -p "$RUNNER_TEMP/apple-release-notes"
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
-            "$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" NOTES_IOS_DE_BASE64
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
-            "$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" NOTES_IOS_EN_BASE64
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
-            "$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" NOTES_MACOS_DE_BASE64
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+          ruby -rbase64 -e 'ARGV.each_slice(2) { |path, name| File.write(path, Base64.strict_decode64(ENV.fetch(name))) }' \
+            "$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" NOTES_IOS_DE_BASE64 \
+            "$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" NOTES_IOS_EN_BASE64 \
+            "$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" NOTES_MACOS_DE_BASE64 \
             "$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" NOTES_MACOS_EN_BASE64
 
       - name: Wait for Apple and distribute the builds
@@ -1211,13 +1174,7 @@ jobs:
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           apple_log="$RUNNER_TEMP/apple-distribute.log"
           if ! ruby .github/scripts/app_store_connect.rb wait-builds \
             --version "${{ needs.prepare.outputs.version }}" \
@@ -1261,13 +1218,10 @@ jobs:
           NOTES_MACOS_EN_BASE64: ${{ needs.prepare.outputs.notes_macos_en_base64 }}
         run: |
           mkdir -p "$RUNNER_TEMP/apple-release-notes"
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
-            "$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" NOTES_IOS_DE_BASE64
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
-            "$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" NOTES_IOS_EN_BASE64
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
-            "$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" NOTES_MACOS_DE_BASE64
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+          ruby -rbase64 -e 'ARGV.each_slice(2) { |path, name| File.write(path, Base64.strict_decode64(ENV.fetch(name))) }' \
+            "$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" NOTES_IOS_DE_BASE64 \
+            "$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" NOTES_IOS_EN_BASE64 \
+            "$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" NOTES_MACOS_DE_BASE64 \
             "$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" NOTES_MACOS_EN_BASE64
 
       - name: Wait for Apple and submit both platforms
@@ -1278,13 +1232,7 @@ jobs:
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           apple_log="$RUNNER_TEMP/apple-submit.log"
           if ! ruby .github/scripts/app_store_connect.rb wait-builds \
             --version "${{ needs.prepare.outputs.version }}" \
