@@ -28,7 +28,7 @@ private func executeSideSQL(_ sql: String, at url: URL) throws {
 
 /// Executes SQL directly on the settlement store's own handle. Test-only transaction control the
 /// store itself classifies as a lasting condition when it sees the open transaction.
-private func executeOnStoreConnection(_ sql: String, store: UploadManualSettlementStore) throws {
+func executeOnStoreConnection(_ sql: String, store: UploadManualSettlementStore) throws {
     let connection = settlementConnection(of: store)
     let result = sqlite3_exec(connection.database, sql, nil, nil, nil)
     guard result == SQLITE_OK else {

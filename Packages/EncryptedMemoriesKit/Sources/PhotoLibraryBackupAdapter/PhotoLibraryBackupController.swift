@@ -1169,13 +1169,16 @@ public final class PhotoLibraryBackupController {
             refreshFromQueue()
             return
         }
+        // A reopen that fails records a failure, but the health probe below forgets a transient one once the database
+        // answers again. Compare the recorded failures too, so a row that was not reopened never looks retried (#1228).
+        let failuresBeforeReopen = queueStore.recordedFailureCount()
         for entry in entries {
             // A row that the runner claimed or changed meanwhile keeps its new state.
             _ = queueStore.reopenForUserRetry(
                 entry, attempts: entry.state == .failed ? 0 : entry.attempts, updatedAt: now)
         }
         noteProblemListChange()
-        guard queueStore.isOperational() else {
+        guard queueStore.recordedFailureCount() == failuresBeforeReopen, queueStore.isOperational() else {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
             return
