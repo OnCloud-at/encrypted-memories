@@ -322,11 +322,8 @@ import TimelineCore
     }
 
     private func waitUntil(_ condition: () async -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(12)
-        while !(await condition()), ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        #expect(await condition())
+        let held = try await pollUntil(timeout: .seconds(12), condition)
+        #expect(held)
     }
 }
 

@@ -128,7 +128,7 @@ final class MobileWindowGeometryTests: XCTestCase {
                         frames.maxGapMs, frames.delayedGaps))
                 if cycle == 0 {
                     let idiom = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
-                    snapshot(window, name: "resize-\(idiom)-\(Int(width))")
+                    snapshot(window, "resize-\(idiom)-\(Int(width))")
                 }
             }
         }
@@ -139,36 +139,10 @@ final class MobileWindowGeometryTests: XCTestCase {
         attachment.name = "resize-report"
         attachment.lifetime = .keepAlways
         add(attachment)
-        writeSnapshotArtifact(name: "resize-report.txt", data: Data(text.utf8))
+        writeArtifact("resize-report.txt", Data(text.utf8))
         // 27 resizes of the same content must not accumulate whole render surfaces; a generous bound catches leaks
         // without failing on simulator noise.
         XCTAssertLessThan(residentAfter, residentBefore + 96 * 1_048_576, text)
-    }
-
-    @MainActor private func descendants(_ view: UIView) -> [UIView] {
-        [view] + view.subviews.flatMap(descendants)
-    }
-
-    @MainActor private func snapshot(_ window: UIWindow, name: String) {
-        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
-            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
-        }
-        let attachment = XCTAttachment(image: image)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        if let data = image.pngData() {
-            writeSnapshotArtifact(name: "\(name).png", data: data)
-        }
-    }
-
-    private func writeSnapshotArtifact(name: String, data: Data) {
-        guard let directory = ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_UI_SNAPSHOT_DIR"] else {
-            return
-        }
-        let url = URL(fileURLWithPath: directory, isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        try? data.write(to: url.appendingPathComponent(name))
     }
 
     private func residentMemoryBytes() -> UInt64 {

@@ -443,6 +443,10 @@ import os
         private let mergeDelay: Duration?
         /// False stands for a merge whose check cannot run yet, which keeps Recently Deleted from being emptied.
         private let confirmsNoPendingMerges: Bool
+        /// Called at each check for a pending merge, before the answer.
+        private let onConfirmNoPendingMerges: (@Sendable () -> Void)?
+        /// Called at the start of each merge batch. A test holds the batch here.
+        private let beforeMerge: (@Sendable () async -> Void)?
         private var scans = 0
         private let invalidatingMergeReloadFails: Bool
         private var reloadMustFail = false
@@ -456,7 +460,8 @@ import os
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
             rescanDropsLastGroup: Bool = false, scanDelay: Duration? = nil, rankDelay: Duration? = nil,
             mergeDelay: Duration? = nil,
-            confirmsNoPendingMerges: Bool = true, invalidatingMergeReloadFails: Bool = false,
+            confirmsNoPendingMerges: Bool = true, onConfirmNoPendingMerges: (@Sendable () -> Void)? = nil,
+            beforeMerge: (@Sendable () async -> Void)? = nil, invalidatingMergeReloadFails: Bool = false,
             buildInterruptions: Int = 0, mergeFailure: URLError.Code? = nil
         ) {
             groups = members.enumerated().map { index, members in
@@ -469,12 +474,17 @@ import os
             self.scanDelay = scanDelay
             self.mergeDelay = mergeDelay
             self.confirmsNoPendingMerges = confirmsNoPendingMerges
+            self.onConfirmNoPendingMerges = onConfirmNoPendingMerges
+            self.beforeMerge = beforeMerge
             self.invalidatingMergeReloadFails = invalidatingMergeReloadFails
             self.buildInterruptions = buildInterruptions
             self.mergeFailure = mergeFailure
         }
 
-        func confirmNoPendingMerges() async -> Bool { confirmsNoPendingMerges }
+        func confirmNoPendingMerges() async -> Bool {
+            onConfirmNoPendingMerges?()
+            return confirmsNoPendingMerges
+        }
 
         func duplicateGroups(
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
@@ -555,6 +565,7 @@ import os
         }
 
         func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+            await beforeMerge?()
             if let mergeDelay { try? await Task.sleep(for: mergeDelay) }
             if invalidatingMergeReloadFails {
                 lock.withLock { reloadMustFail = true }

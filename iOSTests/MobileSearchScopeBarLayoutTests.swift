@@ -196,18 +196,10 @@ final class MobileSearchScopeBarLayoutTests: XCTestCase {
     @MainActor private func waitUntil(
         _ what: String, timeout: Duration = .seconds(30), _ condition: @MainActor () -> Bool
     ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now + timeout
-        while clock.now < deadline {
-            if condition() { return }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let held = try await pollUntil(timeout: timeout, every: .milliseconds(50)) { condition() }
+        if held { return }
         XCTFail("timed out after \(timeout): \(what)")
         throw MobileFixtureError.unavailable
-    }
-
-    @MainActor private func descendants(_ view: UIView) -> [UIView] {
-        [view] + view.subviews.flatMap(descendants)
     }
 }
 

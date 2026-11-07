@@ -55,7 +55,6 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         window.rootViewController = UIHostingController(
             rootView: ChromeProbeShell(items: items, feed: fixture.feed, state: state))
         window.makeKeyAndVisible()
-        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
             window.isHidden = true

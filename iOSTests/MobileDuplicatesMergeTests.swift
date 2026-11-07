@@ -49,8 +49,9 @@ import UploadCore
         fixture.install(into: library)
         let items = fixture.items
         let members = stride(from: 0, to: items.count, by: 2).map { [items[$0].uid, items[$0 + 1].uid] }
-        let finder = HeldAccountDuplicates(groups: members)
-        library.installIsolatedDuplicatesForTesting(finder)
+        let gate = MergeGate()
+        library.installIsolatedDuplicatesForTesting(
+            MobileFixtureDuplicates(groups: members, beforeMerge: { await gate.enter() }))
         var duplicates: ExactDuplicatesModel? = try #require(library.duplicates)
         weak var released: ExactDuplicatesModel? = duplicates
         await duplicates?.load()
@@ -59,10 +60,10 @@ import UploadCore
             await duplicates?.mergeAll()
             finished = true
         }
-        #expect(await eventually { await finder.isHeld })
+        #expect(await eventually { await gate.isHeld })
         if paused {
             duplicates?.pauseMerging()
-            await finder.release()
+            await gate.release()
             await duplicates?.runningMergeWorkEnded()
         }
 
@@ -78,18 +79,18 @@ import UploadCore
         library.configure(session: nil, store: store)
         if !paused {
             #expect(!finished, "Account teardown must let the running batch finish")
-            await finder.release()
+            await gate.release()
         }
         // Replace the local reference before checking the old account's ownership.
         // The merge task and library are the only possible owners now.
         duplicates = nil
         #expect(await eventually { finished })
-        #expect(await finder.batches == 1, "No batch starts after account teardown")
+        #expect(await gate.batches == 1, "No batch starts after account teardown")
         #expect(await eventually { released == nil }, "The old account must release its model")
 
         // The negative control must also finish a paused run.
         released?.stopMergeAll()
-        await finder.release()
+        await gate.release()
         await merge.value
     }
 
@@ -103,12 +104,13 @@ import UploadCore
         let library = MobileLibraryModel()
         fixture.install(into: library)
         let members = fixture.sections[0].items.map(\.uid)
-        let finder = HeldAccountDuplicates(groups: [members])
-        library.installIsolatedDuplicatesForTesting(finder)
+        let gate = MergeGate()
+        library.installIsolatedDuplicatesForTesting(
+            MobileFixtureDuplicates(groups: [members], beforeMerge: { await gate.enter() }))
         let duplicates = try #require(library.duplicates)
         await duplicates.load()
         let merge = Task { await duplicates.mergeAll() }
-        #expect(await eventually { await finder.isHeld })
+        #expect(await eventually { await gate.isHeld })
 
         let store = SessionKeychainStore()
         library.configure(session: nil, store: store)
@@ -117,7 +119,7 @@ import UploadCore
                 uid: "replacement-account", accessToken: "access-b", refreshToken: "refresh-b", keyPassword: "key-b"),
             store: store, backend: replacement.backend, sections: replacement.sections,
             thumbnailFeed: replacement.feed, thumbnailCache: replacement.cache)
-        await finder.release()
+        await gate.release()
         await merge.value
 
         #expect(library.snapshot.count == replacement.items.count)
@@ -167,37 +169,16 @@ import UploadCore
     }
 }
 
-private actor HeldAccountDuplicates: ExactDuplicateMerging {
-    func confirmNoPendingMerges() async -> Bool { true }
-    func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
-    private let base: MobileFixtureDuplicates
+/// Holds each merge batch of a `MobileFixtureDuplicates` until the test releases it.
+private actor MergeGate {
     private var waiter: CheckedContinuation<Void, Never>?
     private var open = false
     private(set) var batches = 0
     var isHeld: Bool { waiter != nil }
 
-    init(groups: [[PhotoUID]]) { base = MobileFixtureDuplicates(groups: groups) }
-
-    func duplicateGroups(
-        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
-    ) async throws -> ExactDuplicateScan { try await base.duplicateGroups(progress: progress) }
-
-    func prepareIndex(
-        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
-    ) async throws -> Bool { try await base.prepareIndex(progress: progress) }
-
-    func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
-        await base.fallbackMembers(of: groups)
-    }
-
-    func rankMembers(
-        of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
-    ) async { await base.rankMembers(of: groups, ranked: ranked) }
-
-    func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+    func enter() async {
         batches += 1
         if !open { await withCheckedContinuation { waiter = $0 } }
-        return await base.merge(requests)
     }
 
     func release() {

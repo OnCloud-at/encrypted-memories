@@ -423,14 +423,9 @@ import UIKit
         return runtime
     }
 
-    private func descendants(_ view: UIView) -> [UIView] {
-        [view] + view.subviews.flatMap(descendants)
-    }
-
     private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(10)
-        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        try #require(condition())
+        let held = try await pollUntil(timeout: .seconds(10), condition)
+        try #require(held)
     }
 }
 

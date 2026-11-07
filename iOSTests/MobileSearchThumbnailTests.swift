@@ -108,12 +108,8 @@ final class MobileSearchThumbnailTests: XCTestCase {
         timeout: Duration = .seconds(3),
         _ predicate: @escaping () -> Bool
     ) async throws {
-        let deadline = ContinuousClock.now + timeout
-        while ContinuousClock.now < deadline {
-            if predicate() { return }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertTrue(predicate())
+        let held = try await pollUntil(timeout: timeout, every: .milliseconds(20)) { predicate() }
+        XCTAssertTrue(held)
     }
 
     @MainActor private func centerColor(_ view: UIView) -> (red: Bool, green: Bool) {

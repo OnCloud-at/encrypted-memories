@@ -522,10 +522,6 @@ final class MobileGridChromeTests: XCTestCase {
             }
         }
     }
-
-    @MainActor private func descendants(_ view: UIView) -> [UIView] {
-        [view] + view.subviews.flatMap(descendants)
-    }
 }
 
 @MainActor @Observable final class ChromeProbeState {
