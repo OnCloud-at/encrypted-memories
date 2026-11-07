@@ -115,24 +115,7 @@ actor PhotoVideoStreamSource {
         let prepared = try await prepareAnyFile(uid: uid)
         var out = Data()
         out.reserveCapacity(prepared.totalSize)
-        let total = max(prepared.totalSize, 1)
-        onProgress(0)
-        for block in prepared.blocks {
-            try Task.checkCancellation()
-            guard block.clearSize > 0 else { continue }
-            let encrypted = try await encryptedBlockData(block, priority: .immediate)
-            let clear = try crypto.decryptBlock(encrypted, sessionKey: prepared.sessionKey)
-            guard clear.count >= block.clearSize else {
-                throw StreamingError.decryptedBlockLengthMismatch(
-                    blockIndex: block.index, expected: block.clearSize, actual: clear.count)
-            }
-            out.append(clear.prefix(block.clearSize))
-            onProgress(min(1, Double(out.count) / Double(total)))
-        }
-        guard out.count == prepared.totalSize else {
-            throw StreamingError.incompleteStream(streamed: out.count, expected: prepared.totalSize)
-        }
-        onProgress(1)
+        try await decryptBlocks(of: prepared, allowsExpensiveNetwork: true, onProgress: onProgress) { out.append($0) }
         return out
     }
 
@@ -145,6 +128,17 @@ actor PhotoVideoStreamSource {
         onProgress: @Sendable (Double) -> Void
     ) async throws {
         let prepared = try await prepareAnyFile(uid: uid)
+        try await decryptBlocks(
+            of: prepared, allowsExpensiveNetwork: allowsExpensiveNetwork, onProgress: onProgress, onChunk: onChunk)
+    }
+
+    /// Fetches and decrypts the blocks of `prepared` in order and hands each decrypted block to `onChunk`.
+    private func decryptBlocks(
+        of prepared: PreparedVideo,
+        allowsExpensiveNetwork: Bool,
+        onProgress: @Sendable (Double) -> Void,
+        onChunk: (Data) async throws -> Void
+    ) async throws {
         let total = max(prepared.totalSize, 1)
         var streamed = 0
         onProgress(0)
@@ -278,13 +272,7 @@ actor PhotoVideoStreamSource {
         allowsExpensiveNetwork: Bool = true
     ) async throws -> Data {
         if priority == .immediate {
-            return try await session.requestGovernor.withPriorityScope(
-                .immediate,
-                // This direct path already supplies `.immediate` to the actual block request.
-                // Do not promote unrelated read-ahead that happens to overlap this demand.
-                promoting: [],
-                suspending: [.storageUpload]
-            ) {
+            return try await withDemandPriority {
                 try await session.fetchBlock(
                     url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle,
                     allowsExpensiveNetwork: allowsExpensiveNetwork)
@@ -296,6 +284,8 @@ actor PhotoVideoStreamSource {
     }
 
     /// Keep upload admission suspended through joining, cache verification and any failed-prefetch retry.
+    /// The scope promotes nothing: the request inside supplies `.immediate` itself, and unrelated read-ahead that
+    /// overlaps this demand must not be promoted.
     func withDemandPriority<T: Sendable>(
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {

@@ -36,7 +36,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         headers: [(String, [String])]
     ) async -> Result<HttpClientResponse, NSError> {
         let url = Self.driveURL(relativePath, makeURL: driveSession.makeURL)
-        guard Self.isTrustedDriveAPIURL(url, baseURL: driveSession.config.baseURL) else {
+        guard driveSession.isTrustedAPIURL(url) else {
             return .failure(Self.invalidURL("Refusing Drive API request outside trusted Proton API host"))
         }
         var req = URLRequest(url: url)
@@ -143,7 +143,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         headers: [(String, [String])]
     ) async -> Result<HttpClientResponse, NSError> {
         let requestURL = Self.driveURL(url, makeURL: driveSession.makeURL)
-        guard Self.isTrustedDriveAPIURL(requestURL, baseURL: driveSession.config.baseURL) else {
+        guard driveSession.isTrustedAPIURL(requestURL) else {
             return .failure(Self.invalidURL("Refusing small upload outside trusted Proton API host"))
         }
         var req = URLRequest(url: requestURL)
@@ -321,14 +321,6 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         combined += embedded.path.hasPrefix("/") ? embedded.path : "/\(embedded.path)"
         if let query = embedded.query, !query.isEmpty { combined += "?\(query)" }
         return URL(string: combined) ?? makeURL(relativePath)
-    }
-
-    private static func isTrustedDriveAPIURL(_ url: URL, baseURL: URL) -> Bool {
-        guard url.scheme == "https",
-            let host = url.host?.lowercased(),
-            let expected = baseURL.host?.lowercased()
-        else { return false }
-        return host == expected
     }
 
     private static func httpsURL(_ raw: String) -> URL? {
