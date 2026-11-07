@@ -871,8 +871,9 @@ struct MobilePhotoViewer: View {
 
     private func share(_ result: BurstExportExpansion.Result) {
         switch result {
-        case .success(let items, _):
-            let failureMessage = String(localized: "viewer.share_failed")
+        case .success(let items, let expandedSingleSeries):
+            let failureMessage = MobileViewerShareFailureText.message(
+                for: items, expandedSingleSeries: expandedSingleSeries, resolvedKinds: resolvedMediaKinds)
             #if DEBUG
                 shareProbeForTesting?.record(
                     .shared(nodeIDs: items.map(\.uid.nodeID), failureMessage: failureMessage))

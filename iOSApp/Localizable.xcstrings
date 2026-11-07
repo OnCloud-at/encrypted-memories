@@ -1530,13 +1530,47 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Das Original konnte nicht zum Teilen geladen werden."
+            "value": "Das Foto konnte nicht zum Teilen vorbereitet werden."
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The original couldn’t be loaded for sharing."
+            "value": "The photo couldn’t be prepared for sharing."
+          }
+        }
+      }
+    },
+    "viewer.share_failed_photos": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos konnten nicht zum Teilen vorbereitet werden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The photos couldn’t be prepared for sharing."
+          }
+        }
+      }
+    },
+    "viewer.share_failed_video": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Video konnte nicht zum Teilen vorbereitet werden."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The video couldn’t be prepared for sharing."
           }
         }
       }
