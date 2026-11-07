@@ -204,7 +204,7 @@
             ticket: WrapperImageCache<UIImage>.InsertionTicket
         ) -> UIImage? {
             guard let decoded = core.memoryDecoded(for: uid) else { return nil }
-            let key = Self.key(uid)
+            let key = uid.cacheKey
             return imageWrappers.resolvePairedImage(
                 forKey: key,
                 cost: decoded.decodedCostBytes,
@@ -217,10 +217,6 @@
                     UIKitThumbnailImageDecoder.image(from: decoded)
                 }
             )
-        }
-
-        private static func key(_ uid: PhotoUID) -> NSString {
-            "\(uid.volumeID)~\(uid.nodeID)" as NSString
         }
     }
 

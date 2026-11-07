@@ -236,7 +236,7 @@ public actor ThumbnailFeed {
         ticket: WrapperImageCache<NSImage>.InsertionTicket
     ) -> NSImage? {
         guard let decoded = core.memoryDecoded(for: uid) else { return nil }
-        let key = Self.key(uid)
+        let key = uid.cacheKey
         return imageWrappers.resolvePairedImage(
             forKey: key,
             cost: decoded.decodedCostBytes,
@@ -249,10 +249,6 @@ public actor ThumbnailFeed {
                 MacThumbnailImageDecoder.image(from: decoded)
             }
         )
-    }
-
-    private static func key(_ uid: PhotoUID) -> NSString {
-        "\(uid.volumeID)~\(uid.nodeID)" as NSString
     }
 }
 

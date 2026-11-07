@@ -3640,9 +3640,7 @@ public actor ThumbnailFeedCore {
         #endif
     }
 
-    private static func key(_ uid: PhotoUID) -> NSString {
-        "\(uid.volumeID)~\(uid.nodeID)" as NSString
-    }
+    private static func key(_ uid: PhotoUID) -> NSString { uid.cacheKey }
 }
 
 #if DEBUG
