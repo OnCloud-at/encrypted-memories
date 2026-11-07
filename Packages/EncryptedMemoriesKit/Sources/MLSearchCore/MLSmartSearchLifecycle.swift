@@ -407,9 +407,7 @@ public actor MLSmartSearchLifecycle {
         }
         await activateNativeSearch()
         guard persistent.selectedModelID != nil else {
-            phase = .selectingModel
-            emit()
-            startIndexingLoopIfAvailable()
+            enterModelSelection()
             return
         }
         await activateSelectedModel()
@@ -435,22 +433,6 @@ public actor MLSmartSearchLifecycle {
     }
 
     // MARK: - Intents
-
-    /// Loads the selectable models while Smart Search is off, so the person can choose one before
-    /// anything is stored or downloaded. A failure stays retryable through `retry()`.
-    public func loadModelChoices() async {
-        // A pending switch-on loads the list itself.
-        guard started, !isShutDown, deps.featureAvailability == .available, !persistent.isEnabled,
-            persistent.pendingOperation == nil, !stateLoadFailed, pendingRecommendedEnable == nil
-        else { return }
-        // The built-in catalog has no download plans, so a fresh signed catalog is required once.
-        if let lastCatalogRefreshAt, lastCatalogRefreshAt.duration(to: .now) < configuration.catalogRefreshInterval {
-            return
-        }
-        guard await refreshCatalog(), !isShutDown, !persistent.isEnabled else { return }
-        phase = .disabled
-        emit()
-    }
 
     /// Turns Smart Search on with the model that suits the device language, without asking first. The model
     /// list loads first when needed. The person can choose another model at once, also while the first one
@@ -595,7 +577,7 @@ public actor MLSmartSearchLifecycle {
         // it for nothing. Its caller sees the newer generation and gives up.
         if activeModel == nil, let downloading = downloadingModelID, downloading != id {
             await deps.installer.cancelInstall(of: downloading)
-            guard !isShutDown, persistent.isEnabled, activationGeneration == selectionGeneration else { return }
+            guard selectionIsCurrent(selectionGeneration) else { return }
         }
 
         let previousSelection = persistent.selectedModelID
@@ -671,9 +653,7 @@ public actor MLSmartSearchLifecycle {
             guard await downloadAndInstall(target, expectedGeneration: selectionGeneration) != nil else { return }
         }
 
-        guard !isShutDown, persistent.isEnabled,
-            activationGeneration == selectionGeneration
-        else { return }
+        guard selectionIsCurrent(selectionGeneration) else { return }
 
         // Journal the switch before touching shared state. If the journal write fails, revert in
         // memory and keep the current model serving.
@@ -700,17 +680,11 @@ public actor MLSmartSearchLifecycle {
         // Retire the old epoch, commit the journal, then activate the new epoch from a clean slate.
         // Keep this ordered and idempotent so it also serves crash recovery.
         await stopActivations()
-        guard !isShutDown, persistent.isEnabled,
-            activationGeneration == selectionGeneration
-        else { return }
+        guard selectionIsCurrent(selectionGeneration) else { return }
         await stopIndexing()
-        guard !isShutDown, persistent.isEnabled,
-            activationGeneration == selectionGeneration
-        else { return }
+        guard selectionIsCurrent(selectionGeneration) else { return }
         await teardownSession()
-        guard !isShutDown, persistent.isEnabled,
-            activationGeneration == selectionGeneration
-        else { return }
+        guard selectionIsCurrent(selectionGeneration) else { return }
         guard
             await completeSwitchCleanup(
                 from: previousID,
@@ -719,13 +693,21 @@ public actor MLSmartSearchLifecycle {
                 expectedGeneration: selectionGeneration
             )
         else { return }
-        guard !isShutDown, persistent.isEnabled,
-            activationGeneration == selectionGeneration
-        else { return }
+        guard selectionIsCurrent(selectionGeneration) else { return }
         await activateSelectedModel(intent: .userInitiated)
         #if DEBUG
             await selectionCompletionGate?()
         #endif
+    }
+
+    private func enterModelSelection() {
+        phase = .selectingModel
+        emit()
+        startIndexingLoopIfAvailable()
+    }
+
+    private func selectionIsCurrent(_ generation: UInt64) -> Bool {
+        !isShutDown && persistent.isEnabled && activationGeneration == generation
     }
 
     /// Retry after a retryable failure (download, model load, storage). A storage failure may
@@ -740,21 +722,17 @@ public actor MLSmartSearchLifecycle {
         }
         guard case .failed(let failure) = phase, failure.isRetryable else { return }
         if !persistent.isEnabled, persistent.pendingOperation == nil {
-            // Off: only the model list can fail, while Smart Search switches on or the person chooses a model.
-            if failure.kind == .catalog {
-                if pendingRecommendedEnable != nil {
-                    // As the start's own task, so a newer intent can stop it like the first attempt. The phase
-                    // leaves the failure before the first suspension, so a second Retry tap starts nothing.
-                    let intent = startIntentSequence
-                    recommendedStartTask?.cancel()
-                    phase = .loadingCatalog
-                    emit()
-                    let task = Task { await self.startRecommended(intent: intent) }
-                    recommendedStartTask = task
-                    await task.value
-                } else {
-                    await loadModelChoices()
-                }
+            // Off: only the model list of a pending switch-on can fail.
+            if failure.kind == .catalog, pendingRecommendedEnable != nil {
+                // As the start's own task, so a newer intent can stop it like the first attempt. The phase
+                // leaves the failure before the first suspension, so a second Retry tap starts nothing.
+                let intent = startIntentSequence
+                recommendedStartTask?.cancel()
+                phase = .loadingCatalog
+                emit()
+                let task = Task { await self.startRecommended(intent: intent) }
+                recommendedStartTask = task
+                await task.value
             }
             return
         }
@@ -762,9 +740,7 @@ public actor MLSmartSearchLifecycle {
         if failure.kind == .catalog {
             guard await refreshCatalog() else { return }
             if persistent.selectedModelID == nil {
-                phase = .selectingModel
-                emit()
-                startIndexingLoopIfAvailable()
+                enterModelSelection()
             } else {
                 await activateSelectedModel(intent: .userInitiated)
             }
@@ -776,9 +752,7 @@ public actor MLSmartSearchLifecycle {
             guard persistState() else { return }
             await activateNativeSearch(intent: .userInitiated)
             guard persistent.selectedModelID != nil else {
-                phase = .selectingModel
-                emit()
-                startIndexingLoopIfAvailable()
+                enterModelSelection()
                 return
             }
             startIndexingLoopIfAvailable()
@@ -940,7 +914,8 @@ public actor MLSmartSearchLifecycle {
         for waiter in waiters { waiter.resume(returning: result) }
     }
 
-    /// Drop cached vector blocks and release model residency under memory pressure.
+    /// Release the derived-resource caches and, through the session, the prompt-embedding cache and the model
+    /// residency under memory pressure.
     public func releaseMemory() async {
         await deps.releaseDerivedResources()
         await session?.releaseMemory()
@@ -1165,8 +1140,6 @@ public actor MLSmartSearchLifecycle {
             ) { _ in
                 await nativeSearchFactory()
             }
-        } catch is CancellationError {
-            return
         } catch {
             return
         }
@@ -1244,9 +1217,7 @@ public actor MLSmartSearchLifecycle {
         await prepareNativeSearch(intent: intent)
         guard !isShutDown, persistent.isEnabled else { return }
         guard let token else {
-            phase = .selectingModel
-            emit()
-            startIndexingLoopIfAvailable()
+            enterModelSelection()
             return
         }
         guard isCurrent(token) else { return }
@@ -1356,10 +1327,7 @@ public actor MLSmartSearchLifecycle {
                     emit()
                     return
                 }
-                lastCoverage = MLIndexCoverage(total: 0, indexed: 0, permanentlyUnindexable: 0)
-                semanticUnavailableAssetUIDs = []
-                semanticIndexedLibraryGeneration = nil
-                semanticReconciliationBaseline = nil
+                resetSemanticState()
             }
             persistent.activatedRevision = record.revision
             persistent.activatedDescriptor = entry.descriptor
@@ -1406,37 +1374,44 @@ public actor MLSmartSearchLifecycle {
                     failure: failure
                 )
             }
-            if previousModel != nil {
-                phase = .ready(lastCoverage)
-                emit()
-                startIndexingLoopIfAvailable()
-            } else {
-                phase = .failed(
-                    MLSmartSearchFailure(
-                        kind: .modelLoad,
-                        isRetryable: failure.isRetryable,
-                        debugDescription: failure.debugDescription
-                    ))
-                emit()
-                startIndexingLoopIfAvailable()
-            }
+            settleFailedActivation(
+                previousModel: previousModel,
+                isRetryable: failure.isRetryable,
+                debugDescription: failure.debugDescription
+            )
         } catch {
             guard isCurrent(token) else { return }
-            if previousModel != nil {
-                phase = .ready(lastCoverage)
-                emit()
-                startIndexingLoopIfAvailable()
-            } else {
-                phase = .failed(
-                    MLSmartSearchFailure(
-                        kind: .modelLoad,
-                        isRetryable: true,
-                        debugDescription: String(describing: error)
-                    ))
-                emit()
-                startIndexingLoopIfAvailable()
-            }
+            settleFailedActivation(
+                previousModel: previousModel,
+                isRetryable: true,
+                debugDescription: String(describing: error)
+            )
         }
+    }
+
+    /// A model that could not load keeps serving its predecessor, or reports the failure when there is none.
+    private func settleFailedActivation(
+        previousModel: MLInstalledModel?,
+        isRetryable: Bool,
+        debugDescription: String
+    ) {
+        if previousModel != nil {
+            phase = .ready(lastCoverage)
+        } else {
+            phase = .failed(
+                MLSmartSearchFailure(
+                    kind: .modelLoad,
+                    isRetryable: isRetryable,
+                    debugDescription: debugDescription
+                ))
+        }
+        emit()
+        startIndexingLoopIfAvailable()
+    }
+
+    private func isSuperseded(_ expectedGeneration: UInt64?) -> Bool {
+        guard let expectedGeneration else { return false }
+        return isShutDown || activationGeneration != expectedGeneration
     }
 
     /// Download + verify + install `entry`. Returns the record, or `nil` after reporting a
@@ -1446,11 +1421,7 @@ public actor MLSmartSearchLifecycle {
         preserving previousModel: MLInstalledModel? = nil,
         expectedGeneration: UInt64? = nil
     ) async -> MLModelInstallRecord? {
-        if let expectedGeneration,
-            isShutDown || activationGeneration != expectedGeneration
-        {
-            return nil
-        }
+        if isSuperseded(expectedGeneration) { return nil }
         phase = .downloading(MLModelTransferProgress(bytesReceived: 0, totalBytes: entry.downloadPlan?.totalByteCount))
         lastEmittedDownloadFraction = -1
         emit()
@@ -1461,40 +1432,18 @@ public actor MLSmartSearchLifecycle {
                 guard let self else { return }
                 await self.noteDownloadProgress(progress, expectedGeneration: expectedGeneration)
             }
-            if let expectedGeneration,
-                isShutDown || activationGeneration != expectedGeneration
-            {
-                return nil
-            }
+            if isSuperseded(expectedGeneration) { return nil }
             phase = .installing
             emit()
             return record
         } catch is CancellationError {
-            if let expectedGeneration,
-                isShutDown || activationGeneration != expectedGeneration
-            {
-                return nil
-            }
-            phase =
-                previousModel == nil
-                ? persistent.isEnabled ? .notInstalled(downloadable: entry.isDownloadable) : .disabled
-                : .ready(lastCoverage)
-            emit()
-            startIndexingLoopIfAvailable()
+            if isSuperseded(expectedGeneration) { return nil }
+            settleCancelledInstall(of: entry, previousModel: previousModel)
             return nil
         } catch let error as MLModelInstallError {
-            if let expectedGeneration,
-                isShutDown || activationGeneration != expectedGeneration
-            {
-                return nil
-            }
+            if isSuperseded(expectedGeneration) { return nil }
             if error == .cancelled {
-                phase =
-                    previousModel == nil
-                    ? persistent.isEnabled ? .notInstalled(downloadable: entry.isDownloadable) : .disabled
-                    : .ready(lastCoverage)
-                emit()
-                startIndexingLoopIfAvailable()
+                settleCancelledInstall(of: entry, previousModel: previousModel)
                 return nil
             }
             let kind: MLSmartSearchFailure.Kind
@@ -1531,11 +1480,7 @@ public actor MLSmartSearchLifecycle {
             startIndexingLoopIfAvailable()
             return nil
         } catch {
-            if let expectedGeneration,
-                isShutDown || activationGeneration != expectedGeneration
-            {
-                return nil
-            }
+            if isSuperseded(expectedGeneration) { return nil }
             phase =
                 previousModel == nil
                 ? .failed(
@@ -1551,15 +1496,20 @@ public actor MLSmartSearchLifecycle {
         }
     }
 
+    private func settleCancelledInstall(of entry: MLModelCatalogEntry, previousModel: MLInstalledModel?) {
+        phase =
+            previousModel == nil
+            ? persistent.isEnabled ? .notInstalled(downloadable: entry.isDownloadable) : .disabled
+            : .ready(lastCoverage)
+        emit()
+        startIndexingLoopIfAvailable()
+    }
+
     private func noteDownloadProgress(
         _ progress: MLModelTransferProgress,
         expectedGeneration: UInt64? = nil
     ) {
-        if let expectedGeneration,
-            isShutDown || activationGeneration != expectedGeneration
-        {
-            return
-        }
+        if isSuperseded(expectedGeneration) { return }
         guard case .downloading = phase else { return }
         let fraction = progress.fraction ?? 0
         if fraction >= 1 {
@@ -1597,15 +1547,8 @@ public actor MLSmartSearchLifecycle {
         passID: UUID
     ) {
         guard acceptsIndexEvent(progress, generation: generation, passID: passID) else { return }
-        lastCoverage = MLIndexCoverage(
-            total: progress.totalAssets,
-            indexed: progress.indexed + progress.alreadyIndexed,
-            permanentlyUnindexable: progress.permanentFailure
-        )
         acceptedIndexProgressSettled = progress.settled
-        phase = .indexing(progress)
-        indexingState = .indexing(aggregateProgress())
-        emit()
+        publishIndexProgress(progress)
     }
 
     private func noteIndexProgress(
@@ -1617,6 +1560,10 @@ public actor MLSmartSearchLifecycle {
         guard case .indexing = phase else { return }
         guard progress.settled >= acceptedIndexProgressSettled else { return }
         acceptedIndexProgressSettled = progress.settled
+        publishIndexProgress(progress)
+    }
+
+    private func publishIndexProgress(_ progress: MLIndexProgress) {
         lastCoverage = MLIndexCoverage(
             total: progress.totalAssets,
             indexed: progress.indexed + progress.alreadyIndexed,
@@ -1791,8 +1738,6 @@ public actor MLSmartSearchLifecycle {
                     }
                     nativeOutcome = permitted.0
                     nativeLeaseDecision = permitted.1
-                } catch is CancellationError {
-                    return
                 } catch {
                     return
                 }
@@ -1809,14 +1754,7 @@ public actor MLSmartSearchLifecycle {
                     )
                 )
                 if nativeOutcome.reason == .storageFailure {
-                    let failure = MLSmartSearchFailure(
-                        kind: .storage,
-                        isRetryable: true,
-                        debugDescription: "native analysis store unavailable"
-                    )
-                    indexingState = .failed(failure)
-                    emit()
-                    await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                    await parkAfterStorageFailure("native analysis store unavailable", since: observedKickGeneration)
                     continue
                 }
                 // The detailed UID set is only needed to suppress assets with terminal input
@@ -1831,14 +1769,8 @@ public actor MLSmartSearchLifecycle {
                         nativeUnavailableAssetUIDs = unavailableAssetUIDs
                     } catch {
                         guard generation == sessionGeneration, !Task.isCancelled else { return }
-                        let failure = MLSmartSearchFailure(
-                            kind: .storage,
-                            isRetryable: true,
-                            debugDescription: "native analysis suppression state unavailable"
-                        )
-                        indexingState = .failed(failure)
-                        emit()
-                        await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                        await parkAfterStorageFailure(
+                            "native analysis suppression state unavailable", since: observedKickGeneration)
                         continue
                     }
                 }
@@ -1928,8 +1860,6 @@ public actor MLSmartSearchLifecycle {
                     outcome = permitted.0
                     semanticQuantumLimit = permitted.1
                     semanticLeaseDecision = permitted.2
-                } catch is CancellationError {
-                    return
                 } catch {
                     return
                 }
@@ -1938,14 +1868,7 @@ public actor MLSmartSearchLifecycle {
                 acceptedIndexProgressSettled = 0
                 guard generation == sessionGeneration, !Task.isCancelled else { return }
                 if case .failed = outcome.progress.phase {
-                    let failure = MLSmartSearchFailure(
-                        kind: .storage,
-                        isRetryable: true,
-                        debugDescription: "semantic index store unavailable"
-                    )
-                    indexingState = .failed(failure)
-                    emit()
-                    await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                    await parkAfterStorageFailure("semantic index store unavailable", since: observedKickGeneration)
                     continue
                 }
                 do {
@@ -1954,14 +1877,8 @@ public actor MLSmartSearchLifecycle {
                     semanticUnavailableAssetUIDs = unavailableAssetUIDs
                 } catch {
                     guard generation == sessionGeneration, !Task.isCancelled else { return }
-                    let failure = MLSmartSearchFailure(
-                        kind: .storage,
-                        isRetryable: true,
-                        debugDescription: "semantic suppression state unavailable"
-                    )
-                    indexingState = .failed(failure)
-                    emit()
-                    await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                    await parkAfterStorageFailure(
+                        "semantic suppression state unavailable", since: observedKickGeneration)
                     continue
                 }
                 lastCoverage = outcome.coverage
@@ -1985,14 +1902,8 @@ public actor MLSmartSearchLifecycle {
             guard generation == sessionGeneration, !Task.isCancelled else { return }
 
             if semanticReconciliationFailed {
-                let failure = MLSmartSearchFailure(
-                    kind: .storage,
-                    isRetryable: true,
-                    debugDescription: "semantic reconciliation store unavailable"
-                )
-                indexingState = .failed(failure)
-                emit()
-                await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                await parkAfterStorageFailure(
+                    "semantic reconciliation store unavailable", since: observedKickGeneration)
                 continue
             }
 
@@ -2037,6 +1948,14 @@ public actor MLSmartSearchLifecycle {
                 await waitForKick(timeout: delay, since: observedKickGeneration)
             }
         }
+    }
+
+    /// Publishes a retryable storage failure of the indexing loop and waits for the next kick or the retry delay.
+    private func parkAfterStorageFailure(_ description: String, since observedKickGeneration: UInt64) async {
+        indexingState = .failed(
+            MLSmartSearchFailure(kind: .storage, isRetryable: true, debugDescription: description))
+        emit()
+        await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
     }
 
     private func nativeQuantumDisposition(
@@ -2290,6 +2209,13 @@ public actor MLSmartSearchLifecycle {
         if !backgroundPassIsAwaitingActivation { finishBackgroundPasses(.cancelled) }
     }
 
+    private func resetSemanticState() {
+        lastCoverage = MLIndexCoverage(total: 0, indexed: 0, permanentlyUnindexable: 0)
+        semanticUnavailableAssetUIDs = []
+        semanticIndexedLibraryGeneration = nil
+        semanticReconciliationBaseline = nil
+    }
+
     private func teardownSession() async {
         sessionGeneration &+= 1
         activeIndexPassID = nil
@@ -2299,10 +2225,7 @@ public actor MLSmartSearchLifecycle {
         }
         session = nil
         activeModel = nil
-        lastCoverage = MLIndexCoverage(total: 0, indexed: 0, permanentlyUnindexable: 0)
-        semanticUnavailableAssetUIDs = []
-        semanticIndexedLibraryGeneration = nil
-        semanticReconciliationBaseline = nil
+        resetSemanticState()
     }
 
     private func shutdownNativeSearch() async {
@@ -2353,11 +2276,6 @@ public actor MLSmartSearchLifecycle {
             }
             if let previousEntry = catalog.entry(for: from) {
                 await deps.installer.uninstall(previousEntry)
-            }
-            if let expectedGeneration,
-                isShutDown || !persistent.isEnabled || activationGeneration != expectedGeneration
-            {
-                return false
             }
         }
         if let expectedGeneration,
@@ -2538,9 +2456,7 @@ public actor MLSmartSearchLifecycle {
         if previousCatalog != refreshed || recoveredFromCatalogFailure { emit() }
 
         if persistent.selectedModelID == nil {
-            phase = .selectingModel
-            emit()
-            startIndexingLoopIfAvailable()
+            enterModelSelection()
             return
         }
 
