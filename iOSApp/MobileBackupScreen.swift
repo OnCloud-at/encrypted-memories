@@ -255,7 +255,7 @@ private struct MobilePhotoBackupSections: View {
 
         // Icon, headline, and action share the headline's first line; details stay below.
         HStack(alignment: .firstTextBaseline, spacing: 12) {
-            statusIcon(display)
+            BackupStatusIcon(display.accessory)
                 .frame(width: 20, height: 24, alignment: .center)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -465,37 +465,6 @@ private struct MobilePhotoBackupSections: View {
             .accessibilityAddTraits(.updatesFrequently)
             .accessibilityHidden(left == nil)
             .accessibilityIdentifier("backup.left")
-    }
-
-    /// The row's single icon. Only `.activity` spins - there is never a second activity indicator.
-    @ViewBuilder private func statusIcon(_ display: BackupStatusPresentation) -> some View {
-        switch display.accessory {
-        case .activity:
-            Image(systemName: "arrow.trianglehead.2.clockwise")
-                .foregroundStyle(ProtonColor.primary)
-                .spinsWhileActive(true)
-        case .attention:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-        case .paused:
-            Image(systemName: "pause.circle")
-                .foregroundStyle(ProtonColor.textWeak)
-        case .waiting:
-            Image(systemName: "clock.arrow.circlepath")
-                .foregroundStyle(ProtonColor.textWeak)
-        case .waitingForWiFi:
-            Image(systemName: BackupStatus.waitingForWiFiSymbolName)
-                .foregroundStyle(ProtonColor.textWeak)
-        case .notice:
-            Image(systemName: "info.circle")
-                .foregroundStyle(ProtonColor.textWeak)
-        case .success:
-            Image(systemName: "checkmark.shield.fill")
-                .foregroundStyle(ProtonColor.primary)
-        case .idle:
-            Image(systemName: "checkmark.shield")
-                .foregroundStyle(ProtonColor.textWeak)
-        }
     }
 
     /// Determinate bar matching the percentage directly above it while bytes move; otherwise it shows

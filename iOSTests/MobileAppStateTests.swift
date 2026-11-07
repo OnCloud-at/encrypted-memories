@@ -871,7 +871,7 @@ private func waitUntil(
             requestID: 1
         )
         let driver = MobileScopeRecoveryDriver(
-            isCurrent: { coordinator.isCurrent(identity) },
+            isCurrent: { coordinator.activeIdentity == identity },
             joinRetry: { state.record("join-retry") },
             retireOwners: { state.record("retire") },
             purgeLostScope: { state.record("purge") },
@@ -886,7 +886,7 @@ private func waitUntil(
 
         #expect(scheduled)
         #expect(coordinator.isActive)
-        #expect(coordinator.isCurrent(identity))
+        #expect(coordinator.activeIdentity == identity)
         #expect(state.events == ["clear-projection"])
         #expect(await coordinator.joinIfActive())
         #expect(state.events == ["clear-projection", "join-retry", "retire", "purge", "rebuild"])
@@ -944,7 +944,7 @@ private func waitUntil(
             requestID: 1
         )
         let oldDriver = MobileScopeRecoveryDriver(
-            isCurrent: { state.oldIdentityIsCurrent && coordinator.isCurrent(oldIdentity) },
+            isCurrent: { state.oldIdentityIsCurrent && coordinator.activeIdentity == oldIdentity },
             joinRetry: {
                 state.record("old-join")
                 await latch.block("old-join")
@@ -986,7 +986,7 @@ private func waitUntil(
         #expect(!state.events.contains("old-retire"))
         #expect(!state.events.contains("old-purge"))
         #expect(!state.events.contains("old-rebuild"))
-        #expect(coordinator.isCurrent(newIdentity))
+        #expect(coordinator.activeIdentity == newIdentity)
         #expect(coordinator.isActive)
 
         await latch.release("new-running")

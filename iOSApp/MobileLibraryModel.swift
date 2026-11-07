@@ -176,10 +176,6 @@ final class MobileScopeRecoveryCoordinator {
         return true
     }
 
-    func isCurrent(_ identity: MobileScopeRecoveryIdentity) -> Bool {
-        activeIdentity == identity
-    }
-
     @discardableResult
     func joinIfActive() async -> Bool {
         guard let task else { return false }
