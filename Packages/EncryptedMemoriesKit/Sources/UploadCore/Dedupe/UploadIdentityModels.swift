@@ -905,8 +905,6 @@ public protocol UploadDuplicateChecking: Sendable {
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool)
     /// Identity of an active main. A missing identifier is unknown, not evidence of another asset.
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool)
-    /// Live encrypted iOS.photos modification time. Missing or unreadable metadata is unknown.
-    func modificationDate(ofMainLink linkID: String) async throws -> Date?
     /// Live complete compound metadata. Missing or unreadable evidence returns nil.
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound?
     /// Earlier links named by an active main's lineage. Uses the same completeness boundary as the head reads.
@@ -966,7 +964,6 @@ public extension UploadDuplicateChecking {
         return visibility
     }
 
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? { nil }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? { nil }
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String

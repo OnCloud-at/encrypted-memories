@@ -235,13 +235,6 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
-        lock.withLock {
-            guard let link = table[linkID], link.state == .active, link.mainLinkID == nil else { return nil }
-            return link.modificationDate
-        }
-    }
-
     /// The person trashes this main right after its compound read, before any later read of the same pass.
     var trashAfterCompoundRead: String? {
         get { lock.withLock { pendingTrashAfterCompoundRead } }
@@ -1155,10 +1148,6 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     func invalidateCachedRemoteState() async {
         await server.invalidateCachedRemoteState()
         lock.withLock { lineageInvalidated = true }
-    }
-
-    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
-        try await server.modificationDate(ofMainLink: linkID)
     }
 
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {

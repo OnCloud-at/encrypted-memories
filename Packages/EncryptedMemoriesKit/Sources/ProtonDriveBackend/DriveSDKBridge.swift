@@ -1035,11 +1035,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Last-known timeline from disk, for instant startup (no spinner). Reads from SQLite - then
     /// `loadTimeline()` refreshes in the background.
-    func cachedTimeline() -> [TimelineSection]? {
-        guard !isShutDown else { return nil }
-        return cachedTimelineSnapshot()?.sections
-    }
-
     func cachedTimelineSnapshot() -> CachedTimelineSnapshot? {
         guard !isShutDown else { return nil }
         guard let store = timelineStore else { return nil }
@@ -1068,11 +1063,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             ? []
             : [TimelineSection(id: "all", date: items.first?.captureTime ?? .distantPast, title: "", items: items)]
         return CachedTimelineSnapshot(sections: sections, validationToken: validationToken)
-    }
-
-    func cachedTimelineValidationToken() -> String? {
-        guard !isShutDown else { return nil }
-        return timelineStore?.validationToken()
     }
 
     /// One bounded SDK event probe. A changed cursor tells the shared foreground monitor to perform
@@ -1104,12 +1094,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 remote = try bridge.eventCursor(from: probe)
             }
             return bridge.monitorToken(remoteToken: remote)
-        }
-    }
-
-    func launchValidationToken() async throws -> String {
-        try await withOpenSession(cause: .timelineValidation) { bridge in
-            try await bridge.launchValidationTokenImpl()
         }
     }
 

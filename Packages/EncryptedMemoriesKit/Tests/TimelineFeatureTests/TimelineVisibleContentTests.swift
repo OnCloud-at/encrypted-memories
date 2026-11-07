@@ -837,8 +837,6 @@ private actor ValidatedStartupRepository: PhotosRepository, LibraryChangeTokenPr
         CachedTimelineSnapshot(sections: cached, validationToken: persistedToken)
     }
 
-    func cachedTimelineValidationToken() async -> String? { persistedToken }
-
     func loadTimeline() async throws -> [TimelineSection] { try await loadTimelineSnapshot().sections }
 
     func loadTimelineSnapshot() async throws -> TimelineLoadSnapshot {
