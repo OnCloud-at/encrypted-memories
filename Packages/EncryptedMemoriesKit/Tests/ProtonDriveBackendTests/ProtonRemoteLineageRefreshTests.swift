@@ -1516,6 +1516,105 @@ extension DriveSessionStubSuite {
             #expect(try metadataRequestLinkIDs().sorted() == ["photo", "trashed"])
         }
 
+        /// The four lineage reads answer from the lineage store, and each reports whether the index is complete.
+        @Test func theLineageReadsAnswerFromTheStoreAndReportItsCompleteness() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [
+                        .init(hashKeyEpoch: "epoch", remoteLinkID: "photo", externalIdentifier: "cloud", isMain: true)
+                    ],
+                    lineage: [.init(hashKeyEpoch: "epoch", replacedLinkID: "old", replacingLinkID: "photo")],
+                    hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let service = makeService(content: content, lineage: lineage)
+
+            let active = try await service.activeMainLinkIDs(forExternalIdentifier: "cloud")
+            let replacing = try await service.replacingMainLinkIDs(ofReplacedLink: "old")
+            let identifier = try await service.externalIdentifier(ofMainLink: "photo")
+            let replaced = try await service.replacedLinkIDs(ofReplacingMain: "photo")
+
+            #expect(active.links == ["photo"] && active.complete)
+            #expect(replacing.links == ["photo"] && replacing.complete)
+            #expect(identifier.identifier == "cloud" && identifier.complete)
+            #expect(replaced.links == ["old"] && replaced.complete)
+        }
+
+        /// Without a lineage store the lineage reads prove nothing: they answer empty and incomplete.
+        @Test func withoutALineageStoreEveryLineageReadIsEmptyAndIncomplete() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let service = makeService(content: content, lineage: nil)
+
+            let active = try await service.activeMainLinkIDs(forExternalIdentifier: "cloud")
+            let replacing = try await service.replacingMainLinkIDs(ofReplacedLink: "old")
+            let identifier = try await service.externalIdentifier(ofMainLink: "photo")
+            let replaced = try await service.replacedLinkIDs(ofReplacingMain: "photo")
+
+            #expect(active.links.isEmpty && !active.complete)
+            #expect(replacing.links.isEmpty && !replacing.complete)
+            #expect(identifier.identifier == nil && !identifier.complete)
+            #expect(replaced.links.isEmpty && !replaced.complete)
+        }
+
+        /// A lineage store that is behind the content index proves nothing: every lineage read reports its answer
+        /// from the store, and none reports the index as complete.
+        @Test func aLineageStoreBehindTheContentIndexMakesEveryLineageReadIncomplete() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [
+                        .init(hashKeyEpoch: "epoch", remoteLinkID: "photo", externalIdentifier: "cloud", isMain: true)
+                    ],
+                    lineage: [.init(hashKeyEpoch: "epoch", replacedLinkID: "old", replacingLinkID: "photo")],
+                    hashKeyEpoch: "epoch", eventID: "zero", unresolvedRemoteLinkIDs: []))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            let service = makeService(content: content, lineage: lineage)
+
+            let active = try await service.activeMainLinkIDs(forExternalIdentifier: "cloud")
+            let replacing = try await service.replacingMainLinkIDs(ofReplacedLink: "old")
+            let identifier = try await service.externalIdentifier(ofMainLink: "photo")
+            let replaced = try await service.replacedLinkIDs(ofReplacingMain: "photo")
+
+            #expect(active.links == ["photo"] && !active.complete)
+            #expect(replacing.links == ["photo"] && !replacing.complete)
+            #expect(identifier.identifier == "cloud" && !identifier.complete)
+            #expect(replaced.links == ["old"] && !replaced.complete)
+        }
+
         /// A link that fails again stays unresolved, and a later sweep reads it again.
         @Test func aLinkThatFailsAgainStaysAndALaterSweepRetriesIt() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
