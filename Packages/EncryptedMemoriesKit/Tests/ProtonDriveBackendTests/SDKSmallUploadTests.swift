@@ -40,6 +40,35 @@ struct SDKSmallUploadTests {
         #expect(SmallUploadURLProtocol.refreshes.isEmpty)
     }
 
+    @Test(arguments: [
+        "drive/https://evil.example/v2/shares/photos",
+        "drive/http://drive-api.proton.me/v2/shares/photos",
+    ])
+    func refusesADriveAPIRequestOutsideTheTrustedAPIHost(relativePath: String) async throws {
+        SmallUploadURLProtocol.reset(uploadStatuses: [200])
+
+        let result = await makeClient().requestDriveApi(
+            method: "GET", relativePath: relativePath, content: Data(), headers: [])
+
+        #expect(throws: (any Error).self) { try result.get() }
+        #expect(SmallUploadURLProtocol.requests.isEmpty, "nothing, and no credential, may reach another host")
+    }
+
+    @Test func sendsSessionCredentialsWithABlockFetchOnlyToTheTrustedAPIHost() async throws {
+        SmallUploadURLProtocol.reset(uploadStatuses: [200, 200])
+        let session = makeSession()
+
+        _ = try await session.fetchBlock(url: "https://evil.example/block", token: nil)
+        _ = try await session.fetchBlock(url: "https://drive-api.proton.me/block", token: nil)
+
+        let requests = SmallUploadURLProtocol.requests
+        #expect(requests.count == 2)
+        #expect(requests.first?.headers["authorization"] == nil)
+        #expect(requests.first?.headers["x-pm-uid"] == nil)
+        #expect(requests.last?.headers["authorization"] == "Bearer test-access")
+        #expect(requests.last?.headers["x-pm-uid"] == "test-uid")
+    }
+
     @Test func keepsTheSDKContentTypeInsteadOfTheDriveJSONDefault() async throws {
         SmallUploadURLProtocol.reset(uploadStatuses: [200])
 

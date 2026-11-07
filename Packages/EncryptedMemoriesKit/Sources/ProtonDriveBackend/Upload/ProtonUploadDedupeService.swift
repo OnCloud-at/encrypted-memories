@@ -314,13 +314,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             let tags = main.photo?.tags
         else { return nil }
         let attributes = try attributes(of: currentMain, material: material)
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        let date = attributes?.iOSPhotos?.modificationTime.flatMap {
-            fractional.date(from: $0) ?? standard.date(from: $0)
-        }
+        let date = attributes?.iOSPhotos?.modificationTime.flatMap(IOSPhotosModificationTimeParser().date(from:))
         let captureDate = main.photo?.captureTime.flatMap { value -> Date? in
             value.isFinite ? Date(timeIntervalSince1970: value) : nil
         }
@@ -370,35 +364,33 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
-        let material = try await resolveMaterial()
-        try await refreshRemoteContentIndex(material: material)
-        guard let lineageIndexStore else { return ([], false) }
-        let links = lineageIndexStore.activeMainLinkIDs(forExternalIdentifier: identifier, hashKeyEpoch: material.epoch)
-        return (links, lineageHealth(material: material) == .complete)
+        try await lineageRead(unavailable: []) {
+            $0.activeMainLinkIDs(forExternalIdentifier: identifier, hashKeyEpoch: $1)
+        }
     }
 
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
-        let material = try await resolveMaterial()
-        try await refreshRemoteContentIndex(material: material)
-        guard let lineageIndexStore else { return ([], false) }
-        let links = lineageIndexStore.replacingMainLinkIDs(ofReplacedLink: linkID, hashKeyEpoch: material.epoch)
-        return (links, lineageHealth(material: material) == .complete)
+        try await lineageRead(unavailable: []) { $0.replacingMainLinkIDs(ofReplacedLink: linkID, hashKeyEpoch: $1) }
     }
 
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
-        let material = try await resolveMaterial()
-        try await refreshRemoteContentIndex(material: material)
-        guard let lineageIndexStore else { return (nil, false) }
-        let identifier = lineageIndexStore.externalIdentifier(ofMainLink: linkID, hashKeyEpoch: material.epoch)
-        return (identifier, lineageHealth(material: material) == .complete)
+        try await lineageRead(unavailable: nil) { $0.externalIdentifier(ofMainLink: linkID, hashKeyEpoch: $1) }
     }
 
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        try await lineageRead(unavailable: []) { $0.replacedLinkIDs(ofReplacingMain: linkID, hashKeyEpoch: $1) }
+    }
+
+    /// One lineage read: refreshes the remote index, reads from the lineage store with the hash key epoch, and reports
+    /// whether the lineage health is complete. Without a lineage store the answer is `unavailable` and incomplete.
+    private func lineageRead<Value>(
+        unavailable: Value, _ read: (UploadRemoteLineageIndexStore, String) -> Value
+    ) async throws -> (Value, Bool) {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
-        guard let lineageIndexStore else { return ([], false) }
-        let links = lineageIndexStore.replacedLinkIDs(ofReplacingMain: linkID, hashKeyEpoch: material.epoch)
-        return (links, lineageHealth(material: material) == .complete)
+        guard let lineageIndexStore else { return (unavailable, false) }
+        let value = read(lineageIndexStore, material.epoch)
+        return (value, lineageHealth(material: material) == .complete)
     }
 
     /// The lineage index fills only in a full index build. An account indexed before the lineage index existed, or
@@ -1093,13 +1085,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         observedAt: Date = Date(),
         measurement: SupportWorkMeasurementPass? = nil
     ) throws -> RemoteContentIndexRows {
-        let fractionalDateFormatter = ISO8601DateFormatter()
-        fractionalDateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let standardDateFormatter = ISO8601DateFormatter()
-        standardDateFormatter.formatOptions = [.withInternetDateTime]
-        func parseDate(_ value: String) -> Date? {
-            fractionalDateFormatter.date(from: value) ?? standardDateFormatter.date(from: value)
-        }
+        let modificationTimes = IOSPhotosModificationTimeParser()
 
         var records: [UploadRemoteContentIndexRecord] = []
         records.reserveCapacity(expectedActiveFileIDs.count)
@@ -1175,7 +1161,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 let cloudID = iOSPhotos.iCloudID,
                 !cloudID.isEmpty,
                 let rawDate = iOSPhotos.modificationTime,
-                let modificationDate = parseDate(rawDate)
+                let modificationDate = modificationTimes.date(from: rawDate)
             {
                 externalIdentitiesByLinkID[id] = UploadBackupExternalIdentity(
                     identifier: cloudID,
