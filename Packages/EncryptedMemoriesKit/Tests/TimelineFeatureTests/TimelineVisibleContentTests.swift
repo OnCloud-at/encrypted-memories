@@ -12,261 +12,269 @@ import Testing
 
 @MainActor
 @Suite(.serialized) struct TimelineVisibleContentTests {
-    @Test(.timeLimit(.minutes(1)))
-    func productionMacGridKeepsProvisionalPhotoActionsUnwiredUntilQualification() async throws {
-        _ = NSApplication.shared
-        let items = (0..<60).map { photo("provisional-\($0)", month: 1) }
-        let sections = [section(items)]
-        let repository = ControlledStartupRepository(cached: nil, remote: sections, provisional: sections)
-        let feed = makeVisibleContentFeed()
-        let model = TimelineViewModel(repository: repository, feed: feed.feedCore)
-        let loading = Task { await model.load() }
-        await repository.waitUntilRemoteRequested()
-        let window = NSWindow(
-            contentRect: CGRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.borderless], backing: .buffered, defer: true)
-        window.isReleasedWhenClosed = false
-        var opened: [PhotoUID] = []
-        var selections: [Set<PhotoUID>] = []
-        let root = NSHostingView(
-            rootView: TimelineView(
-                model: model, feed: feed, level: .constant(0), gridProfile: .testRegularTimeline,
-                dragOutProvider: ProvisionalOriginalsProbe(),
-                onSelectionChange: { selections.append($0) }, onOpen: { item, _ in opened.append(item.uid) }))
-        window.contentView = root
-        window.orderFront(nil)
-        defer {
-            window.orderOut(nil)
-            window.contentView = nil
-        }
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
-        func host() -> MetalGridScrollHost? {
-            descendants(root).compactMap { $0 as? MetalGridScrollHost }.first
-        }
-        func waitUntil(_ condition: () -> Bool) async throws {
-            let deadline = ContinuousClock.now + .seconds(10)
-            while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-            try #require(condition())
-        }
-        do {
-            root.layoutSubtreeIfNeeded()
-            try await waitUntil { host()?.coordinator.orderedUIDs.count == 60 }
-            let grid = try #require(host())
-            try await waitUntil { grid.accessibilityChildren()?.contains { $0 is MetalGridA11yElement } == true }
-            #expect(model.isProvisionalPresentation)
-            #expect(model.allItems.isEmpty)
-            #expect(model.wholeLibraryInventoryAuthority == .hydrating)
-            #expect(grid.onCellClick == nil)
-            #expect(grid.onMarqueeBegan == nil)
-            #expect(grid.onMarqueeChanged == nil)
-            #expect(grid.onMarqueeEnded == nil)
-            #expect(grid.onDragOutThreshold == nil)
-            let cell = try #require(grid.coordinator.visibleCells().first)
-            let point = CGPoint(x: cell.rect.midX, y: cell.rect.midY)
-            grid.onCellClick?(point, 2, [])
-            grid.onCellClick?(point, 1, .command)
-            let element = try #require(grid.accessibilityChildren()?.compactMap { $0 as? MetalGridA11yElement }.first)
-            #expect(!element.accessibilityPerformPress())
-            #expect(opened.isEmpty, "Provisional mouse and accessibility routes must not open a viewer")
-            #expect(selections.isEmpty, "Provisional tiles must not enter selection")
-            let clip = try #require(grid.coordinator.clipView)
-            let before = clip.bounds.origin
-            clip.scroll(to: CGPoint(x: 0, y: before.y > 0 ? 0 : 100))
-            #expect(clip.bounds.origin != before, "Provisional rows remain scrollable")
-            await repository.releaseRemote()
-            await loading.value
-            try await waitUntil { host()?.onCellClick != nil && !model.isProvisionalPresentation }
-            #expect(host() === grid)
-            #expect(model.wholeLibraryInventoryAuthority == .authoritative)
-            #expect(Set(model.allItems.map(\.uid)) == Set(items.map(\.uid)))
-            #expect(grid.onMarqueeBegan != nil)
-            #expect(grid.onMarqueeChanged != nil)
-            #expect(grid.onMarqueeEnded != nil)
-            #expect(grid.onDragOutThreshold != nil)
-            try await waitUntil {
-                grid.accessibilityChildren()?.compactMap { $0 as? MetalGridA11yElement }.first?.onActivate != nil
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func productionMacGridKeepsProvisionalPhotoActionsUnwiredUntilQualification() async throws {
+            _ = NSApplication.shared
+            let items = (0..<60).map { photo("provisional-\($0)", month: 1) }
+            let sections = [section(items)]
+            let repository = ControlledStartupRepository(cached: nil, remote: sections, provisional: sections)
+            let feed = makeVisibleContentFeed()
+            let model = TimelineViewModel(repository: repository, feed: feed.feedCore)
+            let loading = Task { await model.load() }
+            await repository.waitUntilRemoteRequested()
+            let window = NSWindow(
+                contentRect: CGRect(x: 0, y: 0, width: 800, height: 600),
+                styleMask: [.borderless], backing: .buffered, defer: true)
+            window.isReleasedWhenClosed = false
+            var opened: [PhotoUID] = []
+            var selections: [Set<PhotoUID>] = []
+            let root = NSHostingView(
+                rootView: TimelineView(
+                    model: model, feed: feed, level: .constant(0), gridProfile: .testRegularTimeline,
+                    dragOutProvider: ProvisionalOriginalsProbe(),
+                    onSelectionChange: { selections.append($0) }, onOpen: { item, _ in opened.append(item.uid) }))
+            window.contentView = root
+            window.orderFront(nil)
+            defer {
+                window.orderOut(nil)
+                window.contentView = nil
             }
-            let qualified = try #require(grid.coordinator.visibleCells().first)
-            let qualifiedPoint = CGPoint(x: qualified.rect.midX, y: qualified.rect.midY)
-            let previousOpenCount = opened.count
-            grid.onCellClick?(qualifiedPoint, 2, [])
-            let qualifiedElement = try #require(
-                grid.accessibilityChildren()?.compactMap { $0 as? MetalGridA11yElement }.first)
-            #expect(qualifiedElement.accessibilityPerformPress())
-            #expect(opened.count == previousOpenCount + 2)
-            let previousSelectionCount = selections.count
-            grid.onCellClick?(qualifiedPoint, 1, .command)
-            #expect(selections.count == previousSelectionCount + 1)
-        } catch {
-            model.cancelInitialLoadForTesting()
-            await repository.releaseRemote()
-            await loading.value
-            await feed.stopPrefetch()
-            throw error
-        }
-        await feed.stopPrefetch()
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    func productionMacGridKeepsTheVisiblePhotoAnchoredAsOlderMetadataPagesArrive() async throws {
-        _ = NSApplication.shared
-        let items = (0..<180).map { index in
-            PhotoItem(
-                uid: PhotoUID(volumeID: "v", nodeID: "page-\(index)"),
-                captureTime: Date(timeIntervalSince1970: Double(index + 1)), mediaType: "image/jpeg")
-        }
-        let initial = Array(items.suffix(60))
-        let repository = ControlledStartupRepository(
-            cached: nil, remote: [section(items)], provisional: [section(initial)])
-        let feed = makeVisibleContentFeed()
-        let model = TimelineViewModel(repository: repository, feed: feed.feedCore)
-        let loading = Task { await model.load() }
-        await repository.waitUntilRemoteRequested()
-        let window = NSWindow(
-            contentRect: CGRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.borderless], backing: .buffered, defer: true)
-        window.isReleasedWhenClosed = false
-        let root = NSHostingView(
-            rootView: TimelineView(
-                model: model, feed: feed, level: .constant(0),
-                gridProfile: .testRegularTimeline, onOpen: { _, _ in }))
-        window.contentView = root
-        window.orderFront(nil)
-        defer {
-            window.orderOut(nil)
-            window.contentView = nil
-        }
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
-        func host() -> MetalGridScrollHost? { descendants(root).compactMap { $0 as? MetalGridScrollHost }.first }
-        func waitUntil(_ condition: () -> Bool) async throws {
-            let deadline = ContinuousClock.now + .seconds(10)
-            while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-            try #require(condition())
-        }
-        do {
-            root.layoutSubtreeIfNeeded()
-            try await waitUntil { host()?.coordinator.orderedUIDs.count == 60 }
-            let grid = try #require(host())
-            grid.scrollToItem(initial[24].uid)
-            let anchor = try #require(grid.currentScrollAnchor())
-            let clip = try #require(grid.coordinator.clipView)
-            try #require(clip.bounds.minY > 0, "SETUP: an interior scroll position")
-            for count in [120, 180] {
-                let known = Array(items.suffix(count))
-                await repository.publishProvisional([section(known)])
-                try await waitUntil { grid.coordinator.orderedUIDs.count == count }
-                let after = try #require(grid.currentScrollAnchor())
-                #expect(after.itemID == anchor.itemID, "Growing metadata keeps the same photo below the top bar")
-                #expect(abs(after.topOffset - anchor.topOffset) < 0.5, "Growing metadata keeps its viewport offset")
-                #expect(Set(grid.coordinator.orderedUIDs) == Set(known.map(\.uid)))
+            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+            func host() -> MetalGridScrollHost? {
+                descendants(root).compactMap { $0 as? MetalGridScrollHost }.first
+            }
+            func waitUntil(_ condition: () -> Bool) async throws {
+                let deadline = ContinuousClock.now + .seconds(10)
+                while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+                try #require(condition())
+            }
+            do {
+                root.layoutSubtreeIfNeeded()
+                try await waitUntil { host()?.coordinator.orderedUIDs.count == 60 }
+                let grid = try #require(host())
+                try await waitUntil { grid.accessibilityChildren()?.contains { $0 is MetalGridA11yElement } == true }
+                #expect(model.isProvisionalPresentation)
                 #expect(model.allItems.isEmpty)
-                #expect(model.currentSections.isEmpty, "Provisional rows do not enter suggestion inventories")
                 #expect(model.wholeLibraryInventoryAuthority == .hydrating)
                 #expect(grid.onCellClick == nil)
+                #expect(grid.onMarqueeBegan == nil)
+                #expect(grid.onMarqueeChanged == nil)
+                #expect(grid.onMarqueeEnded == nil)
+                #expect(grid.onDragOutThreshold == nil)
+                let cell = try #require(grid.coordinator.visibleCells().first)
+                let point = CGPoint(x: cell.rect.midX, y: cell.rect.midY)
+                grid.onCellClick?(point, 2, [])
+                grid.onCellClick?(point, 1, .command)
+                let element = try #require(
+                    grid.accessibilityChildren()?.compactMap { $0 as? MetalGridA11yElement }.first)
+                #expect(!element.accessibilityPerformPress())
+                #expect(opened.isEmpty, "Provisional mouse and accessibility routes must not open a viewer")
+                #expect(selections.isEmpty, "Provisional tiles must not enter selection")
+                let clip = try #require(grid.coordinator.clipView)
+                let before = clip.bounds.origin
+                clip.scroll(to: CGPoint(x: 0, y: before.y > 0 ? 0 : 100))
+                #expect(clip.bounds.origin != before, "Provisional rows remain scrollable")
+                await repository.releaseRemote()
+                await loading.value
+                try await waitUntil { host()?.onCellClick != nil && !model.isProvisionalPresentation }
+                #expect(host() === grid)
+                #expect(model.wholeLibraryInventoryAuthority == .authoritative)
+                #expect(Set(model.allItems.map(\.uid)) == Set(items.map(\.uid)))
+                #expect(grid.onMarqueeBegan != nil)
+                #expect(grid.onMarqueeChanged != nil)
+                #expect(grid.onMarqueeEnded != nil)
+                #expect(grid.onDragOutThreshold != nil)
+                try await waitUntil {
+                    grid.accessibilityChildren()?.compactMap { $0 as? MetalGridA11yElement }.first?.onActivate != nil
+                }
+                let qualified = try #require(grid.coordinator.visibleCells().first)
+                let qualifiedPoint = CGPoint(x: qualified.rect.midX, y: qualified.rect.midY)
+                let previousOpenCount = opened.count
+                grid.onCellClick?(qualifiedPoint, 2, [])
+                let qualifiedElement = try #require(
+                    grid.accessibilityChildren()?.compactMap { $0 as? MetalGridA11yElement }.first)
+                #expect(qualifiedElement.accessibilityPerformPress())
+                #expect(opened.count == previousOpenCount + 2)
+                let previousSelectionCount = selections.count
+                grid.onCellClick?(qualifiedPoint, 1, .command)
+                #expect(selections.count == previousSelectionCount + 1)
+            } catch {
+                model.cancelInitialLoadForTesting()
+                await repository.releaseRemote()
+                await loading.value
+                await feed.stopPrefetch()
+                throw error
             }
-            await repository.releaseRemote()
-            await loading.value
-            try await waitUntil { grid.onCellClick != nil }
-            let completed = try #require(grid.currentScrollAnchor())
-            #expect(completed.itemID == anchor.itemID)
-            #expect(abs(completed.topOffset - anchor.topOffset) < 0.5)
-            #expect(Set(model.allItems.map(\.uid)) == Set(items.map(\.uid)))
-            #expect(model.wholeLibraryInventoryAuthority == .authoritative)
-        } catch {
-            model.cancelInitialLoadForTesting()
-            await repository.releaseRemote()
-            await loading.value
             await feed.stopPrefetch()
-            throw error
         }
-        await feed.stopPrefetch()
-    }
+    #endif
 
-    @Test(.timeLimit(.minutes(1)))
-    func aLaterPageFailureReplacesTheNativeGridAndRetryStartsWithOnlyNewRows() async throws {
-        _ = NSApplication.shared
-        let failedItems = (0..<10).map { photo("failed-\($0)", month: 1) }
-        let retryItems = (0..<10).map { photo("retry-\($0)", month: 1) }
-        let repository = RetryingProvisionalRepository(first: [section(failedItems)], second: [section(retryItems)])
-        let feed = makeVisibleContentFeed()
-        let model = TimelineViewModel(repository: repository, feed: feed.feedCore)
-        let window = NSWindow(
-            contentRect: CGRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.borderless], backing: .buffered, defer: true)
-        window.isReleasedWhenClosed = false
-        let root = NSHostingView(rootView: TimelineView(model: model, feed: feed))
-        window.contentView = root
-        window.orderFront(nil)
-        defer {
-            window.orderOut(nil)
-            window.contentView = nil
-        }
-        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
-        func host() -> MetalGridScrollHost? { descendants(root).compactMap { $0 as? MetalGridScrollHost }.first }
-        func waitUntil(_ condition: () -> Bool) async throws {
-            let deadline = ContinuousClock.now + .seconds(10)
-            while ContinuousClock.now < deadline {
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func productionMacGridKeepsTheVisiblePhotoAnchoredAsOlderMetadataPagesArrive() async throws {
+            _ = NSApplication.shared
+            let items = (0..<180).map { index in
+                PhotoItem(
+                    uid: PhotoUID(volumeID: "v", nodeID: "page-\(index)"),
+                    captureTime: Date(timeIntervalSince1970: Double(index + 1)), mediaType: "image/jpeg")
+            }
+            let initial = Array(items.suffix(60))
+            let repository = ControlledStartupRepository(
+                cached: nil, remote: [section(items)], provisional: [section(initial)])
+            let feed = makeVisibleContentFeed()
+            let model = TimelineViewModel(repository: repository, feed: feed.feedCore)
+            let loading = Task { await model.load() }
+            await repository.waitUntilRemoteRequested()
+            let window = NSWindow(
+                contentRect: CGRect(x: 0, y: 0, width: 800, height: 600),
+                styleMask: [.borderless], backing: .buffered, defer: true)
+            window.isReleasedWhenClosed = false
+            let root = NSHostingView(
+                rootView: TimelineView(
+                    model: model, feed: feed, level: .constant(0),
+                    gridProfile: .testRegularTimeline, onOpen: { _, _ in }))
+            window.contentView = root
+            window.orderFront(nil)
+            defer {
+                window.orderOut(nil)
+                window.contentView = nil
+            }
+            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+            func host() -> MetalGridScrollHost? { descendants(root).compactMap { $0 as? MetalGridScrollHost }.first }
+            func waitUntil(_ condition: () -> Bool) async throws {
+                let deadline = ContinuousClock.now + .seconds(10)
+                while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+                try #require(condition())
+            }
+            do {
                 root.layoutSubtreeIfNeeded()
-                if condition() { return }
-                try await Task.sleep(for: .milliseconds(10))
+                try await waitUntil { host()?.coordinator.orderedUIDs.count == 60 }
+                let grid = try #require(host())
+                grid.scrollToItem(initial[24].uid)
+                let anchor = try #require(grid.currentScrollAnchor())
+                let clip = try #require(grid.coordinator.clipView)
+                try #require(clip.bounds.minY > 0, "SETUP: an interior scroll position")
+                for count in [120, 180] {
+                    let known = Array(items.suffix(count))
+                    await repository.publishProvisional([section(known)])
+                    try await waitUntil { grid.coordinator.orderedUIDs.count == count }
+                    let after = try #require(grid.currentScrollAnchor())
+                    #expect(after.itemID == anchor.itemID, "Growing metadata keeps the same photo below the top bar")
+                    #expect(abs(after.topOffset - anchor.topOffset) < 0.5, "Growing metadata keeps its viewport offset")
+                    #expect(Set(grid.coordinator.orderedUIDs) == Set(known.map(\.uid)))
+                    #expect(model.allItems.isEmpty)
+                    #expect(model.currentSections.isEmpty, "Provisional rows do not enter suggestion inventories")
+                    #expect(model.wholeLibraryInventoryAuthority == .hydrating)
+                    #expect(grid.onCellClick == nil)
+                }
+                await repository.releaseRemote()
+                await loading.value
+                try await waitUntil { grid.onCellClick != nil }
+                let completed = try #require(grid.currentScrollAnchor())
+                #expect(completed.itemID == anchor.itemID)
+                #expect(abs(completed.topOffset - anchor.topOffset) < 0.5)
+                #expect(Set(model.allItems.map(\.uid)) == Set(items.map(\.uid)))
+                #expect(model.wholeLibraryInventoryAuthority == .authoritative)
+            } catch {
+                model.cancelInitialLoadForTesting()
+                await repository.releaseRemote()
+                await loading.value
+                await feed.stopPrefetch()
+                throw error
             }
-            try #require(
-                condition(), "C7 state: \(model.initialLibraryLoadState), host: \(host() != nil), root: \(root.bounds)")
-        }
-        let loading = Task { await model.load() }
-        var retry: Task<Void, Never>?
-        do {
-            try await waitUntil { model.isProvisionalPresentation && host() != nil }
-            // This C7 probe starts after a presentable frame; C5 tests the frame-readiness boundary separately.
-            model.markInitialContentReady()
-            #expect(model.initialLibraryLoadState.isContentReady)
-            #expect(Set(model.gridItems.map(\.uid)) == Set(failedItems.map(\.uid)))
-            #expect(model.isProvisionalPresentation)
-            #expect(!model.initialLibraryLoadState.hasSettled)
-            await repository.release(read: 1)
-            await loading.value
-            #expect(model.gridItems.isEmpty)
-            #expect(model.currentSections.isEmpty)
-            #expect(model.allItems.isEmpty)
-            #expect(!model.isProvisionalPresentation)
-            #expect(model.initialLibraryLoadState.failure?.retryable == true)
-            #expect(model.initialLibraryChangeToken == "")
-            #expect(model.wholeLibraryInventoryAuthority == .hydrating)
-            #expect(!model.initialLibraryLoadState.isCompletelyEmpty)
-            if case .failed(_, retryable: true) = model.gridState {
-            } else {
-                Issue.record("The existing error cover replaces the provisional grid")
-            }
-            try await waitUntil { host() == nil }
-            let next = Task { await model.retry() }
-            retry = next
-            try await waitUntil { model.isProvisionalPresentation && host() != nil }
-            #expect(model.initialLibraryLoadState.failure == nil, "Retry removes the previous failure cover")
-            #expect(model.initialLibraryLoadState.knownCount == 10)
-            #expect(!model.initialLibraryLoadState.hasSettled)
-            #expect(Set(model.gridItems.map(\.uid)) == Set(retryItems.map(\.uid)))
-            #expect(Set(model.gridItems.map(\.uid)).isDisjoint(with: Set(failedItems.map(\.uid))))
-            #expect(model.allItems.isEmpty)
-            #expect(model.currentSections.isEmpty)
-            #expect(model.wholeLibraryInventoryAuthority == .hydrating)
-            #expect(await repository.readCount == 2)
-            await repository.release(read: 2)
-            await next.value
-            #expect(Set(model.allItems.map(\.uid)) == Set(retryItems.map(\.uid)))
-            #expect(model.wholeLibraryInventoryAuthority == .authoritative)
-            #expect(model.initialLibraryChangeToken == "retry-complete")
-        } catch {
-            model.cancelInitialLoadForTesting()
-            retry?.cancel()
-            await repository.release(read: 1)
-            await repository.release(read: 2)
-            await loading.value
-            await retry?.value
             await feed.stopPrefetch()
-            throw error
         }
-        await feed.stopPrefetch()
-    }
+    #endif
+
+    #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func aLaterPageFailureReplacesTheNativeGridAndRetryStartsWithOnlyNewRows() async throws {
+            _ = NSApplication.shared
+            let failedItems = (0..<10).map { photo("failed-\($0)", month: 1) }
+            let retryItems = (0..<10).map { photo("retry-\($0)", month: 1) }
+            let repository = RetryingProvisionalRepository(first: [section(failedItems)], second: [section(retryItems)])
+            let feed = makeVisibleContentFeed()
+            let model = TimelineViewModel(repository: repository, feed: feed.feedCore)
+            let window = NSWindow(
+                contentRect: CGRect(x: 0, y: 0, width: 800, height: 600),
+                styleMask: [.borderless], backing: .buffered, defer: true)
+            window.isReleasedWhenClosed = false
+            let root = NSHostingView(rootView: TimelineView(model: model, feed: feed))
+            window.contentView = root
+            window.orderFront(nil)
+            defer {
+                window.orderOut(nil)
+                window.contentView = nil
+            }
+            func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+            func host() -> MetalGridScrollHost? { descendants(root).compactMap { $0 as? MetalGridScrollHost }.first }
+            func waitUntil(_ condition: () -> Bool) async throws {
+                let deadline = ContinuousClock.now + .seconds(10)
+                while ContinuousClock.now < deadline {
+                    root.layoutSubtreeIfNeeded()
+                    if condition() { return }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                try #require(
+                    condition(),
+                    "C7 state: \(model.initialLibraryLoadState), host: \(host() != nil), root: \(root.bounds)")
+            }
+            let loading = Task { await model.load() }
+            var retry: Task<Void, Never>?
+            do {
+                try await waitUntil { model.isProvisionalPresentation && host() != nil }
+                // This C7 probe starts after a presentable frame; C5 tests the frame-readiness boundary separately.
+                model.markInitialContentReady()
+                #expect(model.initialLibraryLoadState.isContentReady)
+                #expect(Set(model.gridItems.map(\.uid)) == Set(failedItems.map(\.uid)))
+                #expect(model.isProvisionalPresentation)
+                #expect(!model.initialLibraryLoadState.hasSettled)
+                await repository.release(read: 1)
+                await loading.value
+                #expect(model.gridItems.isEmpty)
+                #expect(model.currentSections.isEmpty)
+                #expect(model.allItems.isEmpty)
+                #expect(!model.isProvisionalPresentation)
+                #expect(model.initialLibraryLoadState.failure?.retryable == true)
+                #expect(model.initialLibraryChangeToken == "")
+                #expect(model.wholeLibraryInventoryAuthority == .hydrating)
+                #expect(!model.initialLibraryLoadState.isCompletelyEmpty)
+                if case .failed(_, retryable: true) = model.gridState {
+                } else {
+                    Issue.record("The existing error cover replaces the provisional grid")
+                }
+                try await waitUntil { host() == nil }
+                let next = Task { await model.retry() }
+                retry = next
+                try await waitUntil { model.isProvisionalPresentation && host() != nil }
+                #expect(model.initialLibraryLoadState.failure == nil, "Retry removes the previous failure cover")
+                #expect(model.initialLibraryLoadState.knownCount == 10)
+                #expect(!model.initialLibraryLoadState.hasSettled)
+                #expect(Set(model.gridItems.map(\.uid)) == Set(retryItems.map(\.uid)))
+                #expect(Set(model.gridItems.map(\.uid)).isDisjoint(with: Set(failedItems.map(\.uid))))
+                #expect(model.allItems.isEmpty)
+                #expect(model.currentSections.isEmpty)
+                #expect(model.wholeLibraryInventoryAuthority == .hydrating)
+                #expect(await repository.readCount == 2)
+                await repository.release(read: 2)
+                await next.value
+                #expect(Set(model.allItems.map(\.uid)) == Set(retryItems.map(\.uid)))
+                #expect(model.wholeLibraryInventoryAuthority == .authoritative)
+                #expect(model.initialLibraryChangeToken == "retry-complete")
+            } catch {
+                model.cancelInitialLoadForTesting()
+                retry?.cancel()
+                await repository.release(read: 1)
+                await repository.release(read: 2)
+                await loading.value
+                await retry?.value
+                await feed.stopPrefetch()
+                throw error
+            }
+            await feed.stopPrefetch()
+        }
+    #endif
 
     @Test func mapPresentationAndLibraryHaveOppositeOrderWithoutChangingCanonicalItems() async {
         let old = photo("old", month: 1)

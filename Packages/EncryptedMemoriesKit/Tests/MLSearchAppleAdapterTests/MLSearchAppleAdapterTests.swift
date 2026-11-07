@@ -211,17 +211,19 @@ import Testing
         #expect(seen == [false, false, true])
     }
 
-    @Test(arguments: GateSignal.allCases)
-    private func gateRecordsThatTheLoopFoundItClosed(signal: GateSignal) {
-        var initial = LibraryRuntimeSnapshot()
-        signal.setActive(true, in: &initial)
-        let runtimeState = LibraryRuntimeState(initial: initial)
-        let gate = AppleSmartSearchWorkGate(visibleMediaDemandActive: { false }, runtimeState: runtimeState)
-        gate.setIndexingWake {}
-        // The observer cannot clear this record: only a wake does, and a closed gate wakes nothing.
-        #expect(gate.permitsIndexing() == false)
-        #expect(gate.wakePolicyForTesting?.loopSawClosedGate == true)
-    }
+    #if DEBUG
+        @Test(arguments: GateSignal.allCases)
+        private func gateRecordsThatTheLoopFoundItClosed(signal: GateSignal) {
+            var initial = LibraryRuntimeSnapshot()
+            signal.setActive(true, in: &initial)
+            let runtimeState = LibraryRuntimeState(initial: initial)
+            let gate = AppleSmartSearchWorkGate(visibleMediaDemandActive: { false }, runtimeState: runtimeState)
+            gate.setIndexingWake {}
+            // The observer cannot clear this record: only a wake does, and a closed gate wakes nothing.
+            #expect(gate.permitsIndexing() == false)
+            #expect(gate.wakePolicyForTesting?.loopSawClosedGate == true)
+        }
+    #endif
 
     @Test(arguments: GateSignal.allCases)
     private func publicWorkGateResumesForRuntimeInputsAndReplacesItsCallback(signal: GateSignal) async throws {

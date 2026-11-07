@@ -57,33 +57,35 @@ final class BackupProblemSnapshotTests: XCTestCase {
         XCTAssertEqual(Set(BackupProblemPhotoSelection(items).revisionsBySource.keys), Set(sources))
     }
 
-    func testCompleteSnapshotHasOneCursorScanAndPagesNeverReadTheStore() throws {
-        try withQueue { queue, _ in
-            XCTAssertTrue(queue.upsertBatch((0..<1_000).map { entry($0) }))
-            var statements = 0
-            var steps = 0
-            var rows = 0
-            var healthProbes = 0
-            queue.onProblemReadEvent = {
-                switch $0 {
-                case .statement: statements += 1
-                case .step: steps += 1
-                case .row: rows += 1
-                case .healthProbe: healthProbes += 1
-                default: break
+    #if DEBUG
+        func testCompleteSnapshotHasOneCursorScanAndPagesNeverReadTheStore() throws {
+            try withQueue { queue, _ in
+                XCTAssertTrue(queue.upsertBatch((0..<1_000).map { entry($0) }))
+                var statements = 0
+                var steps = 0
+                var rows = 0
+                var healthProbes = 0
+                queue.onProblemReadEvent = {
+                    switch $0 {
+                    case .statement: statements += 1
+                    case .step: steps += 1
+                    case .row: rows += 1
+                    case .healthProbe: healthProbes += 1
+                    default: break
+                    }
                 }
+                let snapshot = try XCTUnwrap(BackupProblemSnapshot.backup(in: queue))
+                XCTAssertEqual(statements, 1)
+                XCTAssertEqual(steps, 1_001)
+                XCTAssertEqual(rows, 1_000)
+                XCTAssertEqual(healthProbes, 2)
+                let observed = [statements, steps, rows, healthProbes]
+                var page = try XCTUnwrap(snapshot.page())
+                while let cursor = page.next { page = try XCTUnwrap(snapshot.page(after: cursor)) }
+                XCTAssertEqual([statements, steps, rows, healthProbes], observed)
             }
-            let snapshot = try XCTUnwrap(BackupProblemSnapshot.backup(in: queue))
-            XCTAssertEqual(statements, 1)
-            XCTAssertEqual(steps, 1_001)
-            XCTAssertEqual(rows, 1_000)
-            XCTAssertEqual(healthProbes, 2)
-            let observed = [statements, steps, rows, healthProbes]
-            var page = try XCTUnwrap(snapshot.page())
-            while let cursor = page.next { page = try XCTUnwrap(snapshot.page(after: cursor)) }
-            XCTAssertEqual([statements, steps, rows, healthProbes], observed)
         }
-    }
+    #endif
     func testEveryPhotoIsReachableExactlyOnceAtOneThousandAndFiveThousand() throws {
         for count in [1_000, 5_000] {
             try withQueue { queue, _ in
