@@ -147,7 +147,6 @@ final class TimelineOrderGridTests: XCTestCase {
 
 @MainActor
 private final class OrderGridSource: MetalGridDataSource {
-    let label = "order-test"
     let sectionCounts: [Int]
     let flatUIDs: [PhotoUID]
     var onImagesAvailable: (() -> Void)?

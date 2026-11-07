@@ -414,7 +414,6 @@ private final class VisibilityWindow: NSWindow {
 
 @MainActor
 private final class ReadyGridDataSource: MetalGridDataSource {
-    let label = "visibility-test"
     let sectionCounts: [Int]
     let flatUIDs: [PhotoUID]
     private let thumbnail: CGImage

@@ -216,13 +216,10 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             preferredNormalLevelContentMode == .squareFillCrop ? .aspectFitInsideSquare : .squareFillCrop)
     }
 
-    /// Pushed (throttled) so the SwiftUI HUD can mirror live stats.
-    var onHUD: ((MetalGridHUD) -> Void)?
     /// Called when the content size changes (level / width) so the host can resize the document view.
     var onContentSizeChange: ((CGSize) -> Void)?
 
     // Diagnostics state
-    private var lastHUDPushDetent: CFTimeInterval = 0
     private var lastPerfDiagnosticsLog: CFTimeInterval = 0
     private var lastCommitFrameLog: CFTimeInterval = 0
 
@@ -895,20 +892,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             level: level, viewportSize: layoutViewportSize, scrollOffset: clip.bounds.origin, overscan: 0,
             columnPhase: currentPhase())
         return plan.visibleSlots.map { ($0.index, $0.slotRect) }
-    }
-
-    /// The first visible cell + how far its top sits below the viewport top - captured before a level
-    /// change so the same photo can be re-pinned afterward (anchor preservation).
-    func anchorAtViewportTop() -> (uid: PhotoUID, offset: CGFloat)? {
-        guard let clip = clipView, metalView != nil, layoutWidth > 1 else { return nil }
-        let origin = clip.bounds.origin
-        let plan = engine.framePlan(
-            level: level, viewportSize: layoutViewportSize, scrollOffset: origin, overscan: 0,
-            columnPhase: currentPhase())
-        guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
-            let uid = uid(atFlatIndex: top.index)
-        else { return nil }
-        return (uid, top.slotRect.minY - origin.y)
     }
 
     func contentSize() -> CGSize {
@@ -1668,7 +1651,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     // MARK: - Single-lattice transition render
 
     /// Try to start a click transition
-    /// for a toolbar/keyboard +/- to `newLevel`, pinning `anchorIndex` at `viewportPoint`. Commits the
+    /// for a toolbar +/- to `newLevel`, pinning `anchorIndex` at `viewportPoint`. Commits the
     /// settled level/phase (so the post-settle frame is the target) and overlays the crossfade for the
     /// duration. Returns the target scroll position or `nil` when the caller must snap.
     func tryBeginClickTransition(
@@ -2411,8 +2394,8 @@ extension MetalGridCoordinator {
         phase: String, visibleCount: Int, overscanCount: Int, realCount: Int,
         cellCount: Int, visibleRect: CGRect, contentSize: CGSize, now: CFTimeInterval
     ) {
-        guard now - lastHUDPushDetent > 0.1 else { return }
-        lastHUDPushDetent = now
+        guard now - lastPerfDiagnosticsLog >= 0.5 else { return }
+        lastPerfDiagnosticsLog = now
         let stats = MetalGridStats.frame(
             visibleCount: visibleCount,
             overscanCount: overscanCount,
@@ -2439,14 +2422,6 @@ extension MetalGridCoordinator {
             drawMs: renderer.lastEncodeMs,
             gpuMs: renderer.lastGpuMs
         )
-        var hud = MetalGridHUD()
-        hud.stats = stats
-        hud.level = level
-        hud.totalItems = totalItems
-        hud.dataSource = dataSource.label
-        onHUD?(hud)
-        guard now - lastPerfDiagnosticsLog >= 0.5 else { return }
-        lastPerfDiagnosticsLog = now
         PhotoDiagnostics.shared.emit(
             "MetalGridPerf",
             [
