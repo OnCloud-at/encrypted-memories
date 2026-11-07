@@ -458,6 +458,76 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             "the edit that the expired history lost is found by the resumed rescan")
     }
 
+    /// A NULL key in the snapshot of a resumed rescan stops the rescan (#1241).
+    func testASnapshotKeyStoredAsNullStopsTheResumedRescan() async throws {
+        try await assertDamagedSnapshotKeyStopsTheResumedRescan(.null)
+    }
+
+    /// An INTEGER key in the snapshot of a resumed rescan stops the rescan (#1241).
+    func testASnapshotKeyStoredAsAnIntegerStopsTheResumedRescan() async throws {
+        try await assertDamagedSnapshotKeyStopsTheResumedRescan(.integer)
+    }
+
+    /// A REAL key in the snapshot of a resumed rescan stops the rescan (#1241).
+    func testASnapshotKeyStoredAsARealStopsTheResumedRescan() async throws {
+        try await assertDamagedSnapshotKeyStopsTheResumedRescan(.real)
+    }
+
+    /// A BLOB key in the snapshot of a resumed rescan stops the rescan (#1241).
+    func testASnapshotKeyStoredAsABlobStopsTheResumedRescan() async throws {
+        try await assertDamagedSnapshotKeyStopsTheResumedRescan(.blob)
+    }
+
+    /// A key with invalid UTF-8 in the snapshot of a resumed rescan stops the rescan (#1241).
+    func testASnapshotKeyWithInvalidUTF8StopsTheResumedRescan() async throws {
+        try await assertDamagedSnapshotKeyStopsTheResumedRescan(.invalidUTF8)
+    }
+
+    /// A key with a NUL byte in the snapshot of a resumed rescan stops the rescan (#1241).
+    func testASnapshotKeyWithANULStopsTheResumedRescan() async throws {
+        try await assertDamagedSnapshotKeyStopsTheResumedRescan(.nulByte)
+    }
+
+    /// The rescan stops after A and B, and the snapshot key of C is damaged. A repaired key names no photo, so C would
+    /// go unread, and the removal sweep at the end of the rescan would mark the catalog row of C removed. The rescan
+    /// must stop at the page instead and stay owed with its saved position.
+    private func assertDamagedSnapshotKeyStopsTheResumedRescan(
+        _ damage: DamagedKey, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        try await startScanPass(history: history)
+        XCTAssertTrue(catalog.hasCompletedFullScan(), file: file, line: line)
+        history.expire()
+        enumerator.throwAfter = 2
+        let rescanFinished = try await startScanPass(history: history)
+        XCTAssertFalse(rescanFinished, file: file, line: line)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2, file: file, line: line)
+
+        let catalogURL = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        catalog.close()
+        try storeDamagedSnapshotKey(damage, atPosition: 2, inClosedCatalogAt: catalogURL)
+        catalog = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: catalogURL))
+        enumerator.throwAfter = nil
+        do {
+            try await startScanPass(history: history)
+            XCTFail("the rescan must stop at the damaged key", file: file, line: line)
+        } catch {
+            XCTAssertEqual(
+                error as? UploadError, .backend("Photo library scan snapshot could not be read"), file: file,
+                line: line)
+        }
+        XCTAssertFalse(catalog.isOperational(), file: file, line: line)
+
+        catalog.close()
+        catalog = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: catalogURL))
+        XCTAssertEqual(
+            catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 5, present: 5, removed: 0),
+            "no photo is swept as removed", file: file, line: line)
+        XCTAssertFalse(catalog.hasCompletedFullScan(), "the rescan stays owed", file: file, line: line)
+        XCTAssertEqual(try catalog.fullScanProgress()?.cursor, 2, "the saved position stays", file: file, line: line)
+    }
+
     /// A rescan request that leaves the change token valid (a live change without details) must not drop the open
     /// rescan of an expired change history when its own snapshot fails. A photo from the expired gap that lies after
     /// the saved position is still backed up.

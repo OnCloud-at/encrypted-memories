@@ -367,7 +367,8 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// Publishes the completely-built snapshot and creates its cursor at zero.
     @discardableResult
     func finishFullScanSnapshot() -> Bool
-    /// A nil page is an unknown read, not the end of the snapshot (#1004).
+    /// A nil page is an unknown read, not the end of the snapshot (#1004). A key that is not exact text makes its page
+    /// nil, never a repaired identifier (#1241).
     func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String]?
     /// A nil count is an unknown read, not an empty snapshot (#1004).
     func fullScanSnapshotCount() -> Int?
