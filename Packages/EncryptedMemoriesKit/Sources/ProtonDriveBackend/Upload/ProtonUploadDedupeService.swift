@@ -877,7 +877,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             guard
                 store.applyRemoteContentIndexChanges(
                     upserting: rows.records,
-                    upsertingRemoteAssetRecords: rows.remoteAssetRecords,
+                    // The event path writes no proof rows; it only removes them (see the store).
+                    upsertingRemoteAssetRecords: [],
                     unresolvedIssues: rows.unresolvedIssues,
                     removingRemoteLinkIDs: removedIDs,
                     hashKeyEpoch: material.epoch,
@@ -1047,17 +1048,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
 
     private struct RemoteContentIndexRows {
         var records: [UploadRemoteContentIndexRecord] = []
-        var remoteAssetRecords: [UploadRemoteAssetIndexRecord] = []
         var unresolvedIssues: [UploadRemoteContentIndexIssue] = []
         var externalIdentitiesByLinkID: [String: UploadBackupExternalIdentity] = [:]
         var lineageRows = RemotePhotoLineageRows()
-
-        mutating func merge(_ other: Self) {
-            records.append(contentsOf: other.records)
-            unresolvedIssues.append(contentsOf: other.unresolvedIssues)
-            externalIdentitiesByLinkID.merge(other.externalIdentitiesByLinkID) { _, new in new }
-            lineageRows.merge(other.lineageRows)
-        }
     }
 
     private static func makeIndexRows(

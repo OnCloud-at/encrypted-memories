@@ -1622,6 +1622,69 @@ extension DriveSessionStubSuite {
             #expect(replaced.links == ["old"] && !replaced.complete)
         }
 
+        /// The guard in production: the service lists every link of an event as removed, an updated link included, so an
+        /// update event on a link that a proof row names deletes the proof row of the whole compound, and the asset
+        /// checkpoint moves to the event.
+        @Test func anUpdateEventOnALinkOfACompoundDeletesItsProofRowAndMovesTheAssetCheckpoint() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            let keys = try LineageKeys()
+            let identity = UploadBackupExternalIdentity(
+                identifier: "cloud", modificationDate: Date(timeIntervalSince1970: 1_700_000_000))
+            let proof = UploadRemoteAssetIndexRecord(
+                externalIdentity: identity, resourceCount: 2, remoteLinkIDs: ["primary", "paired"],
+                hashKeyEpoch: "epoch")
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], remoteAssetRecords: [proof], unresolvedIssues: [], hashKeyEpoch: "epoch",
+                    checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+            #expect(content.remoteAssetRecords(for: [identity], hashKeyEpoch: "epoch")[identity] == proof)
+            #expect(try assetCheckpointEventID(in: directory) == "one")
+            StubURLProtocol.reset()
+            routeEventPage(
+                from: "one",
+                json:
+                    #"{"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"paired","Type":2,"State":1}}]}"#
+            )
+            try routeMetadata([try keys.activePhoto("paired", attributes: #"{"iOS.photos":{"ICloudID":"cloud"}}"#)])
+
+            try await refresh(content: content, lineage: lineage, rootKey: keys.root)
+
+            #expect(
+                content.remoteAssetRecords(for: [identity], hashKeyEpoch: "epoch")[identity] == nil,
+                "an update event on a link of the compound deletes the proof row of the whole compound")
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            #expect(try assetCheckpointEventID(in: directory) == "two", "the asset checkpoint moves with the event")
+        }
+
+        /// The event of the asset checkpoint, read with a second connection.
+        private func assetCheckpointEventID(in directory: URL) throws -> String? {
+            var database: OpaquePointer?
+            let path = directory.appendingPathComponent("content.sqlite").path
+            try #require(sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
+            defer { sqlite3_close(database) }
+            var statement: OpaquePointer?
+            try #require(
+                sqlite3_prepare_v2(
+                    database, "SELECT event_id FROM remote_asset_index_checkpoint WHERE key_epoch='epoch';", -1,
+                    &statement, nil) == SQLITE_OK)
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
+                return nil
+            }
+            return String(cString: text)
+        }
+
         /// A link that fails again stays unresolved, and a later sweep reads it again.
         @Test func aLinkThatFailsAgainStaysAndALaterSweepRetriesIt() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

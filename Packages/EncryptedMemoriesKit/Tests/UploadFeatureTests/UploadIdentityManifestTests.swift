@@ -866,6 +866,50 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertNil(reopened.remoteAssetRecords(for: [identity], hashKeyEpoch: "epoch-1")[identity])
     }
 
+    /// Store contract: the store deletes proof rows only for the links of the removal list that it is given. (The
+    /// production caller lists every link of an event, so this case does not occur there.)
+    func testTheStoreInvalidatesProofRowsOnlyByTheRemovalListItIsGiven() throws {
+        let store = try makeStore()
+        let identity = UploadBackupExternalIdentity(
+            identifier: "icloud-asset",
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000.123)
+        )
+        let proof = UploadRemoteAssetIndexRecord(
+            externalIdentity: identity,
+            resourceCount: 2,
+            remoteLinkIDs: ["primary", "paired"],
+            hashKeyEpoch: "epoch-1"
+        )
+        XCTAssertTrue(
+            store.replaceRemoteContentIndex(
+                [], remoteAssetRecords: [proof], unresolvedIssues: [], hashKeyEpoch: "epoch-1",
+                checkpoint: UploadRemoteContentIndexCheckpoint(
+                    eventID: "event-100", refreshedAt: Date(timeIntervalSince1970: 1_700_000_100))
+            ))
+
+        // The event names "primary" as changed (it comes back as an upsert) and removes nothing.
+        let changed = UploadRemoteContentIndexRecord(
+            contentHash: "changed-content", hashKeyEpoch: "epoch-1", remoteLinkID: "primary")
+        XCTAssertTrue(
+            store.applyRemoteContentIndexChanges(
+                upserting: [changed],
+                upsertingRemoteAssetRecords: [],
+                unresolvedIssues: [],
+                removingRemoteLinkIDs: [],
+                hashKeyEpoch: "epoch-1",
+                expectedEventID: "event-100",
+                checkpoint: UploadRemoteContentIndexCheckpoint(
+                    eventID: "event-101", refreshedAt: Date(timeIntervalSince1970: 1_700_000_200))
+            ))
+
+        XCTAssertEqual(store.remoteContentRecord(contentHash: "changed-content", hashKeyEpoch: "epoch-1"), changed)
+        XCTAssertEqual(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch-1")?.eventID, "event-101")
+        XCTAssertEqual(
+            store.remoteAssetRecords(for: [identity], hashKeyEpoch: "epoch-1")[identity], proof,
+            "a link that is only upserted keeps its proof row with its resource count and its links")
+        XCTAssertTrue(store.hasRemoteAssetIndexCheckpoint(hashKeyEpoch: "epoch-1"))
+    }
+
     func testMalformedRemoteAssetProofRollsBackWithCheckpoint() throws {
         let store = try makeStore()
         let identity = UploadBackupExternalIdentity(
