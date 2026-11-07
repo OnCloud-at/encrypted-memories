@@ -320,7 +320,6 @@ public actor ThumbnailFeedCore {
     private nonisolated let visibleAccessOwner = UUID()
     private nonisolated let visibleAccessLifetime = VisibleThumbnailLifetime()
     private nonisolated let loader: ThumbnailBatchLoader
-    private nonisolated let onDecoded: @Sendable (PhotoUID, DecodedThumbnail) -> Void
     private nonisolated let decoded: DecodedThumbnailCache
     private nonisolated let diskPresence = DiskPresenceCache()
     /// Thumbnail reads are authorized by the thumbnail retention scope: every accessible thumbnail-capable
@@ -555,8 +554,7 @@ public actor ThumbnailFeedCore {
         coverageStore: (any ThumbnailCoverageCheckpointStore)? = nil,
         diagnostics: PhotoDiagnostics = .shared,
         clock: @escaping @Sendable () -> Date = { Date() },
-        resourceCoordinator: LibraryResourceCoordinator = .shared,
-        onDecoded: @escaping @Sendable (PhotoUID, DecodedThumbnail) -> Void = { _, _ in }
+        resourceCoordinator: LibraryResourceCoordinator = .shared
     ) {
         self.cache = cache
         self.resourceCoordinator = resourceCoordinator
@@ -566,7 +564,6 @@ public actor ThumbnailFeedCore {
         self.diagnostics = diagnostics
         self.clock = clock
         self.unfetchable = UnfetchableThumbnailBox(clock: clock)
-        self.onDecoded = onDecoded
         self.decoded = DecodedThumbnailCache(costLimit: configuration.decodedMemoryBudgetBytes)
         self.decodePermits = DecodePermitPool(permits: configuration.maxConcurrentDecodes)
         self.decodeExecutor = ThumbnailDecodeWorkExecutor()
@@ -3282,7 +3279,7 @@ public actor ThumbnailFeedCore {
         access: VisibleThumbnailAccess? = nil
     ) -> DecodedThumbnail? {
         guard ownerLeaseIsCurrent(), readAllowed(uid, access: access) else { return nil }
-        let becameCurrent = decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
+        decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
@@ -3291,7 +3288,6 @@ public actor ThumbnailFeedCore {
             decoded.remove(uid)
             return nil
         }
-        if becameCurrent { onDecoded(uid, image) }
         return decoded.image(for: uid)
     }
 

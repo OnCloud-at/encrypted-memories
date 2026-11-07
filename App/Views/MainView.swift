@@ -165,9 +165,6 @@ struct MainView: View {
         self.backend = facade.backend
         self.uploadCoordinator = facade.uploadCoordinator
         _albumActions = State(initialValue: AlbumActionCoordinator(repository: facade.albums))
-        // Learned thumbnail dimensions persist into the library metadata DB (photos.w/h) through the
-        // backend bridge - batched by the coalescer, so decode callbacks never touch the DB directly.
-        let dimensions = PhotoDimensionCoalescer(store: backend)
         // Use the SHARED, account-configured cache (AppModel.prepareBackend calls
         // OfflineLibraryManager.shared.configure(session:) before this view is built) so the encrypted
         // disk cache uses the durable per-account session-derived key and survives relaunch. A fresh
@@ -175,8 +172,7 @@ struct MainView: View {
         // every launch.
         let feed = ThumbnailFeed(
             cache: OfflineLibraryManager.shared.cache,
-            loader: facade.librarySources,
-            dimensions: dimensions
+            loader: facade.librarySources
         )
         self.feed = feed
         self.temporalCoverImageLoader = TimelineTemporalCoverImageLoader(

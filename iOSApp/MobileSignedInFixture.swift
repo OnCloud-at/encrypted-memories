@@ -772,7 +772,6 @@ import os
             trashState.isEmptied = true
         }
         func metadataRowCount() async -> Int { sections.reduce(0) { $0 + $1.items.count } }
-        func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {}
     }
 
     /// The fixture reverts at once, or refuses every revert when the UI test passes `revertFixtureFails`.

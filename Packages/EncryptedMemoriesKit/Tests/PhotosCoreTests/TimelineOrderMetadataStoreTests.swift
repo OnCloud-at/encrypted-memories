@@ -641,7 +641,7 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
             XCTAssertEqual(saved[0].durationSeconds, 2.5)
             XCTAssertEqual(saved[0].tags, [.favorites])
             XCTAssertEqual(saved[0].burstMemberIDs, ["frame"])
-            XCTAssertEqual(timeline.loadDimensions()[saved[0].uid], PhotoPixelDimensions(width: 4032, height: 3024))
+            XCTAssertEqual(Self.storedDimensions(at: url), "4032x3024", release)
             XCTAssertEqual(timeline.validationToken(), "cursor")
             XCTAssertTrue(cache.synchronize(saved, classifiedUIDs: []))
             XCTAssertTrue(timeline.save(cache.enrich(saved)).succeeded)
@@ -652,6 +652,18 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
             XCTAssertEqual(reopened.validationToken(), "cursor")
             reopened.close()
         }
+    }
+
+    /// The `w` and `h` columns of the only photo row, read with plain SQL ("4032x3024"), or "none".
+    private static func storedDimensions(at url: URL) -> String {
+        var db: OpaquePointer?
+        guard sqlite3_open(url.path, &db) == SQLITE_OK else { return "none" }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT w, h FROM photos;", -1, &stmt, nil) == SQLITE_OK else { return "none" }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return "none" }
+        return "\(sqlite3_column_int(stmt, 0))x\(sqlite3_column_int(stmt, 1))"
     }
 
     private static let legacyDDL = """
