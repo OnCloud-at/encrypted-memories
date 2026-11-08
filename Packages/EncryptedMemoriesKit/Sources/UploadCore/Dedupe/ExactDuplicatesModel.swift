@@ -716,7 +716,7 @@ public final class ExactDuplicatesModel {
     }
 
     /// The groups in one page of the ranking. The screen ranks the page that it shows and the page after it.
-    nonisolated static let rankingPageSize = 24
+    nonisolated static let rankingPageSize = ExactDuplicateFinder.rankingPageSize
     /// The pause after the last group shown before its pages rank. The macOS list shows every section at once.
     nonisolated static let appearancePause: Duration = .milliseconds(150)
     /// The pages that wait for the ranking at most. Older pages that the screen scrolled past wait for their next
@@ -1097,7 +1097,12 @@ public final class ExactDuplicatesModel {
         while !Task.isCancelled, !rankingQueue.isEmpty {
             let ids = Array(rankingQueue.prefix(Self.rankingPageSize))
             rankingQueue.removeFirst(ids.count)
-            let page = ids.compactMap { id in groups.first { $0.id == id && !$0.isRanked }?.scanGroup }
+            // The first group with each ID that the ranking has not read yet, found in one pass over the groups.
+            var unranked: [String: ExactDuplicateGroup] = [:]
+            for group in groups where !group.isRanked && unranked[group.id] == nil {
+                unranked[group.id] = group.scanGroup
+            }
+            let page = ids.compactMap { unranked[$0] }
             if page.count < ids.count {
                 apply(ExactDuplicateRankingPage(members: [:], groupCount: ids.count - page.count), token: token)
             }
