@@ -159,6 +159,12 @@ public extension UploadBackupSyncQueueEntry {
     }
 }
 
+/// A cheap stamp of the queue file's content: rows this connection changed and commits of other connections.
+public struct UploadBackupSyncQueueChangeToken: Sendable, Equatable {
+    let changesOfThisConnection: Int64
+    let commitsOfOtherConnections: Int64
+}
+
 public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     public var total = 0
     public var waiting = 0
@@ -363,6 +369,9 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func dismissPermanentFailure(source: UploadSourceIdentity, revision: UploadBackupRevision, updatedAt: Date) -> Bool
     /// Nil means the durable queue could not be read, not that it is empty (#1004).
     func summary() -> UploadBackupSyncQueueSummary?
+    /// Changes whenever any connection may have changed the queue file. Equal tokens mean an equal `summary()`.
+    /// Nil means unknown; a caller then reads the queue again.
+    func changeToken() -> UploadBackupSyncQueueChangeToken?
     /// Nil means the durable queue could not be read, not that it is empty (#1004).
     func count() -> Int?
     func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord?
@@ -431,6 +440,9 @@ public extension UploadBackupSyncQueueStore {
     }
 
     func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? { nil }
+
+    /// A store without a stamp is always read again.
+    func changeToken() -> UploadBackupSyncQueueChangeToken? { nil }
 
     /// Stores without a complete read prove a result by their health after the read.
     func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {

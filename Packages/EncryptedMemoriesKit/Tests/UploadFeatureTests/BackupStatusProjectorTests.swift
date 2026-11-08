@@ -456,6 +456,85 @@ final class BackupStatusProjectorTests: XCTestCase {
         }
     }
 
+    /// Runner ticks publish from the last summary while no connection changed the queue, and read it again after any
+    /// change, also one of another connection. A read that fails after a change still publishes nothing.
+    func testRunnerTicksReadTheQueueAgainOnlyAfterItChanged() async throws {
+        let queue = try XCTUnwrap(self.queue)
+        XCTAssertTrue(queue.upsert(entry(id: "first", state: .discovered)))
+        let projector = BackupStatusProjector(queue: queue, coalescingInterval: 0)
+        let generation = UUID()
+        let recorder = Recorder()
+        await projector.start(generation: generation, context: BackupStatusProjectionContext(isRunning: true)) {
+            recorder.append($0)
+        }
+        var progress = BackupSyncProgress(summary: try XCTUnwrap(queue.summary()), isRunning: true)
+        func tick(_ name: String) async -> Bool {
+            progress.currentItemName = name
+            projector.submit(progress, generation: generation)
+            return await waitUntil { recorder.values.last?.progress.currentItemName == name }
+        }
+        let warmed = await tick("first tick")
+        XCTAssertTrue(warmed)
+
+        let unchangedRead = try SQLiteReadInterrupt(in: queue, matching: "GROUP BY state, source_kind")
+        let unchanged = await tick("unchanged queue")
+        unchangedRead.stop()
+        XCTAssertTrue(unchanged, "an unchanged queue publishes from the kept summary")
+        XCTAssertFalse(unchangedRead.fired, "an unchanged queue is not read again")
+        XCTAssertEqual(recorder.values.last?.progress.total, 1)
+
+        let other = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDirectory.appendingPathComponent("queue.sqlite")))
+        defer { other.close() }
+        XCTAssertTrue(other.upsert(entry(id: "second", state: .discovered)))
+        let afterOtherWrite = await tick("written by another connection")
+        XCTAssertTrue(afterOtherWrite)
+        XCTAssertEqual(recorder.values.last?.progress.total, 2, "a write of another connection is read")
+
+        let first = entry(id: "first", state: .discovered)
+        XCTAssertTrue(
+            queue.updateState(
+                source: first.source, revision: first.revision, state: .checking, attempts: nil, lastError: nil,
+                updatedAt: Date()))
+        let afterChecking = await tick("first row checking")
+        XCTAssertTrue(afterChecking)
+        XCTAssertEqual(recorder.values.last?.progress.checking, 1, "a state update is read")
+        XCTAssertTrue(
+            queue.updateState(
+                source: first.source, revision: first.revision, state: .completed, attempts: nil, lastError: nil,
+                updatedAt: Date()))
+        let afterCompletion = await tick("first row completed")
+        XCTAssertTrue(afterCompletion)
+        XCTAssertEqual(recorder.values.last?.progress.uploaded, 1, "the completed row is counted")
+        XCTAssertEqual(recorder.values.last?.progress.checking, 0)
+
+        XCTAssertTrue(queue.upsert(entry(id: "third", state: .discovered)))
+        let changedRead = try SQLiteReadInterrupt(in: queue, matching: "GROUP BY state, source_kind")
+        let published = await tick("changed queue, failed read")
+        changedRead.stop()
+        XCTAssertTrue(changedRead.fired, "a changed queue is read again")
+        XCTAssertFalse(published, "an unknown summary publishes nothing")
+        XCTAssertEqual(recorder.values.last?.progress.total, 2)
+        await projector.stop()
+    }
+
+    /// An explicit projection always reads the queue, also when nothing changed since the last one, so its read can
+    /// still report an unknown summary.
+    func testAnExplicitProjectionReadsTheUnchangedQueueAgain() async throws {
+        let queue = try XCTUnwrap(self.queue)
+        XCTAssertTrue(queue.upsert(entry(id: "kept", state: .discovered)))
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        await projector.start(generation: generation, context: BackupStatusProjectionContext(isRunning: true)) { _ in }
+        let read = try SQLiteReadInterrupt(in: queue, matching: "GROUP BY state, source_kind")
+        let result = await projector.projectNow(
+            context: BackupStatusProjectionContext(isRunning: true), generation: generation, revision: 1)
+        read.stop()
+        XCTAssertTrue(read.fired, "the explicit projection read the queue")
+        XCTAssertNil(result, "an unknown summary publishes nothing")
+        await projector.stop()
+    }
+
     private func waitUntil(
         timeout: TimeInterval = 1,
         condition: () -> Bool

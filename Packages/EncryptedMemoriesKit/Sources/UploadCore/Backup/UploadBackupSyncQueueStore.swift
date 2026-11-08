@@ -1257,78 +1257,92 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public func queueCounts() -> UploadBackupQueueDiagnostics? {
         connection.withLock {
             var counts = UploadBackupQueueDiagnostics()
-            var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        SELECT state, CASE WHEN state IN ('discovered','checking') THEN last_error END, COUNT(*)
-                        FROM backup_sync_queue GROUP BY 1, 2;
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
-            else { return nil }
-            defer { sqlite3_finalize(stmt) }
-            var stepResult = sqlite3_step(stmt)
-            while stepResult == SQLITE_ROW {
-                guard let raw = columnText(stmt, 0), let state = UploadBackupSyncQueueState(rawValue: raw) else {
-                    return nil
-                }
-                let rows = Int(sqlite3_column_int(stmt, 2))
-                counts.rows[state, default: 0] += rows
+            // An unknown state ends the read with no counts and records no failure.
+            let completed = aggregateRowsLocked { row in
+                guard let raw = row.state, let state = UploadBackupSyncQueueState(rawValue: raw) else { return false }
+                counts.rows[state, default: 0] += row.count
                 if state == .discovered || state == .checking {
-                    let reason = UploadBackupQueueDiagnostics.checkReason(lastError: columnText(stmt, 1))
-                    counts.checkReasons[state, default: [:]][reason, default: 0] += rows
+                    let reason = UploadBackupQueueDiagnostics.checkReason(lastError: row.checkReason)
+                    counts.checkReasons[state, default: [:]][reason, default: 0] += row.count
                 }
-                stepResult = sqlite3_step(stmt)
+                return true
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else { return nil }
-            return counts
+            return completed == true ? counts : nil
         }
     }
 
     public func summary() -> UploadBackupSyncQueueSummary? {
         connection.withLock {
-            var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        SELECT state, source_kind,
-                               CASE WHEN state IN ('discovered','checking') THEN last_error END AS check_reason, COUNT(*)
-                        FROM backup_sync_queue GROUP BY state, source_kind, check_reason;
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
-            else { return nil }
-            defer { sqlite3_finalize(stmt) }
             var summary = UploadBackupSyncQueueSummary()
-            var stepResult = sqlite3_step(stmt)
-            while stepResult == SQLITE_ROW {
-                guard let raw = columnText(stmt, 0),
-                    let state = UploadBackupSyncQueueState(rawValue: raw)
-                else {
+            // An unknown state is a lasting failure at once; the read stops at that row.
+            let completed = aggregateRowsLocked { row in
+                guard let raw = row.state, let state = UploadBackupSyncQueueState(rawValue: raw) else {
                     connection.markFailed()
-                    return nil
+                    return false
                 }
-                let count = Int(sqlite3_column_int(stmt, 3))
-                if let kind = columnText(stmt, 1).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
+                if let kind = row.sourceKind.flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
                     UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
-                        sourceKind: kind, state: state, lastError: columnText(stmt, 2))
+                        sourceKind: kind, state: state, lastError: row.checkReason)
                 {
-                    summary.include(.dismissedFailure, count: count)
-                    summary.pendingSourceRechecks += count
+                    summary.include(.dismissedFailure, count: row.count)
+                    summary.pendingSourceRechecks += row.count
                 } else {
-                    summary.include(state, count: count)
+                    summary.include(state, count: row.count)
                 }
-                stepResult = sqlite3_step(stmt)
+                return true
             }
-            guard requireOperational(stepResult == SQLITE_DONE) else {
-                return nil
-            }
-            return summary
+            return completed == true ? summary : nil
+        }
+    }
+
+    /// One row of the whole-queue count: state, source kind, the stored error of a waiting or checking row, count.
+    private struct AggregateRow {
+        let state: String?
+        let sourceKind: String?
+        let checkReason: String?
+        let count: Int
+    }
+
+    /// Counts every row of the queue in one grouped read and hands each row to `visit`, which `summary()` and
+    /// `queueCounts()` both use. A visit that returns false ends the read at that row (false); nil when the read could
+    /// not run; true after the last row. Call it with the connection lock held.
+    private func aggregateRowsLocked(_ visit: (AggregateRow) -> Bool) -> Bool? {
+        var stmt: OpaquePointer?
+        guard
+            requireOperational(
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT state, source_kind,
+                           CASE WHEN state IN ('discovered','checking') THEN last_error END AS check_reason, COUNT(*)
+                    FROM backup_sync_queue GROUP BY state, source_kind, check_reason;
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK)
+        else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            let row = AggregateRow(
+                state: columnText(stmt, 0), sourceKind: columnText(stmt, 1), checkReason: columnText(stmt, 2),
+                count: Int(sqlite3_column_int(stmt, 3)))
+            guard visit(row) else { return false }
+            stepResult = sqlite3_step(stmt)
+        }
+        guard requireOperational(stepResult == SQLITE_DONE) else { return nil }
+        return true
+    }
+
+    public func changeToken() -> UploadBackupSyncQueueChangeToken? {
+        connection.withLock {
+            guard let db, !connection.operationFailed else { return nil }
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "PRAGMA data_version;", -1, &stmt, nil) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+            return UploadBackupSyncQueueChangeToken(
+                changesOfThisConnection: sqlite3_total_changes64(db),
+                commitsOfOtherConnections: sqlite3_column_int64(stmt, 0))
         }
     }
 
