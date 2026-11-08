@@ -24,6 +24,10 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
         public var minimumInterval: TimeInterval
         /// A pause longer than this starts a new speed measurement.
         public var restartInterval: TimeInterval
+        /// The two independently tunable duration pairs and their boundary in smoothed points per second.
+        public var fadeIn = TimelineScrollDateLabelMotion.fadeIn
+        public var fadeOut = TimelineScrollDateLabelMotion.fadeOut
+        public var fastFadeSpeed = TimelineScrollDateLabelMotion.fastFadeSpeed
 
         public init(
             showSpeed: Double, sustainSpeed: Double, linger: TimeInterval, smoothing: TimeInterval,
@@ -47,9 +51,13 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     /// When a visible label hides if no sustaining movement arrives first.
     public private(set) var hideDeadline: TimeInterval?
     public private(set) var isSuppressed = false
+    /// Frozen when visibility changes. Nil means an immediate change, such as suppression.
+    public private(set) var fadeDuration: TimeInterval?
     private var lastOffsetY: Double?
     private var lastTime: TimeInterval?
     private var smoothedSpeed: Double = 0
+    /// Kept separately because a layout reset or a long linger must not replace the last sustaining movement.
+    private var lastSustainingSpeed: Double = 0
 
     public init(tuning: Tuning = .standard) {
         self.tuning = tuning
@@ -72,21 +80,26 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
         let weight = 1 - exp(-interval / tuning.smoothing)
         smoothedSpeed += (instant - smoothedSpeed) * weight
         if isVisible {
-            if smoothedSpeed >= tuning.sustainSpeed { hideDeadline = time + tuning.linger }
+            if smoothedSpeed >= tuning.sustainSpeed {
+                lastSustainingSpeed = smoothedSpeed
+                hideDeadline = time + tuning.linger
+            }
         } else if smoothedSpeed >= tuning.showSpeed {
             isVisible = true
             hideDeadline = time + tuning.linger
+            lastSustainingSpeed = smoothedSpeed
+            fadeDuration = tuning.fadeIn.duration(for: smoothedSpeed, fastBoundary: tuning.fastFadeSpeed)
         }
     }
 
     /// A movement without user input. A marked navigation jump ends the linger; layout, resize and content-driven
     /// adjustments leave visibility and the existing deadline unchanged. Every such movement resets the speed sample.
     public mutating func nonUserMoved(isJump: Bool = false) {
-        if isJump {
-            hide()
-            return
+        if isJump, isVisible {
+            hide(duration: tuning.fadeOut.fast)
+        } else {
+            resetMeasurement()
         }
-        resetMeasurement()
     }
 
     /// Hides the label at once and ignores movement until `resume()`: pinch, route change, inactive surface.
@@ -101,9 +114,11 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     }
 
     /// Hides the label at once, for example when its content became stale.
-    public mutating func hide() {
+    public mutating func hide(duration: TimeInterval? = nil) {
         isVisible = false
         hideDeadline = nil
+        fadeDuration = duration
+        lastSustainingSpeed = 0
         resetMeasurement()
     }
 
@@ -111,7 +126,7 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     @discardableResult
     public mutating func tick(at time: TimeInterval) -> Bool {
         guard isVisible, let deadline = hideDeadline, time >= deadline else { return false }
-        hide()
+        hide(duration: tuning.fadeOut.duration(for: lastSustainingSpeed, fastBoundary: tuning.fastFadeSpeed))
         return true
     }
 
@@ -124,10 +139,25 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
 
 /// Shared timing and spacing of the scroll date label, so every platform looks and moves the same.
 public enum TimelineScrollDateLabelMotion {
-    /// Seconds of the gentle fade in.
-    public static let fadeIn: TimeInterval = 0.2
-    /// Seconds of the fade out.
-    public static let fadeOut: TimeInterval = 0.35
+    public struct FadeDurations: Equatable, Sendable {
+        public var slow: TimeInterval
+        public var fast: TimeInterval
+
+        public init(slow: TimeInterval, fast: TimeInterval) {
+            self.slow = slow
+            self.fast = fast
+        }
+
+        func duration(for speed: Double, fastBoundary: Double) -> TimeInterval {
+            speed >= fastBoundary ? fast : slow
+        }
+    }
+
+    /// Seconds of each fade; the two pairs can be tuned independently.
+    public static let fadeIn = FadeDurations(slow: 0.40, fast: 0.20)
+    public static let fadeOut = FadeDurations(slow: 0.70, fast: 0.35)
+    /// Boundary at the first smoothed show sample, not at the raw input speed. The visibility threshold stays 600.
+    public static let fastFadeSpeed: Double = 650
     /// Points between the label's trailing edge and the scroll host's trailing edge, clear of the indicator.
     public static let indicatorGap: CGFloat = 16
     /// Points the label keeps from the ends of the indicator track.

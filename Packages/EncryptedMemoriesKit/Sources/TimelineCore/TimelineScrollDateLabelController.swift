@@ -36,7 +36,10 @@ public final class TimelineScrollDateLabelController {
         /// The month and year of the anchor photo. It stays set while the label fades out.
         public let text: String?
 
-        public static let hidden = Presentation(isVisible: false, text: nil)
+        /// The shared duration for this visibility transition.
+        public let fadeDuration: TimeInterval?
+
+        public static let hidden = Presentation(isVisible: false, text: nil, fadeDuration: nil)
     }
 
     /// Called with the new presentation whenever it changes.
@@ -49,9 +52,12 @@ public final class TimelineScrollDateLabelController {
 
     /// True after `retire()`: the host is gone.
     public private(set) var isRetired = false
-    /// False when the last change must take effect at once: a suppression, a route change or stale content. The
-    /// normal hide after the linger time, a marked navigation jump, and every show animate.
-    public private(set) var animatesLastChange = true
+    /// Hosts forward the native setting. Reduce Motion preserves visibility and text with no fade duration.
+    public var reduceMotion = false {
+        didSet {
+            if reduceMotion != oldValue { publish() }
+        }
+    }
 
     private let clock: TimelineScrollDateLabelClock
     private let scheduler: TimelineScrollDateIndexScheduler
@@ -195,11 +201,12 @@ public final class TimelineScrollDateLabelController {
             }
         }
         if index == nil { text = nil }
-        let next = Presentation(isVisible: visible && text != nil, text: text)
+        let next = Presentation(
+            isVisible: visible && text != nil, text: text,
+            fadeDuration: animated && !reduceMotion ? policy.fadeDuration : nil)
         // An immediate hide also reaches the host when the label is already fading out, so the fade stops at once.
         guard next != presentation || (!animated && !next.isVisible) else { return }
         presentation = next
-        animatesLastChange = animated
         onChange?(next)
     }
 

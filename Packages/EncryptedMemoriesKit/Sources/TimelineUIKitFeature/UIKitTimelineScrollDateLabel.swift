@@ -81,21 +81,20 @@
 
         /// Fades the glass in or out. Glass materializes by animating its effect, not the view's alpha. Reduce Motion
         /// shows and hides at once.
-        func setShown(_ shown: Bool, animated: Bool) {
+        func setShown(_ shown: Bool, duration: TimeInterval?) {
             let changes = { [self] in
                 glass.effect = shown ? glassEffect : nil
                 label.alpha = shown ? 1 : 0
             }
             if shown { isHidden = false }
-            guard animated else {
+            guard let duration else {
                 for layer in [layer, glass.layer, label.layer] { layer.removeAllAnimations() }
                 UIView.performWithoutAnimation(changes)
                 isHidden = !shown
                 return
             }
-            let timing = shown ? TimelineScrollDateLabelMotion.fadeIn : TimelineScrollDateLabelMotion.fadeOut
             UIView.animate(
-                withDuration: timing, delay: 0,
+                withDuration: duration, delay: 0,
                 options: [.beginFromCurrentState, .allowUserInteraction, shown ? .curveEaseOut : .curveEaseIn],
                 animations: changes
             ) { [weak self] finished in
@@ -112,7 +111,6 @@
         let view = UIKitTimelineScrollDateLabelView()
         let controller: TimelineScrollDateLabelController
         private(set) var isEnabled = false
-        private var reduceMotion = UIAccessibility.isReduceMotionEnabled
         private var items: [PhotoItem] = []
         /// Viewport bands the label must not cover (fold, camera), sorted by their top edge.
         private var avoidedBands: [ClosedRange<CGFloat>] = []
@@ -124,6 +122,7 @@
             self.controller = controller
             controller.onChange = { [weak self] presentation in self?.apply(presentation) }
             controller.onIndexInstalled = { [weak self] index in self?.prepareText(for: index) }
+            controller.reduceMotion = UIAccessibility.isReduceMotionEnabled
         }
 
         /// Adds the label above the grid.
@@ -143,7 +142,7 @@
             }
         }
 
-        func setReduceMotion(_ reduce: Bool) { reduceMotion = reduce }
+        func setReduceMotion(_ reduce: Bool) { controller.reduceMotion = reduce }
 
         /// The host shows new items. `replacesList` marks another list (account, filter, search result); otherwise it is
         /// a refresh of the same list.
@@ -225,17 +224,16 @@
 
         private func apply(_ presentation: TimelineScrollDateLabelController.Presentation) {
             if let text = presentation.text { view.setText(text) }
-            let animated = !reduceMotion && controller.animatesLastChange
             if presentation.isVisible != isShown {
                 isShown = presentation.isVisible
                 if isShown { host?.bringSubviewToFront(view) }
                 // Suppression, a route change or stale content hides at once; shows and the linger hide fade.
-                view.setShown(isShown, animated: animated)
+                view.setShown(isShown, duration: presentation.fadeDuration)
                 #if DEBUG
                     if isShown { showCount += 1 }
                 #endif
-            } else if !isShown, !animated {
-                view.setShown(false, animated: false)  // Stops a running fade-out at once.
+            } else if presentation.fadeDuration == nil {
+                view.setShown(isShown, duration: nil)  // Stops a running fade at its information-preserving end state.
             }
             layout()  // A new month can change the width.
             #if DEBUG

@@ -28,6 +28,22 @@ private func scrollDateMovementFixture(
         isScrollAnimating: animating, isApplyingJump: applyingJump)
 }
 
+/// Feeds the same injected-clock movement to controller and platform-session tests.
+@MainActor
+@discardableResult
+private func flickScrollDateLabel(
+    _ controller: TimelineScrollDateLabelController, _ manual: ManualClock, frames: Int = 12,
+    speed: Double = 2_000, from initialOffset: Double = 0
+) -> Double {
+    var offset = initialOffset
+    for _ in 0..<frames {
+        controller.userMoved(offsetY: offset)
+        manual.advance(by: 1 / 120)
+        offset += speed / 120
+    }
+    return offset
+}
+
 /// Behavior of the transient scroll date label: visibility policy, controller lifecycle, month lookup and placement.
 @Suite struct TimelineScrollDateLabelPolicyTests {
     /// Feeds user movement at `speed` points per second for `duration` seconds at `rate` frames per second.
@@ -331,8 +347,10 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         }
     }
 
-    private func makeController(_ manual: ManualClock) -> (TimelineScrollDateLabelController, Recorder) {
-        let controller = TimelineScrollDateLabelController(clock: manual.clock)
+    private func makeController(
+        _ manual: ManualClock, tuning: TimelineScrollDateLabelPolicy.Tuning = .standard
+    ) -> (TimelineScrollDateLabelController, Recorder) {
+        let controller = TimelineScrollDateLabelController(clock: manual.clock, tuning: tuning)
         let recorder = Recorder()
         controller.onChange = { recorder.changes.append($0) }
         controller.setIndex(
@@ -346,21 +364,128 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         var changes: [TimelineScrollDateLabelController.Presentation] = []
     }
 
-    /// Brisk user movement for `frames` frames of 1/120 s at 2,000 pt/s.
-    private func flick(_ controller: TimelineScrollDateLabelController, _ manual: ManualClock, frames: Int = 12) {
-        var offset = 0.0
-        for _ in 0..<frames {
-            controller.userMoved(offsetY: offset)
-            manual.advance(by: 1 / 120)
-            offset += 2_000 / 120
+    @Test func crossingTheShowThresholdSlowlyUsesTheSlowFadeIn() {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        flickScrollDateLabel(controller, manual, frames: 48, speed: 650)
+        #expect(controller.presentation.isVisible, "SETUP: the slow crossing still shows the label")
+        #expect(recorder.changes.first?.fadeDuration == 0.40)
+    }
+
+    @Test func aFastCrossingUsesTheFastFadeIn() {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        flickScrollDateLabel(controller, manual, speed: 2_000)
+        #expect(controller.presentation.isVisible)
+        #expect(recorder.changes.first?.fadeDuration == 0.20)
+    }
+
+    @Test func aSlowStopUsesTheLastSustainingSpeedRatherThanThePeak() async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        let offset = flickScrollDateLabel(controller, manual)
+        flickScrollDateLabel(controller, manual, frames: 60, speed: 80, from: offset)
+        #expect(
+            controller.policy.hideDeadline.map { $0 < manual.now + controller.policy.tuning.linger - 0.1 } == true,
+            "the late slow samples no longer extend the linger")
+        manual.advance(by: 2)
+        await settle { !controller.presentation.isVisible }
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == 0.70)
+    }
+
+    @Test func aFastStopUsesTheFastFadeOut() async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        flickScrollDateLabel(controller, manual)
+        manual.advance(by: 2)
+        await settle { !controller.presentation.isVisible }
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == 0.35)
+    }
+
+    @Test(arguments: [649.999, 650.0, 650.001])
+    func fadeClassificationIncludesTheFastBoundary(speed: Double) async {
+        let manual = ManualClock()
+        var tuning = TimelineScrollDateLabelPolicy.Tuning.standard
+        tuning.smoothing = 0.001  // The one-second sample makes the EMA exactly equal the test speed.
+        let (controller, _) = makeController(manual, tuning: tuning)
+        controller.userMoved(offsetY: 0)
+        manual.advance(by: 1)
+        controller.userMoved(offsetY: speed)
+        #expect(controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == (speed >= tuning.fastFadeSpeed ? 0.20 : 0.40))
+        manual.advance(by: 2)
+        await settle { !controller.presentation.isVisible }
+        #expect(controller.presentation.fadeDuration == (speed >= tuning.fastFadeSpeed ? 0.35 : 0.70))
+    }
+
+    @Test(arguments: [true, false])
+    func fadeInAndFadeOutPairsAreIndependent(editFadeIn: Bool) async {
+        var tuning = TimelineScrollDateLabelPolicy.Tuning.standard
+        if editFadeIn {
+            tuning.fadeIn.slow = 0.81
+            tuning.fadeIn.fast = 0.23
+        } else {
+            tuning.fadeOut.slow = 0.91
+            tuning.fadeOut.fast = 0.46
         }
+        for slow in [true, false] {
+            let manual = ManualClock()
+            let (controller, _) = makeController(manual, tuning: tuning)
+            flickScrollDateLabel(controller, manual, frames: 48, speed: slow ? 650 : 2_000)
+            #expect(controller.presentation.fadeDuration == (editFadeIn ? (slow ? 0.81 : 0.23) : (slow ? 0.40 : 0.20)))
+            manual.advance(by: 2)
+            await settle { !controller.presentation.isVisible }
+            #expect(controller.presentation.fadeDuration == (editFadeIn ? (slow ? 0.70 : 0.35) : (slow ? 0.91 : 0.46)))
+        }
+    }
+
+    @Test func aLongLingerKeepsTheLastSustainingClassEvenWhenLayoutResetsSpeed() async {
+        let manual = ManualClock()
+        var tuning = TimelineScrollDateLabelPolicy.Tuning.standard
+        tuning.linger = 10
+        let (controller, _) = makeController(manual, tuning: tuning)
+        flickScrollDateLabel(controller, manual)
+        controller.viewportMoved(.init(isLayout: true), offsetY: 50_000)
+        manual.advance(by: 9)
+        await settle()
+        #expect(controller.presentation.isVisible)
+        manual.advance(by: 2)
+        await settle { !controller.presentation.isVisible }
+        #expect(
+            controller.presentation.fadeDuration == 0.35, "layout did not replace the last sustaining speed with zero")
+    }
+
+    @Test func reduceMotionKeepsTheInformationAndReturnsNoFadeDuration() {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.reduceMotion = true
+        flickScrollDateLabel(controller, manual, frames: 48, speed: 650)
+        #expect(controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == nil)
+        controller.viewportMoved(scrollDateMovementFixture(host: true, animating: true), offsetY: 50_000)
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == nil)
+    }
+
+    @Test func aMarkedJumpAlwaysUsesTheFastFadeOut() {
+        let manual = ManualClock()
+        var tuning = TimelineScrollDateLabelPolicy.Tuning.standard
+        tuning.fadeOut.fast = 0.27
+        tuning.fadeOut.slow = 0.83
+        let (controller, _) = makeController(manual, tuning: tuning)
+        flickScrollDateLabel(controller, manual, frames: 48, speed: 650)
+        controller.viewportMoved(scrollDateMovementFixture(host: true, animating: true), offsetY: 50_000)
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == 0.27)
     }
 
     @Test(arguments: [false, true])
     func aMarkedJumpEndsTheVisibleLingerAndStartsTheFastFade(system: Bool) async {
         let manual = ManualClock()
         let (controller, recorder) = makeController(manual)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         await settle { manual.waiterCount == 1 }
         #expect(controller.presentation.isVisible, "SETUP: the flick shows the label")
         manual.advance(by: 0.2)
@@ -370,7 +495,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         #expect(controller.policy.hideDeadline == nil)
         #expect(!controller.presentation.isVisible)
         #expect(controller.presentation.text == "January 2026", "the text stays for the fade")
-        #expect(controller.animatesLastChange, "the jump uses the normal fade, not suppression")
+        #expect(controller.presentation.fadeDuration == 0.35, "a marked jump uses the fast fade-out")
         await settle(until: { manual.waiterCount == 0 })
         #expect(manual.waiterCount == 0, "the old linger cannot fire after the jump")
         manual.advance(by: 2)
@@ -392,7 +517,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func userMovementAfterAJumpUsesTheNormalShowThreshold() {
         let manual = ManualClock()
         let (controller, _) = makeController(manual)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         controller.viewportMoved(scrollDateMovementFixture(host: true, animating: true), offsetY: 50_000)
         var offset = 50_000.0
         for _ in 0..<12 {
@@ -418,7 +543,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         ] {
             let manual = ManualClock()
             let (controller, _) = makeController(manual)
-            flick(controller, manual)
+            flickScrollDateLabel(controller, manual)
             let deadline = controller.policy.hideDeadline
             controller.viewportMoved(movement, offsetY: 50_000)
             #expect(controller.presentation.isVisible)
@@ -429,8 +554,11 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func briskScrollShowsTextAndHidesAfterLinger() async {
         let manual = ManualClock()
         let (controller, recorder) = makeController(manual)
-        flick(controller, manual)
-        #expect(controller.presentation == .init(isVisible: true, text: "January 2026"))
+        flickScrollDateLabel(controller, manual)
+        #expect(
+            controller.presentation
+                == .init(isVisible: true, text: "January 2026", fadeDuration: TimelineScrollDateLabelMotion.fadeIn.fast)
+        )
         await settle(until: { manual.waiterCount == 1 })
         #expect(manual.waiterCount == 1)
         manual.advance(by: 1.1)
@@ -445,7 +573,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func anchorUpdatesTheTextOnlyWhenTheMonthChanges() {
         let manual = ManualClock()
         let (controller, recorder) = makeController(manual)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         for anchor in [1, 5, 9] { controller.setAnchor(flatIndex: anchor) }
         #expect(recorder.changes.count == 1, "moving inside January publishes nothing")
         controller.setAnchor(flatIndex: 10)
@@ -456,10 +584,10 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func movementWithinLingerMovesTheDeadlineWithoutANewTask() async {
         let manual = ManualClock()
         let (controller, _) = makeController(manual)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         await settle(until: { manual.waiterCount == 1 })
         manual.advance(by: 0.8)
-        flick(controller, manual, frames: 4)
+        flickScrollDateLabel(controller, manual, frames: 4)
         await settle()
         #expect(controller.presentation.isVisible)
         await settle(until: { manual.waiterCount == 1 })
@@ -475,14 +603,14 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func pinchAndRouteChangeHideAtOnceAndCancelThePendingFade() async {
         let manual = ManualClock()
         let (controller, recorder) = makeController(manual)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         await settle(until: { manual.waiterCount == 1 })
         controller.suppress()
         #expect(!controller.presentation.isVisible)
         await settle(until: { manual.waiterCount == 0 })
         #expect(manual.waiterCount == 0, "the cancelled sleeper is gone")
         controller.resume()
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         #expect(controller.presentation.isVisible)
         #expect(recorder.changes.map(\.isVisible) == [true, false, true])
     }
@@ -490,7 +618,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func retiredHostReceivesNoDelayedCallback() async {
         let manual = ManualClock()
         let (controller, recorder) = makeController(manual)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         await settle(until: { manual.waiterCount == 1 })
         // The host's callback keeps the host alive; retiring must release it.
         final class HostStandIn {}
@@ -508,7 +636,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         #expect(controller.isRetired)
         manual.advance(by: 5)
         await settle()
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         #expect(recorder.changes.map(\.isVisible) == [true])
     }
 
@@ -521,17 +649,17 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         gated.releaseAll()
         await settle(until: { controller.index != nil })
         controller.setAnchor(flatIndex: 0)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         #expect(controller.presentation.isVisible)
         // Another account or filter: the label leaves at once and stays away while the new markers build.
         controller.updateContent(Array(items().reversed()), replacesList: true)
         #expect(controller.presentation == .hidden)
         await settle(until: { gated.waiting == 1 })
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         #expect(!controller.presentation.isVisible, "no markers, no label")
         gated.releaseAll()
         await settle(until: { controller.index != nil })
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         #expect(controller.presentation.isVisible, "the new list's markers show again")
     }
 
@@ -544,12 +672,18 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         gated.releaseAll()
         await settle(until: { controller.index != nil })
         controller.setAnchor(flatIndex: 0)
-        flick(controller, manual)
-        #expect(controller.presentation == .init(isVisible: true, text: "January 2026"))
+        flickScrollDateLabel(controller, manual)
+        #expect(
+            controller.presentation
+                == .init(isVisible: true, text: "January 2026", fadeDuration: TimelineScrollDateLabelMotion.fadeIn.fast)
+        )
         // A library update adds a photo: the label stays while the new markers build.
         controller.updateContent(items() + items().prefix(1), replacesList: false)
         await settle(until: { gated.waiting == 1 })
-        #expect(controller.presentation == .init(isVisible: true, text: "January 2026"))
+        #expect(
+            controller.presentation
+                == .init(isVisible: true, text: "January 2026", fadeDuration: TimelineScrollDateLabelMotion.fadeIn.fast)
+        )
         gated.releaseAll()
         await settle(until: { controller.index?.itemCount == 41 })
         #expect(controller.presentation.isVisible)
@@ -579,22 +713,26 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func suppressionsAndRouteHidesTakeEffectAtOnceWhileTheLingerHideFades() async {
         let manual = ManualClock()
         let (controller, _) = makeController(manual)
-        flick(controller, manual)
-        #expect(controller.presentation.isVisible && controller.animatesLastChange, "a show fades in")
+        flickScrollDateLabel(controller, manual)
+        #expect(controller.presentation.isVisible && controller.presentation.fadeDuration != nil, "a show fades in")
         controller.hide()
-        #expect(!controller.animatesLastChange, "opening a photo hides at once")
-        flick(controller, manual)
+        #expect(controller.presentation.fadeDuration == nil, "opening a photo hides at once")
+        flickScrollDateLabel(controller, manual)
         controller.suppress()
-        #expect(!controller.presentation.isVisible && !controller.animatesLastChange, "a suppression hides at once")
+        #expect(
+            !controller.presentation.isVisible && controller.presentation.fadeDuration == nil,
+            "a suppression hides at once")
         controller.resume()
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         await settle(until: { manual.waiterCount == 1 })
         manual.advance(by: 1.1)
         await settle(until: { !controller.presentation.isVisible })
-        #expect(controller.animatesLastChange, "the hide after the linger time fades")
-        flick(controller, manual)
+        #expect(controller.presentation.fadeDuration != nil, "the hide after the linger time fades")
+        flickScrollDateLabel(controller, manual)
         controller.setIndex(nil)
-        #expect(!controller.presentation.isVisible && !controller.animatesLastChange, "stale content hides at once")
+        #expect(
+            !controller.presentation.isVisible && controller.presentation.fadeDuration == nil,
+            "stale content hides at once")
     }
 
     @Test func aSuppressionDuringTheFadeOutStillReachesTheHostAtOnce() async {
@@ -603,9 +741,9 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         var immediate: [Bool] = []
         controller.onChange = { presentation in
             recorder.changes.append(presentation)
-            immediate.append(!controller.animatesLastChange)
+            immediate.append(controller.presentation.fadeDuration == nil)
         }
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         await settle(until: { manual.waiterCount == 1 })
         manual.advance(by: 1.1)
         await settle(until: { !controller.presentation.isVisible })
@@ -621,7 +759,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func openingAPhotoHidesTheLabelAtOnceAndCancelsItsFade() async {
         let manual = ManualClock()
         let (controller, recorder) = makeController(manual)
-        flick(controller, manual)
+        flickScrollDateLabel(controller, manual)
         await settle(until: { manual.waiterCount == 1 })
         controller.hide()
         #expect(controller.presentation.isVisible == false)
@@ -960,10 +1098,15 @@ private final class GatedBuilder {
             manual.advance(by: 1 / 120)
             offset += 2_000 / 120
         }
-        #expect(controller.presentation == .init(isVisible: true, text: "March 2026"))
+        #expect(
+            controller.presentation
+                == .init(isVisible: true, text: "March 2026", fadeDuration: TimelineScrollDateLabelMotion.fadeIn.fast))
         // A refresh grew the list; its markers are still building, so index 30 lies outside the current ones.
         controller.setAnchor(flatIndex: 30)
-        #expect(controller.presentation == .init(isVisible: true, text: "March 2026"), "no flicker during a refresh")
+        #expect(
+            controller.presentation
+                == .init(isVisible: true, text: "March 2026", fadeDuration: TimelineScrollDateLabelMotion.fadeIn.fast),
+            "no flicker during a refresh")
     }
 }
 

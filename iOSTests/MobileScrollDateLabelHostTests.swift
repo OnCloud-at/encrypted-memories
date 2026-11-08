@@ -188,7 +188,9 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         let controller = grid.scrollDateLabel.controller
         controller.viewportMoved(.init(isHostDriven: true, isJump: true), offsetY: 50_000)
         XCTAssertFalse(controller.presentation.isVisible, "the linger ends in the same pass")
-        XCTAssertTrue(controller.animatesLastChange, "a marked jump uses the normal fade")
+        XCTAssertEqual(
+            controller.presentation.fadeDuration, TimelineScrollDateLabelMotion.fadeOut.fast,
+            "a marked jump uses the fast fade")
         XCTAssertFalse(grid.scrollDateLabel.view.isHidden, "the view remains while the fast fade starts")
 
         grid.scrollDateLabel.setReduceMotion(true)
