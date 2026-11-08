@@ -371,18 +371,23 @@ public final class SmartSearchDiscoveryModel {
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        let effectiveContent = effective(content)
-        return forYou.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
-        }
+        displayable(forYou, content: content, snapshot: snapshot)
     }
 
     public func chips(
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
+        displayable(chips, content: content, snapshot: snapshot)
+    }
+
+    private func displayable(
+        _ rows: [TimelineSearchSuggestion],
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> [TimelineSearchSuggestion] {
         let effectiveContent = effective(content)
-        return chips.filter {
+        return rows.filter {
             Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
         }
     }
@@ -411,10 +416,7 @@ public final class SmartSearchDiscoveryModel {
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        let effectiveContent = effective(content)
-        return candidates.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
-        }
+        displayable(candidates, content: content, snapshot: snapshot)
     }
 
     /// `commitDecision` for the published state of this model.
@@ -461,31 +463,6 @@ public final class SmartSearchDiscoveryModel {
         case .ready: "r"
         default: "-"
         }
-    }
-
-    public func refresh(
-        sections: [TimelineSection],
-        timelineRevision: UInt64,
-        favoriteUIDs: Set<PhotoUID>,
-        coordinates: [PhotoCoordinate],
-        smartSearch: MLSmartSearchController?,
-        includeVisualConcepts: Bool = true
-    ) async {
-        let lifecycle = smartSearch?.lifecycleActor
-        let search: MLSearchConceptDiscovery.Search?
-        if let lifecycle {
-            search = { prompt, limit in
-                try await lifecycle.search(prompt, limit: limit, intent: .automatic).results.map(\.uid)
-            }
-        } else {
-            search = nil
-        }
-        await refresh(
-            sections: sections, timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs,
-            coordinates: coordinates, snapshot: smartSearch?.snapshot,
-            indexedAssetCount: { await lifecycle?.semanticIndexedAssetCount() ?? 0 },
-            search: search, includeVisualConcepts: includeVisualConcepts
-        )
     }
 
     func refresh(
@@ -552,7 +529,7 @@ public final class SmartSearchDiscoveryModel {
                 clearVisualEvidence()
             } else {
                 gatePassed = true
-                let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
+                let key = Self.visualEvidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
                 if gateKey != key, !includeVisualConcepts {
                     // The gate needs inference, which this refresh skips. Fail closed: no previews.
                     gatePassed = false
@@ -632,7 +609,7 @@ public final class SmartSearchDiscoveryModel {
         var visualStagesComplete = gatePassed
         if includeVisualConcepts {
             if gatePassed, covered > 0, let search {
-                let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
+                let key = Self.visualEvidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
                 if conceptKey != key {
                     let sensitive = sensitiveUIDs
                     let evaluation = await MLSearchConceptDiscovery.evaluateWithCompletion(
@@ -752,10 +729,6 @@ public final class SmartSearchDiscoveryModel {
         )
         settledContent = content
         settledGeneration &+= 1
-    }
-
-    private func evidenceKey(timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?) -> String {
-        Self.visualEvidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
     }
 
     static func visualEvidenceKey(

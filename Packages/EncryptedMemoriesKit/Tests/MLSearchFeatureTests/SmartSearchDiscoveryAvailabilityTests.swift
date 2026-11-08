@@ -500,7 +500,9 @@ import TimelineCore
             timelineRevision: revision,
             favoriteUIDs: favorites,
             coordinates: coordinates,
-            smartSearch: nil,
+            snapshot: nil,
+            indexedAssetCount: { 0 },
+            search: nil,
             includeVisualConcepts: includeVisualConcepts
         )
         return Self.content(revision, favorites: favorites)
