@@ -267,29 +267,9 @@ extension DriveSessionStubSuite {
                 session: ProtonSession(uid: "page-fixture", accessToken: "", refreshToken: "", keyPassword: ""),
                 store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
                 accountCacheDirectory: directory, requestGovernor: governor, urlProtocolClasses: protocols)
-            let client = try await EncryptedMemoriesClient(
-                configuration: ProtonDriveClientConfiguration(
-                    baseURL: "https://fixture.invalid/", clientUID: "fixture"),
-                httpClient: SDKHttpClient(
-                    driveSession: session, requestGovernor: governor, urlProtocolClasses: protocols),
-                accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
-                logCallback: { _ in }, featureFlagProviderCallback: { _, completion in completion(false) },
-                recordMetricEventCallback: { _ in })
-            let crypto = DriveCrypto(addressKeys: [], signers: [])
-            let gate = TimelineMetadataStartGate()
-            gate.buildStarted()
-            return DriveSDKBridge(
-                prepared: .init(
-                    photosClient: client, uploadClientUID: "fixture", driveSession: session,
-                    requestGovernor: governor, expensiveUploadAccess: ExpensiveUploadAccess(),
-                    timelineStore: store, timelineOrderStore: nil, firstIndexBuildGate: gate,
-                    metadataReconciliation: TimelineMetadataReconciliation(startGate: gate), crypto: crypto,
-                    photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
-                    recentlyDeletedStore: RecentlyDeletedListingStore(
-                        directory: directory, accountUID: "fixture", keyPassword: ""),
-                    photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
-                    uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
-                    uploadManifestPolicy: .conservative))
+            return try await .testBridge(
+                directory: directory, session: session, governor: governor, protocols: protocols,
+                timelineStore: store, startsFirstBuild: true)
         }
     }
 }

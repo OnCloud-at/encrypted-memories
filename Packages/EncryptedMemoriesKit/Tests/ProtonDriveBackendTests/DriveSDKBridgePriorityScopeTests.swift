@@ -83,28 +83,8 @@ struct DriveSDKBridgePriorityScopeTests {
             session: ProtonSession(uid: "scope-fixture", accessToken: "", refreshToken: "", keyPassword: ""),
             store: SessionKeychainStore(service: "scope-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory, requestGovernor: governor, urlProtocolClasses: [ScopeDenyHTTP.self])
-        let client = try await EncryptedMemoriesClient(
-            configuration: ProtonDriveClientConfiguration(baseURL: "https://fixture.invalid/", clientUID: "fixture"),
-            httpClient: SDKHttpClient(
-                driveSession: session, requestGovernor: governor, urlProtocolClasses: [ScopeDenyHTTP.self]),
-            accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
-            logCallback: { _ in },
-            featureFlagProviderCallback: { _, completion in completion(false) },
-            recordMetricEventCallback: { _ in })
-        let crypto = DriveCrypto(addressKeys: [], signers: [])
-        let gate = TimelineMetadataStartGate()
-        return DriveSDKBridge(
-            prepared: DriveSDKBridge.PreparedSession(
-                photosClient: client, uploadClientUID: "fixture", driveSession: session,
-                requestGovernor: governor, expensiveUploadAccess: ExpensiveUploadAccess(),
-                timelineStore: nil, timelineOrderStore: nil, firstIndexBuildGate: gate,
-                metadataReconciliation: TimelineMetadataReconciliation(startGate: gate), crypto: crypto,
-                photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
-                recentlyDeletedStore: RecentlyDeletedListingStore(
-                    directory: directory, accountUID: "fixture", keyPassword: ""),
-                photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
-                uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
-                uploadManifestPolicy: .conservative))
+        return try await .testBridge(
+            directory: directory, session: session, governor: governor, protocols: [ScopeDenyHTTP.self])
     }
 }
 

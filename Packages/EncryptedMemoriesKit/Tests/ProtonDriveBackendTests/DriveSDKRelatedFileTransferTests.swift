@@ -18,7 +18,8 @@ struct DriveSDKRelatedFileTransferTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let governor = ProtonRequestGovernor()
         let session = makeSession(directory: directory, governor: governor)
-        let client = try await makeSDKClient(session: session, governor: governor)
+        let client = try await EncryptedMemoriesClient.testClient(
+            session: session, governor: governor, protocols: [RelatedFileDenyHTTP.self])
 
         #expect(RelatedFileDenyHTTP.requestCount == 0)
         await client.shutdown()
@@ -683,21 +684,8 @@ struct DriveSDKRelatedFileTransferTests {
     ) async throws -> DriveSDKBridge {
         let governor = ProtonRequestGovernor()
         let session = makeSession(directory: directory, governor: governor)
-        let client = try await makeSDKClient(session: session, governor: governor)
-        let crypto = DriveCrypto(addressKeys: [], signers: [])
-        let gate = TimelineMetadataStartGate()
-        return DriveSDKBridge(
-            prepared: DriveSDKBridge.PreparedSession(
-                photosClient: client, uploadClientUID: "fixture", driveSession: session,
-                requestGovernor: governor, expensiveUploadAccess: ExpensiveUploadAccess(),
-                timelineStore: nil, timelineOrderStore: nil, firstIndexBuildGate: gate,
-                metadataReconciliation: TimelineMetadataReconciliation(startGate: gate), crypto: crypto,
-                photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
-                recentlyDeletedStore: RecentlyDeletedListingStore(
-                    directory: directory, accountUID: "fixture", keyPassword: ""),
-                photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
-                uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
-                uploadManifestPolicy: .conservative),
+        return try await .testBridge(
+            directory: directory, session: session, governor: governor, protocols: [RelatedFileDenyHTTP.self],
             relatedFileOperations: operations)
     }
 
@@ -709,19 +697,6 @@ struct DriveSDKRelatedFileTransferTests {
             accountCacheDirectory: directory,
             requestGovernor: governor,
             urlProtocolClasses: [RelatedFileDenyHTTP.self])
-    }
-
-    private func makeSDKClient(
-        session: DriveSession, governor: ProtonRequestGovernor
-    ) async throws -> EncryptedMemoriesClient {
-        try await EncryptedMemoriesClient(
-            configuration: ProtonDriveClientConfiguration(baseURL: "https://fixture.invalid/", clientUID: "fixture"),
-            httpClient: SDKHttpClient(
-                driveSession: session, requestGovernor: governor, urlProtocolClasses: [RelatedFileDenyHTTP.self]),
-            accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
-            logCallback: { _ in },
-            featureFlagProviderCallback: { _, completion in completion(false) },
-            recordMetricEventCallback: { _ in })
     }
 }
 
