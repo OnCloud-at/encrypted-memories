@@ -564,6 +564,50 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         sqlite3_finalize(stmt)
     }
 
+    func testTheChangeTokenChangesWithEveryWriteOfAnyConnection() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let first = try XCTUnwrap(store.changeToken())
+        XCTAssertEqual(store.changeToken(), first, "reads do not change the token")
+        _ = store.summary()
+        XCTAssertEqual(store.changeToken(), first)
+
+        XCTAssertTrue(
+            store.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source("own"), revision: revision(1), originalFilename: "own.heic", updatedAt: Date())))
+        var afterOwnWrite = try XCTUnwrap(store.changeToken())
+        XCTAssertNotEqual(afterOwnWrite, first, "a write of this connection changes the token")
+        for state in [UploadBackupSyncQueueState.checking, .completed] {
+            XCTAssertTrue(
+                store.updateState(
+                    source: source("own"), revision: revision(1), state: state, attempts: nil, lastError: nil,
+                    updatedAt: Date()))
+            let afterUpdate = try XCTUnwrap(store.changeToken())
+            XCTAssertNotEqual(afterUpdate, afterOwnWrite, "a state update changes the token: \(state)")
+            afterOwnWrite = afterUpdate
+        }
+        // The same row again takes the ON CONFLICT DO UPDATE path of the upsert.
+        XCTAssertTrue(
+            store.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source("own"), revision: revision(1), originalFilename: "renamed.heic",
+                    state: .completed, updatedAt: Date())))
+        XCTAssertNotEqual(store.changeToken(), afterOwnWrite, "an upsert that updates a row changes the token")
+        afterOwnWrite = try XCTUnwrap(store.changeToken())
+
+        let other = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        XCTAssertTrue(
+            other.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source("other"), revision: revision(1), originalFilename: "other.heic", updatedAt: Date())))
+        other.close()
+        XCTAssertNotEqual(store.changeToken(), afterOwnWrite, "a commit of another connection changes the token")
+
+        store.close()
+        XCTAssertNil(store.changeToken(), "a closed store has no token")
+    }
+
     func testTwentyThousandQueueBatchStructuralSmoke() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))

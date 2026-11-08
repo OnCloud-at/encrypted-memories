@@ -44,6 +44,46 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
                 as? SQLiteStoreConnection)
     }
 
+    /// A queue with a row in a state this build does not know, and a second row whose read fails for a moment.
+    private func makeUnknownStateQueue() throws -> SQLiteReadInterrupt {
+        store = try makeStore(file: "unknown-state.sqlite")
+        XCTAssertTrue(store!.upsert(entry("unknown")))
+        XCTAssertTrue(store!.upsert(entry("known")))
+        var handle: OpaquePointer?
+        let url = tempDir.appendingPathComponent("unknown-state.sqlite")
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        // Groups come in key order, so the unknown state is the first row of the count.
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle, "UPDATE backup_sync_queue SET state='aaaFutureState' WHERE source_id='unknown';", nil, nil, nil),
+            SQLITE_OK)
+        sqlite3_close(handle)
+        // A temporary failure behind the unknown state: the interrupt armed by the second row also ends the step that
+        // returns it, so only the unknown row comes back before it.
+        return try SQLiteReadInterrupt(in: store!, matching: "GROUP BY state, source_kind", afterRows: 2)
+    }
+
+    func testAnUnknownStateBeforeATemporaryStepFailureStaysALastingFailure() throws {
+        let fault = try makeUnknownStateQueue()
+        XCTAssertNil(store!.summary(), "an unknown state is unknown")
+        fault.stop()
+        XCTAssertEqual(fault.tracedRows, 1, "the read stops at the unknown row")
+        XCTAssertFalse(store!.isOperational(), "the unknown state stays a lasting failure, not the temporary one")
+        store!.close()
+    }
+
+    func testQueueCountsStopAtAnUnknownStateWithoutRecordingAFailure() throws {
+        let fault = try makeUnknownStateQueue()
+        let failureCount = store!.recordedFailureCount()
+        XCTAssertNil(store!.queueCounts(), "an unknown state gives no counts")
+        fault.stop()
+        XCTAssertEqual(fault.tracedRows, 1, "the read stops at the unknown row")
+        XCTAssertFalse(fault.fired, "the counts stop at the unknown row and read no further")
+        XCTAssertEqual(store!.recordedFailureCount(), failureCount, "counts for the log never record a failure")
+        XCTAssertTrue(store!.isOperational(), "counts for the log leave the store operational")
+        store!.close()
+    }
+
     func testEveryOptionalReaderReportsItsOwnFailedStatementAsUnknown() throws {
         let source = entry("known").source
         let readers: [(String, (UploadBackupSyncQueueManifestStore) -> Bool)] = [

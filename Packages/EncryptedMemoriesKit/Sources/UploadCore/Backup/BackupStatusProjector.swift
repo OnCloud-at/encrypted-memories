@@ -88,6 +88,8 @@ public actor BackupStatusProjector {
     private var latestRunnerProgress: BackupSyncProgress?
     private var lastRawPhase: BackupStatus.Phase?
     private var lastPublishedAt = Date.distantPast
+    /// The last queue summary and the change token read before it. A runner tick whose token is unchanged reuses it.
+    private var cachedSummary: (token: UploadBackupSyncQueueChangeToken, summary: UploadBackupSyncQueueSummary)?
     private var speedEstimator = BackupUploadSpeedEstimator()
     private var lastConsumedSequence: UInt64 = 0
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
@@ -182,6 +184,7 @@ public actor BackupStatusProjector {
         latestRunnerProgress = nil
         lastRawPhase = nil
         lastPublishedAt = .distantPast
+        cachedSummary = nil
         speedEstimator.reset()
 
         let stream = self.stream
@@ -296,7 +299,7 @@ public actor BackupStatusProjector {
         if phaseChanged || issueChanged || drained || terminal {
             delayedPublicationTask?.cancel()
             delayedPublicationTask = nil
-            _ = await publishNow()
+            _ = await publishNow(reusingUnchangedSummary: true)
         } else {
             scheduleCoalescedPublication()
         }
@@ -317,12 +320,26 @@ public actor BackupStatusProjector {
 
     private func flushCoalescedPublication() async {
         delayedPublicationTask = nil
-        _ = await publishNow()
+        _ = await publishNow(reusingUnchangedSummary: true)
     }
 
-    private func publishNow() async -> BackupStatusProjection? {
+    /// Runner ticks reuse the last summary while the queue is unchanged; the start and an explicit projection always
+    /// read the queue.
+    private func publishNow(reusingUnchangedSummary: Bool = false) async -> BackupStatusProjection? {
         guard queue.isOperational() else { return nil }
-        guard let summary = queue.summary() else { return nil }
+        // Read before the summary: a write between the two then changes the token, and the next tick reads again.
+        let token = queue.changeToken()
+        let summary: UploadBackupSyncQueueSummary
+        if reusingUnchangedSummary, let token, let cached = cachedSummary, cached.token == token {
+            summary = cached.summary
+        } else {
+            guard let read = queue.summary() else {
+                cachedSummary = nil
+                return nil
+            }
+            summary = read
+            cachedSummary = token.map { ($0, read) }
+        }
         guard queue.isOperational() else { return nil }
 
         var progress = latestRunnerProgress ?? BackupSyncProgress()
