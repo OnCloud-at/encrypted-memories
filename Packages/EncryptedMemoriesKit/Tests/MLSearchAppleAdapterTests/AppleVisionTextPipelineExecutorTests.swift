@@ -10,6 +10,24 @@ import Vision
 @testable import MLSearchAppleAdapter
 
 @Suite struct AppleVisionPipelineExecutorTests {
+    @Test func failureMappingPreservesTextCancellation() {
+        struct OtherError: Error {}
+        let cases: [(any Error, AppleVisionPipelineExecutor.ArtifactAnalysisResult)] = [
+            (CancellationError(), .retryableFailure(.analysisFailed)),
+            (AppleVisionComputePolicy.UnavailableInBackground(), .suspended),
+            (MLAnalysisContractError.nativeKindMismatch, .permanentFailure(.invalidArtifactContract)),
+            (OtherError(), .retryableFailure(.analysisFailed)),
+            (AppleVisionExecutorError.unsupportedRevision, .retryableFailure(.analysisFailed)),
+        ]
+        for (error, expected) in cases {
+            #expect(AppleVisionPipelineExecutor.failureResult(for: error) == expected)
+        }
+        #expect(AppleVisionPipelineExecutor.textPathFailureResult(for: CancellationError()) == nil)
+        #expect(
+            AppleVisionPipelineExecutor.textPathFailureResult(for: AppleVisionExecutorError.unsupportedRevision)
+                == .retryableFailure(.analysisFailed))
+    }
+
     @Test func backgroundDevicePolicyUsesOnlySupportedCPUStages() throws {
         let request = DetectTextRectanglesRequest()
         let stages = request.supportedComputeStageDevices

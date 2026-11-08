@@ -210,14 +210,9 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                         } else {
                             results[.documentRecognition] = .completedEmpty
                         }
-                    } catch is CancellationError {
-                        return [:]
-                    } catch is AppleVisionComputePolicy.UnavailableInBackground {
-                        results[.documentRecognition] = .suspended
-                    } catch is MLAnalysisContractError {
-                        results[.documentRecognition] = .permanentFailure(.invalidArtifactContract)
                     } catch {
-                        results[.documentRecognition] = .retryableFailure(.analysisFailed)
+                        guard let failure = textPathFailureResult(for: error) else { return [:] }
+                        results[.documentRecognition] = failure
                     }
                 } else {
                     results[.documentRecognition] = .unsupported
@@ -236,14 +231,9 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                 results[.barcodeDetection] =
                     outputs[.barcodeDetection]
                     .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
-            } catch is CancellationError {
-                return [:]
-            } catch is AppleVisionComputePolicy.UnavailableInBackground {
-                results[.barcodeDetection] = .suspended
-            } catch is MLAnalysisContractError {
-                results[.barcodeDetection] = .permanentFailure(.invalidArtifactContract)
             } catch {
-                results[.barcodeDetection] = .retryableFailure(.analysisFailed)
+                guard let failure = textPathFailureResult(for: error) else { return [:] }
+                results[.barcodeDetection] = failure
             }
         }
 
@@ -264,14 +254,9 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                     results[.textRecognition] =
                         outputs[.textRecognition]
                         .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
-                } catch is CancellationError {
-                    return [:]
-                } catch is AppleVisionComputePolicy.UnavailableInBackground {
-                    results[.textRecognition] = .suspended
-                } catch is MLAnalysisContractError {
-                    results[.textRecognition] = .permanentFailure(.invalidArtifactContract)
                 } catch {
-                    results[.textRecognition] = .retryableFailure(.analysisFailed)
+                    guard let failure = textPathFailureResult(for: error) else { return [:] }
+                    results[.textRecognition] = failure
                 }
             }
         }
@@ -323,25 +308,12 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         var outputs: [MLNativeAnalysisKind: MLDerivedPipelineOutput] = [:]
         if let context = contexts[.textRecognition] {
             let observations = textObservations.compactMap { observation -> MLTextObservation? in
-                guard let candidate = observation.topCandidates(1).first,
-                    !candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                    let bounds = normalizedRect(points: [
-                        observation.topLeft, observation.topRight,
-                        observation.bottomRight, observation.bottomLeft,
-                    ])
-                else { return nil }
-                let languages: [String]
-                if #available(macOS 26.0, iOS 26.0, *) {
-                    languages = observation.recognitionLanguages.map(\.minimalIdentifier)
-                } else {
-                    languages = []
+                textObservation(observation) {
+                    if #available(macOS 26.0, iOS 26.0, *) {
+                        return observation.recognitionLanguages.map(\.minimalIdentifier)
+                    }
+                    return []
                 }
-                return MLTextObservation(
-                    text: candidate.string,
-                    languages: languages,
-                    confidence: candidate.confidence,
-                    bounds: bounds
-                )
             }
             if !observations.isEmpty {
                 let artifact = try MLRecognizedTextArtifact(context: context, observations: observations)
@@ -352,20 +324,7 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
             }
         }
         if let context = contexts[.barcodeDetection] {
-            let observations = barcodeObservations.compactMap { observation -> MLBarcodeObservation? in
-                guard let payload = observation.payloadString, !payload.isEmpty,
-                    let bounds = normalizedRect(points: [
-                        observation.topLeft, observation.topRight,
-                        observation.bottomRight, observation.bottomLeft,
-                    ])
-                else { return nil }
-                return MLBarcodeObservation(
-                    payload: payload,
-                    symbology: String(describing: observation.symbology),
-                    confidence: observation.confidence,
-                    bounds: bounds
-                )
-            }
+            let observations = barcodeObservations.compactMap { barcodeObservation($0) }
             if !observations.isEmpty {
                 let artifact = try MLBarcodeArtifact(context: context, observations: observations)
                 outputs[.barcodeDetection] = try encodedOutput(
@@ -407,7 +366,9 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
             return nil
         }
         let languages = textOptions.recognitionLanguages.map(\.minimalIdentifier)
-        let text = document.text.lines.compactMap(textObservation)
+        let text = document.text.lines.compactMap { observation in
+            textObservation(observation) { observation.recognitionLanguages.map(\.minimalIdentifier) }
+        }
         let barcodes = includeBarcodes ? documentBarcodes(in: document) : []
         let regions = documentRegions(in: document)
         guard !text.isEmpty || !barcodes.isEmpty || !regions.isEmpty else { return nil }
@@ -523,8 +484,11 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         )
     }
 
-    @available(macOS 26.0, iOS 26.0, *)
-    private static func textObservation(_ observation: RecognizedTextObservation) -> MLTextObservation? {
+    @available(macOS 15.0, iOS 18.0, *)
+    private static func textObservation(
+        _ observation: RecognizedTextObservation,
+        languages: () -> [String]
+    ) -> MLTextObservation? {
         guard let candidate = observation.topCandidates(1).first,
             !candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             let bounds = normalizedRect(points: [
@@ -534,8 +498,28 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         else { return nil }
         return MLTextObservation(
             text: candidate.string,
-            languages: observation.recognitionLanguages.map(\.minimalIdentifier),
+            languages: languages(),
             confidence: candidate.confidence,
+            bounds: bounds
+        )
+    }
+
+    @available(macOS 15.0, iOS 18.0, *)
+    private static func barcodeObservation(
+        _ observation: BarcodeObservation,
+        include: (String, MLNormalizedRect) -> Bool = { _, _ in true }
+    ) -> MLBarcodeObservation? {
+        guard let payload = observation.payloadString, !payload.isEmpty,
+            let bounds = normalizedRect(points: [
+                observation.topLeft, observation.topRight,
+                observation.bottomRight, observation.bottomLeft,
+            ])
+        else { return nil }
+        guard include(payload, bounds) else { return nil }
+        return MLBarcodeObservation(
+            payload: payload,
+            symbology: String(describing: observation.symbology),
+            confidence: observation.confidence,
             bounds: bounds
         )
     }
@@ -558,21 +542,16 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         // The root container reports the document's machine-readable codes. Nested content is not
         // a safely traversable tree and may lead back into containers already visited by Vision.
         for observation in document.barcodes {
-            guard let payload = observation.payloadString, !payload.isEmpty,
-                let bounds = normalizedRect(points: [
-                    observation.topLeft, observation.topRight,
-                    observation.bottomRight, observation.bottomLeft,
-                ])
+            guard
+                let barcode = barcodeObservation(
+                    observation,
+                    include: { payload, bounds in
+                        let key =
+                            "\(observation.symbology):\(payload):\(bounds.x):\(bounds.y):\(bounds.width):\(bounds.height)"
+                        return seen.insert(key).inserted
+                    })
             else { continue }
-            let key = "\(observation.symbology):\(payload):\(bounds.x):\(bounds.y):\(bounds.width):\(bounds.height)"
-            guard seen.insert(key).inserted else { continue }
-            result.append(
-                MLBarcodeObservation(
-                    payload: payload,
-                    symbology: String(describing: observation.symbology),
-                    confidence: observation.confidence,
-                    bounds: bounds
-                ))
+            result.append(barcode)
         }
         return result
     }
@@ -623,6 +602,21 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
 }
 
 @available(macOS 15.0, iOS 18.0, *)
+extension AppleVisionPipelineExecutor {
+    static func failureResult(for error: any Error) -> ArtifactAnalysisResult {
+        switch error {
+        case is AppleVisionComputePolicy.UnavailableInBackground: .suspended
+        case is MLAnalysisContractError: .permanentFailure(.invalidArtifactContract)
+        default: .retryableFailure(.analysisFailed)
+        }
+    }
+
+    static func textPathFailureResult(for error: any Error) -> ArtifactAnalysisResult? {
+        guard !(error is CancellationError) else { return nil }
+        return failureResult(for: error)
+    }
+}
+
 private extension AppleVisionPipelineExecutor {
     static func selectedRevision<Revision>(
         _ identifier: String,
@@ -722,23 +716,9 @@ private extension AppleVisionPipelineExecutor {
                 )
             }
             return results
-        } catch is CancellationError {
-            return Dictionary(
-                uniqueKeysWithValues: contexts.keys.map {
-                    ($0, .retryableFailure(.analysisFailed))
-                })
-        } catch is AppleVisionComputePolicy.UnavailableInBackground {
-            return Dictionary(uniqueKeysWithValues: contexts.keys.map { ($0, .suspended) })
-        } catch is MLAnalysisContractError {
-            return Dictionary(
-                uniqueKeysWithValues: contexts.keys.map {
-                    ($0, .permanentFailure(.invalidArtifactContract))
-                })
         } catch {
-            return Dictionary(
-                uniqueKeysWithValues: contexts.keys.map {
-                    ($0, .retryableFailure(.analysisFailed))
-                })
+            let failure = failureResult(for: error)
+            return Dictionary(uniqueKeysWithValues: contexts.keys.map { ($0, failure) })
         }
     }
 
@@ -747,27 +727,17 @@ private extension AppleVisionPipelineExecutor {
         context: MLNativeResultContext,
         handler: ImageRequestHandler
     ) async -> ArtifactAnalysisResult {
-        guard
-            let revision = selectedRevision(
-                context.requestRevision,
-                from: DetectFaceLandmarksRequest.supportedRevisions
-            )
-        else { return .unsupported }
-        do {
-            var request = DetectFaceLandmarksRequest(revision)
-            request.inputFaceObservations = faces
-            let observations = try await handler.perform(AppleVisionComputePolicy.prepare(request))
-            return try faceLandmarksOutput(observations, context: context)
-                .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
-        } catch is CancellationError {
-            return .retryableFailure(.analysisFailed)
-        } catch is AppleVisionComputePolicy.UnavailableInBackground {
-            return .suspended
-        } catch is MLAnalysisContractError {
-            return .permanentFailure(.invalidArtifactContract)
-        } catch {
-            return .retryableFailure(.analysisFailed)
-        }
+        await perform(
+            context: context,
+            revisions: DetectFaceLandmarksRequest.supportedRevisions,
+            handler: handler,
+            request: { revision in
+                var request = DetectFaceLandmarksRequest(revision)
+                request.inputFaceObservations = faces
+                return request
+            },
+            transform: faceLandmarksOutput
+        )
     }
 
     static func performFaceQuality(
@@ -775,27 +745,17 @@ private extension AppleVisionPipelineExecutor {
         context: MLNativeResultContext,
         handler: ImageRequestHandler
     ) async -> ArtifactAnalysisResult {
-        guard
-            let revision = selectedRevision(
-                context.requestRevision,
-                from: DetectFaceCaptureQualityRequest.supportedRevisions
-            )
-        else { return .unsupported }
-        do {
-            var request = DetectFaceCaptureQualityRequest(revision)
-            request.inputFaceObservations = faces
-            let observations = try await handler.perform(AppleVisionComputePolicy.prepare(request))
-            return try faceQualityOutput(observations, context: context)
-                .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
-        } catch is CancellationError {
-            return .retryableFailure(.analysisFailed)
-        } catch is AppleVisionComputePolicy.UnavailableInBackground {
-            return .suspended
-        } catch is MLAnalysisContractError {
-            return .permanentFailure(.invalidArtifactContract)
-        } catch {
-            return .retryableFailure(.analysisFailed)
-        }
+        await perform(
+            context: context,
+            revisions: DetectFaceCaptureQualityRequest.supportedRevisions,
+            handler: handler,
+            request: { revision in
+                var request = DetectFaceCaptureQualityRequest(revision)
+                request.inputFaceObservations = faces
+                return request
+            },
+            transform: faceQualityOutput
+        )
     }
 
     static func analyze(
@@ -1016,14 +976,8 @@ private extension AppleVisionPipelineExecutor {
             let observation = try await handler.perform(AppleVisionComputePolicy.prepare(request(revision)))
             guard let output = try transform(observation, context) else { return .completedEmpty }
             return .completed(output)
-        } catch is CancellationError {
-            return .retryableFailure(.analysisFailed)
-        } catch is AppleVisionComputePolicy.UnavailableInBackground {
-            return .suspended
-        } catch is MLAnalysisContractError {
-            return .permanentFailure(.invalidArtifactContract)
         } catch {
-            return .retryableFailure(.analysisFailed)
+            return failureResult(for: error)
         }
     }
 
@@ -1622,9 +1576,6 @@ private extension AppleVisionPipelineExecutor {
     }
 }
 
-/// Source-compatible name for callers compiled before the executor grew beyond OCR/document work.
-/// There remains exactly one actor, scheduler path, decode, and persistence pipeline.
-
-private enum AppleVisionExecutorError: Error {
+enum AppleVisionExecutorError: Error {
     case unsupportedRevision
 }
