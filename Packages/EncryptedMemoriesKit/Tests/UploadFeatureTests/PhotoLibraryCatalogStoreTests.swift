@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import SQLite3
 import XCTest
 
@@ -349,6 +350,44 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
 
         let reopened = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
         XCTAssertTrue(reopened.hasCompletedFullScan())
+    }
+
+    /// A write whose transaction cannot begin runs none of its statements, so nothing is written outside a transaction.
+    func testAWriteWhoseTransactionCannotBeginWritesNothing() throws {
+        let store = try makeStore()
+        let connection = try storeConnection(store)
+        // A transaction that is already open on the store's own connection makes `BEGIN IMMEDIATE` fail.
+        XCTAssertEqual(connection.withLock { sqlite3_exec(connection.database, "BEGIN;", nil, nil, nil) }, SQLITE_OK)
+        defer { connection.withLock { _ = sqlite3_exec(connection.database, "ROLLBACK;", nil, nil, nil) } }
+
+        XCTAssertFalse(store.upsertBatch([entry(from: photoInfo(id: "a"), at: 100)]))
+
+        let rows = connection.withLock { () -> Int32 in
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            let sql = "SELECT COUNT(*) FROM photo_catalog;"
+            guard sqlite3_prepare_v2(connection.database, sql, -1, &statement, nil) == SQLITE_OK,
+                sqlite3_step(statement) == SQLITE_ROW
+            else { return -1 }
+            return sqlite3_column_int(statement, 0)
+        }
+        XCTAssertEqual(rows, 0, "no row was written, not even inside the open transaction")
+    }
+
+    /// Clearing an epoch, for example after a restart of the scan, leaves the owed full scan owed; only the end of a
+    /// scan marks it complete.
+    func testClearingTheResumePointKeepsTheFullScanOwedAndRemovesTheEpoch() throws {
+        let store = try makeStore()
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["a", "b"]))
+        XCTAssertTrue(store.finishFullScanSnapshot())
+        XCTAssertNotNil(try store.fullScanProgress())
+
+        XCTAssertTrue(store.clearFullScanResumePoint())
+
+        XCTAssertFalse(store.hasCompletedFullScan(), "clearing an epoch never marks the full scan complete")
+        XCTAssertNil(try store.fullScanProgress())
+        XCTAssertEqual(store.fullScanSnapshotCount(), 0)
     }
 
     func testFullScanSnapshotRoundTripsInStableOrder() throws {
