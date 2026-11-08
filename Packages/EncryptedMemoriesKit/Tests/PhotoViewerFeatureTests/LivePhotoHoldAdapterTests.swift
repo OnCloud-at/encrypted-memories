@@ -11,6 +11,10 @@
         func testPhotoInstallsDirectTouchPressWithoutDelayingPointerEvents() throws {
             let (host, _, press) = try makePhotoHost()
             defer { withExtendedLifetime(host) {} }
+            XCTAssertTrue(press.gestureRecognizerShouldBegin(press))
+            let (stillHost, _, stillPress) = try makePhotoHost(onStart: nil, onStop: nil)
+            defer { withExtendedLifetime(stillHost) {} }
+            XCTAssertFalse(stillPress.isEnabled)
             XCTAssertEqual(press.allowedTouchTypes, .direct)
             XCTAssertEqual(press.buttonMask, 0)
             XCTAssertEqual(press.numberOfTouchesRequired, 1)
@@ -136,11 +140,26 @@
             XCTAssertFalse(analysis.transcript.isEmpty)
             var calls: [String] = []
             let (host, scroll, press) = try makePhotoHost(
-                onStart: { calls.append("start") }, onStop: { calls.append("stop") }, analysis: analysis)
+                onStart: { calls.append("start") }, onStop: { calls.append("stop") }, analysis: analysis, image: image)
             defer { withExtendedLifetime(host) {} }
             let overlay = try XCTUnwrap(
                 scroll.documentView?.subviews.compactMap { $0 as? ImageAnalysisOverlayView }.first)
             let delegate = try XCTUnwrap(overlay.delegate)
+            let imageView = try XCTUnwrap(scroll.documentView)
+            var recognizedPoint: NSPoint?
+            for y in stride(from: CGFloat(0), to: overlay.bounds.height, by: 8) {
+                for x in stride(from: CGFloat(0), to: overlay.bounds.width, by: 8) {
+                    let point = NSPoint(x: x, y: y)
+                    if overlay.analysisHasText(at: point) {
+                        recognizedPoint = point
+                        break
+                    }
+                }
+                if recognizedPoint != nil { break }
+            }
+            let textPoint = try XCTUnwrap(recognizedPoint, "The displayed analysis must expose a text hit")
+            XCTAssertTrue(press.textOwnsPoint(imageView.convert(textPoint, from: overlay)))
+            XCTAssertFalse(press.textOwnsPoint(.zero))
             let event = try XCTUnwrap(
                 NSEvent.mouseEvent(
                     with: .rightMouseDown, location: .zero, modifierFlags: [], timestamp: 0,
@@ -223,12 +242,13 @@
         }
 
         private func makePhotoHost(
-            onStart: @escaping () -> Void = {}, onStop: @escaping () -> Void = {}, analysis: ImageAnalysis? = nil
+            onStart: (() -> Void)? = {}, onStop: (() -> Void)? = {}, analysis: ImageAnalysis? = nil,
+            image: NSImage? = nil
         ) throws -> (NSHostingView<AnyView>, ZoomScrollView, AppKitLivePhotoHoldAdapter) {
             let host = NSHostingView(
                 rootView: AnyView(
                     ZoomableImageView(
-                        image: NSImage(size: NSSize(width: 40, height: 40)), itemIdentity: "first",
+                        image: image ?? NSImage(size: NSSize(width: 40, height: 40)), itemIdentity: "first",
                         onMotionStart: onStart, onMotionStop: onStop, liveTextAnalysis: analysis)))
             host.frame = NSRect(x: 0, y: 0, width: 400, height: 400)
             host.layoutSubtreeIfNeeded()
