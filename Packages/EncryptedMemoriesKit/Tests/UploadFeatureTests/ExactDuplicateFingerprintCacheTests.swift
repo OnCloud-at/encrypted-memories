@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import SQLite3
+import UploadTestSupport
 import XCTest
 
 @testable import UploadCore
@@ -90,7 +91,7 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
             UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
         }
         XCTAssertTrue(
-            manifest.replaceRemoteContentIndex(
+            manifest.seedRemoteContentIndex(
                 records, unresolvedIssues: [], hashKeyEpoch: epoch,
                 checkpoint: .init(eventID: eventID, refreshedAt: Date())))
     }

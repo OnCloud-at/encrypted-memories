@@ -792,21 +792,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
             }
-            let statements = ["DELETE FROM remote_content_index WHERE key_epoch=?;"]
-            var ok = true
-            for sql in statements where ok {
-                var stmt: OpaquePointer?
-                ok = sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK
-                if ok {
-                    do {
-                        try connection.bindText(stmt, 1, hashKeyEpoch)
-                        ok = sqlite3_step(stmt) == SQLITE_DONE
-                    } catch {
-                        ok = false
-                    }
-                }
-                sqlite3_finalize(stmt)
-            }
+            var ok = executeBoundLocked("DELETE FROM remote_content_index WHERE key_epoch=?;", value: hashKeyEpoch)
             if ok {
                 let stagedIssues = readBuildRemoteIssuesLocked(hashKeyEpoch: hashKeyEpoch)
                 ok =
@@ -844,81 +830,6 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             guard clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch),
                 sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
             else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
-        }
-    }
-
-    @discardableResult
-    public func replaceRemoteContentIndex(
-        _ records: [UploadRemoteContentIndexRecord],
-        remoteAssetRecords: [UploadRemoteAssetIndexRecord] = [],
-        unresolvedIssues: [UploadRemoteContentIndexIssue],
-        hashKeyEpoch: String,
-        checkpoint: UploadRemoteContentIndexCheckpoint
-    ) -> Bool {
-        guard records.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch }),
-            remoteAssetRecords.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch })
-        else { return false }
-        return connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            var deleteStmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM remote_content_index WHERE key_epoch=?;",
-                    -1, &deleteStmt, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            do {
-                try connection.bindText(deleteStmt, 1, hashKeyEpoch)
-            } catch {
-                sqlite3_finalize(deleteStmt)
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            let didDelete = sqlite3_step(deleteStmt) == SQLITE_DONE
-            sqlite3_finalize(deleteStmt)
-
-            var deleteUnresolved: OpaquePointer?
-            guard didDelete,
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM remote_content_unresolved WHERE key_epoch=?;",
-                    -1, &deleteUnresolved, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            do {
-                try connection.bindText(deleteUnresolved, 1, hashKeyEpoch)
-            } catch {
-                sqlite3_finalize(deleteUnresolved)
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            let didDeleteUnresolved = sqlite3_step(deleteUnresolved) == SQLITE_DONE
-            sqlite3_finalize(deleteUnresolved)
-
-            let didWrite =
-                didDeleteUnresolved
-                && clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch)
-                && deleteRemoteAssetEpochLocked(hashKeyEpoch: hashKeyEpoch)
-                && writeRemoteContentRecordsLocked(records)
-                && writeRemoteAssetRecordsLocked(remoteAssetRecords)
-                && writeUnresolvedRemoteIssuesLocked(
-                    unresolvedIssues,
-                    hashKeyEpoch: hashKeyEpoch
-                )
-                && writeRemoteContentCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
-                && writeRemoteAssetCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
-            guard didWrite, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
             }
@@ -1136,23 +1047,9 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
     private func deleteRemoteAssetEpochLocked(hashKeyEpoch: String) -> Bool {
         for table in ["remote_asset_index_link", "remote_asset_index", "remote_asset_index_checkpoint"] {
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM \(table) WHERE key_epoch=?;",
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { return false }
-            do {
-                try connection.bindText(stmt, 1, hashKeyEpoch)
-            } catch {
-                sqlite3_finalize(stmt)
+            guard executeBoundLocked("DELETE FROM \(table) WHERE key_epoch=?;", value: hashKeyEpoch) else {
                 return false
             }
-            let succeeded = sqlite3_step(stmt) == SQLITE_DONE
-            sqlite3_finalize(stmt)
-            guard succeeded else { return false }
         }
         return true
     }

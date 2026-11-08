@@ -6,6 +6,7 @@ import ProtonCoreCryptoPatchedGoImplementation
 import ProtonDriveSDK
 import SQLite3
 import Testing
+import UploadTestSupport
 
 @testable import PhotosCore
 @testable import ProtonDriveBackend
@@ -170,7 +171,7 @@ extension DriveSessionStubSuite {
                             lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []) == false)
                 }
                 #expect(
-                    content.replaceRemoteContentIndex(
+                    content.seedRemoteContentIndex(
                         [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                         unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
                 routeEmptyEvents(from: "one", to: "two")
@@ -217,7 +218,7 @@ extension DriveSessionStubSuite {
                     #expect(!lineage.acceptsWrites)
                 }
                 #expect(
-                    content.replaceRemoteContentIndex(
+                    content.seedRemoteContentIndex(
                         [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                         unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
                 StubURLProtocol.reset()
@@ -256,7 +257,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -302,7 +303,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -375,7 +376,7 @@ extension DriveSessionStubSuite {
             let lineage = try #require(
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             let gate = TimelineMetadataStartGate(startLimit: .seconds(60), limit: .seconds(60), sleep: Self.neverFires)
@@ -565,7 +566,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -632,7 +633,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -669,7 +670,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -791,7 +792,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -878,7 +879,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -960,7 +961,7 @@ extension DriveSessionStubSuite {
             let lineage = try #require(UploadRemoteLineageIndexStore(url: url))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
@@ -1009,7 +1010,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
@@ -1048,7 +1049,7 @@ extension DriveSessionStubSuite {
             let lineage = try #require(
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
@@ -1371,7 +1372,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
@@ -1439,7 +1440,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
                 lineage.replaceRows(
@@ -1499,7 +1500,7 @@ extension DriveSessionStubSuite {
             defer { lineage.close() }
             let keys = try LineageKeys()
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
                 lineage.replaceRows(
@@ -1535,7 +1536,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
                 lineage.replaceRows(
@@ -1568,7 +1569,7 @@ extension DriveSessionStubSuite {
                 UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
             defer { content.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
             routeEmptyEvents(from: "one", to: "two")
@@ -1598,7 +1599,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
                 lineage.replaceRows(
@@ -1642,7 +1643,7 @@ extension DriveSessionStubSuite {
                 externalIdentity: identity, resourceCount: 2, remoteLinkIDs: ["primary", "paired"],
                 hashKeyEpoch: "epoch")
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], remoteAssetRecords: [proof], unresolvedIssues: [], hashKeyEpoch: "epoch",
                     checkpoint: checkpoint("one")))
             #expect(
@@ -1696,7 +1697,7 @@ extension DriveSessionStubSuite {
             let url = directory.appendingPathComponent("lineage.sqlite")
             let keys = try LineageKeys()
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             do {
                 let lineage = try #require(UploadRemoteLineageIndexStore(url: url))
@@ -1751,7 +1752,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
                 lineage.replaceRows(
@@ -1797,7 +1798,7 @@ extension DriveSessionStubSuite {
             defer { lineage.close() }
             let backlog = (0..<601).map { String(format: "link%04d", $0) }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
                 lineage.replaceRows(
@@ -1908,7 +1909,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             #expect(
@@ -1981,7 +1982,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -2026,7 +2027,7 @@ extension DriveSessionStubSuite {
                 UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
             defer { lineage.close() }
             #expect(
-                content.replaceRemoteContentIndex(
+                content.seedRemoteContentIndex(
                     [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
                     unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
             StubURLProtocol.reset()
@@ -2474,7 +2475,7 @@ extension DriveSessionStubSuite {
                     UploadRemoteLineageIndexStore(
                         url: directory.appendingPathComponent("lineage.sqlite"), clock: { clock.now }))
                 #expect(
-                    content.replaceRemoteContentIndex(
+                    content.seedRemoteContentIndex(
                         [], unresolvedIssues: [], hashKeyEpoch: "epoch",
                         checkpoint: .init(eventID: "one", refreshedAt: Date())))
                 #expect(

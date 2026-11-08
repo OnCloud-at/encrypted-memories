@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import UploadTestSupport
 import XCTest
 
 @testable import UploadCore
@@ -109,7 +110,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
             UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
         }
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 records + extra, unresolvedIssues: [], hashKeyEpoch: epoch,
                 checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
     }
@@ -1367,7 +1368,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let earlierKeyB = server.seedLink(digest: digest("b"))
         let current = server.links.filter { ![earlierKeyA.nodeID, earlierKeyB.nodeID].contains($0.linkID) }
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 current.map {
                     UploadRemoteContentIndexRecord(
                         contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
@@ -1416,7 +1417,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
                 lastObservedAt: date(0), lastRepairAttemptAt: nil, indexGeneration: "event-1")
         }
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 records, unresolvedIssues: issues, hashKeyEpoch: epoch,
                 checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
         let degraded = try await finder.duplicateGroups()
@@ -1453,7 +1454,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let store = try XCTUnwrap(store)
         server.indexBuild = { [epoch] progress in
             await progress(.init(phase: .indexing, completed: 1, total: 2))
-            _ = store.replaceRemoteContentIndex(
+            _ = store.seedRemoteContentIndex(
                 records, unresolvedIssues: [], hashKeyEpoch: epoch,
                 checkpoint: .init(eventID: "event-1", refreshedAt: Date()))
             await progress(.init(phase: .ready))
@@ -1780,7 +1781,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
             externalIdentity: UploadBackupExternalIdentity(identifier: "cloud-1", revision: .init(rawValue: 1)),
             resourceCount: 2, remoteLinkIDs: ["edit-main", "edit-original"], hashKeyEpoch: epoch)
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 records, remoteAssetRecords: [compound], unresolvedIssues: [], hashKeyEpoch: epoch,
                 checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
 
@@ -1876,7 +1877,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
                 resourceCount: 2, remoteLinkIDs: ["live-\(index)", "video-\(index)"], hashKeyEpoch: epoch)
         }
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 records, remoteAssetRecords: compounds, unresolvedIssues: [], hashKeyEpoch: epoch,
                 checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
         row("asset-video", names: "video-1", contentHash: "video", fileSize: 9_000)
@@ -4213,7 +4214,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
             UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
         }
         XCTAssertTrue(
-            manifest.replaceRemoteContentIndex(
+            manifest.seedRemoteContentIndex(
                 records, unresolvedIssues: [], hashKeyEpoch: epoch,
                 checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
         let finder = ExactDuplicateFinder(

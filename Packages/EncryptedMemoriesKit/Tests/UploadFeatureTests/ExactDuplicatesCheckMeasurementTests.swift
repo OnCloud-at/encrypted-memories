@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import UploadTestSupport
 import XCTest
 
 @testable import UploadCore
@@ -47,7 +48,7 @@ final class ExactDuplicatesCheckMeasurementTests: XCTestCase {
             }
         }
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 server.links.map {
                     UploadRemoteContentIndexRecord(
                         contentHash: $0.contentHash, hashKeyEpoch: "scenario-epoch", remoteLinkID: $0.linkID)
