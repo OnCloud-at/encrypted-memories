@@ -264,8 +264,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     sqlite3_prepare_v2(
                         db,
                         """
-                        SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
-                               state, attempts, last_error, updated_at, remote_commit_reconciliation
+                        SELECT \(Self.entryColumns)
                         FROM backup_sync_queue
                         WHERE remote_commit_reconciliation IS NOT NULL
                         ORDER BY updated_at ASC
@@ -413,8 +412,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     sqlite3_prepare_v2(
                         db,
                         """
-                        SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
-                               state, attempts, last_error, updated_at, remote_commit_reconciliation
+                        SELECT \(Self.entryColumns)
                         FROM backup_sync_queue
                         WHERE state IN (\(Self.runnableStateList))
                           AND updated_at <= ?\(exclusion.clause)
@@ -536,8 +534,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     sqlite3_prepare_v2(
                         db,
                         """
-                        SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
-                               state, attempts, last_error, updated_at, remote_commit_reconciliation
+                        SELECT \(Self.entryColumns)
                         FROM backup_sync_queue
                         WHERE state IN ('failed', 'failedPermanent', 'sourceMissing', 'blockedByDraft')
                            OR (state IN ('discovered', 'queuedForUpload') AND substr(last_error, 1, ?) = ?)
@@ -731,8 +728,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     sqlite3_prepare_v2(
                         db,
                         """
-                        SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
-                               state, attempts, last_error, updated_at, remote_commit_reconciliation
+                        SELECT \(Self.entryColumns)
                         FROM backup_sync_queue
                         WHERE state = ? AND updated_at < ?
                         ORDER BY revision_us DESC, updated_at ASC

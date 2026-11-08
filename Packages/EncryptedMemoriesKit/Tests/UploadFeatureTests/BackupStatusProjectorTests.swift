@@ -98,6 +98,55 @@ final class BackupStatusProjectorTests: XCTestCase {
         await projector.stop()
     }
 
+    func testEveryQueueCounterReplacesRunnerCountsAndKeepsLiveProgress() async throws {
+        let extraRows: [UploadBackupSyncQueueState: Int] = [.alreadyBackedUp: 12, .blockedByDraft: 10, .paused: 2]
+        for (index, state) in UploadBackupSyncQueueState.allCases.enumerated() {
+            for row in 0..<(index + 1 + extraRows[state, default: 0]) {
+                XCTAssertTrue(queue.upsert(entry(id: "counter-\(index)-\(row)", state: state)))
+            }
+        }
+        var recheck = entry(id: "acknowledged-recheck", state: .discovered)
+        recheck.lastError = BackupIssueRecord(kind: .sourceMissing, detail: "missing").persistedValue
+        XCTAssertTrue(queue.upsert(recheck))
+        let summary = try XCTUnwrap(queue.summary())
+        let seeded = BackupSyncProgress(summary: summary, currentItemName: "seed", isRunning: true)
+        XCTAssertEqual(seeded.currentItemName, "seed")
+        XCTAssertTrue(seeded.isRunning)
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        let recorder = Recorder()
+        await projector.start(generation: generation, context: BackupStatusProjectionContext(isRunning: true)) {
+            recorder.append($0)
+        }
+        var live = BackupSyncProgress()
+        live.currentItemName = "live"
+        live.transferredByteCount = 123
+        live.activeExecutionItemEquivalents = 0.5
+        live.leavesNoUploadWork = true
+        live.activeTransfer = BackupActiveTransferProgress(
+            activeItemCount: 1, completedBytes: 2, totalBytes: 4, completedItemEquivalents: 0.5)
+        projector.submit(live, generation: generation)
+        let published = await waitUntil { recorder.values.last?.progress.currentItemName == "live" }
+        XCTAssertTrue(published)
+        let projected = try XCTUnwrap(recorder.values.last?.progress)
+        let expectedCounts = [178, 14, 5, 9, 13, 10, 21, 11, 12, 23, 29, 17, 1, 19]
+        XCTAssertEqual(Set(expectedCounts).count, 14, "Every counter expectation must be distinct to detect swaps")
+        for progress in [seeded, projected] {
+            let actualCounts = [
+                progress.total, progress.waiting, progress.uploadQueued, progress.checking, progress.uploading,
+                progress.uploaded, progress.alreadyBackedUp, progress.skippedRemoteDeletions, progress.sourceMissing,
+                progress.blocked, progress.failed, progress.dismissedFailures, progress.pendingSourceRechecks,
+                progress.paused,
+            ]
+            XCTAssertEqual(actualCounts, expectedCounts)
+        }
+        XCTAssertEqual(projected.transferredByteCount, live.transferredByteCount)
+        XCTAssertEqual(projected.activeExecutionItemEquivalents, live.activeExecutionItemEquivalents)
+        XCTAssertEqual(projected.activeTransfer, live.activeTransfer)
+        XCTAssertEqual(projected.leavesNoUploadWork, live.leavesNoUploadWork)
+        await projector.stop()
+    }
+
     func testStaleGenerationIsDiscarded() async throws {
         XCTAssertTrue(queue.upsert(entry(id: "generation", state: .discovered)))
         let projector = BackupStatusProjector(queue: queue)

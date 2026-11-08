@@ -108,6 +108,16 @@ final class BackupThrottlePolicyTests: XCTestCase {
             "critical thermal still makes forward progress without six concurrent exports")
     }
 
+    func testRuntimeThermalLevelsKeepTheBackupConcurrencyTable() {
+        let policy = BackupThrottlePolicy(baseConcurrency: 6)
+        let levels: [LibraryThermalLevel] = [.nominal, .fair, .serious, .critical]
+        for (level, expected) in zip(levels, [6, 6, 2, 1]) {
+            let inputs = BackupThrottleInputs(
+                runtime: LibraryRuntimeSnapshot(thermalLevel: level), usesMobileData: true)
+            XCTAssertEqual(policy.maxConcurrentItems(for: inputs), expected)
+        }
+    }
+
     func testBaseConcurrencyIsAtLeastOne() {
         XCTAssertEqual(BackupThrottlePolicy(baseConcurrency: 0).maxConcurrentItems(for: .unconstrained), 1)
     }
