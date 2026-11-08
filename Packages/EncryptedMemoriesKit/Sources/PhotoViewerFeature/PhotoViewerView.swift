@@ -592,6 +592,8 @@ private struct ViewerStillImage: View {
                 onPinchDismissEnded: onPinchDismissEnded,
                 onForceClick: { model.playMotion() },  // Press starts motion playback.
                 onForceClickEnded: { model.stopMotion() },  // Release stops motion and fades to still.
+                onMotionStart: model.current.isLivePhoto ? { model.playMotion() } : nil,
+                onMotionStop: model.current.isLivePhoto ? { model.stopMotion() } : nil,
                 onPageSwipe: onPageSwipe,
                 onPhotoFrameChanged: { livePhotoFrame = $0 },
                 onZoomChanged: { zoom in
