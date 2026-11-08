@@ -240,6 +240,9 @@ public final class TimelineMetadataStore {
     /// Name of the connection-scoped TEMP scratch table that holds the current enumeration's keys
     /// for the incremental save's anti-join sweep (see `ensureIncomingKeyTable`).
     private static let incomingKeyTable = "save_incoming_keys"
+    /// Scratch sets of the tag and burst rows a save wants, for the same kind of difference.
+    private static let incomingTagTable = "save_incoming_tags"
+    private static let incomingBurstTable = "save_incoming_bursts"
 
     /// Ordered timeline query used by the library load.
     private static let timelineLoadSQL =
@@ -593,7 +596,7 @@ public final class TimelineMetadataStore {
                 ) == SQLITE_OK
             else { return false }
             swept = Int(sqlite3_changes(db))
-            guard rewriteTags(ordered), rewriteBurstMembers(ordered) else { return false }
+            guard syncTags(ordered), syncBurstMembers(ordered) else { return false }
             guard writeMeta(Self.metaDigestKey, digest),
                 writeMeta(Self.metaGenerationKey, String(newGeneration)),
                 applyValidationTokenUpdate(validationTokenUpdate)
@@ -721,60 +724,100 @@ public final class TimelineMetadataStore {
         return true
     }
 
-    /// Connection-scoped scratch table holding the current enumeration's `(vol, node)` keys - it
-    /// backs the incremental save's anti-join sweep. It lives in SQLite's TEMP store, so filling it
-    /// never appends to the durable WAL; `WITHOUT ROWID` + the composite PK give the anti-join a
-    /// covering index and make duplicate keys in one enumeration a harmless no-op (`INSERT OR IGNORE`).
+    /// Creates the connection-scoped scratch tables of a save. `save_incoming_keys` holds the current
+    /// enumeration's `(vol, node)` keys for the anti-join sweep of `photos`; duplicate keys in one enumeration
+    /// are a harmless no-op there (`INSERT OR IGNORE`). `save_incoming_tags` and `save_incoming_bursts` hold the
+    /// tag and burst rows the save wants, for the difference that `syncTags` and `syncBurstMembers` apply; a
+    /// repeated key there fails the save. All three live in SQLite's TEMP store, so filling them never appends
+    /// to the durable WAL; `WITHOUT ROWID` + the composite PK give the anti-joins a covering index.
     private func ensureIncomingKeyTable() -> Bool {
         sqlite3_exec(
             db,
             "CREATE TEMP TABLE IF NOT EXISTS \(Self.incomingKeyTable)"
-                + "(vol TEXT NOT NULL, node TEXT NOT NULL, PRIMARY KEY(vol, node)) WITHOUT ROWID;",
+                + "(vol TEXT NOT NULL, node TEXT NOT NULL, PRIMARY KEY(vol, node)) WITHOUT ROWID;"
+                + "CREATE TEMP TABLE IF NOT EXISTS \(Self.incomingTagTable)"
+                + "(vol TEXT NOT NULL, node TEXT NOT NULL, tag INTEGER NOT NULL, PRIMARY KEY(tag, vol, node)) "
+                + "WITHOUT ROWID;"
+                + "CREATE TEMP TABLE IF NOT EXISTS \(Self.incomingBurstTable)"
+                + "(anchor_vol TEXT NOT NULL, anchor_node TEXT NOT NULL, seq INTEGER NOT NULL, "
+                + "member_node TEXT NOT NULL, PRIMARY KEY(anchor_vol, anchor_node, seq)) WITHOUT ROWID;",
             nil, nil, nil
         ) == SQLITE_OK
     }
 
-    /// Feature tables are rewritten wholesale inside the save transaction. Their row counts scale
-    /// with tagged/burst items (a small fraction of the library), not with library size - the
-    /// digest short-circuit already spares the common unchanged refresh entirely.
-    private func rewriteTags(_ items: [PhotoItem]) -> Bool {
-        guard sqlite3_exec(db, "DELETE FROM photo_tags;", nil, nil, nil) == SQLITE_OK else { return false }
-        var stmt: OpaquePointer?
+    /// Brings `photo_tags` to exactly the tags of `items` inside the save transaction, writing only the
+    /// difference: a refresh that changes one photo leaves every other tag row untouched instead of deleting and
+    /// re-inserting them all. The difference is computed in SQL against a scratch table of the wanted rows, so a
+    /// stored row that Swift cannot read (a tag beyond 32 bits, a text value) is deleted like any stale row and
+    /// the save heals it, as the former delete-all did. A photo and tag that appear twice in one enumeration
+    /// violate the scratch table's key and fail the save, as the direct inserts did.
+    private func syncTags(_ items: [PhotoItem]) -> Bool {
+        let wanted = Self.incomingTagTable
+        guard sqlite3_exec(db, "DELETE FROM \(wanted);", nil, nil, nil) == SQLITE_OK else { return false }
+        var insert: OpaquePointer?
         guard
-            sqlite3_prepare_v2(db, "INSERT INTO photo_tags(vol, node, tag) VALUES(?,?,?);", -1, &stmt, nil) == SQLITE_OK
-        else {
-            return false
-        }
-        defer { sqlite3_finalize(stmt) }
+            sqlite3_prepare_v2(db, "INSERT INTO \(wanted)(vol, node, tag) VALUES(?,?,?);", -1, &insert, nil)
+                == SQLITE_OK
+        else { return false }
+        defer { sqlite3_finalize(insert) }
         for item in items where !item.tags.isEmpty {
             for tag in item.tags.map(\.rawValue).sorted() {
-                sqlite3_reset(stmt)
-                sqlite3_bind_text(stmt, 1, item.uid.volumeID, -1, transient)
-                sqlite3_bind_text(stmt, 2, item.uid.nodeID, -1, transient)
-                sqlite3_bind_int(stmt, 3, Int32(tag))
-                guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+                sqlite3_reset(insert)
+                sqlite3_bind_text(insert, 1, item.uid.volumeID, -1, transient)
+                sqlite3_bind_text(insert, 2, item.uid.nodeID, -1, transient)
+                sqlite3_bind_int64(insert, 3, Int64(tag))
+                guard sqlite3_step(insert) == SQLITE_DONE else { return false }
             }
         }
-        return true
+        return sqlite3_exec(
+            db,
+            "DELETE FROM photo_tags WHERE NOT EXISTS "
+                + "(SELECT 1 FROM \(wanted) k WHERE k.tag = photo_tags.tag AND k.vol = photo_tags.vol "
+                + "AND k.node = photo_tags.node);"
+                + "INSERT INTO photo_tags(vol, node, tag) SELECT k.vol, k.node, k.tag FROM \(wanted) k "
+                + "WHERE NOT EXISTS (SELECT 1 FROM photo_tags p WHERE p.tag = k.tag AND p.vol = k.vol "
+                + "AND p.node = k.node) ORDER BY k.tag, k.vol, k.node;",
+            nil, nil, nil
+        ) == SQLITE_OK
     }
 
-    private func rewriteBurstMembers(_ items: [PhotoItem]) -> Bool {
-        guard sqlite3_exec(db, "DELETE FROM burst_members;", nil, nil, nil) == SQLITE_OK else { return false }
-        var stmt: OpaquePointer?
-        let sql = "INSERT INTO burst_members(anchor_vol, anchor_node, member_node, seq) VALUES(?,?,?,?);"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
-        defer { sqlite3_finalize(stmt) }
+    /// Brings `burst_members` to exactly the burst members of `items`, writing only the difference, with the
+    /// same scratch-table method and the same healing and duplicate rules as `syncTags`: a stale row is deleted,
+    /// a missing row inserted, and a row whose member changed at the same position updated.
+    private func syncBurstMembers(_ items: [PhotoItem]) -> Bool {
+        let wanted = Self.incomingBurstTable
+        guard sqlite3_exec(db, "DELETE FROM \(wanted);", nil, nil, nil) == SQLITE_OK else { return false }
+        var insert: OpaquePointer?
+        guard
+            sqlite3_prepare_v2(
+                db, "INSERT INTO \(wanted)(anchor_vol, anchor_node, seq, member_node) VALUES(?,?,?,?);", -1,
+                &insert, nil) == SQLITE_OK
+        else { return false }
+        defer { sqlite3_finalize(insert) }
         for item in items where !item.burstMemberIDs.isEmpty {
             for (seq, member) in item.burstMemberIDs.enumerated() {
-                sqlite3_reset(stmt)
-                sqlite3_bind_text(stmt, 1, item.uid.volumeID, -1, transient)
-                sqlite3_bind_text(stmt, 2, item.uid.nodeID, -1, transient)
-                sqlite3_bind_text(stmt, 3, member, -1, transient)
-                sqlite3_bind_int(stmt, 4, Int32(seq))
-                guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+                sqlite3_reset(insert)
+                sqlite3_bind_text(insert, 1, item.uid.volumeID, -1, transient)
+                sqlite3_bind_text(insert, 2, item.uid.nodeID, -1, transient)
+                sqlite3_bind_int64(insert, 3, Int64(seq))
+                sqlite3_bind_text(insert, 4, member, -1, transient)
+                guard sqlite3_step(insert) == SQLITE_DONE else { return false }
             }
         }
-        return true
+        let sameKey =
+            "k.anchor_vol = burst_members.anchor_vol AND k.anchor_node = burst_members.anchor_node "
+            + "AND k.seq = burst_members.seq"
+        return sqlite3_exec(
+            db,
+            "DELETE FROM burst_members WHERE NOT EXISTS (SELECT 1 FROM \(wanted) k WHERE \(sameKey));"
+                + "UPDATE burst_members SET member_node = (SELECT k.member_node FROM \(wanted) k WHERE \(sameKey)) "
+                + "WHERE member_node IS NOT (SELECT k.member_node FROM \(wanted) k WHERE \(sameKey));"
+                + "INSERT INTO burst_members(anchor_vol, anchor_node, member_node, seq) "
+                + "SELECT k.anchor_vol, k.anchor_node, k.member_node, k.seq FROM \(wanted) k WHERE NOT EXISTS "
+                + "(SELECT 1 FROM burst_members b WHERE b.anchor_vol = k.anchor_vol AND b.anchor_node = k.anchor_node "
+                + "AND b.seq = k.seq) ORDER BY k.anchor_vol, k.anchor_node, k.seq;",
+            nil, nil, nil
+        ) == SQLITE_OK
     }
 
     // MARK: Authoritative media-type evidence
