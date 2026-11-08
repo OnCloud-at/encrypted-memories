@@ -852,30 +852,8 @@ extension DriveSessionStubSuite {
                 store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
                 accountCacheDirectory: directory, requestGovernor: governor,
                 urlProtocolClasses: [StubURLProtocol.self])
-            let client = try await EncryptedMemoriesClient(
-                configuration: ProtonDriveClientConfiguration(
-                    baseURL: "https://fixture.invalid/", clientUID: "fixture"),
-                httpClient: SDKHttpClient(
-                    driveSession: session, requestGovernor: governor,
-                    urlProtocolClasses: [StubURLProtocol.self]),
-                accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
-                logCallback: { _ in }, featureFlagProviderCallback: { _, completion in completion(false) },
-                recordMetricEventCallback: { _ in })
-            let crypto = DriveCrypto(addressKeys: [], signers: [])
-            let gate = TimelineMetadataStartGate()
-            let bridge = DriveSDKBridge(
-                prepared: .init(
-                    photosClient: client, uploadClientUID: "fixture", driveSession: session,
-                    requestGovernor: governor, expensiveUploadAccess: ExpensiveUploadAccess(),
-                    timelineStore: nil, timelineOrderStore: nil, firstIndexBuildGate: gate,
-                    metadataReconciliation: TimelineMetadataReconciliation(startGate: gate),
-                    crypto: crypto,
-                    photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
-                    recentlyDeletedStore: RecentlyDeletedListingStore(
-                        directory: directory, accountUID: "fixture", keyPassword: ""),
-                    photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
-                    uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
-                    uploadManifestPolicy: .conservative))
+            let bridge = try await DriveSDKBridge.testBridge(
+                directory: directory, session: session, governor: governor, protocols: [StubURLProtocol.self])
 
             do {
                 await #expect(

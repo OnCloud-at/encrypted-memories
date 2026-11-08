@@ -181,27 +181,8 @@ struct DriveSDKAccountInfoRefreshTests {
             store: SessionKeychainStore(service: "account-refresh-fixture"),
             accountCacheDirectory: directory, requestGovernor: governor,
             urlProtocolClasses: [AccountRefreshHTTP.self])
-        let client = try await EncryptedMemoriesClient(
-            configuration: ProtonDriveClientConfiguration(baseURL: "https://fixture.invalid/", clientUID: "fixture"),
-            httpClient: SDKHttpClient(
-                driveSession: session, requestGovernor: governor, urlProtocolClasses: [AccountRefreshHTTP.self]),
-            accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
-            logCallback: { _ in }, featureFlagProviderCallback: { _, completion in completion(false) },
-            recordMetricEventCallback: { _ in })
-        let crypto = DriveCrypto(addressKeys: [], signers: [])
-        let gate = TimelineMetadataStartGate()
-        let bridge = DriveSDKBridge(
-            prepared: DriveSDKBridge.PreparedSession(
-                photosClient: client, uploadClientUID: "fixture", driveSession: session,
-                requestGovernor: governor, expensiveUploadAccess: ExpensiveUploadAccess(),
-                timelineStore: nil, timelineOrderStore: nil, firstIndexBuildGate: gate,
-                metadataReconciliation: TimelineMetadataReconciliation(startGate: gate), crypto: crypto,
-                photosVolumeBootstrap: PhotosVolumeBootstrapService(session: session, crypto: crypto),
-                recentlyDeletedStore: RecentlyDeletedListingStore(
-                    directory: directory, accountUID: "fixture", keyPassword: ""),
-                photoNames: nil, recentlyDeleted: RecentlyDeletedIdentities(listing: nil),
-                uploadManifestURL: directory.appendingPathComponent("manifest.sqlite"),
-                uploadManifestPolicy: .conservative))
+        let bridge = try await DriveSDKBridge.testBridge(
+            directory: directory, session: session, governor: governor, protocols: [AccountRefreshHTTP.self])
         do {
             try await body(bridge, governor)
         } catch {
