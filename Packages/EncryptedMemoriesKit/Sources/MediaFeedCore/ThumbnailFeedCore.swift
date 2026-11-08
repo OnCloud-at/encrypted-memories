@@ -391,8 +391,8 @@ public actor ThumbnailFeedCore {
     private var lastErrors: [String] = []
     private var prefetchEnabled = true
     private var prefetchPaused = false
-    /// Wakes the crawl after storage leaves the critical level. It exists only while the crawl sleeps for storage.
-    /// Wakes the crawl when the condition that held it ends: storage recovers, or the app is in the foreground.
+    /// Wakes the crawl once nothing holds it: storage is below the critical level and the app is no longer
+    /// suspended (foreground, or a background window).
     private var crawlWakeTask: Task<Void, Never>?
     /// The workers' waits for the coordinator's permit in a background window.
     private var windowPermitWaits: [UUID: Task<LibraryBackgroundWindowPermit?, Never>] = [:]
@@ -2964,12 +2964,6 @@ public actor ThumbnailFeedCore {
     /// waits behind more than this many filesystem stats.
     private static let coverageScanChunk = 512
 
-    /// Advances the end-of-crawl disk-coverage re-scan by one bounded chunk of disk checks, returning the
-    /// refreshed coverage only when a full pass just completed (else `nil` - "call again"). Bounded so it can
-    /// never hold the serial actor for an O(library) scan, and it bails to `nil` the instant a viewport goes
-    /// live, so it can never starve a visible warm decode. Workers share `coverageScanCursor`, so together they
-    /// complete one pass in bounded steps; no single worker runs a full scan. All filesystem probes run on the
-    /// decode executor, never on this actor.
     /// One step of the end-of-crawl coverage scan.
     private enum CoverageScanStep {
         case finished((present: Int, total: Int, percent: Double))
@@ -2978,6 +2972,13 @@ public actor ThumbnailFeedCore {
         case stale
     }
 
+    /// Advances the end-of-crawl disk-coverage re-scan by one bounded chunk of disk checks. It returns
+    /// `.finished` with the refreshed coverage when a full pass just completed, `.unfinished` to call again
+    /// (also the instant a viewport goes live, so it can never starve a visible warm decode), and `.stale`
+    /// when the session or the cache writer changed. Bounded so it can never hold the serial actor for an
+    /// O(library) scan. Workers share `coverageScanCursor`, so together they complete one pass in bounded
+    /// steps; no single worker runs a full scan. All filesystem probes run on the decode executor, never on
+    /// this actor.
     private func advanceDiskCoverageScan() async -> CoverageScanStep {
         #if DEBUG
             testingHooks.beforeCoverageScanStep()

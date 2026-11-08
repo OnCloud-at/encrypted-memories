@@ -143,10 +143,6 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         }
     }
 
-    public static func databaseFileNames() -> [String] {
-        [databaseFileName, databaseFileName + "-wal", databaseFileName + "-shm"]
-    }
-
     /// Starts one graph-owned persistence session and invalidates leases from older graph lifetimes.
     public func activate(for epoch: LibrarySourceEpoch) async throws -> SessionLease {
         try await perform {

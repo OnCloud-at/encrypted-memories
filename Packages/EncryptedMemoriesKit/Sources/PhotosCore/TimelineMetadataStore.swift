@@ -112,11 +112,6 @@ public struct LibraryDatabasePolicy: Sendable, Equatable {
 public enum LibraryDatabaseLocation {
     public static let databaseFileName = "library-v1.sqlite"
 
-    /// Main file plus the WAL sidecars - the three must be treated as one unit for purge/backup.
-    public static func databaseFileNames() -> [String] {
-        [databaseFileName, databaseFileName + "-wal", databaseFileName + "-shm"]
-    }
-
     public static func defaultBaseDirectory() -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     }
@@ -197,9 +192,11 @@ public enum TimelineMetadataReadError: Error {
 /// - `photos` is the hot path and carries only what the timeline needs; feature data lives in
 ///   feature-owned tables (`photo_tags`, `burst_members`) - never serialized blobs.
 /// - Timeline order is `(t, vol, node)` everywhere; `idx_photos_timeline` serves the ordered scan.
-/// - Saves are O(changes): a digest no-op short-circuit skips unchanged refreshes; a changed
-///   refresh upserts only rows whose content actually differs and anti-joins the enumerated key
-///   set to sweep vanished rows - never a full-table rewrite.
+/// - Saves upsert only changed `photos` rows: a digest no-op short-circuit skips unchanged refreshes; a
+///   changed refresh upserts only rows whose content actually differs and anti-joins the enumerated key
+///   set to sweep vanished rows - never a full-table rewrite of `photos`. The tag and burst tables are
+///   rewritten per changed save. Reading the enumeration (digest, key scratch set, guarded upsert per
+///   photo) costs O(N) statements.
 /// - `schema_info` versions each feature's tables explicitly; an unknown newer version fails
 ///   closed without modifying or deleting the last usable timeline.
 ///
