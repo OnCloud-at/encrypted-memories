@@ -409,7 +409,7 @@ import Testing
         #expect(await waitUntil { await catalogProvider.started })
         #expect(await waitUntilMainActor { controller.snapshot.isSearchAvailable })
         #expect(controller.snapshot.isEnabled)
-        #expect(controller.availableSearchScopes == [.all, .text])
+        #expect(await waitUntilMainActor { controller.availableSearchScopes == [.all, .text] })
         #expect(try await lifecycle.searchUIDs("invoice", scope: .text) == [expected])
 
         await catalogProvider.release()
