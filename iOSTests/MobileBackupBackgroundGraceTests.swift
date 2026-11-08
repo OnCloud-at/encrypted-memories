@@ -728,7 +728,7 @@ import UploadCore
                 // The tests deliver the first path themselves; a slow runner must not reach the bounded wait.
                 firstNetworkPathWait: .seconds(600))
             configuration.currentAccessState = { .full }
-            let backend = Backend()
+            let backend = StalledUploadBackend(canUpload: false)
             controller = PhotoLibraryBackupController(
                 configuration: configuration, identityResolver: backend, uploader: backend)
             controller.setEnabledForTesting()
@@ -749,11 +749,7 @@ import UploadCore
             try #require(ready, "fixture must reach the held pass")
         }
 
-        func waitFor(_ condition: () -> Bool) async -> Bool {
-            let deadline = ContinuousClock.now + .seconds(5)
-            while !condition(), ContinuousClock.now < deadline { await Task.yield() }
-            return condition()
-        }
+        func waitFor(_ condition: () -> Bool) async -> Bool { await yieldUntil(condition) }
 
         func close() async {
             scan.release()
@@ -761,25 +757,6 @@ import UploadCore
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
-    }
-
-    private struct Backend: PhotoUploading, UploadIdentityResolving {
-        let capabilities = UploadBackendCapabilities(
-            canUpload: false, supportsCancel: true, supportsPauseResume: false, supportsResumeAcrossRelaunch: false)
-        func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
-            throw CancellationError()
-        }
-        func upload(
-            _ request: PhotoUploadRequest, onProgress: @escaping @Sendable (UploadProgress) -> Void
-        ) async throws -> PhotoUID { throw CancellationError() }
-        func cancel(token: UUID) async {}
-        func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
-            throw CancellationError()
-        }
-        func recordUploaded(
-            _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String,
-            remoteLinkID: String
-        ) async throws { throw CancellationError() }
     }
 
     @Test func expirationCancelsTheAdoptedWorkSynchronously() async throws {

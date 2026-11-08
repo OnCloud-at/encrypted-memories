@@ -57,10 +57,6 @@ final class MobileMapClusterBarTests: XCTestCase {
         }
     }
 
-    @MainActor private func descendants(_ view: UIView) -> [UIView] {
-        [view] + view.subviews.flatMap(descendants)
-    }
-
     @MainActor private func barItems(in window: UIWindow) -> [UIBarButtonItem] {
         var items: [UIBarButtonItem] = []
         for bar in descendants(window).compactMap({ $0 as? UINavigationBar }) {

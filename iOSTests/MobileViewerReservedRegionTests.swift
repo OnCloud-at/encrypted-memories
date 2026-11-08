@@ -183,8 +183,6 @@ final class MobileViewerReservedRegionTests: XCTestCase {
         return report
     }
 
-    private func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
-
     private func visibleControls(in view: UIView) -> [UIControl] {
         guard !view.isHidden, view.alpha >= 0.01 else { return [] }
         let frame = view.convert(view.bounds, to: window)

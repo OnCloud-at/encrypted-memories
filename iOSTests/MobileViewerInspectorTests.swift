@@ -431,7 +431,6 @@ final class MobileViewerInspectorTests: XCTestCase {
             resize(compactBounds, sizeClass: .compact)
             try await Task.sleep(for: .milliseconds(1500))
             if let sheet = viewerHost.presentedViewController {
-                func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
                 let bars = descendants(sheet.presentationController?.containerView ?? window).compactMap {
                     $0 as? UINavigationBar
                 }
@@ -523,24 +522,6 @@ final class MobileViewerInspectorTests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
         writeArtifact("viewer-inspector-report.txt", Data(text.utf8))
-    }
-
-    @MainActor private func snapshot(_ window: UIWindow, _ name: String) {
-        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
-            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
-        }
-        let attachment = XCTAttachment(image: image)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        if let data = image.pngData() { writeArtifact("\(name).png", data) }
-    }
-
-    private func writeArtifact(_ name: String, _ data: Data) {
-        guard let directory = ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_UI_SNAPSHOT_DIR"] else { return }
-        let url = URL(fileURLWithPath: directory, isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        try? data.write(to: url.appendingPathComponent(name))
     }
 }
 

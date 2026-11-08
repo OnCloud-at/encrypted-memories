@@ -384,10 +384,6 @@ final class MobileTimelineChromeTests: XCTestCase {
 
     // MARK: - Helpers
 
-    @MainActor private func descendants(_ view: UIView) -> [UIView] {
-        [view] + view.subviews.flatMap(descendants)
-    }
-
     @MainActor private func barItems(in window: UIWindow) -> [UIBarButtonItem] {
         var items: [UIBarButtonItem] = []
         for bar in descendants(window).compactMap({ $0 as? UINavigationBar }) {
@@ -497,33 +493,11 @@ final class MobileTimelineChromeTests: XCTestCase {
     @MainActor private func waitUntil(
         _ what: String, timeout: Duration = .seconds(20), _ condition: @MainActor () -> Bool
     ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now + timeout
-        while clock.now < deadline {
-            if condition() { return }
-            try await Task.sleep(for: .milliseconds(100))
-        }
+        let held = try await pollUntil(timeout: timeout, every: .milliseconds(100)) { condition() }
+        if held { return }
         report.append("TIMEOUT: \(what)")
         XCTFail("timed out: \(what)")
         throw MobileFixtureError.unavailable
-    }
-
-    @MainActor private func snapshot(_ window: UIWindow, _ name: String) {
-        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
-            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
-        }
-        let attachment = XCTAttachment(image: image)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        if let data = image.pngData() { writeArtifact("\(name).png", data) }
-    }
-
-    private func writeArtifact(_ name: String, _ data: Data) {
-        guard let directory = ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_UI_SNAPSHOT_DIR"] else { return }
-        let url = URL(fileURLWithPath: directory, isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        try? data.write(to: url.appendingPathComponent(name))
     }
 }
 

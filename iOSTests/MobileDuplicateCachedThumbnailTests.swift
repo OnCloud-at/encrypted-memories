@@ -104,10 +104,7 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
     /// Polls until the condition holds. The limit only guards against a hang; a saturated hosted runner may need
     /// several seconds, so the tests prove the image source instead of measuring time.
     private func waitUntil(_ condition: () -> Bool) async throws {
-        let start = ContinuousClock.now
-        while start.duration(to: .now) < .seconds(10), !condition() {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        _ = try await pollUntil(timeout: .seconds(10), condition)
     }
 
     /// SwiftUI tears a removed view down on a later main-actor turn.

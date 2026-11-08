@@ -260,12 +260,7 @@ import UIKit
         timeout: Duration = .seconds(300),
         _ predicate: @MainActor @escaping () async -> Bool
     ) async -> Bool {
-        let deadline = ContinuousClock.now + timeout
-        while ContinuousClock.now < deadline {
-            if await predicate() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return await predicate()
+        (try? await pollUntil(timeout: timeout) { await predicate() }) ?? false
     }
 
     private func section(items: [PhotoItem]) -> TimelineSection {

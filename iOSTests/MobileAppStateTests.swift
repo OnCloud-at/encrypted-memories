@@ -1,6 +1,5 @@
 import Foundation
 import MediaLocationCore
-import PhotoLibraryBackupAdapter
 import PhotoViewerCore
 import PhotoViewerUIKitAdapter
 import PhotosCore
@@ -8,7 +7,6 @@ import ProtonAuth
 import SwiftUI
 import Testing
 import UIKit
-import UploadCore
 import XCTest
 
 @testable import EncryptedMemoriesMobile
@@ -259,12 +257,7 @@ private func waitUntil(
     timeout: Duration = .seconds(3),
     _ condition: @escaping @Sendable () async -> Bool
 ) async throws {
-    let deadline = ContinuousClock.now + timeout
-    while ContinuousClock.now < deadline {
-        if await condition() { return }
-        try await Task.sleep(for: .milliseconds(10))
-    }
-    throw MobileRetryTestTimeout.elapsed
+    guard try await pollUntil(timeout: timeout, condition) else { throw MobileRetryTestTimeout.elapsed }
 }
 
 @Suite @MainActor struct MobileAppStateTests {
@@ -1227,15 +1220,15 @@ private func waitUntil(
                 session: replacement, store: SessionKeychainStore(), backend: fixture.backend,
                 sections: fixture.sections, thumbnailFeed: fixture.feed)
         }
-        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        try #require(await yieldUntil { await latch.hasEntered("load") })
         var returned = false
         let retry = Task { @MainActor in
             await model.retry()
             returned = true
         }
-        try #require(await waitForMobileOwner { model.backend == nil })
+        try #require(await yieldUntil { model.backend == nil })
         await latch.release("load")
-        let finished = await waitForMobileOwner { returned }
+        let finished = await yieldUntil { returned }
         #expect(finished, "A retry must not await its own BackendRetrySequence task")
         #expect(await latch.hasEntered("load-cancelled"))
         #expect(!(await pending.session.delete([])), "retry must close the captured pending session")
@@ -1281,7 +1274,7 @@ private func waitUntil(
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         let revision = model.scopePresentationRevision
         model.refreshAfterLocalUpload()
-        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-refresh") })
+        try #require(await yieldUntil { await latch.hasEntered("terminal-refresh") })
         let replacement = ProtonSession(
             uid: "replacement-fixture", accessToken: "fixture-access", refreshToken: "fixture-refresh",
             keyPassword: "fixture-key")
@@ -1290,7 +1283,7 @@ private func waitUntil(
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         await latch.release("terminal-refresh")
 
-        let recoveredReplacement = await waitForMobileOwner(timeout: .seconds(1)) {
+        let recoveredReplacement = await yieldUntil(timeout: .seconds(1)) {
             model.scopePresentationRevision != revision
         }
         #expect(!recoveredReplacement)
@@ -1320,21 +1313,21 @@ private func waitUntil(
         model.setApplicationActive(true)
 
         for _ in 0..<5 { model.refreshAfterBackupUpload(passIsRunning: true) }
-        try #require(await waitForMobileOwner { await loads.count == 1 })
+        try #require(await yieldUntil { await loads.count == 1 })
         // The interval holds the other four signals back; a wrong route would load again within this window.
-        let loadedAgain = await waitForMobileOwner(timeout: .milliseconds(500)) { await loads.count > 1 }
+        let loadedAgain = await yieldUntil(timeout: .milliseconds(500)) { await loads.count > 1 }
         #expect(!loadedAgain)
         #expect(await loads.count == 1)
 
         model.backupPassDidEnd()
-        try #require(await waitForMobileOwner { await loads.count == 2 })
+        try #require(await yieldUntil { await loads.count == 2 })
 
         // A manual upload keeps its immediate refresh while backup signals wait.
         model.refreshAfterBackupUpload(passIsRunning: true)
         model.refreshAfterLocalUpload()
-        try #require(await waitForMobileOwner { await loads.count == 3 })
+        try #require(await yieldUntil { await loads.count == 3 })
         // Only the manual upload loaded; the backup signal that waits did not add a load of its own.
-        let loadedMore = await waitForMobileOwner(timeout: .milliseconds(500)) { await loads.count > 3 }
+        let loadedMore = await yieldUntil(timeout: .milliseconds(500)) { await loads.count > 3 }
         #expect(!loadedMore)
         model.configure(session: nil, store: SessionKeychainStore())
         await fixture.feed.stopPrefetch()
@@ -1366,18 +1359,18 @@ private func waitUntil(
                 }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         model.installIsolatedInitialLoadForTesting { await latch.block("load") }
-        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        try #require(await yieldUntil { await latch.hasEntered("load") })
         let revision = model.scopePresentationRevision
         model.settleIsolatedLibraryForTesting()
         model.setApplicationActive(true)
         model.refreshAfterLocalUpload()
-        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-refresh") })
-        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-token") })
+        try #require(await yieldUntil { await latch.hasEntered("terminal-refresh") })
+        try #require(await yieldUntil { await latch.hasEntered("terminal-token") })
         await latch.release("terminal-refresh")
         await latch.release("terminal-token")
-        try #require(await waitForMobileOwner { model.isRecoveringScope && model.backend == nil })
+        try #require(await yieldUntil { model.isRecoveringScope && model.backend == nil })
         model.refreshAfterLocalUpload()
-        let recoveredTwice = await waitForMobileOwner(timeout: .seconds(1)) {
+        let recoveredTwice = await yieldUntil(timeout: .seconds(1)) {
             model.scopePresentationRevision != revision &+ 1
         }
         #expect(!recoveredTwice)
@@ -1408,16 +1401,16 @@ private func waitUntil(
                 }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         model.installIsolatedInitialLoadForTesting { await latch.block("load") }
-        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        try #require(await yieldUntil { await latch.hasEntered("load") })
         model.settleIsolatedLibraryForTesting()
         model.setApplicationActive(true)
-        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-token") })
+        try #require(await yieldUntil { await latch.hasEntered("terminal-token") })
         let revision = model.scopePresentationRevision
         model.refreshAfterLocalUpload()
-        try #require(await waitForMobileOwner { model.isRecoveringScope && model.backend == nil })
+        try #require(await yieldUntil { model.isRecoveringScope && model.backend == nil })
         // Retirement is held before monitor reset. Its terminal callback reaches admission with recovery active.
         await latch.release("terminal-token")
-        let admittedAgain = await waitForMobileOwner(timeout: .seconds(1)) {
+        let admittedAgain = await yieldUntil(timeout: .seconds(1)) {
             model.scopePresentationRevision != revision &+ 1
         }
         #expect(!admittedAgain)
@@ -1447,16 +1440,16 @@ private func waitUntil(
                 }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         model.installIsolatedInitialLoadForTesting { await latch.block("load") }
-        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        try #require(await yieldUntil { await latch.hasEntered("load") })
         model.refreshAfterLocalUpload()
-        try #require(await waitForMobileOwner { await latch.hasEntered("terminal-refresh") })
+        try #require(await yieldUntil { await latch.hasEntered("terminal-refresh") })
         // Teardown advances the load generation. The held load keeps upload cancellation from running yet.
         model.configure(session: nil, store: SessionKeychainStore())
         fixture.install(into: model)
         let revision = model.scopePresentationRevision
         // A typed terminal catch reaches the observer without the success path's lease validation.
         await latch.release("terminal-refresh")
-        let admitted = await waitForMobileOwner(timeout: .seconds(1)) {
+        let admitted = await yieldUntil(timeout: .seconds(1)) {
             model.scopePresentationRevision != revision
         }
         #expect(!admitted)
@@ -1483,11 +1476,11 @@ private func waitUntil(
                 }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         model.installIsolatedInitialLoadForTesting { await latch.block("load") }
-        try #require(await waitForMobileOwner { await latch.hasEntered("load") })
+        try #require(await yieldUntil { await latch.hasEntered("load") })
         let revision = model.scopePresentationRevision
         model.refreshAfterLocalUpload()
-        try #require(await waitForMobileOwner { await latch.hasEntered("refresh") })
-        let recovered = await waitForMobileOwner(timeout: .seconds(1)) {
+        try #require(await yieldUntil { await latch.hasEntered("refresh") })
+        let recovered = await yieldUntil(timeout: .seconds(1)) {
             model.scopePresentationRevision != revision
         }
         #expect(!recovered)
@@ -1505,9 +1498,9 @@ private func waitUntil(
             AccountTeardownOwner(id: "purge", stage: .purgeClaims) { await latch.block("purge") }
         ])
         let first = Task { await coordinator.teardown() }
-        try #require(await waitForMobileOwner { await latch.hasEntered("purge") })
+        try #require(await yieldUntil { await latch.hasEntered("purge") })
         let second = Task { await coordinator.teardown() }
-        let purgedConcurrently = await waitForMobileOwner(timeout: .seconds(1)) {
+        let purgedConcurrently = await yieldUntil(timeout: .seconds(1)) {
             await latch.events().filter { $0 == "purge" }.count > 1
         }
         #expect(!purgedConcurrently)
@@ -1625,7 +1618,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         BackupLocalDataPurge.requestPurgeOnSignOut()
         model.configure(session: nil, store: SessionKeychainStore())
         XCTAssertTrue(model.isSigningOut)
-        let completedWhileHeld = await waitForMobileOwner(timeout: .seconds(1)) {
+        let completedWhileHeld = await yieldUntil(timeout: .seconds(1)) {
             !model.isSigningOut || model.signOutCleanupFailed
         }
         XCTAssertFalse(completedWhileHeld)
@@ -1667,7 +1660,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         try await waitForOwnerEvent("the first start to close the live pending pair") {
             await latch.waitUntilEntered("close")
         }
-        let configuredWhileClosing = await waitForMobileOwner(timeout: .milliseconds(300)) {
+        let configuredWhileClosing = await yieldUntil(timeout: .milliseconds(300)) {
             model.locationStoreLeaseForTesting != leaseBefore
         }
         XCTAssertFalse(configuredWhileClosing, "the load opens no store before the retired pair is closed")
@@ -1684,7 +1677,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         BackupLocalDataPurge.requestPurgeOnSignOut()
         model.configure(session: nil, store: SessionKeychainStore())
         XCTAssertTrue(model.isSigningOut)
-        let completedWhileHeld = await waitForMobileOwner(timeout: .seconds(1)) {
+        let completedWhileHeld = await yieldUntil(timeout: .seconds(1)) {
             !model.isSigningOut || model.signOutCleanupFailed
         }
         XCTAssertFalse(completedWhileHeld, "the purge waits for the close of the pending pair")
@@ -1736,7 +1729,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
             for close in heldCloses { await close.value }
         }
         XCTAssertFalse(pending.store.isOperational(), "the held close of the retired pair ends")
-        let reopenedByCancelledLoad = await waitForMobileOwner(timeout: .milliseconds(500)) {
+        let reopenedByCancelledLoad = await yieldUntil(timeout: .milliseconds(500)) {
             model.locationStoreLeaseForTesting != newerLease
         }
         XCTAssertFalse(reopenedByCancelledLoad, "the cancelled load opens no location store after the close ends")
@@ -1802,7 +1795,7 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
         let openWhileHeld = await pending.session.delete([])
         XCTAssertTrue(openWhileHeld)
         XCTAssertTrue(pending.store.isOperational())
-        let completedWhileHeld = await waitForMobileOwner(timeout: .seconds(1)) {
+        let completedWhileHeld = await yieldUntil(timeout: .seconds(1)) {
             !model.isSigningOut || model.signOutCleanupFailed
         }
         XCTAssertFalse(completedWhileHeld)
@@ -1852,63 +1845,4 @@ final class MobileAccountOwnerAdapterTests: XCTestCase {
             error.localizedDescription.contains("the never-arriving event"),
             "The failure must name the awaited event: \(error.localizedDescription)")
     }
-}
-
-@MainActor private func waitForMobileOwner(
-    timeout: Duration = .seconds(5), _ condition: () async -> Bool
-) async -> Bool {
-    let deadline = ContinuousClock.now + timeout
-    while !(await condition()) && ContinuousClock.now < deadline { await Task.yield() }
-    return await condition()
-}
-
-@MainActor private struct MobilePendingOwnerFixture {
-    private let suite = "mobile-pending-owner-" + UUID().uuidString
-    private let directory: URL
-    private let defaults: UserDefaults
-    let store: PendingBackupManifestStore
-    private let controller: PhotoLibraryBackupController
-    let session: PendingGridSession
-
-    init(model: MobileLibraryModel) throws {
-        directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
-        defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        store = try XCTUnwrap(PendingGridSession.openStore(accountDataDirectory: directory, policy: .conservative))
-        let backend = PendingOwnerBackend()
-        controller = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: backend, uploader: backend, pendingStore: store, requiresPendingStore: true)
-        model.installIsolatedPendingBackupForTesting(controller, store: store, remote: backend)
-        session = try XCTUnwrap(model.pendingGrid)
-    }
-
-    func close() async {
-        await session.close()
-        await controller.shutdown()
-        store.close()
-        defaults.removePersistentDomain(forName: suite)
-        try? FileManager.default.removeItem(at: directory)
-    }
-}
-
-private struct PendingOwnerBackend: PhotoUploading, UploadIdentityResolving, PendingRemoteEffects {
-    let capabilities = UploadBackendCapabilities(
-        canUpload: false, supportsCancel: true, supportsPauseResume: false, supportsResumeAcrossRelaunch: false)
-    func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
-        throw CancellationError()
-    }
-    func upload(
-        _ request: PhotoUploadRequest, onProgress: @escaping @Sendable (UploadProgress) -> Void
-    ) async throws -> PhotoUID { throw CancellationError() }
-    func cancel(token: UUID) async {}
-    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
-        throw CancellationError()
-    }
-    func recordUploaded(
-        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String, remoteLinkID: String
-    ) async throws { throw CancellationError() }
-    func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .done }
-    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
 }

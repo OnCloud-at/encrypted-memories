@@ -15,6 +15,15 @@ import UploadCore
         func increment() { lock.withLock { value += 1 } }
     }
 
+    private final class StoreBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var held: PendingBackupManifestStore?
+        var store: PendingBackupManifestStore? {
+            get { lock.withLock { held } }
+            set { lock.withLock { held = newValue } }
+        }
+    }
+
     private func makeLibrary(confirmsNoPendingMerges: Bool) async throws -> (MobileLibraryModel, Count) {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 2)
         let emptied = Count()
@@ -42,7 +51,7 @@ import UploadCore
         let (model, emptied) = try await makeLibrary(confirmsNoPendingMerges: false)
 
         let checks = Count()
-        model.installIsolatedDuplicatesForTesting(CountingDuplicates(checks: checks))
+        model.installIsolatedDuplicatesForTesting(countingDuplicates(checks))
 
         try await model.emptyTrash(includesProtonTrash: false)
 
@@ -54,34 +63,27 @@ import UploadCore
     func pendingRemovalPrecedesProtonAndFailureStopsIt(storeFails: Bool) async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 2)
         let model = MobileLibraryModel()
-        let suite = "mobile-empty-trash-\(UUID().uuidString)"
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        let store = try #require(PendingGridSession.openStore(accountDataDirectory: directory, policy: .conservative))
-        defer {
-            store.close()
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
-        }
         let source = PendingSourceKey(kind: .photoLibraryAsset, identifier: "fixture-paused-photo")
         let emptied = Count()
+        let storeBox = StoreBox()
         var backend = MobileFixtureBackend(sections: fixture.sections, thumbnails: [:])
         backend.trashEmptier = {
-            #expect(store.sourceState(for: source)?.listedInTrash == false, "pending removal must finish before Proton")
+            #expect(
+                storeBox.store?.sourceState(for: source)?.listedInTrash == false,
+                "pending removal must finish before Proton")
             emptied.increment()
         }
         fixture.install(
             into: model, backend: backend, sections: fixture.sections, thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         model.installIsolatedDuplicatesForTesting(MobileFixtureDuplicates(groups: []))
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: PendingBackend(), uploader: PendingBackend(), pendingStore: store,
-            requiresPendingStore: true)
+        let pending = try MobilePendingOwnerFixture(
+            model: model, canUpload: true, remote: PendingRemote(),
+            prepare: { #expect($0.installPausedBackupFixtureForTesting()) })
+        let store = pending.store
+        storeBox.store = store
         do {
-            #expect(controller.installPausedBackupFixtureForTesting())
-            model.installIsolatedPendingBackupForTesting(controller, store: store, remote: PendingRemote())
-            let session = try #require(model.pendingGrid)
+            let session = pending.session
             #expect(await eventually { session.pendingSnapshot.tiles.contains { $0.item.uid == source.localUID } })
             #expect(await session.delete([source.localUID]))
             #expect(await eventually { model.pendingTrash.localUIDs == [source.localUID] })
@@ -99,18 +101,16 @@ import UploadCore
                 #expect(await eventually { model.pendingTrash.isEmpty })
             }
         } catch {
-            await model.pendingGrid?.close()
-            await controller.shutdown()
+            await pending.close()
             throw error
         }
-        await model.pendingGrid?.close()
-        await controller.shutdown()
+        await pending.close()
     }
 
     @Test func withoutABackendEmptyingDoesNothing() async throws {
         let model = MobileLibraryModel()
         let checks = Count()
-        model.installIsolatedDuplicatesForTesting(CountingDuplicates(checks: checks))
+        model.installIsolatedDuplicatesForTesting(countingDuplicates(checks))
 
         try await model.emptyTrash()
 
@@ -119,53 +119,12 @@ import UploadCore
     }
 
     private func eventually(_ condition: () -> Bool) async -> Bool {
-        let deadline = ContinuousClock.now + .seconds(10)
-        while !condition() && ContinuousClock.now < deadline { await Task.yield() }
-        return condition()
+        await yieldUntil(timeout: .seconds(10), condition)
     }
 
-    private struct CountingDuplicates: ExactDuplicateMerging {
-        func excludingMerges(_ body: () async throws -> Void) async throws { try await body() }
-        let checks: Count
-        private let base = MobileFixtureDuplicates(groups: [], confirmsNoPendingMerges: false)
-        func confirmNoPendingMerges() async -> Bool {
-            checks.increment()
-            return await base.confirmNoPendingMerges()
-        }
-        func duplicateGroups(
-            progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
-        ) async throws -> ExactDuplicateScan { try await base.duplicateGroups(progress: progress) }
-        func prepareIndex(
-            progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
-        ) async throws -> Bool { try await base.prepareIndex(progress: progress) }
-        func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
-            await base.fallbackMembers(of: groups)
-        }
-        func rankMembers(
-            of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
-        ) async { await base.rankMembers(of: groups, ranked: ranked) }
-        func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
-            await base.merge(requests)
-        }
-    }
-
-    private struct PendingBackend: PhotoUploading, UploadIdentityResolving {
-        let capabilities = UploadBackendCapabilities(
-            canUpload: true, supportsCancel: true, supportsPauseResume: false, supportsResumeAcrossRelaunch: false)
-        func upload(
-            _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
-        ) async throws -> PhotoUID { throw CancellationError() }
-        func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
-            throw CancellationError()
-        }
-        func cancel(token: UUID) async {}
-        func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
-            throw CancellationError()
-        }
-        func recordUploaded(
-            _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String,
-            remoteLinkID: String
-        ) async throws { throw CancellationError() }
+    private func countingDuplicates(_ checks: Count) -> MobileFixtureDuplicates {
+        MobileFixtureDuplicates(
+            groups: [], confirmsNoPendingMerges: false, onConfirmNoPendingMerges: { checks.increment() })
     }
 
     private struct PendingRemote: PendingRemoteEffects {

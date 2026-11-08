@@ -147,10 +147,6 @@ final class MobileGridRotationTests: XCTestCase {
                 .min { ($0.slotRect.minY, $0.slotRect.minX) < ($1.slotRect.minY, $1.slotRect.minX) })
         return (slot.index, slot.slotRect.minY - usableTop)
     }
-
-    @MainActor private func descendants(_ view: UIView) -> [UIView] {
-        [view] + view.subviews.flatMap(descendants)
-    }
 }
 
 /// The library route's chrome around the production grid: a tab bar, a navigation stack with a large title, and a
