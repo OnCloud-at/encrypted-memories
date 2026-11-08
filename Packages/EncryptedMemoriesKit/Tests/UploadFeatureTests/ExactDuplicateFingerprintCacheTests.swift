@@ -449,15 +449,6 @@ private final class HeldRanking: EditScenarioDuplicateRemote, @unchecked Sendabl
 
     init(base: EditScenarioServer) { self.base = base }
 
-    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         await gate.pass()
         return try await base.favoriteUIDs(among: uids)
