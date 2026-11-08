@@ -185,12 +185,14 @@ public enum FolderEnumerator {
 
         private let fileManager: FileManager
         private let options: FileManager.DirectoryEnumerationOptions
-        private let keys: [URLResourceKey] = [
+        private static let keys: [URLResourceKey] = [
             .isRegularFileKey,
             .isDirectoryKey,
             .isPackageKey,
             .isSymbolicLinkKey,
         ]
+        /// The same keys as a set, built once instead of for each listed entry.
+        private static let keySet = Set(keys)
         private var nextDirectory: URL?
         private var frames: [DirectoryFrame] = []
 
@@ -225,7 +227,7 @@ public enum FolderEnumerator {
                 frames[frameIndex].nextIndex += 1
                 let values: URLResourceValues
                 do {
-                    values = try url.resourceValues(forKeys: Set(keys))
+                    values = try url.resourceValues(forKeys: Self.keySet)
                 } catch {
                     let failure = FolderEnumerationError(
                         operation: .resourceValues,
@@ -252,7 +254,7 @@ public enum FolderEnumerator {
             do {
                 children = try fileManager.contentsOfDirectory(
                     at: directory,
-                    includingPropertiesForKeys: keys,
+                    includingPropertiesForKeys: Self.keys,
                     options: options
                 )
             } catch {
