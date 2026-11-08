@@ -337,7 +337,7 @@ final class BackupStatusProjectorTests: XCTestCase {
                 outstandingCount: projection.status.outstandingCount, queueDate: projection.status.nextAttemptAt,
                 consecutiveNoProgressRuns: 0, now: now, retryPolicy: BackupRetryPolicy()), due)
         var failures: [BackupFailedItem] = []
-        queue.forEachProblemEntry {
+        try queue.decisionForEachProblemEntry {
             failures.append(BackupFailedItem(entry: $0))
             return true
         }
@@ -400,7 +400,7 @@ final class BackupStatusProjectorTests: XCTestCase {
         XCTAssertNotNil(display.localizedWaitingDetail)
         XCTAssertEqual(display.nextAttemptAt, draft.updatedAt)
         var failures: [BackupFailedItem] = []
-        queue.forEachProblemEntry {
+        try queue.decisionForEachProblemEntry {
             failures.append(BackupFailedItem(entry: $0))
             return true
         }
