@@ -4852,15 +4852,6 @@ private final class FavoritesGatedRemote: EditScenarioDuplicateRemote, @unchecke
 
     init(base: EditScenarioServer) { self.base = base }
 
-    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         await gate.pass()
         return try await base.favoriteUIDs(among: uids)
@@ -4884,15 +4875,6 @@ private final class TrashStoppingRemote: EditScenarioDuplicateRemote, @unchecked
         await gate.pass()
         if throwsWhenCancelled { try Task.checkCancellation() }
     }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Holds every restore before it reaches the server while its gate is closed, and counts the restores that arrived.
@@ -4906,20 +4888,11 @@ private final class RestoreGatedRemote: EditScenarioDuplicateRemote, @unchecked 
 
     var arrivals: Int { lock.withLock { _arrivals } }
 
-    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {
         lock.withLock { _arrivals += 1 }
         await gate.pass()
         try await base.restoreDuplicates(uids)
     }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Turns true once.
@@ -4936,18 +4909,9 @@ private struct TimelineDatesRemote: EditScenarioDuplicateRemote {
     let base: EditScenarioServer
     let unknown: Set<PhotoUID>
 
-    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
         await base.captureDates(of: uids).filter { !unknown.contains($0.key) }
     }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Runs `before` right before each trash, for example the trash of another device.
@@ -4959,15 +4923,6 @@ private struct BeforeTrashRemote: EditScenarioDuplicateRemote {
         await before()
         try await base.trashDuplicates(uids)
     }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Records the photos whose dates the device is asked for.
@@ -4980,19 +4935,10 @@ private final class DateReadCountingRemote: EditScenarioDuplicateRemote, @unchec
 
     var asked: [Set<PhotoUID>] { lock.withLock { _asked } }
 
-    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
         lock.withLock { _asked.append(Set(uids)) }
         return await base.captureDates(of: uids)
     }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Holds callers until `count` callers arrived, or for at most 10 seconds, so a missing caller fails the test instead
@@ -5038,16 +4984,9 @@ private struct MemberDroppingRemote: EditScenarioDuplicateRemote {
     let base: EditScenarioServer
     let drop: PhotoUID
 
-    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await base.nodeFacts(of: uids).filter { $0.key != drop }
     }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Holds callers until it opens.
@@ -5331,15 +5270,6 @@ private final class CopyingDuplicateRemote: EditScenarioDuplicateRemote, @unchec
         try await beforeTrash?()
         try await base.trashDuplicates(uids)
     }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
 }
 
 private final class CopyPolicySequence: @unchecked Sendable {
@@ -5377,16 +5307,6 @@ private final class UnavailableCopyProbe: EditScenarioDuplicateRemote, @unchecke
         lock.withLock { counted.uploads += 1 }
         return try await base.uploadRelatedFile(request)
     }
-    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
-    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
-    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
-        try await base.nodeFacts(of: uids)
-    }
-    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
-    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
 }
 
 /// Holds the actual pre-trash lineage read after copy verification, while all other merge reads use the same server.
