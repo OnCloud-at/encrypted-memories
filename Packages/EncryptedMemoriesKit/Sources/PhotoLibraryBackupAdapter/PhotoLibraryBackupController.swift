@@ -1178,8 +1178,13 @@ public final class PhotoLibraryBackupController {
                 entry, attempts: entry.state == .failed ? 0 : entry.attempts, updatedAt: now)
         }
         noteProblemListChange()
-        guard queueStore.recordedFailureCount() == failuresBeforeReopen, queueStore.isOperational() else {
-            lastMessage = L10n.string("backup.error_local_state_unavailable")
+        let failuresAfterReopen = queueStore.recordedFailureCount()
+        let queueIsOperational = queueStore.isOperational()
+        guard failuresAfterReopen == failuresBeforeReopen, queueIsOperational else {
+            lastMessage =
+                queueIsOperational
+                ? L10n.string("backup.error_retry_incomplete")
+                : L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
             return
         }

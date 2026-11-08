@@ -1666,6 +1666,24 @@
         }
       }
     },
+    "backup.error_retry_incomplete": {
+      "extractionState": "manual",
+      "comment": "Retry did not reopen every photo after a transient local queue failure. The failed photos keep Retry.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Some photos were not retried; try again."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nicht alle Fotos wurden erneut versucht; versuche es noch einmal."
+          }
+        }
+      }
+    },
     "backup.error_local_state_unavailable": {
       "extractionState": "manual",
       "comment": "Backup cannot continue safely because its local persistent queue is unavailable.",

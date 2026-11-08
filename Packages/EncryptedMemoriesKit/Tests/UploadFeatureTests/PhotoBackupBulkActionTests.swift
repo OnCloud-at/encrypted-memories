@@ -279,9 +279,7 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         try fixture.park("held", at: date)
         let captured = await fixture.controller.prepareBackUpAgain()
         let confirmation = try XCTUnwrap(captured)
-        let stored = try XCTUnwrap(Mirror(reflecting: fixture.controller).children.first { $0.label == "queueStore" })
-        let queue = try XCTUnwrap(
-            Mirror(reflecting: stored.value).children.first?.value as? UploadBackupSyncQueueManifestStore)
+        let queue = try photoBackupQueueStore(fixture.controller)
         XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
         let deadline = ContinuousClock.now + .seconds(3)
         while !(await gate.hasStarted), ContinuousClock.now < deadline {

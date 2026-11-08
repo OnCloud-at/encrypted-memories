@@ -12,6 +12,13 @@ func storeConnection(_ store: Any) throws -> SQLiteStoreConnection {
         Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value as? SQLiteStoreConnection)
 }
 
+/// The photo backup controller's own queue store, including in Release tests without its DEBUG accessor.
+func photoBackupQueueStore(_ controller: Any) throws -> UploadBackupSyncQueueManifestStore {
+    try XCTUnwrap(
+        Mirror(reflecting: controller).children.first(where: { $0.label == "queueStore" })?.value
+            as? UploadBackupSyncQueueManifestStore)
+}
+
 /// Pending-grid effects that succeed without doing anything.
 struct InertPendingEffects: PendingBackupEffects {
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool { true }

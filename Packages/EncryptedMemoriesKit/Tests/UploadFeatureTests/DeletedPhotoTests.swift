@@ -728,9 +728,7 @@ final class DeletedPhotoTests: XCTestCase {
         let controller = PhotoLibraryBackupController(
             configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
             identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
-        let queue = try XCTUnwrap(
-            Mirror(reflecting: controller).children.first(where: { $0.label == "queueStore" })?.value
-                as? UploadBackupSyncQueueManifestStore)
+        let queue = try photoBackupQueueStore(controller)
         let observer = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
