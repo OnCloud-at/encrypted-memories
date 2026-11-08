@@ -515,12 +515,19 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private var unknownEntryReadCount = 0
     var failedEntryReads: Int { lock.withLock { unknownEntryReadCount } }
     private var reconciliationHook: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)?
+    private var stateWriteHook: (@Sendable (UploadSourceIdentity, UploadBackupSyncQueueState) -> Bool)?
 
     /// Runs before each receipt reaches the row, after the upload returned its uid. False fails the write as a broken
     /// store does.
     var beforeReconciliationMark: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)? {
         get { lock.withLock { reconciliationHook } }
         set { lock.withLock { reconciliationHook = newValue } }
+    }
+
+    /// Runs before each state write reaches the row. False refuses the write without recording a store failure.
+    var beforeStateWrite: (@Sendable (UploadSourceIdentity, UploadBackupSyncQueueState) -> Bool)? {
+        get { lock.withLock { stateWriteHook } }
+        set { lock.withLock { stateWriteHook = newValue } }
     }
 
     /// With `failsRunnableDateRead`, the read of the next due date fails as a broken SQLite read does: it returns nil
@@ -599,6 +606,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         updatedAt: Date
     ) -> Bool {
         log.append("queue.state:\(state.rawValue)")
+        guard beforeStateWrite?(source, state) ?? true else { return false }
         return inner.updateState(
             source: source, revision: revision, state: state,
             attempts: attempts, lastError: lastError, updatedAt: updatedAt)
@@ -4148,6 +4156,30 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: next), .discovered)
     }
 
+    /// Every state change is written before the runner reports it. A refused write ends the pass, and no progress report
+    /// counts the state that the queue does not hold.
+    func testARefusedStateWriteEndsThePassAndIsNeverReported() async throws {
+        let failing = seedEntry("state-write-fails.jpg", ageSeconds: 120)
+        let next = seedEntry("next.jpg")
+        let queue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        let runner = makeRunner(queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1))
+        let recorder = BackupProgressRecorder()
+        await runner.setOnProgress { recorder.append($0) }
+        // Only the first write to uploading fails, so a runner that kept the pass running uploads the next photo.
+        queue.beforeStateWrite = { [weak queue] source, state in
+            guard source == failing.source, state == .uploading else { return true }
+            queue?.beforeStateWrite = nil
+            return false
+        }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty, "a refused state write ends the pass")
+        XCTAssertEqual(state(of: next), .discovered)
+        XCTAssertNotEqual(state(of: failing), .uploading, "the refused write changed nothing")
+        XCTAssertFalse(recorder.snapshots.contains { $0.uploading > 0 }, "no report counts the refused state")
+    }
+
     // MARK: - A pending row that this build cannot read (#982)
 
     /// A photo was claimed, and a newer build then wrote its pending row with a value that this build does not know
@@ -5025,6 +5057,51 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: entry), .alreadyBackedUp)
         XCTAssertEqual(progress.backedUp, 1)
         XCTAssertEqual(hasher.hashCount, 1, "the persisted identity must spare the rehash on retry")
+    }
+
+    func testOrdinaryRetryPublishesOnceAfterItsWriteAndNeverAfterARefusedWrite() async throws {
+        let store = try XCTUnwrap(queueStore)
+        for refusesWrite in [false, true] {
+            let entry = seedEntry("ordinary-retry-\(refusesWrite).jpg")
+            defer { XCTAssertTrue(store.remove(source: entry.source, revision: entry.revision)) }
+            resolver.set(.transientFailure(times: 1), for: entry.source.identifier)
+            let eligibleAt = clock.now.addingTimeInterval(8)
+            let log = BackupEventLog()
+            let queue = SpyQueueStore(inner: store, log: log)
+            queue.beforeStateWrite = { _, state in !refusesWrite || state != .discovered }
+            let runner = makeRunner(
+                queue: queue, retry: BackupRetryPolicy(baseDelay: 8, maxDelay: 8, maxAttempts: 3),
+                throttle: BackupThrottlePolicy(baseConcurrency: 1))
+            await runner.setOnProgress { progress in
+                // The transition still names the item. Its separate process-defer publication clears the name.
+                guard progress.currentItemName == entry.originalFilename,
+                    log.events.contains("queue.state:discovered")
+                else { return }
+                let persisted = try? store.entry(for: entry.source, revision: entry.revision)
+                log.append(
+                    "retry-publication:\(persisted?.state.rawValue ?? "unknown"):\(persisted?.updatedAt == eligibleAt):\(progress.waiting):\(progress.checking)"
+                )
+            }
+
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+            let row = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+            let publications = log.events.filter { $0.hasPrefix("retry-publication:") }
+            XCTAssertEqual(log.events.filter { $0 == "queue.state:discovered" }.count, 1)
+            if refusesWrite {
+                XCTAssertEqual(row.state, .checking, "the refused retry write changes nothing")
+                XCTAssertEqual(row.attempts, 0)
+                XCTAssertTrue(publications.isEmpty, "a refused retry write publishes no transition")
+            } else {
+                XCTAssertEqual(row.state, .discovered)
+                XCTAssertEqual(row.attempts, 1, "the ordinary failure spends one attempt with more left")
+                XCTAssertEqual(row.updatedAt, eligibleAt)
+                XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.nextAttemptAt, eligibleAt)
+                XCTAssertEqual(
+                    publications, ["retry-publication:discovered:true:1:0"],
+                    "the retry publishes exactly once, after its state and date are stored")
+            }
+        }
     }
 
     func testTransientFailuresBackOffAndEventuallySucceed() async throws {

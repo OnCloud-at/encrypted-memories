@@ -1311,54 +1311,8 @@ public actor BackupSyncRunner {
                         message: L10n.string("backup.state_skipped_remote_deletion"), resolved: resolved)
 
                 case .draftExists:
-                    // Another upload (possibly our own crashed one) occupies the name. Park with
-                    // backoff; never a success state. A foreign/ownerless draft that outlives the
-                    // ordinary retry budget becomes an honest, dismissible permanent failure instead
-                    // of rechecking forever.
-                    let attempts = entry.attempts + 1
-                    if configuration.retry.shouldPark(attempts: attempts) {
-                        guard
-                            queue.updateState(
-                                source: entry.source,
-                                revision: entry.revision,
-                                state: .failedPermanent,
-                                attempts: attempts,
-                                lastError: BackupIssueRecord(
-                                    kind: .remoteDraftStale,
-                                    detail: L10n.string("backup.issue_remote_draft_stale")
-                                ).persistedValue,
-                                updatedAt: now()
-                            )
-                        else {
-                            stopRequested = true
-                            return
-                        }
-                        endActiveExecution(key: key, publish: false)
-                        adjustProgress(from: persistedState, to: .failedPermanent)
-                        emitProgress()
-                        return
-                    }
-                    let nextAttemptAt = now().addingTimeInterval(
-                        max(60, configuration.retry.delay(afterAttempts: attempts))
-                    )
-                    guard
-                        queue.updateState(
-                            source: entry.source, revision: entry.revision,
-                            state: .blockedByDraft, attempts: attempts,
-                            lastError: BackupIssueRecord(
-                                kind: .remoteDraft,
-                                detail: L10n.string("upload.error_remote_draft"),
-                                nextAttemptAt: nextAttemptAt
-                            ).persistedValue,
-                            updatedAt: nextAttemptAt
-                        )
-                    else {
-                        stopRequested = true
-                        return
-                    }
-                    endActiveExecution(key: key, publish: false)
-                    adjustProgress(from: persistedState, to: .blockedByDraft)
-                    emitProgress()
+                    // Another upload (possibly our own crashed one) occupies the name.
+                    parkBehindDraft(entry, from: persistedState, key: key, endsExecutionOnPermanentPark: true)
 
                 case .inconsistentRemoteState:
                     retryOrPark(
@@ -1637,16 +1591,9 @@ public actor BackupSyncRunner {
 
     /// Clears the receipt and returns the row to the ordinary path.
     private func requeueWithoutReceipt(_ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState) {
-        guard
-            queue.updateState(
-                source: entry.source, revision: entry.revision, state: .discovered, attempts: nil, lastError: nil,
-                updatedAt: now())
-        else {
-            stopRequested = true
-            return
-        }
-        adjustProgress(from: state, to: .discovered)
-        emitProgress()
+        persist(
+            entry, from: state, to: .discovered, attempts: nil, lastError: nil,
+            updatedAt: now())
     }
 
     private func parkRemoteReconciliation(
@@ -1805,51 +1752,8 @@ public actor BackupSyncRunner {
                     retryOrPark(entry, from: persistedState, error: error)
                     return
                 }
-                let attempts = entry.attempts + 1
-                if configuration.retry.shouldPark(attempts: attempts) {
-                    guard
-                        queue.updateState(
-                            source: entry.source,
-                            revision: entry.revision,
-                            state: .failedPermanent,
-                            attempts: attempts,
-                            lastError: BackupIssueRecord(
-                                kind: .remoteDraftStale,
-                                detail: L10n.string("backup.issue_remote_draft_stale")
-                            ).persistedValue,
-                            updatedAt: now()
-                        )
-                    else {
-                        stopRequested = true
-                        return
-                    }
-                    adjustProgress(from: persistedState, to: .failedPermanent)
-                    emitProgress()
-                    return
-                }
-                let nextAttemptAt = now().addingTimeInterval(
-                    max(60, configuration.retry.delay(afterAttempts: attempts))
-                )
-                guard
-                    queue.updateState(
-                        source: entry.source,
-                        revision: entry.revision,
-                        state: .blockedByDraft,
-                        attempts: attempts,
-                        lastError: BackupIssueRecord(
-                            kind: .remoteDraft,
-                            detail: L10n.string("upload.error_remote_draft"),
-                            nextAttemptAt: nextAttemptAt
-                        ).persistedValue,
-                        updatedAt: nextAttemptAt
-                    )
-                else {
-                    stopRequested = true
-                    return
-                }
-                endActiveExecution(key: Self.key(entry), publish: false)
-                adjustProgress(from: persistedState, to: .blockedByDraft)
-                emitProgress()
+                parkBehindDraft(
+                    entry, from: persistedState, key: Self.key(entry), endsExecutionOnPermanentPark: false)
                 return
             case .skippedRemoteDeletion:
                 finish(
@@ -1994,20 +1898,12 @@ public actor BackupSyncRunner {
                     endActiveExecution(key: Self.key(entry), publish: false)
                     return
                 }
-                guard
-                    queue.updateState(
-                        source: entry.source, revision: entry.revision, state: .failedPermanent,
-                        attempts: entry.attempts,
-                        lastError: BackupIssueRecord(
-                            kind: .deletedElsewhere, detail: L10n.string("backup.issue_deleted_elsewhere")
-                        ).persistedValue, updatedAt: now())
-                else {
-                    stopRequested = true
-                    return
-                }
-                endActiveExecution(key: Self.key(entry), publish: false)
-                adjustProgress(from: oldState, to: .failedPermanent)
-                emitProgress()
+                persist(
+                    entry, from: oldState, to: .failedPermanent, attempts: entry.attempts,
+                    lastError: BackupIssueRecord(
+                        kind: .deletedElsewhere, detail: L10n.string("backup.issue_deleted_elsewhere")
+                    ).persistedValue,
+                    updatedAt: now(), endingExecutionOf: Self.key(entry))
                 return
             }
             try journal.startDeletionCheck(at: now(), for: entry.source)
@@ -2292,16 +2188,10 @@ public actor BackupSyncRunner {
     ) -> UploadBackupSyncQueueState? {
         guard !sourceWasRemoved(entry) else { return nil }
         guard
-            queue.updateState(
-                source: entry.source, revision: entry.revision,
-                state: newState, attempts: nil, lastError: nil, updatedAt: now()
-            )
-        else {
-            stopRequested = true
-            return nil
-        }
-        adjustProgress(from: oldState, to: newState)
-        emitProgress()
+            persist(
+                entry, from: oldState, to: newState, attempts: nil, lastError: nil,
+                updatedAt: now())
+        else { return nil }
         return newState
     }
 
@@ -2393,6 +2283,54 @@ public actor BackupSyncRunner {
         adjustProgress(from: nil, to: terminal)
     }
 
+    /// Parks `entry` behind a remote draft with backoff; never a success state. A foreign or ownerless draft that
+    /// outlives the ordinary retry budget becomes an honest, dismissible permanent failure instead of rechecking
+    /// forever. `endsExecutionOnPermanentPark` keeps each caller's order of events for the permanent park.
+    private func parkBehindDraft(
+        _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState, key: String,
+        endsExecutionOnPermanentPark: Bool
+    ) {
+        let attempts = entry.attempts + 1
+        if configuration.retry.shouldPark(attempts: attempts) {
+            persist(
+                entry, from: oldState, to: .failedPermanent, attempts: attempts,
+                lastError: BackupIssueRecord(
+                    kind: .remoteDraftStale, detail: L10n.string("backup.issue_remote_draft_stale")
+                ).persistedValue,
+                updatedAt: now(), endingExecutionOf: endsExecutionOnPermanentPark ? key : nil)
+            return
+        }
+        let nextAttemptAt = now().addingTimeInterval(max(60, configuration.retry.delay(afterAttempts: attempts)))
+        persist(
+            entry, from: oldState, to: .blockedByDraft, attempts: attempts,
+            lastError: BackupIssueRecord(
+                kind: .remoteDraft, detail: L10n.string("upload.error_remote_draft"), nextAttemptAt: nextAttemptAt
+            ).persistedValue,
+            updatedAt: nextAttemptAt, endingExecutionOf: key)
+    }
+
+    /// Persists the new state of `entry` before anything else: a failed write stops the drain and returns false. After
+    /// the write it ends the active execution of `key` when one is given, then mirrors and reports the change.
+    @discardableResult
+    private func persist(
+        _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState,
+        to newState: UploadBackupSyncQueueState, attempts: Int?, lastError: String?, updatedAt: Date,
+        endingExecutionOf key: String? = nil
+    ) -> Bool {
+        guard
+            queue.updateState(
+                source: entry.source, revision: entry.revision, state: newState, attempts: attempts,
+                lastError: lastError, updatedAt: updatedAt)
+        else {
+            stopRequested = true
+            return false
+        }
+        if let key { endActiveExecution(key: key, publish: false) }
+        adjustProgress(from: oldState, to: newState)
+        emitProgress()
+        return true
+    }
+
     /// Defers a source with unfinished resources without spending its failure budget or claiming backup success.
     private func deferSource(
         _ entry: UploadBackupSyncQueueEntry,
@@ -2402,20 +2340,9 @@ public actor BackupSyncRunner {
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
-        guard
-            queue.updateState(
-                source: entry.source, revision: entry.revision,
-                state: .discovered,
-                attempts: entry.attempts,
-                lastError: issue?.persistedValue,
-                updatedAt: max(eligibleAt, now())
-            )
-        else {
-            stopRequested = true
-            return
-        }
-        adjustProgress(from: oldState, to: .discovered)
-        emitProgress()
+        persist(
+            entry, from: oldState, to: .discovered, attempts: entry.attempts, lastError: issue?.persistedValue,
+            updatedAt: max(eligibleAt, now()))
     }
 
     /// A PhotoKit identity pass streams every resource. Metadata or a partial compound is insufficient.
@@ -2585,20 +2512,12 @@ public actor BackupSyncRunner {
             }
             let checks = Self.sourceWaits(of: entry, detail: detail)
             guard checks < Self.reportedMissingRechecks else {
-                guard
-                    queue.updateState(
-                        source: entry.source, revision: entry.revision,
-                        state: .sourceMissing, attempts: entry.attempts,
-                        lastError: BackupIssueRecord(
-                            kind: .sourceMissing, detail: detail, automaticRetryAttempt: checks
-                        ).persistedValue,
-                        updatedAt: now())
-                else {
-                    stopRequested = true
-                    return
-                }
-                adjustProgress(from: oldState, to: .sourceMissing)
-                emitProgress()
+                persist(
+                    entry, from: oldState, to: .sourceMissing, attempts: entry.attempts,
+                    lastError: BackupIssueRecord(
+                        kind: .sourceMissing, detail: detail, automaticRetryAttempt: checks
+                    ).persistedValue,
+                    updatedAt: now())
                 return
             }
             let eligibleAt = now().addingTimeInterval(
@@ -2620,22 +2539,12 @@ public actor BackupSyncRunner {
             let eligibleAt = now().addingTimeInterval(
                 max(30, configuration.retry.delay(afterAttempts: resourcePressureStreak))
             )
-            guard
-                queue.updateState(
-                    source: entry.source, revision: entry.revision,
-                    state: .discovered,
-                    attempts: entry.attempts,
-                    lastError: BackupIssueRecord(
-                        kind: .deviceStorage, detail: message, nextAttemptAt: eligibleAt
-                    ).persistedValue,
-                    updatedAt: eligibleAt
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: oldState, to: .discovered)
-            emitProgress()
+            persist(
+                entry, from: oldState, to: .discovered, attempts: entry.attempts,
+                lastError: BackupIssueRecord(
+                    kind: .deviceStorage, detail: message, nextAttemptAt: eligibleAt
+                ).persistedValue,
+                updatedAt: eligibleAt)
             return
         }
 
@@ -2651,20 +2560,9 @@ public actor BackupSyncRunner {
                 detail: message,
                 previous: BackupIssueRecord.decode(entry.lastError)
             )
-            guard
-                queue.updateState(
-                    source: entry.source, revision: entry.revision,
-                    state: .discovered,
-                    attempts: entry.attempts,
-                    lastError: issue.persistedValue,
-                    updatedAt: issue.nextAttemptAt ?? now()
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: oldState, to: .discovered)
-            emitProgress()
+            persist(
+                entry, from: oldState, to: .discovered, attempts: entry.attempts, lastError: issue.persistedValue,
+                updatedAt: issue.nextAttemptAt ?? now())
             return
         }
 
@@ -2673,22 +2571,12 @@ public actor BackupSyncRunner {
         // Freeing space or a larger plan and Back Up Now take it up at once.
         if case UploadError.accountStorageFull = error {
             let eligibleAt = now().addingTimeInterval(Self.accountStorageRecheckInterval)
-            guard
-                queue.updateState(
-                    source: entry.source, revision: entry.revision,
-                    state: .discovered,
-                    attempts: entry.attempts,
-                    lastError: BackupIssueRecord(
-                        kind: .accountStorage, detail: message, nextAttemptAt: eligibleAt
-                    ).persistedValue,
-                    updatedAt: eligibleAt
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: oldState, to: .discovered)
-            emitProgress()
+            persist(
+                entry, from: oldState, to: .discovered, attempts: entry.attempts,
+                lastError: BackupIssueRecord(
+                    kind: .accountStorage, detail: message, nextAttemptAt: eligibleAt
+                ).persistedValue,
+                updatedAt: eligibleAt)
             return
         }
 
@@ -2702,20 +2590,9 @@ public actor BackupSyncRunner {
                 detail: message,
                 previous: BackupIssueRecord.decode(entry.lastError)
             )
-            guard
-                queue.updateState(
-                    source: entry.source, revision: entry.revision,
-                    state: .discovered,
-                    attempts: entry.attempts,
-                    lastError: issue.persistedValue,
-                    updatedAt: issue.nextAttemptAt ?? now()
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: oldState, to: .discovered)
-            emitProgress()
+            persist(
+                entry, from: oldState, to: .discovered, attempts: entry.attempts, lastError: issue.persistedValue,
+                updatedAt: issue.nextAttemptAt ?? now())
             return
         }
 
@@ -2736,25 +2613,16 @@ public actor BackupSyncRunner {
             }
             clearRemoteIndexExecutionFraction()
             adjustProgress(from: oldState, to: .failed)
+            emitProgress()
         } else {
             let eligibleAt = now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempts))
-            guard
-                queue.updateState(
-                    source: entry.source, revision: entry.revision,
-                    state: .discovered,
-                    attempts: attempts,
-                    lastError: BackupIssueRecord(
-                        kind: issue, detail: message, nextAttemptAt: eligibleAt
-                    ).persistedValue,
-                    updatedAt: eligibleAt
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: oldState, to: .discovered)
+            persist(
+                entry, from: oldState, to: .discovered, attempts: attempts,
+                lastError: BackupIssueRecord(
+                    kind: issue, detail: message, nextAttemptAt: eligibleAt
+                ).persistedValue,
+                updatedAt: eligibleAt)
         }
-        emitProgress()
     }
 
     /// Stop/cancel path: put the row back where the next pass picks it up, without burning an
@@ -2766,17 +2634,9 @@ public actor BackupSyncRunner {
             (oldState == .uploading || oldState == .finalizing)
             ? .queuedForUpload
             : .discovered
-        guard
-            queue.updateState(
-                source: entry.source, revision: entry.revision,
-                state: runnable, attempts: nil, lastError: entry.lastError, updatedAt: now()
-            )
-        else {
-            stopRequested = true
-            return
-        }
-        adjustProgress(from: oldState, to: runnable)
-        emitProgress()
+        persist(
+            entry, from: oldState, to: runnable, attempts: nil, lastError: entry.lastError,
+            updatedAt: now())
     }
 
     private func discardMissingSource(
