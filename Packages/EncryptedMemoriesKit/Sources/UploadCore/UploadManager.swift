@@ -171,51 +171,47 @@ public actor UploadManager {
 
     // MARK: - Enqueue
 
-    @discardableResult
-    public func enqueueFiles(_ urls: [URL], destination: UploadDestination) async -> [UploadQueueItemID] {
-        guard !isShuttingDown else { return [] }
+    /// The checks before an enqueue adds items, in this order: shutdown, the durable settlement, then the album. Nil
+    /// means that the enqueue adds nothing. A `failure` means that every item is added as failed with that message.
+    private func enqueuePreflight(
+        destination: UploadDestination
+    ) async -> (generation: UInt64, albumID: String?, failure: String?)? {
+        guard !isShuttingDown else { return nil }
         let generation = lifecycleGeneration
         ensureDurableSettlementReplay()
-        guard lifecycleIsCurrent(generation) else { return [] }
-        let settlementAvailable =
-            settlementStore?.isOperationalAllowingTransientRecovery() ?? !requiresDurableSettlement
-        guard settlementAvailable else {
-            let message = UploadError.backend("Durable manual upload settlement is unavailable.").errorDescription!
-            let ids = urls.map {
-                addItem(
-                    url: $0,
-                    destination: destination,
-                    cancellationToken: UUID(),
-                    resolvedAlbumID: nil,
-                    failure: message
-                )
-            }
-            notify()
-            return ids
+        guard lifecycleIsCurrent(generation) else { return nil }
+        guard settlementStore?.isOperationalAllowingTransientRecovery() ?? !requiresDurableSettlement else {
+            return (
+                generation, nil,
+                UploadError.backend("Durable manual upload settlement is unavailable.").errorDescription!
+            )
         }
-        guard let resolutionResult = await resolveAlbum(for: destination, generation: generation) else {
-            return []
+        guard let resolution = await resolveAlbum(for: destination, generation: generation) else { return nil }
+        switch resolution {
+        case .resolved(let albumID): return (generation, albumID, nil)
+        case .failed(let message): return (generation, nil, message)
         }
+    }
 
-        let resolvedAlbumID: String?
-        switch resolutionResult {
-        case .resolved(let albumID):
-            resolvedAlbumID = albumID
-        case .failed(let failureMessage):
-            // Destination can't be honoured (e.g. album creation unsupported). Surface every chosen
-            // file as failed so nothing uploads to the library behind the user's back.
+    @discardableResult
+    public func enqueueFiles(_ urls: [URL], destination: UploadDestination) async -> [UploadQueueItemID] {
+        guard let preflight = await enqueuePreflight(destination: destination) else { return [] }
+        if let failure = preflight.failure {
+            // Without durable settlement, or when the destination can't be honoured (e.g. album creation
+            // unsupported), every chosen file is failed so nothing uploads to the library behind the user's back.
             let ids = urls.map {
                 addItem(
                     url: $0,
                     destination: destination,
                     cancellationToken: UUID(),
                     resolvedAlbumID: nil,
-                    failure: failureMessage
+                    failure: failure
                 )
             }
             notify()
             return ids
         }
+        let resolvedAlbumID = preflight.albumID
 
         var ids: [UploadQueueItemID] = []
         for url in urls {
@@ -255,7 +251,7 @@ public actor UploadManager {
                 }
                 return .resolved(try await albums.resolveAlbum(for: destination.target))
             } catch {
-                return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                return .failed(Self.message(error))
             }
         }
         albumResolutionTasks[resolutionID] = resolution
@@ -307,32 +303,9 @@ public actor UploadManager {
 
     @discardableResult
     public func enqueueFolder(_ url: URL, destination: UploadDestination) async throws -> [UploadQueueItemID] {
-        guard !isShuttingDown else { return [] }
-        let generation = lifecycleGeneration
-        ensureDurableSettlementReplay()
-        guard lifecycleIsCurrent(generation) else { return [] }
-
-        let settlementAvailable =
-            settlementStore?.isOperationalAllowingTransientRecovery() ?? !requiresDurableSettlement
-        let settlementFailure =
-            settlementAvailable
-            ? nil
-            : UploadError.backend("Durable manual upload settlement is unavailable.").errorDescription!
-
-        var resolvedAlbumID: String?
-        var destinationFailure: String?
-        if settlementAvailable {
-            guard let resolutionResult = await resolveAlbum(for: destination, generation: generation) else {
-                return []
-            }
-
-            switch resolutionResult {
-            case .resolved(let albumID):
-                resolvedAlbumID = albumID
-            case .failed(let failureMessage):
-                destinationFailure = failureMessage
-            }
-        }
+        guard let preflight = await enqueuePreflight(destination: destination) else { return [] }
+        let generation = preflight.generation
+        let resolvedAlbumID = preflight.albumID
 
         var ids: [UploadQueueItemID] = []
         // Keep folder prefetch bounded while the queue starts work on the current prefix.
@@ -351,7 +324,7 @@ public actor UploadManager {
                     destination: destination,
                     cancellationToken: UUID(),
                     resolvedAlbumID: resolvedAlbumID,
-                    failure: settlementFailure ?? destinationFailure
+                    failure: preflight.failure
                 )
                 ids.append(id)
                 dedupeBatch.append(id)
@@ -554,20 +527,23 @@ public actor UploadManager {
                 await identityResolver?.remoteCommitNeedsReconciliation(descriptor)
                 return .failed(
                     record,
-                    message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    message: Self.message(error)
                 )
             }
         }
 
-        guard let albumID = record.resolvedAlbumID else {
+        /// Saves the record as completed. A refused write keeps the settlement failed with `failure`.
+        func settleCompleted(failure: String) -> DurableSettlementOutcome {
             record.stage = .terminal
             record.terminalState = .completed
             record.lastError = nil
             record.updatedAt = now()
-            guard settlementStore.upsert(record) else {
-                return .failed(record, message: "Manual upload settlement could not be persisted.")
-            }
+            guard settlementStore.upsert(record) else { return .failed(record, message: failure) }
             return .settled(record)
+        }
+
+        guard let albumID = record.resolvedAlbumID else {
+            return settleCompleted(failure: "Manual upload settlement could not be persisted.")
         }
 
         record.stage = .albumPending
@@ -588,18 +564,11 @@ public actor UploadManager {
         } catch {
             return .failed(
                 record,
-                message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                message: Self.message(error)
             )
         }
 
-        record.stage = .terminal
-        record.terminalState = .completed
-        record.lastError = nil
-        record.updatedAt = now()
-        guard settlementStore.upsert(record) else {
-            return .failed(record, message: "Manual album settlement could not be persisted.")
-        }
-        return .settled(record)
+        return settleCompleted(failure: "Manual album settlement could not be persisted.")
     }
 
     private func updateDurableItemAsFinalizing(_ record: UploadManualSettlementRecord) {
@@ -985,11 +954,7 @@ public actor UploadManager {
                     // The store cannot confirm that no settlement record exists. Never treat the
                     // unreadable row as absence: album attachment and completion would duplicate
                     // a settlement that a later read can still see. Keep the item retryable.
-                    if jobs[id]?.resolvedAlbumID != nil {
-                        markPartialFailure(id, message: "Durable manual upload settlement could not be read.")
-                    } else {
-                        transition(id, to: .failed(message: "Durable manual upload settlement could not be read."))
-                    }
+                    failKeepingUpload(id, message: "Durable manual upload settlement could not be read.")
                     finish(id)
                     return
                 }
@@ -1010,7 +975,7 @@ public actor UploadManager {
                     try await attachToAlbum(uploadedUID, albumID: albumID, cover: jobs[id]?.destination.cover)
                 } catch {
                     // The photo upload succeeded, but the album step failed. Keep the partial-success state.
-                    markPartialFailure(id, message: message(error))
+                    markPartialFailure(id, message: Self.message(error))
                     finish(id)
                     return
                 }
@@ -1040,20 +1005,14 @@ public actor UploadManager {
                 // it (#1226). When the write fails again, keep the item failed with its receipt.
                 if let written = writeUnwrittenReceiptRow(id) {
                     settleReceiptRow(written)
-                } else if jobs[id]?.resolvedAlbumID != nil {
-                    markPartialFailure(id, message: settlement.settlementMessage)
                 } else {
-                    transition(id, to: .failed(message: settlement.settlementMessage))
+                    failKeepingUpload(id, message: settlement.settlementMessage)
                 }
             case .absent, .unreadable:
                 // Without a readable record the receipt exists only in memory. Keep the item
                 // failed: Retry writes its row again while the store can work (#1226). An
                 // unreadable row is never treated as absence (#1104).
-                if jobs[id]?.resolvedAlbumID != nil {
-                    markPartialFailure(id, message: settlement.settlementMessage)
-                } else {
-                    transition(id, to: .failed(message: settlement.settlementMessage))
-                }
+                failKeepingUpload(id, message: settlement.settlementMessage)
             }
         } catch is CancellationError {
             transition(id, to: .cancelled)
@@ -1061,7 +1020,7 @@ public actor UploadManager {
             if currentState(id) == .cancelled || currentState(id) == .paused {
                 // already handled by cancel()/pause()
             } else {
-                transition(id, to: .failed(message: message(error)))
+                transition(id, to: .failed(message: Self.message(error)))
             }
         }
         finish(id)
@@ -1225,6 +1184,16 @@ public actor UploadManager {
                 destination: job.destination,
                 resolvedAlbumID: job.resolvedAlbumID
             ))
+    }
+
+    /// Fails an item whose upload may have reached Proton. An album item keeps the partial-success state, so its
+    /// photo is not uploaded again; any other item fails.
+    private func failKeepingUpload(_ id: UploadQueueItemID, message: String) {
+        if jobs[id]?.resolvedAlbumID != nil {
+            markPartialFailure(id, message: message)
+        } else {
+            transition(id, to: .failed(message: message))
+        }
     }
 
     private func markPartialFailure(_ id: UploadQueueItemID, message: String) {
@@ -1538,7 +1507,7 @@ public actor UploadManager {
         } catch {
             if jobs[id]?.generation == generation, jobs[id]?.retryRequested == true {
                 jobs[id]?.retryRequested = false
-                markPartialFailure(id, message: message(error))
+                markPartialFailure(id, message: Self.message(error))
             }
         }
         finishControl(id, controlID: controlID)
@@ -1665,7 +1634,7 @@ public actor UploadManager {
         onSequencedChange?(nextChangeSequence, items, stats)
     }
 
-    private func message(_ error: Error) -> String {
+    private nonisolated static func message(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 }
