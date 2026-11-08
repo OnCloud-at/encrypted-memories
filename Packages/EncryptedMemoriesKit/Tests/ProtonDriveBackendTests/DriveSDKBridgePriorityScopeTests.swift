@@ -45,7 +45,7 @@ struct DriveSDKBridgePriorityScopeTests {
 
         // An upload acquire waits while any scope that holds uploads is open.
         let upload = Task { try await governor.acquire(scope: .storageUpload, priority: .background) }
-        let admitted = await Self.eventually(timeout: .seconds(5)) {
+        let admitted = await eventually(timeout: .seconds(5)) {
             await governor.snapshot().storageUpload.inFlight == 1
         }
         #expect(admitted, "the failed \(entry.rawValue) read left its priority scope open")
@@ -66,15 +66,6 @@ struct DriveSDKBridgePriorityScopeTests {
         case .prefetchEncrypted: try await bridge.prefetchEncrypted(for: uid)
         case .streamingAsset: _ = try await bridge.makeStreamingAsset(for: uid)
         }
-    }
-
-    private static func eventually(timeout: Duration, _ condition: () async -> Bool) async -> Bool {
-        let end = ContinuousClock.now + timeout
-        while ContinuousClock.now < end {
-            if await condition() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return await condition()
     }
 
     /// A bridge whose every request fails as if the device were offline. Other bridge suites reuse it.

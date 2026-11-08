@@ -119,7 +119,7 @@ struct DriveSessionRefreshTests {
         server.release(path, 1)
         // X handles its 401 now. A retry before refresh B ends would reach the server; give it the chance to.
         try #require(await server.waitUntilAnswered(path, 1))
-        _ = await server.eventually(timeout: .seconds(1)) { server.authorizations(for: path).count > 1 }
+        _ = await eventually(timeout: .seconds(1)) { server.authorizations(for: path).count > 1 }
         server.release(RefreshServer.refreshPath, 2)
 
         try await x.value
@@ -335,16 +335,6 @@ private final class RefreshServer: @unchecked Sendable {
     func waitUntilAnswered(_ path: String, _ occurrence: Int) async -> Bool {
         let key = "\(path)#\(occurrence)"
         return await eventually(timeout: .seconds(5)) { self.lock.withLock { self.answered.contains(key) } }
-    }
-
-    /// Polls a condition up to `timeout`; a false result is for the caller to judge.
-    func eventually(timeout: Duration, _ condition: () -> Bool) async -> Bool {
-        let end = ContinuousClock.now + timeout
-        while ContinuousClock.now < end {
-            if condition() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return condition()
     }
 
     /// The gate of this request when the test holds it.

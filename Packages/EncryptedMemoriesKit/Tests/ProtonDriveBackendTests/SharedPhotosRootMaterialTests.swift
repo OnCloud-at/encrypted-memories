@@ -97,10 +97,10 @@ struct SharedPhotosRootMaterialTests {
                 operation = { _ = try await dedupe.hashKeyEpoch() }
             }
             let first = env.start(operation)
-            try #require(await rootEventually { env.fixture.paths.count == 1 })
+            try #require(await eventually(timeout: .seconds(2)) { env.fixture.paths.count == 1 })
             let second = env.start(operation)
             // A second context lookup, if attempted, stays held until the first caller fills its cache.
-            _ = await rootEventually(timeout: .milliseconds(200)) { context.calls == 2 }
+            _ = await eventually(timeout: .milliseconds(200)) { context.calls == 2 }
             env.fixture.release()
             await first.join()
             context.release()
@@ -124,10 +124,10 @@ struct SharedPhotosRootMaterialTests {
                 operation = { _ = try await dedupe.hashKeyEpoch() }
             }
             let first = env.start(operation)
-            try #require(await rootEventually { env.fixture.paths.count == 1 })
+            try #require(await eventually(timeout: .seconds(2)) { env.fixture.paths.count == 1 })
             let second = env.start(operation)
             first.cancel()
-            #expect(await rootEventually { first.finished })
+            #expect(await eventually(timeout: .seconds(2)) { first.finished })
             env.fixture.release()
             await first.join()
             await second.join()
@@ -153,9 +153,9 @@ struct SharedPhotosRootMaterialTests {
                 work = env.start { _ = try await dedupe.hashKeyEpoch() }
                 shutdownOperation = { await dedupe.shutdown() }
             }
-            try #require(await rootEventually { context.calls == 1 })
+            try #require(await eventually(timeout: .seconds(2)) { context.calls == 1 })
             let shutdown = env.start { await shutdownOperation() }
-            let returnedWhileHeld = await rootEventually(timeout: .milliseconds(200)) { shutdown.finished }
+            let returnedWhileHeld = await eventually(timeout: .milliseconds(200)) { shutdown.finished }
             #expect(!returnedWhileHeld)
             context.release()
             env.fixture.release()
@@ -189,7 +189,7 @@ struct SharedPhotosRootMaterialTests {
                 _ = try await env.resolver.resolve(
                     session: env.session, crypto: env.fixture.crypto, context: env.fixture.shareContext)
             }
-            try #require(await rootEventually { env.fixture.paths.count == 1 })
+            try #require(await eventually(timeout: .seconds(2)) { env.fixture.paths.count == 1 })
             let otherSession = change == .session ? env.makeSession() : env.session
             let otherCrypto = change == .crypto ? DriveCrypto(addressKeys: [], signers: []) : env.fixture.crypto
             let context = PhotosShareContext(
@@ -202,7 +202,7 @@ struct SharedPhotosRootMaterialTests {
                 let expectedHash = change == .session ? env.fixture.otherHashToken : env.fixture.hashToken
                 #expect(value.hashKey == Data(expectedHash.utf8))
             }
-            try #require(await rootEventually { await env.resolver.waitingCount == 2 })
+            try #require(await eventually(timeout: .seconds(2)) { await env.resolver.waitingCount == 2 })
             #expect(await env.resolver.activeResolutionCount == 2)
             env.fixture.release()
             await first.join()
@@ -226,9 +226,9 @@ struct SharedPhotosRootMaterialTests {
             }
             let first = env.start(operation)
             let second = env.start(operation)
-            try #require(await rootEventually { await env.resolver.waitingCount == 2 })
+            try #require(await eventually(timeout: .seconds(2)) { await env.resolver.waitingCount == 2 })
             first.cancel()
-            let cancelledWhileHeld = await rootEventually { first.finished }
+            let cancelledWhileHeld = await eventually(timeout: .seconds(2)) { first.finished }
             #expect(cancelledWhileHeld)
             #expect(!second.finished)
             #expect(await env.resolver.activeResolutionCount == 1)
@@ -247,7 +247,7 @@ struct SharedPhotosRootMaterialTests {
                 _ = try await env.resolver.resolve(
                     session: env.session, crypto: env.fixture.crypto, context: env.fixture.shareContext)
             }
-            try #require(await rootEventually { work.finished })
+            try #require(await eventually(timeout: .seconds(2)) { work.finished })
             #expect(work.cancelled)
             #expect(await env.resolver.activeResolutionCount == 0)
             #expect(env.fixture.paths.isEmpty)
@@ -261,10 +261,10 @@ struct SharedPhotosRootMaterialTests {
                 _ = try await env.resolver.resolve(
                     session: env.session, crypto: env.fixture.crypto, context: env.fixture.shareContext)
             }
-            try #require(await rootEventually { env.completion.entered })
+            try #require(await eventually(timeout: .seconds(2)) { env.completion.entered })
             let shutdown = env.start { await env.resolver.shutdown() }
-            try #require(await rootEventually { await env.resolver.isClosed })
-            let shutdownReturnedWhileHeld = await rootEventually(timeout: .milliseconds(200)) { shutdown.finished }
+            try #require(await eventually(timeout: .seconds(2)) { await env.resolver.isClosed })
+            let shutdownReturnedWhileHeld = await eventually(timeout: .milliseconds(200)) { shutdown.finished }
             #expect(!shutdownReturnedWhileHeld)
             env.completion.release()
             await shutdown.join()
@@ -315,7 +315,7 @@ struct SharedPhotosRootMaterialTests {
             let dedupe = env.dedupe(crypto: env.fixture.noSignerCrypto)
             let albumWork = env.start { _ = try await album.resolveRootMaterial() }
             let dedupeWork = env.start { _ = try await dedupe.hashKeyEpoch() }
-            try #require(await rootEventually { await env.resolver.waitingCount == 2 })
+            try #require(await eventually(timeout: .seconds(2)) { await env.resolver.waitingCount == 2 })
             env.fixture.release()
             await albumWork.join()
             await dedupeWork.join()
@@ -334,9 +334,11 @@ struct SharedPhotosRootMaterialTests {
             let dedupe = env.dedupe()
             let albumWork = env.start { _ = try await album.resolveRootMaterial() }
             let dedupeWork = env.start { _ = try await dedupe.hashKeyEpoch() }
-            try #require(await rootEventually { await env.resolver.waitingCount == 2 })
+            try #require(await eventually(timeout: .seconds(2)) { await env.resolver.waitingCount == 2 })
             let shutdown = env.start { await dedupe.shutdown() }
-            let dedupeFinishedWhileHeld = await rootEventually { dedupeWork.finished && shutdown.finished }
+            let dedupeFinishedWhileHeld = await eventually(timeout: .seconds(2)) {
+                dedupeWork.finished && shutdown.finished
+            }
             #expect(dedupeFinishedWhileHeld)
             #expect(!albumWork.finished)
             env.fixture.release()
@@ -352,9 +354,9 @@ struct SharedPhotosRootMaterialTests {
         try await withRootEnvironment { env in
             let dedupe = env.dedupe(shared: false)
             let work = env.start { _ = try await dedupe.hashKeyEpoch() }
-            try #require(await rootEventually { env.fixture.paths.count == 1 })
+            try #require(await eventually(timeout: .seconds(2)) { env.fixture.paths.count == 1 })
             let shutdown = env.start { await dedupe.shutdown() }
-            let stoppedWhileHeld = await rootEventually { shutdown.finished }
+            let stoppedWhileHeld = await eventually(timeout: .seconds(2)) { shutdown.finished }
             #expect(stoppedWhileHeld)
             #expect(await dedupe.rootMaterialResolver.activeResolutionCount == 0)
             env.fixture.release()
@@ -373,15 +375,6 @@ struct SharedPhotosRootMaterialTests {
             #expect(env.fixture.paths.count == 2)
         }
     }
-}
-
-private func rootEventually(timeout: Duration = .seconds(2), _ condition: () async -> Bool) async -> Bool {
-    let end = ContinuousClock.now + timeout
-    while ContinuousClock.now < end {
-        if await condition() { return true }
-        try? await Task.sleep(for: .milliseconds(5))
-    }
-    return await condition()
 }
 
 private func withRootEnvironment(
@@ -562,9 +555,11 @@ private final class RootEnvironment: @unchecked Sendable {
         for service in dedupeServices {
             await service.rootMaterialResolver.shutdown()
             await service.shutdown()
-            #expect(await rootEventually { await service.rootMaterialResolver.activeResolutionCount == 0 })
+            #expect(
+                await eventually(timeout: .seconds(2)) { await service.rootMaterialResolver.activeResolutionCount == 0 }
+            )
         }
-        #expect(await rootEventually { await resolver.activeResolutionCount == 0 })
+        #expect(await eventually(timeout: .seconds(2)) { await resolver.activeResolutionCount == 0 })
         store.close()
         RootMaterialHTTP.clear()
         try? FileManager.default.removeItem(at: directory)
