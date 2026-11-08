@@ -214,19 +214,7 @@ public final class FileThumbnailCoverageCheckpointStore: ThumbnailCoverageCheckp
     private func token(for uid: PhotoUID, key: String) -> String {
         let material = "\(tokenScope)\u{1f}\(key)\u{1f}\(uid.volumeID)\u{1f}\(uid.nodeID)"
         let digest = SHA256.hash(data: Data(material.utf8))
-        return Self.lowercaseHex(digest)
-    }
-
-    private static let lowercaseHexDigits = Array("0123456789abcdef".utf8)
-
-    private static func lowercaseHex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
-        var output: [UInt8] = []
-        output.reserveCapacity(64)
-        for byte in bytes {
-            output.append(lowercaseHexDigits[Int(byte >> 4)])
-            output.append(lowercaseHexDigits[Int(byte & 0x0F)])
-        }
-        return String(decoding: output, as: UTF8.self)
+        return ThumbnailCache.lowercaseHex(digest)
     }
 
     private static func safeComponent(_ value: String) -> String {
@@ -664,7 +652,6 @@ public actor ThumbnailFeedCore {
         // Local pending photos live in memory only.
         guard !uid.isLocalPending else { return nil }
         diagnostics.increment("thumb.ramDecodeMiss")
-        diagnostics.recordDiskReadDuringPinch()
         let cache = self.cache
         let generation = access?.cacheGeneration ?? cache.captureWriterGeneration()
         let maxPixels = configuration.targetPixels
@@ -1198,10 +1185,10 @@ public actor ThumbnailFeedCore {
         diskPresence.set(tile.uid, present: true)
         diagnostics.increment("thumb.diskCacheHit")
         prefetchDecodeStarted += 1
-        diagnostics.recordDecodeStarted(queueDepth: visibleDiskDemand.pendingCount)
+        diagnostics.increment("thumb.ramDecodeStarted")
         guard let image = tile.decoded else {
             diagnostics.increment("thumb.diskDecodeFailed")
-            diagnostics.recordDecodeFailed(queueDepth: visibleDiskDemand.pendingCount)
+            diagnostics.increment("thumb.ramDecodeFailed")
             recordError("decode failed for \(Self.key(tile.uid))")
             return
         }
@@ -1209,10 +1196,7 @@ public actor ThumbnailFeedCore {
         notifyHostOfAvailableImageIfVisible()
         if tile.isUpgrade { diagnostics.increment("thumb.decodedUpgrade") }
         prefetchDecodeCompleted += 1
-        diagnostics.recordDecodeCompleted(
-            durationMs: tile.durationMs,
-            queueDepth: visibleDiskDemand.pendingCount
-        )
+        diagnostics.increment("thumb.ramDecodeCompleted")
     }
 
     private func warmDecodedImpl(
@@ -1321,7 +1305,7 @@ public actor ThumbnailFeedCore {
                             diskPresence.set(tile.uid, present: true)
                             diagnostics.increment("thumb.diskCacheHit")
                             prefetchDecodeStarted += 1
-                            diagnostics.recordDecodeStarted(queueDepth: 0)
+                            diagnostics.increment("thumb.ramDecodeStarted")
                             if let image = tile.decoded {
                                 // Publish each completed decode immediately. Waiting for the slowest member of
                                 // a large visible batch made every already-finished tile remain a placeholder,
@@ -1330,12 +1314,12 @@ public actor ThumbnailFeedCore {
                                 notifyHostOfAvailableImageIfVisible()
                                 if tile.isUpgrade { diagnostics.increment("thumb.decodedUpgrade") }
                                 prefetchDecodeCompleted += 1
-                                diagnostics.recordDecodeCompleted(durationMs: tile.durationMs, queueDepth: 0)
+                                diagnostics.increment("thumb.ramDecodeCompleted")
                                 decodedFromDisk += 1
                             } else {
                                 missing += 1
                                 diagnostics.increment("thumb.diskDecodeFailed")
-                                diagnostics.recordDecodeFailed(queueDepth: 0)
+                                diagnostics.increment("thumb.ramDecodeFailed")
                                 recordError("decode failed for \(Self.key(tile.uid))")
                             }
                         } else {
@@ -1458,7 +1442,6 @@ public actor ThumbnailFeedCore {
         let cache = self.cache
         let writerGeneration = access?.cacheGeneration ?? cache.captureWriterGeneration()
         guard cache.isCurrentWriterGeneration(writerGeneration) else { return nil }
-        diagnostics.recordNetworkRequestDuringPinch()
         if batchesInFlight.values.contains(where: { $0.contains(uid) }) {
             diagnostics.increment("thumb.directLoadOverlapsBatch")
         }
@@ -2401,7 +2384,6 @@ public actor ThumbnailFeedCore {
             let batchID = UUID()
             batchesInFlight[batchID] = Set(chunk)
             prefetchDownloadStarted += reportedCount(in: chunk)
-            diagnostics.recordNetworkRequestDuringPinch()
             let writerGeneration = cache.captureWriterGeneration()
             let snapshot = await Self.loadBatch(
                 chunk,
@@ -2908,7 +2890,6 @@ public actor ThumbnailFeedCore {
                 #if DEBUG
                     testingHooks.beforeDiskProbe()
                 #endif
-                self.diagnostics.recordDiskPresenceCheckDuringPinch()
                 let usable =
                     forceAuthentication
                     ? cache.hasAuthenticatedDiskData(uid)
@@ -3042,7 +3023,6 @@ public actor ThumbnailFeedCore {
                     else {
                         return nil
                     }
-                    self.diagnostics.recordDiskPresenceCheckDuringPinch()
                     probes.append(DiskProbe(uid: uid, usable: cache.hasUsableDiskData(uid)))
                 }
                 return probes
