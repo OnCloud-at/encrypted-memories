@@ -10,6 +10,27 @@ import Testing
 
 @testable import TimelineFeature
 
+/// Builds the presentation lattice between two frame plans and schedules it, as the controller does.
+private func clickPlan(
+    source: GridFramePlan, target: GridFramePlan, anchorIndex: Int, viewportSize: CGSize
+) -> GridTransitionPlan? {
+    GridTransitionComponentBuilder.build(
+        source: source, target: target, anchorIndex: anchorIndex, viewportSize: viewportSize
+    ).flatMap {
+        ClickZoomTransitionScheduler.makePlan(lattice: $0, sourceLevel: source.levelID, targetLevel: target.levelID)
+    }
+}
+
+private func pinchPlan(
+    source: GridFramePlan, target: GridFramePlan, anchorIndex: Int, viewportSize: CGSize
+) -> GridTransitionPlan? {
+    GridTransitionComponentBuilder.build(
+        source: source, target: target, anchorIndex: anchorIndex, viewportSize: viewportSize
+    ).flatMap {
+        PinchZoomTransitionScheduler.makePlan(lattice: $0, sourceLevel: source.levelID, targetLevel: target.levelID)
+    }
+}
+
 @Suite struct GridTransitionScheduleTests {
     // Calibrated component areas (band/alloc-area fractions) - the production reference set.
     private func referenceComponents() -> [GridTransitionComponent] {
@@ -448,7 +469,7 @@ import Testing
         // some relocation components exist (other rows re-lay-out)
         #expect(!lat.components.isEmpty)
         // and a click plan builds + schedules every component with one-partial-at-a-time
-        if let plan = ClickZoomTransitionScheduler.makePlan(
+        if let plan = clickPlan(
             source: src, target: tgt, anchorIndex: anchor, viewportSize: viewport)
         {
             for q in stride(from: 0.0, through: 1.0, by: 0.01) { #expect(plan.partialComponentCount(at: q) <= 1) }
@@ -477,7 +498,7 @@ import Testing
         let tgt = engine.framePlan(level: 2, viewportSize: viewport, scrollOffset: .zero, overscan: 0)
         #expect(Set(src.visibleSlots.map(\.index)).contains(0) && Set(tgt.visibleSlots.map(\.index)).contains(0))
         guard
-            let plan = PinchZoomTransitionScheduler.makePlan(
+            let plan = pinchPlan(
                 source: src, target: tgt, anchorIndex: 0, viewportSize: viewport)
         else {
             Issue.record("pinch plan nil")
@@ -523,9 +544,9 @@ import Testing
         let f2 = engine.framePlan(level: 2, viewportSize: viewport, scrollOffset: .zero, overscan: 0)  // shared detent
         let f1 = engine.framePlan(level: 1, viewportSize: viewport, scrollOffset: .zero, overscan: 0)
         guard
-            let seg1 = PinchZoomTransitionScheduler.makePlan(
+            let seg1 = pinchPlan(
                 source: f3, target: f2, anchorIndex: 0, viewportSize: viewport),
-            let seg2 = PinchZoomTransitionScheduler.makePlan(
+            let seg2 = pinchPlan(
                 source: f2, target: f1, anchorIndex: 0, viewportSize: viewport)
         else {
             Issue.record("segment plan nil")

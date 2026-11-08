@@ -7,19 +7,6 @@ import CoreGraphics
 
 package enum PinchZoomTransitionScheduler {
     package static func makePlan(
-        source: GridFramePlan, target: GridFramePlan, anchorIndex: Int,
-        viewportSize: CGSize, tuning: GridTransitionTuning = .default
-    ) -> GridTransitionPlan? {
-        guard
-            let lat = GridTransitionComponentBuilder.build(
-                source: source, target: target,
-                anchorIndex: anchorIndex, viewportSize: viewportSize),
-            !lat.components.isEmpty
-        else { return nil }
-        return makePlan(lattice: lat, sourceLevel: source.levelID, targetLevel: target.levelID, tuning: tuning)
-    }
-
-    package static func makePlan(
         lattice lat: GridTransitionLattice, sourceLevel: Int, targetLevel: Int,
         tuning: GridTransitionTuning = .default
     ) -> GridTransitionPlan? {

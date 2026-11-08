@@ -1,3 +1,4 @@
+import CoreGraphics
 import GridCore
 import TimelineCore
 
@@ -18,5 +19,12 @@ extension SquareTileGridEngine {
 
     static func testRegular(sectionCounts: [Int]) -> SquareTileGridEngine {
         SquareTileGridEngine(sectionCounts: sectionCounts, profile: .testRegularTimeline)
+    }
+}
+
+extension GridZoomCommitDelta {
+    /// Horizontal shift in whole columns, rounded; this is the dominant component of the phase seam.
+    func anchorColumnShift(pitch: CGFloat) -> Int {
+        pitch > 0 ? Int((anchorDelta.width / pitch).rounded()) : 0
     }
 }
