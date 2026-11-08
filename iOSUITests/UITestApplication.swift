@@ -11,3 +11,16 @@ enum UITestApplication {
         return app
     }
 }
+
+extension XCUIElement {
+    /// Waits up to `timeout` seconds until `format`, an `NSPredicate` format, holds for this element.
+    func wait(until format: String, timeout: TimeInterval) -> XCTWaiter.Result {
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: format), object: self)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout)
+    }
+
+    /// Waits up to `timeout` seconds until this element no longer exists.
+    func waitUntilGone(timeout: TimeInterval) -> XCTWaiter.Result {
+        wait(until: "exists == false", timeout: timeout)
+    }
+}

@@ -45,8 +45,7 @@ final class MobileDuplicatesUITests: XCTestCase {
     }
 
     private func waitUntilGone(_ element: XCUIElement, _ message: String) {
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: element)
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 20), .completed, message)
+        XCTAssertEqual(element.waitUntilGone(timeout: 20), .completed, message)
     }
 
     func testTheLibraryCheckShowsItsTitleAndProgressWhileNoDuplicateIsFound() {
@@ -354,8 +353,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             revealGroup(0, scrollingUp: false)
             revealGroup(1)
             // A merge that Cancel failed to stop would remove the group.
-            let merged = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: group(1))
-            XCTAssertEqual(XCTWaiter.wait(for: [merged], timeout: 4), .timedOut, "Cancel starts no merge")
+            XCTAssertEqual(group(1).waitUntilGone(timeout: 4), .timedOut, "Cancel starts no merge")
             app.terminate()
         }
     }
@@ -418,8 +416,7 @@ final class MobileDuplicatesUITests: XCTestCase {
     }
 
     private func waitUntil(_ element: XCUIElement, _ predicate: String, _ message: String) {
-        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 10), .completed, message)
+        XCTAssertEqual(element.wait(until: predicate, timeout: 10), .completed, message)
     }
 
     func testTappingAPhotoOpensItWithItsGroupAndKeepsItThere() {
@@ -499,8 +496,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         XCTAssertTrue(group(0).waitForExistence(timeout: 10))
         // A scan after the viewer would drop the last group of this fixture.
-        let dropped = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: group(1))
-        XCTAssertEqual(XCTWaiter.wait(for: [dropped], timeout: 4), .timedOut, "the list did not scan again")
+        XCTAssertEqual(group(1).waitUntilGone(timeout: 4), .timedOut, "the list did not scan again")
     }
 
     func testPullToRefreshScansTheLibraryAgain() {
