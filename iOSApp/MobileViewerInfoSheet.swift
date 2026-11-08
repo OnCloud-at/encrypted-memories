@@ -258,20 +258,20 @@ enum MobileViewerCaptureFormat {
 /// as chips. No map, no file information and no buttons; the Info inspector keeps those. The title bar then shows only
 /// the position, so each fact appears once.
 struct MobileViewerDetailsSummary: View {
-    let profile: ViewerChromeLayoutProfile
+    let details: ViewerChromeLayoutProfile.Details
     let item: PhotoItem
     let placeName: String?
     let albumTitles: [String]
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        VStack(alignment: .leading, spacing: profile.detailsGroupSpacing) {
+        VStack(alignment: .leading, spacing: details.groupSpacing) {
             ViewThatFits(in: .horizontal) {
-                HStack(alignment: .firstTextBaseline, spacing: profile.detailsTitleSpacing) {
+                HStack(alignment: .firstTextBaseline, spacing: details.titleSpacing) {
                     dateText
                     timeText
                 }
-                VStack(alignment: .leading, spacing: profile.detailsStackedTitleSpacing) {
+                VStack(alignment: .leading, spacing: details.stackedTitleSpacing) {
                     dateText
                     timeText
                 }
@@ -285,10 +285,10 @@ struct MobileViewerDetailsSummary: View {
             }
             if !albumTitles.isEmpty {
                 if dynamicTypeSize.isAccessibilitySize {
-                    VStack(alignment: .leading, spacing: profile.albumChipSpacing) { chips(singleLine: false) }
+                    VStack(alignment: .leading, spacing: details.albumChipSpacing) { chips(singleLine: false) }
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: profile.albumChipSpacing) { chips(singleLine: true) }
+                        HStack(spacing: details.albumChipSpacing) { chips(singleLine: true) }
                     }
                     .scrollClipDisabled()
                 }
@@ -314,9 +314,9 @@ struct MobileViewerDetailsSummary: View {
             Label(title, systemImage: "rectangle.stack")
                 .font(.footnote.weight(.medium))
                 .lineLimit(singleLine ? 1 : nil)
-                .modifier(CappedWidth(maximum: singleLine ? profile.albumChipMaxWidth : nil))
-                .padding(.horizontal, profile.albumChipHorizontalPadding)
-                .padding(.vertical, profile.albumChipVerticalPadding)
+                .modifier(CappedWidth(maximum: singleLine ? details.albumChipMaxWidth : nil))
+                .padding(.horizontal, details.albumChipHorizontalPadding)
+                .padding(.vertical, details.albumChipVerticalPadding)
                 .background(.fill.secondary, in: Capsule())
         }
     }

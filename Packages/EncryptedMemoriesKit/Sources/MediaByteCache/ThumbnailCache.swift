@@ -305,7 +305,7 @@ public actor ThumbnailCache {
     public func data(for uid: PhotoUID) -> Data? {
         guard retentionAuthorization.isAllowed(uid) else { return nil }
         let generation = writerGeneration.capture()
-        let mk = Self.memKey(uid)
+        let mk = uid.cacheKey
         if let cached = memory.object(forKey: mk) {
             return writerGeneration.performIfCurrent(generation) {
                 retentionAuthorization.isAllowed(uid) ? cached as Data : nil
@@ -552,17 +552,17 @@ public actor ThumbnailCache {
         let generation = writerGeneration.capture()
         let result = storeToDisk(data, for: uid, ifCurrent: generation)
         guard result == .stored || result == .storagePaused else {
-            memory.removeObject(forKey: Self.memKey(uid))
+            memory.removeObject(forKey: uid.cacheKey)
             return
         }
         let published =
             writerGeneration.performIfCurrent(generation) {
                 guard retentionAuthorization.isAllowed(uid) else { return false }
                 // Plaintext remains process-local and is published only after the fenced encrypted write.
-                memory.setObject(data as NSData, forKey: Self.memKey(uid), cost: data.count)
+                memory.setObject(data as NSData, forKey: uid.cacheKey, cost: data.count)
                 return true
             } ?? false
-        if !published { memory.removeObject(forKey: Self.memKey(uid)) }
+        if !published { memory.removeObject(forKey: uid.cacheKey) }
     }
 
     // MARK: - LRU size cap
@@ -733,7 +733,7 @@ public actor ThumbnailCache {
             if let removedUIDs {
                 for uid in removedUIDs {
                     let name = filename(uid: uid, account: account)
-                    memory.removeObject(forKey: Self.memKey(uid))
+                    memory.removeObject(forKey: uid.cacheKey)
                     let url = directory.appendingPathComponent(name)
                     guard FileManager.default.fileExists(atPath: url.path) else { continue }
                     do {
@@ -1006,11 +1006,6 @@ public actor ThumbnailCache {
             output.append(lowercaseHexDigits[Int(byte & 0x0F)])
         }
         return String(decoding: output, as: UTF8.self)
-    }
-
-    /// In-RAM NSCache key (process-local plaintext tier; not security sensitive).
-    private static func memKey(_ uid: PhotoUID) -> NSString {
-        "\(uid.volumeID)~\(uid.nodeID)" as NSString
     }
 
     private static func defaultDerivative(for namespace: String) -> String {

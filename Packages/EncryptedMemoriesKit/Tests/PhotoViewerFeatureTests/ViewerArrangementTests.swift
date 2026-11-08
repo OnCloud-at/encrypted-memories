@@ -35,6 +35,21 @@ final class ViewerArrangementTests: XCTestCase {
         XCTAssertEqual(ViewerChromeLayoutProfile.compactLandscape.stackedLowerPartHeight, 56)
     }
 
+    func testOnlyTheFoldedLayoutHasDetailsWithItsValues() throws {
+        XCTAssertNil(ViewerChromeLayoutProfile.regular.details)
+        XCTAssertNil(ViewerChromeLayoutProfile.compactLandscape.details)
+        let details = try XCTUnwrap(ViewerChromeLayoutProfile.folded.details)
+        XCTAssertEqual(details.horizontalPadding, 20)
+        XCTAssertEqual(details.verticalPadding, 12)
+        XCTAssertEqual(details.groupSpacing, 12)
+        XCTAssertEqual(details.titleSpacing, 8)
+        XCTAssertEqual(details.stackedTitleSpacing, 2)
+        XCTAssertEqual(details.albumChipSpacing, 8)
+        XCTAssertEqual(details.albumChipHorizontalPadding, 12)
+        XCTAssertEqual(details.albumChipVerticalPadding, 6)
+        XCTAssertEqual(details.albumChipMaxWidth, 240)
+    }
+
     func testTransportPlacementKeepsFlatDesignAndRequiresChromeAndAnAttachedVideo() {
         for divided in [false, true] {
             XCTAssertEqual(

@@ -498,14 +498,13 @@ public final class PhotoViewerModel {
             fullImageCacheScope = scope
         }
     }
-    private static func cacheKey(_ uid: PhotoUID) -> NSString { "\(uid.volumeID)~\(uid.nodeID)" as NSString }
 
     /// A pending photo can change in Apple Photos before it uploads, so it always reloads from the device.
     private static func cacheFullImage(_ image: NSImage, pixelSize: Int, for uid: PhotoUID) {
         guard !uid.isLocalPending else { return }
         fullImageCache.setObject(
             CachedSharpImage(image: image, pixelSize: pixelSize),
-            forKey: cacheKey(uid),
+            forKey: uid.cacheKey,
             cost: decodedImageCost(image)
         )
     }
@@ -619,7 +618,7 @@ public final class PhotoViewerModel {
         motion.prepare(for: item, streamer: streamer) { [weak self] in self?.isDisplaying(item) ?? false }
 
         // Instant: if we already have the sharp original cached, show it - no spinner, no network.
-        if let cached = Self.fullImageCache.object(forKey: Self.cacheKey(item.uid)) {
+        if let cached = Self.fullImageCache.object(forKey: item.uid.cacheKey) {
             image = cached.image
             isSharp = true
             loadedSharpPixelSize = cached.pixelSize

@@ -81,7 +81,7 @@
             let clamped = min(1, max(0, scale))
             let scaledLimit = Int(Double(cache.nominalCostLimitBytes) * clamped)
             if purge {
-                let keptKey = currentPageUID.map(Self.key)
+                let keptKey = currentPageUID.map(\.cacheKey)
                 let keptCost = keptKey.flatMap { cache.image(forKey: $0)?.cost } ?? 0
                 // Floor the shrunken limit at the kept page's cost so the on-screen entry survives its own
                 // re-insert even at scale 0 - "keep only what is currently essential", which this page IS.
@@ -102,7 +102,7 @@
         /// a second edit that reuses the UID of the first. The next request loads them again.
         public func forget(_ uids: [PhotoUID]) {
             for uid in uids {
-                cache.remove(forKey: Self.key(uid))
+                cache.remove(forKey: uid.cacheKey)
                 // A load that started before keeps its result out of the cache and away from the page.
                 forgottenGenerations[uid, default: 0] &+= 1
             }
@@ -120,7 +120,7 @@
         public func displayImage(for uid: PhotoUID, maxPixelSize: Int) async -> DisplayImage? {
             let startGeneration = generation(of: uid)
             currentPageUID = uid
-            let key = Self.key(uid)
+            let key = uid.cacheKey
             // Avoid reusing a thumbnail-sized decode for a later full-screen request.
             if let cached = cache.image(forKey: key), cached.decodedCap >= maxPixelSize {
                 return DisplayImage(image: cached.image, source: cached.source)
@@ -219,7 +219,7 @@
         public func originalImage(for uid: PhotoUID, maxPixelSize: Int) async -> DisplayImage? {
             let startGeneration = generation(of: uid)
             currentPageUID = uid
-            let key = Self.key(uid)
+            let key = uid.cacheKey
             // Reuse original-backed decodes only when they satisfy this request's size.
             if let cached = cache.image(forKey: key), cached.source.hasPrefix("original"),
                 cached.decodedCap >= maxPixelSize
@@ -321,10 +321,6 @@
             } catch {
                 return nil
             }
-        }
-
-        private static func key(_ uid: PhotoUID) -> NSString {
-            "\(uid.volumeID)~\(uid.nodeID)" as NSString
         }
 
         private static func short(_ uid: PhotoUID) -> String {

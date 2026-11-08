@@ -392,10 +392,10 @@ struct MobilePhotoViewer: View {
                 .padding(.bottom, profile.bottomPadding)
                 // The details fill the rest of the lower part and scroll when many albums or a large text size need
                 // more room, so nothing reaches the fold.
-                if profile.showsDetails, let item = currentBaseItem {
+                if let details = profile.details, let item = currentBaseItem {
                     ScrollView {
                         MobileViewerDetailsSummary(
-                            profile: profile,
+                            details: details,
                             item: item,
                             placeName: ViewerInfoLocation(
                                 metadata: metadataLoadState.metadata,
@@ -404,8 +404,8 @@ struct MobilePhotoViewer: View {
                             ).placeName,
                             albumTitles: albumTitles
                         )
-                        .padding(.horizontal, profile.detailsHorizontalPadding)
-                        .padding(.vertical, profile.detailsVerticalPadding)
+                        .padding(.horizontal, details.horizontalPadding)
+                        .padding(.vertical, details.verticalPadding)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .environment(\.colorScheme, .dark)
