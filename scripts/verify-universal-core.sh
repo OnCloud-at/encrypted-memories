@@ -143,13 +143,7 @@ build_scheme() {
 pushd "$PACKAGE" >/dev/null
 
 echo "[core-gate] resolving pinned packages into shared cache"
-xcrun xcodebuild \
-  -resolvePackageDependencies \
-  -scheme PhotosCore \
-  -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
-  -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
-  -packageAuthorizationProvider netrc \
-  -onlyUsePackageVersionsFromResolvedFile
+encryptedmemories_resolve_xcode_packages PhotosCore
 
 for target in "${CORE_TARGETS[@]}"; do
   for platform in "${PLATFORMS[@]}"; do

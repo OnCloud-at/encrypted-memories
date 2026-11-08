@@ -3,44 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
+source "$ROOT/scripts/swift-file-selection.sh"
 
-usage() {
-  echo "usage: scripts/check-swift-format.sh --all | --diff BASE HEAD | FILE..." >&2
-}
-
-declare -a files=()
-case "${1:-}" in
-  --all)
-    shift
-    while IFS= read -r file; do files+=("$file"); done < <(
-      git ls-files --cached --others --exclude-standard -- '*.swift'
-    )
-    ;;
-  --diff)
-    [[ $# -eq 3 ]] || { usage; exit 64; }
-    base="$2"
-    head="$3"
-    shift 3
-    while IFS= read -r file; do files+=("$file"); done < <(
-      git diff --diff-filter=ACMR --name-only "$base...$head" -- '*.swift'
-    )
-    ;;
-  "")
-    usage
-    exit 64
-    ;;
-  *)
-    files=("$@")
-    ;;
-esac
-
-declare -a source_files=()
-for file in "${files[@]}"; do
-  case "$file" in
-    Vendor/*|EncryptedMemories.xcodeproj/*) continue ;;
-  esac
-  [[ -f "$file" ]] && source_files+=("$file")
-done
+select_swift_files check-swift-format.sh "$@"
 
 if [[ ${#source_files[@]} -eq 0 ]]; then
   echo "No Swift files require a format check."

@@ -79,3 +79,19 @@ encryptedmemories_pin_generated_project_packages() {
   mkdir -p "$(dirname "$workspace_destination")"
   cp "$project_destination" "$workspace_destination"
 }
+
+# Resolves the pinned package graph into the shared caches. The optional second argument is the Xcode project;
+# without it xcodebuild resolves the package in the current directory.
+encryptedmemories_resolve_xcode_packages() {
+  local scheme="$1"
+  local -a project=()
+  [[ -z "${2:-}" ]] || project=(-project "$2")
+  xcrun xcodebuild \
+    -resolvePackageDependencies \
+    ${project[@]+"${project[@]}"} \
+    -scheme "$scheme" \
+    -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
+    -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+    -packageAuthorizationProvider netrc \
+    -onlyUsePackageVersionsFromResolvedFile
+}

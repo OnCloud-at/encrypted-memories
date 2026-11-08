@@ -163,14 +163,7 @@ runs:
         cmp \
           EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved \
           BuildSupport/Package.resolved
-        xcrun xcodebuild \
-          -resolvePackageDependencies \
-          -project EncryptedMemories.xcodeproj \
-          -scheme EncryptedMemoriesMobile \
-          -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
-          -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
-          -packageAuthorizationProvider netrc \
-          -onlyUsePackageVersionsFromResolvedFile
+        encryptedmemories_resolve_xcode_packages EncryptedMemoriesMobile EncryptedMemories.xcodeproj
 
     - name: Save resolved SwiftPM dependencies
       if: ${{ inputs.save-cache != 'false' && inputs.build-profile != 'app' && steps.spm-cache.outputs.cache-hit != 'true' }}
