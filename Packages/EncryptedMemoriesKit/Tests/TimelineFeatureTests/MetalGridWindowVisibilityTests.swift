@@ -294,15 +294,11 @@ struct MetalGridWindowVisibilityTests {
             case 1: coordinator.setUploadBadges(PendingUploadBadges(contentEpochs: [id: 1]))
             default: fixture.detach()
             }
-            var first = 0
             var revisions: [UInt64] = []
-            proxy.onFirstContentReady = { first += 1 }
             proxy.onContentReady = { revisions.append($0) }
-            #expect(first == 0)
             #expect(revisions.isEmpty)
             if event != 2 {
                 coordinator.didRenderVisible([id])
-                #expect(first == 1)
                 #expect(revisions == [4])
                 fixture.detach()
             }
@@ -361,7 +357,7 @@ struct MetalGridWindowVisibilityTests {
         let id = try #require(fixture.source.flatUIDs.first)
         let proxy = GridProxy<PhotoUID>()
         var state = LibraryLoadState.loadingContent(count: 1, usingCachedInventory: false)
-        proxy.onFirstContentReady = { state = LibraryLoadPolicy.reduce(state, .firstContentReady) }
+        proxy.onContentReady = { _ in state = LibraryLoadPolicy.reduce(state, .firstContentReady) }
         coordinator.connectReadinessProxy(proxy, revision: 1)
         coordinator.didRenderVisible([id])
         #expect(state == .loadingContent(count: 1, usingCachedInventory: false))

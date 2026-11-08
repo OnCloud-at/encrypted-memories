@@ -296,7 +296,6 @@ struct MetalProductionGridView: NSViewRepresentable {
         // Forward live-resize activity so the shell can suspend expensive overlays.
         host.coordinator.liveResizeChanged = { [weak proxy] active in proxy?.liveResizeChanged?(active) }
         // Forward content-mode changes without changing geometry.
-        proxy.toggleContentMode = { [weak host] in host?.coordinator.toggleContentMode() }
         proxy.setContentMode = { [weak host] mode in host?.coordinator.setPreferredNormalLevelContentMode(mode) }
         proxy.contentModeState = { [weak host] in
             guard let c = host?.coordinator else { return (.aspectFitInsideSquare, false) }

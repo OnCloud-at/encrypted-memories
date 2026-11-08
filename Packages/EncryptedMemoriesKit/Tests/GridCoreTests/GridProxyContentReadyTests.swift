@@ -3,40 +3,7 @@ import XCTest
 @testable import GridCore
 
 @MainActor
-final class GridProxyFirstContentReadyTests: XCTestCase {
-    func testHandlerInstalledBeforeReportReceivesEvent() {
-        let proxy = GridProxy<String>()
-        var deliveryCount = 0
-        proxy.onFirstContentReady = { deliveryCount += 1 }
-
-        proxy.reportFirstContentReady()
-
-        XCTAssertEqual(deliveryCount, 1)
-    }
-
-    func testReportBeforeHandlerInstallationIsReplayed() {
-        let proxy = GridProxy<String>()
-        var deliveryCount = 0
-
-        proxy.reportFirstContentReady()
-        XCTAssertEqual(deliveryCount, 0)
-
-        proxy.onFirstContentReady = { deliveryCount += 1 }
-        XCTAssertEqual(deliveryCount, 1)
-    }
-
-    func testReadinessIsDeliveredExactlyOnce() {
-        let proxy = GridProxy<String>()
-        var deliveryCount = 0
-        proxy.onFirstContentReady = { deliveryCount += 1 }
-
-        proxy.reportFirstContentReady()
-        proxy.reportFirstContentReady()
-        proxy.onFirstContentReady = { deliveryCount += 1 }
-
-        XCTAssertEqual(deliveryCount, 1)
-    }
-
+final class GridProxyContentReadyTests: XCTestCase {
     func testContentReadinessRepeatsForNewDataGenerations() {
         let proxy = GridProxy<String>()
         var revisions: [UInt64] = []
@@ -65,14 +32,10 @@ final class GridProxyFirstContentReadyTests: XCTestCase {
         let proxy = GridProxy<String>()
         proxy.reportContentReady(revision: 4)
         proxy.invalidatePendingContentReady()
-        var first = 0
         var revisions: [UInt64] = []
-        proxy.onFirstContentReady = { first += 1 }
         proxy.onContentReady = { revisions.append($0) }
-        XCTAssertEqual(first, 0)
         XCTAssertEqual(revisions, [])
         proxy.reportContentReady(revision: 7)
-        XCTAssertEqual(first, 1)
         XCTAssertEqual(revisions, [7])
     }
 }
