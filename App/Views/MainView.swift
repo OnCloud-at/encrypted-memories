@@ -340,13 +340,13 @@ struct MainView: View {
             .task { await uploadCoordinator.start() }
             .task { await startLibraryChangeMonitor() }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesUploadPhotos)) { notification in
-                performUploadUIAction("uploadPhotos", trigger: uploadTrigger(from: notification))
+                performUploadUIAction(.uploadPhotos, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesUploadFolder)) { notification in
-                performUploadUIAction("uploadFolder", trigger: uploadTrigger(from: notification))
+                performUploadUIAction(.uploadFolder, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesShowUploadQueue)) { notification in
-                performUploadUIAction("showQueue", trigger: uploadTrigger(from: notification))
+                performUploadUIAction(.showQueue, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesNewAlbum)) { _ in
                 presentCreateAlbum()
@@ -729,12 +729,12 @@ struct MainView: View {
     /// Native upload menu for the system toolbar.
     private var uploadToolbarMenu: some View {
         Menu {
-            Button("menu.upload_photos") { performUploadUIAction("uploadPhotos", trigger: .toolbar) }
+            Button("menu.upload_photos") { performUploadUIAction(.uploadPhotos, trigger: .toolbar) }
                 .disabled(!uploadCoordinator.uploadCapabilities.canUpload)
-            Button("menu.upload_folder") { performUploadUIAction("uploadFolder", trigger: .toolbar) }
+            Button("menu.upload_folder") { performUploadUIAction(.uploadFolder, trigger: .toolbar) }
                 .disabled(!uploadCoordinator.uploadCapabilities.canUpload)
             Divider()
-            Button("menu.show_uploads") { performUploadUIAction("showQueue", trigger: .toolbar) }
+            Button("menu.show_uploads") { performUploadUIAction(.showQueue, trigger: .toolbar) }
         } label: {
             Label("toolbar.upload", systemImage: "tray.and.arrow.up")
         }
@@ -1093,7 +1093,7 @@ struct MainView: View {
             streamer: media, metadataProvider: media,
             albumMembershipProvider: facade.albums,
             placeNameResolver: NativePlaceNameResolver.shared,
-            knownLocationUIDs: Set(offline.locationIndex.coordinates.map(\.uid)),
+            hasKnownLocation: offline.locationIndex.hasKnownLocation,
             burstProvider: backend,
             previewCache: offline.previewCache,
             originalsCache: offline.originalsCache,
@@ -1187,21 +1187,15 @@ struct MainView: View {
         )
     }
 
-    /// Aspect-fit rect of `image` centred in `size` - the photo's fullscreen frame.
-    private func fitRect(_ image: NSImage, in size: CGSize) -> CGRect {
-        let ia = image.size.width / max(image.size.height, 1)
-        let ra = size.width / max(size.height, 1)
-        var w = size.width
-        var h = size.height
-        if ia > ra { h = w / ia } else { w = h * ia }
-        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
-    }
-
-    /// Aspect-fit rect of `image` centred within an arbitrary `rect` (used to fit inside the media region
-    /// below the top bar, not the whole window).
+    /// Aspect-fit rect of `image` centred within `rect` (used to fit inside the media region below the top bar, not
+    /// the whole window).
     private func fitRect(_ image: NSImage, in rect: CGRect) -> CGRect {
-        let fitted = fitRect(image, in: rect.size)
-        return fitted.offsetBy(dx: rect.minX, dy: rect.minY)
+        let ia = image.size.width / max(image.size.height, 1)
+        let ra = rect.width / max(rect.height, 1)
+        var w = rect.width
+        var h = rect.height
+        if ia > ra { h = w / ia } else { w = h * ia }
+        return CGRect(x: rect.minX + (rect.width - w) / 2, y: rect.minY + (rect.height - h) / 2, width: w, height: h)
     }
 
     // MARK: - Chrome
@@ -1279,7 +1273,7 @@ struct MainView: View {
         case .album(_, let name): return name
         case .sharedAlbum(_, _, let name): return name
         case .trash: return String(localized: "sidebar.recently_deleted")
-        case .map: return "Map"
+        case .map: return String(localized: "sidebar.map")
         case .duplicates: return L10n.string("duplicates.title")
         }
     }
@@ -1460,17 +1454,15 @@ struct MainView: View {
 
     // MARK: - Upload
 
-    private func performUploadUIAction(_ action: String, trigger: UploadUITrigger) {
-        logUploadUI(action: action, trigger: trigger)
+    private func performUploadUIAction(_ action: UploadUIAction, trigger: UploadUITrigger) {
+        DebugLog.log("[UploadUI] action=\(action.rawValue) trigger=\(trigger.rawValue)")
         switch action {
-        case "uploadPhotos":
+        case .uploadPhotos:
             presentUploadPhotos()
-        case "uploadFolder":
+        case .uploadFolder:
             presentUploadFolder()
-        case "showQueue":
+        case .showQueue:
             uploadCoordinator.isQueueVisible = true
-        default:
-            break
         }
     }
 
@@ -1542,11 +1534,6 @@ struct MainView: View {
 
     private func refreshLibraryManually() {
         libraryRefresh.refreshManually(host: refreshHost)
-    }
-
-    private func logUploadUI(action: String, trigger: UploadUITrigger) {
-        let line = "[UploadUI] action=\(action) trigger=\(trigger.rawValue)"
-        DebugLog.log(line)
     }
 
     /// Honest Map empty state, mirroring the iOS states and the standard macOS library empty surface.

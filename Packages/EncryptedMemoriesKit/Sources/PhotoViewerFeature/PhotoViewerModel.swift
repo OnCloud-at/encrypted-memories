@@ -77,7 +77,7 @@ public final class PhotoViewerModel {
     public var placeName: String? { titleMetadataState.resolution?.placeName }
     public var isPlaceNameResolving: Bool {
         titleMetadataState.shouldReservePlaceNameLine(
-            hasKnownLocation: knownLocationUIDs.contains(current.uid)
+            hasKnownLocation: hasKnownLocation(current.uid)
         )
     }
 
@@ -91,7 +91,7 @@ public final class PhotoViewerModel {
     private let metadataProvider: PhotoMetadataProvider?
     private let albumMembershipProvider: (any PhotoAlbumMembershipProviding)?
     private let titleMetadataCoordinator: ViewerTitleMetadataCoordinator
-    private let knownLocationUIDs: Set<PhotoUID>
+    private let hasKnownLocation: @MainActor (PhotoUID) -> Bool
     private let burstProvider: BurstGroupProvider?
     private let previewCache: ThumbnailCache?
     /// Encrypted disk cache for full-resolution originals (offline library). Viewer page appearance does not read
@@ -144,7 +144,7 @@ public final class PhotoViewerModel {
         streamer: VideoStreamProvider? = nil, metadataProvider: PhotoMetadataProvider? = nil,
         albumMembershipProvider: (any PhotoAlbumMembershipProviding)? = nil,
         placeNameResolver: (any PlaceNameResolving)? = nil,
-        knownLocationUIDs: Set<PhotoUID> = [],
+        hasKnownLocation: @escaping @MainActor (PhotoUID) -> Bool = { _ in false },
         burstProvider: BurstGroupProvider? = nil,
         previewCache: ThumbnailCache? = nil, originalsCache: ThumbnailCache? = nil,
         cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
@@ -174,7 +174,7 @@ public final class PhotoViewerModel {
             metadataProvider: metadataProvider,
             placeNameResolver: placeNameResolver
         )
-        self.knownLocationUIDs = knownLocationUIDs
+        self.hasKnownLocation = hasKnownLocation
         self.burstProvider = burstProvider
         self.editedOriginalProvider = editedOriginalProvider
         self.editedOriginalLookup = editedOriginalLookup

@@ -604,7 +604,7 @@ private struct PhotoLibraryBackupSection: View {
                 let display = rowModel.displayed
                 // Icon, headline, and action share the headline's first line; details stay below.
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    statusIcon(display)
+                    BackupStatusIcon(display.accessory)
                         .frame(width: 18, height: 20, alignment: .center)
 
                     VStack(alignment: .leading, spacing: 3) {
@@ -784,37 +784,6 @@ private struct PhotoLibraryBackupSection: View {
         .frame(height: 4)
         .padding(.top, 3)
         .accessibilityHidden(display.progressBarFraction == nil)
-    }
-
-    /// Match the mobile status vocabulary and its Proton semantic color roles.
-    @ViewBuilder private func statusIcon(_ display: BackupStatusPresentation) -> some View {
-        switch display.accessory {
-        case .activity:
-            Image(systemName: "arrow.trianglehead.2.clockwise")
-                .foregroundStyle(ProtonColor.primary)
-                .spinsWhileActive(true)
-        case .attention:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-        case .paused:
-            Image(systemName: "pause.circle")
-                .foregroundStyle(.secondary)
-        case .waiting:
-            Image(systemName: "clock.arrow.circlepath")
-                .foregroundStyle(.secondary)
-        case .waitingForWiFi:
-            Image(systemName: BackupStatus.waitingForWiFiSymbolName)
-                .foregroundStyle(.secondary)
-        case .notice:
-            Image(systemName: "info.circle")
-                .foregroundStyle(.secondary)
-        case .success:
-            Image(systemName: "checkmark.shield.fill")
-                .foregroundStyle(ProtonColor.primary)
-        case .idle:
-            Image(systemName: "checkmark.shield")
-                .foregroundStyle(.secondary)
-        }
     }
 }
 
