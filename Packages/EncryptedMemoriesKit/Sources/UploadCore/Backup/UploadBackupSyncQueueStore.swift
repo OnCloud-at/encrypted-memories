@@ -13,6 +13,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public static let databaseFileName = "upload-backup-sync-queue-v1.sqlite"
 
     private static let schemaVersion = 2
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "backup_sync_queue_info", version: schemaVersion, stampReplacesExistingRow: true)
     private static let catalogReplayStateKey = "catalog_replay_state"
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
@@ -1646,33 +1648,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             at: url,
             schemaSQL: schema,
             policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: schemaVersionRow.verify,
+            stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(handle, "SELECT value FROM backup_sync_queue_info WHERE key='schema';", -1, &stmt, nil)
-                == SQLITE_OK
-        else {
-            return false
-        }
-        var onDisk: Int?
-        let result = sqlite3_step(stmt)
-        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
-        sqlite3_finalize(stmt)
-        return result == SQLITE_ROW && onDisk == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        return sqlite3_exec(
-            handle,
-            "INSERT INTO backup_sync_queue_info(key, value) VALUES('schema', \(schemaVersion)) "
-                + "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-            nil, nil, nil
-        ) == SQLITE_OK
     }
 
     /// Binds every column of one row. A failed bind throws; the caller must not step the statement (#1194).

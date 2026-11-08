@@ -276,9 +276,6 @@ public final class PendingGridSession {
         onListsChange?()
     }
 
-    /// Whether pending photos show now (backup on, available, and allowed to read the Photos library).
-    public var isShowingPendingPhotos: Bool { showsPending }
-
     /// Favorites as the app shows them: Proton favorites plus the desired states of pending photos, which the
     /// backup applies after the upload.
     public func displayedFavorites(_ remote: Set<PhotoUID>) -> Set<PhotoUID> {

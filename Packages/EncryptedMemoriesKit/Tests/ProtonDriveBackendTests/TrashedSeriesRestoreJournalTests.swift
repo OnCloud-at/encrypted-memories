@@ -87,6 +87,23 @@ import Testing
         #expect(journal == nil)
         #expect(try Data(contentsOf: directory.database) == before)
     }
+    @Test func anotherSchemaVersionIsUnavailableAndUntouched() throws {
+        let directory = try Directory()
+        defer { directory.remove() }
+        let journal = try #require(TrashedSeriesRestoreJournal(url: directory.database))
+        try journal.record([Self.duty()])
+        journal.close()
+        var db: OpaquePointer?
+        #expect(sqlite3_open(directory.database.path, &db) == SQLITE_OK)
+        #expect(sqlite3_exec(db, "UPDATE restore_info SET value=2 WHERE key='schema';", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+        let before = try Data(contentsOf: directory.database)
+        let reopened = TrashedSeriesRestoreJournal(url: directory.database)
+        reopened?.close()
+        #expect(reopened == nil)
+        #expect(try Data(contentsOf: directory.database) == before)
+    }
+
     @Test func anUndecodableDutyStaysUntouchedAndPreventsReplacement() throws {
         let directory = try Directory()
         defer { directory.remove() }

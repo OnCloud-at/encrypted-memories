@@ -29,6 +29,9 @@ final class TrashedSeriesRestoreJournal: @unchecked Sendable {
             PRIMARY KEY(volume, main));
         """
 
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "restore_info", version: 1, stampReplacesExistingRow: false)
+
     init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         do {
             try FileManager.default.createDirectory(
@@ -37,16 +40,7 @@ final class TrashedSeriesRestoreJournal: @unchecked Sendable {
         guard
             let handle = SQLiteStoreSchemaGate.openCurrentStore(
                 at: url, schemaSQL: Self.schema, policy: policy,
-                verifyVersion: { db in
-                    var statement: OpaquePointer?
-                    defer { sqlite3_finalize(statement) }
-                    return sqlite3_prepare_v2(
-                        db, "SELECT value FROM restore_info WHERE key='schema';", -1, &statement, nil) == SQLITE_OK
-                        && sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1
-                },
-                stampVersion: {
-                    sqlite3_exec($0, "INSERT INTO restore_info VALUES('schema', 1);", nil, nil, nil) == SQLITE_OK
-                })
+                verifyVersion: Self.schemaVersionRow.verify, stampVersion: Self.schemaVersionRow.stamp)
         else { return nil }
         connection = SQLiteStoreConnection(database: handle)
     }

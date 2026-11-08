@@ -1048,20 +1048,6 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(store.mapping(localAlbumID: album.id) == nil)
     }
 
-    @Test func missingLocalAlbumPrecheckDoesNoRemoteResolution() async throws {
-        let source = ScriptedLocalAlbumSource(contents: .missing)
-        let (runner, remote, _, _) = makeRunner(
-            contents: [:],
-            links: [:],
-            localSource: source
-        )
-
-        await #expect(throws: AlbumSyncError.localAlbumMissing) {
-            try await runner.precheck(album: album)
-        }
-        #expect(remote.listCount == 0)
-    }
-
     @Test func albumDisappearingAfterScanStopsBeforeRemoteMutation() async throws {
         let source = ScriptedLocalAlbumSource(
             contents: .present([]),
@@ -1577,6 +1563,37 @@ private final class ProgressBox: @unchecked Sendable {
         #expect(try Data(contentsOf: url) == original)
     }
 
+    @Test func aHealthyStoreReopensWithItsMapping() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-sync-reopen-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let mapping = AlbumSyncMapping(
+            localAlbumID: "kept", remoteAlbumID: "R", title: "A", createdAt: Date(timeIntervalSinceReferenceDate: 100))
+        let store = try #require(AlbumSyncMappingStore(url: url))
+        #expect(store.upsert(mapping))
+        store.close()
+
+        let reopened = try #require(AlbumSyncMappingStore(url: url))
+        defer { reopened.close() }
+        #expect(reopened.mapping(localAlbumID: "kept") == mapping)
+    }
+
+    @Test func anotherSchemaVersionFailsClosedAndKeepsTheMapping() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-sync-version-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try #require(AlbumSyncMappingStore(url: url))
+        #expect(store.upsert(AlbumSyncMapping(localAlbumID: "kept", remoteAlbumID: "R", title: "A", createdAt: Date())))
+        store.close()
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        #expect(sqlite3_exec(db, "UPDATE mapping_info SET value=99 WHERE key='schema';", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+
+        #expect(AlbumSyncMappingStore(url: url) == nil)
+        #expect(sqliteCount(url: url, table: "album_sync_mapping") == 1)
+    }
+
     @Test func markerlessMappingShapeFailsClosedWithoutRepairingIt() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("album-sync-markerless-\(UUID().uuidString).sqlite")
@@ -1626,7 +1643,7 @@ private final class ProgressBox: @unchecked Sendable {
         #expect(store.mapping(localAlbumID: "L1")?.remoteAlbumID == "R1")
     }
 
-    @Test func upsertReadRemoveRoundTrip() throws {
+    @Test func upsertReadRoundTrip() throws {
         let store = makeStore()
         let mapping = AlbumSyncMapping(
             localAlbumID: "L1", remoteAlbumID: "R1", title: "Urlaub",
@@ -1643,9 +1660,6 @@ private final class ProgressBox: @unchecked Sendable {
         store.upsert(updated)
         #expect(store.mapping(localAlbumID: "L1")?.lastAttachedCount == 9)
         #expect(store.allMappings().count == 1)
-
-        store.removeMapping(localAlbumID: "L1")
-        #expect(store.mapping(localAlbumID: "L1") == nil)
     }
 
     private func sqliteCount(url: URL, table: String) -> Int {

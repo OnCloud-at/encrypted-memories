@@ -185,7 +185,7 @@ public final class AlbumActionCoordinator {
     /// Loads exact SDK memberships only for small interactive selections. Large selections keep the
     /// write path available but deliberately avoid one get-node request per photo.
     public func loadMemberships(for photoUIDs: [PhotoUID]) async {
-        membershipSelection = Self.unique(photoUIDs)
+        membershipSelection = photoUIDs.uniqued()
         membershipsByPhoto = [:]
         membershipSelectionIsCovered = false
         guard canReadMemberships,
@@ -242,7 +242,7 @@ public final class AlbumActionCoordinator {
     }
 
     public func add(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async -> Bool {
-        let uniqueUIDs = Self.unique(photoUIDs)
+        let uniqueUIDs = photoUIDs.uniqued()
         guard !uniqueUIDs.isEmpty, !isWorking else { return false }
         let missingUIDs: [PhotoUID]
         if membershipSelectionIsCovered, Set(uniqueUIDs) == Set(membershipSelection) {
@@ -295,10 +295,5 @@ public final class AlbumActionCoordinator {
 
     private static func message(for error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-    }
-
-    private static func unique(_ photoUIDs: [PhotoUID]) -> [PhotoUID] {
-        var seen = Set<PhotoUID>()
-        return photoUIDs.filter { seen.insert($0).inserted }
     }
 }
