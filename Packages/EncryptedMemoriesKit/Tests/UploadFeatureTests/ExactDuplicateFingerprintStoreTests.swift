@@ -338,6 +338,251 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         XCTAssertFalse(store.store([first: details()], for: secondEvent))
     }
 
+    func testRepeatedGroupsKeepOnlyCompleteMetadataAfterMissingAndCorruptMembers() throws {
+        let store = try open()
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let third = PhotoUID(volumeID: "volume", nodeID: "third")
+        let fourth = PhotoUID(volumeID: "volume", nodeID: "fourth")
+        let missing = PhotoUID(volumeID: "volume", nodeID: "missing")
+        let values = [first: details("first"), second: details("second"), third: details("third")]
+        XCTAssertTrue(store.store(values.merging([fourth: details()]) { first, _ in first }, for: snapshot))
+        try changeDatabase("UPDATE fingerprint SET payload=x'00' WHERE link_id='fourth';")
+        let groups = [
+            ExactDuplicateGroup(contentHash: "missing", hashKeyEpoch: "epoch", members: [first, missing]),
+            ExactDuplicateGroup(contentHash: "corrupt", hashKeyEpoch: "epoch", members: [second, fourth]),
+            ExactDuplicateGroup(contentHash: "good", hashKeyEpoch: "epoch", members: [first, third]),
+            ExactDuplicateGroup(contentHash: "overlap", hashKeyEpoch: "epoch", members: [second, third]),
+        ]
+        XCTAssertEqual(store.fingerprints(ofGroups: groups, in: snapshot), values)
+        XCTAssertEqual(store.fingerprints(ofGroups: Array(groups.reversed()), in: snapshot), values)
+        store.close()
+    }
+
+    func testManyInvalidatedLinksLeaveUntouchedMetadataAndRevokeTheOldSnapshot() throws {
+        let store = try open()
+        defer { store.close() }
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let third = PhotoUID(volumeID: "volume", nodeID: "third")
+        XCTAssertTrue(store.store([first: details(), second: details(), third: details("kept")], for: snapshot))
+        let next = try XCTUnwrap(
+            store.advance(from: snapshot, to: "next", invalidating: [first.nodeID, second.nodeID]))
+        XCTAssertEqual(store.fingerprints(ofGroups: [group], in: next), [:])
+        let survivor = ExactDuplicateGroup(contentHash: "kept", hashKeyEpoch: "epoch", members: [third])
+        XCTAssertEqual(store.fingerprints(ofGroups: [survivor], in: next), [third: details("kept")])
+        XCTAssertEqual(store.fingerprints(ofGroups: [survivor], in: snapshot), [:])
+    }
+
+    func testFingerprintReadBindFailureIsRecordedInsteadOfBecomingAMissingRow() throws {
+        let store = try open()
+        defer { store.close() }
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let long = PhotoUID(volumeID: "volume", nodeID: String(repeating: "x", count: 512))
+        XCTAssertTrue(store.store([long: details()], for: snapshot))
+        let connection = try storeConnection(store)
+        let fault = BindFailureUntilStep(
+            on: connection, statement: "SELECT payload FROM fingerprint WHERE",
+            after: "SELECT payload FROM fingerprint_context",
+            limit: 128)
+        defer { fault.remove() }
+        let group = ExactDuplicateGroup(contentHash: "long", hashKeyEpoch: "epoch", members: [long])
+        XCTAssertEqual(store.fingerprints(ofGroups: [group], in: snapshot), [:])
+        XCTAssertTrue(fault.lowered)
+        XCTAssertFalse(fault.stepped)
+        assertRecordedBindFailure(on: connection)
+    }
+
+    func testFingerprintDeleteBindFailureKeepsThePreviousSnapshotAndRows() throws {
+        let store = try open()
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let long = PhotoUID(volumeID: "volume", nodeID: String(repeating: "x", count: 512))
+        XCTAssertTrue(store.store([long: details()], for: snapshot))
+        let connection = try storeConnection(store)
+        let fault = BindFailureUntilStep(
+            on: connection, statement: "DELETE FROM fingerprint WHERE",
+            after: "SELECT payload FROM fingerprint_context",
+            limit: 128)
+        XCTAssertNil(store.advance(from: snapshot, to: "next", invalidating: [long.nodeID]))
+        XCTAssertTrue(fault.lowered)
+        XCTAssertFalse(fault.stepped)
+        assertRecordedBindFailure(on: connection)
+        fault.remove()
+        store.close()
+        let reopened = try open()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.prepare(scope: scope, eventID: "event"), snapshot)
+        XCTAssertEqual(reopened.fingerprints(for: [long], in: snapshot), [long: details()])
+    }
+
+    func testFingerprintBlobBindingFailureStopsBeforeStepAndKeepsThePreviousRows() throws {
+        let store = try open()
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        XCTAssertTrue(store.store([first: details()], for: snapshot))
+        let connection = try storeConnection(store)
+        let fault = BindFailureUntilStep(
+            on: connection, statement: "INSERT OR REPLACE INTO fingerprint VALUES",
+            after: "SELECT payload FROM fingerprint_context", limit: 128)
+        XCTAssertFalse(store.store([first: details(String(repeating: "x", count: 512))], for: snapshot))
+        XCTAssertTrue(fault.lowered)
+        XCTAssertFalse(fault.stepped, "a refused BLOB bind must not step the INSERT")
+        assertRecordedBindFailure(on: connection)
+        fault.remove()
+        store.close()
+        let reopened = try open()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.prepare(scope: scope, eventID: "event"), snapshot)
+        XCTAssertEqual(reopened.fingerprints(for: [first], in: snapshot), [first: details()])
+    }
+
+    func testFingerprintReadStepFailureIsRecordedAndKeepsTheRankingPath() throws {
+        let store = try open()
+        defer { store.close() }
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        XCTAssertTrue(store.store([first: details(), second: details()], for: snapshot))
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT payload FROM fingerprint WHERE")
+        defer { fault.stop() }
+        XCTAssertEqual(store.fingerprints(ofGroups: [group], in: snapshot), [:])
+        XCTAssertTrue(fault.fired)
+        let connection = try storeConnection(store)
+        connection.withLock { XCTAssertTrue(connection.operationFailed) }
+    }
+
+    func testFingerprintPrepareFailuresAreRecordedButEmptyBatchesNeedNoStatement() throws {
+        for action in [SQLITE_READ, SQLITE_DELETE] {
+            let store = try open()
+            let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+            XCTAssertTrue(store.store([first: details(), second: details()], for: snapshot))
+            let connection = try storeConnection(store)
+            try withSQLiteAuthorization(
+                in: store,
+                authorizing: { operation, table, _ in
+                    operation == action && table == "fingerprint" ? SQLITE_DENY : SQLITE_OK
+                },
+                {
+                    if action == SQLITE_READ {
+                        XCTAssertEqual(store.fingerprints(ofGroups: [], in: snapshot), [:])
+                        connection.withLock { XCTAssertFalse(connection.operationFailed) }
+                        XCTAssertEqual(store.fingerprints(ofGroups: [group], in: snapshot), [:])
+                    } else {
+                        let next = store.advance(from: snapshot, to: "empty", invalidating: [])
+                        XCTAssertNotNil(next, "an empty invalidation needs no delete statement")
+                        if let next {
+                            XCTAssertNil(store.advance(from: next, to: "next", invalidating: [first.nodeID]))
+                        }
+                    }
+                    connection.withLock { XCTAssertTrue(connection.operationFailed) }
+                }
+            )
+            store.close()
+        }
+    }
+
+    func testMultipleReadsAndInvalidationsPrepareEachStatementOnce() throws {
+        let store = try open()
+        defer { store.close() }
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let values = [first: details("first"), second: details("second")]
+        XCTAssertTrue(store.store(values, for: snapshot))
+        var counts: [Int32] = [0, 0]
+        try withSQLiteAuthorization(
+            in: store,
+            authorizing: { operation, table, column in
+                if table == "fingerprint" {
+                    if operation == SQLITE_READ, column == "payload" { counts[0] += 1 }
+                    if operation == SQLITE_DELETE { counts[1] += 1 }
+                }
+                return SQLITE_OK
+            },
+            {
+                XCTAssertEqual(store.fingerprints(ofGroups: [group, group], in: snapshot), values)
+                XCTAssertNotNil(store.advance(from: snapshot, to: "next", invalidating: [first.nodeID, second.nodeID]))
+            }
+        )
+        XCTAssertEqual(counts, [1, 1], "one prepare serves every member or invalidation in its transaction")
+    }
+
+    func testSQLiteAuthorizationFiltersUpdatesAndCleansUpAfterReturnOrThrow() throws {
+        let store = try open()
+        defer { store.close() }
+        _ = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let connection = try storeConnection(store)
+        for shouldThrow in [false, true] {
+            do {
+                try withSQLiteAuthorization(
+                    in: store,
+                    authorizing: { operation, table, _ in
+                        operation == SQLITE_UPDATE && table == "fingerprint" ? SQLITE_DENY : SQLITE_OK
+                    },
+                    {
+                        connection.withLock {
+                            XCTAssertEqual(
+                                sqlite3_exec(
+                                    connection.database, "UPDATE fingerprint SET payload=payload;", nil, nil, nil),
+                                SQLITE_AUTH)
+                            XCTAssertEqual(
+                                sqlite3_exec(
+                                    connection.database, "UPDATE fingerprint_context SET payload=payload;", nil, nil,
+                                    nil),
+                                SQLITE_OK)
+                        }
+                        if shouldThrow { throw CancellationError() }
+                    }
+                )
+                XCTAssertFalse(shouldThrow)
+            } catch is CancellationError {
+                XCTAssertTrue(shouldThrow)
+            }
+            connection.withLock {
+                XCTAssertEqual(
+                    sqlite3_exec(connection.database, "UPDATE fingerprint SET payload=payload;", nil, nil, nil),
+                    SQLITE_OK)
+            }
+        }
+    }
+
+    func testSQLiteAuthorizationRemovesTheCallbackAfterAThrownError() throws {
+        let store = try open()
+        defer { store.close() }
+        let connection = try storeConnection(store)
+        XCTAssertThrowsError(
+            try withDeniedSQLiteSelect(in: store) {
+                connection.withLock {
+                    XCTAssertEqual(sqlite3_exec(connection.database, "SELECT 1;", nil, nil, nil), SQLITE_AUTH)
+                }
+                throw CancellationError()
+            }
+        ) { XCTAssertTrue($0 is CancellationError) }
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "SELECT 1;", nil, nil, nil), SQLITE_OK)
+        }
+    }
+
+    func testSQLiteAuthorizationAdaptersOnlyDenyTheirOperation() throws {
+        let store = try open()
+        defer { store.close() }
+        let connection = try storeConnection(store)
+        for denyPragma in [false, true] {
+            let body = {
+                connection.withLock {
+                    XCTAssertEqual(
+                        sqlite3_exec(connection.database, "SELECT 1;", nil, nil, nil),
+                        denyPragma ? SQLITE_OK : SQLITE_AUTH)
+                    XCTAssertEqual(
+                        sqlite3_exec(connection.database, "PRAGMA user_version;", nil, nil, nil),
+                        denyPragma ? SQLITE_AUTH : SQLITE_OK)
+                }
+            }
+            if denyPragma {
+                try withDeniedSQLitePragma(in: store, body)
+            } else {
+                try withDeniedSQLiteSelect(in: store, body)
+            }
+            connection.withLock {
+                XCTAssertEqual(
+                    sqlite3_exec(connection.database, "SELECT 1; PRAGMA user_version;", nil, nil, nil), SQLITE_OK)
+            }
+        }
+    }
+
     private func changeDatabase(_ sql: String) throws {
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)

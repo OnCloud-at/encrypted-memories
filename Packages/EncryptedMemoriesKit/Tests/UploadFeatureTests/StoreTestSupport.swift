@@ -165,3 +165,45 @@ func storeIntegerCatalogKey(_ key: Int, replacing localIdentifier: String, inClo
     try declare(blobKey, as: textKey)
     XCTAssertEqual(try text("SELECT local_id FROM photo_catalog WHERE typeof(local_id)='integer';"), "\(key)")
 }
+
+/// Authorizes statement preparation, not each step. Prepare, use and finalize statements within the body;
+/// statements prepared before installation or retained across the body are outside this fixture's guarantees.
+/// SQLite can reprepare during a step, so the callback stays installed until the body returns or throws.
+/// The predicate receives the operation and arg1/arg2: table for READ/UPDATE/DELETE, column for READ/UPDATE;
+/// other operations retain SQLite's argument meanings. Database and trigger/view names are not forwarded.
+/// Do not nest or overlap calls on one connection: SQLite has one authorizer and the next install replaces it.
+/// Keep the store open. The predicate must not re-enter the connection's nonrecursive lock.
+/// The callback must not modify its connection, including preparing or stepping statements.
+func withSQLiteAuthorization(
+    in store: Any, authorizing: @escaping (Int32, String?, String?) -> Int32,
+    _ body: () throws -> Void
+) throws {
+    let authorization = try SQLiteAuthorization(in: store, authorizing: authorizing)
+    defer { authorization.remove() }
+    try body()
+}
+
+private final class SQLiteAuthorization {
+    private let connection: SQLiteStoreConnection
+    private let authorizing: (Int32, String?, String?) -> Int32
+
+    init(in store: Any, authorizing: @escaping (Int32, String?, String?) -> Int32) throws {
+        connection = try storeConnection(store)
+        self.authorizing = authorizing
+        connection.withLock {
+            XCTAssertEqual(
+                sqlite3_set_authorizer(
+                    connection.database,
+                    { context, action, table, column, _, _ in
+                        guard let context else { return SQLITE_DENY }
+                        let authorization = Unmanaged<SQLiteAuthorization>.fromOpaque(context).takeUnretainedValue()
+                        return authorization.authorizing(
+                            action, table.map { String(cString: $0) }, column.map { String(cString: $0) })
+                    }, Unmanaged.passUnretained(self).toOpaque()), SQLITE_OK)
+        }
+    }
+
+    func remove() {
+        connection.withLock { XCTAssertEqual(sqlite3_set_authorizer(connection.database, nil, nil), SQLITE_OK) }
+    }
+}
