@@ -105,8 +105,12 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         guard !eventID.isEmpty else { return nil }
         return transaction { db in
             guard self.current(db) == snapshot else { return nil }
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
             for linkID in linkIDs {
-                guard self.execute(db, "DELETE FROM fingerprint WHERE link_id=?;", text: linkID) else { return nil }
+                guard self.prepare(db, "DELETE FROM fingerprint WHERE link_id=?;", reusing: &statement),
+                    self.execute(statement, text: linkID)
+                else { return nil }
             }
             let next = Snapshot(scope: snapshot.scope, eventID: eventID, generation: UUID().uuidString)
             guard self.writeContext(next, db: db) else { return nil }
@@ -143,6 +147,8 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         transaction(writing: false) { db in
             guard self.current(db) == snapshot else { return nil }
             var result: [PhotoUID: ExactDuplicateFingerprint] = [:]
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
             for group in groups
             where group.hashKeyEpoch == snapshot.scope.hashKeyEpoch
                 && group.members.allSatisfy({ $0.volumeID == snapshot.scope.volumeID })
@@ -150,7 +156,8 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
                 var saved: [PhotoUID: ExactDuplicateFingerprint] = [:]
                 for uid in group.members {
                     let select = "SELECT payload FROM fingerprint WHERE link_id=?;"
-                    guard let data = self.read(db, select, text: uid.nodeID),
+                    guard self.prepare(db, select, reusing: &statement),
+                        let data = self.read(statement, text: uid.nodeID),
                         let row = try? JSONDecoder().decode(SavedFingerprint.self, from: data)
                     else { break }
                     saved[uid] = row.fingerprint(for: uid)
@@ -187,13 +194,20 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         return execute(db, "INSERT OR REPLACE INTO fingerprint_context VALUES(1,?);", data: data)
     }
 
+    private func prepare(_ db: OpaquePointer, _ sql: String, reusing statement: inout OpaquePointer?) -> Bool {
+        if statement != nil { return true }
+        return connection.requireOperational(sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK)
+    }
+
     private func execute(_ db: OpaquePointer, _ sql: String, text: String? = nil, data: Data? = nil) -> Bool {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            connection.markFailed()
-            return false
-        }
         defer { sqlite3_finalize(statement) }
+        guard prepare(db, sql, reusing: &statement) else { return false }
+        return execute(statement, text: text, data: data)
+    }
+
+    private func execute(_ statement: OpaquePointer?, text: String?, data: Data? = nil) -> Bool {
+        defer { sqlite3_reset(statement) }
         guard bind(statement, text: text, data: data), sqlite3_step(statement) == SQLITE_DONE else {
             connection.markFailed()
             return false
@@ -201,13 +215,15 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         return true
     }
 
-    private func read(_ db: OpaquePointer, _ sql: String, text: String? = nil) -> Data? {
+    private func read(_ db: OpaquePointer, _ sql: String) -> Data? {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            connection.markFailed()
-            return nil
-        }
         defer { sqlite3_finalize(statement) }
+        guard prepare(db, sql, reusing: &statement) else { return nil }
+        return read(statement, text: nil)
+    }
+
+    private func read(_ statement: OpaquePointer?, text: String?) -> Data? {
+        defer { sqlite3_reset(statement) }
         guard bind(statement, text: text) else {
             connection.markFailed()
             return nil
@@ -221,14 +237,9 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0)))
     }
 
-    private func bind(_ statement: OpaquePointer?, text: String? = nil, data: Data? = nil) -> Bool {
-        let copy = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        if let text, sqlite3_bind_text(statement, 1, text, -1, copy) != SQLITE_OK { return false }
-        if let data {
-            return data.withUnsafeBytes {
-                sqlite3_bind_blob64(statement, text == nil ? 1 : 2, $0.baseAddress, UInt64($0.count), copy) == SQLITE_OK
-            }
-        }
+    private func bind(_ statement: OpaquePointer?, text: String?, data: Data? = nil) -> Bool {
+        if let text, SQLiteBinding.text(statement, 1, text) != SQLITE_OK { return false }
+        if let data { return SQLiteBinding.blob(statement, text == nil ? 1 : 2, data) == SQLITE_OK }
         return true
     }
 }
