@@ -804,10 +804,23 @@ private func settle(until condition: (() -> Bool)? = nil) async {
 }
 
 @Suite struct TimelineScrollDateLabelGeometryTests {
+    @Test func actualThumbLengthDeterminesTheCenterAtFiveFractions() {
+        for (top, expected) in zip([CGFloat(100), 250, 400, 550, 700], [CGFloat(150), 300, 450, 600, 750]) {
+            #expect(
+                TimelineScrollDateLabelGeometry.centerY(
+                    thumbTop: top, thumbLength: 100, viewportTop: 0, viewportBottom: 900, labelHeight: 30) == expected)
+        }
+        #expect(
+            TimelineScrollDateLabelGeometry.centerY(
+                thumbTop: 100, thumbLength: 7, viewportTop: 0, viewportBottom: 900, labelHeight: 30) == 103.5,
+            "a squeezed native thumb keeps its actual center")
+    }
+
     @Test func followsTheScrollIndicatorFromTopToBottom() {
         func center(_ offset: CGFloat) -> CGFloat? {
             TimelineScrollDateLabelGeometry.centerY(
-                offsetY: offset, minOffsetY: -100, maxOffsetY: 9_900, trackTop: 100, trackBottom: 800, labelHeight: 30)
+                thumbTop: 100 + min(max((offset + 100) / 10_000, 0), 1) * 670, thumbLength: 30, viewportTop: 100,
+                viewportBottom: 800, labelHeight: 30)
         }
         #expect(center(-100) == 115)
         #expect(center(9_900) == 785)
@@ -822,7 +835,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         for step in 0...100 {
             let y = try #require(
                 TimelineScrollDateLabelGeometry.centerY(
-                    offsetY: CGFloat(step), minOffsetY: 0, maxOffsetY: 100, trackTop: 100, trackBottom: 800,
+                    thumbTop: 100 + CGFloat(step) / 100 * 670, thumbLength: 30, viewportTop: 100, viewportBottom: 800,
                     labelHeight: 30, avoiding: [band]))
             #expect(y - 15 >= 100 && y + 15 <= 800)
             #expect(y + 15 <= band.lowerBound || y - 15 >= band.upperBound, "label at \(y) covers the fold")
@@ -845,11 +858,11 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     }
 
     @Test func theEndOfTheTrackStaysPlacedDespiteRounding() throws {
-        // The layout that the review reproduced: fraction 1 with one fold band left a rounding step after the last
-        // segment, so the label had no place and vanished during its linger.
+        // A native thumb at the bottom stays placed despite fractional viewport and label dimensions.
         let y = try #require(
             TimelineScrollDateLabelGeometry.centerY(
-                offsetY: 1, minOffsetY: 0, maxOffsetY: 1, trackTop: 114.94, trackBottom: 745.75, labelHeight: 44.07,
+                thumbTop: 745.75 - 44.07, thumbLength: 44.07, viewportTop: 114.94, viewportBottom: 745.75,
+                labelHeight: 44.07,
                 avoiding: [435.21...446.74]))
         #expect(abs(y - (745.75 - 44.07 / 2)) < 0.001)
     }
@@ -874,7 +887,8 @@ private func settle(until condition: (() -> Bool)? = nil) async {
             }
             for fraction in [0, 0.25, 0.5, 0.999_999, 1, random.next(in: 0...1)] as [CGFloat] {
                 let y = TimelineScrollDateLabelGeometry.centerY(
-                    offsetY: fraction, minOffsetY: 0, maxOffsetY: 1, trackTop: top, trackBottom: bottom,
+                    thumbTop: top + fraction * (bottom - top - height), thumbLength: height, viewportTop: top,
+                    viewportBottom: bottom,
                     labelHeight: height, avoiding: bands)
                 guard fits else {
                     #expect(y == nil)
@@ -915,7 +929,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
     @Test func returnsNilWhenNoSegmentHoldsTheLabel() {
         #expect(
             TimelineScrollDateLabelGeometry.centerY(
-                offsetY: 0, minOffsetY: 0, maxOffsetY: 100, trackTop: 0, trackBottom: 50, labelHeight: 30,
+                thumbTop: 0, thumbLength: 30, viewportTop: 0, viewportBottom: 50, labelHeight: 30,
                 avoiding: [10...40]) == nil)
     }
 }

@@ -276,7 +276,7 @@
         private static let gridClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
         let metalView = UIKitTimelineMetalHostView()
-        let scrollView = UIScrollView()
+        let scrollView = UIKitTimelineScrollView()
         let contentView = UIView()
         private let profileAdapter = UIKitTimelineGridProfileAdapter()
         private let displayLink: UIKitTimelineDisplayLinkDriver

@@ -115,8 +115,10 @@
         /// Viewport bands the label must not cover (fold, camera), sorted by their top edge.
         private var avoidedBands: [ClosedRange<CGFloat>] = []
         private var isShown = false
+
         private weak var host: UIView?
-        private weak var scrollView: UIScrollView?
+        private weak var scrollView: UIKitTimelineScrollView?
+        private var nativeThumbRect: CGRect?
 
         init(controller: TimelineScrollDateLabelController = TimelineScrollDateLabelController()) {
             self.controller = controller
@@ -126,10 +128,15 @@
         }
 
         /// Adds the label above the grid.
-        func attach(to host: UIView, scrollView: UIScrollView) {
+        func attach(to host: UIView, scrollView: UIKitTimelineScrollView) {
             self.host = host
             self.scrollView = scrollView
             host.addSubview(view)
+            scrollView.onVerticalIndicatorLayout = { [weak self, weak host, weak scrollView] rect in
+                guard let self, let host, let scrollView else { return }
+                nativeThumbRect = rect.map { host.convert($0, from: scrollView) }
+                layout()
+            }
         }
 
         func setEnabled(_ enabled: Bool) {
@@ -161,6 +168,10 @@
             controller.viewportMoved(movement, offsetY: Double(offsetY))
         }
 
+        private func labelTrailingX(in host: UIView) -> CGFloat {
+            host.bounds.width - host.safeAreaInsets.right - TimelineScrollDateLabelMotion.indicatorGap
+        }
+
         /// A photo opens over the grid: the label leaves at once.
         func hideForRoute() { controller.hide() }
 
@@ -177,33 +188,24 @@
 
         /// Places the label beside the scroll indicator. Runs only while the label shows.
         func layout() {
-            guard isShown, let host, let scrollView else { return }
+            guard isShown, let host else { return }
             let size = view.fittingSize
-            // The native thumb runs inside the indicator insets plus, by default, the scroll view's safe area.
-            var indicator = scrollView.verticalScrollIndicatorInsets
-            if scrollView.automaticallyAdjustsScrollIndicatorInsets {
-                indicator.top += scrollView.safeAreaInsets.top
-                indicator.bottom += scrollView.safeAreaInsets.bottom
-            }
-            let minOffset = -scrollView.contentInset.top
-            let maxOffset = max(
-                minOffset, scrollView.contentSize.height + scrollView.contentInset.bottom - scrollView.bounds.height)
-            guard
+            guard let nativeThumbRect,
                 let centerY = TimelineScrollDateLabelGeometry.centerY(
-                    offsetY: scrollView.contentOffset.y, minOffsetY: minOffset, maxOffsetY: maxOffset,
-                    trackTop: indicator.top + TimelineScrollDateLabelMotion.trackMargin,
-                    trackBottom: host.bounds.height - indicator.bottom - TimelineScrollDateLabelMotion.trackMargin,
+                    thumbTop: nativeThumbRect.minY, thumbLength: nativeThumbRect.height,
+                    viewportTop: host.safeAreaInsets.top,
+                    viewportBottom: host.bounds.height - host.safeAreaInsets.bottom,
                     labelHeight: size.height, avoiding: avoidedBands)
             else {
-                view.alpha = 0  // No free place on the track (an extreme fold or a tiny window).
+                view.alpha = 0  // No native thumb geometry or no space outside the reserved regions.
                 return
             }
             view.alpha = 1
-            let maxX = host.bounds.width - host.safeAreaInsets.right - TimelineScrollDateLabelMotion.indicatorGap
-            let frame = CGRect(
-                x: (maxX - size.width).rounded(), y: (centerY - size.height / 2).rounded(),
-                width: size.width, height: size.height)
-            if view.frame != frame { view.frame = frame }
+            let origin = CGPoint(
+                x: (labelTrailingX(in: host) - size.width).rounded(), y: centerY - size.height / 2)
+            let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+            if view.bounds.size != size { view.bounds.size = size }
+            if view.center != center { view.center = center }
             #if DEBUG
                 notePlacementForTests()
             #endif
@@ -211,6 +213,7 @@
 
         /// Ends the label with its host: no build, hide or callback outlives it.
         func retire() {
+            scrollView?.onVerticalIndicatorLayout = nil
             controller.retire()
         }
 
@@ -224,6 +227,7 @@
 
         private func apply(_ presentation: TimelineScrollDateLabelController.Presentation) {
             if let text = presentation.text { view.setText(text) }
+
             if presentation.isVisible != isShown {
                 isShown = presentation.isVisible
                 if isShown { host?.bringSubviewToFront(view) }
@@ -273,4 +277,5 @@
             }
         #endif
     }
+
 #endif

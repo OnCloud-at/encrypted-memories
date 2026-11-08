@@ -39,6 +39,12 @@ public final class TimelineScrollDateLabelController {
         /// The shared duration for this visibility transition.
         public let fadeDuration: TimeInterval?
 
+        public init(isVisible: Bool, text: String?, fadeDuration: TimeInterval?) {
+            self.isVisible = isVisible
+            self.text = text
+            self.fadeDuration = fadeDuration
+        }
+
         public static let hidden = Presentation(isVisible: false, text: nil, fadeDuration: nil)
     }
 
@@ -204,6 +210,7 @@ public final class TimelineScrollDateLabelController {
         let next = Presentation(
             isVisible: visible && text != nil, text: text,
             fadeDuration: animated && !reduceMotion ? policy.fadeDuration : nil)
+
         // An immediate hide also reaches the host when the label is already fading out, so the fade stops at once.
         guard next != presentation || (!animated && !next.isVisible) else { return }
         presentation = next

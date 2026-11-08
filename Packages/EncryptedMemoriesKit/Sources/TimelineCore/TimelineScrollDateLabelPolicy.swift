@@ -53,6 +53,7 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     public private(set) var isSuppressed = false
     /// Frozen when visibility changes. Nil means an immediate change, such as suppression.
     public private(set) var fadeDuration: TimeInterval?
+
     private var lastOffsetY: Double?
     private var lastTime: TimeInterval?
     private var smoothedSpeed: Double = 0
@@ -79,6 +80,7 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
         let instant = abs(offsetY - previousY) / interval
         let weight = 1 - exp(-interval / tuning.smoothing)
         smoothedSpeed += (instant - smoothedSpeed) * weight
+
         if isVisible {
             if smoothedSpeed >= tuning.sustainSpeed {
                 lastSustainingSpeed = smoothedSpeed
@@ -116,6 +118,7 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     /// Hides the label at once, for example when its content became stale.
     public mutating func hide(duration: TimeInterval? = nil) {
         isVisible = false
+
         hideDeadline = nil
         fadeDuration = duration
         lastSustainingSpeed = 0
@@ -158,10 +161,9 @@ public enum TimelineScrollDateLabelMotion {
     public static let fadeOut = FadeDurations(slow: 0.70, fast: 0.35)
     /// Boundary at the first smoothed show sample, not at the raw input speed. The visibility threshold stays 600.
     public static let fastFadeSpeed: Double = 650
+
     /// Points between the label's trailing edge and the scroll host's trailing edge, clear of the indicator.
     public static let indicatorGap: CGFloat = 16
-    /// Points the label keeps from the ends of the indicator track.
-    public static let trackMargin: CGFloat = 2
     /// Width of the trailing column that the label can occupy, from the trailing edge, including the indicator gap.
     /// Reserved regions outside this column, such as the crease of an open iPhone Duo, never move the label.
     public static let columnWidth: CGFloat = 240
@@ -174,40 +176,25 @@ public enum TimelineScrollDateLabelMotion {
 
 /// Vertical placement of the scroll date label beside the native scroll indicator.
 public enum TimelineScrollDateLabelGeometry {
-    /// The label centre in viewport coordinates. It follows the scroll indicator: the scroll fraction maps onto the
-    /// indicator track (`trackTop`...`trackBottom`). Bands that the label must not cover, such as a fold, are
-    /// skipped: the track becomes the free segments that can hold the label, in order. Returns nil when no segment
-    /// can hold the label.
+    /// The native thumb owns its track, proportional/minimum length and overscroll squeeze. The adapter forwards
+    /// that actual geometry. Only a reserved region or viewport edge can move the label away from its center.
     public static func centerY(
-        offsetY: CGFloat, minOffsetY: CGFloat, maxOffsetY: CGFloat,
-        trackTop: CGFloat, trackBottom: CGFloat, labelHeight: CGFloat,
-        avoiding bands: [ClosedRange<CGFloat>] = []
+        thumbTop: CGFloat, thumbLength: CGFloat, viewportTop: CGFloat, viewportBottom: CGFloat,
+        labelHeight: CGFloat, avoiding bands: [ClosedRange<CGFloat>] = []
     ) -> CGFloat? {
-        let range = maxOffsetY - minOffsetY
-        let fraction = range > 0 ? min(max((offsetY - minOffsetY) / range, 0), 1) : 0
-        // Usable length of each free segment: the distance the label centre can travel inside it.
-        var total: CGFloat = 0
-        forEachFreeSegment(trackTop: trackTop, trackBottom: trackBottom, bands: bands) { start, end in
-            total += max(0, end - start - labelHeight)
-            return false
-        }
+        let desired = thumbTop + thumbLength / 2
         var result: CGFloat?
-        var lastFittingEnd: CGFloat?
-        var remaining = fraction * total
-        forEachFreeSegment(trackTop: trackTop, trackBottom: trackBottom, bands: bands) { start, end in
-            guard end - start >= labelHeight else { return false }
-            lastFittingEnd = end
-            let usable = end - start - labelHeight
-            if remaining <= usable {
-                result = start + labelHeight / 2 + remaining
-                return true
+        var distance = CGFloat.infinity
+        forEachFreeSegment(trackTop: viewportTop, trackBottom: viewportBottom, bands: bands) { start, end in
+            guard end - start >= labelHeight else { return }
+            let center = min(max(desired, start + labelHeight / 2), end - labelHeight / 2)
+            let delta = abs(center - desired)
+            if delta < distance {
+                result = center
+                distance = delta
             }
-            remaining -= usable
-            return false
         }
-        // Subtracting the segment lengths can leave a rounding step at the very end of the track; that position is
-        // the end of the last segment that holds the label.
-        return result ?? lastFittingEnd.map { $0 - labelHeight / 2 }
+        return result
     }
 
     /// The vertical bands of reserved regions that reach into the trailing label column (x from `columnMinX` to the
@@ -222,16 +209,16 @@ public enum TimelineScrollDateLabelGeometry {
     }
 
     /// Visits the parts of the track that no band covers, top to bottom, without allocating. `bands` must be sorted
-    /// by their lower bound. The visitor returns true to stop.
+    /// by their lower bound.
     private static func forEachFreeSegment(
         trackTop: CGFloat, trackBottom: CGFloat, bands: [ClosedRange<CGFloat>],
-        _ visit: (CGFloat, CGFloat) -> Bool
+        _ visit: (CGFloat, CGFloat) -> Void
     ) {
         var cursor = trackTop
         for band in bands where band.upperBound > cursor && band.lowerBound < trackBottom {
-            if band.lowerBound > cursor, visit(cursor, band.lowerBound) { return }
+            if band.lowerBound > cursor { visit(cursor, band.lowerBound) }
             cursor = max(cursor, band.upperBound)
         }
-        if cursor < trackBottom { _ = visit(cursor, trackBottom) }
+        if cursor < trackBottom { visit(cursor, trackBottom) }
     }
 }

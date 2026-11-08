@@ -46,6 +46,11 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
 
     /// Makes the label visible through the shared controller, as a brisk scroll on a scrollable library would.
     private func showLabel(on grid: UIKitTimelineGridHostView) throws {
+        if grid.scrollView.contentSize.height <= grid.bounds.height {
+            grid.scrollView.contentSize = CGSize(width: grid.bounds.width, height: grid.bounds.height * 20)
+            grid.scrollView.flashScrollIndicators()
+            grid.scrollView.layoutIfNeeded()
+        }
         let controller = grid.scrollDateLabel.controller
         controller.updateHost(
             TimelineScrollDateLabelHostState(
@@ -59,6 +64,30 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
             controller.userMoved(offsetY: offset)
         }
         XCTAssertTrue(controller.presentation.isVisible, "SETUP: the label must be visible")
+    }
+
+    private func nativeThumb(on grid: UIKitTimelineGridHostView) throws -> CGRect {
+        let rect = try XCTUnwrap(grid.scrollView.verticalIndicatorRect)
+        return grid.convert(rect, from: grid.scrollView)
+    }
+
+    func testNativeThumbGeometryCentersTheLabelAtFiveFractions() async throws {
+        let grid = try hostInWindow()
+        try showLabel(on: grid)
+        grid.window?.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        for fraction in [CGFloat(0), 0.25, 0.5, 0.75, 1] {
+            grid.scrollView.contentSize = CGSize(width: grid.bounds.width, height: 10_000)
+            let low = -grid.scrollView.contentInset.top
+            let high = 10_000 + grid.scrollView.contentInset.bottom - grid.bounds.height
+            grid.scrollView.setContentOffset(CGPoint(x: 0, y: low + fraction * (high - low)), animated: false)
+            grid.scrollView.flashScrollIndicators()
+            grid.scrollView.layoutIfNeeded()
+            try showLabel(on: grid)
+            grid.scrollDateLabel.layout()
+            let thumb = try nativeThumb(on: grid)
+            XCTAssertEqual(grid.scrollDateLabel.view.frame.midY, thumb.midY, accuracy: 0.01)
+        }
     }
 
     func testTheHostReportsItsOwnScrollsAndLayoutAsNonUserMovement() throws {
