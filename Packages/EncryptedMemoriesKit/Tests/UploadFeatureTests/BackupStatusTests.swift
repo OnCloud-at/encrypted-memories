@@ -247,7 +247,6 @@ final class BackupStatusTests: XCTestCase {
         running.total = 10
         running.waiting = 4
         running.checking = 2
-        running.checked = 3
         running.skippedDuplicates = 1
         let checking = BackupStatus(manualUploadCheck: running)
         XCTAssertEqual(
@@ -262,13 +261,11 @@ final class BackupStatusTests: XCTestCase {
 
         var failed = UploadPreparationStatus()
         failed.total = 2
-        failed.checked = 1
         failed.failed = 1
         XCTAssertEqual(BackupStatus(manualUploadCheck: failed).phase, .needsAttention)
 
         var done = UploadPreparationStatus()
         done.total = 2
-        done.checked = 1
         done.skippedDuplicates = 1
         XCTAssertEqual(BackupStatus(manualUploadCheck: done).phase, .completed)
     }

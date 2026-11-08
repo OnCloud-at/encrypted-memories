@@ -113,7 +113,9 @@ final class ManualUploadRetryEligibilityTests: XCTestCase {
         // Removing the injected fault restores SQLite writes, but not this store's failed connection.
         try execute("DROP TRIGGER refuse_terminal_update;", at: databaseURL)
         for _ in 0..<3 {
-            await manager.resumeAll()
+            #if DEBUG
+                await manager.pumpForTesting()
+            #endif
             try await Task.sleep(for: .milliseconds(20))
         }
         await manager.retry(id)
