@@ -3266,7 +3266,9 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
 
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
-        // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
+        // One tag listing per operation. It lists the main photos that carry the favorites tag; the listing hides
+        // related photos. A per-node tag read exists (`fetchAlbumPhotoMetadata` reads `Photo.Tags`), but it is not
+        // shown to answer the same as the listing for every photo asked here, so this path keeps the listing.
         let favorites = try await requestGovernor.causes.run(.carryOver) { try await favoriteUIDs() }
         return Set(uids.filter(favorites.contains))
     }
