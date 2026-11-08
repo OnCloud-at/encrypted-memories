@@ -24,7 +24,6 @@
         public init(
             cache: ThumbnailCache,
             loader: ThumbnailBatchLoader,
-            dimensions: PhotoDimensionCoalescer? = nil,
             targetPixels: CGFloat = 320,
             concurrency: Int = UIKitMediaCachePolicy.downloadConcurrencyLimit(),
             batch: Int = 6,
@@ -57,11 +56,7 @@
                     directory: cache.coverageCheckpointDirectory(),
                     scope: cache.coverageCheckpointScope()
                 ),
-                clock: clock,
-                onDecoded: { uid, decoded in
-                    // Same DB-backed dimension pipeline as the macOS feed - batched, off this path.
-                    dimensions?.record(uid, width: decoded.pixelWidth, height: decoded.pixelHeight)
-                }
+                clock: clock
             )
         }
 

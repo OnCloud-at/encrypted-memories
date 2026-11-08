@@ -1618,7 +1618,6 @@ final class MobileLibraryModel {
                 let feed = UIKitThumbnailFeed(
                     cache: cache,
                     loader: client.librarySources,
-                    dimensions: PhotoDimensionCoalescer(store: backend),
                     targetPixels: 288
                 )
                 // The pending store, the photo backup and album sync are built the same way on macOS.

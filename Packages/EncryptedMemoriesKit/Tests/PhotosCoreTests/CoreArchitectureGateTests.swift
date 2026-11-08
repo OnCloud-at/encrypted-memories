@@ -80,7 +80,7 @@ final class CoreArchitectureGateTests: XCTestCase {
         ),
         CoreTargetRule(
             name: "MediaCacheCore",
-            // MediaCacheCore has no Observation dependency; learned dimensions are stored in PhotosCore metadata.
+            // MediaCacheCore has no Observation dependency.
             allowedImports: ["Foundation", "PhotosCore"],
             expectedDependencies: ["PhotosCore"],
             extraForbiddenTokens: []

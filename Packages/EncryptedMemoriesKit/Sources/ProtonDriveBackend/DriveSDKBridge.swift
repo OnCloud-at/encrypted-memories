@@ -2760,18 +2760,6 @@ private extension ThumbnailPriority {
     }
 }
 
-// MARK: - PhotoDimensionRecording (learned w/h into the library metadata DB)
-
-extension DriveSDKBridge: PhotoDimensionRecording {
-    /// Batched by `PhotoDimensionCoalescer`; the store fills only rows without dimensions
-    /// (first-seen-wins), so repeated decodes and future true-dimension writers can coexist.
-    func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {
-        _ = try? await withOpenSession(cause: .local) { bridge in
-            bridge.timelineStore?.updateDimensions(batch)
-        }
-    }
-}
-
 // MARK: - PhotoUploading (UploadFeature seam)
 
 /// Library upload via the SDK's `EncryptedMemoriesClient`. The SDK resolves the photos root itself, encrypts
