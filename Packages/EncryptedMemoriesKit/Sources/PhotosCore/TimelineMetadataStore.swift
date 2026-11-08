@@ -1138,17 +1138,26 @@ public final class TimelineMetadataStore {
     // MARK: Digest
 
     /// Deterministic SHA-256 over the canonically ordered rows' persisted fields. Doubles hash by
-    /// exact bit pattern (little-endian) so the digest is identical across platforms; field and
-    /// record separators keep the encoding unambiguous.
+    /// exact bit pattern (little-endian) so the digest is identical across platforms. The field and record
+    /// separators do not make the encoding unambiguous (a comma inside an ID reads like two IDs); it stays as
+    /// it is because a change would invalidate every stored digest.
     private static func timelineDigest(of ordered: [PhotoItem]) -> String {
         var hasher = SHA256()
+        // Feed the UTF-8 bytes of each string directly: no `Data` copy per field.
+        func update(_ string: String) {
+            var string = string
+            string.withUTF8 { hasher.update(bufferPointer: UnsafeRawBufferPointer($0)) }
+        }
+        func update(_ byte: UInt8) {
+            withUnsafeBytes(of: byte) { hasher.update(bufferPointer: $0) }
+        }
         func feed(_ string: String) {
-            hasher.update(data: Data(string.utf8))
-            hasher.update(data: Data([0x1F]))
+            update(string)
+            update(0x1F)
         }
         func feed(_ double: Double) {
             withUnsafeBytes(of: double.bitPattern.littleEndian) { hasher.update(bufferPointer: $0) }
-            hasher.update(data: Data([0x1F]))
+            update(0x1F)
         }
         for item in ordered {
             feed(item.uid.volumeID)
@@ -1158,9 +1167,18 @@ public final class TimelineMetadataStore {
             feed(item.isLivePhoto ? "1" : "0")
             feed(item.relatedVideoID ?? "")
             if let dur = item.durationSeconds { feed(dur) } else { feed("") }
-            feed(item.tags.map(\.rawValue).sorted().map(String.init).joined(separator: ","))
-            feed(item.burstMemberIDs.joined(separator: ","))
-            hasher.update(data: Data([0x1E]))
+            // Tags as ascending raw values and burst members in order, each joined by a comma.
+            for (index, raw) in item.tags.map(\.rawValue).sorted().enumerated() {
+                if index > 0 { update(0x2C) }
+                update(String(raw))
+            }
+            update(0x1F)
+            for (index, member) in item.burstMemberIDs.enumerated() {
+                if index > 0 { update(0x2C) }
+                update(member)
+            }
+            update(0x1F)
+            update(0x1E)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }

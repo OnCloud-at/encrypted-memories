@@ -761,6 +761,36 @@ final class TimelineMetadataStoreTests: XCTestCase {
         store.close()
     }
 
+    /// The stored digest decides whether a refresh writes anything, so its byte stream is part of the
+    /// persisted format: an unchanged digest keeps an existing database from a forced full rewrite. The value
+    /// was computed once from the original implementation.
+    func testTimelineDigestBytesAreStable() throws {
+        let dir = try makeTempDir()
+        let (store, url) = try makeStore(in: dir)
+        let items = [
+            makeItem(node: "a", t: 0),
+            makeItem(
+                node: "\u{e9}-\u{65E5}\u{672C}-\u{1F642}", t: 1.5, mime: "image/heic", live: true,
+                relvid: "motion-\u{fc}", dur: 12.25, tags: [.livePhotos, .favorites, .bursts],
+                burst: ["b1", "b2,x"]),
+            makeItem(vol: "vol2", node: "c", t: -3.75, mime: "video/quicktime", dur: 0, tags: [.videos]),
+            makeItem(node: "d", t: 1_000_000_000.125, dur: -0.0, tags: [.raw, .selfies]),
+            makeItem(node: "e", t: 1_000_000_000.125, relvid: "", burst: [""]),
+            // Identifiers longer than 15 UTF-8 bytes are stored on the heap, like production identifiers.
+            makeItem(
+                vol: "volume-with-a-long-identifier", node: "node-0123456789abcdefghijklmnopqrstuvwxyz", t: 7,
+                mime: "video/quicktime", live: true, relvid: "related-video-0123456789abcdef", dur: 3.5,
+                tags: [.panoramas, .portraits],
+                burst: ["burst-member-0123456789abcdef", "second-member-0123456789abcdef"]),
+        ]
+        store.save(items)
+
+        XCTAssertEqual(
+            rawRows(url, "SELECT value FROM store_meta WHERE key='timeline.digest';"),
+            [["b4f9f7213241013e9dff3b38ed59fd3e8f84e751dbe34e6491760f6beafaa086"]])
+        store.close()
+    }
+
     func testMediaTypeEvidenceRepairsRowsTagsAndPersistsDurably() throws {
         let dir = try makeTempDir()
         let (store, url) = try makeStore(in: dir)
