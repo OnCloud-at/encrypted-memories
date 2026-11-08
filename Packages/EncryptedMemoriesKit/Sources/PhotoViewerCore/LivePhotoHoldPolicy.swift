@@ -18,21 +18,21 @@ public struct LivePhotoHoldPolicy {
         }
     }
 
-    private var active = false
+    public private(set) var isActive = false
 
     public init() {}
 
     public mutating func consume(_ event: Event, textIsSelected: Bool = false) -> Action? {
         switch textIsSelected ? .textSelection : event {
         case .began:
-            guard !active else { return nil }
-            active = true
+            guard !isActive else { return nil }
+            isActive = true
             return .start
         case .possible, .changed:
             return nil
         case .ended, .cancelled, .failed, .scroll, .pan, .pinch, .pageChange, .teardown, .textSelection:
-            guard active else { return nil }
-            active = false
+            guard isActive else { return nil }
+            isActive = false
             return .stop
         }
     }

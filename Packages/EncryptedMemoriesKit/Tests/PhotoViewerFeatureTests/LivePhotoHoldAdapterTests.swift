@@ -51,7 +51,7 @@
         }
 
         func testNativeScrollAndPinchNotificationsCancelOnlyTheirPhoto() throws {
-            for name in [NSScrollView.willStartLiveScrollNotification, NSScrollView.willStartLiveMagnifyNotification] {
+            for name in [NSScrollView.didLiveScrollNotification, NSScrollView.willStartLiveMagnifyNotification] {
                 var calls: [String] = []
                 let (host, scroll, press) = try makePhotoHost(
                     onStart: { calls.append("start") }, onStop: { calls.append("stop") })
@@ -115,7 +115,7 @@
             press.onStart = { calls.append("start") }
             press.onStop = { calls.append("stop") }
             press.consume(.began, at: .zero)
-            press.consume(.changed, at: NSPoint(x: press.allowableMovement / 2, y: 0))
+            press.consume(.changed, at: NSPoint(x: press.allowableMovement, y: 0))
             XCTAssertEqual(calls, ["start"])
             press.consume(.changed, at: NSPoint(x: press.allowableMovement + 1, y: 0))
             XCTAssertEqual(calls, ["start", "stop"])
@@ -123,25 +123,83 @@
             XCTAssertEqual(calls, ["start", "stop"])
         }
 
-        func testLiveTextExcludesBeginAndStopsAnActiveHold() {
-            let coordinator = ZoomableImageView.Coordinator()
-            let press = coordinator.motionHold
+        func testLiveTextQueriesAndMenusUseTheInstalledDelegate() async throws {
+            let image = NSImage(size: NSSize(width: 800, height: 200))
+            image.lockFocus()
+            NSColor.white.setFill()
+            NSRect(x: 0, y: 0, width: 800, height: 200).fill()
+            ("LIVE PHOTO" as NSString).draw(
+                at: NSPoint(x: 40, y: 60),
+                withAttributes: [.font: NSFont.systemFont(ofSize: 64), .foregroundColor: NSColor.black])
+            image.unlockFocus()
+            let analysis = try await ImageAnalyzer().analyze(image, orientation: .up, configuration: .init([.text]))
+            XCTAssertFalse(analysis.transcript.isEmpty)
+            var calls: [String] = []
+            let (host, scroll, press) = try makePhotoHost(
+                onStart: { calls.append("start") }, onStop: { calls.append("stop") }, analysis: analysis)
+            defer { withExtendedLifetime(host) {} }
+            let overlay = try XCTUnwrap(
+                scroll.documentView?.subviews.compactMap { $0 as? ImageAnalysisOverlayView }.first)
+            let delegate = try XCTUnwrap(overlay.delegate)
+            let event = try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: .rightMouseDown, location: .zero, modifierFlags: [], timestamp: 0,
+                    windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0))
+            XCTAssertTrue(delegate.overlayView(overlay, shouldShowMenuForEvent: event, atPoint: .zero))
+            press.consume(.began, at: .zero)
+            for type: ImageAnalysisOverlayView.InteractionTypes in [.textSelection, .dataDetectors] {
+                XCTAssertTrue(delegate.overlayView(overlay, shouldBeginAt: .zero, forAnalysisType: type))
+                XCTAssertEqual(calls, ["start"])
+            }
+            delegate.textSelectionDidChange(overlay)
+            XCTAssertEqual(calls, ["start"])
+            XCTAssertFalse(delegate.overlayView(overlay, shouldShowMenuForEvent: event, atPoint: .zero))
+            let text = overlay.text
+            XCTAssertFalse(text.isEmpty)
+            overlay.selectedRanges = [text.startIndex..<text.endIndex]
+            XCTAssertTrue(overlay.hasActiveTextSelection)
+            delegate.textSelectionDidChange(overlay)
+            XCTAssertEqual(calls, ["start", "stop"])
+            XCTAssertFalse(press.gestureRecognizerShouldBegin(press))
+            press.consume(.began, at: .zero)
+            XCTAssertEqual(calls, ["start", "stop"])
+            XCTAssertTrue(delegate.overlayView(overlay, shouldShowMenuForEvent: event, atPoint: .zero))
+            overlay.resetSelection()
+            delegate.textSelectionDidChange(overlay)
+            XCTAssertTrue(press.gestureRecognizerShouldBegin(press))
+        }
+
+        func testMovingOntoUnselectedTextDoesNotStopTheHold() {
+            let press = AppKitLivePhotoHoldAdapter()
             var calls: [String] = []
             press.onStart = { calls.append("start") }
             press.onStop = { calls.append("stop") }
-            press.textOwnsPoint = { _ in true }
-            XCTAssertFalse(press.gestureRecognizerShouldBegin(press))
-            press.consume(.began, at: .zero)
-            press.consume(.ended, at: .zero)
-            XCTAssertTrue(calls.isEmpty)
-            press.textOwnsPoint = { _ in false }
+            var overText = false
+            press.textOwnsPoint = { _ in overText }
             XCTAssertTrue(press.gestureRecognizerShouldBegin(press))
             press.consume(.began, at: .zero)
-            XCTAssertTrue(
-                coordinator.overlayView(
-                    ImageAnalysisOverlayView(), shouldBeginAt: .zero, forAnalysisType: .textSelection))
-            XCTAssertEqual(calls, ["start", "stop"])
+            overText = true
+            XCTAssertFalse(press.gestureRecognizerShouldBegin(press))
+            press.consume(.changed, at: .zero)
+            XCTAssertEqual(calls, ["start"])
             press.consume(.ended, at: .zero)
+            XCTAssertEqual(calls, ["start", "stop"])
+        }
+
+        func testNativeActionMeasuresMovementInWindowPointsAtFiveTimesZoom() throws {
+            let press = InjectedAppKitHold()
+            var calls: [String] = []
+            press.onStart = { calls.append("start") }
+            press.onStop = { calls.append("stop") }
+            press.allowableMovement = 10
+            let image = NSImageView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+            image.addGestureRecognizer(press)
+            let action = try XCTUnwrap(press.action)
+            press.injectedState = .began
+            XCTAssertTrue(NSApplication.shared.sendAction(action, to: press.target, from: press))
+            press.windowPoint = NSPoint(x: 11, y: 0)
+            press.injectedState = .changed
+            XCTAssertTrue(NSApplication.shared.sendAction(action, to: press.target, from: press))
             XCTAssertEqual(calls, ["start", "stop"])
         }
 
@@ -165,13 +223,13 @@
         }
 
         private func makePhotoHost(
-            onStart: @escaping () -> Void = {}, onStop: @escaping () -> Void = {}
+            onStart: @escaping () -> Void = {}, onStop: @escaping () -> Void = {}, analysis: ImageAnalysis? = nil
         ) throws -> (NSHostingView<AnyView>, ZoomScrollView, AppKitLivePhotoHoldAdapter) {
             let host = NSHostingView(
                 rootView: AnyView(
                     ZoomableImageView(
                         image: NSImage(size: NSSize(width: 40, height: 40)), itemIdentity: "first",
-                        onMotionStart: onStart, onMotionStop: onStop)))
+                        onMotionStart: onStart, onMotionStop: onStop, liveTextAnalysis: analysis)))
             host.frame = NSRect(x: 0, y: 0, width: 400, height: 400)
             host.layoutSubtreeIfNeeded()
             var views = [host as NSView]
@@ -184,6 +242,18 @@
             let presses = (photoScroll.documentView?.gestureRecognizers ?? []).filter { $0.name == "LivePhotoHold" }
             XCTAssertEqual(presses.count, 1)
             return (host, photoScroll, try XCTUnwrap(presses.first as? AppKitLivePhotoHoldAdapter))
+        }
+    }
+
+    private final class InjectedAppKitHold: AppKitLivePhotoHoldAdapter {
+        var injectedState = NSGestureRecognizer.State.possible
+        var windowPoint = NSPoint.zero
+        override var state: NSGestureRecognizer.State {
+            get { injectedState }
+            set { injectedState = newValue }
+        }
+        override func location(in view: NSView?) -> NSPoint {
+            view == nil ? windowPoint : NSPoint(x: windowPoint.x / 5, y: windowPoint.y / 5)
         }
     }
 

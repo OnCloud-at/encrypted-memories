@@ -3,12 +3,13 @@ import PhotoViewerCore
 
 /// A touch-only press that coexists with native recognizers and cancels when another interaction takes over.
 @MainActor
-final class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecognizerDelegate {
+class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecognizerDelegate {
     var onStart: (() -> Void)?
     var onStop: (() -> Void)?
-    /// The point uses the photo view's coordinates. Active selection also owns presses outside its text.
+    /// Recognized text uses photo coordinates and excludes only the initial press.
     var textOwnsPoint: (NSPoint) -> Bool = { _ in false }
-    private var policy = LivePhotoHoldPolicy()
+    var textIsSelected: () -> Bool = { false }
+    private(set) var policy = LivePhotoHoldPolicy()
     private var holdOrigin: NSPoint?
 
     init() {
@@ -21,13 +22,7 @@ final class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecog
         buttonMask = 0
         numberOfTouchesRequired = 1
         minimumPressDuration = LivePhotoHoldPolicy.minimumPressDuration
-        // NSPress derives mouse delays from buttonMask; do not rely on superclass defaults.
-        delaysPrimaryMouseButtonEvents = false
-        delaysSecondaryMouseButtonEvents = false
-        delaysOtherMouseButtonEvents = false
-        delaysKeyEvents = false
-        delaysMagnificationEvents = false
-        delaysRotationEvents = false
+        // With no mouse buttons in the mask, NSPress derives no mouse delays; other delays default to false.
         if #available(macOS 27.0, *) { isCancellableByScrollGesture = true }
     }
 
@@ -40,12 +35,12 @@ final class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecog
     ) -> Bool { true }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
-        !textOwnsPoint(gestureRecognizer.location(in: view))
+        !textIsSelected() && !textOwnsPoint(gestureRecognizer.location(in: view))
     }
 
-    @objc private func pressed() { consume(state, at: location(in: view)) }
+    @objc private func pressed() { consume(state, at: location(in: nil)) }
 
-    /// The action and injected-state tests use the same native-to-shared transition mapping.
+    /// Points are in window coordinates, independent of the image magnification.
     func consume(_ state: NSGestureRecognizer.State, at point: NSPoint) {
         if state == .changed, let origin = holdOrigin,
             hypot(point.x - origin.x, point.y - origin.y) > allowableMovement
@@ -65,7 +60,7 @@ final class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecog
         case .failed: event = .failed
         default: event = .possible
         }
-        let action = policy.consume(event, textIsSelected: textOwnsPoint(point))
+        let action = policy.consume(event, textIsSelected: textIsSelected())
         action?.deliver(start: onStart, stop: onStop)
     }
 

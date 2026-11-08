@@ -171,9 +171,12 @@ struct ZoomableImageView: NSViewRepresentable {
         hold.textOwnsPoint = { [weak coordinator = context.coordinator] point in
             coordinator?.liveTextOwns(point) ?? false
         }
+        hold.textIsSelected = { [weak coordinator = context.coordinator] in
+            coordinator?.liveTextOverlay?.hasActiveTextSelection == true
+        }
         imageView.addGestureRecognizer(hold)
         scrollView.motionHold = hold
-        for name in [NSScrollView.willStartLiveScrollNotification, NSScrollView.willStartLiveMagnifyNotification] {
+        for name in [NSScrollView.didLiveScrollNotification, NSScrollView.willStartLiveMagnifyNotification] {
             NotificationCenter.default.addObserver(
                 context.coordinator, selector: #selector(Coordinator.motionGestureBegan(_:)), name: name,
                 object: scrollView)
@@ -239,7 +242,7 @@ struct ZoomableImageView: NSViewRepresentable {
         let motionHold = AppKitLivePhotoHoldAdapter()
         var itemIdentity: String?
         var isSharp = false
-        private var liveTextOverlay: ImageAnalysisOverlayView?
+        fileprivate var liveTextOverlay: ImageAnalysisOverlayView?
 
         @objc func motionGestureBegan(_ notification: Notification) {
             motionHold.cancel(notification.name == NSScrollView.willStartLiveMagnifyNotification ? .pinch : .scroll)
@@ -248,16 +251,15 @@ struct ZoomableImageView: NSViewRepresentable {
         func liveTextOwns(_ point: NSPoint) -> Bool {
             guard let overlay = liveTextOverlay, let imageView else { return false }
             let location = overlay.convert(point, from: imageView)
-            return overlay.hasActiveTextSelection || overlay.analysisHasText(at: location)
+            return overlay.analysisHasText(at: location)
                 || (overlay.selectableItemsHighlighted && overlay.hasInteractiveItem(at: location))
         }
 
         func overlayView(
-            _ overlayView: ImageAnalysisOverlayView, shouldBeginAt point: CGPoint,
-            forAnalysisType analysisType: ImageAnalysisOverlayView.InteractionTypes
+            _ overlayView: ImageAnalysisOverlayView, shouldShowMenuForEvent event: NSEvent, atPoint point: CGPoint
         ) -> Bool {
-            motionHold.cancel(.textSelection)
-            return true
+            // A stationary finger can emulate a right click. Keep that menu out of an active playback hold.
+            !motionHold.policy.isActive
         }
 
         func textSelectionDidChange(_ overlayView: ImageAnalysisOverlayView) {
@@ -492,7 +494,13 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        motionHold?.cancel(.scroll)
+        // A mayBegin or zero-delta event does not move content. Legacy wheels have no phase.
+        let phase = event.momentumPhase.isEmpty ? event.phase : event.momentumPhase
+        if phase.isEmpty || phase.contains(.began) || phase.contains(.changed),
+            event.scrollingDeltaX != 0 || event.scrollingDeltaY != 0
+        {
+            motionHold?.cancel(.scroll)
+        }
         guard magnification <= minMagnification + 0.001 else {
             super.scrollWheel(with: event)
             return

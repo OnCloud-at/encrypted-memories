@@ -1,6 +1,7 @@
 import PhotoViewerCore
 import SwiftUI
 import UIKit
+import VisionKit
 import XCTest
 
 @testable import EncryptedMemoriesMobile
@@ -28,63 +29,19 @@ final class MobileLivePhotoHoldTests: XCTestCase {
         }
     }
 
-    func testPanPinchAndPageChangeStopWithoutDuplicateStops() throws {
+    func testDeclinedTextSelectionQueryKeepsTheHoldPlaying() throws {
         var calls: [String] = []
-        let (window, host, scroll, coordinator) = try makeMobileHoldHost(
+        let (window, _, _, coordinator) = try makeMobileHoldHost(
             onStart: { calls.append("start") }, onStop: { calls.append("stop") })
         defer { window.isHidden = true }
-        let injected = InjectedMotionPress()
-        for pinch in [false, true] {
-            injected.state = .began
-            coordinator.handleLongPress(injected)
-            if pinch {
-                coordinator.scrollViewWillBeginZooming(scroll, with: nil)
-            } else {
-                coordinator.scrollViewWillBeginDragging(scroll)
-            }
-            XCTAssertEqual(calls.count, pinch ? 4 : 2)
-            injected.state = .ended
-            coordinator.handleLongPress(injected)
-        }
-        injected.state = .began
-        coordinator.handleLongPress(injected)
-        var page = host.rootView
-        page.isCurrent = false
-        host.rootView = page
-        host.view.layoutIfNeeded()
-        XCTAssertEqual(calls, ["start", "stop", "start", "stop", "start", "stop"])
-        XCTAssertFalse(try XCTUnwrap(coordinator.motionPress).isEnabled)
-    }
-
-    func testRemovingMotionCallbacksStopsBeforeTheirReplacement() throws {
-        var calls: [String] = []
-        let (window, host, _, coordinator) = try makeMobileHoldHost(
-            onStart: { calls.append("start") }, onStop: { calls.append("stop") })
-        defer { window.isHidden = true }
-        let injected = InjectedMotionPress()
-        injected.state = .began
-        coordinator.handleLongPress(injected)
-        var page = host.rootView
-        page.onMotionStart = nil
-        page.onMotionStop = nil
-        host.rootView = page
-        host.view.layoutIfNeeded()
-        XCTAssertEqual(calls, ["start", "stop"])
-        XCTAssertFalse(try XCTUnwrap(coordinator.motionPress).isEnabled)
-    }
-
-    func testTeardownStopsTheActiveHold() throws {
-        var calls: [String] = []
-        let (window, _, scroll, coordinator) = try makeMobileHoldHost(
-            onStart: { calls.append("start") }, onStop: { calls.append("stop") })
-        defer { window.isHidden = true }
-        let injected = InjectedMotionPress()
-        injected.state = .began
-        coordinator.handleLongPress(injected)
-        MobileZoomableImage.dismantleUIView(scroll, coordinator: coordinator)
-        XCTAssertEqual(calls, ["start", "stop"])
-        injected.state = .ended
-        coordinator.handleLongPress(injected)
+        let press = InjectedMotionPress()
+        press.state = .began
+        coordinator.handleLongPress(press)
+        let interaction = ImageAnalysisInteraction(coordinator)
+        XCTAssertFalse(coordinator.interaction(interaction, shouldBeginAt: .zero, for: .textSelection))
+        XCTAssertEqual(calls, ["start"])
+        press.state = .ended
+        coordinator.handleLongPress(press)
         XCTAssertEqual(calls, ["start", "stop"])
     }
 

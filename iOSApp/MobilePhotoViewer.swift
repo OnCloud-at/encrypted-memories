@@ -1383,7 +1383,6 @@ struct MobileImagePage: View {
                             motion.play(for: item, streamer: streamer) { isCurrent }
                         } : nil,
                     onMotionStop: item.isLivePhoto ? { motion.stop() } : nil,
-                    isCurrent: isCurrent,
                     onPhotoFrameChanged: { photoFrame = $0 },
                     onZoomSettled: { loadZoomedDecodeIfNeeded(zoom: $0) },
                     liveTextAnalysis: isCurrent ? liveTextAnalysis : nil,
@@ -2539,7 +2538,6 @@ struct MobileZoomableImage: UIViewRepresentable {
     /// photo, in which case no long-press recognizer is installed.
     var onMotionStart: (() -> Void)? = nil
     var onMotionStop: (() -> Void)? = nil
-    var isCurrent = true
     /// Reports the displayed photo rect (the aspect-fit image area, zoom- and pan-transformed) in the page's
     /// coordinate space whenever layout/zoom/pan changes it. Drives the photo-anchored Live badge and the
     /// motion overlay's geometry, so both stay glued to the photo instead of the viewer.
@@ -2624,9 +2622,6 @@ struct MobileZoomableImage: UIViewRepresentable {
     }
 
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
-        if !isCurrent { context.coordinator.cancelMotion(.pageChange) }
-        if onMotionStart == nil { context.coordinator.cancelMotion(.cancelled) }
-        context.coordinator.motionPress?.isEnabled = isCurrent && onMotionStart != nil
         context.coordinator.onSingleTap = onSingleTap
         context.coordinator.onCloseRequested = onCloseRequested
         context.coordinator.onMotionStart = onMotionStart
@@ -2655,10 +2650,6 @@ struct MobileZoomableImage: UIViewRepresentable {
             onMotionStop: onMotionStop,
             reduceMotion: reduceMotion
         )
-    }
-
-    static func dismantleUIView(_ scrollView: UIScrollView, coordinator: Coordinator) {
-        coordinator.cancelMotion(.teardown)
     }
 
     final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate,
@@ -2713,16 +2704,8 @@ struct MobileZoomableImage: UIViewRepresentable {
             case .failed: event = .failed
             default: event = .possible
             }
-            let action = motionHold.consume(event, textIsSelected: liveTextInteraction?.hasActiveTextSelection == true)
-            action?.deliver(start: onMotionStart, stop: onMotionStop)
-        }
-
-        func cancelMotion(_ event: LivePhotoHoldPolicy.Event) {
             let action = motionHold.consume(event)
             action?.deliver(start: onMotionStart, stop: onMotionStop)
-            let enabled = motionPress?.isEnabled
-            motionPress?.isEnabled = false
-            motionPress?.isEnabled = enabled ?? false
         }
 
         /// Keeps UIKit's zoom document equal to the actual fitted media, rather than the whole viewport.
@@ -2835,12 +2818,7 @@ struct MobileZoomableImage: UIViewRepresentable {
             if !updatingZoomGeometry { reportPhotoFrame() }
         }
 
-        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) { cancelMotion(.pan) }
-
-        func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) { cancelMotion(.pinch) }
-
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
-            if scrollView.isDragging || scrollView.isDecelerating { cancelMotion(.scroll) }
             if !updatingZoomGeometry { reportPhotoFrame() }
         }
 
@@ -2862,8 +2840,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             // A press on recognized text selects it, as in Photos; a press anywhere else plays the Live Photo.
             if gestureRecognizer === motionPress {
-                return liveTextInteraction?.hasActiveTextSelection != true
-                    && !liveTextOwns(gestureRecognizer) && !isOnText(gestureRecognizer)
+                return !liveTextOwns(gestureRecognizer) && !isOnText(gestureRecognizer)
             }
             guard gestureRecognizer === dismissPan, let scrollView else { return true }
             let isZoomedIn = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
@@ -2874,7 +2851,6 @@ struct MobileZoomableImage: UIViewRepresentable {
         }
 
         @objc func handleDismissPan(_ gesture: UIPanGestureRecognizer) {
-            if gesture.state == .began || gesture.state == .changed { cancelMotion(.pan) }
             guard let scrollView, let container = scrollView.superview else { return }
             let translation = gesture.translation(in: container)
             switch gesture.state {
@@ -2979,16 +2955,11 @@ struct MobileZoomableImage: UIViewRepresentable {
             shouldBeginAt point: CGPoint,
             for interactionType: ImageAnalysisInteraction.InteractionTypes
         ) -> Bool {
-            if interactionType.contains(.textSelection) { cancelMotion(.textSelection) }
             if interaction.selectableItemsHighlighted { return true }
             // Unhighlighted, only a press on text starts a selection, on stills and Live Photos alike. Taps and
             // double taps keep their viewer meaning, and a press beside the text plays the Live Photo.
             guard interactionType.contains(.textSelection) else { return false }
             return interaction.analysisHasText(at: point)
-        }
-
-        func textSelectionDidChange(_ interaction: ImageAnalysisInteraction) {
-            if interaction.hasActiveTextSelection { cancelMotion(.textSelection) }
         }
 
         @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
@@ -3015,7 +2986,6 @@ struct MobileZoomableImage: UIViewRepresentable {
         }
 
         @objc func handleDismissPinch(_ gesture: UIPinchGestureRecognizer) {
-            if gesture.state == .began || gesture.state == .changed { cancelMotion(.pinch) }
             guard let scrollView, let container = scrollView.superview else { return }
             switch gesture.state {
             case .began, .changed:
