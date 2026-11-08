@@ -343,20 +343,7 @@ public actor BackupStatusProjector {
         guard queue.isOperational() else { return nil }
 
         var progress = latestRunnerProgress ?? BackupSyncProgress()
-        progress.total = summary.total
-        progress.waiting = summary.waiting
-        progress.uploadQueued = summary.queuedForUpload
-        progress.checking = summary.checkingActive
-        progress.uploading = summary.uploadingActive
-        progress.uploaded = summary.uploaded
-        progress.alreadyBackedUp = summary.alreadyBackedUp
-        progress.skippedRemoteDeletions = summary.skippedRemoteDeletions
-        progress.sourceMissing = summary.sourceMissing
-        progress.blocked = summary.blocked
-        progress.failed = summary.failed
-        progress.dismissedFailures = summary.dismissedFailures
-        progress.pendingSourceRechecks = summary.pendingSourceRechecks
-        progress.paused = summary.paused
+        progress.applyQueueCounts(summary)
         // A Photo Library pass repeatedly invokes short eligible-only runner drains while its scan
         // runs concurrently. The controller's run context is therefore the stable activity truth;
         // Mirroring each micro-drain's terminal callback would flicker between checking and waiting.

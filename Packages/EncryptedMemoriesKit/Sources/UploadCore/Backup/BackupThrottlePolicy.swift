@@ -1,24 +1,9 @@
-import Foundation
 import PhotosCore
-
-/// Platform-neutral thermal pressure level. Platform adapters map their OS signal
-/// (`ProcessInfo.thermalState` on both Apple platforms) into this so the throttle table
-/// lives once in core.
-public enum BackupThermalLevel: Int, Sendable, Comparable, Equatable {
-    case nominal = 0
-    case fair = 1
-    case serious = 2
-    case critical = 3
-
-    public static func < (lhs: BackupThermalLevel, rhs: BackupThermalLevel) -> Bool {
-        lhs.rawValue < rhs.rawValue
-    }
-}
 
 /// The environment signals that throttle backup work. Platform layers fill these from
 /// ProcessInfo/NWPathMonitor equivalents; core never reads OS state itself.
 public struct BackupThrottleInputs: Sendable, Equatable {
-    public var thermalLevel: BackupThermalLevel
+    public var thermalLevel: LibraryThermalLevel
     public var isLowPowerMode: Bool
     /// False when there is currently no usable network path. The runner waits without spending an
     /// item's retry budget and resumes from the durable queue as soon as the path returns.
@@ -37,7 +22,7 @@ public struct BackupThrottleInputs: Sendable, Equatable {
     public var isAppInBackground: Bool
 
     public init(
-        thermalLevel: BackupThermalLevel = .nominal,
+        thermalLevel: LibraryThermalLevel = .nominal,
         isLowPowerMode: Bool = false,
         isNetworkAvailable: Bool = true,
         isNetworkConstrained: Bool = false,
@@ -59,15 +44,8 @@ public struct BackupThrottleInputs: Sendable, Equatable {
     /// Maps the shared runtime snapshot of a platform adapter, so every backup upload path reads the same signals.
     /// Before the first network path, the network may be cellular: with mobile data off, the backup waits for it.
     public init(runtime snapshot: LibraryRuntimeSnapshot, usesMobileData: Bool) {
-        let thermal: BackupThermalLevel =
-            switch snapshot.thermalLevel {
-            case .nominal: .nominal
-            case .fair: .fair
-            case .serious: .serious
-            case .critical: .critical
-            }
         self.init(
-            thermalLevel: thermal,
+            thermalLevel: snapshot.thermalLevel,
             isLowPowerMode: snapshot.isLowPowerMode,
             isNetworkAvailable: snapshot.network.isReachable,
             isNetworkConstrained: snapshot.network.isConstrained,
@@ -116,7 +94,7 @@ public struct BackupThrottlePolicy: Sendable, Equatable {
         return governor.budget(
             for: .userInitiatedBackup,
             signals: LibraryWorkloadSignals(
-                thermalLevel: inputs.thermalLevel.libraryLevel,
+                thermalLevel: inputs.thermalLevel,
                 isLowPowerMode: inputs.isLowPowerMode,
                 isNetworkConstrained: inputs.isNetworkConstrained,
                 isNetworkExpensive: inputs.isNetworkExpensive,
@@ -124,16 +102,5 @@ public struct BackupThrottlePolicy: Sendable, Equatable {
             ),
             baseConcurrency: baseConcurrency
         ).maxConcurrentItems
-    }
-}
-
-private extension BackupThermalLevel {
-    var libraryLevel: LibraryThermalLevel {
-        switch self {
-        case .nominal: return .nominal
-        case .fair: return .fair
-        case .serious: return .serious
-        case .critical: return .critical
-        }
     }
 }

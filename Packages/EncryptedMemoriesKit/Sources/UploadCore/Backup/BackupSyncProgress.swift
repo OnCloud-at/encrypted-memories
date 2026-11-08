@@ -126,6 +126,13 @@ public struct BackupSyncProgress: Sendable, Equatable {
         isRunning: Bool = false
     ) {
         self.init()
+        applyQueueCounts(summary)
+        self.currentItemName = currentItemName
+        self.isRunning = isRunning
+    }
+
+    /// Replaces only durable queue counters; runner liveness fields keep their current values.
+    mutating func applyQueueCounts(_ summary: UploadBackupSyncQueueSummary) {
         total = summary.total
         waiting = summary.waiting
         uploadQueued = summary.queuedForUpload
@@ -140,7 +147,5 @@ public struct BackupSyncProgress: Sendable, Equatable {
         dismissedFailures = summary.dismissedFailures
         pendingSourceRechecks = summary.pendingSourceRechecks
         paused = summary.paused
-        self.currentItemName = currentItemName
-        self.isRunning = isRunning
     }
 }
