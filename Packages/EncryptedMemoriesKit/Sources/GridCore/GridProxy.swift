@@ -9,8 +9,6 @@ import CoreGraphics
 public final class GridProxy<ItemID: Hashable & Sendable> {
     public init() {}
 
-    private var firstContentReadyReported = false
-    private var firstContentReadyDelivered = false
     private var pendingContentReadyRevision: UInt64?
 
     /// Frame of an item's cell in the shell/window content coordinate space, or nil if the cell is not visible.
@@ -38,54 +36,26 @@ public final class GridProxy<ItemID: Hashable & Sendable> {
     /// Current density bounds for native menus. Hosts compute this from their live profile and level.
     public var zoomAvailability: (() -> (canZoomIn: Bool, canZoomOut: Bool))?
 
-    /// Flip normal-level thumbnail content fit. This is a content-fit command only; it must not mutate grid
-    /// level, zoom, scroll, phase, or geometry.
-    public var toggleContentMode: (() -> Void)?
-
     /// Set the normal-level content-mode preference explicitly.
     public var setContentMode: ((TileContentDisplayMode) -> Void)?
 
     /// Query live content-mode state for the shell control.
     public var contentModeState: (() -> (mode: TileContentDisplayMode, toggleAvailable: Bool))?
 
-    /// Grid-to-shell event fired once the first visible thumbnail is resident.
-    ///
-    /// Readiness is latched so a fast grid cannot lose the event before the shell finishes installing its
-    /// handler. Replacing the handler after delivery does not replay an already-consumed launch event.
-    public var onFirstContentReady: (() -> Void)? {
-        didSet { deliverFirstContentReadyIfPossible() }
-    }
-
-    /// Fired whenever a newly installed content generation has produced its first visible resident thumbnail.
-    /// Unlike `onFirstContentReady`, this repeats after data-source changes. Reports that arrive before the
-    /// shell installs its handler are coalesced and replayed once, so the latest rendered generation is never
-    /// lost during SwiftUI/AppKit mounting.
+    /// Fired whenever a newly installed content generation has produced its first visible resident thumbnail. It
+    /// repeats after data-source changes. Reports that arrive before the shell installs its handler are coalesced
+    /// and replayed once, so the latest rendered generation is never lost during SwiftUI/AppKit mounting.
     public var onContentReady: ((UInt64) -> Void)? {
         didSet { deliverContentReadyIfPossible() }
     }
 
-    /// Reports the first visible resident thumbnail. Duplicate reports are intentionally ignored.
-    public func reportFirstContentReady() {
-        guard !firstContentReadyReported else { return }
-        firstContentReadyReported = true
-        deliverFirstContentReadyIfPossible()
-    }
-
     public func reportContentReady(revision: UInt64) {
         pendingContentReadyRevision = revision
-        reportFirstContentReady()
         deliverContentReadyIfPossible()
     }
 
     public func invalidatePendingContentReady() {
         pendingContentReadyRevision = nil
-        if !firstContentReadyDelivered { firstContentReadyReported = false }
-    }
-
-    private func deliverFirstContentReadyIfPossible() {
-        guard firstContentReadyReported, !firstContentReadyDelivered, let onFirstContentReady else { return }
-        firstContentReadyDelivered = true
-        onFirstContentReady()
     }
 
     private func deliverContentReadyIfPossible() {

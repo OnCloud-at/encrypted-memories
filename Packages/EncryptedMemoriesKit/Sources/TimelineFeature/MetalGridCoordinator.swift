@@ -210,12 +210,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         requestRedraw()
     }
 
-    /// Flip the normal-level content-mode preference.
-    func toggleContentMode() {
-        setPreferredNormalLevelContentMode(
-            preferredNormalLevelContentMode == .squareFillCrop ? .aspectFitInsideSquare : .squareFillCrop)
-    }
-
     /// Called when the content size changes (level / width) so the host can resize the document view.
     var onContentSizeChange: ((CGSize) -> Void)?
 

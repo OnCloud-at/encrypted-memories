@@ -255,7 +255,6 @@
             proxy?.zoomAvailability = { [weak view] in
                 view?.zoomAvailability() ?? (canZoomIn: false, canZoomOut: false)
             }
-            proxy?.toggleContentMode = { [weak view] in view?.togglePreferredContentMode() }
             proxy?.setContentMode = { [weak view] mode in view?.setPreferredContentMode(mode) }
             proxy?.contentModeState = { [weak view] in
                 view?.preferredContentModeState() ?? (mode: .squareFillCrop, toggleAvailable: false)
@@ -1385,14 +1384,6 @@
             guard displayMode != mode else { return }
             displayMode = mode
             requestRender()
-        }
-
-        func togglePreferredContentMode() {
-            let next: TileContentDisplayMode =
-                displayMode == .squareFillCrop
-                ? .aspectFitInsideSquare
-                : .squareFillCrop
-            setPreferredContentMode(next)
         }
 
         func preferredContentModeState() -> (mode: TileContentDisplayMode, toggleAvailable: Bool) {
