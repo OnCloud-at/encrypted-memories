@@ -332,34 +332,6 @@ private actor Counter {
     func increment() { value += 1 }
 }
 
-/// Holds a revert open until the test lets it go, so a second call meets a revert that still runs.
-private actor Gate {
-    private var entered = false
-    private var isOpen = false
-    private var openWaiters: [CheckedContinuation<Void, Never>] = []
-
-    func wait() async {
-        entered = true
-        guard !isOpen else { return }
-        await withCheckedContinuation { openWaiters.append($0) }
-    }
-
-    /// Waits at most two seconds, so a revert that never starts fails an assertion and does not hang the suite.
-    func waitUntilEntered() async -> Bool {
-        for _ in 0..<200 {
-            if entered { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return entered
-    }
-
-    func open() {
-        isOpen = true
-        openWaiters.forEach { $0.resume() }
-        openWaiters = []
-    }
-}
-
 private actor SpyReverter: EditedPhotoReverting {
     struct Call {
         let main: PhotoItem
