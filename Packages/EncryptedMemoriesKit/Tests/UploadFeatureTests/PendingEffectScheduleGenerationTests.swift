@@ -10,7 +10,7 @@ import XCTest
 /// 2. A retained defer write applies to any generation of its key, not only the one it was created for.
 ///
 /// The harness helpers are local copies of the private helpers in `PendingBackupCoordinatorTests`, with distinct
-/// names, because that file is owned by #1005/#933.
+/// names, because that file is owned by #1005/#933. The polling wait is the shared `pollWhileFalse`.
 final class PendingEffectScheduleGenerationTests: XCTestCase {
     private var directory: URL!
     private var queue: UploadBackupSyncQueueManifestStore!
@@ -86,7 +86,7 @@ final class PendingEffectScheduleGenerationTests: XCTestCase {
         await coordinator.close()
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
-        try await waitUntil { !clock.waits.isEmpty }
+        try await pollWhileFalse { !clock.waits.isEmpty }
         try await settle()
         XCTAssertFalse(clock.waits.isEmpty, "a real timer must register before its delay is checked")
     }
@@ -120,11 +120,6 @@ final class PendingEffectScheduleGenerationTests: XCTestCase {
                 PendingHandoff(key: key(id), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
             .failed)
         return remote
-    }
-
-    private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
-        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
     }
 
     /// How long exact and negative checks of the recorded waits give a timer task to register.
@@ -275,7 +270,7 @@ final class PendingEffectScheduleGenerationTests: XCTestCase {
                 of: "write", at: storeURL))
 
         clock.advance(by: .seconds(60))
-        try await waitUntil { clock.waits.count >= 2 }
+        try await pollWhileFalse { clock.waits.count >= 2 }
         try await settle()
 
         let kept = try XCTUnwrap(store.sourceState(for: key("write")))
@@ -320,7 +315,7 @@ final class PendingEffectScheduleGenerationTests: XCTestCase {
 
         failure.remove(from: store)
         clock.advance(by: .seconds(60))
-        try await waitUntil { clock.waits.count >= 2 }
+        try await pollWhileFalse { clock.waits.count >= 2 }
         try await settle()
 
         let kept = try XCTUnwrap(store.sourceState(for: key("write")))

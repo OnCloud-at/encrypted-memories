@@ -1694,7 +1694,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let secondStarted = await waitUntil { transfers.started.contains("second.jpg") }
+        let secondStarted = await pollUntil { transfers.started.contains("second.jpg") }
         transfers.releaseAll()
         let progress = await pass.value
 
@@ -3733,7 +3733,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let removal = Task {
             await runner.removeSources(kind: removed.source.kind, identifiers: [removed.source.identifier])
         }
-        let rowRemoved = await waitUntil {
+        let rowRemoved = await pollUntil {
             queueEntryForTesting(in: queueStore, source: removed.source, revision: removed.revision) == nil
         }
         await gated.returnGate.signal()
@@ -4541,12 +4541,12 @@ final class BackupSyncRunnerTests: XCTestCase {
         let runner = makeRunner(uploader: stalledUploader, schedulerClock: BackupContinuousClock())
 
         let drain = Task { await runner.runUntilDrained() }
-        let uploadStarted = await waitUntil { stalledUploader.uploadAttempts == 1 }
+        let uploadStarted = await pollUntil { stalledUploader.uploadAttempts == 1 }
         let beforeRemoval = await runner.currentProgress()
 
         // The removal refreshes the progress from the queue before it waits for native cancellation.
         let removal = Task { await runner.removePhotoLibraryAssets([source.identifier]) }
-        let cancelStarted = await waitUntil { stalledUploader.cancellations == 1 }
+        let cancelStarted = await pollUntil { stalledUploader.cancellations == 1 }
         let afterRemoval = await runner.currentProgress()
 
         await stalledUploader.cancelRelease.signal()
@@ -6629,15 +6629,6 @@ final class RecordHoldingIdentityResolver: UploadIdentityResolving, @unchecked S
 
 /// The drain starts the next item as soon as one ends, instead of waiting for a whole group (#310).
 extension BackupSyncRunnerTests {
-    private func waitUntil(timeout: Duration = .seconds(5), _ predicate: () -> Bool) async -> Bool {
-        let deadline = ContinuousClock.now.advanced(by: timeout)
-        while ContinuousClock.now < deadline {
-            if predicate() { return true }
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        return predicate()
-    }
-
     private static let wiFi = LibraryNetworkState(
         path: LibraryNetworkPath(isSatisfied: true, availableInterfaces: [.wifi]))
 
@@ -6649,9 +6640,9 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let started = await waitUntil { transfers.started.contains("edited.jpg") }
+        let started = await pollUntil { transfers.started.contains("edited.jpg") }
         let olderWasClaimed = state(of: older) == .checking
-        let othersFinished = await waitUntil { others.allSatisfy { self.state(of: $0) == .completed } }
+        let othersFinished = await pollUntil { others.allSatisfy { self.state(of: $0) == .completed } }
         let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
         let slowStillRunning = !transfers.finished.contains("edited.jpg")
         transfers.releaseAll()
@@ -6677,7 +6668,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let fastFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let fastFinished = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         let slowStillRunning = !transfers.finished.contains("slow.mov")
         transfers.releaseAll()
         let progress = await pass.value
@@ -6709,7 +6700,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore, now: { [clock] in clock!.now })
         let pass = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
-        let initialFinished = await waitUntil { self.state(of: initial) == .completed }
+        let initialFinished = await pollUntil { self.state(of: initial) == .completed }
         XCTAssertTrue(initialFinished)
         // Let the settlement wake finish before inserting work into the otherwise idle queue.
         for _ in 0..<100 { await Task.yield() }
@@ -6724,7 +6715,7 @@ extension BackupSyncRunnerTests {
         } else {
             _ = try await engine.enqueueBatch([candidate])
         }
-        let newFinished = await waitUntil(timeout: .seconds(2)) {
+        let newFinished = await pollUntil(timeout: .seconds(2)) {
             queueEntryForTesting(in: self.queueStore, source: source, revision: revision)?.state == .completed
         }
         let slowStillRunning = !transfers.finished.contains("slow.mov")
@@ -6748,7 +6739,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(schedulerClock: heldClock)
         let engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore, now: { [clock] in clock!.now })
         let pass = Task { await runner.runUntilDrained() }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting)
 
         let source = UploadSourceIdentity.file(URL(fileURLWithPath: "/backup/now.jpg"))
@@ -6758,7 +6749,7 @@ extension BackupSyncRunnerTests {
                 snapshot: UploadBackupAssetSnapshot(source: source, revision: revision, resourceCount: 1),
                 originalFilename: "now.jpg", byteCount: 4)
         ])
-        let newFinished = await waitUntil(timeout: .seconds(2)) {
+        let newFinished = await pollUntil(timeout: .seconds(2)) {
             queueEntryForTesting(in: self.queueStore, source: source, revision: revision)?.state == .completed
         }
         let delayedStillWaiting = state(of: delayed) == .discovered
@@ -6780,10 +6771,10 @@ extension BackupSyncRunnerTests {
             finished.append("finished")
             return result
         }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting)
         pass.cancel()
-        let endedBeforeTheRetry = await waitUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
+        let endedBeforeTheRetry = await pollUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
         heldClock.releaseAll()
         _ = await pass.value
 
@@ -6798,7 +6789,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let othersFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let othersFinished = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         transfers.releaseAll()
         let progress = await pass.value
 
@@ -6817,7 +6808,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let retriedWhileSlowRuns = await waitUntil { self.state(of: failing) == .completed }
+        let retriedWhileSlowRuns = await pollUntil { self.state(of: failing) == .completed }
         let slowStillRunning = !transfers.finished.contains("slow.mov")
         let waitsWhileSlowRuns = clock.sleeps
         transfers.releaseAll()
@@ -6844,9 +6835,9 @@ extension BackupSyncRunnerTests {
         let pass = Task { await runner.runUntilDrained() }
         let claims = { log.events.filter { $0 == "queue.claimRunnable" }.count }
 
-        _ = await waitUntil { self.state(of: fast) == .completed }
+        _ = await pollUntil { self.state(of: fast) == .completed }
         // Give a wrong wake time to claim again.
-        let claimedAgain = await waitUntil(timeout: .milliseconds(200)) { claims() > 2 }
+        let claimedAgain = await pollUntil(timeout: .milliseconds(200)) { claims() > 2 }
         let sleepsWhileSlowRuns = clock.sleeps
         transfers.releaseAll()
         _ = await pass.value
@@ -6890,12 +6881,12 @@ extension BackupSyncRunnerTests {
             throttleInputs: { throttle.current })
         let pass = Task { await runner.runUntilDrained() }
 
-        let allStarted = await waitUntil { transfers.started.count == 6 }
+        let allStarted = await pollUntil { transfers.started.count == 6 }
         throttle.set(BackupThrottleInputs(thermalLevel: .critical))
         transfers.release(held[0])
-        _ = await waitUntil { transfers.finished.contains(held[0]) }
+        _ = await pollUntil { transfers.finished.contains(held[0]) }
         // Give a wrongly started item time to appear.
-        let startedTooEarly = await waitUntil(timeout: .milliseconds(200)) { transfers.started.count > 6 }
+        let startedTooEarly = await pollUntil(timeout: .milliseconds(200)) { transfers.started.count > 6 }
         let cancellationsWhileLowered = transfers.cancellations
         transfers.releaseAll()
         let progress = await pass.value
@@ -6920,10 +6911,10 @@ extension BackupSyncRunnerTests {
             runtimeChanges: { runtime.updates() })
         let pass = Task { await runner.runUntilDrained() }
 
-        let slowStarted = await waitUntil { transfers.started.contains("slow.mov") }
+        let slowStarted = await pollUntil { transfers.started.contains("slow.mov") }
         let othersWaited = transfers.started == ["slow.mov"]
         runtime.update { $0.thermalLevel = .nominal }
-        let fastFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let fastFinished = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         transfers.releaseAll()
         let progress = await pass.value
 
@@ -6942,8 +6933,8 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        _ = await waitUntil { self.state(of: other) == .completed }
-        let claimedTooEarly = await waitUntil(timeout: .milliseconds(200)) { self.state(of: older) != .discovered }
+        _ = await pollUntil { self.state(of: other) == .completed }
+        let claimedTooEarly = await pollUntil(timeout: .milliseconds(200)) { self.state(of: older) != .discovered }
         let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
         transfers.releaseAll()
         _ = await pass.value
@@ -6965,9 +6956,9 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(identityResolver: identities, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        let recordStarted = await waitUntil { identities.holds }
+        let recordStarted = await pollUntil { identities.holds }
         let rowDuringTheRecord = state(of: slow)
-        _ = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        _ = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
         identities.releaseAll()
         let progress = await pass.value
 
@@ -6988,7 +6979,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        _ = await waitUntil { transfers.started.contains("edited.jpg") }
+        _ = await pollUntil { transfers.started.contains("edited.jpg") }
         let olderWasClaimed = state(of: older) == .checking
         let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
         pass.cancel()
@@ -7012,10 +7003,10 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
         let pass = Task { await runner.runUntilDrained() }
 
-        _ = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
-        _ = await waitUntil { transfers.started.contains("slow.mov") }
+        _ = await pollUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        _ = await pollUntil { transfers.started.contains("slow.mov") }
         // Every slot now holds a transfer that waits, so nothing else can start before the stop.
-        _ = await waitUntil(timeout: .seconds(1)) { transfers.started.count == 5 }
+        _ = await pollUntil(timeout: .seconds(1)) { transfers.started.count == 5 }
         let startedBeforeStop = transfers.started.count
         await runner.stop()
         let progress = await pass.value
@@ -7077,7 +7068,7 @@ extension BackupSyncRunnerTests {
         let runner = makeRunner(
             throttleInputs: signals.current, runtimeChanges: signals.updates, schedulerClock: heldClock)
         let pass = Task { await runner.runUntilDrained() }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting, "the drain waits for Wi-Fi")
         return (runner, heldClock, pass)
     }
@@ -7089,7 +7080,7 @@ extension BackupSyncRunnerTests {
         XCTAssertTrue(uploader.requests.isEmpty)
 
         runtime.update { $0.network = Self.wiFi }
-        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        let uploaded = await pollUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
         await runner.stop()
         heldClock.releaseAll()
         _ = await pass.value
@@ -7105,10 +7096,10 @@ extension BackupSyncRunnerTests {
 
         runtime.update { $0.network = Self.offline }
         runtime.update { $0.network = Self.cellular }
-        let uploadedEarly = await waitUntil(timeout: .milliseconds(300)) { !self.uploader.requests.isEmpty }
+        let uploadedEarly = await pollUntil(timeout: .milliseconds(300)) { !self.uploader.requests.isEmpty }
         let row = try XCTUnwrap(queueStore.entry(for: due.source, revision: due.revision))
         runtime.update { $0.network = Self.wiFi }
-        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        let uploaded = await pollUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
         await runner.stop()
         heldClock.releaseAll()
         _ = await pass.value
@@ -7132,11 +7123,11 @@ extension BackupSyncRunnerTests {
             finished.append("finished")
             return result
         }
-        let waiting = await waitUntil { heldClock.isWaiting }
+        let waiting = await pollUntil { heldClock.isWaiting }
         XCTAssertTrue(waiting)
 
         pass.cancel()
-        let ended = await waitUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
+        let ended = await pollUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
         heldClock.releaseAll()
         _ = await pass.value
 
@@ -7155,7 +7146,7 @@ extension BackupSyncRunnerTests {
 
         // The settings toggle writes this preference; no runtime change accompanies it.
         defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
-        let uploaded = await waitUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
+        let uploaded = await pollUntil(timeout: .seconds(2)) { self.state(of: due) == .completed }
         await runner.stop()
         heldClock.releaseAll()
         _ = await pass.value

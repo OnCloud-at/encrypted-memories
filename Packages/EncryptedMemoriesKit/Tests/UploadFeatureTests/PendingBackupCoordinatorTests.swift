@@ -670,11 +670,11 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         if fault == .sourceRead {
             XCTAssertEqual(interruption.count, 1, "only the helper's second source read must fail")
         }
-        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
         XCTAssertEqual(clock.waits, [.seconds(60)], "the unreadable later handoff must keep a degraded retry")
         if repeatFailure {
             clock.advance(by: .seconds(60))
-            try await waitUntil { clock.waits.contains(.seconds(120)) }
+            try await pollWhileFalse { clock.waits.contains(.seconds(120)) }
             XCTAssertEqual(clock.waits, [.seconds(60), .seconds(120)])
             XCTAssertEqual(Array(effects.trashed.joined()), [earlier], "the second denied cycle must not resend A")
         }
@@ -696,7 +696,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             await coordinator.close()
             return
         }
-        try await waitUntil { effects.trashed.joined().contains(later) }
+        try await pollWhileFalse { effects.trashed.joined().contains(later) }
         XCTAssertEqual(
             Array(effects.trashed.joined()), [earlier, later], "repair must trash B once without resending A")
         let finished = try XCTUnwrap(store.sourceState(for: key("later")))
@@ -732,12 +732,12 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             XCTAssertTrue(change("UPDATE handoff SET kind='invalid' WHERE source_id='later' AND revision_us=12;"))
             nextGate.open()
             _ = await nextPass.value
-            try await waitUntil { clock.waits.filter { $0 == .seconds(60) }.count >= 2 }
+            try await pollWhileFalse { clock.waits.filter { $0 == .seconds(60) }.count >= 2 }
             XCTAssertEqual(Array(effects.trashed.joined()), [earlier, later, next])
             XCTAssertEqual(clock.waits.last, .seconds(60), "a new failure episode starts at the first backoff again")
             XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='later' AND revision_us=12;"))
             clock.advance(by: .seconds(60))
-            try await waitUntil { effects.trashed.joined().contains(newest) }
+            try await pollWhileFalse { effects.trashed.joined().contains(newest) }
             XCTAssertEqual(Array(effects.trashed.joined()), [earlier, later, next, newest])
         }
         await coordinator.close()
@@ -762,7 +762,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
 
-        try await waitUntil { effects.trashed.joined().contains(later) }
+        try await pollWhileFalse { effects.trashed.joined().contains(later) }
         XCTAssertEqual(Array(effects.trashed.joined()), [later], "startup must recover B without resending saved A")
         XCTAssertEqual(store.latestHandoffsRead(for: [key("later")])[key("later")]?.handoff?.remote, later)
         XCTAssertEqual(store.sourceState(for: key("later"))?.remote, later)
@@ -810,7 +810,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
         let target = PhotoUID(volumeID: "vol", nodeID: "b-0")
-        try await waitUntil { effects.trashed.joined().contains(target) }
+        try await pollWhileFalse { effects.trashed.joined().contains(target) }
         XCTAssertEqual(Array(effects.trashed.joined()), [target])
         let first = try XCTUnwrap(store.sourceState(for: key("batch-0")))
         if returnFirst {
@@ -841,7 +841,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
         _ = await coordinator.restore([key("trigger").localUID])
 
-        try await waitUntil { effects.trashed.joined().count >= 2 }
+        try await pollWhileFalse { effects.trashed.joined().count >= 2 }
         XCTAssertEqual(
             Array(effects.trashed.joined()), [target, target], "a new decision must re-enter startup recovery")
         await coordinator.close()
@@ -858,17 +858,17 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
 
-        try await waitUntil { effects.trashed.joined().count >= 200 }
+        try await pollWhileFalse { effects.trashed.joined().count >= 200 }
         XCTAssertEqual(failure.count, 1)
         XCTAssertEqual(effects.trashed.joined().count, 200, "all healthy keys must advance across the batch boundary")
         XCTAssertTrue(effects.trashed.joined().allSatisfy { $0.nodeID.hasPrefix("b-") })
-        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
         try await settle()
         XCTAssertEqual(
             clock.waits.last, .seconds(60), "healthy startup groups must not postpone the failed key's retry")
         failure.remove(from: store)
         clock.advance(by: .seconds(60))
-        try await waitUntil { effects.trashed.joined().count >= 201 }
+        try await pollWhileFalse { effects.trashed.joined().count >= 201 }
         XCTAssertEqual(effects.trashed.joined().count, 201, "the failed key must remain retryable")
         XCTAssertEqual(Set(effects.trashed.joined()).count, 201, "recovery must not repeat completed targets")
         await coordinator.close()
@@ -907,14 +907,14 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         defer { clock.releaseAll() }
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
-        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
         try await settle()
         XCTAssertEqual(clock.waits, [.seconds(60)], "an unreadable-only batch must still start reconciliation backoff")
         XCTAssertTrue(effects.trashed.isEmpty)
         XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='batch-0';"))
         clock.advance(by: .seconds(60))
         let target = PhotoUID(volumeID: "vol", nodeID: "b-0")
-        try await waitUntil { effects.trashed.joined().contains(target) }
+        try await pollWhileFalse { effects.trashed.joined().contains(target) }
         XCTAssertEqual(Array(effects.trashed.joined()), [target])
         await coordinator.close()
     }
@@ -934,7 +934,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
         let first = await coordinator.currentSnapshot()
-        try await waitUntil { !clock.waits.isEmpty }
+        try await pollWhileFalse { !clock.waits.isEmpty }
         try await settle()
 
         XCTAssertEqual(clock.waits, [.seconds(5000)], "a batch without new work must not replace the existing timer")
@@ -945,7 +945,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(effects.trashed.isEmpty)
         clock.advance(by: .seconds(5000))
         let target = PhotoUID(volumeID: "vol", nodeID: "future")
-        try await waitUntil { effects.trashed.joined().contains(target) }
+        try await pollWhileFalse { effects.trashed.joined().contains(target) }
         XCTAssertEqual(
             Array(effects.trashed.joined()), [target], "the retained timer must still dispatch the other source")
         await coordinator.close()
@@ -2248,7 +2248,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             "the durable upload event has not reached this tile")
         let deleted = await coordinator.exclude([key("p").localUID])
         XCTAssertTrue(deleted)
-        try await waitUntil { effects.trashed.flatMap { $0 }.contains(committed) }
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.contains(committed) }
         XCTAssertEqual(
             Set(effects.trashed.flatMap { $0 }), [earlier, committed],
             "the delete keeps the existing this-or-later revision contract")
@@ -2679,7 +2679,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 }
             })
         await coordinator.start()
-        try await waitUntil { delays.values.contains(.seconds(500)) }
+        try await pollWhileFalse { delays.values.contains(.seconds(500)) }
         XCTAssertTrue(delays.values.contains(.seconds(500)), "the initial retry is held before the fault")
         // The store now owes photo B. Its queue completion must succeed before the read fault starts.
         XCTAssertTrue(
@@ -2696,10 +2696,10 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try failure.install(on: store)
         defer { failure.remove(from: store) }
         trashGate.open()
-        try await waitUntil { delays.values.contains(.seconds(60)) }
+        try await pollWhileFalse { delays.values.contains(.seconds(60)) }
         XCTAssertTrue(delays.values.contains(.seconds(60)), "the rejected trash completion starts the backoff")
         retryGate.open()
-        try await waitUntil { delays.values.contains(.seconds(120)) }
+        try await pollWhileFalse { delays.values.contains(.seconds(120)) }
         XCTAssertTrue(
             delays.values.contains(.seconds(120)), "the next pass retries persistence and doubles the backoff")
         XCTAssertGreaterThan(failure.count, 0)
@@ -2977,7 +2977,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(clock.waits, [.seconds(60)])
         failure.remove(from: store)
         clock.advance(by: .seconds(60))
-        try await waitUntil { clock.waits.count >= 2 }
+        try await pollWhileFalse { clock.waits.count >= 2 }
         try await settle()
         XCTAssertEqual(clock.waits, [.seconds(60), .seconds(4940)], "a saved result leaves only ordinary future work")
         if rejected.isQueue {
@@ -3006,7 +3006,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(clock.waits, [.seconds(60)])
         failure.remove(from: store)
         clock.advance(by: .seconds(60))
-        try await waitUntil {
+        try await pollWhileFalse {
             rejected.isAction
                 ? store.actions().first?.attempts == 1
                 : store.sourceState(for: key("write"))?.attempts == 1
@@ -3025,7 +3025,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try await settle()
         XCTAssertEqual(rejected.isAction ? effects.favorites.count : effects.trashed.joined().count, 1)
         clock.advance(by: .seconds(1))
-        try await waitUntil {
+        try await pollWhileFalse {
             rejected.isAction ? effects.favorites.count == 2 : effects.trashed.joined().count == 2
         }
         try await settle()
@@ -3066,7 +3066,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                     + (rejected.isQueue ? "" : ", needs_queue_sync=0"),
                 of: "write", at: storeURL))
         clock.advance(by: .seconds(60))
-        try await waitUntil { clock.waits.count >= 2 }
+        try await pollWhileFalse { clock.waits.count >= 2 }
         try await settle()
         let kept = try XCTUnwrap(store.sourceState(for: key("write")))
         XCTAssertEqual(kept.generation, newer.generation)
@@ -3079,7 +3079,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(clock.waits, [.seconds(60), .seconds(540)])
         XCTAssertEqual(rejected.isQueue ? effects.removed.count : effects.trashed.joined().count, 1)
         clock.advance(by: .seconds(540))
-        try await waitUntil {
+        try await pollWhileFalse {
             rejected.isQueue ? effects.removed.count == 2 : effects.trashed.joined().count == 2
         }
         try await settle()
@@ -3116,7 +3116,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(clock.waits, [.seconds(60)], "neither unsaved action registers a one-second timer")
         failure.remove(from: store)
         clock.advance(by: .seconds(60 - offset))
-        try await waitUntil { store.actions().isEmpty && clock.waits.count >= 2 }
+        try await pollWhileFalse { store.actions().isEmpty && clock.waits.count >= 2 }
         try await settle()
         XCTAssertTrue(store.actions().isEmpty)
         XCTAssertEqual(effects.favoriteValues, [true, favorite], "repair saves both results without another request")
@@ -3150,7 +3150,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let stored = await coordinator.setFavorite(
             [PhotoUID(localPending: .photoLibrary, identifier: "write")], favorite: true)
         XCTAssertTrue(stored)
-        try await waitUntil { clock.waits.count >= 2 }
+        try await pollWhileFalse { clock.waits.count >= 2 }
         try await settle()
         XCTAssertTrue(failure.denied)
         XCTAssertEqual(effects.favoriteValues, [true])
@@ -3198,7 +3198,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             "only another readable key may shorten the degraded backoff")
         if healthyOther {
             clock.advance(by: .seconds(30))
-            try await waitUntil { effects.trashed.joined().contains(healthyRemote) && clock.waits.count >= 2 }
+            try await pollWhileFalse { effects.trashed.joined().contains(healthyRemote) && clock.waits.count >= 2 }
             try await settle()
             XCTAssertEqual(Array(effects.trashed.joined()), [healthyRemote])
             XCTAssertEqual(effects.removed, [["write"]], "the unsaved key does not dispatch again")
@@ -3210,7 +3210,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await coordinator.close()
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
-        try await waitUntil { !clock.waits.isEmpty }
+        try await pollWhileFalse { !clock.waits.isEmpty }
         try await settle()
         XCTAssertFalse(clock.waits.isEmpty, "a real timer must register before its delay is checked")
     }
@@ -3287,7 +3287,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await coordinator.close()
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
         await coordinator.start()
-        try await waitUntil { !clock.waits.isEmpty }
+        try await pollWhileFalse { !clock.waits.isEmpty }
         XCTAssertTrue(failure.denied, "the real result write must be rejected", file: file, line: line)
 
         let expected: [Duration] =
@@ -3300,7 +3300,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             ]
             : [.seconds(60)]
         for (index, delay) in expected.enumerated() {
-            try await waitUntil { clock.waits.count > index }
+            try await pollWhileFalse { clock.waits.count > index }
             XCTAssertEqual(
                 Array(clock.waits.prefix(index + 1)), Array(expected.prefix(index + 1)),
                 "a rejected result waits for the degraded backoff", file: file, line: line)
@@ -3318,7 +3318,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         failure.remove(from: store)
         effects.volumeID = "photos-volume"
         clock.advance(by: expected.last!)
-        try await waitUntil {
+        try await pollWhileFalse {
             if rejected.isAction {
                 let actions = store.actions()
                 switch rejected {
@@ -3880,11 +3880,6 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             delays.values.contains { $0 < .seconds(60) }, "short waits: \(delays.values)", file: file, line: line)
     }
 
-    private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
-        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-    }
-
     /// How long exact and negative checks of the recorded waits give a timer task to record. A timer records its wait
     /// when its task starts, after the call that scheduled it returned. A negative check observes only this bounded
     /// window: a wrong timer that registers later is missed (a false pass, never a false failure).
@@ -3911,7 +3906,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         _ = await coordinator.setFavorite([uid], favorite: true)
         _ = await coordinator.setFavorite([uid], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertGreaterThan(failure.count, 0)
         XCTAssertTrue(effects.favorites.isEmpty, "an unreadable handoff is no Proton photo to act on")
@@ -3923,7 +3918,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(owed.first?.failed, false, "the action is not failed")
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote], "the retry reads the handoff and runs the owed action")
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
         try await settle()
@@ -3942,14 +3937,14 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertTrue(effects.favorites.isEmpty)
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "an undecodable handoff is retried after a minute")
         assertNoShortWait(delays)
         XCTAssertTrue(change("UPDATE handoff SET kind='uploaded' WHERE source_id='k';"))
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -3969,7 +3964,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(effects.favorites.isEmpty)
         let remote = PhotoUID(volumeID: "vol", nodeID: "link-k")
         recorder.recordHandoff(source: source("k"), revision: revision, remote: remote, kind: .uploaded)
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote], "the handoff event starts the action")
         retry.open()
     }
@@ -3988,7 +3983,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         await restartWithBackoffLog(delays, firstRetry: retry)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertTrue(failure.denied)
         XCTAssertTrue(effects.favorites.isEmpty)
@@ -3996,7 +3991,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         assertNoShortWait(delays)
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
         try await settle()
@@ -4028,7 +4023,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         await coordinator.start()
 
-        try await waitUntil { delays.values.count >= 2 }
+        try await pollWhileFalse { delays.values.count >= 2 }
         XCTAssertEqual(effects.favorites, [remote], "the healthy action runs in the same pass")
         XCTAssertEqual(delays.values.prefix(2), [.seconds(60), .seconds(120)], "the retries back off")
         XCTAssertFalse(delays.values.contains(.seconds(1)), "an undecodable action row never retries every second")
@@ -4095,7 +4090,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertGreaterThan(failure.count, 0)
         XCTAssertTrue(effects.favorites.isEmpty)
@@ -4103,7 +4098,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         assertNoShortWait(delays)
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -4121,7 +4116,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         failure.remove(from: store)
         XCTAssertEqual(failure.count, 1, "only the dispatch read failed")
@@ -4129,7 +4124,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)])
         assertNoShortWait(delays)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -4147,7 +4142,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try failure.install(on: store)
         defer { failure.remove(from: store) }
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         failure.remove(from: store)
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k2")], favorite: true)
@@ -4156,7 +4151,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try again.install(on: store)
         defer { again.remove(from: store) }
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k3")], favorite: true)
-        try await waitUntil { Self.backoffs(delays.values).count >= 2 }
+        try await pollWhileFalse { Self.backoffs(delays.values).count >= 2 }
         try await settle()
         again.remove(from: store)
 
@@ -4212,11 +4207,11 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(effects.trashed.isEmpty, "no photo chosen on an unreadable handoff goes to the trash")
         XCTAssertNil(store.sourceState(for: key("p"))?.remote)
 
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         XCTAssertTrue(effects.trashed.isEmpty, "the read waits for the unreadable backoff")
         passes.allow()
 
-        try await waitUntil { !effects.trashed.isEmpty }
+        try await pollWhileFalse { !effects.trashed.isEmpty }
         XCTAssertEqual(effects.trashed, [[earlier]], "the photo the person deleted is the earlier upload")
         let state = try XCTUnwrap(store.sourceState(for: key("p")))
         XCTAssertEqual(state.desired, .excluded)
@@ -4269,7 +4264,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             passes.allow()
         }
         relations.relatedLookupGate = { await gate.pass() }
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         passes.allow()
         guard await gate.entered(within: .seconds(5)) else { return XCTFail("the first retry lookup must wait") }
         let first = try XCTUnwrap(relations.relatedLookups.first)
@@ -4287,10 +4282,10 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(store.sourceState(for: key(other))?.generation, 3)
         failure.remove(from: store)
         gate.open()
-        try await waitUntil { effects.trashed.flatMap { $0 }.contains { $0.nodeID == first } }
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.contains { $0.nodeID == first } }
         try await settle()
         passes.allow()
-        try await waitUntil { effects.trashed.flatMap { $0 }.count == 2 }
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.count == 2 }
 
         XCTAssertEqual(
             Set(effects.trashed.flatMap { $0 }), Set(targets.values), "the newer deletion keeps its own retry")
@@ -4318,7 +4313,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             default: break
             }
         }
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         passes.allow()
         guard await first.entered(within: .seconds(5)) else { return XCTFail("the first lookup must wait") }
         let restored = await coordinator.restore([key("restore-me").localUID])
@@ -4330,7 +4325,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             effects.returned.flatMap { $0 }.contains(key("restore-me")),
             "the restore must reach the backup before another earlier-upload lookup starts")
         second.open()
-        try await waitUntil { effects.trashed.flatMap { $0 }.count == 2 }
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.count == 2 }
         XCTAssertEqual(Set(effects.trashed.flatMap { $0 }), Set(targets.values), "both deletions stay eligible")
         await coordinator.close()
     }
@@ -4349,9 +4344,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(failure.count, 1)
         failure.remove(from: store)
         XCTAssertEqual(store.sourceState(for: key("repeat"))?.generation, generation)
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         passes.allow()
-        try await waitUntil { !effects.trashed.isEmpty }
+        try await pollWhileFalse { !effects.trashed.isEmpty }
 
         XCTAssertEqual(
             effects.trashed.flatMap { $0 }, [try XCTUnwrap(targets["repeat"])],
@@ -4372,7 +4367,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(deleted)
         XCTAssertEqual(failure.count, 1)
         failure.remove(from: store)
-        try await waitUntil { deadlines.waits.contains(.seconds(60)) }
+        try await pollWhileFalse { deadlines.waits.contains(.seconds(60)) }
         XCTAssertTrue(deadlines.waits.contains(.seconds(60)), "the first retry has a 60-second deadline")
 
         for index in 1...8 {
@@ -4388,7 +4383,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             deadlines.advance(by: .seconds(10))
             try await settle()
             if index == 6 {
-                try await waitUntil { !effects.trashed.isEmpty }
+                try await pollWhileFalse { !effects.trashed.isEmpty }
                 XCTAssertEqual(effects.trashed, [[earlier]], "the original deadline fires during the event stream")
             }
         }
@@ -4411,7 +4406,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(deleted)
         XCTAssertEqual(handoffFailure.count, 1)
         handoffFailure.remove(from: store)
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
 
         let writeFailure = KeyedReadFailure(
             matching:
@@ -4420,16 +4415,16 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try writeFailure.install(on: store)
         defer { writeFailure.remove(from: store) }
         passes.allow()
-        try await waitUntil { writeFailure.count == 1 }
+        try await pollWhileFalse { writeFailure.count == 1 }
         XCTAssertEqual(writeFailure.count, 1, "the guarded write really failed")
         XCTAssertTrue(effects.trashed.isEmpty)
         XCTAssertNil(store.sourceState(for: key("p"))?.remote)
         writeFailure.remove(from: store)
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         XCTAssertGreaterThan(passes.waiting, 0, "the failed write keeps a later retry")
 
         passes.allow()
-        try await waitUntil { !effects.trashed.isEmpty }
+        try await pollWhileFalse { !effects.trashed.isEmpty }
 
         XCTAssertEqual(effects.trashed, [[earlier]], "the same deletion settles after the write recovers")
         XCTAssertEqual(store.sourceState(for: key("p"))?.remote, earlier)
@@ -4446,7 +4441,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await coordinator.exclude([key("p").localUID])
         XCTAssertEqual(failure.count, 1, "the delete could not read the handoff")
 
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         passes.allow()
         try await settle()
 
@@ -4466,7 +4461,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         defer { failure.remove(from: store) }
         await coordinator.exclude([key("p").localUID])
         XCTAssertEqual(failure.count, 1, "the delete could not read the handoff")
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         let waitsBefore = passes.waits.count
 
         await coordinator.restore([key("p").localUID])
@@ -4504,9 +4499,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(effects.trashed.isEmpty, "an unreadable handoff proves no ownership")
         XCTAssertTrue(relations.relatedLookups.isEmpty, "unreadable handoffs cause no server lookups")
         failure.remove(from: store)
-        try await waitUntil { passes.waiting > 0 }
+        try await pollWhileFalse { passes.waiting > 0 }
         passes.allow()
-        try await waitUntil { effects.trashed.flatMap { $0 }.count == 101 }
+        try await pollWhileFalse { effects.trashed.flatMap { $0 }.count == 101 }
 
         XCTAssertEqual(Set(effects.trashed.flatMap { $0 }), Set(remotes), "no delete is dropped at 100")
         XCTAssertEqual(store.sourceState(for: key(ids[100]))?.remote, remotes[100], "the 101st delete is retried")
@@ -4576,7 +4571,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertTrue(failure.denied)
         XCTAssertTrue(effects.favorites.isEmpty)
@@ -4584,7 +4579,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         assertNoShortWait(delays)
         failure.remove(from: store)
         retry.open()
-        try await waitUntil { !effects.favorites.isEmpty }
+        try await pollWhileFalse { !effects.favorites.isEmpty }
         XCTAssertEqual(effects.favorites, [remote])
     }
 
@@ -4606,7 +4601,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         // A pass with no due action: only the read that schedules the timer reads the handoff.
         _ = await coordinator.restore([PhotoUID(localPending: .photoLibrary, identifier: "other")])
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
 
         failure.remove(from: store)
@@ -4629,7 +4624,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
         await restartWithBackoffLog(delays, firstRetry: retry)
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the incomplete list starts the backoff")
         assertNoShortWait(delays)
@@ -4648,7 +4643,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let delays = DelayLog()
         let retry = OpenGate()
         await restartWithBackoffLog(delays, firstRetry: retry)
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
 
@@ -4697,7 +4692,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             XCTAssertTrue(self.change("UPDATE handoff SET kind='uploaded' WHERE source_id='a';"))
         }
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertEqual(Set(effects.favorites.map(\.nodeID)), ["link-a", "link-b"], "the second pass runs the favorite")
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the failed read of the first pass counts")
@@ -4722,7 +4717,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             XCTAssertTrue(self.change("UPDATE pending_action SET kind='favorite' WHERE source_id='a';"))
         }
 
-        try await waitUntil { !Self.backoffs(delays.values).isEmpty }
+        try await pollWhileFalse { !Self.backoffs(delays.values).isEmpty }
         try await settle()
         XCTAssertEqual(Set(effects.favorites.map(\.nodeID)), ["link-a", "link-b"])
         XCTAssertEqual(Self.backoffs(delays.values), [.seconds(60)], "the incomplete read of the first pass counts")
@@ -4737,7 +4732,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let delays = DelayLog()
         let retry = OpenGate()
         await restartWithBackoffLog(delays, firstRetry: retry)
-        try await waitUntil { delays.values.contains(.seconds(5000)) }
+        try await pollWhileFalse { delays.values.contains(.seconds(5000)) }
 
         _ = await coordinator.setFavorite([PhotoUID(localPending: .photoLibrary, identifier: "k")], favorite: true)
         try await settle()
@@ -5904,13 +5899,13 @@ extension PendingBackupCoordinatorTests {
             _ = backingQueue.removeSources(kind: .photoLibraryAsset, identifiers: [id])
         }
         await coordinator.start()
-        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
         XCTAssertTrue(effects.removed.isEmpty)
         let connection = try fault.install(on: store, key: sourceKey)
         defer { PendingStoreTransactionFault.remove(from: connection) }
 
         clock.advance(by: .seconds(60))
-        try await waitUntil { clock.waits.filter { $0 >= .seconds(60) }.count >= 2 }
+        try await pollWhileFalse { clock.waits.filter { $0 >= .seconds(60) }.count >= 2 }
 
         XCTAssertTrue(effects.removed.isEmpty, "an unavailable decision must not remove a photo from backup")
         XCTAssertNotNil(
@@ -5923,7 +5918,7 @@ extension PendingBackupCoordinatorTests {
             PendingStoreTransactionFault.remove(from: connection)
             XCTAssertTrue(store.isOperational())
             clock.advance(by: .seconds(60))
-            try await waitUntil {
+            try await pollWhileFalse {
                 queueEntryForTesting(in: backingQueue, source: self.source(id), revision: self.revision) == nil
             }
             XCTAssertEqual(
@@ -5953,7 +5948,7 @@ extension PendingBackupCoordinatorTests {
             .recorded)
         XCTAssertTrue(store.setFavoriteIntent(favoriteKey, favorite: true, at: date.addingTimeInterval(120)))
         await coordinator.start()
-        try await waitUntil { clock.waits.contains(.seconds(60)) }
+        try await pollWhileFalse { clock.waits.contains(.seconds(60)) }
         let connection = try PendingStoreTransactionFault.openTransaction.install(on: store, key: sourceKey)
         defer { PendingStoreTransactionFault.remove(from: connection) }
 
@@ -5961,7 +5956,7 @@ extension PendingBackupCoordinatorTests {
         func refusalWaitCount() -> Int {
             clock.waits.filter { $0 == .seconds(60) || $0 == .seconds(1) }.count
         }
-        try await waitUntil { refusalWaitCount() >= 2 }
+        try await pollWhileFalse { refusalWaitCount() >= 2 }
         XCTAssertGreaterThanOrEqual(refusalWaitCount(), 2, "the refused reconcile must finish before the event")
         // The foreground event runs before the already scheduled action timer, so this await observes the whole
         // dispatch. Waking both at once can return here while another runDueActions call still awaits its effect.
@@ -6065,13 +6060,13 @@ extension PendingBackupCoordinatorTests {
         coordinator = makeCoordinator(clock: clock, sleep: { try await clock.sleep($0) })
 
         await coordinator.start()
-        try await waitUntil { failure.count >= 1 }
+        try await pollWhileFalse { failure.count >= 1 }
         XCTAssertGreaterThanOrEqual(failure.count, 1, "the reload keyed read must be genuinely interrupted")
 
         // The safe baseline: the degraded 60 s backoff is scheduled, no action runs while the read fails,
         // and the control source keeps its readable long wait in the schedule alongside the backoff.
         let backoffDelay = Duration.seconds(60)
-        try await waitUntil { clock.waits.contains(backoffDelay) }
+        try await pollWhileFalse { clock.waits.contains(backoffDelay) }
         XCTAssertTrue(
             effects.trashed.isEmpty,
             "while the keyed read fails, no remote trash dispatch may run; the handoff stays unconsumed")
@@ -6087,7 +6082,7 @@ extension PendingBackupCoordinatorTests {
         // interrupted keyed read (a fresh interrupt beyond the settled startup count).
         let settledCount = failure.count
         clock.advance(by: .seconds(60))
-        try await waitUntil { failure.count > settledCount }
+        try await pollWhileFalse { failure.count > settledCount }
         XCTAssertGreaterThan(
             failure.count, settledCount,
             "the 60 s backoff timer must fire and retry the interrupted keyed read")
@@ -6115,10 +6110,10 @@ extension PendingBackupCoordinatorTests {
         await coordinator.start()
 
         let resumedRemote = PhotoUID(volumeID: "vol", nodeID: "new-k")
-        try await waitUntil { effects.trashed.count >= 1 }
+        try await pollWhileFalse { effects.trashed.count >= 1 }
         XCTAssertEqual(effects.trashed, [[resumedRemote]], "healthy reads must dispatch the rescheduled remote trash")
 
-        try await waitUntil {
+        try await pollWhileFalse {
             clock.waits.contains { $0 > Duration.seconds(4000) && $0 < Duration.seconds(5500) }
         }
         XCTAssertTrue(
@@ -6262,7 +6257,7 @@ extension PendingBackupCoordinatorTests {
         _ = await waitForSnapshot("the fixture must first show the source in the trash list") {
             $0.trashTiles.contains { $0.key == trashKey }
         }
-        try await waitUntil { handoffFailure.count >= 1 }
+        try await pollWhileFalse { handoffFailure.count >= 1 }
         XCTAssertGreaterThanOrEqual(
             handoffFailure.count, 1, "startup recovery must read the source's handoff")
         try await settle()
@@ -6339,7 +6334,7 @@ extension PendingBackupCoordinatorTests {
             PhotoUID(localPending: .photoLibrary, identifier: "t1")
         ])
         XCTAssertTrue(first, "the first unlist must commit and arm the degraded countdown")
-        try await waitUntil { clock.waits.contains(Duration.seconds(60)) }
+        try await pollWhileFalse { clock.waits.contains(Duration.seconds(60)) }
         XCTAssertEqual(firstFailure.count, 1, "the first failed reload must be interrupted")
         firstFailure.remove(from: store)
 
@@ -6351,7 +6346,7 @@ extension PendingBackupCoordinatorTests {
             PhotoUID(localPending: .photoLibrary, identifier: "t2")
         ])
         XCTAssertTrue(second, "the second unlist must commit too")
-        try await waitUntil { secondFailure.count == 1 }
+        try await pollWhileFalse { secondFailure.count == 1 }
         XCTAssertEqual(
             secondFailure.count, 1,
             "the second reload must fail as well, entering the same degraded episode")
@@ -6412,11 +6407,11 @@ extension PendingBackupCoordinatorTests {
 
         // Releasing the trash ends the pass; its end-of-pass scheduling arms the countdown once.
         trashGate.open()
-        try await waitUntil { !effects.trashed.isEmpty }
+        try await pollWhileFalse { !effects.trashed.isEmpty }
         XCTAssertEqual(
             effects.trashed, [[PhotoUID(volumeID: "vol", nodeID: "new-d")]],
             "the held pass must finish its remote trash dispatch")
-        try await waitUntil { clock.waits.contains(Duration.seconds(60)) }
+        try await pollWhileFalse { clock.waits.contains(Duration.seconds(60)) }
         XCTAssertEqual(
             clock.waits.filter { $0 == Duration.seconds(60) }.count, 1,
             "the pass-end scheduling must arm exactly one degraded 60 s countdown")
