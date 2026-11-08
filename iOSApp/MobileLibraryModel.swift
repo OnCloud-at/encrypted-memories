@@ -2011,22 +2011,6 @@ final class MobileLibraryModel {
         }
     }
 
-    private func requestLibraryRefresh() {
-        guard let recoverySession = session, let refreshLease = currentMutationLease() else { return }
-        let coalescer = libraryRefreshCoalescer
-        Task { [weak self] in
-            let outcome = await coalescer.request { [weak self] in
-                await self?.performLibraryRefresh(lease: refreshLease).outcome ?? .retry
-            }
-            if outcome == .terminal {
-                await self?.recoverAfterScopeAccessLoss(
-                    expectedSession: recoverySession,
-                    expectedLoadGeneration: refreshLease.loadToken
-                )
-            }
-        }
-    }
-
     private func performLibraryRefresh(
         lease refreshLease: MobileLibraryMutationLease
     ) async -> MobileLibraryRefreshResult {
