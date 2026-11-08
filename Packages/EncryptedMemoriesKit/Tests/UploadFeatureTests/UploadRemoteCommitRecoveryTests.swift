@@ -512,7 +512,6 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         let primary = source("live")
         let secondary = source("live", resource: .photoKit(role: "alternate", ordinal: 2))
         let descriptor = descriptor(source: secondary, filename: "live.mov", fileExists: false)
-        XCTAssertNil(descriptor.mainResource)
         let reconciliation = reconciliation(
             descriptor: descriptor,
             queueSource: primary,

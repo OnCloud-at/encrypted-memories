@@ -101,9 +101,6 @@ public struct UploadResourceDescriptor: Sendable {
     public let precomputedSHA1Digest: Data?
     /// Admission intent for local hashing only. It is never persisted or sent to the server.
     public let workIntent: LibraryWorkIntent
-    /// The primary resource of this compound when `source.resource` is secondary - lets a future
-    /// Live Photo path upload only the missing paired video via `mainPhotoUid`.
-    public let mainResource: UploadSourceIdentity?
     /// The remote main photo that a burst member becomes a related photo of. The dedupe rule for burst members
     /// reads the relation from it. It is never persisted.
     public let mainRemoteLinkID: String?
@@ -130,7 +127,6 @@ public struct UploadResourceDescriptor: Sendable {
         modificationDate: Date,
         precomputedSHA1Digest: Data? = nil,
         workIntent: LibraryWorkIntent = .userInitiated,
-        mainResource: UploadSourceIdentity? = nil,
         mainRemoteLinkID: String? = nil,
         requiresRelatedMatch: Bool = false,
         externalIdentifier: String? = nil,
@@ -148,7 +144,6 @@ public struct UploadResourceDescriptor: Sendable {
         self.modificationDate = modificationDate
         self.precomputedSHA1Digest = precomputedSHA1Digest
         self.workIntent = workIntent
-        self.mainResource = mainResource
         self.mainRemoteLinkID = mainRemoteLinkID
         self.requiresRelatedMatch = requiresRelatedMatch
         self.externalIdentifier = externalIdentifier
@@ -209,7 +204,6 @@ public struct UploadResourceDescriptor: Sendable {
             modificationDate: modificationDate,
             precomputedSHA1Digest: precomputedSHA1Digest,
             workIntent: workIntent ?? self.workIntent,
-            mainResource: mainResource,
             mainRemoteLinkID: mainRemoteLinkID ?? self.mainRemoteLinkID,
             requiresRelatedMatch: requiresRelatedMatch ?? self.requiresRelatedMatch,
             externalIdentifier: externalIdentifier ?? self.externalIdentifier,
