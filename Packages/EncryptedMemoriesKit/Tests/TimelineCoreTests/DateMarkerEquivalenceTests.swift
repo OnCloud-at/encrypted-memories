@@ -6,15 +6,10 @@ import Testing
 
 /// Compares the optimized date-marker pass with a per-item reference implementation.
 @Suite struct DateMarkerEquivalenceTests {
-    private static var calendar: Calendar {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return calendar
-    }
     private static let locale = Locale(identifier: "en_US_POSIX")
 
     private func date(_ y: Int, _ m: Int, _ d: Int, _ h: Int = 12) -> Date {
-        Self.calendar.date(from: DateComponents(year: y, month: m, day: d, hour: h))!
+        timelineTestUTCCalendar.date(from: DateComponents(year: y, month: m, day: d, hour: h))!
     }
 
     private func item(_ i: Int, _ date: Date) -> PhotoItem {
@@ -27,7 +22,7 @@ import Testing
         _ granularity: TimelineDateMarker.Granularity
     ) -> [(index: Int, text: String)] {
         guard !items.isEmpty else { return [] }
-        let calendar = Self.calendar
+        let calendar = timelineTestUTCCalendar
         let formatter = DateFormatter()
         formatter.locale = Self.locale
         switch granularity {
@@ -60,7 +55,7 @@ import Testing
         _ label: String
     ) {
         let produced = TimelineDateMarkers.markers(
-            items: items, granularity: granularity, calendar: Self.calendar, locale: Self.locale)
+            items: items, granularity: granularity, calendar: timelineTestUTCCalendar, locale: Self.locale)
         let reference = referenceMarkers(items, granularity)
         #expect(produced.map(\.index) == reference.map(\.index), "\(label): indices [\(granularity)]")
         #expect(produced.map(\.text) == reference.map(\.text), "\(label): labels [\(granularity)]")
@@ -116,10 +111,10 @@ import Testing
         let section = TimelineSection(id: "s", date: items[0].captureTime, title: "s", items: items)
         let viaItems = TimelineDateMarkers.markers(
             items: items, granularity: .month,
-            calendar: Self.calendar, locale: Self.locale)
+            calendar: timelineTestUTCCalendar, locale: Self.locale)
         let viaSections = TimelineDateMarkers.markers(
             sections: [section], granularity: .month,
-            calendar: Self.calendar, locale: Self.locale)
+            calendar: timelineTestUTCCalendar, locale: Self.locale)
         #expect(viaItems == viaSections)
     }
 
@@ -127,7 +122,7 @@ import Testing
         #expect(
             TimelineDateMarkers.markers(
                 items: [], granularity: .month,
-                calendar: Self.calendar, locale: Self.locale
+                calendar: timelineTestUTCCalendar, locale: Self.locale
             ).isEmpty)
     }
 }

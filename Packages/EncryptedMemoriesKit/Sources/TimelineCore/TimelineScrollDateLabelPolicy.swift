@@ -55,9 +55,6 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
         self.tuning = tuning
     }
 
-    /// The smoothed user scroll speed in points per second.
-    public var speed: Double { smoothedSpeed }
-
     /// A viewport movement that the user drives: finger, momentum, scroll indicator, wheel, trackpad or keyboard.
     public mutating func userMoved(offsetY: Double, at time: TimeInterval) {
         guard !isSuppressed else { return }

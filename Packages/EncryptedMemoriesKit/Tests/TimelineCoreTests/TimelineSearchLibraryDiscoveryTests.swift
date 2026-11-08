@@ -5,12 +5,6 @@ import Testing
 @testable import TimelineCore
 
 @Suite struct TimelineSearchLibraryDiscoveryTests {
-    private let calendar: Calendar = {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return calendar
-    }()
-
     // MARK: Structured result sets
 
     @Test func requiredUIDsNarrowAnEmptyQueryAndAndCombineWithText() {
@@ -139,7 +133,7 @@ import Testing
         let excluded = Set(items.filter { $0.uid.nodeID.hasSuffix("-5") }.map(\.uid))
         let scanned = Set(items.filter { !$0.uid.nodeID.hasSuffix("-7") }.map(\.uid))
         let gated = TimelineSearchDiscoveryContext(
-            now: now, calendar: calendar, locale: Locale(identifier: "de_AT"), favoriteUIDs: favorites,
+            now: now, calendar: timelineTestUTCCalendar, locale: Locale(identifier: "de_AT"), favoriteUIDs: favorites,
             excludedRepresentativeUIDs: excluded, allowsRepresentative: { scanned.contains($0) })
         var withoutPreviews = gated
         withoutPreviews.excludedRepresentativeUIDs = []
@@ -221,7 +215,7 @@ import Testing
         let favorite = items[2]
         let excluded = items[9]
         let context = TimelineSearchDiscoveryContext(
-            now: date(2026, 1, 1), calendar: calendar,
+            now: date(2026, 1, 1), calendar: timelineTestUTCCalendar,
             favoriteUIDs: [favorite.uid], excludedRepresentativeUIDs: [excluded.uid])
 
         let picked = TimelineSearchDiscovery.representatives(for: items, context: context)
@@ -234,7 +228,7 @@ import Testing
     @Test func aFailedSensitiveGateSuppressesEveryPreview() {
         let items = (1...5).map { item("g\($0)", date(2024, 1, $0)) }
         let context = TimelineSearchDiscoveryContext(
-            now: date(2026, 1, 1), calendar: calendar, suppressesRepresentatives: true)
+            now: date(2026, 1, 1), calendar: timelineTestUTCCalendar, suppressesRepresentatives: true)
 
         #expect(TimelineSearchDiscovery.representatives(for: items, context: context).isEmpty)
     }
@@ -292,7 +286,7 @@ import Testing
         let favorites = Set(items.filter { $0.uid.nodeID.hasSuffix("-7") }.map(\.uid))
         let sections = [TimelineSection(id: "all", date: now, title: "", items: items)]
         let context = TimelineSearchDiscoveryContext(
-            now: now, calendar: calendar, locale: Locale(identifier: "de_AT"), favoriteUIDs: favorites)
+            now: now, calendar: timelineTestUTCCalendar, locale: Locale(identifier: "de_AT"), favoriteUIDs: favorites)
 
         let metadata = TimelineSearchDiscovery.librarySuggestions(sections: sections, context: context)
         let candidates = TimelineSearchDiscovery.placeCandidates(coordinates: coordinates)
@@ -329,7 +323,7 @@ import Testing
         func announced(_ id: String) -> Set<PhotoUID>? {
             offered.first { $0.id == id }?.matchingUIDs
         }
-        func localDay(_ date: Date) -> Date { calendar.startOfDay(for: date) }
+        func localDay(_ date: Date) -> Date { timelineTestUTCCalendar.startOfDay(for: date) }
         #expect(announced("media:\(PhotoTag.favorites.rawValue)") == favorites)
         #expect(
             announced("media:\(PhotoTag.videos.rawValue)")
@@ -337,7 +331,9 @@ import Testing
 
         let anniversary = localDay(date(2025, 9, 21))
         let aroundAnniversary = items.filter {
-            let distance = calendar.dateComponents([.day], from: anniversary, to: localDay($0.captureTime)).day
+            let distance = timelineTestUTCCalendar.dateComponents(
+                [.day], from: anniversary, to: localDay($0.captureTime)
+            ).day
             return abs(distance ?? .max) <= 3
         }
         #expect(aroundAnniversary.contains { $0.uid == uid("y1-0") })
@@ -355,7 +351,7 @@ import Testing
     // MARK: Fixtures
 
     private func context(now: Date) -> TimelineSearchDiscoveryContext {
-        TimelineSearchDiscoveryContext(now: now, calendar: calendar, locale: Locale(identifier: "de_AT"))
+        TimelineSearchDiscoveryContext(now: now, calendar: timelineTestUTCCalendar, locale: Locale(identifier: "de_AT"))
     }
 
     private func uid(_ id: String) -> PhotoUID { PhotoUID(volumeID: "v", nodeID: id) }
@@ -373,6 +369,6 @@ import Testing
     }
 
     private func date(_ year: Int, _ month: Int, _ day: Int, hour: Int = 12) -> Date {
-        calendar.date(from: DateComponents(year: year, month: month, day: day, hour: hour))!
+        timelineTestUTCCalendar.date(from: DateComponents(year: year, month: month, day: day, hour: hour))!
     }
 }

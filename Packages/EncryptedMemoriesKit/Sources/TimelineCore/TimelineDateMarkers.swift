@@ -36,12 +36,11 @@ public struct TimelineDateMarker: Equatable, Sendable {
 public enum TimelineDateMarkers {
     public static func markers(
         sections: [TimelineSection], granularity: TimelineDateMarker.Granularity,
-        monthStyle: TimelineDateMarker.MonthStyle = .abbreviated,
         calendar: Calendar = .autoupdatingCurrent,
         locale: Locale = .autoupdatingCurrent
     ) -> [TimelineDateMarker] {
         markers(
-            items: sections.flatMap { $0.items }, granularity: granularity, monthStyle: monthStyle,
+            items: sections.flatMap { $0.items }, granularity: granularity,
             calendar: calendar, locale: locale)
     }
 

@@ -1,9 +1,10 @@
 import Foundation
 import PhotosCore
 import SwiftUI
-import TimelineUIKitFeature
 
 #if DEBUG
+    import TimelineUIKitFeature
+
     /// Starts the app signed in to the offline fixture account when a UI test passes `fixtureArgument`.
     /// Debug builds only: the App Store build contains neither this switch nor the fixture.
     @MainActor

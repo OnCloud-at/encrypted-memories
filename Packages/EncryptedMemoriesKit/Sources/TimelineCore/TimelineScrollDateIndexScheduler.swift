@@ -11,8 +11,6 @@ public final class TimelineScrollDateIndexScheduler {
 
     /// Receives each finished index, or nil for an empty list.
     public var onIndex: ((TimelineScrollDateIndex?) -> Void)?
-    /// True while a build runs or waits for a cancelled one to end. Exposed for lifecycle tests.
-    public var isBuilding: Bool { task != nil }
 
     private let build: Builder
     private var revision: UInt64 = 0

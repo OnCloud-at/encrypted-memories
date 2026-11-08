@@ -53,8 +53,7 @@ extension TimelineScrollDateLabelMovement {
 ///
 /// - Host-driven and layout movements never count.
 /// - Touch, drag, deceleration and system scroll animations count.
-/// - A movement without any of these flags counts only while it continues frame after frame. A native scroll indicator
-///   drag moves the viewport like that, whatever flags the platform reports for it; a single layout jump does not.
+/// - A movement without any of these flags counts only while it continues frame after frame.
 public struct TimelineScrollDateLabelInputClassifier: Equatable, Sendable {
     /// The longest gap between two unflagged movements of one continuous gesture.
     public static let continuationWindow: TimeInterval = 0.05

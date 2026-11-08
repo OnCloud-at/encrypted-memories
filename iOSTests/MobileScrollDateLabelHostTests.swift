@@ -120,19 +120,23 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         grid.scrollViewWillBeginDragging(grid.scrollView)
         XCTAssertFalse(grid.hostAnimatedScrollActive)
         XCTAssertFalse(grid.systemScrollToTopActive)
-        let controller = grid.scrollDateLabel.controller
+        final class Time: @unchecked Sendable { var now: TimeInterval = 0 }
+        let time = Time()
+        let controller = TimelineScrollDateLabelController(
+            clock: .init(now: { time.now }, sleep: { _ in throw CancellationError() }))
+        defer { controller.retire() }
         controller.updateHost(
             TimelineScrollDateLabelHostState(
                 hasWindow: true, isActive: true, isBackgrounded: false, isTransforming: false, hasItems: true,
                 isScrollable: true))
         controller.setIndex(TimelineScrollDateIndex.build(items: photos(), revision: 1))
         controller.setAnchor(flatIndex: 0)
-        // The host's real movement description, fed as a continuous movement.
+        // Feed the host's observed movement through the shared controller at exact clock intervals.
         var offset = 0.0
         for _ in 0..<6 {
             offset += 400
             controller.viewportMoved(grid.scrollDateLabelMovement, offsetY: offset)
-            Thread.sleep(forTimeInterval: 0.005)
+            time.now += 1.0 / 120
         }
         XCTAssertTrue(controller.presentation.isVisible, "the person's flick after the interruption shows the label")
     }
@@ -162,41 +166,17 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         XCTAssertFalse(grid.systemScrollToTopActive)
     }
 
-    /// The label already fades out after its linger time; backgrounding or opening a photo must not wait for the fade.
-    func testAnImmediateHideStopsARunningFadeOut() async throws {
-        final class Time: @unchecked Sendable { var now: TimeInterval = 0 }
-        let time = Time()
-        let controller = TimelineScrollDateLabelController(
-            clock: TimelineScrollDateLabelClock(
-                now: { time.now }, sleep: { _ in try await Task.sleep(for: .milliseconds(2)) }))
-        let presenter = UIKitTimelineScrollDateLabelPresenter(controller: controller)
-        let host = UIView(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
-        let scrollView = UIScrollView(frame: host.bounds)
-        scrollView.contentSize = CGSize(width: 400, height: 8_000)
-        host.addSubview(scrollView)
-        presenter.attach(to: host, scrollView: scrollView)
-        controller.updateHost(
-            TimelineScrollDateLabelHostState(
-                hasWindow: true, isActive: true, isBackgrounded: false, isTransforming: false, hasItems: true,
-                isScrollable: true))
-        controller.setIndex(TimelineScrollDateIndex.build(items: photos(), revision: 1))
-        controller.setAnchor(flatIndex: 0)
-        var offset = 0.0
-        for _ in 0..<12 {
-            controller.userMoved(offsetY: offset)
-            time.now += 1.0 / 120
-            offset += 2_000.0 / 120
-        }
-        XCTAssertFalse(presenter.view.isHidden, "SETUP: the label shows")
-        time.now += 1.5
-        let deadline = ContinuousClock.now + .seconds(2)
-        while controller.presentation.isVisible, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        XCTAssertFalse(controller.presentation.isVisible, "SETUP: the linger hide started")
-        XCTAssertFalse(presenter.view.isHidden, "SETUP: the 0.35 s fade-out still runs")
+    /// Suppression stops an already-started fade in the same actor turn, with no animation-deadline race.
+    func testAnImmediateHideStopsAnAlreadyStartedFadeOut() throws {
+        let grid = try hostInWindow()
+        grid.scrollDateLabel.setReduceMotion(false)
+        try showLabel(on: grid)
+        let controller = grid.scrollDateLabel.controller
+        controller.nonUserMoved(isJump: true)
+        XCTAssertFalse(controller.presentation.isVisible, "SETUP: the fast jump fade has started")
+        XCTAssertFalse(grid.scrollDateLabel.view.isHidden, "the same actor turn precedes animation completion")
         controller.suppress()
-        XCTAssertTrue(presenter.view.isHidden, "the fade-out stops at once")
+        XCTAssertTrue(grid.scrollDateLabel.view.isHidden, "suppression stops the already-running fade at once")
     }
 
     func testAStatusBarTapIsAJumpUntilItEnds() throws {

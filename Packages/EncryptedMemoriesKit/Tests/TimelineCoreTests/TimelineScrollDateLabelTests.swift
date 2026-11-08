@@ -5,6 +5,19 @@ import Testing
 
 @testable import TimelineCore
 
+private func scrollDateIndexItems(_ count: Int) -> [PhotoItem] {
+    (0..<count).map {
+        PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "n\($0)"),
+            captureTime: Date(timeIntervalSince1970: 1_780_000_000 + Double($0) * 86_400), mediaType: "image/jpeg")
+    }
+}
+
+private func scrollDateMovementClassifier() -> (TimelineScrollDateLabelMovement, TimeInterval) -> Bool {
+    var classifier = TimelineScrollDateLabelInputClassifier()
+    return { classifier.isUserMovement($0, at: $1) }
+}
+
 /// Behavior of the transient scroll date label: visibility policy, controller lifecycle, month lookup and placement.
 @Suite struct TimelineScrollDateLabelPolicyTests {
     /// Feeds user movement at `speed` points per second for `duration` seconds at `rate` frames per second.
@@ -123,22 +136,16 @@ import Testing
 }
 
 @Suite struct TimelineScrollDateIndexTests {
-    private static var calendar: Calendar {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return calendar
-    }
-
     private func item(_ i: Int, _ y: Int, _ m: Int, _ d: Int) -> PhotoItem {
         PhotoItem(
             uid: PhotoUID(volumeID: "v", nodeID: "n\(i)"),
-            captureTime: Self.calendar.date(from: DateComponents(year: y, month: m, day: d, hour: 12))!,
+            captureTime: timelineTestUTCCalendar.date(from: DateComponents(year: y, month: m, day: d, hour: 12))!,
             mediaType: "image/jpeg")
     }
 
     private func makeIndex(_ items: [PhotoItem], locale: String = "en_US") -> TimelineScrollDateIndex? {
         TimelineScrollDateIndex.build(
-            items: items, revision: 7, calendar: Self.calendar, locale: Locale(identifier: locale))
+            items: items, revision: 7, calendar: timelineTestUTCCalendar, locale: Locale(identifier: locale))
     }
 
     @Test func mixedMonthViewportUsesTheMonthOfTheAnchorPhoto() throws {
@@ -188,9 +195,8 @@ import Testing
 
     @Test func calendarTimeZoneDecidesTheMonth() throws {
         // 23:30 UTC on 31 January is February in Vienna.
-        var utc = Self.calendar
-        utc.timeZone = TimeZone(identifier: "UTC")!
-        var vienna = Self.calendar
+        let utc = timelineTestUTCCalendar
+        var vienna = timelineTestUTCCalendar
         vienna.timeZone = TimeZone(identifier: "Europe/Vienna")!
         let date = utc.date(from: DateComponents(year: 2026, month: 1, day: 31, hour: 23, minute: 30))!
         let items = [PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "x"), captureTime: date, mediaType: "image/jpeg")]
@@ -206,7 +212,7 @@ import Testing
 
     @Test func largeLibraryBuildsOnceWithinBudget() throws {
         // 200,000 photos over about 16 years, newest first.
-        let start = Self.calendar.date(from: DateComponents(year: 2026, month: 11, day: 1))!
+        let start = timelineTestUTCCalendar.date(from: DateComponents(year: 2026, month: 11, day: 1))!
         let items = (0..<200_000).map {
             PhotoItem(
                 uid: PhotoUID(volumeID: "v", nodeID: "n\($0)"),
@@ -217,7 +223,7 @@ import Testing
         var built: TimelineScrollDateIndex?
         let elapsed = clock.measure {
             built = TimelineScrollDateIndex.build(
-                items: items, revision: 1, calendar: Self.calendar, locale: Locale(identifier: "en_US"))
+                items: items, revision: 1, calendar: timelineTestUTCCalendar, locale: Locale(identifier: "en_US"))
         }
         let index = try #require(built)
         #expect(index.starts.count > 180 && index.starts.count < 200)
@@ -229,50 +235,29 @@ import Testing
     }
 }
 
-/// A clock whose time moves only when the test advances it.
+/// Adapts the existing shared test clock to the label's absolute TimeInterval dependency.
 private final class ManualClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var time: TimeInterval = 100
-    private var waiters: [(deadline: TimeInterval, id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
+    private let shared = TimelineRefreshTestClock()
+    private let epoch: ContinuousClock.Instant
 
-    var now: TimeInterval { lock.withLock { time } }
-    var waiterCount: Int { lock.withLock { waiters.count } }
+    init() { epoch = shared.now }
+
+    var now: TimeInterval {
+        let parts = epoch.duration(to: shared.now).components
+        return 100 + Double(parts.seconds) + Double(parts.attoseconds) / 1_000_000_000_000_000_000
+    }
+
+    var waiterCount: Int { shared.pendingSleeps }
 
     var clock: TimelineScrollDateLabelClock {
         TimelineScrollDateLabelClock(
-            now: { [self] in now }, sleep: { [self] deadline in try await sleep(until: deadline) })
+            now: { [self] in now },
+            sleep: { [self] deadline in
+                try await shared.dependency.sleepUntil(epoch.advanced(by: .seconds(deadline - 100)))
+            })
     }
 
-    func advance(by seconds: TimeInterval) {
-        let ready: [CheckedContinuation<Void, Error>] = lock.withLock {
-            time += seconds
-            let due = waiters.filter { $0.deadline <= time }
-            waiters.removeAll { $0.deadline <= time }
-            return due.map(\.continuation)
-        }
-        ready.forEach { $0.resume() }
-    }
-
-    private func sleep(until deadline: TimeInterval) async throws {
-        let id = UUID()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let resumeNow: Bool = lock.withLock {
-                    if Task.isCancelled || deadline <= time { return true }
-                    waiters.append((deadline, id, continuation))
-                    return false
-                }
-                if resumeNow { continuation.resume() }
-            }
-        } onCancel: {
-            let cancelled = lock.withLock { () -> CheckedContinuation<Void, Error>? in
-                guard let i = waiters.firstIndex(where: { $0.id == id }) else { return nil }
-                return waiters.remove(at: i).continuation
-            }
-            cancelled?.resume(throwing: CancellationError())
-        }
-        try Task.checkCancellation()
-    }
+    func advance(by seconds: TimeInterval) { shared.advance(by: .seconds(seconds)) }
 }
 
 /// Lets queued main-actor tasks run. With a condition it waits until the condition holds or 5 s pass; without one it
@@ -291,17 +276,12 @@ private func settle(until condition: (() -> Bool)? = nil) async {
 
 @MainActor
 @Suite struct TimelineScrollDateLabelControllerTests {
-    private static var calendar: Calendar {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return calendar
-    }
-
     private func items() -> [PhotoItem] {
         (0..<40).map {
             PhotoItem(
                 uid: PhotoUID(volumeID: "v", nodeID: "n\($0)"),
-                captureTime: Self.calendar.date(from: DateComponents(year: 2026, month: 1 + $0 / 10, day: 2))!,
+                captureTime: timelineTestUTCCalendar.date(
+                    from: DateComponents(year: 2026, month: 1 + $0 / 10, day: 2))!,
                 mediaType: "image/jpeg")
         }
     }
@@ -312,7 +292,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         controller.onChange = { recorder.changes.append($0) }
         controller.setIndex(
             TimelineScrollDateIndex.build(
-                items: items(), revision: 1, calendar: Self.calendar, locale: Locale(identifier: "en_US")))
+                items: items(), revision: 1, calendar: timelineTestUTCCalendar, locale: Locale(identifier: "en_US")))
         controller.setAnchor(flatIndex: 0)
         return (controller, recorder)
     }
@@ -336,13 +316,14 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         let (controller, recorder) = makeController(manual)
         flick(controller, manual)
         #expect(controller.presentation == .init(isVisible: true, text: "January 2026"))
-        #expect(controller.hasPendingHide)
         await settle(until: { manual.waiterCount == 1 })
+        #expect(manual.waiterCount == 1)
         manual.advance(by: 1.1)
         await settle(until: { !controller.presentation.isVisible })
         #expect(!controller.presentation.isVisible)
         #expect(controller.presentation.text == "January 2026", "the text stays while the label fades out")
-        #expect(!controller.hasPendingHide)
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0)
         #expect(recorder.changes.map(\.isVisible) == [true, false])
     }
 
@@ -366,6 +347,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         flick(controller, manual, frames: 4)
         await settle()
         #expect(controller.presentation.isVisible)
+        await settle(until: { manual.waiterCount == 1 })
         #expect(manual.waiterCount == 1, "one waiting hide at a time")
         manual.advance(by: 0.5)
         await settle()
@@ -382,7 +364,6 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         await settle(until: { manual.waiterCount == 1 })
         controller.suppress()
         #expect(!controller.presentation.isVisible)
-        #expect(!controller.hasPendingHide)
         await settle(until: { manual.waiterCount == 0 })
         #expect(manual.waiterCount == 0, "the cancelled sleeper is gone")
         controller.resume()
@@ -407,7 +388,8 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         host = nil
         controller.retire()
         #expect(weakHost == nil, "retire drops the host callback")
-        #expect(!controller.hasPendingHide, "retire cancels the pending hide")
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0, "retire cancels the pending hide")
         #expect(controller.isRetired)
         manual.advance(by: 5)
         await settle()
@@ -454,7 +436,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         await settle(until: { gated.waiting == 1 })
         #expect(controller.presentation == .init(isVisible: true, text: "January 2026"))
         gated.releaseAll()
-        await settle(until: { !controller.isBuildingIndex })
+        await settle(until: { controller.index?.itemCount == 41 })
         #expect(controller.presentation.isVisible)
     }
 
@@ -474,7 +456,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         #expect(installed.isEmpty, "the old list's markers never arrive")
         #expect(controller.index == nil)
         gated.releaseAll()
-        await settle(until: { !controller.isBuildingIndex })
+        await settle(until: { installed == [25] })
         #expect(installed == [25])
         #expect(gated.maximumRunning == 1)
     }
@@ -528,7 +510,6 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         await settle(until: { manual.waiterCount == 1 })
         controller.hide()
         #expect(controller.presentation.isVisible == false)
-        #expect(!controller.hasPendingHide)
         await settle(until: { manual.waiterCount == 0 })
         #expect(manual.waiterCount == 0)
         #expect(recorder.changes.map(\.isVisible) == [true, false])
@@ -754,7 +735,7 @@ private final class GatedBuilder {
     private(set) var maximumRunning = 0
     private var gates: [CheckedContinuation<Void, Never>] = []
     /// Set by a cancellation that reached a build.
-    let cancellations = CancellationCounter()
+    let cancellations = TimelineTestCounter()
 
     var build: TimelineScrollDateIndexScheduler.Builder {
         { [self] items, revision in
@@ -791,27 +772,19 @@ private final class GatedBuilder {
 
 @MainActor
 @Suite struct TimelineScrollDateIndexSchedulerTests {
-    private func items(_ count: Int) -> [PhotoItem] {
-        (0..<count).map {
-            PhotoItem(
-                uid: PhotoUID(volumeID: "v", nodeID: "n\($0)"),
-                captureTime: Date(timeIntervalSince1970: 1_780_000_000 + Double($0) * 86_400), mediaType: "image/jpeg")
-        }
-    }
-
     @Test func refreshesDuringABuildCoalesceToTheNewestList() async {
         let gated = GatedBuilder()
         let scheduler = TimelineScrollDateIndexScheduler(build: gated.build)
         var received: [Int?] = []
         scheduler.onIndex = { received.append($0?.itemCount) }
-        scheduler.update(items: items(10))
+        scheduler.update(items: scrollDateIndexItems(10))
         await settle(until: { gated.waiting == 1 })
         // Five refreshes arrive while the first build runs.
-        for count in 11...15 { scheduler.update(items: items(count)) }
+        for count in 11...15 { scheduler.update(items: scrollDateIndexItems(count)) }
         gated.releaseAll()
         await settle(until: { gated.waiting == 1 })
         gated.releaseAll()
-        await settle(until: { !scheduler.isBuilding })
+        await settle(until: { received == [10, 15] })
         #expect(gated.requested == [10, 15], "the stale lists 11 to 14 are skipped")
         #expect(received == [10, 15], "every finished build reports, the newest last")
     }
@@ -821,13 +794,13 @@ private final class GatedBuilder {
         let scheduler = TimelineScrollDateIndexScheduler(build: gated.build)
         var received: [Int?] = []
         scheduler.onIndex = { received.append($0?.itemCount) }
-        scheduler.update(items: items(10))
+        scheduler.update(items: scrollDateIndexItems(10))
         await settle(until: { gated.waiting == 1 })
         scheduler.update(items: [])
         gated.releaseAll()
         await settle()
         #expect(received == [nil], "the old list's index never arrives after the empty list")
-        #expect(!scheduler.isBuilding)
+        #expect(gated.running == 0)
     }
 
     @Test func cancelStopsEveryLaterResult() async {
@@ -835,17 +808,17 @@ private final class GatedBuilder {
         let scheduler = TimelineScrollDateIndexScheduler(build: gated.build)
         var received: [Int?] = []
         scheduler.onIndex = { received.append($0?.itemCount) }
-        scheduler.update(items: items(10))
+        scheduler.update(items: scrollDateIndexItems(10))
         await settle(until: { gated.waiting == 1 })
         scheduler.cancel()
         gated.releaseAll()
         await settle()
         #expect(received.isEmpty)
         // A later update starts a new build.
-        scheduler.update(items: items(3))
+        scheduler.update(items: scrollDateIndexItems(3))
         await settle(until: { gated.waiting == 1 })
         gated.releaseAll()
-        await settle(until: { !scheduler.isBuilding })
+        await settle(until: { received == [3] })
         #expect(received == [3])
     }
 }
@@ -853,11 +826,7 @@ private final class GatedBuilder {
 @MainActor
 @Suite struct TimelineScrollDateLabelReplacementTests {
     @Test func aLookupOutsideTheMarkersKeepsTheLastMonth() {
-        let calendar: Calendar = {
-            var c = Calendar(identifier: .gregorian)
-            c.timeZone = TimeZone(secondsFromGMT: 0)!
-            return c
-        }()
+        let calendar = timelineTestUTCCalendar
         let manual = ManualClock()
         let controller = TimelineScrollDateLabelController(clock: manual.clock)
         let photos = (0..<20).map {
@@ -900,35 +869,19 @@ private struct SplitMix64 {
     }
 }
 
-/// Counts cancellations that a build observed; written from cancellation handlers.
-private final class CancellationCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    var value: Int { lock.withLock { count } }
-    func increment() { lock.withLock { count += 1 } }
-}
-
 @MainActor
 @Suite struct TimelineScrollDateIndexSchedulerCancellationTests {
-    private func items(_ count: Int) -> [PhotoItem] {
-        (0..<count).map {
-            PhotoItem(
-                uid: PhotoUID(volumeID: "v", nodeID: "n\($0)"),
-                captureTime: Date(timeIntervalSince1970: 1_780_000_000 + Double($0) * 86_400), mediaType: "image/jpeg")
-        }
-    }
-
     @Test func cancellingReachesTheBuildAndTheNextBuildWaitsForIt() async {
         let gated = GatedBuilder()
         let scheduler = TimelineScrollDateIndexScheduler(build: gated.build)
         var received: [Int?] = []
         scheduler.onIndex = { received.append($0?.itemCount) }
-        scheduler.update(items: items(10))
+        scheduler.update(items: scrollDateIndexItems(10))
         await settle(until: { gated.waiting == 1 })
         scheduler.cancel()
         #expect(gated.cancellations.value == 1, "the cancellation reaches the running build")
         // A new list arrives while the cancelled build has not ended yet.
-        scheduler.update(items: items(4))
+        scheduler.update(items: scrollDateIndexItems(4))
         await settle()
         #expect(gated.requested == [10], "the next build waits for the cancelled one")
         gated.releaseAll()
@@ -936,12 +889,12 @@ private final class CancellationCounter: @unchecked Sendable {
         #expect(gated.requested == [10, 4])
         #expect(gated.maximumRunning == 1, "never two builds at once")
         gated.releaseAll()
-        await settle(until: { !scheduler.isBuilding })
+        await settle(until: { received == [4] })
         #expect(received == [4], "the cancelled build reports nothing")
     }
 
     @Test func theDefaultBuilderStopsWhenCancelled() async {
-        let many = items(200_000)
+        let many = scrollDateIndexItems(200_000)
         let task = Task { await TimelineScrollDateIndexScheduler.detachedBuild(many, 1) }
         task.cancel()
         let index = await task.value
@@ -951,36 +904,27 @@ private final class CancellationCounter: @unchecked Sendable {
 
 @Suite struct TimelineScrollDateLabelInputTests {
     @Test func hostDrivenAndLayoutMovementsNeverCount() {
-        var classifier = TimelineScrollDateLabelInputClassifier()
-        func counts(_ movement: TimelineScrollDateLabelMovement, at time: TimeInterval) -> Bool {
-            classifier.isUserMovement(movement, at: time)
-        }
-        #expect(!counts(.init(isHostDriven: true, isDragging: true), at: 0))
-        #expect(!counts(.init(isLayout: true, isDecelerating: true), at: 0.01))
+        let counts = scrollDateMovementClassifier()
+        #expect(!counts(.init(isHostDriven: true, isDragging: true), 0))
+        #expect(!counts(.init(isLayout: true, isDecelerating: true), 0.01))
     }
 
     @Test func touchDecelerationAndSystemAnimationsCount() {
-        var classifier = TimelineScrollDateLabelInputClassifier()
-        func counts(_ movement: TimelineScrollDateLabelMovement, at time: TimeInterval) -> Bool {
-            classifier.isUserMovement(movement, at: time)
-        }
-        #expect(counts(.init(isTracking: true), at: 0))
-        #expect(counts(.init(isDragging: true), at: 0.01))
-        #expect(counts(.init(isDecelerating: true), at: 0.02))
-        #expect(counts(.init(isSystemAnimation: true), at: 0.03), "status bar tap or page key")
+        let counts = scrollDateMovementClassifier()
+        #expect(counts(.init(isTracking: true), 0))
+        #expect(counts(.init(isDragging: true), 0.01))
+        #expect(counts(.init(isDecelerating: true), 0.02))
+        #expect(counts(.init(isSystemAnimation: true), 0.03), "a keyboard page key")
     }
 
     @Test func onlyAContinuousUnflaggedMovementCounts() {
-        var classifier = TimelineScrollDateLabelInputClassifier()
-        func counts(_ movement: TimelineScrollDateLabelMovement, at time: TimeInterval) -> Bool {
-            classifier.isUserMovement(movement, at: time)
-        }
-        #expect(!counts(.init(), at: 0), "one jump alone is layout-like")
-        #expect(counts(.init(), at: 0.008), "the next frame continues an indicator drag")
-        #expect(counts(.init(), at: 0.016))
-        #expect(!counts(.init(), at: 0.5), "a later single change starts over")
-        #expect(!counts(.init(isLayout: true), at: 0.508))
-        #expect(!counts(.init(), at: 0.516), "a layout pass breaks the continuation")
+        let counts = scrollDateMovementClassifier()
+        #expect(!counts(.init(), 0), "one jump alone is layout-like")
+        #expect(counts(.init(), 0.008), "the next frame continues the movement")
+        #expect(counts(.init(), 0.016))
+        #expect(!counts(.init(), 0.5), "a later single change starts over")
+        #expect(!counts(.init(isLayout: true), 0.508))
+        #expect(!counts(.init(), 0.516), "a layout pass breaks the continuation")
     }
 
     @Test func jumpsCountOnlyWhileTheirAnimationRuns() {

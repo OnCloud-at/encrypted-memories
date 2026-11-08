@@ -171,14 +171,12 @@
         }
 
         func setAvoidedBands(_ bands: [ClosedRange<CGFloat>]) {
-            let sorted = bands.sorted { $0.lowerBound < $1.lowerBound }
-            guard sorted != avoidedBands else { return }
-            avoidedBands = sorted
+            guard bands != avoidedBands else { return }
+            avoidedBands = bands
             layout()
         }
 
-        /// Places the label beside the scroll indicator. Runs only while the label shows; it measures no text and
-        /// allocates nothing.
+        /// Places the label beside the scroll indicator. Runs only while the label shows.
         func layout() {
             guard isShown, let host, let scrollView else { return }
             let size = view.fittingSize

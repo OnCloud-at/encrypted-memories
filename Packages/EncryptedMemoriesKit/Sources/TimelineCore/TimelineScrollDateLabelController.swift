@@ -27,9 +27,8 @@ public struct TimelineScrollDateLabelClock: Sendable {
 /// `presentation`; this type owns the visibility policy, the month index build, the month lookup and the one pending
 /// hide.
 ///
-/// Scroll events only update numbers. The text is looked up only when the anchor photo leaves the current month,
-/// and `onChange` fires only when the visibility or the text changes. At most one hide task waits at a time; a new
-/// deadline moves without a new task.
+/// Scroll events only update numbers. The text is looked up only when the anchor photo leaves the current month.
+/// At most one hide task waits at a time; a new deadline moves without a new task.
 @MainActor
 public final class TimelineScrollDateLabelController {
     public struct Presentation: Equatable, Sendable {
@@ -47,10 +46,7 @@ public final class TimelineScrollDateLabelController {
     public private(set) var presentation: Presentation = .hidden
     public private(set) var policy: TimelineScrollDateLabelPolicy
     public private(set) var index: TimelineScrollDateIndex?
-    /// True while a hide task waits. Exposed for lifecycle tests.
-    public var hasPendingHide: Bool { hideTask != nil }
-    /// True while a month index builds. Exposed for lifecycle tests.
-    public var isBuildingIndex: Bool { scheduler.isBuilding }
+
     /// True after `retire()`: the host is gone.
     public private(set) var isRetired = false
     /// False when the last change must take effect at once: a suppression, a route change or stale content. The

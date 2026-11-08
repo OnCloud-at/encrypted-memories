@@ -1423,8 +1423,8 @@
             requestRender()
         }
 
-        /// Moves the viewport for the host itself. The jump flag is set after the call: when the new animation replaces a
-        /// running one, UIKit ends the old one inside the call and its end callback clears the flag.
+        /// Moves the viewport for the host itself. `hostAnimatedScrollActive` is set after the call: when a new animation
+        /// replaces a running one, UIKit ends the old one inside the call and its callback clears that flag.
         func setHostContentOffsetY(_ y: CGFloat, animated: Bool) {
             isApplyingProgrammaticScroll = true
             scrollView.setContentOffset(CGPoint(x: 0, y: y), animated: animated)
