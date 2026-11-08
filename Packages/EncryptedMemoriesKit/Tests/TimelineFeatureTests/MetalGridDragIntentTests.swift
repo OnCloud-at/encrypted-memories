@@ -7,21 +7,12 @@ import TimelineCore
 
 @testable import TimelineFeature
 
-@MainActor private final class DragIntentDataSource: MetalGridDataSource {
-    let sectionCounts = [3]
-    let flatUIDs = (0..<3).map { PhotoUID(volumeID: "drag-intent", nodeID: "\($0)") }
-    var onImagesAvailable: (() -> Void)?
-    func image(for uid: PhotoUID) -> CGImage? { nil }
-    func warm(_ requests: [ThumbnailRequest]) {}
-    func hasImage(for uid: PhotoUID) -> Bool { false }
-}
-
 @Suite @MainActor struct MetalGridDragIntentTests {
     @Test func edgePressStillClicksButCannotClaimDragOut() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let coordinator = try #require(
             MetalGridCoordinator(
-                device: device, dataSource: DragIntentDataSource(),
+                device: device, dataSource: StubMetalGridDataSource(count: 3, volumeID: "drag-intent"),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile))
         let view = MetalGridView(frame: CGRect(x: 0, y: 0, width: 900, height: 600), device: device)
         let clip = NSClipView(frame: view.frame)

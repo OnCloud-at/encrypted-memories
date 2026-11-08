@@ -17,7 +17,9 @@ final class TimelineOrderGridTests: XCTestCase {
                 captureTime: Date(timeIntervalSince1970: Double(500 + $0 / 2)), mediaType: "image/jpeg")
         }
         let host = try XCTUnwrap(
-            MetalGridScrollHost(device: device, dataSource: OrderGridSource(items), gridProfile: .testRegularTimeline))
+            MetalGridScrollHost(
+                device: device, dataSource: StubMetalGridDataSource(uids: items.map(\.uid)),
+                gridProfile: .testRegularTimeline))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600), styleMask: [.borderless], backing: .buffered,
             defer: true)
@@ -60,7 +62,7 @@ final class TimelineOrderGridTests: XCTestCase {
             items: enriched, revision: 1, routeGeneration: 0, initialViewport: .newest, markers: [],
             makeSource: {
                 rebuilds += 1
-                return OrderGridSource(enriched)
+                return StubMetalGridDataSource(uids: enriched.map(\.uid))
             })
         XCTAssertEqual(coordinator.allItems[index], enriched[index])
         XCTAssertTrue(coordinator.allItems[index].isVideo)
@@ -89,7 +91,7 @@ final class TimelineOrderGridTests: XCTestCase {
                 markerBuilds += 1
                 return []
             }(),
-            makeSource: { OrderGridSource(items) })
+            makeSource: { StubMetalGridDataSource(uids: items.map(\.uid)) })
         XCTAssertEqual(markerBuilds, 0, "an update with the applied revision discards the markers; do not build them")
 
         coordinator.receiveContent(
@@ -98,7 +100,7 @@ final class TimelineOrderGridTests: XCTestCase {
                 markerBuilds += 1
                 return []
             }(),
-            makeSource: { OrderGridSource(items) })
+            makeSource: { StubMetalGridDataSource(uids: items.map(\.uid)) })
         XCTAssertEqual(markerBuilds, 1, "a new revision builds the markers once")
         XCTAssertEqual(coordinator.dataRevision, 2)
     }
@@ -117,7 +119,7 @@ final class TimelineOrderGridTests: XCTestCase {
                 markerBuilds += 1
                 return []
             }(),
-            makeSource: { OrderGridSource(items) })
+            makeSource: { StubMetalGridDataSource(uids: items.map(\.uid)) })
         XCTAssertEqual(markerBuilds, 0, "without a host nothing is applied, so the markers are not built")
 
         let before = try XCTUnwrap(host.currentScrollAnchor())
@@ -137,7 +139,7 @@ final class TimelineOrderGridTests: XCTestCase {
                     markerBuilds += 1
                     return []
                 }(),
-                makeSource: { OrderGridSource(corrected) })
+                makeSource: { StubMetalGridDataSource(uids: corrected.map(\.uid)) })
         }
         receive()
         XCTAssertEqual(coordinator.allItems, items, "the visible correction is deferred")
@@ -168,7 +170,7 @@ final class TimelineOrderGridTests: XCTestCase {
         coordinator.dataRevision = 1
         coordinator.receiveContent(
             items: enriched, revision: 2, routeGeneration: 0, initialViewport: .newest, markers: [],
-            makeSource: { OrderGridSource(enriched) })
+            makeSource: { StubMetalGridDataSource(uids: enriched.map(\.uid)) })
         XCTAssertEqual(coordinator.allItems, enriched)
         XCTAssertEqual(host.coordinator.currentPhase(), phase)
         XCTAssertEqual(try XCTUnwrap(host.coordinator.cellContentRect(forFlatIndex: index)), frame)
@@ -195,7 +197,8 @@ final class TimelineOrderGridTests: XCTestCase {
         let receive = {
             coordinator.receiveContent(
                 items: corrected, revision: 2, routeGeneration: 0,
-                initialViewport: .newest, markers: [], makeSource: { OrderGridSource(corrected) })
+                initialViewport: .newest, markers: [],
+                makeSource: { StubMetalGridDataSource(uids: corrected.map(\.uid)) })
         }
         receive()
         XCTAssertEqual(coordinator.allItems, items)
@@ -217,18 +220,4 @@ final class TimelineOrderGridTests: XCTestCase {
         XCTAssertEqual(host.currentScrollAnchor()?.itemID, expected.itemID)
         XCTAssertEqual(try XCTUnwrap(host.currentScrollAnchor()).topOffset, expected.topOffset, accuracy: 0.5)
     }
-}
-
-@MainActor
-private final class OrderGridSource: MetalGridDataSource {
-    let sectionCounts: [Int]
-    let flatUIDs: [PhotoUID]
-    var onImagesAvailable: (() -> Void)?
-    init(_ items: [PhotoItem]) {
-        sectionCounts = [items.count]
-        flatUIDs = items.map(\.uid)
-    }
-    func hasImage(for uid: PhotoUID) -> Bool { false }
-    func image(for uid: PhotoUID) -> CGImage? { nil }
-    func warm(_ requests: [ThumbnailRequest]) {}
 }

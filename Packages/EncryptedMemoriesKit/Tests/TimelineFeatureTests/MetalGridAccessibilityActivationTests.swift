@@ -7,15 +7,6 @@ import TimelineCore
 
 @testable import TimelineFeature
 
-@MainActor private final class ActivateDataSource: MetalGridDataSource {
-    let sectionCounts = [4]
-    let flatUIDs = (0..<4).map { PhotoUID(volumeID: "a11y-activate", nodeID: "\($0)") }
-    var onImagesAvailable: (() -> Void)?
-    func image(for uid: PhotoUID) -> CGImage? { nil }
-    func warm(_ requests: [ThumbnailRequest]) {}
-    func hasImage(for uid: PhotoUID) -> Bool { false }
-}
-
 /// U1: VoiceOver press on a grid cell must respect the CURRENT selection mode. In selection mode it
 /// toggles exactly one item (no viewer); outside selection mode it opens the viewer. Stale UIDs
 /// (removed photos) must fail, and a mode change must affect an already-created accessibility element.
@@ -24,7 +15,7 @@ import TimelineCore
         let device = try #require(MTLCreateSystemDefaultDevice())
         let coordinator = try #require(
             MetalGridCoordinator(
-                device: device, dataSource: ActivateDataSource(),
+                device: device, dataSource: StubMetalGridDataSource(count: 4, volumeID: "a11y-activate"),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile))
         let host = NSView()
         let provider = MetalGridAccessibilityProvider(host: host, coordinator: coordinator)
@@ -49,7 +40,7 @@ import TimelineCore
         let device = try #require(MTLCreateSystemDefaultDevice())
         let coordinator = try #require(
             MetalGridCoordinator(
-                device: device, dataSource: ActivateDataSource(),
+                device: device, dataSource: StubMetalGridDataSource(count: 4, volumeID: "a11y-activate"),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile))
         let selection = MetalGridSelectionController()
         var openedUIDs: [PhotoUID] = []
@@ -72,7 +63,7 @@ import TimelineCore
         let device = try #require(MTLCreateSystemDefaultDevice())
         let coordinator = try #require(
             MetalGridCoordinator(
-                device: device, dataSource: ActivateDataSource(),
+                device: device, dataSource: StubMetalGridDataSource(count: 4, volumeID: "a11y-activate"),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile))
         let selection = MetalGridSelectionController()
         var openedUIDs: [PhotoUID] = []
@@ -91,7 +82,7 @@ import TimelineCore
         let device = try #require(MTLCreateSystemDefaultDevice())
         let coordinator = try #require(
             MetalGridCoordinator(
-                device: device, dataSource: ActivateDataSource(),
+                device: device, dataSource: StubMetalGridDataSource(count: 4, volumeID: "a11y-activate"),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile))
         let selection = MetalGridSelectionController()
         var openedUIDs: [PhotoUID] = []
@@ -115,7 +106,7 @@ import TimelineCore
         let device = try #require(MTLCreateSystemDefaultDevice())
         let coordinator = try #require(
             MetalGridCoordinator(
-                device: device, dataSource: ActivateDataSource(),
+                device: device, dataSource: StubMetalGridDataSource(count: 4, volumeID: "a11y-activate"),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile))
         let selection = MetalGridSelectionController()
         var openedUIDs: [PhotoUID] = []
@@ -133,7 +124,7 @@ import TimelineCore
         let device = try #require(MTLCreateSystemDefaultDevice())
         let coordinator = try #require(
             MetalGridCoordinator(
-                device: device, dataSource: ActivateDataSource(),
+                device: device, dataSource: StubMetalGridDataSource(count: 4, volumeID: "a11y-activate"),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile))
         let selection = MetalGridSelectionController()
         let interaction = MetalGridInteractionController(coordinator: coordinator, selection: selection)
