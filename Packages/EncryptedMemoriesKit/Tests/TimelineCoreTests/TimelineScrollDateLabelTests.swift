@@ -1251,3 +1251,36 @@ private struct SplitMix64 {
         #expect(states.allSatisfy { $0.suppressesLabel })
     }
 }
+
+@Suite struct TimelineScrollDateLabelTextSizeCacheTests {
+    @Test func nativeMeasurementRunsOnceUntilInvalidation() {
+        var cache = TimelineScrollDateLabelTextSizeCache(horizontalPadding: 12, verticalPadding: 6)
+        var measurements = 0
+        let first = cache.fittingSize {
+            measurements += 1
+            return CGSize(width: 106.2, height: 17.3)
+        }
+        let repeated = cache.fittingSize {
+            measurements += 1
+            return CGSize(width: 200, height: 25)
+        }
+        #expect(first == CGSize(width: 131, height: 30))
+        #expect(repeated == first)
+        #expect(measurements == 1)
+        cache.invalidate()
+        let resized = cache.fittingSize {
+            measurements += 1
+            return CGSize(width: 200, height: 25)
+        }
+        #expect(resized == CGSize(width: 224, height: 37))
+        #expect(measurements == 2)
+    }
+
+    @Test func platformPaddingKeepsNativeContentFitting() {
+        var cache = TimelineScrollDateLabelTextSizeCache(horizontalPadding: 10, verticalPadding: 6)
+        let size = cache.fittingSize { CGSize(width: 110.201, height: 18) }
+        #expect(size == CGSize(width: 131, height: 30))
+        #expect(
+            cache.contentFrame(in: CGRect(origin: .zero, size: size)) == CGRect(x: 10, y: 6, width: 111, height: 18))
+    }
+}
