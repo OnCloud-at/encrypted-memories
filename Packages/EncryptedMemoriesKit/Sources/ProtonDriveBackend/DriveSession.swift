@@ -676,6 +676,7 @@ extension DriveSession {
     /// Lists the photos contained in an album (same per-photo shape as the timeline).
     func fetchAlbumPhotos(volumeID: String, albumLinkID: String) async throws -> [PhotosListEntry] {
         var all: [PhotosListEntry] = []
+        var usedAnchors = Set<String>()
         var anchor: String?
         repeat {
             var path = "/drive/photos/volumes/\(volumeID)/albums/\(albumLinkID)/children?Desc=1"
@@ -683,6 +684,10 @@ extension DriveSession {
             let page = try await getJSON(path, as: AlbumPhotosResponse.self)
             all.append(contentsOf: page.photos)
             anchor = page.more == true ? page.anchorID : nil
+            // A page that points to an anchor that was already used would be requested forever.
+            if let anchor, !usedAnchors.insert(anchor).inserted {
+                throw DrivePaginationError.repeatedAlbumAnchor(anchor)
+            }
         } while anchor != nil
         return all
     }
@@ -832,12 +837,17 @@ struct DrivePaginationError: LocalizedError, Equatable {
         case repeatedPhotosCursor(String)
         /// A trash listing returned a full page that contained no new (shareID, linkID) identities.
         case trashPageWithoutNewIDs(pageIndex: Int)
+        /// An album listing page named an anchor that an earlier page of the same listing already used.
+        case repeatedAlbumAnchor(String)
     }
     static func invalidPageSize(_ pageSize: Int) -> DrivePaginationError {
         DrivePaginationError(reason: .invalidPageSize(pageSize))
     }
     static func repeatedPhotosCursor(_ cursor: String) -> DrivePaginationError {
         DrivePaginationError(reason: .repeatedPhotosCursor(cursor))
+    }
+    static func repeatedAlbumAnchor(_ anchor: String) -> DrivePaginationError {
+        DrivePaginationError(reason: .repeatedAlbumAnchor(anchor))
     }
     static func trashPageWithoutNewIDs(_ pageIndex: Int) -> DrivePaginationError {
         DrivePaginationError(reason: .trashPageWithoutNewIDs(pageIndex: pageIndex))
@@ -848,6 +858,8 @@ struct DrivePaginationError: LocalizedError, Equatable {
             return "Drive pagination requires a positive page size (got \(pageSize))."
         case .repeatedPhotosCursor:
             return "Drive photos listing did not advance. Please try again."
+        case .repeatedAlbumAnchor:
+            return "Drive album listing did not advance. Please try again."
         case .trashPageWithoutNewIDs(let pageIndex):
             return
                 "Drive trash listing page \(pageIndex) returned a full page with no new link identities; aborting to avoid an infinite pagination loop."
