@@ -189,20 +189,6 @@ public protocol MLNativeSearchServing: Sendable {
     func availableBackends() async -> Set<MLSearchBackend>
     func maximumConcurrentAssets() async -> Int
     func hasIndexedTextEntries() async -> Bool
-    func index(
-        assets: [MLPipelineAssetRevision],
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome
-    func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome
     func indexQuantum(
         assets: [MLPipelineAssetRevision],
         libraryGeneration: UInt64,
@@ -226,57 +212,6 @@ public extension MLNativeSearchServing {
     /// Conservative default: a conformer that does not report its text index is treated as having
     /// none, so the OCR scope stays hidden instead of offering a scope that cannot answer.
     func hasIndexedTextEntries() async -> Bool { false }
-
-    func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool,
-        destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome {
-        // Legacy conformers cannot revalidate after their awaited work. Keep them additive until
-        // they implement this requirement and can enforce the fence at their deletion boundary.
-        _ = destructiveReconciliationIsAuthorized
-        return await indexQuantum(
-            assets: assets,
-            libraryGeneration: libraryGeneration,
-            allowsDestructiveReconciliation: false,
-            maximumAssets: maximumAssets,
-            maximumConcurrentAssets: maximumConcurrentAssets,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
-    func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
-    func index(
-        assets: [MLPipelineAssetRevision],
-        shouldContinue: @escaping @Sendable () -> Bool
-    ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            shouldContinue: shouldContinue,
-            observer: MLDerivedPipelineObserver()
-        )
-    }
 
     func unavailableAssetUIDs() async -> Set<PhotoUID> { [] }
 }
@@ -321,33 +256,12 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
     public func index(
         assets: [MLPipelineAssetRevision],
         shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
+        observer: MLDerivedPipelineObserver = MLDerivedPipelineObserver()
     ) async -> MLDerivedPipelinePassOutcome {
         await index(
             assets: assets,
             libraryGeneration: nil,
             maximumAssets: nil,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
-    public func indexQuantum(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64,
-        allowsDestructiveReconciliation: Bool = true,
-        maximumAssets: Int,
-        maximumConcurrentAssets: Int,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            libraryGeneration: libraryGeneration,
-            allowsDestructiveReconciliation: allowsDestructiveReconciliation,
-            destructiveReconciliationIsAuthorized: { true },
-            maximumAssets: maximumAssets,
-            maximumConcurrentAssets: maximumConcurrentAssets,
             shouldContinue: shouldContinue,
             observer: observer
         )

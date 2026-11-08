@@ -53,36 +53,6 @@ public actor MLSearchService {
 
     public func indexQuantum(
         _ assets: [PhotoUID],
-        maximumAssets: Int,
-        observer: MLIndexPassObserver
-    ) async -> MLIndexPassOutcome {
-        let outcome = await runIndexPass(
-            assets,
-            maximumAssets: maximumAssets,
-            observer: observer
-        )
-        await releaseAfterDrainedQuantum(outcome)
-        return outcome
-    }
-
-    public func indexQuantum(
-        _ assets: [PhotoUID],
-        libraryGeneration: UInt64,
-        maximumAssets: Int,
-        observer: MLIndexPassObserver
-    ) async -> MLIndexPassOutcome {
-        let outcome = await runIndexPass(
-            assets,
-            maximumAssets: maximumAssets,
-            libraryGeneration: libraryGeneration,
-            observer: observer
-        )
-        await releaseAfterDrainedQuantum(outcome)
-        return outcome
-    }
-
-    public func indexQuantum(
-        _ assets: [PhotoUID],
         libraryGeneration: UInt64,
         maximumAssets: Int,
         shouldContinue: @escaping @Sendable () -> Bool,
