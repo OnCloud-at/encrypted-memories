@@ -16,12 +16,16 @@ final class MobileLivePhotoHoldTests: XCTestCase {
         XCTAssertEqual(press.minimumPressDuration, LivePhotoHoldPolicy.minimumPressDuration)
         XCTAssertTrue(scroll.gestureRecognizers?.contains(press) == true)
         let injected = InjectedMotionPress()
-        for state: UIGestureRecognizer.State in [.ended, .cancelled, .failed, .began, .began, .changed, .ended, .ended]
-        {
-            injected.state = state
-            coordinator.handleLongPress(injected)
+        for terminal: UIGestureRecognizer.State in [.ended, .cancelled, .failed] {
+            calls = []
+            for state: UIGestureRecognizer.State in [
+                .possible, .changed, terminal, .began, .began, .changed, terminal, terminal,
+            ] {
+                injected.state = state
+                coordinator.handleLongPress(injected)
+            }
+            XCTAssertEqual(calls, ["start", "stop"])
         }
-        XCTAssertEqual(calls, ["start", "stop"])
     }
 
     func testPanPinchAndPageChangeStopWithoutDuplicateStops() throws {
