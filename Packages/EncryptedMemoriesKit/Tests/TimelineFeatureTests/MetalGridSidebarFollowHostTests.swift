@@ -109,7 +109,7 @@ private final class SplitHostFixture {
         let device = try #require(MTLCreateSystemDefaultDevice())
         host = try #require(
             MetalGridScrollHost(
-                device: device, dataSource: FollowDataSource(count: 600), gridProfile: .testRegularTimeline))
+                device: device, dataSource: StubMetalGridDataSource(count: 600), gridProfile: .testRegularTimeline))
         let sidebar = NSViewController()
         sidebar.view = NSView()
         let detail = NSViewController()
@@ -158,20 +158,4 @@ private final class SplitHostFixture {
 @MainActor
 private final class UnseenWindow: NSWindow {
     override var occlusionState: NSWindow.OcclusionState { [.visible] }
-}
-
-@MainActor
-private final class FollowDataSource: MetalGridDataSource {
-    let sectionCounts: [Int]
-    let flatUIDs: [PhotoUID]
-    var onImagesAvailable: (() -> Void)?
-
-    init(count: Int) {
-        sectionCounts = [count]
-        flatUIDs = (0..<count).map { PhotoUID(volumeID: "v", nodeID: "\($0)") }
-    }
-
-    func image(for uid: PhotoUID) -> CGImage? { nil }
-    func warm(_ requests: [ThumbnailRequest]) {}
-    func hasImage(for uid: PhotoUID) -> Bool { false }
 }

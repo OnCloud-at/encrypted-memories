@@ -9,22 +9,6 @@ import TimelineCore
 
 @testable import TimelineFeature
 
-@MainActor
-final class PresentationTestDataSource: MetalGridDataSource {
-    let sectionCounts: [Int]
-    let flatUIDs: [PhotoUID]
-    var onImagesAvailable: (() -> Void)?
-
-    init(count: Int) {
-        self.sectionCounts = [count]
-        self.flatUIDs = (0..<count).map { PhotoUID(volumeID: "v", nodeID: "\($0)") }
-    }
-
-    func image(for uid: PhotoUID) -> CGImage? { nil }
-    func warm(_ requests: [ThumbnailRequest]) {}
-    func hasImage(for uid: PhotoUID) -> Bool { false }
-}
-
 // Live window-resize presentation layer. During a live window edge drag the grid keeps stable geometry: the
 // captured items keep their rows and columns. Width changes use canonical fixed gaps and the bounded release
 // camera before mouse-up. Thumbnail streaming stays live. Height-only dragging retains its counter-scroll.
@@ -38,7 +22,7 @@ final class PresentationTestDataSource: MetalGridDataSource {
         guard let device = MTLCreateSystemDefaultDevice(),
             let coordinator = MetalGridCoordinator(
                 device: device,
-                dataSource: PresentationTestDataSource(count: count),
+                dataSource: StubMetalGridDataSource(count: count),
                 gridProfile: TimelineGridProfileConfiguration.production.defaultProfile
             )
         else { return nil }

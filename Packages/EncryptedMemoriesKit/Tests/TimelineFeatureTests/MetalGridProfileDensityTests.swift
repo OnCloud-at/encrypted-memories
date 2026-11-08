@@ -16,7 +16,7 @@ import TimelineCore
         guard let device = MTLCreateSystemDefaultDevice() else { return nil }
         return MetalGridCoordinator(
             device: device,
-            dataSource: PresentationTestDataSource(count: 2000),
+            dataSource: StubMetalGridDataSource(count: 2000),
             gridProfile: TimelineGridProfileConfiguration.production.defaultProfile)
     }
 
