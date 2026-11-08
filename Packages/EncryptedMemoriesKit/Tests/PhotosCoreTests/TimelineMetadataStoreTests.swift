@@ -197,6 +197,178 @@ final class TimelineMetadataStoreTests: XCTestCase {
         )
     }
 
+    private func sortedRows(_ rows: [[String]]) -> [[String]] {
+        rows.sorted { $0.joined(separator: "|") < $1.joined(separator: "|") }
+    }
+
+    /// Tag and burst rows must mirror the items of the latest save, whatever the history was: rows of removed
+    /// photos, removed tags and shortened burst lists are deleted, new ones inserted, and a member that changed at
+    /// the same position is replaced. Between saves, other writers disturb the tables (a photo removed, stray,
+    /// deleted and changed rows), and some saves are empty; the next changed save must still end in the mirror.
+    func testFeatureTablesMirrorTheLatestSaveAcrossSeededSequences() throws {
+        struct Generator {
+            var state: UInt64
+            mutating func next(_ bound: Int) -> Int {
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                return Int((state >> 33) % UInt64(bound))
+            }
+        }
+        let allTags: [PhotoTag] = [.favorites, .videos, .livePhotos, .bursts]
+        let members = ["m0", "m1", "m2", "m3", "m4"]
+        let disturbances = [
+            "INSERT OR IGNORE INTO photo_tags(vol, node, tag) VALUES('vol1', 'n0', 9);",
+            "DELETE FROM photo_tags WHERE rowid = (SELECT min(rowid) FROM photo_tags);",
+            "INSERT OR REPLACE INTO burst_members(anchor_vol, anchor_node, member_node, seq) VALUES('vol1', 'n1', 'stray', 0);",
+            "UPDATE burst_members SET member_node = 'changed' WHERE rowid = (SELECT min(rowid) FROM burst_members);",
+        ]
+        for sequence in 0..<20 {
+            let dir = try makeTempDir()
+            let (store, url) = try makeStore(in: dir, name: "sequence-\(sequence).sqlite")
+            var generator = Generator(state: UInt64(sequence + 1))
+            var previous: [PhotoItem] = []
+            for step in 0..<12 {
+                var items: [PhotoItem] = []
+                // An empty save only when the previous one was not empty (an unchanged digest saves nothing).
+                if !(generator.next(6) == 0 && !previous.isEmpty) {
+                    for node in 0..<12 where generator.next(4) != 0 {
+                        var tags = Set<PhotoTag>()
+                        for tag in allTags where generator.next(3) == 0 { tags.insert(tag) }
+                        var burst: [String] = []
+                        for _ in 0..<generator.next(4) { burst.append(members[generator.next(members.count)]) }
+                        items.append(makeItem(node: "n\(node)", t: Double(node), tags: tags, burst: burst))
+                    }
+                    // A photo that differs in every step keeps the digest of each save different.
+                    items.append(makeItem(node: "marker", t: Double(100 + step)))
+                }
+                switch generator.next(6) {
+                case 0: if let first = previous.first { XCTAssertTrue(store.remove([first.uid])) }
+                case 1, 2, 3, 4: rawExec(url, disturbances[generator.next(disturbances.count)])
+                default: break
+                }
+                XCTAssertTrue(store.save(items).succeeded, "sequence \(sequence) step \(step)")
+                previous = items
+
+                let ordered = items.sorted { $0.captureTime < $1.captureTime }
+                let expectedTags = sortedRows(
+                    items.flatMap { item in
+                        item.tags.map { [item.uid.volumeID, item.uid.nodeID, String($0.rawValue)] }
+                    })
+                let expectedBursts = sortedRows(
+                    items.flatMap { item in
+                        item.burstMemberIDs.enumerated().map { index, member in
+                            [item.uid.volumeID, item.uid.nodeID, String(index), member]
+                        }
+                    })
+                let storedTags = sortedRows(rawRows(url, "SELECT vol, node, tag FROM photo_tags;"))
+                let storedBursts = sortedRows(
+                    rawRows(url, "SELECT anchor_vol, anchor_node, seq, member_node FROM burst_members;"))
+                XCTAssertEqual(storedTags, expectedTags, "tags, sequence \(sequence) step \(step)")
+                XCTAssertEqual(storedBursts, expectedBursts, "bursts, sequence \(sequence) step \(step)")
+                let loaded = try store.load()
+                XCTAssertEqual(loaded.map(\.tags), ordered.map(\.tags))
+                XCTAssertEqual(loaded.map(\.burstMemberIDs), ordered.map(\.burstMemberIDs))
+            }
+            store.close()
+        }
+    }
+
+    /// The tag rows that Swift cannot map (a number beyond 32 bits, a text value) make `load()` throw. The former
+    /// delete-all of a changed save removed them, so the next refresh repaired the cache; the sync must do the same,
+    /// without trapping on the value.
+    func testChangedSaveHealsTagRowsThatCannotBeMapped() throws {
+        for brokenTag in ["4294967296", "'x'", "x'00ff'", "-1"] {
+            try assertChangedSaveHeals(
+                "INSERT INTO photo_tags(vol, node, tag) VALUES('vol1', 'a', \(brokenTag));")
+        }
+    }
+
+    func testChangedSaveHealsBurstRowsWithBrokenPositionsOrMembers() throws {
+        for broken in [
+            "INSERT INTO burst_members(anchor_vol, anchor_node, member_node, seq) VALUES('vol1', 'a', 'zz', 4294967296);",
+            "INSERT INTO burst_members(anchor_vol, anchor_node, member_node, seq) VALUES('vol1', 'a', 'zz', 'x');",
+            // member_node has TEXT affinity: an integer is stored as text, so this case is a changed member.
+            "UPDATE burst_members SET member_node = 12 WHERE anchor_node = 'a' AND seq = 0;",
+            // A blob is kept as a blob, so this member is not text.
+            "UPDATE burst_members SET member_node = x'00' WHERE anchor_node = 'a' AND seq = 0;",
+        ] {
+            try assertChangedSaveHeals(broken)
+        }
+    }
+
+    private func assertChangedSaveHeals(_ brokenRowSQL: String) throws {
+        let dir = try makeTempDir()
+        let (store, url) = try makeStore(in: dir, name: "heal-\(UUID().uuidString).sqlite")
+        defer { store.close() }
+        let a = makeItem(node: "a", t: 1, tags: [.favorites], burst: ["m1"])
+        XCTAssertTrue(store.save([a]).succeeded)
+        rawExec(url, brokenRowSQL)
+
+        let b = makeItem(node: "b", t: 2, tags: [.videos], burst: ["m2", "m3"])
+        XCTAssertTrue(store.save([a, b]).succeeded, brokenRowSQL)
+
+        XCTAssertEqual(
+            sortedRows(rawRows(url, "SELECT vol, node, tag FROM photo_tags;")),
+            [["vol1", "a", "0"], ["vol1", "b", "2"]], brokenRowSQL)
+        XCTAssertEqual(
+            sortedRows(rawRows(url, "SELECT anchor_vol, anchor_node, seq, member_node FROM burst_members;")),
+            [["vol1", "a", "0", "m1"], ["vol1", "b", "0", "m2"], ["vol1", "b", "1", "m3"]], brokenRowSQL)
+        XCTAssertNoThrow(try store.load(), brokenRowSQL)
+    }
+
+    /// One photo and tag, or one photo and burst position, twice in one enumeration violated the key of the former
+    /// direct inserts and rolled the save back. It still does, and the stored state stays as it was.
+    func testDuplicatePhotoInOneEnumerationRollsTheSaveBack() throws {
+        let tagged = makeItem(node: "a", t: 1, tags: [.favorites])
+        let taggedAgain = makeItem(node: "a", t: 5, tags: [.favorites])
+        let burstB = makeItem(node: "u", t: 2, burst: ["B"])
+        let burstA = makeItem(node: "u", t: 3, burst: ["A"])
+        let burstBAgain = makeItem(node: "u", t: 4, burst: ["B"])
+        for (stored, duplicated) in [([tagged], [tagged, taggedAgain]), ([burstB], [burstA, burstBAgain])] {
+            let dir = try makeTempDir()
+            let (store, url) = try makeStore(in: dir, name: "duplicate-\(UUID().uuidString).sqlite")
+            defer { store.close() }
+            XCTAssertTrue(store.save(stored).succeeded)
+            let tagsBefore = rawRows(url, "SELECT vol, node, tag FROM photo_tags;")
+            let burstsBefore = rawRows(url, "SELECT anchor_vol, anchor_node, seq, member_node FROM burst_members;")
+
+            XCTAssertFalse(store.save(duplicated).succeeded)
+
+            XCTAssertEqual(rawRows(url, "SELECT vol, node, tag FROM photo_tags;"), tagsBefore)
+            XCTAssertEqual(
+                rawRows(url, "SELECT anchor_vol, anchor_node, seq, member_node FROM burst_members;"), burstsBefore)
+            XCTAssertEqual(try store.load(), stored)
+        }
+    }
+
+    /// Performance property only: a changed save writes just the difference, so the rows of photos whose tags and
+    /// burst members did not change keep their rows (and so their rowids) when another photo is added between
+    /// them. No code reads these rowids; the test cannot show a behavior change, only that the rows are not
+    /// rewritten.
+    func testChangedSaveKeepsTheTagAndBurstRowsOfUnchangedPhotos() throws {
+        let dir = try makeTempDir()
+        let (store, url) = try makeStore(in: dir)
+        let a = makeItem(node: "a", t: 1, tags: [.favorites], burst: ["m1", "m2"])
+        let c = makeItem(node: "c", t: 3, tags: [.favorites], burst: ["m3"])
+        XCTAssertTrue(store.save([a, c]).succeeded)
+        let tagsBefore = rawRows(url, "SELECT rowid, vol, node, tag FROM photo_tags ORDER BY rowid;")
+        let burstsBefore = rawRows(
+            url, "SELECT rowid, anchor_vol, anchor_node, seq, member_node FROM burst_members ORDER BY rowid;")
+        XCTAssertEqual(tagsBefore.count, 2)
+        XCTAssertEqual(burstsBefore.count, 3)
+
+        let b = makeItem(node: "b", t: 2, tags: [.favorites], burst: ["m9"])
+        XCTAssertTrue(store.save([a, b, c]).succeeded)
+
+        let tagsAfter = rawRows(url, "SELECT rowid, vol, node, tag FROM photo_tags ORDER BY rowid;")
+        let burstsAfter = rawRows(
+            url, "SELECT rowid, anchor_vol, anchor_node, seq, member_node FROM burst_members ORDER BY rowid;")
+        XCTAssertEqual(Array(tagsAfter.prefix(2)), tagsBefore, "unchanged tag rows keep their rowids")
+        XCTAssertEqual(Array(burstsAfter.prefix(3)), burstsBefore, "unchanged burst rows keep their rowids")
+        XCTAssertEqual(tagsAfter.count, 3)
+        XCTAssertEqual(burstsAfter.count, 4)
+        store.close()
+    }
+
     func testSchemaCreationStampsFeatureVersions() throws {
         let dir = try makeTempDir()
         let (store, url) = try makeStore(in: dir)
