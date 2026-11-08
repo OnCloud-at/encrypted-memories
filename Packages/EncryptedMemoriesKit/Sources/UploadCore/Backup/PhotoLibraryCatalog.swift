@@ -374,16 +374,6 @@ public protocol PhotoLibraryCatalogStore: Sendable {
 }
 
 public extension PhotoLibraryCatalogStore {
-    func reconciledMissingSourceGeneration() -> Int64? { nil }
-    func missingSourceSweepProgress() -> PhotoLibraryMissingSourceSweepProgress? { nil }
-    func recordMissingSourceSweepProgress(_ progress: PhotoLibraryMissingSourceSweepProgress) -> Bool { false }
-    func completeMissingSourceSweep(generation: Int64) -> Bool { false }
-
-    func isOperational() -> Bool { true }
-
-    /// An unimplemented page reader cannot prove the catalog empty; nil reports unknown, not absence (#1004).
-    func presentEntries(afterLocalIdentifier: String?, limit: Int) -> PhotoLibraryCatalogPage? { nil }
-
     /// Photos lists no asset for this source any more: the person deleted it, or it lies outside a narrowed
     /// limited-access selection. The entry leaves the present inventory, so missing-source recovery does not queue it
     /// again; the next scan or Photos change that lists the asset brings it back.
