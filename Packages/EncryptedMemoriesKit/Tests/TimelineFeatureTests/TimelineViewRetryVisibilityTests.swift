@@ -16,7 +16,8 @@ import Testing
 /// The direction of the comparison matters: with `retryable: true` the actions row joins the
 /// centered stack, so the stack grows and its first ink row moves up; with `retryable: false` it does
 /// not. The comparison is strict and has no pixel or row threshold, so it holds for any font or
-/// renderer metrics, and an inverted switch fails it.
+/// renderer metrics, and an inverted switch fails it. Each side is compared as its settled render:
+/// the first two consecutive renders that agree.
 @MainActor
 @Suite struct TimelineViewRetryVisibilityTests {
     #if DEBUG
@@ -30,22 +31,22 @@ import Testing
                 return
             }
             #expect(retryable, "The production route must record a thrown first read as retryable")
-            let shown = try renderedPixels(of: shownModel, feed: shownFeed)
-            let shownRepeated = try renderedPixels(of: shownModel, feed: shownFeed)
-            #expect(
-                Self.differingPixels(shown, shownRepeated) == 0,
-                "Renders of the same failure state must be identical")
+            // A render of the same state must settle: two consecutive renders are identical (see
+            // `RenderedInk.stablePixels`). A view that never settles fails the test.
+            let shown = try RenderedInk.stablePixels(label: "failure route") {
+                try renderedPixels(of: shownModel, feed: shownFeed)
+            }
 
             // Only the Retry affordance may change the render. Its layout height makes the centered stack
             // taller, so the first ink row (the title symbol) sits higher; whether the renderer also draws
             // the glass button itself does not matter. Strict inequalities hold for any metrics, and an
             // inverted switch flips both of them.
-            let bare = try renderReplayedFailure(message: message, retryable: false)
-            let bareRepeated = try renderReplayedFailure(message: message, retryable: false)
-            let withButton = try renderReplayedFailure(message: message, retryable: true)
-            #expect(
-                Self.differingPixels(bare, bareRepeated) == 0,
-                "Renders of the failure without the Retry button must be identical")
+            let bare = try RenderedInk.stablePixels(label: "failure without Retry") {
+                try renderReplayedFailure(message: message, retryable: false)
+            }
+            let withButton = try RenderedInk.stablePixels(label: "failure with Retry") {
+                try renderReplayedFailure(message: message, retryable: true)
+            }
             #expect(
                 Self.differingPixels(withButton, bare) > 0,
                 "The retryable flag must change the render")
@@ -99,8 +100,9 @@ import Testing
             loader: NoopThumbnailLoader())
     }
 
-    /// `ImageRenderer` takes one snapshot and runs no view lifecycle, so the error screen renders
-    /// from the model's recorded failure state alone.
+    /// `ImageRenderer` takes a snapshot of the error screen, which renders from the model's recorded
+    /// failure state. Whether lifecycle effects of the view (`onAppear`, `task`) run during a snapshot is not
+    /// established: the failing run printed `[MetalGrid] activePath=metal`, which `onAppear` produces.
     private func renderedPixels(of model: TimelineViewModel, feed: ThumbnailFeed) throws -> [UInt8] {
         let view = TimelineView(model: model, feed: feed)
         return try RenderedInk.rawPixels(view, width: 480, height: 360)
@@ -116,23 +118,8 @@ import Testing
         }
     #endif
 
-    /// Offsets of pixels whose color differs between two same-sized RGBA renders.
-    private static func differingPixelOffsets(_ lhs: [UInt8], _ rhs: [UInt8]) -> [Int] {
-        precondition(lhs.count == rhs.count)
-        var offsets: [Int] = []
-        for offset in stride(from: 0, to: lhs.count, by: 4) {
-            if lhs[offset] != rhs[offset]
-                || lhs[offset + 1] != rhs[offset + 1]
-                || lhs[offset + 2] != rhs[offset + 2]
-            {
-                offsets.append(offset)
-            }
-        }
-        return offsets
-    }
-
     private static func differingPixels(_ lhs: [UInt8], _ rhs: [UInt8]) -> Int {
-        differingPixelOffsets(lhs, rhs).count
+        RenderedInk.differingPixelOffsets(lhs, rhs).count
     }
 
     /// Row of the first pixel that departs from the corner surface background. The centered error

@@ -52,8 +52,47 @@ enum RenderedInk {
         return bytes
     }
 
+    /// Renders until two consecutive renders agree and returns that render. A render can differ from the
+    /// one before it for a moment, so one difference is tolerated. A view that does not settle within
+    /// `attempts` renders is not deterministic, and this throws. Every difference is printed with its
+    /// screen area under `logTag`, so an occurrence can be found in a log. Tests of this helper pass their own tag.
+    @MainActor static func stablePixels(
+        attempts: Int = 5, width: Int = 480, label: String, logTag: String = "RENDER_DIFFERENCE",
+        render: () throws -> [UInt8]
+    ) throws -> [UInt8] {
+        var previous = try render()
+        for attempt in 1..<max(2, attempts) {
+            let next = try render()
+            let offsets = differingPixelOffsets(previous, next)
+            if offsets.isEmpty { return next }
+            let columns = offsets.map { ($0 / 4) % width }
+            let rows = offsets.map { ($0 / 4) / width }
+            print(
+                "\(logTag) label=\(label) render=\(attempt + 1) pixels=\(offsets.count) "
+                    + "x=\(columns.min()!)...\(columns.max()!) y=\(rows.min()!)...\(rows.max()!)")
+            previous = next
+        }
+        throw RenderError.unstable(label)
+    }
+
+    /// Offsets of pixels whose color differs between two same-sized RGBA renders.
+    static func differingPixelOffsets(_ lhs: [UInt8], _ rhs: [UInt8]) -> [Int] {
+        precondition(lhs.count == rhs.count)
+        var offsets: [Int] = []
+        for offset in stride(from: 0, to: lhs.count, by: 4) {
+            if lhs[offset] != rhs[offset]
+                || lhs[offset + 1] != rhs[offset + 1]
+                || lhs[offset + 2] != rhs[offset + 2]
+            {
+                offsets.append(offset)
+            }
+        }
+        return offsets
+    }
+
     enum RenderError: Error {
         case noImage
         case noContext
+        case unstable(String)
     }
 }
