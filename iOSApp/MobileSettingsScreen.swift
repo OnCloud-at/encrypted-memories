@@ -274,15 +274,10 @@ struct MobileSettingsScreen: View {
             HStack {
                 Spacer()
                 VStack(spacing: 8) {
-                    MemoriesBrandMark(height: 28)
                     Text(ProductBrand.displayName)
                         .font(.footnote)
                         .foregroundStyle(ProtonColor.textHint)
                     AppBuildInfoLabel()
-                    Text(ProductBrand.madeInAustria)
-                        .font(.caption2)
-                        .foregroundStyle(ProtonColor.textHint)
-                        .multilineTextAlignment(.center)
                 }
                 Spacer()
             }

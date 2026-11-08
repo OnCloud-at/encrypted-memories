@@ -2722,7 +2722,7 @@
     },
     "brand.made_in_austria": {
       "extractionState": "manual",
-      "comment": "Quiet footer line in the About area of Settings on every platform. The English text is on purpose also under \"de\" (owner decision, no translation). Keep the emoji.",
+      "comment": "Quiet line in the Settings footer on every platform. The English text is on purpose also under \"de\" (owner decision, no translation). Keep the emoji.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Made with ❤️ in Austria 🇦🇹" } },
         "de": { "stringUnit": { "state": "translated", "value": "Made with ❤️ in Austria 🇦🇹" } }
@@ -5737,7 +5737,7 @@
     },
     "settings.version %@": {
       "extractionState": "manual",
-      "comment": "App version shown at the bottom of Settings when the build names no source commit.",
+      "comment": "App version shown at the bottom of Settings.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Version %@" } },
         "de": { "stringUnit": { "state": "translated", "value": "Version %@" } }
