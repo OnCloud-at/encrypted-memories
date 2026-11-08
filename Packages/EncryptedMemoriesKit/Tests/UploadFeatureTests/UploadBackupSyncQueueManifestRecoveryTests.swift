@@ -179,35 +179,29 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
     func testEntryBindingFailureThrowsInsteadOfProvingAbsence() throws {
         store = try makeStore()
         let connection = try queueConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
+        lowerSQLiteLengthLimit(on: connection, to: 32)
         let row = entry(String(repeating: "x", count: 128))
         XCTAssertThrowsError(try store!.entry(for: row.source, revision: row.revision))
-        connection.withLock {
-            XCTAssertTrue(connection.operationFailed, "The failed bind must be recorded")
-            XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure")
-        }
+        assertRecordedBindFailure(on: connection)
     }
 
     func testEntryResourceBindingFailureThrowsInsteadOfProvingAbsence() throws {
         store = try makeStore()
         let connection = try queueConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
+        lowerSQLiteLengthLimit(on: connection, to: 32)
         let source = UploadSourceIdentity(
             kind: .fileURL, identifier: "file", resource: .init(rawValue: String(repeating: "r", count: 128)))
         XCTAssertThrowsError(try store!.entry(for: source, revision: .init(rawValue: 1)))
-        connection.withLock { XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure") }
+        assertRecordedBindFailure(on: connection)
     }
 
     func testDecisionBindingFailuresThrowInsteadOfProvingAbsence() throws {
         for (limit, identifier) in [(Int32(32), String(repeating: "x", count: 128))] {
             store = try makeStore(file: "decision-binding-\(limit).sqlite")
             let connection = try queueConnection()
-            connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, limit) }
+            lowerSQLiteLengthLimit(on: connection, to: limit)
             XCTAssertThrowsError(try store!.decisionRows(kind: .photoLibraryAsset, identifiers: [identifier]))
-            connection.withLock {
-                XCTAssertTrue(connection.operationFailed, "The failed bind must be recorded")
-                XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure")
-            }
+            assertRecordedBindFailure(on: connection)
             store!.close()
         }
     }
@@ -839,16 +833,10 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         store = try makeStore()
         XCTAssertTrue(store!.upsert(entry("runnable", revision: 1)))
         let connection = try queueConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
-        connection.withLock {
-            XCTAssertEqual(sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, -1), 32, "the limit applies")
-        }
+        lowerSQLiteLengthLimit(on: connection, to: 32)
         let excluded = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: String(repeating: "x", count: 128))
         XCTAssertThrowsError(try store!.decisionNextRunnableDate(excludingSourcesOf: [excluded]))
-        connection.withLock {
-            XCTAssertTrue(connection.operationFailed, "The failed bind must be recorded")
-            XCTAssertFalse(connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure")
-        }
+        assertRecordedBindFailure(on: connection)
     }
 }
 

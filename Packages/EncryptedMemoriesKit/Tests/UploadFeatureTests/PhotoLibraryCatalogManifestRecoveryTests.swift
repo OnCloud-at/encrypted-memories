@@ -49,11 +49,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
     }
 
     /// The store's own connection, as the pending store tests reach it (#982).
-    private func catalogConnection() throws -> SQLiteStoreConnection {
-        try XCTUnwrap(
-            Mirror(reflecting: store!).children.first(where: { $0.label == "connection" })?.value
-                as? SQLiteStoreConnection)
-    }
+    private func catalogConnection() throws -> SQLiteStoreConnection { try storeConnection(store!) }
 
     func testEveryOptionalReaderReportsItsOwnFailedStatementAsUnknown() throws {
         let readers: [(String, (PhotoLibraryCatalogManifestStore) -> Bool)] = [
@@ -147,7 +143,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
     func testAnEntryReadThrowsAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
+        lowerSQLiteLengthLimit(on: connection, to: 32)
         XCTAssertThrowsError(try store!.entry(for: String(repeating: "x", count: 128)))
         XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }
@@ -155,7 +151,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
     func testAPresenceReadIsUnknownAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
+        lowerSQLiteLengthLimit(on: connection, to: 32)
         XCTAssertNil(store!.presentEntries(for: [String(repeating: "x", count: 128)]))
         XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }
@@ -163,7 +159,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
     func testAPageReadIsUnknownAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
+        lowerSQLiteLengthLimit(on: connection, to: 32)
         XCTAssertNil(store!.presentEntries(afterLocalIdentifier: String(repeating: "x", count: 128), limit: 10))
         XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }
@@ -171,7 +167,7 @@ final class PhotoLibraryCatalogManifestRecoveryTests: XCTestCase {
     func testAClassificationIsShorterAfterABindingFailure() throws {
         store = try makeStore()
         let connection = try catalogConnection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 32) }
+        lowerSQLiteLengthLimit(on: connection, to: 32)
         XCTAssertEqual(store!.classifyBatch([entry(String(repeating: "x", count: 128))]), [])
         XCTAssertFalse(store!.isOperational(), "The failed binding records a failed read")
     }

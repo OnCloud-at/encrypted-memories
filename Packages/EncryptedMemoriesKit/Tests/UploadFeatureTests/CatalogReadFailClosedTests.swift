@@ -254,29 +254,34 @@ final class CatalogReadFailClosedTests: XCTestCase {
         var unbound = photo(longIdentifier)
         unbound.resources[0].originalFilename = "IMG_LONG.HEIC"
         XCTAssertFalse(store.upsertBatch([entry(unbound)]), "an unbound identifier is no observation")
-        try setLengthLimit(1_000_000, on: store)
+        try setLengthLimit(1_000_000, on: store, message: "The raised length limit must apply")
         XCTAssertEqual(store.count(), 0, "no row without an identifier")
     }
 
     // The missing-source info keys are longer than the effective length floor of 30 bytes: 31
     // (`missing_source_sweep_generation`), 33 (`missing_source_sweep_resume_point`) and 36
     // (`reconciled_missing_source_generation`). An unbound key would write or delete under a NULL key and report
-    // success. `KeyBindFailureAfterBegin` fails only the first bind after the transaction starts.
+    // success. Each `BindFailureUntilStep` fails only the binds of the first info statement after the transaction
+    // starts, at the 30-byte floor.
 
     func testAFailedCursorKeyBindSavesNoSweepProgress() throws {
         let store = try makeCatalog()
-        let fault = try KeyBindFailureAfterBegin(in: store)
+        let fault = try keyBindFailureAfterBegin(in: store, statement: "INSERT INTO photo_catalog_info")
         let progress = PhotoLibraryMissingSourceSweepProgress(generation: 1, afterLocalIdentifier: "a")
         XCTAssertFalse(store.recordMissingSourceSweepProgress(progress), "the cursor key did not bind")
-        XCTAssertTrue(fault.remove(), "the cursor write was the only statement under the limit")
+        fault.remove()
+        XCTAssertTrue(fault.lowered, "the limit applied once the transaction started")
+        XCTAssertFalse(fault.stepped, "a write whose bind failed must not run")
         XCTAssertNil(store.missingSourceSweepProgress(), "nothing of the refused progress was saved")
     }
 
     func testAFailedCompletionKeyBindLeavesTheSweepOwed() throws {
         let store = try makeCatalog()
-        let fault = try KeyBindFailureAfterBegin(in: store)
+        let fault = try keyBindFailureAfterBegin(in: store, statement: "INSERT INTO photo_catalog_info")
         XCTAssertFalse(store.completeMissingSourceSweep(generation: 1), "the completion key did not bind")
-        XCTAssertTrue(fault.remove(), "the completion write was the only statement under the limit")
+        fault.remove()
+        XCTAssertTrue(fault.lowered, "the limit applied once the transaction started")
+        XCTAssertFalse(fault.stepped, "a write whose bind failed must not run")
         XCTAssertNil(store.reconciledMissingSourceGeneration(), "the sweep is still owed")
     }
 
@@ -284,20 +289,29 @@ final class CatalogReadFailClosedTests: XCTestCase {
         let store = try makeCatalog()
         let saved = PhotoLibraryMissingSourceSweepProgress(generation: 1, afterLocalIdentifier: "a")
         XCTAssertTrue(store.recordMissingSourceSweepProgress(saved))
-        let fault = try KeyBindFailureAfterBegin(in: store)
+        let fault = try keyBindFailureAfterBegin(in: store, statement: "DELETE FROM photo_catalog_info")
         // A new sweep without a cursor deletes the saved one first; that deletion cannot bind its key.
         XCTAssertFalse(
             store.recordMissingSourceSweepProgress(PhotoLibraryMissingSourceSweepProgress(generation: 2)),
             "the cursor key of the deletion did not bind")
-        XCTAssertTrue(fault.remove(), "the deletion was the only statement under the limit")
+        fault.remove()
+        XCTAssertTrue(fault.lowered, "the limit applied once the transaction started")
+        XCTAssertFalse(fault.stepped, "a write whose bind failed must not run")
         XCTAssertEqual(store.missingSourceSweepProgress(), saved, "the refused change kept the saved progress")
     }
 
-    private func setLengthLimit(_ limit: Int32, on store: PhotoLibraryCatalogManifestStore) throws {
-        let connection = try storeConnection(store)
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, limit) }
-        let effective = connection.withLock { sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, -1) }
-        XCTAssertEqual(effective, limit, "the effective limit is the requested one")
+    private func setLengthLimit(
+        _ limit: Int32, on store: PhotoLibraryCatalogManifestStore,
+        message: String = "The lowered length limit must apply"
+    ) throws {
+        lowerSQLiteLengthLimit(on: try storeConnection(store), to: limit, message: message)
+    }
+
+    /// Fails the binds of the first `statement` after `BEGIN IMMEDIATE` at the 30-byte floor.
+    private func keyBindFailureAfterBegin(
+        in store: PhotoLibraryCatalogManifestStore, statement: String
+    ) throws -> BindFailureUntilStep {
+        BindFailureUntilStep(on: try storeConnection(store), statement: statement, after: "BEGIN IMMEDIATE", limit: 30)
     }
 
     // MARK: - Pending grid (H7, row 11)
@@ -855,48 +869,6 @@ private final class LengthLimitAfterWrite {
             _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 1_000_000_000)
         }
         return applied
-    }
-}
-
-/// Fails exactly one bind: lowers SQLITE_LIMIT_LENGTH to the 30-byte floor once `BEGIN IMMEDIATE` finishes, and restores
-/// it when the next statement starts to step, after its binds and before it builds a record. A bind of a longer value
-/// fails as a bind that runs out of memory does; the record and every later statement run without the limit.
-private final class KeyBindFailureAfterBegin {
-    private let connection: SQLiteStoreConnection
-    private var lowered = false
-    private var restored = false
-
-    init(in store: Any) throws {
-        connection = try storeConnection(store)
-        connection.withLock {
-            _ = sqlite3_trace_v2(
-                connection.database, UInt32(SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE),
-                { event, context, statement, _ in
-                    guard let context, let statement else { return 0 }
-                    let fault = Unmanaged<KeyBindFailureAfterBegin>.fromOpaque(context).takeUnretainedValue()
-                    let db = sqlite3_db_handle(OpaquePointer(statement))
-                    if event == UInt32(SQLITE_TRACE_PROFILE), !fault.lowered,
-                        let sql = sqlite3_sql(OpaquePointer(statement)),
-                        String(cString: sql).hasPrefix("BEGIN IMMEDIATE")
-                    {
-                        _ = sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 30)
-                        fault.lowered = sqlite3_limit(db, SQLITE_LIMIT_LENGTH, -1) == 30
-                    } else if event == UInt32(SQLITE_TRACE_STMT), fault.lowered, !fault.restored {
-                        _ = sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 1_000_000_000)
-                        fault.restored = true
-                    }
-                    return 0
-                }, Unmanaged.passUnretained(self).toOpaque())
-        }
-    }
-
-    /// Removes the hook. True when the limit applied to one statement and was restored.
-    func remove() -> Bool {
-        connection.withLock {
-            _ = sqlite3_trace_v2(connection.database, 0, nil, nil)
-            _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, 1_000_000_000)
-        }
-        return lowered && restored
     }
 }
 
