@@ -32,8 +32,7 @@ final class MobilePausedBackupUITests: XCTestCase {
         let resume = app.buttons["backup.resume"]
         XCTAssertTrue(resume.waitForExistence(timeout: 10), "the paused backup offers no resume")
         resume.tap()
-        let resumed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: resume)
-        XCTAssertEqual(XCTWaiter.wait(for: [resumed], timeout: 10), .completed)
+        XCTAssertEqual(resume.waitUntilGone(timeout: 10), .completed)
         app.backButton(to: "Settings").tap()
         let done = app.buttons["Done"]
         XCTAssertTrue(done.waitForExistence(timeout: 5))
@@ -150,7 +149,6 @@ final class MobilePausedBackupUITests: XCTestCase {
     }
 
     private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {
-        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        element.wait(until: predicate, timeout: timeout) == .completed
     }
 }

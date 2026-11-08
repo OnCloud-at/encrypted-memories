@@ -112,8 +112,7 @@ final class MobileVerticalBarsUITests: XCTestCase {
         XCTAssertTrue(create.exists)
         XCTAssertFalse(create.isEnabled)
         cancel.tap()
-        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: name)
-        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 10), .completed)
+        XCTAssertEqual(name.waitUntilGone(timeout: 10), .completed)
         newAlbum.tap()
         XCTAssertTrue(createEntry.waitForExistence(timeout: 10))
         createEntry.tap()
@@ -123,9 +122,7 @@ final class MobileVerticalBarsUITests: XCTestCase {
         XCTAssertTrue(create.isEnabled)
         XCTAssertTrue(create.isHittable)
         create.tap()
-        let createdDismissed = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"), object: name)
-        XCTAssertEqual(XCTWaiter.wait(for: [createdDismissed], timeout: 10), .completed)
+        XCTAssertEqual(name.waitUntilGone(timeout: 10), .completed)
         let createdAlbum = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Toolbar Album'")).firstMatch
         // Collections creates album rows lazily, below the smart categories on a short display.
         for _ in 0..<4 where !createdAlbum.exists { app.collectionViews.firstMatch.swipeUp() }

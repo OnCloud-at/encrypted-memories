@@ -60,8 +60,7 @@ final class MobileDeletedBackupUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Nothing needs attention."].waitForExistence(timeout: 5))
         app.buttons["Done"].tap()
         let attention = app.buttons["backup.failedItems"]
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: attention)
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 20), .completed)
+        XCTAssertEqual(attention.waitUntilGone(timeout: 20), .completed)
         let deletionCount = app.buttons["backup.remoteDeletions"]
         XCTAssertTrue(deletionCount.waitForExistence(timeout: 5))
         XCTAssertTrue((deletionCount.value as? String)?.contains("1") == true)
@@ -117,10 +116,9 @@ final class MobileDeletedBackupUITests: XCTestCase {
         // Confirm a removal with a second check after a settle, so only a lasting disappearance completes.
         var remaining: TimeInterval = 60
         while remaining > 0 {
-            let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: decisionRow)
             let slice = min(5, remaining)
             let start = Date()
-            if XCTWaiter.wait(for: [gone], timeout: slice) == .completed {
+            if decisionRow.waitUntilGone(timeout: slice) == .completed {
                 Thread.sleep(forTimeInterval: 2)
                 if !decisionRow.exists { return .completed }
             }

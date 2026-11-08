@@ -66,8 +66,7 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertTrue(permanent.label.contains("This file type cannot be backed up."))
         let dismiss = app.buttons["backup.dismissFailedItem.swipe.unsupported fixture.heic"]
         func rowLeaves(within timeout: TimeInterval) -> Bool {
-            let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: permanent)
-            return XCTWaiter.wait(for: [gone], timeout: timeout) == .completed
+            permanent.waitUntilGone(timeout: timeout) == .completed
         }
         // On a slow simulator XCUITest can drop the tap on a swipe action while the row still slides, and a removal
         // can take longer than the wait. Swipe again only while the row is still there; a dismissal that never
@@ -172,8 +171,7 @@ final class MobileFailedBackupUITests: XCTestCase {
         let retry = app.buttons["backup.retryUserResolvable.sheet"]
         XCTAssertTrue(retry.waitForExistence(timeout: 5))
         retry.tap()
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: retry)
         // While a pass runs, the open list reloads every 5 seconds, so the button can take one reload to go away.
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 15), .completed)
+        XCTAssertEqual(retry.waitUntilGone(timeout: 15), .completed)
     }
 }

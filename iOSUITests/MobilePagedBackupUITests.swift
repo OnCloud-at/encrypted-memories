@@ -30,8 +30,7 @@ final class MobilePagedBackupUITests: XCTestCase {
         XCTAssertTrue(app.buttons["backup.keepDeleted.dialog"].firstMatch.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)
         try app.tapDialogButton("backup.keepDeleted.dialog")
-        let removed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: decision)
-        XCTAssertEqual(XCTWaiter.wait(for: [removed], timeout: 20), .completed)
+        XCTAssertEqual(decision.waitUntilGone(timeout: 20), .completed)
         assertLoaded("loaded=4999;total=4999", list: list)
 
         let last = row(5_000, in: app)

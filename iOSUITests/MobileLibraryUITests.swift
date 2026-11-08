@@ -642,8 +642,7 @@ final class MobileLibraryUITests: XCTestCase {
     }
 
     private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {
-        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        element.wait(until: predicate, timeout: timeout) == .completed
     }
 
     /// Grid photos are accessibility elements named "Photo, <date>".

@@ -79,9 +79,7 @@ final class MobileRevertToOriginalUITests: XCTestCase {
     }
 
     private func isGone(_ element: XCUIElement, timeout: TimeInterval = 30) -> Bool {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"), object: element)
-        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+        element.waitUntilGone(timeout: timeout) == .completed
     }
 
     private func presentConfirmation(_ copy: Copy) throws -> (more: XCUIElement, alert: XCUIElement) {
