@@ -1,5 +1,4 @@
 import PhotoViewerCore
-import SwiftUI
 import UIKit
 import VisionKit
 import XCTest
@@ -10,7 +9,7 @@ import XCTest
 final class MobileLivePhotoHoldTests: XCTestCase {
     func testInstalledLongPressUsesSharedDurationAndNativeTransitions() throws {
         var calls: [String] = []
-        let (window, _, scroll, coordinator) = try makeMobileHoldHost(
+        let (window, scroll, coordinator) = try makeHoldHost(
             onStart: { calls.append("start") }, onStop: { calls.append("stop") })
         defer { window.isHidden = true }
         let press = try XCTUnwrap(coordinator.motionPress)
@@ -31,7 +30,7 @@ final class MobileLivePhotoHoldTests: XCTestCase {
 
     func testDeclinedTextSelectionQueryKeepsTheHoldPlaying() throws {
         var calls: [String] = []
-        let (window, _, _, coordinator) = try makeMobileHoldHost(
+        let (window, _, coordinator) = try makeHoldHost(
             onStart: { calls.append("start") }, onStop: { calls.append("stop") })
         defer { window.isHidden = true }
         let press = InjectedMotionPress()
@@ -45,30 +44,15 @@ final class MobileLivePhotoHoldTests: XCTestCase {
         XCTAssertEqual(calls, ["start", "stop"])
     }
 
-    private func makeMobileHoldHost(
+    private func makeHoldHost(
         onStart: @escaping () -> Void, onStop: @escaping () -> Void
-    ) throws -> (UIWindow, UIHostingController<MobileZoomableImage>, UIScrollView, MobileZoomableImage.Coordinator) {
-        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let window = UIWindow(windowScene: scene)
-        let host = UIHostingController(
-            rootView: MobileZoomableImage(
-                image: UIImage(), reduceMotion: true, onSingleTap: {}, onCloseRequested: {},
-                onMotionStart: onStart, onMotionStop: onStop))
-        window.rootViewController = host
-        window.isHidden = false
-        host.view.layoutIfNeeded()
-        var views = [try XCTUnwrap(host.view)]
-        var result: (UIScrollView, MobileZoomableImage.Coordinator)?
-        while let view = views.popLast() {
-            if let scroll = view as? UIScrollView, let coordinator = scroll.delegate as? MobileZoomableImage.Coordinator
-            {
-                result = (scroll, coordinator)
-                break
-            }
-            views += view.subviews
-        }
-        let (scroll, coordinator) = try XCTUnwrap(result, "The production photo adapter must install its scroll view")
-        return (window, host, scroll, coordinator)
+    ) throws
+        -> (UIWindow, UIScrollView, MobileZoomableImage.Coordinator)
+    {
+        let (window, _, scroll) = try makeHostedViewer(
+            image: UIImage(), size: CGSize(width: 390, height: 844),
+            onMotionStart: onStart, onMotionStop: onStop)
+        return (window, scroll, try XCTUnwrap(scroll.delegate as? MobileZoomableImage.Coordinator))
     }
 }
 

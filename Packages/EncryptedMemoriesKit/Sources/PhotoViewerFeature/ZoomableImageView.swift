@@ -165,9 +165,7 @@ struct ZoomableImageView: NSViewRepresentable {
 
         context.coordinator.imageView = imageView
         let hold = context.coordinator.motionHold
-        hold.onStart = onMotionStart
-        hold.onStop = onMotionStop
-        hold.isEnabled = onMotionStart != nil
+        configureMotionHold(hold)
         hold.textOwnsPoint = { [weak coordinator = context.coordinator] point in
             coordinator?.liveTextOwns(point) ?? false
         }
@@ -189,11 +187,10 @@ struct ZoomableImageView: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        if context.coordinator.itemIdentity != itemIdentity { context.coordinator.motionHold.cancel(.pageChange) }
-        if onMotionStart == nil { context.coordinator.motionHold.cancel(.cancelled) }
-        context.coordinator.motionHold.onStart = onMotionStart
-        context.coordinator.motionHold.onStop = onMotionStop
-        context.coordinator.motionHold.isEnabled = onMotionStart != nil
+        if context.coordinator.itemIdentity != itemIdentity {
+            context.coordinator.motionHold.cancel(.pageChange, afterViewUpdate: true)
+        }
+        configureMotionHold(context.coordinator.motionHold)
         if let z = scrollView as? ZoomScrollView {
             z.onPinchDismissBegan = onPinchDismissBegan
             z.onPinchDismissChanged = onPinchDismissChanged
@@ -228,10 +225,14 @@ struct ZoomableImageView: NSViewRepresentable {
         context.coordinator.updateLiveText(analysis: liveTextAnalysis, highlighted: liveTextHighlighted)
     }
 
+    private func configureMotionHold(_ hold: AppKitLivePhotoHoldAdapter) {
+        hold.updateCallbacks(start: onMotionStart, stop: onMotionStop)
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
-        coordinator.motionHold.cancel(.teardown)
+        coordinator.motionHold.cancel(.teardown, afterViewUpdate: true)
         coordinator.imageView?.removeGestureRecognizer(coordinator.motionHold)
         NotificationCenter.default.removeObserver(coordinator)
     }
@@ -510,7 +511,11 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func magnify(with event: NSEvent) {
-        motionHold?.cancel(.pinch)
+        if event.phase.isEmpty || event.phase.contains(.began) || event.phase.contains(.changed),
+            event.magnification != 0
+        {
+            motionHold?.cancel(.pinch)
+        }
         let atBase = magnification <= minMagnification + 0.001
         // Intercept only a pinch-OUT that starts at fit-scale - otherwise let the scroll view zoom.
         guard atBase, pinchDismiss.claims(magnification: event.magnification) else {

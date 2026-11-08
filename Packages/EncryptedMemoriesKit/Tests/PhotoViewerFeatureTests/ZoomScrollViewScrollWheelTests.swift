@@ -56,20 +56,16 @@ final class ZoomScrollViewScrollWheelTests: XCTestCase {
     func testHoldIgnoresNonmovingScrollPhasesAndStopsOnMovement() throws {
         for phase: Phase in [.mayBegin, .began, .changed, .ended, .cancelled] {
             let (view, _) = makeView()
-            let press = AppKitLivePhotoHoldAdapter()
-            view.motionHold = press
-            var calls: [String] = []
-            press.onStart = { calls.append("start") }
-            press.onStop = { calls.append("stop") }
-            press.consume(.began, at: .zero)
+            let probe = LivePhotoHoldProbe(began: true)
+            view.motionHold = probe.press
             view.scrollWheel(with: try event(deltaX: 0, phase: phase))
-            XCTAssertEqual(calls, ["start"], "Zero delta at \(phase)")
+            XCTAssertEqual(probe.calls, ["start"], "Zero delta at \(phase)")
             if phase == .mayBegin || phase == .ended || phase == .cancelled {
                 view.scrollWheel(with: try event(deltaX: 10, phase: phase))
-                XCTAssertEqual(calls, ["start"], "No moving phase at \(phase)")
+                XCTAssertEqual(probe.calls, ["start"], "No moving phase at \(phase)")
             }
             view.scrollWheel(with: try event(deltaX: 10, phase: .changed))
-            XCTAssertEqual(calls, ["start", "stop"])
+            XCTAssertEqual(probe.calls, ["start", "stop"])
         }
     }
 
@@ -78,29 +74,21 @@ final class ZoomScrollViewScrollWheelTests: XCTestCase {
         for momentum: Int64 in [0, 1, 2] {
             for horizontal in [false, true] {
                 let (view, _) = makeView()
-                let press = AppKitLivePhotoHoldAdapter()
-                view.motionHold = press
-                var calls: [String] = []
-                press.onStart = { calls.append("start") }
-                press.onStop = { calls.append("stop") }
-                press.consume(.began, at: .zero)
+                let probe = LivePhotoHoldProbe(began: true)
+                view.motionHold = probe.press
                 view.scrollWheel(with: try event(deltaX: 0, phase: .began, momentum: momentum))
-                XCTAssertEqual(calls, ["start"])
+                XCTAssertEqual(probe.calls, ["start"])
                 view.scrollWheel(
                     with: try event(
                         deltaX: horizontal ? 10 : 0, deltaY: horizontal ? 0 : 10, phase: .began, momentum: momentum))
-                XCTAssertEqual(calls, ["start", "stop"])
+                XCTAssertEqual(probe.calls, ["start", "stop"])
             }
         }
         let (view, _) = makeView()
-        let press = AppKitLivePhotoHoldAdapter()
-        view.motionHold = press
-        var calls: [String] = []
-        press.onStart = { calls.append("start") }
-        press.onStop = { calls.append("stop") }
-        press.consume(.began, at: .zero)
+        let probe = LivePhotoHoldProbe(began: true)
+        view.motionHold = probe.press
         view.scrollWheel(with: try event(deltaX: 10, phase: .changed, momentum: 3))
-        XCTAssertEqual(calls, ["start"])
+        XCTAssertEqual(probe.calls, ["start"])
     }
 
     func testACompletedTrackpadSwipeAtFitScaleReportsOnePageSwipe() throws {

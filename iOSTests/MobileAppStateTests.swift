@@ -365,44 +365,6 @@ private func waitUntil(
         }
     }
 
-    private func findViewerScrollView(in view: UIView) -> UIScrollView? {
-        if let scrollView = view as? UIScrollView, scrollView.delegate != nil {
-            return scrollView
-        }
-        for subview in view.subviews {
-            if let scrollView = findViewerScrollView(in: subview) {
-                return scrollView
-            }
-        }
-        return nil
-    }
-
-    private func makeHostedViewer(
-        image: UIImage,
-        size: CGSize
-    ) throws -> (UIWindow, UIHostingController<MobileZoomableImage>, UIScrollView) {
-        let scene = try #require(UIApplication.shared.foregroundWindowScene)
-        let window = UIWindow(windowScene: scene)
-        let host = UIHostingController(
-            rootView: MobileZoomableImage(
-                image: image,
-                reduceMotion: true,
-                onSingleTap: {},
-                onCloseRequested: {}
-            ))
-        window.frame = CGRect(origin: .zero, size: size)
-        window.rootViewController = host
-        window.makeKeyAndVisible()
-        host.view.frame = window.bounds
-        host.view.setNeedsLayout()
-        host.view.layoutIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
-        host.view.layoutIfNeeded()
-        let scrollView = try #require(findViewerScrollView(in: host.view))
-        scrollView.layoutIfNeeded()
-        return (window, host, scrollView)
-    }
-
     private func makeHostedImagePage(
         _ page: ViewerImagePageProbe
     ) throws -> (
@@ -434,7 +396,7 @@ private func waitUntil(
 
         do {
             try await waitUntil {
-                await MainActor.run { self.findViewerScrollView(in: host.view) != nil }
+                await MainActor.run { findViewerScrollView(in: host.view) != nil }
             }
             let scrollView = try #require(findViewerScrollView(in: host.view))
             scrollView.setZoomScale(3, animated: false)
@@ -497,7 +459,7 @@ private func waitUntil(
         }
         do {
             try await waitUntil {
-                await MainActor.run { self.findViewerScrollView(in: host.view) != nil }
+                await MainActor.run { findViewerScrollView(in: host.view) != nil }
             }
             #expect(await !provider.motionStarted)
             visibility.isCurrent = true

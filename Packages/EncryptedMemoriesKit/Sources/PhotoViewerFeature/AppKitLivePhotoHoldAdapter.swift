@@ -38,6 +38,18 @@ class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecognizerD
         !textIsSelected() && !textOwnsPoint(gestureRecognizer.location(in: view))
     }
 
+    func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldReceive touch: NSTouch) -> Bool {
+        if holdOrigin == nil, touch.type == .direct, let view {
+            holdOrigin = view.convert(touch.location(in: view), to: nil)
+        }
+        return true
+    }
+
+    override func reset() {
+        super.reset()
+        holdOrigin = nil
+    }
+
     @objc private func pressed() { consume(state, at: location(in: nil)) }
 
     /// Points are in window coordinates, independent of the image magnification.
@@ -52,7 +64,7 @@ class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecognizerD
         let event: LivePhotoHoldPolicy.Event
         switch state {
         case .began:
-            holdOrigin = point
+            if holdOrigin == nil { holdOrigin = point }
             event = .began
         case .changed: event = .changed
         case .ended: event = .ended
@@ -64,13 +76,30 @@ class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecognizerD
         action?.deliver(start: onStart, stop: onStop)
     }
 
-    func cancel(_ event: LivePhotoHoldPolicy.Event) {
+    func updateCallbacks(start: (() -> Void)?, stop: (() -> Void)?) {
+        if start == nil { cancel(.cancelled, afterViewUpdate: true) }
+        onStart = start
+        onStop = stop
+        setEnabled(start != nil)
+    }
+
+    func cancel(_ event: LivePhotoHoldPolicy.Event, afterViewUpdate: Bool = false) {
         let action = policy.consume(event)
-        action?.deliver(start: onStart, stop: onStop)
-        holdOrigin = nil
-        // Disabling cancels the native stream, including a press still waiting for its threshold.
+        if afterViewUpdate {
+            let start = onStart
+            let stop = onStop
+            DispatchQueue.main.async { action?.deliver(start: start, stop: stop) }
+        } else {
+            action?.deliver(start: onStart, stop: onStop)
+        }
+        // Disabling cancels a gesture currently being recognized.
+        // Toggle enabled to request a reset of a press that may still be waiting for its threshold.
         let enabled = isEnabled
-        isEnabled = false
-        isEnabled = enabled
+        setEnabled(false)
+        setEnabled(enabled)
+    }
+
+    private func setEnabled(_ value: Bool) {
+        if isEnabled != value { isEnabled = value }
     }
 }

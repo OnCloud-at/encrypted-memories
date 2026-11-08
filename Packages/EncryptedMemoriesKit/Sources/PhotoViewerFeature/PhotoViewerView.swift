@@ -339,7 +339,7 @@ public struct PhotoViewerView: View {
                 onPageSwipe: handlePageSwipe)
         } else if let image = model.image {
             // Still image, including a Live Photo key frame, with the motion clip crossfaded over it. Hovering
-            // the Live badge or force-clicking the photo plays motion with sound.
+            // the Live badge, force-clicking, or holding a finger on the photo plays motion with sound.
             ViewerStillImage(
                 model: model,
                 image: image,
@@ -560,8 +560,8 @@ public struct PhotoViewerView: View {
     }
 }
 
-/// A still image, including a Live Photo key frame, with the motion clip crossfaded over it. Hovering the Live badge
-/// or force-clicking the photo plays motion with sound.
+/// A still image, including a Live Photo key frame, with the motion clip crossfaded over it. Hovering the Live badge,
+/// force-clicking, or holding a finger on the photo plays motion with sound.
 ///
 /// The displayed photo rect is view state here, not in `PhotoViewerView`: it changes on every frame of a resize, and
 /// only the image and its motion layer depend on it.
