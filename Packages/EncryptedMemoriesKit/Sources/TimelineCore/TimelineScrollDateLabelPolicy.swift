@@ -8,7 +8,7 @@ import Foundation
 /// - User movement at `sustainSpeed` or faster keeps it, including momentum. The gap between both speeds keeps a
 ///   stop and restart near the threshold from flickering.
 /// - The label hides `linger` seconds after the last such movement.
-/// - Programmatic jumps, layout, content replacement and resizes never show or keep the label.
+/// - Marked navigation jumps end the linger. Layout and content-driven adjustments only reset the speed sample.
 /// - Pinch, route changes and inactive surfaces hide it at once.
 public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     public struct Tuning: Equatable, Sendable {
@@ -79,9 +79,13 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
         }
     }
 
-    /// A viewport movement without user input: programmatic jump, layout, content replacement or resize. It starts a
-    /// new speed measurement and leaves the visibility unchanged.
-    public mutating func nonUserMoved() {
+    /// A movement without user input. A marked navigation jump ends the linger; layout, resize and content-driven
+    /// adjustments leave visibility and the existing deadline unchanged. Every such movement resets the speed sample.
+    public mutating func nonUserMoved(isJump: Bool = false) {
+        if isJump {
+            hide()
+            return
+        }
         resetMeasurement()
     }
 

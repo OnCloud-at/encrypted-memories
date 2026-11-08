@@ -457,6 +457,8 @@
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
         var isApplyingProgrammaticScroll = false
+        /// True only while an explicit newest/top navigation command sets its offset.
+        var isApplyingScrollJump = false
         /// One-shot after a settled frame encodes presentable known photos.
         private var firstContentReported = false
         private var firstContentPending = false
@@ -1426,6 +1428,8 @@
         /// Moves the viewport for the host itself. `hostAnimatedScrollActive` is set after the call: when a new animation
         /// replaces a running one, UIKit ends the old one inside the call and its callback clears that flag.
         func setHostContentOffsetY(_ y: CGFloat, animated: Bool) {
+            isApplyingScrollJump = true
+            defer { isApplyingScrollJump = false }
             isApplyingProgrammaticScroll = true
             scrollView.setContentOffset(CGPoint(x: 0, y: y), animated: animated)
             isApplyingProgrammaticScroll = false
@@ -2423,7 +2427,7 @@
         }
 
         public func scrollViewShouldScrollToTop(_ scrollView: UIScrollView) -> Bool {
-            systemScrollToTopActive = true  // A status-bar tap jumps; the date label stays hidden.
+            systemScrollToTopActive = true  // A status-bar tap marks a jump; the date label starts its fade-out.
             return true
         }
 
@@ -2476,7 +2480,7 @@
                 hostAnimationActive: hostAnimatedScrollActive, systemJumpActive: systemScrollToTopActive,
                 isLayout: scrollDateLabelLayoutDepth > 0, isTracking: scrollView.isTracking,
                 isDragging: scrollView.isDragging, isDecelerating: scrollView.isDecelerating,
-                isScrollAnimating: scrollView.isScrollAnimating)
+                isScrollAnimating: scrollView.isScrollAnimating, isApplyingJump: isApplyingScrollJump)
         }
 
         /// Opens a photo; the date label leaves at once, before the viewer covers the grid.

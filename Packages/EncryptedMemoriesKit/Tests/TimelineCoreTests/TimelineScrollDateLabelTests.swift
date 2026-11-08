@@ -18,6 +18,16 @@ private func scrollDateMovementClassifier() -> (TimelineScrollDateLabelMovement,
     return { classifier.isUserMovement($0, at: $1) }
 }
 
+private func scrollDateMovementFixture(
+    programmatic: Bool = false, host: Bool = false, system: Bool = false, dragging: Bool = false,
+    animating: Bool, applyingJump: Bool = false, layout: Bool = false
+) -> TimelineScrollDateLabelMovement {
+    .observed(
+        isApplyingProgrammaticScroll: programmatic, hostAnimationActive: host, systemJumpActive: system,
+        isLayout: layout, isTracking: false, isDragging: dragging, isDecelerating: false,
+        isScrollAnimating: animating, isApplyingJump: applyingJump)
+}
+
 /// Behavior of the transient scroll date label: visibility policy, controller lifecycle, month lookup and placement.
 @Suite struct TimelineScrollDateLabelPolicyTests {
     /// Feeds user movement at `speed` points per second for `duration` seconds at `rate` frames per second.
@@ -101,14 +111,49 @@ private func scrollDateMovementClassifier() -> (TimelineScrollDateLabelMovement,
         #expect(!policy.isVisible)
     }
 
-    @Test func programmaticJumpLayoutAndResizeNeverShowTheLabel() {
+    @Test func programmaticPlacementLayoutAndResizeNeverShowTheLabel() {
         var policy = TimelineScrollDateLabelPolicy()
         policy.userMoved(offsetY: 0, at: 0)
-        policy.nonUserMoved()  // A jump of 50,000 pt must not count as speed.
+        policy.nonUserMoved()  // A placement of 50,000 pt must not count as speed.
         policy.userMoved(offsetY: 50_000, at: 0.01)
         #expect(!policy.isVisible)
         policy.userMoved(offsetY: 50_001, at: 0.02)
         #expect(!policy.isVisible)
+    }
+
+    @Test func nonJumpProgrammaticMovementKeepsTheCurrentLinger() {
+        var policy = TimelineScrollDateLabelPolicy()
+        var offset = 0.0
+        _ = scroll(&policy, from: 0, offset: &offset, speed: 2_000, duration: 0.1)
+        let deadline = policy.hideDeadline
+        policy.nonUserMoved()  // Layout, resize, or a content-driven viewport adjustment.
+        #expect(policy.isVisible)
+        #expect(policy.hideDeadline == deadline)
+        policy.userMoved(offsetY: 50_000, at: 0.2)
+        policy.userMoved(offsetY: 50_000, at: 0.21)
+        #expect(policy.hideDeadline == deadline, "stationary movement after layout does not extend the linger")
+    }
+
+    @Test func aMarkedJumpClearsTheLingerWithoutSuppressingThePolicy() {
+        var policy = TimelineScrollDateLabelPolicy()
+        var offset = 0.0
+        _ = scroll(&policy, from: 0, offset: &offset, speed: 2_000, duration: 0.1)
+        #expect(policy.isVisible, "SETUP: the flick shows the label")
+        policy.nonUserMoved(isJump: true)
+        #expect(!policy.isVisible)
+        #expect(policy.hideDeadline == nil)
+        #expect(!policy.isSuppressed, "a jump is not pinch or route suppression")
+        _ = scroll(&policy, from: 0.2, offset: &offset, speed: 200, duration: 0.1)
+        #expect(!policy.isVisible, "inspection scrolling still needs the normal show threshold")
+        _ = scroll(&policy, from: 0.4, offset: &offset, speed: 2_000, duration: 0.1)
+        #expect(policy.isVisible, "a later brisk drag shows the label again")
+    }
+
+    @Test func aMarkedJumpFromHiddenKeepsThePolicyHidden() {
+        var policy = TimelineScrollDateLabelPolicy()
+        policy.nonUserMoved(isJump: true)
+        #expect(!policy.isVisible)
+        #expect(policy.hideDeadline == nil)
     }
 
     @Test func pinchSuppressesTheLabelUntilResumed() {
@@ -308,6 +353,76 @@ private func settle(until condition: (() -> Bool)? = nil) async {
             controller.userMoved(offsetY: offset)
             manual.advance(by: 1 / 120)
             offset += 2_000 / 120
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func aMarkedJumpEndsTheVisibleLingerAndStartsTheFastFade(system: Bool) async {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        flick(controller, manual)
+        await settle { manual.waiterCount == 1 }
+        #expect(controller.presentation.isVisible, "SETUP: the flick shows the label")
+        manual.advance(by: 0.2)
+        controller.viewportMoved(
+            scrollDateMovementFixture(host: !system, system: system, animating: true), offsetY: 50_000)
+        #expect(!controller.policy.isVisible, "a marked jump ends the linger in the same call")
+        #expect(controller.policy.hideDeadline == nil)
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.text == "January 2026", "the text stays for the fade")
+        #expect(controller.animatesLastChange, "the jump uses the normal fade, not suppression")
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0, "the old linger cannot fire after the jump")
+        manual.advance(by: 2)
+        await settle { manual.waiterCount == 0 }
+        #expect(recorder.changes.map(\.isVisible) == [true, false])
+    }
+
+    @Test func aMarkedJumpFromHiddenNeverShowsTheLabel() async {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        controller.viewportMoved(scrollDateMovementFixture(host: true, animating: true), offsetY: 50_000)
+        #expect(!controller.policy.isVisible)
+        #expect(!controller.presentation.isVisible)
+        #expect(recorder.changes.isEmpty)
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0)
+    }
+
+    @Test func userMovementAfterAJumpUsesTheNormalShowThreshold() {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        flick(controller, manual)
+        controller.viewportMoved(scrollDateMovementFixture(host: true, animating: true), offsetY: 50_000)
+        var offset = 50_000.0
+        for _ in 0..<12 {
+            manual.advance(by: 1 / 120)
+            offset += 200 / 120
+            controller.viewportMoved(.init(isDragging: true), offsetY: offset)
+        }
+        #expect(!controller.presentation.isVisible, "slow inspection movement does not show it after the jump")
+        for _ in 0..<12 {
+            manual.advance(by: 1 / 120)
+            offset += 2_000 / 120
+            controller.viewportMoved(.init(isDragging: true), offsetY: offset)
+        }
+        #expect(controller.presentation.isVisible, "a later brisk drag shows it under the normal threshold")
+    }
+
+    @Test func layoutResizeAndContentMovementsKeepTheExistingLinger() {
+        for movement in [
+            TimelineScrollDateLabelMovement(isLayout: true),
+            .init(isHostDriven: true, isLayout: true),
+            .init(isHostDriven: true),
+            .init(isLayout: true, isJump: true),
+        ] {
+            let manual = ManualClock()
+            let (controller, _) = makeController(manual)
+            flick(controller, manual)
+            let deadline = controller.policy.hideDeadline
+            controller.viewportMoved(movement, offsetY: 50_000)
+            #expect(controller.presentation.isVisible)
+            #expect(controller.policy.hideDeadline == deadline)
         }
     }
 
@@ -537,7 +652,7 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         #expect(controller.presentation.isVisible)
     }
 
-    @Test func resizeAndProgrammaticJumpDoNotShowTheLabel() {
+    @Test func resizeAndProgrammaticPlacementDoNotShowTheLabel() {
         let manual = ManualClock()
         let (controller, _) = makeController(manual)
         controller.userMoved(offsetY: 0)
@@ -907,6 +1022,7 @@ private struct SplitMix64 {
         let counts = scrollDateMovementClassifier()
         #expect(!counts(.init(isHostDriven: true, isDragging: true), 0))
         #expect(!counts(.init(isLayout: true, isDecelerating: true), 0.01))
+        #expect(!counts(.init(isTracking: true, isJump: true), 0.02))
     }
 
     @Test func touchDecelerationAndSystemAnimationsCount() {
@@ -928,24 +1044,33 @@ private struct SplitMix64 {
     }
 
     @Test func jumpsCountOnlyWhileTheirAnimationRuns() {
-        func observed(
-            programmatic: Bool = false, host: Bool = false, system: Bool = false, dragging: Bool = false,
-            animating: Bool
-        ) -> TimelineScrollDateLabelMovement {
-            .observed(
-                isApplyingProgrammaticScroll: programmatic, hostAnimationActive: host, systemJumpActive: system,
-                isLayout: false, isTracking: false, isDragging: dragging, isDecelerating: false,
-                isScrollAnimating: animating)
-        }
-        #expect(observed(host: true, animating: true).isHostDriven, "the tab retap animation is a jump")
-        #expect(observed(system: true, animating: true).isHostDriven, "the status-bar scroll to top is a jump")
-        #expect(!observed(system: true, animating: true).isSystemAnimation)
+        #expect(
+            scrollDateMovementFixture(host: true, animating: true).isHostDriven, "the tab retap animation is a jump")
+        #expect(
+            scrollDateMovementFixture(system: true, animating: true).isHostDriven,
+            "the status-bar scroll to top is a jump")
+        #expect(!scrollDateMovementFixture(system: true, animating: true).isSystemAnimation)
         // A touch ended the jump animation without a callback: the stale flag must not swallow the person's flick.
-        let interrupted = observed(host: true, system: true, dragging: true, animating: false)
+        let interrupted = scrollDateMovementFixture(host: true, system: true, dragging: true, animating: false)
         #expect(!interrupted.isHostDriven)
         #expect(interrupted.isDragging)
-        #expect(observed(animating: true).isSystemAnimation, "a keyboard page key is the person's input")
-        #expect(observed(programmatic: true, animating: false).isHostDriven)
+        #expect(
+            scrollDateMovementFixture(animating: true).isSystemAnimation, "a keyboard page key is the person's input")
+        #expect(scrollDateMovementFixture(programmatic: true, animating: false).isHostDriven)
+        #expect(
+            !scrollDateMovementFixture(programmatic: true, animating: false).isJump,
+            "generic host adjustments only reset speed")
+        #expect(scrollDateMovementFixture(host: true, animating: true).isJump)
+        #expect(scrollDateMovementFixture(system: true, animating: true).isJump)
+        #expect(!interrupted.isJump)
+        #expect(
+            scrollDateMovementFixture(programmatic: true, animating: false, applyingJump: true).isJump,
+            "a synchronous navigation jump")
+        #expect(
+            !scrollDateMovementFixture(host: true, animating: true, layout: true).isJump,
+            "layout is not a navigation jump")
+        #expect(
+            !scrollDateMovementFixture(programmatic: true, animating: false, applyingJump: true, layout: true).isJump)
     }
 
     @Test func everySuppressingHostStateHidesTheLabel() {

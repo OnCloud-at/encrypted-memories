@@ -50,7 +50,7 @@ public final class TimelineScrollDateLabelController {
     /// True after `retire()`: the host is gone.
     public private(set) var isRetired = false
     /// False when the last change must take effect at once: a suppression, a route change or stale content. The
-    /// normal hide after the linger time and every show animate.
+    /// normal hide after the linger time, a marked navigation jump, and every show animate.
     public private(set) var animatesLastChange = true
 
     private let clock: TimelineScrollDateLabelClock
@@ -122,7 +122,7 @@ public final class TimelineScrollDateLabelController {
         if classifier.isUserMovement(movement, at: clock.now()) {
             userMoved(offsetY: offsetY)
         } else {
-            nonUserMoved()
+            nonUserMoved(isJump: movement.isJump && !movement.isLayout)
         }
     }
 
@@ -141,9 +141,14 @@ public final class TimelineScrollDateLabelController {
         scheduleHideIfNeeded()
     }
 
-    /// A viewport movement without user input: programmatic jump, layout, content replacement or resize.
-    public func nonUserMoved() {
-        policy.nonUserMoved()
+    /// A movement without user input. A marked navigation jump cancels the linger and starts the fast fade-out.
+    /// Layout, resize and content-driven adjustments only reset the speed sample.
+    public func nonUserMoved(isJump: Bool = false) {
+        policy.nonUserMoved(isJump: isJump)
+        if isJump {
+            cancelHide()
+            publish()
+        }
     }
 
     /// Hides the label at once, for example when a photo opens over the grid. A new brisk scroll can show it again.

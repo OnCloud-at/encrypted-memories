@@ -65,7 +65,14 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         let grid = try hostInWindow()
         XCTAssertFalse(grid.scrollDateLabelMovement.isHostDriven)
         grid.isApplyingProgrammaticScroll = true
-        XCTAssertTrue(grid.scrollDateLabelMovement.isHostDriven, "a programmatic jump")
+        XCTAssertTrue(grid.scrollDateLabelMovement.isHostDriven, "a programmatic adjustment")
+        XCTAssertFalse(grid.scrollDateLabelMovement.isJump, "a generic host adjustment only resets speed")
+        grid.isApplyingScrollJump = true
+        XCTAssertTrue(grid.scrollDateLabelMovement.isJump, "an explicit navigation command marks a jump")
+        grid.scrollDateLabelLayoutDepth = 1
+        XCTAssertFalse(grid.scrollDateLabelMovement.isJump, "layout is not navigation")
+        grid.scrollDateLabelLayoutDepth = 0
+        grid.isApplyingScrollJump = false
         grid.isApplyingProgrammaticScroll = false
         // The host's animated scroll (Library tab retap) is a jump while its animation runs.
         grid.scrollView.contentSize = CGSize(width: grid.bounds.width, height: grid.bounds.height * 20)
@@ -73,12 +80,14 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         grid.scrollView.setContentOffset(CGPoint(x: 0, y: grid.bounds.height * 5), animated: true)
         XCTAssertTrue(grid.scrollView.isScrollAnimating, "SETUP: the offset animation runs")
         XCTAssertTrue(grid.scrollDateLabelMovement.isHostDriven, "the host's animated scroll to the newest photos")
+        XCTAssertTrue(grid.scrollDateLabelMovement.isJump)
         // A touch can end the animation without the end callback and leave the flag set; once nothing animates, the
         // stale flag no longer makes movement a jump.
         grid.scrollView.setContentOffset(grid.scrollView.contentOffset, animated: false)
         grid.hostAnimatedScrollActive = true
         XCTAssertFalse(grid.scrollView.isScrollAnimating)
         XCTAssertFalse(grid.scrollDateLabelMovement.isHostDriven, "a stale flag must not swallow the next flick")
+        XCTAssertFalse(grid.scrollDateLabelMovement.isJump)
         grid.hostAnimatedScrollActive = false
         grid.scrollDateLabelLayoutDepth = 1
         XCTAssertTrue(grid.scrollDateLabelMovement.isLayout, "a layout pass")
@@ -152,6 +161,41 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         XCTAssertTrue(grid.scrollView.isScrollAnimating, "SETUP: the second jump animates")
         XCTAssertTrue(grid.hostAnimatedScrollActive)
         XCTAssertTrue(grid.scrollDateLabelMovement.isHostDriven, "the label stays hidden during the second jump")
+        XCTAssertTrue(grid.scrollDateLabelMovement.isJump)
+    }
+
+    func testASynchronousNavigationOffsetIsMarkedOnlyDuringTheSet() throws {
+        let grid = try hostInWindow()
+        grid.scrollView.contentSize = CGSize(width: grid.bounds.width, height: grid.bounds.height * 20)
+        var movements: [TimelineScrollDateLabelMovement] = []
+        let observation = grid.scrollView.observe(\.contentOffset, options: [.new]) { [weak grid] _, _ in
+            MainActor.assumeIsolated {
+                if let grid { movements.append(grid.scrollDateLabelMovement) }
+            }
+        }
+        defer { observation.invalidate() }
+        grid.setHostContentOffsetY(grid.bounds.height * 5, animated: false)
+        XCTAssertFalse(movements.isEmpty, "SETUP: the native offset setter reports a movement")
+        XCTAssertTrue(movements.allSatisfy { $0.isHostDriven && $0.isJump })
+        XCTAssertFalse(grid.isApplyingScrollJump)
+        XCTAssertFalse(grid.scrollDateLabelMovement.isJump, "the transient marker ends with the setter")
+    }
+
+    func testAMarkedJumpUsesTheFastFadeAndReduceMotionHidesAtOnce() throws {
+        let grid = try hostInWindow()
+        grid.scrollDateLabel.setReduceMotion(false)
+        try showLabel(on: grid)
+        let controller = grid.scrollDateLabel.controller
+        controller.viewportMoved(.init(isHostDriven: true, isJump: true), offsetY: 50_000)
+        XCTAssertFalse(controller.presentation.isVisible, "the linger ends in the same pass")
+        XCTAssertTrue(controller.animatesLastChange, "a marked jump uses the normal fade")
+        XCTAssertFalse(grid.scrollDateLabel.view.isHidden, "the view remains while the fast fade starts")
+
+        grid.scrollDateLabel.setReduceMotion(true)
+        try showLabel(on: grid)
+        controller.viewportMoved(.init(isHostDriven: true, isJump: true), offsetY: 50_000)
+        XCTAssertFalse(controller.presentation.isVisible)
+        XCTAssertTrue(grid.scrollDateLabel.view.isHidden, "Reduce Motion applies the hide without a fade")
     }
 
     /// A tap that stops a jump, or a status-bar tap at the top, ends without a callback; the next offset change

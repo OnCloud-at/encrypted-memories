@@ -4,6 +4,8 @@ import Foundation
 public struct TimelineScrollDateLabelMovement: Equatable, Sendable {
     /// The host moved the viewport itself: a jump, restore, placement or its own animated scroll.
     public var isHostDriven: Bool
+    /// An explicitly marked navigation jump, rather than layout or a content-driven viewport adjustment.
+    public var isJump: Bool
     /// The movement came from layout: a resize, an inset or content-size change.
     public var isLayout: Bool
     /// A finger touches or drags the scroll view.
@@ -16,9 +18,10 @@ public struct TimelineScrollDateLabelMovement: Equatable, Sendable {
 
     public init(
         isHostDriven: Bool = false, isLayout: Bool = false, isTracking: Bool = false, isDragging: Bool = false,
-        isDecelerating: Bool = false, isSystemAnimation: Bool = false
+        isDecelerating: Bool = false, isSystemAnimation: Bool = false, isJump: Bool = false
     ) {
         self.isHostDriven = isHostDriven
+        self.isJump = isJump
         self.isLayout = isLayout
         self.isTracking = isTracking
         self.isDragging = isDragging
@@ -34,24 +37,28 @@ extension TimelineScrollDateLabelMovement {
     /// - `hostAnimationActive`: the host started an animated scroll (tab retap, placement).
     /// - `systemJumpActive`: the system scrolls to the top after a status-bar tap.
     /// - `isScrollAnimating`: the scroll view animates an offset change.
+    /// - `isApplyingJump`: an explicit navigation command sets the offset in this call.
     ///
     /// Both jump flags count only while the scroll view still animates. A touch that interrupts the animation ends it
     /// without any callback, so a stale flag must not turn the person's next flick into a jump. Every other offset
     /// animation counts as the person's input, for example a keyboard page key.
     public static func observed(
         isApplyingProgrammaticScroll: Bool, hostAnimationActive: Bool, systemJumpActive: Bool, isLayout: Bool,
-        isTracking: Bool, isDragging: Bool, isDecelerating: Bool, isScrollAnimating: Bool
+        isTracking: Bool, isDragging: Bool, isDecelerating: Bool, isScrollAnimating: Bool,
+        isApplyingJump: Bool = false
     ) -> TimelineScrollDateLabelMovement {
-        let isJump = isScrollAnimating && (hostAnimationActive || systemJumpActive)
+        let isMarkedAnimation = isScrollAnimating && (hostAnimationActive || systemJumpActive)
         return TimelineScrollDateLabelMovement(
-            isHostDriven: isApplyingProgrammaticScroll || isJump, isLayout: isLayout, isTracking: isTracking,
-            isDragging: isDragging, isDecelerating: isDecelerating, isSystemAnimation: isScrollAnimating && !isJump)
+            isHostDriven: isApplyingProgrammaticScroll || isApplyingJump || isMarkedAnimation,
+            isLayout: isLayout, isTracking: isTracking, isDragging: isDragging, isDecelerating: isDecelerating,
+            isSystemAnimation: isScrollAnimating && !isMarkedAnimation,
+            isJump: !isLayout && (isApplyingJump || isMarkedAnimation))
     }
 }
 
 /// Decides whether a viewport movement comes from the person.
 ///
-/// - Host-driven and layout movements never count.
+/// - Host-driven movements, layout and marked jumps never count.
 /// - Touch, drag, deceleration and system scroll animations count.
 /// - A movement without any of these flags counts only while it continues frame after frame.
 public struct TimelineScrollDateLabelInputClassifier: Equatable, Sendable {
@@ -63,7 +70,7 @@ public struct TimelineScrollDateLabelInputClassifier: Equatable, Sendable {
     public init() {}
 
     public mutating func isUserMovement(_ movement: TimelineScrollDateLabelMovement, at time: TimeInterval) -> Bool {
-        if movement.isHostDriven || movement.isLayout {
+        if movement.isHostDriven || movement.isLayout || movement.isJump {
             lastUnflaggedTime = nil
             return false
         }
