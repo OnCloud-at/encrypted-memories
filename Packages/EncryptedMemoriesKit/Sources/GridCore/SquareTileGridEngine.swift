@@ -11,10 +11,6 @@ import CoreGraphics
 //
 // Media fitting belongs to `TileContentFitter`; slot geometry does not depend on media aspect.
 
-/// One zoom level's nominal metrics. `slotSide` is the target square side; the actually-rendered side is
-/// recomputed per width so the grid fills the viewport exactly. `gap` is the inter-slot spacing and may
-/// differ per level (dynamic gap). `headerHeight`/`interSectionSpacing` let the engine reserve section
-/// header space + spacing (0 = labels float over the grid, the production default). `pitch == slotSide + gap`.
 /// Classification for an adjacent-level transition. The engine stores the value; transition effects live outside
 /// the geometry engine.
 public enum GridTransitionKind: String, Equatable, Sendable {
@@ -45,30 +41,6 @@ public extension GridTransitionKind {
         case (.squareOverview, .aspectThumbnail):
             return nil
         }
-    }
-}
-
-/// One zoom level. The settled grid keeps `nominalColumns` and sizes each square slot to fill the viewport width.
-public struct AppleGridLevelSpec: Equatable, Sendable {
-    public let id: Int
-    public let nominalColumns: Int
-    public let gap: CGFloat
-    public let supportedContentModes: Set<TileContentDisplayMode>
-    public let defaultContentMode: TileContentDisplayMode
-    public let transitionKindToNext: GridTransitionKind?  // nil = last level (no next)
-    public let monthLabels: Bool
-
-    public init(
-        id: Int, nominalColumns: Int, gap: CGFloat, supportedContentModes: Set<TileContentDisplayMode>,
-        defaultContentMode: TileContentDisplayMode, transitionKindToNext: GridTransitionKind?, monthLabels: Bool
-    ) {
-        self.id = id
-        self.nominalColumns = nominalColumns
-        self.gap = gap
-        self.supportedContentModes = supportedContentModes
-        self.defaultContentMode = defaultContentMode
-        self.transitionKindToNext = transitionKindToNext
-        self.monthLabels = monthLabels
     }
 }
 
@@ -302,29 +274,6 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// Whether the aspect/square toggle is meaningful at a level with both modes supported.
     public func contentModeToggleAvailable(level: Int) -> Bool { metrics(level: level).supportedContentModes.count > 1 }
 
-    /// Default six-level density ladder. Normal levels support both fitting modes; overview levels are square-only
-    /// and show month labels. Each level keeps its nominal column count while slots fill the available width.
-    public static let appleLevelSpecs: [AppleGridLevelSpec] = [
-        AppleGridLevelSpec(
-            id: 0, nominalColumns: 3, gap: 16, supportedContentModes: [.aspectFitInsideSquare, .squareFillCrop],
-            defaultContentMode: .aspectFitInsideSquare, transitionKindToNext: .focusRowRelayout, monthLabels: false),
-        AppleGridLevelSpec(
-            id: 1, nominalColumns: 5, gap: 12, supportedContentModes: [.aspectFitInsideSquare, .squareFillCrop],
-            defaultContentMode: .aspectFitInsideSquare, transitionKindToNext: .focusRowRelayout, monthLabels: false),
-        AppleGridLevelSpec(
-            id: 2, nominalColumns: 7, gap: 10, supportedContentModes: [.aspectFitInsideSquare, .squareFillCrop],
-            defaultContentMode: .aspectFitInsideSquare, transitionKindToNext: .focusRowRelayout, monthLabels: false),
-        AppleGridLevelSpec(
-            id: 3, nominalColumns: 9, gap: 8, supportedContentModes: [.aspectFitInsideSquare, .squareFillCrop],
-            defaultContentMode: .aspectFitInsideSquare, transitionKindToNext: .overviewWarp, monthLabels: false),
-        AppleGridLevelSpec(
-            id: 4, nominalColumns: 20, gap: 2, supportedContentModes: [.squareFillCrop],
-            defaultContentMode: .squareFillCrop, transitionKindToNext: .denseOverviewZoom, monthLabels: true),
-        AppleGridLevelSpec(
-            id: 5, nominalColumns: 30, gap: 1, supportedContentModes: [.squareFillCrop],
-            defaultContentMode: .squareFillCrop, transitionKindToNext: nil, monthLabels: true),
-    ]
-
     /// The constant outer gutter (points) for the normal photo levels. It stays the same across those levels so a
     /// transition does not change layout width while computing its anchor. It also sizes the breathing room reserved
     /// below transient chrome above the grid (the iOS search scope picker), so all sides keep one visual rhythm.
@@ -360,19 +309,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
 
     public func sectionItem(globalIndex flat: Int) -> (section: Int, item: Int)? {
         guard flat >= 0, flat < totalItems else { return nil }
-        var lo = 0
-        var hi = sectionFlatStart.count - 1
-        var section = 0
-        while lo <= hi {
-            let mid = (lo + hi) / 2
-            if sectionFlatStart[mid] <= flat {
-                section = mid
-                lo = mid + 1
-            } else {
-                hi = mid - 1
-            }
-        }
-        return (section, flat - sectionFlatStart[section])
+        return sectionAndItem(of: flat, sectionFlatStart: sectionFlatStart)
     }
 
     // MARK: - Resolved section layout (the geometry kernel - pure)
@@ -417,19 +354,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
             guard flat >= 0, !sectionCounts.isEmpty else { return nil }
             let total = sectionFlatStart[sectionFlatStart.count - 1] + sectionCounts[sectionCounts.count - 1]
             guard flat < total else { return nil }
-            var lo = 0
-            var hi = sectionFlatStart.count - 1
-            var section = 0
-            while lo <= hi {
-                let mid = (lo + hi) / 2
-                if sectionFlatStart[mid] <= flat {
-                    section = mid
-                    lo = mid + 1
-                } else {
-                    hi = mid - 1
-                }
-            }
-            return (section, flat - sectionFlatStart[section])
+            return sectionAndItem(of: flat, sectionFlatStart: sectionFlatStart)
         }
 
         /// Square slots intersecting `rect` (content coords). Runtime ∝ visible rows.
@@ -832,4 +757,22 @@ private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b 
 private func smoothstep(_ x: CGFloat) -> CGFloat {
     let t = clamp01(x)
     return t * t * (3 - 2 * t)
+}
+
+/// The section that holds the flat index `flat`, and the item's position inside it. `sectionFlatStart` holds the
+/// first flat index of every section in ascending order; `flat` must lie inside the library.
+private func sectionAndItem(of flat: Int, sectionFlatStart: [Int]) -> (section: Int, item: Int) {
+    var lo = 0
+    var hi = sectionFlatStart.count - 1
+    var section = 0
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if sectionFlatStart[mid] <= flat {
+            section = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return (section, flat - sectionFlatStart[section])
 }

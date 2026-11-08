@@ -35,22 +35,4 @@ package enum GridScrollAheadPolicy {
             return start..<end
         }
     }
-
-    /// Chooses a bounded decode corridor from the actual scroll velocity. One viewport is the minimum useful
-    /// look-ahead (the rejected fixed three-row policy was smaller than many macOS viewports); three viewports is
-    /// the hard ceiling so a trackpad fling cannot turn interactive prefetch into an unbounded library crawl.
-    package static func corridorRows(
-        viewportRows: Int,
-        rowsPerSecond: Double,
-        lookAheadSeconds: Double = 0.45,
-        maximumViewportCount: Int = 3
-    ) -> Int {
-        guard viewportRows > 0 else { return 0 }
-        let base = max(1, viewportRows)
-        let ceiling = max(base, base * max(1, maximumViewportCount))
-        let finiteVelocity = rowsPerSecond.isFinite ? max(0, rowsPerSecond) : 0
-        let finiteLookAhead = lookAheadSeconds.isFinite ? max(0, lookAheadSeconds) : 0
-        let projected = Int((finiteVelocity * finiteLookAhead).rounded(.up))
-        return min(ceiling, max(base, projected))
-    }
 }

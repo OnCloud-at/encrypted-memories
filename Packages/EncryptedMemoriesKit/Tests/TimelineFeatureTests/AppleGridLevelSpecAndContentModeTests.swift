@@ -16,7 +16,7 @@ import TimelineCore
     private func engine(_ count: Int = 4000) -> SquareTileGridEngine {
         SquareTileGridEngine.testRegular(sectionCounts: [count])
     }
-    private let specs = SquareTileGridEngine.appleLevelSpecs
+    private let specs = SquareTileGridEngine.testRegularLevels
 
     private func contained(_ inner: CGRect, _ outer: CGRect) -> Bool {
         inner.minX >= outer.minX - eps && inner.minY >= outer.minY - eps && inner.maxX <= outer.maxX + eps
@@ -26,8 +26,7 @@ import TimelineCore
     // Density levels use the documented slot metrics.
     @Test func sixAppleGridLevelsExist() {
         #expect(specs.count == 6)
-        #expect(SquareTileGridEngine.testRegularLevels.count == 6)
-        #expect(specs.map(\.id) == [0, 1, 2, 3, 4, 5])
+        #expect(specs.map(\.levelID) == [0, 1, 2, 3, 4, 5])
         #expect(engine().levelCount == 6)
     }
 
