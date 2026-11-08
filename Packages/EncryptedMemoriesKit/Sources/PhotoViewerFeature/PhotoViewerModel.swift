@@ -196,22 +196,18 @@ public final class PhotoViewerModel {
     }
 
     private func sessionIsCurrent() -> Bool {
-        let previewCurrent =
-            previewCache.map { cache in
-                guard let lease = previewSessionLease else { return false }
-                return cache.isCurrentSessionLease(lease)
-            } ?? true
-        let originalsCurrent =
-            originalsCache.map { cache in
-                guard let lease = originalsSessionLease else { return false }
-                return cache.isCurrentSessionLease(lease)
-            } ?? true
-        let sessionCurrent =
-            sessionCache.map { cache in
-                guard let lease = sessionLease else { return false }
-                return cache.isCurrentSessionLease(lease)
-            } ?? true
+        let previewCurrent = Self.leaseIsCurrent(previewSessionLease, in: previewCache)
+        let originalsCurrent = Self.leaseIsCurrent(originalsSessionLease, in: originalsCache)
+        let sessionCurrent = Self.leaseIsCurrent(sessionLease, in: sessionCache)
         return previewCurrent && originalsCurrent && sessionCurrent
+    }
+
+    /// A cache that the viewer does not hold imposes nothing. A held cache whose lease was not captured fails closed.
+    private static func leaseIsCurrent(_ lease: CacheWriterGeneration.SessionToken?, in cache: ThumbnailCache?) -> Bool
+    {
+        guard let cache else { return true }
+        guard let lease else { return false }
+        return cache.isCurrentSessionLease(lease)
     }
 
     public func toggleInfo() {
