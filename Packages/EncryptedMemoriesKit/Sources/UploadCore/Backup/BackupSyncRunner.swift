@@ -931,8 +931,7 @@ public actor BackupSyncRunner {
                 fileURL: Self.primePlaceholderURL,
                 filename: entry.originalFilename,
                 fileSize: entry.byteCount ?? 0,
-                modificationDate: entry.updatedAt,
-                mainResource: nil
+                modificationDate: entry.updatedAt
             )
         }
         await identityResolver.prime(descriptors)

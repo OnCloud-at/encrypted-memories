@@ -121,7 +121,6 @@ public struct UploadResourceDescriptorSnapshot: Codable, Sendable, Equatable {
     public let modificationDate: Date
     public let precomputedSHA1Digest: Data?
     public let workIntentRawValue: Int
-    public let mainResource: UploadSourceIdentity?
 
     public init(_ descriptor: UploadResourceDescriptor) {
         self.source = descriptor.source
@@ -131,7 +130,6 @@ public struct UploadResourceDescriptorSnapshot: Codable, Sendable, Equatable {
         self.modificationDate = descriptor.modificationDate
         self.precomputedSHA1Digest = descriptor.precomputedSHA1Digest
         self.workIntentRawValue = descriptor.workIntent.rawValue
-        self.mainResource = descriptor.mainResource
     }
 
     public var descriptor: UploadResourceDescriptor? {
@@ -143,8 +141,7 @@ public struct UploadResourceDescriptorSnapshot: Codable, Sendable, Equatable {
             fileSize: fileSize,
             modificationDate: modificationDate,
             precomputedSHA1Digest: precomputedSHA1Digest,
-            workIntent: workIntent,
-            mainResource: mainResource
+            workIntent: workIntent
         )
     }
 }
@@ -241,9 +238,7 @@ public protocol UploadManualSettlementStoreProtocol: Sendable {
     func hasLastingFailure() -> Bool
     @discardableResult
     func upsert(_ record: UploadManualSettlementRecord) -> Bool
-    func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord?
     func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome
-    func allRecords() -> [UploadManualSettlementRecord]
     func readAllOutcome() -> UploadManualSettlementListReadOutcome
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool
@@ -350,13 +345,6 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
         }
     }
 
-    public func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? {
-        switch readOutcome(for: queueItemID) {
-        case .found(let record): return record
-        case .absent, .unreadable: return nil
-        }
-    }
-
     public func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
         allowTransientRecovery()
         return connection.withLock {
@@ -398,11 +386,6 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             }
             return .found(record)
         }
-    }
-
-    public func allRecords() -> [UploadManualSettlementRecord] {
-        if case .records(let records) = readAllOutcome() { return records }
-        return []
     }
 
     public func readAllOutcome() -> UploadManualSettlementListReadOutcome {

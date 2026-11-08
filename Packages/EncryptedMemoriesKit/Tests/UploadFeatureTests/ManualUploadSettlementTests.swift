@@ -88,7 +88,6 @@ private final class ReadCountingSettlementStore: UploadManualSettlementStoreProt
     func isOperationalAllowingTransientRecovery() -> Bool { operational }
     func hasLastingFailure() -> Bool { !operational }
     func upsert(_ record: UploadManualSettlementRecord) -> Bool { false }
-    func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? { nil }
     func remove(queueItemID: UploadQueueItemID) -> Bool { false }
     func close() {}
 
@@ -99,11 +98,6 @@ private final class ReadCountingSettlementStore: UploadManualSettlementStoreProt
     func readAllOutcome() -> UploadManualSettlementListReadOutcome {
         lock.withLock { reads += 1 }
         return operational ? .records(rows) : .unreadable
-    }
-
-    func allRecords() -> [UploadManualSettlementRecord] {
-        lock.withLock { reads += 1 }
-        return rows
     }
 }
 
@@ -334,11 +328,6 @@ private final class FailingSettlementStore: UploadManualSettlementStoreProtocol,
         }
     }
 
-    func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? {
-        if case .found(let record) = readOutcome(for: queueItemID) { return record }
-        return nil
-    }
-
     func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
         lock.withLock {
             guard !failed else { return .unreadable }
@@ -353,11 +342,6 @@ private final class FailingSettlementStore: UploadManualSettlementStoreProtocol,
 
     func readAllOutcome() -> UploadManualSettlementListReadOutcome {
         lock.withLock { failed ? .unreadable : .records(Array(records.values)) }
-    }
-
-    func allRecords() -> [UploadManualSettlementRecord] {
-        if case .records(let rows) = readAllOutcome() { return rows }
-        return []
     }
 
     @discardableResult
@@ -398,21 +382,11 @@ private final class EnqueueGateStore: UploadManualSettlementStoreProtocol, @unch
         }
     }
 
-    func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? {
-        if case .found(let record) = readOutcome(for: queueItemID) { return record }
-        return nil
-    }
-
     func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
         lock.withLock {
             guard let record = records[queueItemID] else { return .absent }
             return .found(record)
         }
-    }
-
-    func allRecords() -> [UploadManualSettlementRecord] {
-        if case .records(let rows) = readAllOutcome() { return rows }
-        return []
     }
 
     func readAllOutcome() -> UploadManualSettlementListReadOutcome {
@@ -483,11 +457,6 @@ private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unc
         }
     }
 
-    func record(for queueItemID: UploadQueueItemID) -> UploadManualSettlementRecord? {
-        if case .found(let record) = readOutcome(for: queueItemID) { return record }
-        return nil
-    }
-
     func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
         lock.withLock {
             if !queuedReads.isEmpty { return queuedReads.removeFirst() }
@@ -495,11 +464,6 @@ private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unc
             guard let record = records[queueItemID] else { return .absent }
             return .found(record)
         }
-    }
-
-    func allRecords() -> [UploadManualSettlementRecord] {
-        if case .records(let rows) = readAllOutcome() { return rows }
-        return []
     }
 
     func readAllOutcome() -> UploadManualSettlementListReadOutcome {
@@ -631,6 +595,66 @@ final class ManualUploadSettlementTests: XCTestCase {
         let reopened = try store()
         defer { reopened.close() }
         XCTAssertEqual(reopened.record(for: id), record)
+    }
+
+    /// A row that carried a `mainResource` key in the descriptor snapshot, null or set, still decodes. A row written
+    /// now leaves the key out, which an Optional field of an earlier build reads as nil.
+    func testSettlementRowsOfEarlierBuildsWithAMainResourceStillDecode() async throws {
+        let id = try await seedCompletedRow()
+        let seeded = try store()
+        let record = try XCTUnwrap(seeded.record(for: id))
+        seeded.close()
+        let url = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        func payload() throws -> [String: Any] {
+            var statement: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(handle, "SELECT payload FROM manual_upload_settlement;", -1, &statement, nil),
+                SQLITE_OK)
+            defer { sqlite3_finalize(statement) }
+            XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+            let text = try XCTUnwrap(sqlite3_column_text(statement, 0))
+            let object = try JSONSerialization.jsonObject(with: Data(String(cString: text).utf8))
+            return try XCTUnwrap(object as? [String: Any])
+        }
+        func write(_ object: [String: Any]) throws {
+            let text = String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+            var statement: OpaquePointer?
+            XCTAssertEqual(
+                sqlite3_prepare_v2(handle, "UPDATE manual_upload_settlement SET payload=?;", -1, &statement, nil),
+                SQLITE_OK)
+            sqlite3_bind_text(statement, 1, text, -1, SQLiteStoreSchemaGate.transientDestructor)
+            XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+            sqlite3_finalize(statement)
+        }
+
+        let current = try payload()
+        let descriptor = try XCTUnwrap(current["descriptor"] as? [String: Any])
+        XCTAssertNil(descriptor["mainResource"], "a row written now has no mainResource key")
+        struct EarlierSnapshot: Decodable { let mainResource: UploadSourceIdentity? }
+        let earlierRead = try JSONDecoder().decode(
+            EarlierSnapshot.self, from: try JSONSerialization.data(withJSONObject: descriptor))
+        XCTAssertNil(earlierRead.mainResource, "an earlier build reads the missing key as nil")
+
+        let main = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "main")))
+        for earlierValue in [NSNull(), main] {
+            var earlierDescriptor = descriptor
+            earlierDescriptor["mainResource"] = earlierValue
+            var earlierRow = current
+            earlierRow["descriptor"] = earlierDescriptor
+            try write(earlierRow)
+            let reopened = try store()
+            guard case .found(let read) = reopened.readOutcome(for: id) else {
+                XCTFail("a row with mainResource \(earlierValue) must stay readable")
+                reopened.close()
+                continue
+            }
+            XCTAssertEqual(read, record, "mainResource \(earlierValue)")
+            reopened.close()
+        }
     }
 
     func testManualDecodeFailureKeepsReadsAndWritesFailClosedAfterRepair() async throws {
