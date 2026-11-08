@@ -22,10 +22,12 @@
             XCTAssertFalse(press.delaysMagnificationEvents)
             XCTAssertFalse(press.delaysRotationEvents)
             if #available(macOS 27.0, *) { XCTAssertTrue(press.isCancellableByScrollGesture) }
-            for other in [NSPanGestureRecognizer(), NSMagnificationGestureRecognizer(), NSClickGestureRecognizer()] {
-                XCTAssertFalse(press.canPrevent(other))
-                XCTAssertTrue(press.canBePrevented(by: other))
-                XCTAssertFalse(press.shouldRequireFailure(of: other))
+            for other in [
+                NSPanGestureRecognizer(), NSMagnificationGestureRecognizer(), NSClickGestureRecognizer(),
+                NSPressGestureRecognizer(),
+            ] {
+                XCTAssertEqual(
+                    press.delegate?.gestureRecognizer?(press, shouldRecognizeSimultaneouslyWith: other), true)
             }
             press.isEnabled = false
             press.cancel(.scroll)

@@ -1,7 +1,7 @@
 import AppKit
 import PhotoViewerCore
 
-/// A touch-only press that cannot prevent native text, pan, or magnification recognizers.
+/// A touch-only press that coexists with native recognizers and cancels when another interaction takes over.
 @MainActor
 final class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecognizerDelegate {
     var onStart: (() -> Void)?
@@ -34,7 +34,10 @@ final class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecog
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
-    override func canPrevent(_ preventedGestureRecognizer: NSGestureRecognizer) -> Bool { false }
+    func gestureRecognizer(
+        _ gestureRecognizer: NSGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+    ) -> Bool { true }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
         !textOwnsPoint(gestureRecognizer.location(in: view))
