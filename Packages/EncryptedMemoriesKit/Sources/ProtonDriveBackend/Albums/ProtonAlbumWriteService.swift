@@ -834,16 +834,8 @@ struct AlbumPhotoMetadata: Decodable, Sendable {
 }
 
 private struct AlbumXAttrDigests: Decodable {
-    let common: Common?
+    let common: DedupeXAttr.Common?
     enum CodingKeys: String, CodingKey { case common = "Common" }
-    struct Common: Decodable {
-        let digests: Digests?
-        enum CodingKeys: String, CodingKey { case digests = "Digests" }
-        struct Digests: Decodable {
-            let sha1: String?
-            enum CodingKeys: String, CodingKey { case sha1 = "SHA1" }
-        }
-    }
 }
 
 // MARK: - Endpoints (DriveSession)

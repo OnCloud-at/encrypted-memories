@@ -64,6 +64,22 @@ struct DedupeXAttr: Decodable {
     }
 }
 
+/// Parses the ISO 8601 modification time of `iOS.photos`, with or without fractional seconds. Create one per pass:
+/// the formatters are reused for every photo of the pass and are not shared between passes.
+struct IOSPhotosModificationTimeParser {
+    private let fractional = ISO8601DateFormatter()
+    private let standard = ISO8601DateFormatter()
+
+    init() {
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        standard.formatOptions = [.withInternetDateTime]
+    }
+
+    func date(from raw: String) -> Date? {
+        fractional.date(from: raw) ?? standard.date(from: raw)
+    }
+}
+
 enum RemotePhotoAssetProofBuilder {
     struct Accumulator {
         private let hashKeyEpoch: String
