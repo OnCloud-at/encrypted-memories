@@ -146,7 +146,7 @@ public struct GridSelectionBadgeMotion {
     private func presentation(now: Double) -> CGRect {
         guard isAnimating else { return target }
         let t = CGFloat(min(1, max(0, (now - startedAt) / Self.duration)))
-        let eased = t * t * (3 - 2 * t)
+        let eased = gridSmoothstep(t)
         return CGRect(
             x: source.minX + (target.minX - source.minX) * eased,
             y: source.minY + (target.minY - source.minY) * eased,

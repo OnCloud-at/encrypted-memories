@@ -728,6 +728,32 @@ import Testing
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func contentModeTransitionEasesTheFitAlongTheSmoothstepCurve() throws {
+        let cache = try #require(makeCache())
+        let image = try #require(makeImage(width: 64, height: 48))
+        let a = uid("wide")
+        cache.beginFrame(pinned: [a])
+        cache.uploadVisible(wanted: [a]) { _ in image }
+        let tile = slot(0, y: 0)
+        let decorations = MetalGridDecorations<PhotoUID>(
+            accent: SIMD4(0, 0, 1, 1), accentGlyphColor: .white,
+            selectionMode: false, selected: [], favorites: [], overlay: { _ in GridThumbnailOverlay() })
+        func imageRect(progress: CGFloat) -> CGRect {
+            MetalGridFrameComposer.buildGroups(
+                slots: [tile], flatUIDs: [a], cache: cache,
+                displayMode: .squareFillCrop, cornerRadius: 11, decorations: decorations,
+                contentTransition: .init(from: .aspectFitInsideSquare, to: .squareFillCrop, progress: progress)
+            ).groups[0].quads[0].rect
+        }
+        let start = imageRect(progress: 0)
+        let end = imageRect(progress: 1)
+        let quarter = imageRect(progress: 0.25)
+        #expect(end.height - start.height > 1, "the fit and the fill differ, so a linear ease would differ")
+        let eased: CGFloat = 0.15625  // 3 * 0.25^2 - 2 * 0.25^3
+        #expect(abs(quarter.height - (start.height + (end.height - start.height) * eased)) < 0.01)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
     func buildGroupsGivesDenseTinySlotsSharpCornersAndLargeSlotsTheFullRadius() throws {
         let cache = try #require(makeCache())
         let image = try #require(makeImage())

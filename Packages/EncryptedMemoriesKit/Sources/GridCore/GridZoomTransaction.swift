@@ -194,17 +194,7 @@ public struct GridZoomTransaction: Equatable, Sendable {
         GridApparentMetrics.slotSide(at: x, width: width, levels: levels)
     }
     public func apparentGap(at x: CGFloat) -> CGFloat {
-        let maxIndex = levels.count - 1
-        if x <= 0 { return levels[0].gap }
-        if x >= CGFloat(maxIndex) { return levels[maxIndex].gap }
-        let lo = Int(x)
-        return lerp(levels[lo].gap, levels[lo + 1].gap, smoothstep(x - CGFloat(lo)))
-    }
-
-    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b - a) * t }
-    private func smoothstep(_ x: CGFloat) -> CGFloat {
-        let t = min(max(x, 0), 1)
-        return t * t * (3 - 2 * t)
+        GridApparentMetrics.gap(at: x, levels: levels)
     }
 }
 

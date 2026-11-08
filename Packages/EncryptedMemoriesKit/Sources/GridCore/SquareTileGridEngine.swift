@@ -628,11 +628,7 @@ public struct SquareTileGridEngine: Equatable, Sendable {
 
     /// The apparent gap for a continuous level position (first-class: scales smoothly through the pinch).
     public func apparentGap(at x: CGFloat) -> CGFloat {
-        let maxIndex = levels.count - 1
-        if x <= 0 { return levels[0].gap }
-        if x >= CGFloat(maxIndex) { return levels[maxIndex].gap }
-        let lo = Int(x)
-        return lerp(levels[lo].gap, levels[lo + 1].gap, smoothstep(x - CGFloat(lo)))
+        GridApparentMetrics.gap(at: x, levels: levels)
     }
 
     // MARK: Anchor preservation
@@ -748,15 +744,6 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         let dy = p.y - cy
         return dx * dx + dy * dy
     }
-}
-
-// MARK: - Pure easing helpers (free functions so the engine stays a pure value type)
-
-private func clamp01(_ x: CGFloat) -> CGFloat { min(max(x, 0), 1) }
-private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b - a) * t }
-private func smoothstep(_ x: CGFloat) -> CGFloat {
-    let t = clamp01(x)
-    return t * t * (3 - 2 * t)
 }
 
 /// The section that holds the flat index `flat`, and the item's position inside it. `sectionFlatStart` holds the

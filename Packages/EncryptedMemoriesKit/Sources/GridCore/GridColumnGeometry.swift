@@ -12,6 +12,23 @@ package enum GridApparentMetrics {
         let t = x - CGFloat(lo)
         return side(lo) + (side(lo + 1) - side(lo)) * t * t * (3 - 2 * t)
     }
+
+    /// The apparent gap for a continuous level position `x`: the gap of the bracketing detents, eased with the
+    /// smoothstep curve, and the gap of the first or last level beyond the ladder.
+    package static func gap(at x: CGFloat, levels: [GridLevelMetrics]) -> CGFloat {
+        let maxIndex = levels.count - 1
+        if x <= 0 { return levels[0].gap }
+        if x >= CGFloat(maxIndex) { return levels[maxIndex].gap }
+        let lo = Int(x)
+        let from = levels[lo].gap
+        return from + (levels[lo + 1].gap - from) * gridSmoothstep(x - CGFloat(lo))
+    }
+}
+
+/// The smoothstep curve `3t^2 - 2t^3` of `x` clamped into 0...1: zero slope at both ends.
+package func gridSmoothstep(_ x: CGFloat) -> CGFloat {
+    let t = min(max(x, 0), 1)
+    return t * t * (3 - 2 * t)
 }
 
 /// One horizontal mapping for slot placement, queries and zoom.

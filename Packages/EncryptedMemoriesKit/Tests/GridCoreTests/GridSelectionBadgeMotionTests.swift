@@ -29,6 +29,19 @@ import Testing
         #expect(!tile(462).contains(rect), "No circle fits inside a tile wholly inside the division")
     }
 
+    @Test func theSlideEasesAlongTheSmoothstepCurve() {
+        var motion = GridSelectionBadgeMotion()
+        _ = frame(&motion, y: 380, now: 0)
+        let start = frame(&motion, y: 430, now: 1)
+        let target = motion.target
+        #expect(motion.isAnimating)
+        let quarter = frame(&motion, y: 430, now: 1 + GridSelectionBadgeMotion.duration * 0.25)
+        let eased: CGFloat = 0.15625  // 3 * 0.25^2 - 2 * 0.25^3
+        #expect(abs(quarter.minX - (start.minX + (target.minX - start.minX) * eased)) < 1e-6)
+        #expect(abs(quarter.minY - (start.minY + (target.minY - start.minY) * eased)) < 1e-6)
+        #expect(abs(target.minY - start.minY) > 1, "the slide moves, so a linear ease would differ")
+    }
+
     @Test func crossingStartsATimedSlideThatContinuesAfterScrollingStops() {
         var motion = GridSelectionBadgeMotion()
         let home = frame(&motion, y: 380, now: 0)
