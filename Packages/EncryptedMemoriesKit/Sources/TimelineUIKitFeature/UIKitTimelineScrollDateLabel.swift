@@ -18,9 +18,9 @@
     @MainActor
     final class UIKitTimelineScrollDateLabelPresenter {
         let view = UIKitTimelineScrollDateLabelView()
-        let controller: TimelineScrollDateLabelController
-        private(set) var isEnabled = false
-        private var items: [PhotoItem] = []
+        private let session: TimelineScrollDateLabelSession
+        var controller: TimelineScrollDateLabelController { session.controller }
+        var isEnabled: Bool { session.isEnabled }
         /// Viewport bands the label must not cover (fold, camera), sorted by their top edge.
         private var avoidedBands: [ClosedRange<CGFloat>] = []
         private var isShown = false
@@ -30,7 +30,7 @@
         private var nativeThumbRect: CGRect?
 
         init(controller: TimelineScrollDateLabelController = TimelineScrollDateLabelController()) {
-            self.controller = controller
+            session = TimelineScrollDateLabelSession(controller: controller)
             controller.onChange = { [weak self] presentation in self?.apply(presentation) }
             controller.onIndexInstalled = { [weak self] index in self?.prepareText(for: index) }
             controller.reduceMotion = UIAccessibility.isReduceMotionEnabled
@@ -48,24 +48,14 @@
             }
         }
 
-        func setEnabled(_ enabled: Bool) {
-            guard enabled != isEnabled else { return }
-            isEnabled = enabled
-            if enabled {
-                controller.updateContent(items, replacesList: true)
-            } else {
-                controller.clearContent()
-            }
-        }
+        func setEnabled(_ enabled: Bool) { session.setEnabled(enabled) }
 
         func setReduceMotion(_ reduce: Bool) { controller.reduceMotion = reduce }
 
         /// The host shows new items. `replacesList` marks another list (account, filter, search result); otherwise it is
         /// a refresh of the same list.
         func contentChanged(_ newItems: [PhotoItem], replacesList: Bool) {
-            items = newItems
-            guard isEnabled else { return }
-            controller.updateContent(newItems, replacesList: replacesList)
+            session.contentChanged(newItems, replacesList: replacesList)
         }
 
         func updateHost(_ state: TimelineScrollDateLabelHostState) {
@@ -140,7 +130,7 @@
             if presentation.isVisible != isShown {
                 isShown = presentation.isVisible
                 if isShown { host?.bringSubviewToFront(view) }
-                // Suppression, a route change or stale content hides at once; shows and the linger hide fade.
+                // Suppression, routes and stale content hide at once; shows, linger expiry and marked jumps fade.
                 view.setShown(isShown, duration: presentation.fadeDuration)
                 #if DEBUG
                     if isShown { showCount += 1 }

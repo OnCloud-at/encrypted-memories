@@ -546,6 +546,8 @@ private func settle(until condition: (() -> Bool)? = nil) async {
             flickScrollDateLabel(controller, manual)
             let deadline = controller.policy.hideDeadline
             controller.viewportMoved(movement, offsetY: 50_000)
+            manual.advance(by: 1 / 120)
+            controller.userMoved(offsetY: 50_000)
             #expect(controller.presentation.isVisible)
             #expect(controller.policy.hideDeadline == deadline)
         }
@@ -1282,5 +1284,35 @@ private struct SplitMix64 {
         #expect(size == CGSize(width: 131, height: 30))
         #expect(
             cache.contentFrame(in: CGRect(origin: .zero, size: size)) == CGRect(x: 10, y: 6, width: 111, height: 18))
+    }
+}
+
+@MainActor
+@Suite struct TimelineScrollDateLabelSessionTests {
+    @Test func enablingUsesTheLatestContentAndDisablingDropsItsIndex() async throws {
+        let gated = GatedBuilder()
+        let controller = TimelineScrollDateLabelController(clock: ManualClock().clock, build: gated.build)
+        let session = TimelineScrollDateLabelSession(controller: controller)
+        let item = PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "item"), captureTime: Date(timeIntervalSince1970: 1_780_000_000),
+            mediaType: "image/jpeg")
+        session.contentChanged([item], replacesList: true)
+        await settle()
+        #expect(gated.requested.isEmpty, "disabled content does not build an index")
+        session.setEnabled(true)
+        await settle(until: { gated.waiting == 1 })
+        try #require(gated.requested == [1], "enabling builds the retained content")
+        gated.releaseAll()
+        await settle(until: { controller.index != nil })
+        #expect(controller.index?.itemCount == 1)
+        session.setEnabled(false)
+        #expect(controller.index == nil)
+        session.contentChanged([item, item], replacesList: false)
+        session.setEnabled(true)
+        await settle(until: { gated.waiting == 1 })
+        #expect(gated.requested == [1, 2], "re-enabling builds the newest content")
+        gated.releaseAll()
+        await settle(until: { controller.index?.itemCount == 2 })
+        #expect(controller.index?.itemCount == 2)
     }
 }

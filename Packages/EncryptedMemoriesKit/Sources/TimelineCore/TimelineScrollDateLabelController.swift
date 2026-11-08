@@ -55,7 +55,6 @@ public final class TimelineScrollDateLabelController {
     public private(set) var presentation: Presentation = .hidden
     public private(set) var policy: TimelineScrollDateLabelPolicy
     public private(set) var index: TimelineScrollDateIndex?
-
     /// True after `retire()`: the host is gone.
     public private(set) var isRetired = false
     /// Hosts forward the native setting. Reduce Motion preserves visibility and text with no fade duration.

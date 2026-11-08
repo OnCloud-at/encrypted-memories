@@ -71,11 +71,10 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         return grid.convert(rect, from: grid.scrollView)
     }
 
-    func testNativeThumbGeometryCentersTheLabelAtFiveFractions() async throws {
+    func testNativeThumbGeometryCentersTheLabelAtFiveFractions() throws {
         let grid = try hostInWindow()
         try showLabel(on: grid)
         grid.window?.layoutIfNeeded()
-        try await Task.sleep(for: .milliseconds(150))
         for fraction in [CGFloat(0), 0.25, 0.5, 0.75, 1] {
             grid.scrollView.contentSize = CGSize(width: grid.bounds.width, height: 10_000)
             let low = -grid.scrollView.contentInset.top
