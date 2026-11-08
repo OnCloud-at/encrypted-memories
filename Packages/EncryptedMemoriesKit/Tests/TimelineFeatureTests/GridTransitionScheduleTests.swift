@@ -417,14 +417,6 @@ import Testing
         #expect(GridTransitionPresentationTransform.fit(keys: [entry, exit], sourceRect: src, targetRect: tgt) == nil)
     }
 
-    @Test func selectionDoesNotGateTransitionGeometry() {
-        let relocating: Set<Int> = [201, 301]
-        #expect(GridTransitionSelectionEligibility.isEligible(selection: [], relocatingIdentities: relocating))
-        #expect(GridTransitionSelectionEligibility.isEligible(selection: [100], relocatingIdentities: relocating))
-        #expect(GridTransitionSelectionEligibility.isEligible(selection: [201], relocatingIdentities: relocating))
-        #expect(GridTransitionSelectionEligibility.isEligible(selection: [100, 201], relocatingIdentities: relocating))
-    }
-
     @Test func builderOnEngineGeometryFocusRowStable() {
         let viewport = CGSize(width: 1400, height: 900)
         let engine = SquareTileGridEngine.testRegular(sectionCounts: [4000])

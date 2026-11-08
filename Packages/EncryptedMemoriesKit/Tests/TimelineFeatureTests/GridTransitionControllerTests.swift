@@ -21,7 +21,7 @@ import Testing
         #expect(
             c.beginClick(
                 source: src, target: tgt, anchorIndex: 0,
-                viewportSize: CGSize(width: 1400, height: 900), selection: []))
+                viewportSize: CGSize(width: 1400, height: 900)))
         #expect(c.isActive)
         #expect(!c.currentDraws().isEmpty)
         #expect(c.q == 0)
@@ -43,12 +43,59 @@ import Testing
         #expect(
             c.beginClick(
                 source: src, target: tgt, anchorIndex: 0,
-                viewportSize: CGSize(width: 1400, height: 900), selection: []))
+                viewportSize: CGSize(width: 1400, height: 900)))
         c.end()
 
         #expect(events.map(\.name) == ["GridTransition", "GridTransition"])
         #expect(events[0].fields["event"] == "PLAN_BUILT")
         #expect(events[1].fields["event"] == "SETTLED")
+    }
+
+    @Test func planBuiltEventCarriesTheFieldsOfItsGesture() throws {
+        let (src, tgt) = plans()
+        let viewport = CGSize(width: 1400, height: 900)
+        var events: [CoreTelemetryEvent] = []
+
+        let click = GridTransitionController(telemetrySink: { events.append($0) })
+        #expect(click.beginClick(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport))
+        let clickFields = try #require(events.first?.fields)
+        let clickComponents = try #require(click.plan?.components.count)
+        #expect(
+            clickFields == [
+                "event": "PLAN_BUILT", "components": "\(clickComponents)", "src": "0", "tgt": "1",
+                "durationMs": "\(Int(GridTransitionTuning.default.clickDurationMs))",
+            ])
+
+        events.removeAll()
+        let pinch = GridTransitionController(telemetrySink: { events.append($0) })
+        #expect(pinch.beginPinch(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport))
+        let pinchFields = try #require(events.first?.fields)
+        let pinchComponents = try #require(pinch.plan?.components.count)
+        #expect(
+            pinchFields == ["event": "PLAN_BUILT", "components": "\(pinchComponents)", "src": "0", "tgt": "1"])
+        // The plans carry the levels of the frames and the duration of their gesture.
+        let clickPlan = try #require(click.plan)
+        let pinchPlan = try #require(pinch.plan)
+        #expect(clickPlan.kind == .click && pinchPlan.kind == .pinch)
+        #expect(clickPlan.sourceLevel == 0 && clickPlan.targetLevel == 1)
+        #expect(pinchPlan.sourceLevel == 0 && pinchPlan.targetLevel == 1)
+        #expect(clickPlan.durationMs == GridTransitionTuning.default.clickDurationMs && pinchPlan.durationMs == 0)
+    }
+
+    @Test func anAnchorOutsideBothFramesFallsBackWithoutAPlan() {
+        let (src, tgt) = plans()
+        let viewport = CGSize(width: 1400, height: 900)
+        var events: [CoreTelemetryEvent] = []
+        let c = GridTransitionController(telemetrySink: { events.append($0) })
+        #expect(!c.beginClick(source: src, target: tgt, anchorIndex: 3_999_999, viewportSize: viewport))
+        #expect(!c.beginPinch(source: src, target: tgt, anchorIndex: 3_999_999, viewportSize: viewport))
+        #expect(c.lastFallback == .latticeBuildFailed)
+        #expect(!c.isActive)
+        let fallback = ["event": "FALLBACK", "reason": "latticeBuildFailed"]
+        #expect(events.map(\.fields) == [fallback, fallback])
+        // The next gesture that can build a plan clears the recorded fallback.
+        #expect(c.beginClick(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport))
+        #expect(c.lastFallback == .none && c.isActive)
     }
 
     @Test func sevenNineViewportCenterClickBuildsPlan() throws {
@@ -96,8 +143,7 @@ import Testing
                 source: source,
                 target: target,
                 anchorIndex: anchor.flatIndex,
-                viewportSize: viewport,
-                selection: []
+                viewportSize: viewport
             ))
         #expect(controller.lastFallback == .none)
         #expect(controller.isActive)
@@ -149,8 +195,7 @@ import Testing
                 source: source,
                 target: target,
                 anchorIndex: anchor.flatIndex,
-                viewportSize: viewport,
-                selection: []
+                viewportSize: viewport
             ))
         let initial = controller.currentDraws()
         #expect(!initial.isEmpty)
@@ -178,32 +223,11 @@ import Testing
         #expect(sawPartialHandoff, "9<->7 click plans must have at least one visible handoff frame during the click")
     }
 
-    @Test func relocatingSelectionDoesNotBlockClickPlan() {
-        let (src, tgt) = plans()
-        let viewport = CGSize(width: 1400, height: 900)
-        guard
-            let lat = GridTransitionComponentBuilder.build(
-                source: src, target: tgt, anchorIndex: 0, viewportSize: viewport)
-        else {
-            Issue.record("lattice nil")
-            return
-        }
-        let relocating = GridTransitionSelectionEligibility.relocatingIdentities(in: lat)
-        guard let r = relocating.first else {
-            Issue.record("no relocating identity")
-            return
-        }
-        let c = GridTransitionController()
-        #expect(c.beginClick(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport, selection: [r]))
-        #expect(c.lastFallback == .none)
-        #expect(c.isActive)
-    }
-
     @Test func pinchBuildsHostDrivenPlanByDefault() {
         let (src, tgt) = plans()
         let viewport = CGSize(width: 1400, height: 900)
         let c = GridTransitionController()
-        #expect(c.beginPinch(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport, selection: []))
+        #expect(c.beginPinch(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport))
         #expect(c.isActive)
         #expect(c.activeKind == .pinch)
         #expect(c.q == 0)
@@ -227,32 +251,12 @@ import Testing
         let (src, tgt) = plans()
         let viewport = CGSize(width: 1400, height: 900)
         let c = GridTransitionController()
-        #expect(c.beginPinch(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport, selection: []))
+        #expect(c.beginPinch(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport))
         c.setProgress(0.37)
         let forward = c.currentDraws()
         c.setProgress(0.8)
         c.setProgress(0.37)  // scrub back to the same q
         let back = c.currentDraws()
         #expect(forward == back)  // pure function of q, so no hysteresis
-    }
-
-    @Test func pinchRelocatingSelectionStillBuildsPlan() {
-        let (src, tgt) = plans()
-        let viewport = CGSize(width: 1400, height: 900)
-        guard
-            let lat = GridTransitionComponentBuilder.build(
-                source: src, target: tgt, anchorIndex: 0, viewportSize: viewport)
-        else {
-            Issue.record("lattice nil")
-            return
-        }
-        guard let r = GridTransitionSelectionEligibility.relocatingIdentities(in: lat).first else {
-            Issue.record("no relocating identity")
-            return
-        }
-        let c = GridTransitionController()
-        #expect(c.beginPinch(source: src, target: tgt, anchorIndex: 0, viewportSize: viewport, selection: [r]))
-        #expect(c.lastFallback == .none)
-        #expect(c.isActive)
     }
 }

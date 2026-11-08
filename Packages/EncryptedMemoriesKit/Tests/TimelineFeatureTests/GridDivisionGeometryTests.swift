@@ -73,7 +73,7 @@ import TimelineCore
             let controller = GridTransitionController()
             #expect(
                 controller.beginPinch(
-                    source: source, target: target, anchorIndex: 0, viewportSize: size, selection: []))
+                    source: source, target: target, anchorIndex: 0, viewportSize: size))
             let sourceRects = Dictionary(
                 uniqueKeysWithValues: source.visibleSlots.map { ($0.index, $0.slotRect) })
             let targetRects = Dictionary(
