@@ -1836,7 +1836,8 @@ public actor PendingBackupCoordinator {
         finish(effect, dispatched, at: date) { state in
             Self.normalized(state.remote, volume: volume).map { !result.retry.contains($0) } ?? true
         }
-        // A finished trash can leave the trash of a later commit due, see `PendingBackupManifestStore.completeEffect`.
+        // A finished trash can leave the trash of a later commit due, see
+        // `PendingBackupManifestStore.completeEffectResult`.
         // A source whose state cannot be read now is retried by the backoff timer of `scheduleReconcileTimer`.
         let movedOn = dispatched.contains { dispatchedState in
             // A last known state can be older than the effect; only a fresh read shows that the trash moved on.

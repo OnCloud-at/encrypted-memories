@@ -240,8 +240,6 @@ public struct PendingSourceState: Sendable, Equatable {
     public let nextAttemptAt: Date
     public let updatedAt: Date
 
-    public var hasDueEffect: Bool { needsQueueSync || needsRemoteTrash || needsRemoteRestore }
-
     public init(
         key: PendingSourceKey,
         desired: PendingDesiredState,

@@ -138,10 +138,11 @@ import XCTest
                 XCTAssertNotNil(
                     reopened.exclude(
                         [PendingExclusionRequest(key: key, presentation: nil, remote: second)], at: old.updatedAt))
-                XCTAssertTrue(
-                    reopened.completeEffect(
+                XCTAssertNotEqual(
+                    reopened.completeEffectResult(
                         .remoteTrash, for: key, generation: old.generation, remoteLinkID: "released-main",
-                        at: old.updatedAt))
+                        at: old.updatedAt),
+                    .failed)
                 let current = try XCTUnwrap(reopened.sourceState(for: key))
                 XCTAssertNil(current.remoteOperation, "legacy unknown ownership keeps the previous contract")
                 XCTAssertEqual(current.remote, second)

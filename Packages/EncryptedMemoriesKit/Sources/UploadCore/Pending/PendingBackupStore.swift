@@ -145,7 +145,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         for: handoff.key, remote: handoff.remote, completed: false, generation: state.generation)
                 else { return false }
                 // The delete of an unfinished edit still owes the trash of the earlier upload. That photo stays the
-                // state's photo; its completed trash moves on to this handoff, see `completeEffect`.
+                // state's photo; its completed trash moves on to this handoff, see `completeEffectResult`.
                 if state.needsRemoteTrash, let pending = state.remote, pending.nodeID != handoff.remote.nodeID {
                     return true
                 }
@@ -229,12 +229,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
-    /// The handoffs for a complete reverse lookup. Use `handoffsRead` to distinguish unreadable from absent.
-    public func handoffs(forRemoteLinkIDs linkIDs: [String]) -> [PendingHandoff] {
-        guard case .complete(let handoffs) = handoffsRead(forRemoteLinkIDs: linkIDs) else { return [] }
-        return handoffs
-    }
-
     /// Only SQLITE_DONE for every requested link, with every row decoded, proves a complete lookup.
     public func handoffsRead(forRemoteLinkIDs linkIDs: [String]) -> PendingHandoffsRead {
         guard !linkIDs.isEmpty else { return .complete([]) }
@@ -305,11 +299,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     // MARK: - Desired state
 
-    /// The rows that decode. Use `sourceStatesRead()` where a missing row must not count as "nothing owed".
-    public func sourceStates() -> [PendingSourceState] {
-        sourceStatesRead().states
-    }
-
     /// Every row that decodes, and whether the query succeeded and every row decoded.
     public func sourceStatesRead() -> PendingSourceStatesRead {
         connection.withLock {
@@ -325,11 +314,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     public func sourceStateRead(for key: PendingSourceKey) -> PendingSourceStateRead {
         connection.withLock { sourceStateLocked(key) }
-    }
-
-    /// Sources with an effect that is due by `date`.
-    public func dueSourceStates(by date: Date) -> [PendingSourceState] {
-        dueSourceStatesRead(by: date).states
     }
 
     /// Due sources that decode, and whether the query succeeded and every due row decoded.
@@ -443,7 +427,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     guard case .readable(let previous) = sourceStateLocked(request.key) else { return false }
                     // A commit of the deleted revision is already durable here, even when its event has not reached
                     // the coordinator yet. The earlier upload that the coordinator sends for an edit goes first: the
-                    // completed trash of that photo moves on to the latest handoff, see `completeEffect`.
+                    // completed trash of that photo moves on to the latest handoff, see `completeEffectResult`.
                     var durable: PhotoUID?
                     if let revision = request.revision {
                         guard case .readable(let handoff) = handoffReadLocked(request.key, revision: revision) else {
@@ -659,6 +643,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
+    enum EffectCompletionResult: Sendable, Equatable {
+        case failed, saved, laterHandoffUnreadable
+    }
+
     /// Marks one effect done for the generation that performed it. A completion always re-reads the current
     /// desired state: a trash that finishes after a restore schedules the remote restore, and a restore that
     /// finishes after a new delete schedules the trash again. Stale generations therefore never undo a newer
@@ -666,21 +654,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// effect handled; a trash of a photo that a later commit replaced leaves the trash of the new photo due.
     /// A finished trash of an excluded source moves on to every recorded duty; legacy state keeps its latest handoff: the
     /// edit of a deleted photo can commit before the trash of the earlier upload is sent.
-    @discardableResult
-    public func completeEffect(
-        _ effect: PendingSourceEffect,
-        for key: PendingSourceKey,
-        generation: Int64,
-        remoteLinkID: String? = nil,
-        at date: Date
-    ) -> Bool {
-        completeEffectResult(effect, for: key, generation: generation, remoteLinkID: remoteLinkID, at: date) != .failed
-    }
-
-    enum EffectCompletionResult: Sendable, Equatable {
-        case failed, saved, laterHandoffUnreadable
-    }
-
+    ///
     /// A confirmed completion and the discovery of its next photo are separate durable steps. A failed lookup must
     /// never make the coordinator replay the completion of a photo that is already saved as trashed.
     func completeEffectResult(
@@ -1126,10 +1100,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Every action row that decodes, and whether the query succeeded and every row decoded.
     public func actionsRead() -> PendingActionsRead {
         connection.withLock { actionsLocked(where: nil) }
-    }
-
-    public func dueActions(by date: Date) -> [PendingAction] {
-        dueActionsRead(by: date).actions
     }
 
     /// Due actions that decode, and whether the query succeeded and every due row decoded.
