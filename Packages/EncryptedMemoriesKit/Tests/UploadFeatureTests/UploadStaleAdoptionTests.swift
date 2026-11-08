@@ -167,21 +167,16 @@ final class UploadStaleAdoptionTests: XCTestCase {
         let joinedBefore = PhotoDiagnostics.shared.counter("upload.stateRefreshJoined")
 
         let first = Task { try await checks.resolve(photos[0]) }
-        await waitUntil("the first check reads both old states") { server.heldVisibilityReads == 1 }
+        await assertEventually({ server.heldVisibilityReads == 1 }, "the first check reads both old states")
         let second = Task { try await checks.resolve(photos[1]) }
-        await waitUntil("the second check waits for that read") {
-            PhotoDiagnostics.shared.counter("upload.stateRefreshJoined") > joinedBefore
-        }
+        await assertEventually(
+            { PhotoDiagnostics.shared.counter("upload.stateRefreshJoined") > joinedBefore },
+            "the second check waits for that read")
         server.releaseVisibilityReads()
 
         let results = [try await first.value, try await second.value]
         XCTAssertEqual(results.map(\.decision), copies.map { .skip(.activeDuplicate, remoteLinkID: $0.nodeID) })
         XCTAssertEqual(server.readCounts.visibility - primed, 1, "one read for both checks")
-    }
-
-    private func waitUntil(_ message: String, _ condition: () -> Bool) async {
-        for _ in 0..<2_000 where !condition() { try? await Task.sleep(for: .milliseconds(1)) }
-        XCTAssertTrue(condition(), message)
     }
 
     /// A copy in a state that is neither active nor in the trash is unknown: the photo neither uploads nor counts as
