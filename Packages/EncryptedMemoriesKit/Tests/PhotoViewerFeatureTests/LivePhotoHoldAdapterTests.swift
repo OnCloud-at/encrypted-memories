@@ -189,6 +189,6 @@
 
     private final class HoldMagnifyEvent: NSEvent {
         override var phase: NSEvent.Phase { .began }
-        override var magnification: CGFloat { 0.1 }
+        override var magnification: CGFloat { -0.1 }
     }
 #endif
