@@ -302,27 +302,6 @@ private final class CallCounter: @unchecked Sendable {
     func add() { lock.withLock { _calls += 1 } }
 }
 
-private struct FileMetadata: PendingSourceMetadataProviding {
-    func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
-        Dictionary(
-            uniqueKeysWithValues: keys.map {
-                (
-                    $0,
-                    PendingPresentationMetadata(
-                        captureTime: Date(timeIntervalSince1970: 1_700_000_000), mediaType: "image/heic",
-                        displayName: "photo.heic")
-                )
-            })
-    }
-}
-
-private struct NoRemoteEffects: PendingRemoteEffects {
-    func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .done }
-    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
-}
-
 @MainActor
 private struct ReturnFixture {
     let suite = "folder-return-classification-\(UUID().uuidString)"
@@ -414,7 +393,7 @@ private struct ReturnFixture {
         let counter = callCounter
         let files = PendingFileSource(
             queue: queueStore,
-            metadata: FileMetadata(),
+            metadata: AllFilesMetadata(),
             removeFromBackup: { _ in true },
             returnToBackup: { paths in
                 counter?.add()

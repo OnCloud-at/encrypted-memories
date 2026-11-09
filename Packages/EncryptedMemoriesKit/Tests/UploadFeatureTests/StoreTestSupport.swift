@@ -30,6 +30,29 @@ struct InertPendingEffects: PendingBackupEffects {
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
 }
 
+/// Remote pending effects that succeed without doing anything.
+struct NoRemoteEffects: PendingRemoteEffects {
+    func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
+    func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
+    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .done }
+    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
+}
+
+/// The same presentation metadata for every source: a photo.heic of November 2023.
+struct AllFilesMetadata: PendingSourceMetadataProviding {
+    func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
+        Dictionary(
+            uniqueKeysWithValues: keys.map {
+                (
+                    $0,
+                    PendingPresentationMetadata(
+                        captureTime: Date(timeIntervalSince1970: 1_700_000_000), mediaType: "image/heic",
+                        displayName: "photo.heic")
+                )
+            })
+    }
+}
+
 /// Fails every statement whose expanded SQL matches, until `stop()` or until it failed `failures` statements. Other
 /// statements and probes run normally. With `fails: false` it only counts the matching statement runs.
 final class SQLiteStatementFaults {

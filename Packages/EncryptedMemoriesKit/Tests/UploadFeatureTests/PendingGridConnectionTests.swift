@@ -967,20 +967,6 @@ private struct Fixture {
     }
 }
 
-private struct AllFilesMetadata: PendingSourceMetadataProviding {
-    func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
-        Dictionary(
-            uniqueKeysWithValues: keys.map {
-                (
-                    $0,
-                    PendingPresentationMetadata(
-                        captureTime: Date(timeIntervalSince1970: 1_700_000_000), mediaType: "image/heic",
-                        displayName: "photo.heic")
-                )
-            })
-    }
-}
-
 /// Answers unknown for every file until it becomes readable.
 private final class UnknownUntilReadableMetadata: PendingSourceMetadataProviding, @unchecked Sendable {
     private let lock = NSLock()
@@ -1004,11 +990,4 @@ private final class UnknownUntilReadableMetadata: PendingSourceMetadataProviding
         guard readable else { return PendingSourceMetadataAnswer(unknown: Set(keys)) }
         return PendingSourceMetadataAnswer(metadata: await AllFilesMetadata().metadata(for: keys))
     }
-}
-
-private struct NoRemoteEffects: PendingRemoteEffects {
-    func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .done }
-    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
 }

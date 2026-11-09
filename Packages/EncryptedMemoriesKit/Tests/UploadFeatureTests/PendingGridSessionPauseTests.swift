@@ -71,10 +71,3 @@ import UploadCore
         return condition()
     }
 }
-
-private struct NoRemoteEffects: PendingRemoteEffects {
-    func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .done }
-    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .done }
-    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .done }
-}
