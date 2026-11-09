@@ -32,21 +32,15 @@ class PullRequestWorkflowTests < Minitest::Test
       .select { |step| step.fetch("env", {}).key?("BASE_SHA") }
   end
 
-  def test_documentation_only_queue_entry_skips_macos_workers
-    context = {"github.event_name" => "merge_group", "needs.queue-path-policy.outputs.run_macos" => "false", "needs.queue-path-policy.result" => "success"}
-    %w[package-verification ios-verification ios-ui-verification macos-verification].each do |id|
-      refute evaluate(@workflow.fetch("jobs").fetch(id).fetch("if"), context), id
-    end
-  end
-
   def test_queue_path_policy_never_skips_protected_or_unknown_paths
     script = File.expand_path("queue_path_policy.py", __dir__)
     paths = %w[.github/test.md scripts/test.md project.yml BuildSupport/test.md VendorPatches/test.md
-               site/test.swift Wiki/test.swift unknown App/test.md]
-    code = "import json,runpy,sys; f=runpy.run_path(sys.argv[1])['can_skip']; print(json.dumps([f([p]) for p in json.load(sys.stdin)]))"
-    result, status = Open3.capture2("python3", "-c", code, script, stdin_data: JSON.generate(paths))
+               site/test.swift Wiki/test.swift unknown App/test.md docs/guide.md README.MD agents.md Claude.md
+               CONTRIBUTING.md AGENTS.md CLAUDE.md PROJECT-TRAPS.md]
+    code = "import json,runpy,sys; f=runpy.run_path(sys.argv[1])['can_skip']; print(json.dumps([f(p) for p in json.load(sys.stdin)]))"
+    result, status = Open3.capture2("python3", "-c", code, script, stdin_data: JSON.generate([[], *paths.map { |path| [path] }, *paths.map { |path| ["site/index.html", path] }]))
     assert status.success?
-    assert_equal [false] * paths.length, JSON.parse(result)
+    assert_equal [false] * (1 + paths.length * 2), JSON.parse(result)
   end
 
   def test_policy_skip_requires_a_successful_decision_and_skipped_workers
@@ -58,7 +52,6 @@ class PullRequestWorkflowTests < Minitest::Test
     step = policy.fetch("steps").find { |item| item["id"] == "policy" }
     assert_equal "${{ github.event.merge_group.base_sha }}", step.fetch("env").fetch("BASE_SHA")
     assert_equal "${{ github.event.merge_group.head_sha }}", step.fetch("env").fetch("HEAD_SHA")
-    assert_equal "python3 .github/scripts/queue_path_policy.py", step.fetch("run")
     workers = %w[package-verification ios-verification ios-ui-verification macos-verification]
     workers.each do |id|
       condition = jobs.fetch(id).fetch("if")
@@ -68,21 +61,74 @@ class PullRequestWorkflowTests < Minitest::Test
       assert evaluate(condition, decision.merge("github.event_name" => "workflow_dispatch")), id
     end
     %w[code-quality package-tests architecture ios-app-tests ios-ui-tests macos-app-shell ios-app-shell].each do |id|
-      steps = jobs.fetch(id).fetch("steps")
-      skip = steps.find { |step| step["name"] == "Record policy skip" }
-      assert evaluate(skip.fetch("if"), decision), id
-      refute evaluate(skip.fetch("if"), decision.merge("needs.queue-path-policy.result" => "failure")), id
-      refute evaluate(skip.fetch("if"), decision.merge("github.event_name" => "workflow_dispatch")), id
-      env = skip.fetch("env").keys.to_h { |key| [key, "skipped"] }
-      output, status = Open3.capture2e(env, "bash", "-c", skip.fetch("run"))
+      job = jobs.fetch(id)
+      skip = job.fetch("env").fetch("SKIP")
+      assert evaluate(skip, decision), id
+      refute evaluate(skip, decision.merge("needs.queue-path-policy.result" => "failure")), id
+      refute evaluate(skip, decision.merge("github.event_name" => "workflow_dispatch")), id
+      step = job.fetch("steps").fetch(0)
+      assert_equal "${{ always() }}", step.fetch("if"), id
+      env = step.fetch("env").keys.to_h { |key| [key, key.start_with?("WORKER_") ? "skipped" : "success"] }
+      env["EVENT"] = "merge_group"
+      env["SKIP"] = "true"
+      output, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"))
       assert status.success?, id
       assert_includes output, "skipped by policy"
-      env[env.keys.first] = "failure"
-      _output, status = Open3.capture2e(env, "bash", "-c", skip.fetch("run"))
-      refute status.success?, id
-      steps.reject { |step| step == skip }.each do |step|
-        refute evaluate(step.fetch("if"), decision), id
-        assert evaluate(step.fetch("if"), decision.merge("needs.queue-path-policy.result" => "failure")), id
+      env.keys.grep(/^WORKER_/).each do |key|
+        failure = env.merge(key => "failure")
+        _output, status = Open3.capture2e(failure, "bash", "-c", step.fetch("run"))
+        refute status.success?, "#{id}: #{key}"
+      end
+      env["SKIP"] = "false"
+      _output, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"))
+      assert status.success?, id
+      env.keys.grep(/RESULT$/).each do |key|
+        next if id == "code-quality" && key == "LINUX_RESULT"
+        _output, status = Open3.capture2e(env.merge(key => "failure"), "bash", "-c", step.fetch("run"))
+        refute status.success?, "#{id}: #{key}"
+      end
+    end
+  end
+
+  def test_macos_worker_conditions_preserve_cancelled_status_check
+    expected = "${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}"
+    %w[package-verification ios-verification ios-ui-verification macos-verification].each do |id|
+      assert_equal expected, @workflow.fetch("jobs").fetch(id).fetch("if"), id
+    end
+  end
+
+  def test_policy_step_reads_the_base_script_and_runs_all_when_missing
+    step = @workflow.fetch("jobs").fetch("queue-path-policy").fetch("steps").find { |item| item["id"] == "policy" }
+    Dir.mktmpdir do |directory|
+      git = lambda do |*args|
+        out, status = Open3.capture2e("git", *args, chdir: directory)
+        assert status.success?, out
+        out.strip
+      end
+      git.call("init", "-q")
+      git.call("config", "user.name", "Test")
+      git.call("config", "user.email", "test@example.invalid")
+      File.write(File.join(directory, "initial"), "initial")
+      git.call("add", ".")
+      git.call("commit", "-qm", "without policy")
+      missing_base = git.call("rev-parse", "HEAD")
+      FileUtils.mkdir_p(File.join(directory, ".github/scripts"))
+      script = File.join(directory, ".github/scripts/queue_path_policy.py")
+      File.write(script, "import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('run_macos=true\\n')\n")
+      git.call("add", ".")
+      git.call("commit", "-qm", "trusted policy")
+      base = git.call("rev-parse", "HEAD")
+      File.write(script, "import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('run_macos=false\\n')\n")
+      git.call("add", ".")
+      git.call("commit", "-qm", "changed head policy")
+      head = git.call("rev-parse", "HEAD")
+      [missing_base, base].each do |ref|
+        output = File.join(directory, "output")
+        File.write(output, "")
+        env = {"BASE_SHA" => ref, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output, "RUNNER_TEMP" => directory}
+        text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+        assert status.success?, text
+        assert_equal "run_macos=true\n", File.read(output), ref
       end
     end
   end
@@ -436,12 +482,13 @@ class PullRequestWorkflowTests < Minitest::Test
     # The result job takes the verdict of the job that ran for the event, and nothing else.
     step = result.fetch("steps").find { |item| item["name"] == "Require Swift style" }
     assert_equal({"EVENT" => "${{ github.event_name }}", "LINUX_RESULT" => "${{ needs.swift-style-linux.outputs.style }}",
-                  "MACOS_RESULT" => "${{ needs.package-verification.outputs.style }}"}, step.fetch("env"))
+                  "MACOS_RESULT" => "${{ needs.package-verification.outputs.style }}",
+                  "WORKER_0" => "${{ needs.package-verification.result }}"}, step.fetch("env"))
     verdicts = ["", "success", "failure", "skipped"]
     {"pull_request" => "LINUX_RESULT", "merge_group" => "MACOS_RESULT", "workflow_dispatch" => "MACOS_RESULT"}
       .each do |event, decisive|
         verdicts.product(verdicts).each do |linux_verdict, macos_verdict|
-          env = {"EVENT" => event, "LINUX_RESULT" => linux_verdict, "MACOS_RESULT" => macos_verdict}
+          env = {"EVENT" => event, "LINUX_RESULT" => linux_verdict, "MACOS_RESULT" => macos_verdict, "SKIP" => "false"}
           _out, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"))
           expected = env.fetch(decisive) == "success"
           assert_equal expected, status.success?, "#{event}: Linux #{linux_verdict.inspect}, macOS #{macos_verdict.inspect}"
@@ -846,12 +893,10 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal "${{ steps.upgrade-probes.outcome }}", macos.fetch("outputs").fetch("upgrade_probes")
     gate_job = jobs.fetch("macos-app-shell")
     assert_equal "macOS app shell", gate_job.fetch("name"), "The gate must stay the required check of that name"
-    gate = gate_job.fetch("steps").find { |step| step.fetch("env", {}).key?("RESULT") &&
-      step.fetch("env").fetch("RESULT").include?("upgrade_probes") }
-    refute_nil gate, "The macOS gate must require the probe result"
-    assert_equal "${{ needs.macos-verification.outputs.upgrade_probes }}", gate.fetch("env").fetch("RESULT")
-    assert_equal 'test "$RESULT" = success', gate.fetch("run")
-    assert_includes gate.fetch("if"), "always()", "The probe result must report even when the app shell check fails"
+    gate = gate_job.fetch("steps").first
+    assert_equal "${{ needs.macos-verification.outputs.upgrade_probes }}", gate.fetch("env").fetch("PROBES_RESULT")
+    assert_equal "${{ needs.macos-verification.outputs.shell }}", gate.fetch("env").fetch("SHELL_RESULT")
+    assert_equal "${{ always() }}", gate.fetch("if"), "The probe result must report even when the app shell check fails"
     assert_includes gate_job.fetch("needs"), "macos-verification"
     # Without always(), a failing macOS job would skip the gate and the required check would never be evaluated.
     assert_equal "${{ always() && github.event_name != 'pull_request' }}", gate_job.fetch("if")

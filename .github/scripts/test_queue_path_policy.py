@@ -12,19 +12,12 @@ spec.loader.exec_module(policy)
 
 
 class QueuePathPolicyTests(unittest.TestCase):
-    def test_allowlist_and_denials(self):
-        for paths in [['Wiki/page.txt'], ['site/index.html'], ['docs/guide.md'], ['README.md'], ['Wiki/a', 'site/b']]:
+    def test_allowlist(self):
+        for paths in [['Wiki/page.txt'], ['site/index.html'], ['README.md'], ['SECURITY.md'], ['Wiki/a', 'site/b']]:
             with self.subTest(paths=paths):
                 self.assertTrue(policy.can_skip(paths))
-        for path in ['.github/a.md', 'scripts/a.md', 'project.yml', 'BuildSupport/a.md',
-                     'VendorPatches/a.md', 'site/a.swift', 'Wiki/a.Swift', 'App/a.md',
-                     'CONTRIBUTING.md', 'AGENTS.md', 'CLAUDE.md', 'PROJECT-TRAPS.md', 'unknown']:
-            with self.subTest(path=path):
-                self.assertFalse(policy.can_skip([path]))
-                self.assertFalse(policy.can_skip(['site/index.html', path]))
-        self.assertFalse(policy.can_skip([]))
 
-    def test_git_diff_counts_both_sides_of_rename_and_invalid_base_runs(self):
+    def test_git_diff_renames_and_invalid_base_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             def git(*args):
@@ -50,6 +43,19 @@ class QueuePathPolicyTests(unittest.TestCase):
             git('add', '-A')
             git('commit', '-qm', 'rename')
             env.update(BASE_SHA=doc_head, HEAD_SHA=git('rev-parse', 'HEAD'))
+            subprocess.run(['python3', str(SCRIPT)], cwd=root, env=env, check=True, capture_output=True)
+            self.assertEqual('run_macos=true\n', output.read_text())
+            output.unlink()
+            (root / 'App').mkdir()
+            (root / 'App/Thing.swift').write_text('unchanged contents\n')
+            git('add', '-A')
+            git('commit', '-qm', 'protected')
+            protected_base = git('rev-parse', 'HEAD')
+            (root / 'Wiki').mkdir()
+            (root / 'App/Thing.swift').rename(root / 'Wiki/Thing.txt')
+            git('add', '-A')
+            git('commit', '-qm', 'move protected to wiki')
+            env.update(BASE_SHA=protected_base, HEAD_SHA=git('rev-parse', 'HEAD'))
             subprocess.run(['python3', str(SCRIPT)], cwd=root, env=env, check=True, capture_output=True)
             self.assertEqual('run_macos=true\n', output.read_text())
             output.unlink()
