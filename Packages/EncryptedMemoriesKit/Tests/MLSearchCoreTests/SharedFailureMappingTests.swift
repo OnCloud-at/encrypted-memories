@@ -6,8 +6,17 @@ import XCTest
 final class SharedFailureMappingTests: XCTestCase {
     func testRuntimeAndInstallerCauses() {
         XCTAssertEqual(MLRuntimeFailure(category: .network).failureCause, .network)
+        for category in [
+            MLRuntimeFailureCategory.missingModel, .incompatibleModel, .invalidOutputSchema,
+            .invalidStaticInputContract,
+        ] {
+            XCTAssertEqual(MLRuntimeFailure(category: category).failureCause, .permanent)
+        }
+        XCTAssertEqual(MLRuntimeFailure(category: .temporaryResource).failureCause, .localTransient)
+        XCTAssertEqual(MLRuntimeFailure(category: .retryableRuntimeState).failureCause, .localTransient)
+        XCTAssertEqual(MLModelInstallError.licenseProhibitsDistribution.failureCause, .unsupported)
         XCTAssertEqual(MLRuntimeFailure(category: .unknown).failureCause, .unknown)
-        XCTAssertEqual(MLRuntimeFailure(category: .incompatibleModel).failureCause, .unknown)
+        XCTAssertEqual(MLRuntimeFailure(category: .incompatibleModel).failureCause, .permanent)
         XCTAssertEqual(MLModelInstallError.notDownloadable.failureCause, .unknown)
         XCTAssertEqual(
             MLModelInstallError.insufficientStorage(requiredBytes: 10, availableBytes: 1).failureCause, .deviceStorage)

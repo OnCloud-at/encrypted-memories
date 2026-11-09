@@ -4,9 +4,10 @@ extension MLRuntimeFailure: FailureClassifiable {
     public var failureCause: FailureCause {
         switch category {
         case .network: .network
-        case .missingModel, .incompatibleModel, .invalidOutputSchema, .invalidStaticInputContract, .temporaryResource,
-            .retryableRuntimeState, .unknown:
-            .unknown
+        case .missingModel, .incompatibleModel, .invalidOutputSchema, .invalidStaticInputContract: .permanent
+        // These are local runtime conditions; they do not establish a service failure.
+        case .temporaryResource, .retryableRuntimeState: .localTransient
+        case .unknown: .unknown
         }
     }
 }

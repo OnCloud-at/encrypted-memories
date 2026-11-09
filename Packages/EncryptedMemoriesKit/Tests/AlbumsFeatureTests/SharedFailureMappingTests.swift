@@ -12,6 +12,11 @@ final class SharedFailureMappingTests: XCTestCase {
     func testKnownAlbumCausesAndPartialResults() {
         XCTAssertEqual(AlbumError.requestFailed(AlbumWriteCause(URLError(.timedOut))).failureCause, .network)
         XCTAssertEqual(AlbumError.requestFailed(AlbumWriteCause(URLError(.cancelled))).failureCause, .cancelled)
+        XCTAssertEqual(AlbumError.requestFailed(AlbumWriteCause(CancellationError())).failureCause, .cancelled)
+        let cancelledWrite = AlbumError.requestFailed(AlbumWriteCause(URLError(.cancelled)))
+        let policy = FailurePolicy.resolve(cancelledWrite.failureCause, situation: .awaitedByPerson, safety: .mutation)
+        XCTAssertEqual(policy.retry, .afterReconciliation)
+        XCTAssertEqual(policy.presentation, .alert)
         XCTAssertEqual(
             AlbumError.requestFailed(AlbumWriteCause(URLError(.badServerResponse), httpStatus: 503)).failureCause,
             .serviceTemporary)
@@ -21,5 +26,18 @@ final class SharedFailureMappingTests: XCTestCase {
             AlbumError.albumCreatedButPhotosNotAdded(albumID: "id", albumName: "name", message: "").failureCause,
             .partialCompletion
         )
+    }
+    func testAdditionalAlbumCauses() {
+        XCTAssertEqual(
+            AlbumError.partialAddWithCauses(succeeded: 1, total: 2, message: "", failures: []).failureCause,
+            .partialCompletion)
+        XCTAssertEqual(AlbumError.sharedAlbumReadOnly(.roleDoesNotPermitEditing).failureCause, .permission)
+        XCTAssertEqual(AlbumError.requestFailed(AlbumWriteCause(URLError(.badURL))).failureCause, .unknown)
+        XCTAssertEqual(
+            AlbumError.requestFailed(AlbumWriteCause(URLError(.badServerResponse), httpStatus: 403)).failureCause,
+            .unknown)
+        XCTAssertEqual(
+            AlbumError.requestFailed(AlbumWriteCause(URLError(.badServerResponse), httpStatus: 429)).failureCause,
+            .rateLimited)
     }
 }

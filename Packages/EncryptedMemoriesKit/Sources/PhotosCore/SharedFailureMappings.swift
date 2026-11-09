@@ -5,11 +5,8 @@ extension VideoPlaybackError: FailureClassifiable {
         case .quotaOrRateLimited: .rateLimited
         case .streamURLUnavailable: .unsupported
         case .authExpired: .authentication
-        case .notVideo, .unsupportedCodec, .decryptionFailed, .malformedContent, .metadataUnavailable,
-            .rangeNotSupported,
-            .timedOut, .localFileError,
-            .playerItemFailed, .unknown:
-            .unknown
+        case .notVideo, .unsupportedCodec, .decryptionFailed, .malformedContent: .permanent
+        case .metadataUnavailable, .rangeNotSupported, .timedOut, .localFileError, .playerItemFailed, .unknown: .unknown
         }
     }
 }
