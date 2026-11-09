@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import PhotosCore
 
@@ -39,10 +40,18 @@ public final class TimelineScrollDateLabelController {
         /// The shared duration for this visibility transition.
         public let fadeDuration: TimeInterval?
 
-        public init(isVisible: Bool, text: String?, fadeDuration: TimeInterval?) {
+        public let slideDuration: TimeInterval?
+        public let indicatorOffset: CGFloat
+
+        public init(
+            isVisible: Bool, text: String?, fadeDuration: TimeInterval?,
+            slideDuration: TimeInterval? = nil, indicatorOffset: CGFloat = 0
+        ) {
             self.isVisible = isVisible
             self.text = text
             self.fadeDuration = fadeDuration
+            self.slideDuration = slideDuration
+            self.indicatorOffset = indicatorOffset
         }
 
         public static let hidden = Presentation(isVisible: false, text: nil, fadeDuration: nil)
@@ -143,6 +152,26 @@ public final class TimelineScrollDateLabelController {
         if state.suppressesLabel { suppress() } else { resume() }
     }
 
+    /// The adapter identified a native indicator drag. Visibility and offset are shared policy decisions.
+    public func indicatorDragBegan(offset: CGFloat, radius: CGFloat) {
+        guard !isRetired else { return }
+        policy.indicatorDragBegan(offset: offset, radius: radius)
+        if policy.isIndicatorDragging { cancelHide() }
+        publish()
+    }
+
+    /// Retirement suppresses the policy and ends its contact, so the policy rejects subsequent movement.
+    public func indicatorDragMoved(offset: CGFloat, radius: CGFloat) {
+        if policy.indicatorDragMoved(offset: offset, radius: radius) { publish() }
+    }
+
+    public func indicatorDragEnded() {
+        guard !isRetired else { return }
+        policy.indicatorDragEnded(at: clock.now())
+        publish()
+        scheduleHideIfNeeded()
+    }
+
     /// A viewport movement that the user drives.
     public func userMoved(offsetY: Double) {
         guard !isRetired else { return }
@@ -208,8 +237,9 @@ public final class TimelineScrollDateLabelController {
         if index == nil { text = nil }
         let next = Presentation(
             isVisible: visible && text != nil, text: text,
-            fadeDuration: animated && !reduceMotion ? policy.fadeDuration : nil)
-
+            fadeDuration: animated && !reduceMotion ? policy.fadeDuration : nil,
+            slideDuration: animated && !reduceMotion ? policy.slideDuration : nil,
+            indicatorOffset: policy.indicatorOffset)
         // An immediate hide also reaches the host when the label is already fading out, so the fade stops at once.
         guard next != presentation || (!animated && !next.isVisible) else { return }
         presentation = next

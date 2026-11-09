@@ -7,7 +7,8 @@ import Foundation
 /// - A brisk user scroll shows the label: the smoothed speed reaches `showSpeed`.
 /// - User movement at `sustainSpeed` or faster keeps it, including momentum. The gap between both speeds keeps a
 ///   stop and restart near the threshold from flickering.
-/// - The label hides `linger` seconds after the last such movement.
+/// - A visible native-thumb contact shows without a speed threshold and holds the label until contact ends.
+/// - Contact release returns the label to its usual edge; the label hides after the `linger` interval.
 /// - Marked navigation jumps end the linger. Layout and content-driven adjustments only reset the speed sample.
 /// - Pinch, route changes and inactive surfaces hide it at once.
 public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
@@ -53,7 +54,12 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     public private(set) var isSuppressed = false
     /// Frozen when visibility changes. Nil means an immediate change, such as suppression.
     public private(set) var fadeDuration: TimeInterval?
-
+    public private(set) var isIndicatorDragging = false
+    /// Offsets the label during thumb contact; release or cancellation returns it to the usual edge.
+    public private(set) var isDragOffset = false
+    public private(set) var slideDuration: TimeInterval?
+    public private(set) var indicatorOffset: CGFloat = 0
+    private var indicatorRadius: CGFloat = 0
     private var lastOffsetY: Double?
     private var lastTime: TimeInterval?
     private var smoothedSpeed: Double = 0
@@ -66,7 +72,7 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
 
     /// A viewport movement that the user drives: finger, momentum, scroll indicator, wheel, trackpad or keyboard.
     public mutating func userMoved(offsetY: Double, at time: TimeInterval) {
-        guard !isSuppressed else { return }
+        guard !isSuppressed, !isIndicatorDragging else { return }
         defer {
             lastOffsetY = offsetY
             lastTime = time
@@ -80,7 +86,11 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
         let instant = abs(offsetY - previousY) / interval
         let weight = 1 - exp(-interval / tuning.smoothing)
         smoothedSpeed += (instant - smoothedSpeed) * weight
-
+        if isDragOffset, smoothedSpeed >= tuning.showSpeed {
+            isDragOffset = false
+            indicatorOffset = 0
+            slideDuration = TimelineScrollDateLabelMotion.indicatorSlideBack
+        }
         if isVisible {
             if smoothedSpeed >= tuning.sustainSpeed {
                 lastSustainingSpeed = smoothedSpeed
@@ -92,6 +102,44 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
             lastSustainingSpeed = smoothedSpeed
             fadeDuration = tuning.fadeIn.duration(for: smoothedSpeed, fastBoundary: tuning.fastFadeSpeed)
         }
+    }
+
+    /// The host validated a native indicator contact. It shows without a speed threshold and cannot time out.
+    public mutating func indicatorDragBegan(offset: CGFloat, radius: CGFloat) {
+        guard !isSuppressed, !isIndicatorDragging else { return }
+        if !isVisible { fadeDuration = tuning.fadeIn.fast }
+        isVisible = true
+        isIndicatorDragging = true
+        isDragOffset = true
+        indicatorOffset = offset
+        indicatorRadius = TimelineScrollDateLabelGeometry.resolvedContactRadius(radius)
+        slideDuration = TimelineScrollDateLabelMotion.indicatorSlideOut
+        hideDeadline = nil
+        lastSustainingSpeed = tuning.fastFadeSpeed
+    }
+
+    /// Position changes track directly; a reported radius step uses the existing short slide ease.
+    @discardableResult
+    public mutating func indicatorDragMoved(offset: CGFloat, radius: CGFloat) -> Bool {
+        guard isIndicatorDragging else { return false }
+        let radius = TimelineScrollDateLabelGeometry.resolvedContactRadius(radius)
+        let radiusChanged = radius != indicatorRadius
+        indicatorRadius = radius
+        guard offset != indicatorOffset else { return false }
+        indicatorOffset = offset
+        slideDuration = radiusChanged ? TimelineScrollDateLabelMotion.indicatorSlideOut : nil
+        return true
+    }
+
+    /// Release returns to the normal edge immediately and starts the usual linger while still visible.
+    public mutating func indicatorDragEnded(at time: TimeInterval) {
+        guard isIndicatorDragging || isDragOffset else { return }
+        isIndicatorDragging = false
+        isDragOffset = false
+        indicatorOffset = 0
+        slideDuration = TimelineScrollDateLabelMotion.indicatorSlideBack
+        if isVisible { hideDeadline = time + tuning.linger }
+        resetMeasurement()
     }
 
     /// A movement without user input. A marked navigation jump ends the linger; layout, resize and content-driven
@@ -118,7 +166,12 @@ public struct TimelineScrollDateLabelPolicy: Equatable, Sendable {
     /// Hides the label at once, for example when its content became stale.
     public mutating func hide(duration: TimeInterval? = nil) {
         isVisible = false
-
+        isIndicatorDragging = false
+        if duration == nil {
+            isDragOffset = false
+            indicatorOffset = 0
+            slideDuration = nil
+        }
         hideDeadline = nil
         fadeDuration = duration
         lastSustainingSpeed = 0
@@ -161,7 +214,18 @@ public enum TimelineScrollDateLabelMotion {
     public static let fadeOut = FadeDurations(slow: 0.70, fast: 0.35)
     /// Boundary at the first smoothed show sample, not at the raw input speed. The visibility threshold stays 600.
     public static let fastFadeSpeed: Double = 650
-
+    /// Seconds of the outward and return slide, tuned independently from the fades.
+    public static let indicatorSlideOut: TimeInterval = 0.22
+    public static let indicatorSlideBack: TimeInterval = 0.22
+    /// A native thumb contact requires effective rendered opacity strictly above this boundary.
+    public static let indicatorContactAlphaThreshold: Float = 0.01
+    /// Gap from the reported finger edge. Calibrated so the median measured thumb contact has a 40 pt thumb gap.
+    public static let indicatorFingerGap: CGFloat = 16.964134412507207
+    /// Smallest measured radius including tolerance, used only when the native sample is unavailable or invalid.
+    public static let indicatorFallbackRadius: CGFloat = 18.151899190619588
+    /// Maximum distance in points between the label right edge and the native thumb left edge.
+    /// The ceiling can overlap an extreme live sample; it never hides an already visible label.
+    public static let indicatorMaximumFingerGap: CGFloat = 87.80379838123918
     /// Points between the label's trailing edge and the scroll host's trailing edge, clear of the indicator.
     public static let indicatorGap: CGFloat = 16
     /// Width of the trailing column that the label can occupy, from the trailing edge, including the indicator gap.
@@ -174,8 +238,75 @@ public enum TimelineScrollDateLabelMotion {
     }
 }
 
-/// Vertical placement of the scroll date label beside the native scroll indicator.
+/// Placement and native-thumb contact geometry shared by the scroll date label adapters.
 public enum TimelineScrollDateLabelGeometry {
+    /// Follows the reported finger edge directly. All positions share the host coordinate space; radius already
+    /// includes the native tolerance. The sole distance ceiling may overlap an exceptionally large contact.
+    public static func indicatorDragOffset(
+        normalRightX: CGFloat, thumbLeftX: CGFloat, contactX: CGFloat, contactRadius: CGFloat
+    ) -> CGFloat {
+        let radius = resolvedContactRadius(contactRadius)
+        let right = min(
+            normalRightX,
+            max(
+                contactX - radius - TimelineScrollDateLabelMotion.indicatorFingerGap,
+                thumbLeftX - TimelineScrollDateLabelMotion.indicatorMaximumFingerGap))
+        return normalRightX - right
+    }
+
+    /// Adapters pass their actual thumb and rendered opacity. The contact envelope includes the
+    /// reported radius and the real strip between the thumb and the physical trailing edge.
+    public static func acceptsIndicatorContact(
+        at point: CGPoint, radius: CGFloat, thumb: CGRect, viewportRightX: CGFloat, effectiveAlpha: Float
+    ) -> Bool {
+        guard effectiveAlpha > TimelineScrollDateLabelMotion.indicatorContactAlphaThreshold,
+            keepsIndicatorContact(atY: point.y, radius: radius, thumb: thumb)
+        else { return false }
+        let radius = resolvedContactRadius(radius)
+        // Limit leftward eligibility so the full reported finger gap fits inside the maximum label distance.
+        let leftReach = min(
+            radius,
+            TimelineScrollDateLabelMotion.indicatorMaximumFingerGap
+                - TimelineScrollDateLabelMotion.indicatorFingerGap - radius)
+        return point.x >= thumb.minX - leftReach && point.x <= max(thumb.maxX, viewportRightX) + radius
+    }
+
+    /// The reported radius supplies vertical slack. During a hold, the clamped track end stays open so a finger
+    /// can travel beyond the track and return. Initial eligibility always uses the closed thumb envelope.
+    public static func keepsIndicatorContact(
+        atY y: CGFloat, radius: CGFloat, thumb: CGRect, atTop: Bool = false, atBottom: Bool = false
+    ) -> Bool {
+        guard let extent = indicatorContactRange(radius: radius, thumb: thumb) else { return false }
+        return extent.contains(y) || (atTop && y < extent.lowerBound) || (atBottom && y > extent.upperBound)
+    }
+
+    /// A touch can precede native layout. Keep one pending sample while the previous sample still aligns.
+    public static func continuesIndicatorContactAfterMove(
+        at y: CGFloat, previousY: CGFloat, radius: CGFloat, thumb: CGRect, atTop: Bool, atBottom: Bool
+    ) -> Bool {
+        keepsIndicatorContact(atY: y, radius: radius, thumb: thumb, atTop: atTop, atBottom: atBottom)
+            || keepsIndicatorContact(atY: previousY, radius: radius, thumb: thumb, atTop: atTop, atBottom: atBottom)
+    }
+
+    /// Native layout can precede the touch. Keep the current finger sample if either adjacent thumb rect aligns.
+    public static func continuesIndicatorContactAfterLayout(
+        at y: CGFloat, radius: CGFloat, thumb: CGRect, previousThumb: CGRect, atTop: Bool, atBottom: Bool
+    ) -> Bool {
+        guard indicatorContactRange(radius: radius, thumb: thumb) != nil else { return false }
+        return keepsIndicatorContact(atY: y, radius: radius, thumb: thumb, atTop: atTop, atBottom: atBottom)
+            || keepsIndicatorContact(atY: y, radius: radius, thumb: previousThumb, atTop: atTop, atBottom: atBottom)
+    }
+
+    private static func indicatorContactRange(radius: CGFloat, thumb: CGRect) -> ClosedRange<CGFloat>? {
+        guard thumb.width > 0, thumb.height > 0 else { return nil }
+        let contactSlack = resolvedContactRadius(radius)
+        return (thumb.minY - contactSlack)...(thumb.maxY + contactSlack)
+    }
+
+    fileprivate static func resolvedContactRadius(_ radius: CGFloat) -> CGFloat {
+        radius.isFinite && radius > 0 ? radius : TimelineScrollDateLabelMotion.indicatorFallbackRadius
+    }
+
     /// The native thumb owns its track, proportional/minimum length and overscroll squeeze. The adapter forwards
     /// that actual geometry. Only a reserved region or viewport edge can move the label away from its center.
     public static func centerY(
