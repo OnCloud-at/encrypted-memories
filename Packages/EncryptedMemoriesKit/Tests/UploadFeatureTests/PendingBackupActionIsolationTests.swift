@@ -181,7 +181,7 @@ final class PendingBackupActionIsolationTests: XCTestCase {
     }
 
     private func change(_ sql: String, at url: URL) throws {
-        try withDatabase(at: url, flags: SQLITE_OPEN_READWRITE) { db in
+        try withSQLiteDatabase(at: url, flags: SQLITE_OPEN_READWRITE) { db in
             XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
             XCTAssertEqual(sqlite3_changes(db), 1, "Only the named entry changes")
         }
@@ -194,7 +194,7 @@ final class PendingBackupActionIsolationTests: XCTestCase {
 
     /// Compare all stored columns, including unknown enum bytes, attempts, dates, generation and handoff flags.
     private func storedRows(for identifier: String, at url: URL) throws -> [[[Cell]]] {
-        try withDatabase(at: url, flags: SQLITE_OPEN_READONLY) { db in
+        try withSQLiteDatabase(at: url, flags: SQLITE_OPEN_READONLY) { db in
             try ["source_state", "pending_action", "handoff"].map { table in
                 var statement: OpaquePointer?
                 XCTAssertEqual(
@@ -225,14 +225,6 @@ final class PendingBackupActionIsolationTests: XCTestCase {
                 return rows
             }
         }
-    }
-
-    private func withDatabase<T>(at url: URL, flags: Int32, _ body: (OpaquePointer) throws -> T) throws -> T {
-        var handle: OpaquePointer?
-        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, flags, nil), SQLITE_OK)
-        let db = try XCTUnwrap(handle)
-        defer { sqlite3_close(db) }
-        return try body(db)
     }
 }
 

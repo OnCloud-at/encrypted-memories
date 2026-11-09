@@ -5,7 +5,7 @@ import XCTest
 /// Interrupts one matching statement on the store's own connection. Later probes can succeed immediately.
 final class SQLiteReadInterrupt {
     private let connection: SQLiteStoreConnection
-    private let matching: String
+    private let matches: (String) -> Bool
     private let afterRows: Int
     private var remaining: Int
     private var shotsRemaining: Int
@@ -24,7 +24,7 @@ final class SQLiteReadInterrupt {
     ///     the default of one shot keeps the original behavior exactly: only the `occurrence`-th
     ///     matching statement is armed, and nothing is armed after it. `fired` reports whether any
     ///     shot fired.
-    init(
+    convenience init(
         in store: Any,
         matching: String,
         occurrence: Int = 1,
@@ -32,8 +32,22 @@ final class SQLiteReadInterrupt {
         afterRows: Int = 0,
         onFire: (() -> Void)? = nil
     ) throws {
+        try self.init(
+            in: store, matches: { $0.contains(matching) }, occurrence: occurrence, shots: shots, afterRows: afterRows,
+            onFire: onFire)
+    }
+
+    /// Interrupts the `occurrence`-th statement whose SQL satisfies `matches`; `{ _ in true }` counts every statement.
+    init(
+        in store: Any,
+        matches: @escaping (String) -> Bool,
+        occurrence: Int = 1,
+        shots: Int = 1,
+        afterRows: Int = 0,
+        onFire: (() -> Void)? = nil
+    ) throws {
         connection = try storeConnection(store)
-        self.matching = matching
+        self.matches = matches
         self.afterRows = afterRows
         self.shotsRemaining = max(shots, 1)
         self.onFire = onFire
@@ -56,7 +70,7 @@ final class SQLiteReadInterrupt {
                     // The previous statement has ended; a later shot may interrupt again.
                     fault.interrupted = false
                     guard let sql = sqlite3_sql(OpaquePointer(statement)),
-                        String(cString: sql).contains(fault.matching)
+                        fault.matches(String(cString: sql))
                     else { return 0 }
                     fault.remaining -= 1
                     // The `occurrence`-th match is armed; later matches only after a shot fired.
