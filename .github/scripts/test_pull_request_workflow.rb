@@ -32,6 +32,160 @@ class PullRequestWorkflowTests < Minitest::Test
       .select { |step| step.fetch("env", {}).key?("BASE_SHA") }
   end
 
+  def test_queue_path_policy_never_skips_protected_or_unknown_paths
+    script = File.expand_path("queue_path_policy.py", __dir__)
+    paths = %w[.github/test.md scripts/test.md project.yml BuildSupport/test.md VendorPatches/test.md
+               site/test.swift Wiki/test.swift unknown App/test.md docs/guide.md README.MD agents.md Claude.md
+               CONTRIBUTING.md AGENTS.md CLAUDE.md PROJECT-TRAPS.md wiki/a.md Site/a.html Wiki/a.SWIFT]
+    code = "import json,runpy,sys; f=runpy.run_path(sys.argv[1])['can_skip']; print(json.dumps([f(p) for p in json.load(sys.stdin)]))"
+    result, status = Open3.capture2("python3", "-c", code, script, stdin_data: JSON.generate([[], *paths.map { |path| [path] }, *paths.map { |path| ["site/index.html", path] }]))
+    assert status.success?
+    assert_equal [false] * (1 + paths.length * 2), JSON.parse(result)
+  end
+
+  def test_policy_skip_requires_a_successful_decision_and_skipped_workers
+    jobs = @workflow.fetch("jobs")
+    decision = {"github.event_name" => "merge_group", "needs.queue-path-policy.result" => "success",
+                "needs.queue-path-policy.outputs.run_macos" => "false"}
+    policy = jobs.fetch("queue-path-policy")
+    assert_equal "${{ github.event_name == 'merge_group' }}", policy.fetch("if")
+    step = policy.fetch("steps").find { |item| item["id"] == "policy" }
+    assert_equal "${{ github.event.merge_group.base_sha }}", step.fetch("env").fetch("BASE_SHA")
+    assert_equal "${{ github.event.merge_group.head_sha }}", step.fetch("env").fetch("HEAD_SHA")
+    assert_equal "${{ github.token }}", step.fetch("env").fetch("GH_TOKEN")
+    workers = %w[package-verification ios-verification ios-ui-verification macos-verification]
+    workers.each do |id|
+      condition = jobs.fetch(id).fetch("if")
+      refute evaluate(condition, decision), id
+      assert evaluate(condition, decision.merge("needs.queue-path-policy.result" => "failure")), id
+      assert evaluate(condition, decision.merge("needs.queue-path-policy.outputs.run_macos" => "true")), id
+      assert evaluate(condition, decision.merge("github.event_name" => "workflow_dispatch")), id
+    end
+    %w[code-quality package-tests architecture ios-app-tests ios-ui-tests macos-app-shell ios-app-shell].each do |id|
+      job = jobs.fetch(id)
+      skip = job.fetch("env").fetch("SKIP")
+      assert evaluate(skip, decision), id
+      refute evaluate(skip, decision.merge("needs.queue-path-policy.result" => "failure")), id
+      refute evaluate(skip, decision.merge("github.event_name" => "workflow_dispatch")), id
+      step = job.fetch("steps").fetch(0)
+      assert_equal "${{ always() }}", step.fetch("if"), id
+      env = step.fetch("env").keys.to_h { |key| [key, key.start_with?("WORKER_") ? "skipped" : "success"] }
+      env["EVENT"] = "merge_group"
+      env["SKIP"] = "true"
+      output, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"))
+      assert status.success?, id
+      assert_includes output, "skipped by policy"
+      env.keys.grep(/^WORKER_/).each do |key|
+        failure = env.merge(key => "failure")
+        _output, status = Open3.capture2e(failure, "bash", "-c", step.fetch("run"))
+        refute status.success?, "#{id}: #{key}"
+      end
+      env["SKIP"] = "false"
+      _output, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"))
+      assert status.success?, id
+      env.keys.grep(/RESULT$/).each do |key|
+        next if id == "code-quality" && key == "LINUX_RESULT"
+        _output, status = Open3.capture2e(env.merge(key => "failure"), "bash", "-c", step.fetch("run"))
+        refute status.success?, "#{id}: #{key}"
+      end
+    end
+  end
+
+  def test_macos_worker_conditions_preserve_cancelled_status_check
+    expected = "${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}"
+    %w[package-verification ios-verification ios-ui-verification macos-verification].each do |id|
+      assert_equal expected, @workflow.fetch("jobs").fetch(id).fetch("if"), id
+    end
+  end
+
+  def test_policy_step_reads_the_base_script_and_runs_all_when_missing
+    step = @workflow.fetch("jobs").fetch("queue-path-policy").fetch("steps").find { |item| item["id"] == "policy" }
+    Dir.mktmpdir do |directory|
+      git = lambda do |*args|
+        out, status = Open3.capture2e("git", *args, chdir: directory)
+        assert status.success?, out
+        out.strip
+      end
+      git.call("init", "-q")
+      git.call("config", "user.name", "Test")
+      git.call("config", "user.email", "test@example.invalid")
+      File.write(File.join(directory, "initial"), "initial")
+      git.call("add", ".")
+      git.call("commit", "-qm", "without policy")
+      missing_base = git.call("rev-parse", "HEAD")
+      FileUtils.mkdir_p(File.join(directory, ".github/scripts"))
+      script = File.join(directory, ".github/scripts/queue_path_policy.py")
+      File.write(script, "import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('run_macos=' + os.environ.get('POLICY_TEST_RESULT', 'true') + '\\n')\n")
+      guard = File.join(directory, ".github/scripts/require_merge_queue.py")
+      File.write(guard, "import json,os,sys\nif os.environ.get('OLD_READER'): print('unrecognized arguments: --require-allgreen', file=sys.stderr); sys.exit(2)\nsys.exit(0 if sys.argv[1:] == ['--require-allgreen', 'test/repo'] and os.environ.get('POLICY_STRATEGY') == 'ALLGREEN' else 1)\n")
+      git.call("add", ".")
+      git.call("commit", "-qm", "trusted policy")
+      base = git.call("rev-parse", "HEAD")
+      File.write(script, "import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('run_macos=false\\n')\n")
+      git.call("add", ".")
+      git.call("commit", "-qm", "changed head policy")
+      head = git.call("rev-parse", "HEAD")
+      ["", missing_base, base].each do |ref|
+        output = File.join(directory, "output")
+        File.write(output, "")
+        env = {"BASE_SHA" => ref, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output, "RUNNER_TEMP" => directory, "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN"}
+        text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+        assert status.success?, text
+        assert_equal "run_macos=true\n", File.read(output), ref
+      end
+      ["ALLGREEN", "HEADGREEN", "", "UNAVAILABLE"].each do |strategy|
+        output = File.join(directory, "output")
+        File.write(output, "")
+        env = {"BASE_SHA" => base, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
+               "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => strategy, "POLICY_TEST_RESULT" => "false"}
+        text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+        assert status.success?, text
+        assert_equal "run_macos=#{strategy == 'ALLGREEN' ? 'false' : 'true'}\n", File.read(output), strategy
+      end
+      output = File.join(directory, "output")
+      File.write(output, "")
+      tree = git.call("rev-parse", "#{base}^{tree}")
+      env = {"BASE_SHA" => tree, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
+             "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN", "POLICY_TEST_RESULT" => "false"}
+      text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+      assert status.success?, text
+      assert_equal "run_macos=true\n", File.read(output), "tree base"
+      output = File.join(directory, "output")
+      File.write(output, "")
+      env = {"BASE_SHA" => base, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
+             "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN",
+             "OLD_READER" => "1", "GH_TOKEN" => "synthetic-test-token"}
+      text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+      assert status.success?, text
+      assert_equal "run_macos=true\n", File.read(output)
+      assert_includes text, "unrecognized arguments: --require-allgreen"
+      refute_includes text, "synthetic-test-token"
+      # A head checkout can contain names that shadow Python's standard library.
+      File.write(script, File.read(File.expand_path("queue_path_policy.py", __dir__)))
+      git.call("add", ".")
+      git.call("commit", "-qm", "real policy")
+      real_base = git.call("rev-parse", "HEAD")
+      File.write(File.join(directory, "json.py"), "import sys; sys.exit(0)\n")
+      File.write(File.join(directory, "subprocess.py"), "PIPE=1\nclass Result: stdout=b'Wiki/page\\x00'\ndef run(*args, **kwargs): return Result()\n")
+      FileUtils.mkdir_p(File.join(directory, "App"))
+      File.write(File.join(directory, "App/x.swift"), "change")
+      git.call("add", ".")
+      git.call("commit", "-qm", "shadow standard library")
+      hostile_head = git.call("rev-parse", "HEAD")
+      [[base, "HEADGREEN"], [real_base, "ALLGREEN"]].each do |ref, strategy|
+        output = File.join(directory, "output")
+        File.write(output, "")
+        env = {"BASE_SHA" => ref, "HEAD_SHA" => hostile_head, "GITHUB_OUTPUT" => output,
+               "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => strategy,
+               "POLICY_TEST_RESULT" => "false", "GH_TOKEN" => "synthetic-test-token"}
+        text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+        assert status.success?, text
+        assert_equal "run_macos=true\n", File.read(output), strategy
+        refute_includes text, "synthetic-test-token"
+      end
+    end
+  end
+
   def test_merge_queue_runs_all_required_checks
     assert_equal ["checks_requested"], (@workflow["on"] || @workflow.fetch(true)).fetch("merge_group").fetch("types")
     jobs = @workflow.fetch("jobs").values
@@ -50,6 +204,7 @@ class PullRequestWorkflowTests < Minitest::Test
   SUPERSEDED_WATCHDOG = "cancel-superseded-run"
   # Runs only for pull requests, so the queue watchdog never waits for it; it is a worker, not a result job.
   PULL_REQUEST_ONLY_WORKERS = %w[swift-style-linux].freeze
+  POLICY_JOB = "queue-path-policy"
 
   def watchdog
     @workflow.fetch("jobs").fetch(WATCHDOG)
@@ -347,7 +502,7 @@ class PullRequestWorkflowTests < Minitest::Test
 
   def test_every_result_job_runs_also_when_a_worker_job_is_cancelled
     results = @workflow.fetch("jobs").reject do |id, _|
-      WORKER_JOBS.include?(id) || PULL_REQUEST_ONLY_WORKERS.include?(id) ||
+      WORKER_JOBS.include?(id) || PULL_REQUEST_ONLY_WORKERS.include?(id) || id == POLICY_JOB ||
         [WATCHDOG, SUPERSEDED_WATCHDOG].include?(id)
     end
     PULL_REQUEST_ONLY_WORKERS.each do |id|
@@ -375,17 +530,18 @@ class PullRequestWorkflowTests < Minitest::Test
         assert_equal on_linux, evaluate(linux.fetch("if"), context), "Linux job, #{event}"
         assert_equal on_macos, macos.fetch("if", "${{ true }}").then { |condition| evaluate(condition, context) }, "macOS job, #{event}"
       end
-    assert_equal %w[package-verification swift-style-linux], result.fetch("needs").sort
+    assert_equal %w[package-verification queue-path-policy swift-style-linux], result.fetch("needs").sort
     assert_equal "${{ always() }}", result.fetch("if")
     # The result job takes the verdict of the job that ran for the event, and nothing else.
-    step = result.fetch("steps").first
+    step = result.fetch("steps").find { |item| item["name"] == "Require Swift style" }
     assert_equal({"EVENT" => "${{ github.event_name }}", "LINUX_RESULT" => "${{ needs.swift-style-linux.outputs.style }}",
-                  "MACOS_RESULT" => "${{ needs.package-verification.outputs.style }}"}, step.fetch("env"))
+                  "MACOS_RESULT" => "${{ needs.package-verification.outputs.style }}",
+                  "WORKER_0" => "${{ needs.package-verification.result }}"}, step.fetch("env"))
     verdicts = ["", "success", "failure", "skipped"]
     {"pull_request" => "LINUX_RESULT", "merge_group" => "MACOS_RESULT", "workflow_dispatch" => "MACOS_RESULT"}
       .each do |event, decisive|
         verdicts.product(verdicts).each do |linux_verdict, macos_verdict|
-          env = {"EVENT" => event, "LINUX_RESULT" => linux_verdict, "MACOS_RESULT" => macos_verdict}
+          env = {"EVENT" => event, "LINUX_RESULT" => linux_verdict, "MACOS_RESULT" => macos_verdict, "SKIP" => "false"}
           _out, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"))
           expected = env.fetch(decisive) == "success"
           assert_equal expected, status.success?, "#{event}: Linux #{linux_verdict.inspect}, macOS #{macos_verdict.inspect}"
@@ -428,7 +584,7 @@ class PullRequestWorkflowTests < Minitest::Test
       [{"github.event.merge_group.base_sha" => "queue-base", "github.event.merge_group.head_sha" => "queue-head", "github.sha" => "merge"}, "queue-base", "queue-head"],
       [{"github.sha" => "dispatch-head"}, nil, "dispatch-head"]
     ]
-    diff_steps.each do |step|
+    diff_steps.reject { |step| step["name"] == "Select macOS jobs" }.each do |step|
       contexts.each do |context, base, head|
         actual_base = evaluate(step["env"]["BASE_SHA"], context)
         base.nil? ? assert_nil(actual_base, step["name"]) : assert_equal(base, actual_base, step["name"])
@@ -482,7 +638,7 @@ class PullRequestWorkflowTests < Minitest::Test
   def test_full_verification_uses_four_mac_runners_without_hygiene_waits
     mac_jobs = @workflow.fetch("jobs").select { |_, job| job["runs-on"] == "xcode-27" }
     assert_equal ["ios-ui-verification", "ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort
-    mac_jobs.each_value { |job| refute job.key?("needs") }
+    mac_jobs.each_value { |job| assert_equal [POLICY_JOB], job.fetch("needs") }
   end
 
   def test_queue_guard_runs_only_for_pull_requests
@@ -790,11 +946,9 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal "${{ steps.upgrade-probes.outcome }}", macos.fetch("outputs").fetch("upgrade_probes")
     gate_job = jobs.fetch("macos-app-shell")
     assert_equal "macOS app shell", gate_job.fetch("name"), "The gate must stay the required check of that name"
-    gate = gate_job.fetch("steps").find { |step| step.fetch("env", {}).key?("RESULT") &&
-      step.fetch("env").fetch("RESULT").include?("upgrade_probes") }
-    refute_nil gate, "The macOS gate must require the probe result"
-    assert_equal "${{ needs.macos-verification.outputs.upgrade_probes }}", gate.fetch("env").fetch("RESULT")
-    assert_equal 'test "$RESULT" = success', gate.fetch("run")
+    gate = gate_job.fetch("steps").first
+    assert_equal "${{ needs.macos-verification.outputs.upgrade_probes }}", gate.fetch("env").fetch("PROBES_RESULT")
+    assert_equal "${{ needs.macos-verification.outputs.shell }}", gate.fetch("env").fetch("SHELL_RESULT")
     assert_equal "${{ always() }}", gate.fetch("if"), "The probe result must report even when the app shell check fails"
     assert_includes gate_job.fetch("needs"), "macos-verification"
     # Without always(), a failing macOS job would skip the gate and the required check would never be evaluated.

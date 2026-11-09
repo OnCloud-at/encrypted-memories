@@ -148,6 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/test_require_merge_queue.py
+          python3 .github/scripts/test_queue_path_policy.py
           python3 .github/scripts/test_cancel_superseded_queue_run.py
           python3 -B .github/scripts/test_collect_ui_wait_diagnostics.py
           python3 .github/scripts/test_list_retried_tests.py
@@ -177,6 +178,39 @@ jobs:
           echo "$ACTIONLINT_SHA256  $archive" | sha256sum --check
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
+
+  # Compare this entry with its base (main or the entry ahead). Skips require ALLGREEN; otherwise run all macOS jobs.
+  # Both scripts come from the base; this workflow YAML comes from the head.
+  queue-path-policy:
+    name: Select merge queue jobs
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run_macos: ${{ steps.policy.outputs.run_macos }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select macOS jobs
+        id: policy
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null &&
+            git cat-file -e "$BASE_SHA:.github/scripts/queue_path_policy.py" 2>/dev/null &&
+            git show "$BASE_SHA:.github/scripts/require_merge_queue.py" |
+              python3 -I - --require-allgreen "$GITHUB_REPOSITORY" 1>&2; then
+            git show "$BASE_SHA:.github/scripts/queue_path_policy.py" | python3 -I -
+          else
+            echo "run_macos=true" >> "$GITHUB_OUTPUT"
+            echo "Base policy or ALLGREEN unavailable; macOS jobs required."
+          fi
 
   # swift-format and SwiftLint on Linux give the same verdicts as the macOS runner: a corpus with one deliberate
   # violation per rule and the whole repository gave identical exit codes, rule names and positions. The Swift
@@ -231,10 +265,11 @@ jobs:
         run: bash scripts/verify-swift-style.sh
 
   # The style check of a pull request runs on Linux (swift-style-linux), so it does not wait for a macOS runner. The
-  # queue runs the same check on the macOS runner with the Xcode toolchain, together with the tests.
+  # queue runs the same check with the Xcode toolchain when the macOS jobs are required.
   package-verification:
     name: Package verification and style
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: [queue-path-policy]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}
     runs-on: xcode-27
     timeout-minutes: 90
     outputs:
@@ -288,7 +323,8 @@ jobs:
 
   ios-verification:
     name: iOS verification
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: [queue-path-policy]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}
     runs-on: xcode-27
     timeout-minutes: 120
     outputs:
@@ -362,7 +398,8 @@ jobs:
   # runner ran twice as long and timed out UI waits.
   ios-ui-verification:
     name: iOS UI verification
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: [queue-path-policy]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}
     runs-on: xcode-27
     # The slowest finished queue run took 88 minutes, and another was cancelled at the 90-minute
     # job limit although no test failed; the merge queue then removed the pull request. 120 minutes
@@ -468,7 +505,8 @@ jobs:
 
   macos-verification:
     name: macOS verification
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: [queue-path-policy]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}
     runs-on: xcode-27
     timeout-minutes: 60
     outputs:
@@ -624,103 +662,179 @@ jobs:
 
   code-quality:
     name: Swift style
-    needs: [swift-style-linux, package-verification]
+    needs: [swift-style-linux, package-verification, queue-path-policy]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
     steps:
       - name: Require Swift style
+        if: ${{ always() }}
         env:
           EVENT: ${{ github.event_name }}
           LINUX_RESULT: ${{ needs.swift-style-linux.outputs.style }}
           MACOS_RESULT: ${{ needs.package-verification.outputs.style }}
-        # A pull request is checked on Linux, every other event on the macOS runner.
+          WORKER_0: ${{ needs.package-verification.result }}
         run: |
-          if [[ "$EVENT" == pull_request ]]; then
-            test "$LINUX_RESULT" = success
+          set -euo pipefail
+          if [[ "$SKIP" == true ]]; then
+            test "$WORKER_0" = skipped
+            echo "skipped by policy"
           else
-            test "$MACOS_RESULT" = success
+            if [[ "$EVENT" == pull_request ]]; then
+              test "$LINUX_RESULT" = success
+            else
+              test "$MACOS_RESULT" = success
+            fi
           fi
 
   package-tests:
     name: Swift package tests
-    needs: [package-verification]
+    needs: [package-verification, queue-path-policy]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
     steps:
       - name: Require all package and SDK tests
+        if: ${{ always() }}
         env:
           RESULT: ${{ needs.package-verification.outputs.tests }}
-        run: test "$RESULT" = success
+          WORKER_0: ${{ needs.package-verification.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$SKIP" == true ]]; then
+            test "$WORKER_0" = skipped
+            echo "skipped by policy"
+          else
+            test "$RESULT" = success
+          fi
 
   architecture:
     name: Shared architecture
-    needs: [package-verification, ios-verification, macos-verification]
+    needs: [package-verification, ios-verification, macos-verification, queue-path-policy]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
     steps:
       - name: Require contracts and both platform builds
+        if: ${{ always() }}
         env:
           PACKAGE_RESULT: ${{ needs.package-verification.outputs.tests }}
           IOS_RESULT: ${{ needs.ios-verification.outputs.architecture }}
           MACOS_RESULT: ${{ needs.macos-verification.outputs.architecture }}
+          WORKER_0: ${{ needs.package-verification.result }}
+          WORKER_1: ${{ needs.ios-verification.result }}
+          WORKER_2: ${{ needs.macos-verification.result }}
         run: |
           set -euo pipefail
-          test "$PACKAGE_RESULT" = success
-          test "$IOS_RESULT" = success
-          test "$MACOS_RESULT" = success
+          if [[ "$SKIP" == true ]]; then
+            test "$WORKER_0" = skipped
+            test "$WORKER_1" = skipped
+            test "$WORKER_2" = skipped
+            echo "skipped by policy"
+          else
+            test "$PACKAGE_RESULT" = success
+            test "$IOS_RESULT" = success
+            test "$MACOS_RESULT" = success
+          fi
 
   ios-app-tests:
     name: iOS app tests
-    needs: [ios-verification]
+    needs: [ios-verification, queue-path-policy]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
     steps:
       - name: Require hosted tests
+        if: ${{ always() }}
         env:
           RESULT: ${{ needs.ios-verification.outputs.tests }}
-        run: test "$RESULT" = success
+          WORKER_0: ${{ needs.ios-verification.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$SKIP" == true ]]; then
+            test "$WORKER_0" = skipped
+            echo "skipped by policy"
+          else
+            test "$RESULT" = success
+          fi
 
   ios-ui-tests:
     name: iOS UI tests
-    needs: [ios-ui-verification]
+    needs: [ios-ui-verification, queue-path-policy]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
     steps:
       - name: Require UI tests
+        if: ${{ always() }}
         env:
           RESULT: ${{ needs.ios-ui-verification.outputs.ui }}
-        run: test "$RESULT" = success
+          WORKER_0: ${{ needs.ios-ui-verification.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$SKIP" == true ]]; then
+            test "$WORKER_0" = skipped
+            echo "skipped by policy"
+          else
+            test "$RESULT" = success
+          fi
 
   macos-app-shell:
     name: macOS app shell
-    needs: [macos-verification]
+    needs: [macos-verification, queue-path-policy]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
     steps:
-      - name: Require macOS app shell
-        env:
-          RESULT: ${{ needs.macos-verification.outputs.shell }}
-        run: test "$RESULT" = success
-      - name: Require the macOS upgrade probe tests
+      - name: Require macOS app shell and upgrade probe tests
         if: ${{ always() }}
         env:
-          RESULT: ${{ needs.macos-verification.outputs.upgrade_probes }}
-        run: test "$RESULT" = success
+          SHELL_RESULT: ${{ needs.macos-verification.outputs.shell }}
+          PROBES_RESULT: ${{ needs.macos-verification.outputs.upgrade_probes }}
+          WORKER_0: ${{ needs.macos-verification.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$SKIP" == true ]]; then
+            test "$WORKER_0" = skipped
+            echo "skipped by policy"
+          else
+            status=0
+            test "$SHELL_RESULT" = success || status=1
+            test "$PROBES_RESULT" = success || status=1
+            exit "$status"
+          fi
 
   ios-app-shell:
     name: iOS app shell
-    needs: [ios-verification]
+    needs: [ios-verification, queue-path-policy]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
     steps:
       - name: Require iOS app shell
+        if: ${{ always() }}
         env:
           RESULT: ${{ needs.ios-verification.outputs.shell }}
-        run: test "$RESULT" = success
+          WORKER_0: ${{ needs.ios-verification.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$SKIP" == true ]]; then
+            test "$WORKER_0" = skipped
+            echo "skipped by policy"
+          else
+            test "$RESULT" = success
+          fi
