@@ -129,11 +129,16 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
                 ) == SQLITE_OK
             else { return .unavailable }
             defer { sqlite3_finalize(stmt) }
-            guard sqlite3_bind_double(stmt, 1, now().timeIntervalSince1970) == SQLITE_OK,
-                bindNullableText(stmt, 2, phase ?? existing.phase) == SQLITE_OK,
-                bindText(stmt, 3, lockName) == SQLITE_OK,
-                bindText(stmt, 4, runID) == SQLITE_OK
-            else { return .unavailable }
+            do {
+                guard sqlite3_bind_double(stmt, 1, now().timeIntervalSince1970) == SQLITE_OK else {
+                    return .unavailable
+                }
+                try connection.bindText(stmt, 2, phase ?? existing.phase)
+                try connection.bindText(stmt, 3, lockName)
+                try connection.bindText(stmt, 4, runID)
+            } catch {
+                return .unavailable
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return .unavailable }
             // Another connection removed or replaced the row after the read.
             return sqlite3_changes(db) > 0 ? .renewed : .lost
@@ -152,8 +157,12 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
                 ) == SQLITE_OK
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, lockName)
-            bindText(stmt, 2, runID)
+            do {
+                try connection.bindText(stmt, 1, lockName)
+                try connection.bindText(stmt, 2, runID)
+            } catch {
+                return false
+            }
             return sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) > 0
         }
     }
@@ -171,7 +180,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
                 ) == SQLITE_OK
             else { return [] }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, lockName)
+            guard (try? connection.bindText(stmt, 1, lockName)) != nil else { return [] }
             sqlite3_bind_double(stmt, 2, cutoff.timeIntervalSince1970)
             guard sqlite3_step(stmt) == SQLITE_DONE, sqlite3_changes(db) > 0 else { return [] }
             return [existing]
@@ -207,8 +216,12 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
                 ) == SQLITE_OK
             else { return [] }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, lockName)
-            bindText(stmt, 2, existing.runID)
+            do {
+                try connection.bindText(stmt, 1, lockName)
+                try connection.bindText(stmt, 2, existing.runID)
+            } catch {
+                return []
+            }
             guard sqlite3_step(stmt) == SQLITE_DONE, sqlite3_changes(db) > 0 else { return [] }
             return [existing]
         }
@@ -227,7 +240,8 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
         return row
     }
 
-    /// `strict` also treats a failed bind and an unreadable run identifier as a failed read; the heartbeat uses it.
+    /// A failed bind is always a failed read: a lock name that does not bind is no proof that the lock is free (#1194).
+    /// `strict` also treats an unreadable run identifier as a failed read; the heartbeat uses it.
     private func readLockResult(strict: Bool = false) -> LockReadResult {
         var stmt: OpaquePointer?
         guard
@@ -241,7 +255,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
             ) == SQLITE_OK
         else { return .failed }
         defer { sqlite3_finalize(stmt) }
-        guard bindText(stmt, 1, lockName) == SQLITE_OK || !strict else { return .failed }
+        guard (try? connection.bindText(stmt, 1, lockName)) != nil else { return .failed }
         let result = sqlite3_step(stmt)
         if result == SQLITE_DONE { return .confirmedAbsent }
         guard result == SQLITE_ROW else { return .failed }
@@ -278,13 +292,17 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
             ) == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, lockName)
-        bindText(stmt, 2, lock.owner.rawValue)
-        bindText(stmt, 3, lock.runID)
-        sqlite3_bind_double(stmt, 4, lock.acquiredAt.timeIntervalSince1970)
-        sqlite3_bind_double(stmt, 5, lock.heartbeatAt.timeIntervalSince1970)
-        bindNullableText(stmt, 6, lock.phase)
-        bindNullableText(stmt, 7, lock.processContext)
+        do {
+            try connection.bindText(stmt, 1, lockName)
+            try connection.bindText(stmt, 2, lock.owner.rawValue)
+            try connection.bindText(stmt, 3, lock.runID)
+            sqlite3_bind_double(stmt, 4, lock.acquiredAt.timeIntervalSince1970)
+            sqlite3_bind_double(stmt, 5, lock.heartbeatAt.timeIntervalSince1970)
+            try connection.bindText(stmt, 6, lock.phase)
+            try connection.bindText(stmt, 7, lock.processContext)
+        } catch {
+            return false
+        }
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
@@ -331,23 +349,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
         return (platform, pid)
     }
 
-    // MARK: - Bind/column helpers
-
-    private let transient = SQLiteStoreSchemaGate.transientDestructor
-
-    @discardableResult
-    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) -> Int32 {
-        sqlite3_bind_text(stmt, index, value, -1, transient)
-    }
-
-    @discardableResult
-    private func bindNullableText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) -> Int32 {
-        if let value {
-            bindText(stmt, index, value)
-        } else {
-            sqlite3_bind_null(stmt, index)
-        }
-    }
+    // MARK: - Column helpers
 
     private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
         guard sqlite3_column_type(stmt, index) != SQLITE_NULL, let text = sqlite3_column_text(stmt, index) else {

@@ -523,10 +523,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
             return false
         }
         for (offset, value) in values.enumerated() {
-            guard
-                sqlite3_bind_text(
-                    statement, Int32(offset + 1), value, -1, SQLiteStoreSchemaGate.transientDestructor) == SQLITE_OK
-            else {
+            guard SQLiteBinding.text(statement, Int32(offset + 1), value) == SQLITE_OK else {
                 sqlite3_finalize(statement)
                 statement = nil
                 return false

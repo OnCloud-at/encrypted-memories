@@ -38,9 +38,8 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
                 ) == SQLITE_OK
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
+            // A failed bind leaves its parameter NULL; it records the failure, and the read answers nil (#1194).
+            guard connection.bindUploadSource(source, to: stmt, from: 1) else { return nil }
             sqlite3_bind_int64(stmt, 4, revision.rawValue)
             guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
             return UploadBackupAssetRecord(
@@ -68,9 +67,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
                 ) == SQLITE_OK
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
+            guard connection.bindUploadSource(source, to: stmt, from: 1) else { return false }
             return sqlite3_step(stmt) == SQLITE_ROW
         }
     }
@@ -165,7 +162,11 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK else { return false }
             defer { sqlite3_finalize(stmt) }
-            bind(record, to: stmt)
+            do {
+                try bind(record, to: stmt)
+            } catch {
+                return false
+            }
             return sqlite3_step(stmt) == SQLITE_DONE
         }
     }
@@ -185,9 +186,8 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
                 ) == SQLITE_OK
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
+            // A key that does not bind removes nothing; that is no successful removal (#1194).
+            guard connection.bindUploadSource(source, to: stmt, from: 1) else { return false }
             for (offset, revision) in kept.enumerated() {
                 sqlite3_bind_int64(stmt, Int32(4 + offset), revision)
             }
@@ -210,8 +210,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
             for record in records {
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
-                bind(record, to: stmt)
-                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                guard (try? bind(record, to: stmt)) != nil, sqlite3_step(stmt) == SQLITE_DONE else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                     return false
                 }
@@ -254,9 +253,8 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     ) -> ReadResult<UploadBackupAssetRecord?> {
         sqlite3_reset(statement)
         sqlite3_clear_bindings(statement)
-        bindText(statement, 1, source.kind.rawValue)
-        bindText(statement, 2, source.identifier)
-        bindText(statement, 3, source.resource.rawValue)
+        // A key that does not bind is no proof that the photo has no backup state (#1194).
+        guard connection.bindUploadSource(source, to: statement, from: 1) else { return .failed }
         sqlite3_bind_int64(statement, 4, revision.rawValue)
         let result = sqlite3_step(statement)
         if result == SQLITE_DONE { return .value(nil) }
@@ -274,9 +272,7 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     private func readAny(statement: OpaquePointer?, source: UploadSourceIdentity) -> ReadResult<Bool> {
         sqlite3_reset(statement)
         sqlite3_clear_bindings(statement)
-        bindText(statement, 1, source.kind.rawValue)
-        bindText(statement, 2, source.identifier)
-        bindText(statement, 3, source.resource.rawValue)
+        guard connection.bindUploadSource(source, to: statement, from: 1) else { return .failed }
         let result = sqlite3_step(statement)
         if result == SQLITE_ROW { return .value(true) }
         if result == SQLITE_DONE { return .value(false) }
@@ -298,10 +294,10 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
           updated_at=excluded.updated_at;
         """
 
-    private func bind(_ record: UploadBackupAssetRecord, to stmt: OpaquePointer?) {
-        bindText(stmt, 1, record.source.kind.rawValue)
-        bindText(stmt, 2, record.source.identifier)
-        bindText(stmt, 3, record.source.resource.rawValue)
+    private func bind(_ record: UploadBackupAssetRecord, to stmt: OpaquePointer?) throws {
+        guard connection.bindUploadSource(record.source, to: stmt, from: 1) else {
+            throw SQLiteStoreUnknownReadError()
+        }
         sqlite3_bind_int64(stmt, 4, record.revision.rawValue)
         sqlite3_bind_int(stmt, 5, Int32(record.resourceCount))
         sqlite3_bind_int(stmt, 6, Int32(record.pendingResourceCount))
@@ -332,11 +328,5 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
             verifyVersion: schemaVersionRow.verify,
             stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private let transient = SQLiteStoreSchemaGate.transientDestructor
-
-    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
-        sqlite3_bind_text(stmt, index, value, -1, transient)
     }
 }
