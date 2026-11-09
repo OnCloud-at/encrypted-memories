@@ -1837,6 +1837,8 @@ final class CoreArchitectureGateTests: XCTestCase {
             import
             NewlineModule
             import struct Scoped.Struct
+            import struct
+            SplitScoped.Struct
             import class Scoped.Klass
             import enum Scoped.Enuhm
             import protocol Scoped.Proto
@@ -1866,7 +1868,7 @@ final class CoreArchitectureGateTests: XCTestCase {
             "Spi", "ExportedFlag", "BothAttributes", "InternalLevel", "PackageLevel",
             "PublicLevel", "PrivateLevel", "FileprivateLevel", "ExportedPublicLevel",
             "ExportedOwnLine", "NewlinePublicLevel", "NewlineModule",
-            "Scoped", "DotPath", "Semi", "Second", "Trailing",
+            "Scoped", "SplitScoped", "DotPath", "Semi", "Second", "Trailing",
         ]
         XCTAssertEqual(modules, expected)
         XCTAssertFalse(modules.contains("NotACount"))
@@ -1884,6 +1886,8 @@ final class CoreArchitectureGateTests: XCTestCase {
     func testReexportedModulesSamplesFlagOnlyExportedImports() {
         let sample = """
             @_exported import Exported
+            import First; @_exported
+            import SplitExported
             @_spi(Foo) @_exported import AlsoExported
             @_exported import struct Scoped.ExportedMember
             @_exported
@@ -1892,15 +1896,18 @@ final class CoreArchitectureGateTests: XCTestCase {
             public import AccessLevelWithoutAttribute
             import Plain
             @_implementationOnly import NotExported
+            @_exported
+            ; import NotExportedAfterSemicolon
             """
             + "\n"
 
         let reexported = Self.reexportedModules(inSource: sample)
         XCTAssertEqual(
             reexported,
-            ["Exported", "AlsoExported", "Scoped", "OwnLineExported", "PublicExportedLevel"]
+            ["Exported", "SplitExported", "AlsoExported", "Scoped", "OwnLineExported", "PublicExportedLevel"]
         )
         XCTAssertFalse(reexported.contains("AccessLevelWithoutAttribute"))
+        XCTAssertFalse(reexported.contains("NotExportedAfterSemicolon"))
     }
 
     /// Each Proton boundary rule flags its own violating sample, so a rule that loses its
@@ -2380,12 +2387,12 @@ final class CoreArchitectureGateTests: XCTestCase {
     /// Every import declaration of `source` as (module, reexported).
     ///
     /// An import declaration may spread its pieces across lines: the `@` attributes, the
-    /// access-level modifier and the `import` keyword each may sit alone on a line ahead of
-    /// the next piece, and the module name may follow `import` on the next line. The scan
-    /// therefore joins a line that stops mid declaration with the line after it before
-    /// parsing, and the sample test pins every joined shape. A line that stops after its
+    /// access-level modifier, `import` keyword and scoped kind may sit on a line ahead of
+    /// the next piece. The module name may follow `import` on the next line. The scan joins
+    /// an incomplete final segment with the next segment before parsing. The sample test pins
+    /// every joined shape. A line that stops after its
     /// attributes or its access level always continues with an import or a declaration; only
-    /// the continuation that follows the `import` keyword is a reserved word, so the join can
+    /// the continuation after `import` or a scoped kind names its module, so the join can
     /// manufacture no import the source does not declare.
     private static func imports(inSource source: String) -> [(module: String, reexported: Bool)] {
         let stripped = stripCommentsAndStringLiterals(from: source)
@@ -2393,15 +2400,16 @@ final class CoreArchitectureGateTests: XCTestCase {
 
         var pending: String?
         for rawLine in stripped.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = pending.map { $0 + " " + rawLine } ?? String(rawLine)
-            if isIncompleteImportPrefix(line) {
-                pending = line
-                continue
-            }
-            pending = nil
             // One line may hold several statements: `import A; import B`.
-            for segment in line.split(separator: ";", omittingEmptySubsequences: false) {
-                found.append(contentsOf: imports(inSegment: segment))
+            let segments = rawLine.split(separator: ";", omittingEmptySubsequences: false)
+            for (index, segment) in segments.enumerated() {
+                let line = pending.map { $0 + " " + segment } ?? String(segment)
+                if isIncompleteImportPrefix(line) {
+                    pending = index == segments.count - 1 ? line : nil
+                    continue
+                }
+                pending = nil
+                found.append(contentsOf: imports(inSegment: Substring(line)))
             }
         }
 
@@ -2414,14 +2422,18 @@ final class CoreArchitectureGateTests: XCTestCase {
     private static let importAccessLevels = [
         "internal", "package", "public", "private", "fileprivate",
     ]
+    /// The kinds that precede the module in a scoped import.
+    private static let scopedImportKinds = ["struct", "class", "enum", "protocol", "typealias", "func", "var", "let"]
 
     /// Whether `line` stops inside an import declaration before its module name: only `@`
-    /// attributes and access levels so far, or exactly the `import` keyword. Such a line
+    /// attributes and access levels so far, `import`, or `import` and a scoped kind. Such a line
     /// continues on the next line; every other line is complete (or no import at all).
     private static func isIncompleteImportPrefix(_ line: String) -> Bool {
         guard let scanned = scanImportPrefix(Substring(line)) else { return false }
         let rest = scanned.rest.trimmingCharacters(in: .whitespacesAndNewlines)
+        let words = rest.split(whereSeparator: \.isWhitespace)
         return rest.isEmpty || rest == "import"
+            || (words.count == 2 && words[0] == "import" && scopedImportKinds.contains(String(words[1])))
     }
 
     /// Consumes the leading `@` attributes (each with balanced parenthesized arguments) and
@@ -2486,7 +2498,7 @@ final class CoreArchitectureGateTests: XCTestCase {
         var tail = rest.dropFirst("import".count).drop(while: { $0.isWhitespace })
 
         // A scoped import names what it pulls in before the module: `import class Foo.Bar`.
-        for keyword in ["struct", "class", "enum", "protocol", "typealias", "func", "var", "let"] {
+        for keyword in scopedImportKinds {
             guard
                 tail.hasPrefix(keyword),
                 tail.count > keyword.count,
