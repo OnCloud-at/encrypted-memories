@@ -1344,7 +1344,7 @@
 
         /// The largest valid vertical content offset given the current content size and bottom inset.
         var maxContentOffsetY: CGFloat {
-            max(0, scrollView.contentSize.height - bounds.height + scrollView.contentInset.bottom)
+            max(0, scrollView.verticalOffsetRange.upperBound)
         }
 
         func refreshContentSize() {

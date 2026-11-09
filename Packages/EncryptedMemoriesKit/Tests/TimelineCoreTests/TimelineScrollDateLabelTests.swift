@@ -364,6 +364,235 @@ private func settle(until condition: (() -> Bool)? = nil) async {
         var changes: [TimelineScrollDateLabelController.Presentation] = []
     }
 
+    @Test func anIndicatorDragShowsAHiddenLabelWithoutASpeedThreshold() async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        #expect(controller.presentation.isVisible)
+        #expect(controller.policy.isDragOffset)
+        #expect(controller.policy.isIndicatorDragging)
+        #expect(controller.presentation.fadeDuration == 0.20)
+        #expect(controller.presentation.slideDuration == 0.22)
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0, "an active drag cannot expire")
+    }
+
+    @Test func anIndicatorDragMovesAnAlreadyVisibleLabelWithoutRestartingItsFade() async {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        flickScrollDateLabel(controller, manual)
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        #expect(controller.presentation.isVisible)
+        #expect(controller.policy.isDragOffset)
+        #expect(recorder.changes.count == 2, "one show followed by one offset transition")
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0)
+    }
+
+    @Test func liveContactTargetsPublishImmediatelyWithoutRestartingTheSlide() {
+        let (controller, recorder) = makeController(ManualClock())
+        controller.indicatorDragBegan(offset: 30, radius: 18.15)
+        let count = recorder.changes.count
+        controller.indicatorDragMoved(offset: 30, radius: 18.15)
+        #expect(recorder.changes.count == count)
+        #expect(controller.presentation.slideDuration == 0.22)
+        for offset in [CGFloat(40), 40.5, 55, 35] {
+            controller.indicatorDragMoved(offset: offset, radius: 18.15)
+            #expect(controller.presentation.indicatorOffset == offset)
+            #expect(controller.presentation.slideDuration == nil)
+            #expect(controller.presentation.isVisible && controller.policy.hideDeadline == nil)
+        }
+        controller.indicatorDragEnded()
+        controller.indicatorDragMoved(offset: 70, radius: 18.15)
+        #expect(controller.presentation.indicatorOffset == 0)
+        #expect(controller.presentation.slideDuration == 0.22)
+        controller.retire()
+        controller.indicatorDragMoved(offset: 80, radius: 18.15)
+        #expect(controller.presentation == .hidden)
+    }
+
+    @Test func radiusStepsEaseButEqualRadiusAndInvalidFallbackUpdatesStayDirect() {
+        let (controller, _) = makeController(ManualClock())
+        controller.indicatorDragBegan(offset: 30, radius: 18.15)
+        controller.indicatorDragMoved(offset: 30, radius: 30.25)  // Same target, but remember the new radius.
+        controller.indicatorDragMoved(offset: 31, radius: 30.25)
+        #expect(controller.presentation.slideDuration == nil)
+        controller.indicatorDragMoved(offset: 43, radius: 42.35)
+        #expect(controller.presentation.slideDuration == 0.22)
+        controller.indicatorDragMoved(offset: 44, radius: 42.35)
+        #expect(controller.presentation.slideDuration == nil)
+        controller.indicatorDragMoved(offset: 20, radius: .nan)
+        #expect(controller.presentation.slideDuration == 0.22)
+        controller.indicatorDragMoved(offset: 21, radius: .infinity)
+        #expect(controller.presentation.slideDuration == nil)
+        #expect(controller.presentation.isVisible && controller.policy.hideDeadline == nil)
+    }
+
+    @Test func liveMovementCannotReviveAContactAfterAJumpOrSuppression() {
+        for suppress in [false, true] {
+            let (controller, _) = makeController(ManualClock())
+            controller.indicatorDragBegan(offset: 30, radius: 18.15)
+            if suppress { controller.suppress() } else { controller.nonUserMoved(isJump: true) }
+            let presentation = controller.presentation
+            controller.indicatorDragMoved(offset: 80, radius: 18.15)
+            #expect(controller.presentation == presentation)
+        }
+    }
+
+    @Test func releasingTheIndicatorReturnsImmediatelyWhileTheLingerContinues() async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        manual.advance(by: 5)
+        await settle()
+        #expect(controller.presentation.isVisible, "holding the indicator does not time out")
+        controller.indicatorDragEnded()
+        #expect(controller.policy.hideDeadline == manual.now + 1)
+        #expect(!controller.policy.isDragOffset, "release starts the return without waiting for another scroll")
+        #expect(!controller.policy.isIndicatorDragging)
+        #expect(controller.presentation.slideDuration == 0.22)
+        manual.advance(by: 0.9)
+        await settle()
+        #expect(controller.presentation.isVisible && !controller.policy.isDragOffset)
+        manual.advance(by: 0.2)
+        await settle { !controller.presentation.isVisible }
+        #expect(!controller.presentation.isVisible)
+        #expect(!controller.policy.isDragOffset, "the return finished before fade-out")
+    }
+
+    @Test(arguments: [false, true])
+    func normalScrollingKeepsTheReleasedLabelAtItsUsualPosition(afterHide: Bool) async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        controller.indicatorDragEnded()
+        if afterHide {
+            manual.advance(by: 2)
+            await settle { !controller.presentation.isVisible }
+        }
+        flickScrollDateLabel(controller, manual)
+        #expect(controller.presentation.isVisible)
+        #expect(!controller.policy.isDragOffset)
+        #expect(!controller.policy.isIndicatorDragging)
+        #expect(controller.presentation.slideDuration == 0.22)
+    }
+
+    @Test func aMarkedJumpDuringIndicatorDragHidesWithTheFastFade() async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        controller.nonUserMoved(isJump: true)
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == 0.35)
+        controller.indicatorDragEnded()
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0, "ending the old drag cannot revive the label")
+        #expect(controller.policy.hideDeadline == nil)
+        #expect(!controller.policy.isDragOffset, "release also clears an offset left by a jump")
+        flickScrollDateLabel(controller, manual)
+        #expect(controller.presentation.isVisible && !controller.policy.isDragOffset)
+    }
+
+    @Test func suppressionAndRetirementCancelTheIndicatorDrag() async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        controller.suppress()
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        controller.indicatorDragEnded()
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(!controller.presentation.isVisible && manual.waiterCount == 0)
+        controller.resume()
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        #expect(controller.presentation.isVisible)
+        controller.retire()
+        controller.indicatorDragEnded()
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        #expect(controller.presentation == .hidden)
+        await settle(until: { manual.waiterCount == 0 })
+        #expect(manual.waiterCount == 0)
+    }
+
+    @Test func reduceMotionShowsTheDragInformationWithoutFadeOrSlide() {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.reduceMotion = true
+        controller.indicatorDragBegan(offset: 0, radius: 18.15)
+        #expect(controller.presentation.isVisible && controller.policy.isDragOffset)
+        #expect(controller.presentation.fadeDuration == nil)
+        #expect(controller.presentation.slideDuration == nil)
+    }
+
+    @Test func endingAnInactiveIndicatorContactDoesNotPublishAMotion() {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        controller.indicatorDragEnded()
+        #expect(recorder.changes.isEmpty)
+        controller.suppress()
+        let count = recorder.changes.count
+        controller.indicatorDragEnded()
+        #expect(recorder.changes.count == count)
+    }
+
+    @Test func fastViewportSamplesCannotRemoveTheHeldOffsetOrStartTheLinger() {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        controller.indicatorDragBegan(offset: 30, radius: 18.15)
+        for offset in [0.0, 5_000, 15_000, 25_000] {
+            manual.advance(by: 0.016)
+            controller.viewportMoved(.init(isTracking: true, isDragging: true), offsetY: offset)
+            #expect(controller.presentation.isVisible)
+            #expect(controller.policy.isIndicatorDragging)
+            #expect(controller.presentation.indicatorOffset == 30)
+            #expect(controller.policy.hideDeadline == nil)
+        }
+    }
+
+    @Test func repeatedDragBeginKeepsTheFirstTargetAndItsPresentation() {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        controller.indicatorDragBegan(offset: 30, radius: 18.15)
+        let initial = controller.presentation
+        let count = recorder.changes.count
+        controller.indicatorDragBegan(offset: 60, radius: 18.15)
+        #expect(controller.presentation == initial)
+        #expect(recorder.changes.count == count)
+    }
+
+    @Test func fastMovementAfterAJumpClearsTheOldContactOffsetAndPublishesTheNewShow() {
+        let manual = ManualClock()
+        let (controller, recorder) = makeController(manual)
+        controller.indicatorDragBegan(offset: 30, radius: 18.15)
+        controller.nonUserMoved(isJump: true)
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.indicatorOffset == 30, "jump fade preserves the presented horizontal position")
+        #expect(controller.policy.isDragOffset)
+        #expect(!controller.policy.isIndicatorDragging)
+        controller.userMoved(offsetY: 0)
+        manual.advance(by: 0.016)
+        controller.userMoved(offsetY: 5_000)
+        #expect(controller.presentation.isVisible)
+        #expect(!controller.policy.isDragOffset)
+        #expect(controller.presentation.indicatorOffset == 0)
+        #expect(recorder.changes.last == controller.presentation)
+        #expect(controller.presentation.slideDuration == 0.22)
+        controller.hide()
+        #expect(controller.presentation.indicatorOffset == 0)
+        #expect(!controller.policy.isDragOffset)
+    }
+
+    @Test func aReleasedDragUsesTheFastFadeEvenAfterASlowScroll() async {
+        let manual = ManualClock()
+        let (controller, _) = makeController(manual)
+        flickScrollDateLabel(controller, manual, frames: 48, speed: 620)
+        controller.indicatorDragBegan(offset: 30, radius: 18.15)
+        controller.indicatorDragEnded()
+        manual.advance(by: 1.01)
+        await settle { !controller.presentation.isVisible }
+        #expect(!controller.presentation.isVisible)
+        #expect(controller.presentation.fadeDuration == 0.35)
+    }
+
     @Test func crossingTheShowThresholdSlowlyUsesTheSlowFadeIn() {
         let manual = ManualClock()
         let (controller, recorder) = makeController(manual)
@@ -816,6 +1045,160 @@ private func settle(until condition: (() -> Bool)? = nil) async {
             TimelineScrollDateLabelGeometry.centerY(
                 thumbTop: 100, thumbLength: 7, viewportTop: 0, viewportBottom: 900, labelHeight: 30) == 103.5,
             "a squeezed native thumb keeps its actual center")
+    }
+
+    @Test func thumbContactRequiresVisibleOpacityAndTheActualEnvelope() {
+        let thumb = CGRect(x: 434, y: 100, width: 3, height: 36)
+        let boundary = Float(0.01)
+        for (alpha, expected) in [(Float(0), false), (boundary, false), (boundary.nextUp, true), (1, true)] {
+            #expect(
+                TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                    at: CGPoint(x: 438, y: 118), radius: 18, thumb: thumb, viewportRightX: 440,
+                    effectiveAlpha: alpha) == expected)
+        }
+        #expect(
+            !TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                at: CGPoint(x: 438, y: 200), radius: 18, thumb: thumb, viewportRightX: 440, effectiveAlpha: 1))
+        for empty in [CGRect(x: 0, y: 0, width: 0, height: 36), CGRect(x: 0, y: 0, width: 3, height: 0)] {
+            #expect(
+                !TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                    at: .zero, radius: 18, thumb: empty, viewportRightX: 440, effectiveAlpha: 1))
+        }
+        #expect(
+            TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                at: CGPoint(x: 440, y: 118), radius: 1, thumb: thumb, viewportRightX: 440, effectiveAlpha: 1))
+        for (x, expected) in [(CGFloat(415.99), false), (416, true), (458, true), (458.01, false)] {
+            #expect(
+                TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                    at: CGPoint(x: x, y: 118), radius: 18, thumb: thumb,
+                    viewportRightX: 440, effectiveAlpha: 1) == expected)
+        }
+    }
+
+    @Test func aLandscapeContactNeverMovesTheLabelTowardThePhysicalEdge() {
+        // Landscape safe-right inset62: normal edge766, native thumb at779, physical edge844.
+        let thumb = CGRect(x: 779, y: 100, width: 3, height: 36)
+        #expect(
+            TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                at: CGPoint(x: 840, y: 118), radius: 18.15, thumb: thumb, viewportRightX: 844, effectiveAlpha: 1))
+        #expect(
+            TimelineScrollDateLabelGeometry.indicatorDragOffset(
+                normalRightX: 766, thumbLeftX: 779, contactX: 840, contactRadius: 18.15) == 0)
+    }
+
+    @Test func initialLargeContactsLeaveRoomForTheReportedFingerInsideTheDistanceCeiling() {
+        let thumb = CGRect(x: 434, y: 100, width: 3, height: 36)
+        for radius in [CGFloat(18.15), 30.25, 42.35, 54.46] {
+            for x in stride(from: CGFloat(370), through: 438, by: 1) {
+                let accepted = TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                    at: CGPoint(x: x, y: 118), radius: radius, thumb: thumb,
+                    viewportRightX: 440, effectiveAlpha: 1)
+                if accepted {
+                    let offset = TimelineScrollDateLabelGeometry.indicatorDragOffset(
+                        normalRightX: 424, thumbLeftX: 434, contactX: x, contactRadius: radius)
+                    #expect(424 - offset <= x - radius - 16.964134412507207 + 0.000_001)
+                }
+            }
+            #expect(
+                TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                    at: CGPoint(x: 438, y: 118), radius: radius, thumb: thumb,
+                    viewportRightX: 440, effectiveAlpha: 1))
+        }
+        #expect(
+            !TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                at: CGPoint(x: 380, y: 118), radius: 54.46, thumb: thumb, viewportRightX: 440, effectiveAlpha: 1))
+    }
+
+    @Test func thumbContactContinuationUsesCurrentAlignmentAndOnePendingTouchSample() {
+        let thumb = CGRect(x: 434, y: 100, width: 3, height: 36)
+        for (y, previous, expected) in [
+            (CGFloat(118), CGFloat(118), true),
+            (118, 218, true),  // The current sample aligns; the previous sample does not.
+            (218, 118, true),  // Touch delivered before the matching native layout.
+            (218, 218, false),  // A second touch confirms that the thumb did not follow.
+            (81.85, 81.85, true), (154.15, 154.15, true),
+            (81.84, 81.84, false), (154.16, 154.16, false),
+        ] {
+            #expect(
+                TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterMove(
+                    at: y, previousY: previous, radius: 18.15, thumb: thumb, atTop: false, atBottom: false) == expected)
+        }
+        for (y, newThumb, previousThumb, expected) in [
+            (CGFloat(218), thumb.offsetBy(dx: 0, dy: 100), thumb, true),
+            (118, thumb.offsetBy(dx: 0, dy: 100), thumb, true),
+            (118, thumb.offsetBy(dx: 0, dy: 105), thumb.offsetBy(dx: 0, dy: 100), false),
+            (118, CGRect.zero, thumb, false),
+            (118, CGRect(x: 434, y: 100, width: 0, height: 36), thumb, false),
+            (118, CGRect(x: 434, y: 100, width: 3, height: 0), thumb, false),
+        ] {
+            #expect(
+                TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterLayout(
+                    at: y, radius: 18.15, thumb: newThumb, previousThumb: previousThumb,
+                    atTop: false, atBottom: false) == expected)
+        }
+        for radius in [CGFloat(0), -1, .nan, .infinity] {
+            #expect(TimelineScrollDateLabelGeometry.keepsIndicatorContact(atY: 82, radius: radius, thumb: thumb))
+            #expect(!TimelineScrollDateLabelGeometry.keepsIndicatorContact(atY: 81, radius: radius, thumb: thumb))
+        }
+    }
+
+    @Test func clampedTrackEndsKeepOnlyTheirOwnSideOpenDuringTheHold() {
+        let thumb = CGRect(x: 434, y: 100, width: 3, height: 36)
+        for (top, bottom) in [(true, false), (false, true), (false, false)] {
+            for (y, expected) in [(CGFloat(-200), top), (400, bottom), (118, true)] {
+                #expect(
+                    TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterMove(
+                        at: y, previousY: y, radius: 18, thumb: thumb, atTop: top, atBottom: bottom) == expected)
+                #expect(
+                    TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterLayout(
+                        at: y, radius: 18, thumb: thumb, previousThumb: thumb,
+                        atTop: top, atBottom: bottom) == expected)
+            }
+        }
+        for invalidThumb in [
+            CGRect.zero, CGRect(x: 434, y: 100, width: 0, height: 36),
+            CGRect(x: 434, y: 100, width: 3, height: 0),
+        ] {
+            #expect(
+                !TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterMove(
+                    at: -200, previousY: -200, radius: 18, thumb: invalidThumb, atTop: true, atBottom: true))
+            #expect(
+                !TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterLayout(
+                    at: -200, radius: 18, thumb: invalidThumb, previousThumb: thumb, atTop: true, atBottom: true))
+        }
+        // An open end is a continuation rule only; it never enlarges the initial touch target.
+        #expect(
+            !TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
+                at: CGPoint(x: 435, y: -200), radius: 18, thumb: thumb, viewportRightX: 440, effectiveAlpha: 1))
+    }
+
+    @Test func fingerEdgeUsesTheReportedRadiusAndOneCalibratedGap() {
+        for x in [CGFloat(420), 428, 434, 438] {
+            for radius in [CGFloat(18.15), 30.25, 42.35, 54.46] {
+                let offset = TimelineScrollDateLabelGeometry.indicatorDragOffset(
+                    normalRightX: 424, thumbLeftX: 434, contactX: x, contactRadius: radius)
+                #expect(abs(424 - offset - (x - radius - 16.964134412507207)) < 0.000_001)
+            }
+        }
+    }
+
+    @Test func unavailableFingerRadiusUsesTheSmallestMeasuredContact() {
+        for radius in [CGFloat(0), -1, .nan, .infinity, -.infinity] {
+            let offset = TimelineScrollDateLabelGeometry.indicatorDragOffset(
+                normalRightX: 424, thumbLeftX: 434, contactX: 438, contactRadius: radius)
+            #expect(abs(10 + offset - 31.116033603126795) < 0.000_001)
+        }
+    }
+
+    @Test func anExtremeContactStopsAtTheDistanceCeilingWithoutHiding() {
+        for (x, radius) in [(CGFloat(438), CGFloat(1_000)), (400, 54.46), (-1_000, 18.15)] {
+            let offset = TimelineScrollDateLabelGeometry.indicatorDragOffset(
+                normalRightX: 424, thumbLeftX: 434, contactX: x, contactRadius: radius)
+            #expect(abs(10 + offset - 87.80379838123918) < 0.000_001)
+            var policy = TimelineScrollDateLabelPolicy()
+            policy.indicatorDragBegan(offset: offset, radius: 18.15)
+            #expect(policy.isVisible && policy.hideDeadline == nil)
+        }
     }
 
     @Test func followsTheScrollIndicatorFromTopToBottom() {
