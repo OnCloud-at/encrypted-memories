@@ -926,6 +926,22 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         }
     }
 
+    /// Applies one page of volume events to the remote content index.
+    ///
+    /// Asset proof rows (`remote_asset_index`): the store deletes every proof row that names a link of
+    /// `removingRemoteLinkIDs`, with all its link rows, in the same transaction, and it writes the rows of
+    /// `upsertingRemoteAssetRecords` (it deletes no row for a link that is only upserted). The production caller,
+    /// `ProtonUploadDedupeService.applyRemoteEvents`, passes EVERY link of every relevant event in
+    /// `removingRemoteLinkIDs`, updated links included, and passes no proof rows. So in production an event on any
+    /// link of a compound deletes the proof row of the whole compound, and the event path writes none. The production
+    /// rebuild writes the rows (`finishRemoteContentIndexBuild`). One case keeps an old row: a compound whose listed
+    /// links get no event, for example a related file added later. A reader accepts a proof only when identity and
+    /// resource count of the local asset match, so such a row cannot prove an asset with another resource count.
+    /// The asset checkpoint moves with the content checkpoint in this transaction: it says that the events up to it
+    /// are applied, not that every asset has a proof row.
+    ///
+    /// Readers of the rows: `remoteAssetRecords` (backup and album proof) and `remoteContentDuplicateGroups`, which
+    /// leaves the related links of a proven compound out of the duplicate groups before any request.
     @discardableResult
     public func applyRemoteContentIndexChanges(
         upserting records: [UploadRemoteContentIndexRecord],
