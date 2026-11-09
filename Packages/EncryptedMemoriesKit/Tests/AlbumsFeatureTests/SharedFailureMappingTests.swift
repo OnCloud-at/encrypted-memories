@@ -11,9 +11,9 @@ final class SharedFailureMappingTests: XCTestCase {
     }
     func testKnownAlbumCausesAndPartialResults() {
         XCTAssertEqual(AlbumError.requestFailed(AlbumWriteCause(URLError(.timedOut))).failureCause, .network)
-        XCTAssertEqual(AlbumError.requestFailed(AlbumWriteCause(URLError(.cancelled))).failureCause, .cancelled)
         XCTAssertEqual(AlbumError.requestFailed(AlbumWriteCause(CancellationError())).failureCause, .cancelled)
         let cancelledWrite = AlbumError.requestFailed(AlbumWriteCause(URLError(.cancelled)))
+        XCTAssertEqual(cancelledWrite.failureCause, .cancelled)
         let policy = FailurePolicy.resolve(cancelledWrite.failureCause, situation: .awaitedByPerson, safety: .mutation)
         XCTAssertEqual(policy.retry, .afterReconciliation)
         XCTAssertEqual(policy.presentation, .alert)

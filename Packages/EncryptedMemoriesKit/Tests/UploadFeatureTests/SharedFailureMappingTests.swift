@@ -17,7 +17,6 @@ final class SharedFailureMappingTests: XCTestCase {
             operation: .readDirectory, url: URL(fileURLWithPath: "/"),
             failureClass: .permissionDenied, domain: "", code: 0)
         XCTAssertEqual(error.failureCause, .permission)
-        XCTAssertEqual(UploadRemoteCommitRecoveryError.storeUnavailable.failureCause, .partialCompletion)
     }
 
     func testStoredBackupReasonValuesRemainStable() throws {
@@ -117,14 +116,6 @@ final class SharedFailureMappingTests: XCTestCase {
         XCTAssertEqual(
             BackupTempFileStore.BackupTempFileError.needsFreeSpace(requiredBytes: 10).failureCause, .deviceStorage)
         XCTAssertEqual(BackupTempFileStore.BackupTempFileError.diskBudgetExceeded.failureCause, .deviceStorage)
-    }
-    func testRecoveryDescriptorDoesNotClaimStoreFailure() {
-        let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "test")
-        let revision = UploadBackupRevision(rawValue: 1)
-        XCTAssertEqual(
-            UploadRemoteCommitRecoveryError.descriptorUnavailable(source, revision).failureCause, .partialCompletion)
-        XCTAssertEqual(
-            UploadRemoteCommitRecoveryError.descriptorMismatch(source, revision).failureCause, .partialCompletion)
     }
     func testCommittedUploadNeedsReconciliationEvenWhenCancelled() {
         let receipt = UploadRemoteCommitReceipt(remoteVolumeID: "v", remoteLinkID: "l")

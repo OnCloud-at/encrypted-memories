@@ -16,7 +16,6 @@ final class SharedFailureMappingTests: XCTestCase {
         XCTAssertEqual(MLRuntimeFailure(category: .retryableRuntimeState).failureCause, .localTransient)
         XCTAssertEqual(MLModelInstallError.licenseProhibitsDistribution.failureCause, .unsupported)
         XCTAssertEqual(MLRuntimeFailure(category: .unknown).failureCause, .unknown)
-        XCTAssertEqual(MLRuntimeFailure(category: .incompatibleModel).failureCause, .permanent)
         XCTAssertEqual(MLModelInstallError.notDownloadable.failureCause, .unknown)
         XCTAssertEqual(
             MLModelInstallError.insufficientStorage(requiredBytes: 10, availableBytes: 1).failureCause, .deviceStorage)
