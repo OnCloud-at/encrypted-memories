@@ -179,7 +179,7 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
 
-  # Compare every changed path in the complete merge group. An unreadable or empty diff runs all macOS jobs.
+  # Compare this entry with its base (main or the entry ahead). Skips require ALLGREEN; otherwise run all macOS jobs.
   queue-path-policy:
     name: Select merge queue jobs
     if: ${{ github.event_name == 'merge_group' }}
@@ -198,13 +198,17 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if git cat-file -e "$BASE_SHA:.github/scripts/queue_path_policy.py" 2>/dev/null; then
+          if [[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null &&
+            git cat-file -e "$BASE_SHA:.github/scripts/queue_path_policy.py" 2>/dev/null &&
+            git show "$BASE_SHA:.github/scripts/require_merge_queue.py" 2>/dev/null |
+              python3 - --require-allgreen "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             git show "$BASE_SHA:.github/scripts/queue_path_policy.py" | python3 -
           else
             echo "run_macos=true" >> "$GITHUB_OUTPUT"
-            echo "No policy at the base; macOS jobs required."
+            echo "Base policy or ALLGREEN unavailable; macOS jobs required."
           fi
 
   # swift-format and SwiftLint on Linux give the same verdicts as the macOS runner: a corpus with one deliberate
@@ -260,7 +264,7 @@ jobs:
         run: bash scripts/verify-swift-style.sh
 
   # The style check of a pull request runs on Linux (swift-style-linux), so it does not wait for a macOS runner. The
-  # queue runs the same check on the macOS runner with the Xcode toolchain, together with the tests.
+  # queue runs the same check with the Xcode toolchain when the macOS jobs are required.
   package-verification:
     name: Package verification and style
     needs: [queue-path-policy]

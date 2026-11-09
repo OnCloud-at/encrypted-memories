@@ -44,12 +44,30 @@ def require_queue(repository):
         raise MergeQueueMissing(
             "Enable the merge_queue ruleset on main before using reduced pull request verification."
         )
+    return rules
+
+
+def allgreen_queue(repository):
+    try:
+        rules = require_queue(repository)
+    except QueueGuardError:
+        return False
+    queues = [rule for rule in rules if rule.get("type") == "merge_queue"]
+    return all(isinstance(rule.get("parameters"), dict)
+               and rule["parameters"].get("grouping_strategy") == "ALLGREEN" for rule in queues)
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--require-allgreen", action="store_true")
     parser.add_argument("repository")
     args = parser.parse_args()
+    if args.require_allgreen:
+        if not allgreen_queue(args.repository):
+            print("ALLGREEN could not be verified; full macOS verification is required.")
+            return 1
+        print("The merge queue uses ALLGREEN.")
+        return 0
     try:
         require_queue(args.repository)
     except QueueGuardError as error:

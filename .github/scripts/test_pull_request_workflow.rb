@@ -36,7 +36,7 @@ class PullRequestWorkflowTests < Minitest::Test
     script = File.expand_path("queue_path_policy.py", __dir__)
     paths = %w[.github/test.md scripts/test.md project.yml BuildSupport/test.md VendorPatches/test.md
                site/test.swift Wiki/test.swift unknown App/test.md docs/guide.md README.MD agents.md Claude.md
-               CONTRIBUTING.md AGENTS.md CLAUDE.md PROJECT-TRAPS.md]
+               CONTRIBUTING.md AGENTS.md CLAUDE.md PROJECT-TRAPS.md wiki/a.md Site/a.html Wiki/a.SWIFT]
     code = "import json,runpy,sys; f=runpy.run_path(sys.argv[1])['can_skip']; print(json.dumps([f(p) for p in json.load(sys.stdin)]))"
     result, status = Open3.capture2("python3", "-c", code, script, stdin_data: JSON.generate([[], *paths.map { |path| [path] }, *paths.map { |path| ["site/index.html", path] }]))
     assert status.success?
@@ -52,6 +52,7 @@ class PullRequestWorkflowTests < Minitest::Test
     step = policy.fetch("steps").find { |item| item["id"] == "policy" }
     assert_equal "${{ github.event.merge_group.base_sha }}", step.fetch("env").fetch("BASE_SHA")
     assert_equal "${{ github.event.merge_group.head_sha }}", step.fetch("env").fetch("HEAD_SHA")
+    assert_equal "${{ github.token }}", step.fetch("env").fetch("GH_TOKEN")
     workers = %w[package-verification ios-verification ios-ui-verification macos-verification]
     workers.each do |id|
       condition = jobs.fetch(id).fetch("if")
@@ -114,7 +115,9 @@ class PullRequestWorkflowTests < Minitest::Test
       missing_base = git.call("rev-parse", "HEAD")
       FileUtils.mkdir_p(File.join(directory, ".github/scripts"))
       script = File.join(directory, ".github/scripts/queue_path_policy.py")
-      File.write(script, "import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('run_macos=true\\n')\n")
+      File.write(script, "import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('run_macos=' + os.environ.get('POLICY_TEST_RESULT', 'true') + '\\n')\n")
+      guard = File.join(directory, ".github/scripts/require_merge_queue.py")
+      File.write(guard, "import os,sys\nsys.exit(0 if os.environ.get('POLICY_STRATEGY') == 'ALLGREEN' else 1)\n")
       git.call("add", ".")
       git.call("commit", "-qm", "trusted policy")
       base = git.call("rev-parse", "HEAD")
@@ -122,14 +125,24 @@ class PullRequestWorkflowTests < Minitest::Test
       git.call("add", ".")
       git.call("commit", "-qm", "changed head policy")
       head = git.call("rev-parse", "HEAD")
-      [missing_base, base].each do |ref|
+      ["", missing_base, base].each do |ref|
         output = File.join(directory, "output")
         File.write(output, "")
-        env = {"BASE_SHA" => ref, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output, "RUNNER_TEMP" => directory}
+        env = {"BASE_SHA" => ref, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output, "RUNNER_TEMP" => directory, "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN"}
         text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
         assert status.success?, text
         assert_equal "run_macos=true\n", File.read(output), ref
       end
+      ["ALLGREEN", "HEADGREEN", "", "UNAVAILABLE"].each do |strategy|
+        output = File.join(directory, "output")
+        File.write(output, "")
+        env = {"BASE_SHA" => base, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
+               "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => strategy, "POLICY_TEST_RESULT" => "false"}
+        text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+        assert status.success?, text
+        assert_equal "run_macos=#{strategy == 'ALLGREEN' ? 'false' : 'true'}\n", File.read(output), strategy
+      end
+      assert_includes step.fetch("run"), '[[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA^{commit}"'
     end
   end
 

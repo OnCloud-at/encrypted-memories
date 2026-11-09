@@ -22,6 +22,31 @@ class MergeQueueGuardTests(unittest.TestCase):
             "https://api.github.com/repos/OnCloud-at/encrypted-memories/rules/branches/main",
         )
 
+    def test_allgreen_is_required_for_policy_skip(self):
+        for rules, allowed in [
+            ([{"type": "merge_queue", "parameters": {"grouping_strategy": "ALLGREEN"}}], True),
+            ([{"type": "merge_queue", "parameters": {"grouping_strategy": "HEADGREEN"}}], False),
+            ([{"type": "merge_queue", "parameters": {}}], False),
+            ([{"type": "merge_queue"}], False),
+            ([{"type": "merge_queue", "parameters": {"grouping_strategy": "ALLGREEN"}},
+              {"type": "merge_queue", "parameters": {"grouping_strategy": "HEADGREEN"}}], False),
+            ([], False),
+        ]:
+            with self.subTest(rules=rules):
+                with mock.patch("urllib.request.urlopen", return_value=self.response(rules)):
+                    self.assertEqual(allowed, require_merge_queue.allgreen_queue("OnCloud-at/encrypted-memories"))
+
+    def test_allgreen_cannot_be_verified_when_rules_are_unavailable(self):
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("unavailable")):
+            self.assertFalse(require_merge_queue.allgreen_queue("OnCloud-at/encrypted-memories"))
+
+    def test_allgreen_cli_rejects_headgreen(self):
+        rules = [{"type": "merge_queue", "parameters": {"grouping_strategy": "HEADGREEN"}}]
+        with mock.patch("sys.argv", ["guard", "--require-allgreen", "OnCloud-at/encrypted-memories"]):
+            with mock.patch("urllib.request.urlopen", return_value=self.response(rules)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(1, require_merge_queue.main())
+
     def test_missing_queue_rule_fails_closed(self):
         with mock.patch("urllib.request.urlopen", return_value=self.response([
             {"type": "required_status_checks"}

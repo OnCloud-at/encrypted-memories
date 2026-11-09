@@ -95,7 +95,8 @@ Run the full local gates only when your change touches storage, a migration, bac
 
 A pull request runs repository hygiene and the Swift style check on Linux. The merge queue runs the package
 tests, the iOS app and UI tests, and both platform builds before the merge. Changes only to `Wiki/**`, `site/**`,
-`README.md`, or `SECURITY.md` skip these macOS jobs unless a Swift file changed; all other changes run them.
+the root `README.md` or `SECURITY.md` skip these macOS jobs when the queue uses ALLGREEN and no Swift file changed;
+all other changes run them.
 For every gate that you did not run locally, write "covered by the merge queue" in the pull request.
 
 A pull request that changes `iOSApp`, `iOSUITests`, `project.yml`, or the UI test scripts also runs the iOS UI tests
