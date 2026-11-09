@@ -126,7 +126,7 @@ struct MediaByteCacheTests {
             using: refresh
         )
         if !authoritative { _ = graph.beginRefresh(source.id) }
-        return (graph, graph.thumbnailRetentionDerivedDataScope())
+        return (graph, graph.snapshot().thumbnailRetentionScope)
     }
 
     @Test func encryptedBlobHasNoPlaintextAndRoundTrips() throws {

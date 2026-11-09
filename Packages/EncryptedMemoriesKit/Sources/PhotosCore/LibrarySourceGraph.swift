@@ -134,15 +134,6 @@ public struct LibrarySourceMetadataFields: OptionSet, Hashable, Sendable, Codabl
         .tags,
         .burstRelationship,
     ]
-
-    fileprivate static let individualFields: [Self] = [
-        .captureTime,
-        .mediaType,
-        .livePhotoRelationship,
-        .duration,
-        .tags,
-        .burstRelationship,
-    ]
 }
 
 /// One source's metadata for a resource, including explicit field completeness.
@@ -562,75 +553,8 @@ public final class DerivedDataResourceAuthorization<Kind: DerivedDataScopeKind>:
     }
 }
 
-/// A deduplicated timeline plus the source memberships used for capability routing.
-public struct LibrarySourceProjection: Sendable {
-    public let timeline: TimelineContentProjection
-    private let metadataByUID: [PhotoUID: LibrarySourceItem]
-    private let membershipsByUID: [PhotoUID: Set<SourceID>]
-    private let sourcesByID: [SourceID: LibrarySource]
-    private let metadataProvenanceByUID: [PhotoUID: [LibrarySourceMetadataFields: SourceID]]
-
-    fileprivate init(
-        timeline: TimelineContentProjection,
-        metadataByUID: [PhotoUID: LibrarySourceItem],
-        membershipsByUID: [PhotoUID: Set<SourceID>],
-        sourcesByID: [SourceID: LibrarySource],
-        metadataProvenanceByUID: [PhotoUID: [LibrarySourceMetadataFields: SourceID]]
-    ) {
-        self.timeline = timeline
-        self.metadataByUID = metadataByUID
-        self.membershipsByUID = membershipsByUID
-        self.sourcesByID = sourcesByID
-        self.metadataProvenanceByUID = metadataProvenanceByUID
-    }
-
-    public func sourceIDs(for uid: PhotoUID) -> Set<SourceID> {
-        membershipsByUID[uid] ?? []
-    }
-
-    public func metadata(for uid: PhotoUID) -> LibrarySourceItem? {
-        metadataByUID[uid]
-    }
-
-    /// Source which supplied one resolved metadata field after precedence merging.
-    public func sourceID(
-        for uid: PhotoUID,
-        metadataField: LibrarySourceMetadataFields
-    ) -> SourceID? {
-        guard LibrarySourceMetadataFields.individualFields.contains(metadataField) else { return nil }
-        return metadataProvenanceByUID[uid]?[metadataField]
-    }
-
-    public func capabilities(for uid: PhotoUID) -> LibrarySourceCapabilities {
-        sourceIDs(for: uid).reduce(into: LibrarySourceCapabilities()) { capabilities, sourceID in
-            if let source = sourcesByID[sourceID] {
-                capabilities.formUnion(source.capabilities)
-            }
-        }
-    }
-
-    /// Highest-precedence source which can perform `capability`, with source ID as a stable tie-breaker.
-    public func preferredSourceID(
-        for uid: PhotoUID,
-        requiring capability: LibrarySourceCapabilities
-    ) -> SourceID? {
-        sourceIDs(for: uid)
-            .compactMap { sourcesByID[$0] }
-            .filter { $0.capabilities.contains(capability) }
-            .sorted(by: Self.sourcePrecedes)
-            .first?.id
-    }
-
-    fileprivate static func sourcePrecedes(_ lhs: LibrarySource, _ rhs: LibrarySource) -> Bool {
-        if lhs.precedence != rhs.precedence { return lhs.precedence > rhs.precedence }
-        return lhs.id.rawValue.utf8.lexicographicallyPrecedes(rhs.id.rawValue.utf8)
-    }
-}
-
 /// Atomic result of one accepted graph mutation.
 public struct LibrarySourceChange: Sendable {
-    public let selectedProjection: LibrarySourceProjection
-    public let retentionProjection: LibrarySourceProjection
     public let selectedScope: SelectedDerivedDataScope
     /// Every accessible identity whose source can supply a thumbnail, independent of main-view inclusion.
     public let analysisScope: AnalysisDerivedDataScope
@@ -678,7 +602,7 @@ package struct LibrarySourcePersistenceSignature: Equatable, Sendable {
 /// retention, access-loss fencing, projection deduplication, and derived-data authority.
 ///
 /// This non-Sendable reference type cannot diverge through value copies. A host actor or coordinator owns
-/// one instance and publishes its Sendable projections, leases, and scopes to asynchronous consumers.
+/// one instance and publishes its Sendable leases and scopes to asynchronous consumers.
 public final class LibrarySourceGraph {
     private struct Record: Sendable {
         var source: LibrarySource
@@ -1056,7 +980,7 @@ public final class LibrarySourceGraph {
             && record.source.capabilities.contains(capability)
         {
             if let selectedID, let selected = records[selectedID],
-                !LibrarySourceProjection.sourcePrecedes(record.source, selected.source)
+                !Self.sourcePrecedes(record.source, selected.source)
             {
                 continue
             }
@@ -1168,7 +1092,7 @@ public final class LibrarySourceGraph {
             && record.itemIndexByUID[uid] != nil
         {
             if let selectedID, let selected = records[selectedID],
-                !LibrarySourceProjection.sourcePrecedes(record.source, selected.source)
+                !Self.sourcePrecedes(record.source, selected.source)
             {
                 continue
             }
@@ -1213,7 +1137,7 @@ public final class LibrarySourceGraph {
                 )
             else { continue }
             if let selectedID, let selected = records[selectedID],
-                !LibrarySourceProjection.sourcePrecedes(record.source, selected.source)
+                !Self.sourcePrecedes(record.source, selected.source)
             {
                 continue
             }
@@ -1353,83 +1277,13 @@ public final class LibrarySourceGraph {
         }
     }
 
-    public func selectedProjection() -> LibrarySourceProjection {
-        makeProjection(records: selectedRecords())
-    }
-
-    /// All still-accessible sources, including sources excluded from the main projection.
-    public func retentionProjection() -> LibrarySourceProjection {
-        makeProjection(records: retentionRecords())
-    }
-
-    public func selectedDerivedDataScope() -> SelectedDerivedDataScope {
-        let included = selectedRecords()
-        return makeScope(
-            records: included,
-            orderedUIDs: makeProjection(records: included).timeline.uids
-        )
-    }
-
-    /// All accessible thumbnail-capable identities, including sources excluded from the main projection.
-    public func analysisDerivedDataScope() -> AnalysisDerivedDataScope {
-        let included = retentionRecords().filter { $0.source.capabilities.contains(.readThumbnail) }
-        return makeScope(
-            records: included,
-            orderedUIDs: Self.membershipOrder(records: included),
-            requiredCapability: .readThumbnail
-        )
-    }
-
-    public func retentionDerivedDataScope() -> RetentionDerivedDataScope {
-        let included = retentionRecords()
-        return makeScope(
-            records: included,
-            orderedUIDs: Self.membershipOrder(records: included)
-        )
-    }
-
-    public func thumbnailRetentionDerivedDataScope() -> ThumbnailRetentionDerivedDataScope {
-        let included = retentionRecords().filter {
-            $0.source.capabilities.contains(.readThumbnail)
-        }
-        return makeScope(
-            records: included,
-            orderedUIDs: Self.relationshipRetentionOrder(
-                records: included,
-                relationship: .burstMember
-            ),
-            // A photo in the volume trash left every inventory but stays visible in Recently Deleted.
-            // Its thumbnail stays on disk; the crawl fetches it after every library photo.
-            authorizationOnlyUIDs: included.isEmpty ? [] : identitiesOutsideInventoryOrder,
-            requiredCapability: .readThumbnail
-        )
-    }
-
-    public func videoRetentionDerivedDataScope() -> VideoRetentionDerivedDataScope {
-        let included = retentionRecords().filter {
-            $0.source.capabilities.contains(.readContent)
-        }
-        return makeScope(
-            records: included,
-            orderedUIDs: Self.relationshipRetentionOrder(
-                records: included,
-                relationship: .livePhotoMotion
-            ),
-            requiredCapability: .readContent
-        )
-    }
-
     private func makeChange(previousRetentionUIDs: Set<PhotoUID>) -> LibrarySourceChange {
         let retentionRecords = retentionRecords()
         let selectedRecords = retentionRecords.filter { $0.source.isIncluded }
-        let retentionProjection = makeProjection(records: retentionRecords)
-        let selectedProjection =
-            selectedRecords.count == retentionRecords.count
-            ? retentionProjection : makeProjection(records: selectedRecords)
         let retentionOrder = Self.membershipOrder(records: retentionRecords)
         let selectedScope: SelectedDerivedDataScope = makeScope(
             records: selectedRecords,
-            orderedUIDs: selectedProjection.timeline.uids
+            orderedUIDs: selectedTimelineOrder(records: selectedRecords)
         )
         let analysisRecords = retentionRecords.filter {
             $0.source.capabilities.contains(.readThumbnail)
@@ -1472,8 +1326,6 @@ public final class LibrarySourceGraph {
             requiredCapability: .readContent
         )
         return LibrarySourceChange(
-            selectedProjection: selectedProjection,
-            retentionProjection: retentionProjection,
             selectedScope: selectedScope,
             analysisScope: analysisScope,
             retentionScope: retentionScope,
@@ -1486,75 +1338,32 @@ public final class LibrarySourceGraph {
 
     private func selectedRecords() -> [Record] {
         records.values.filter { $0.source.isIncluded && $0.accessState != .accessLost }.sorted { lhs, rhs in
-            LibrarySourceProjection.sourcePrecedes(lhs.source, rhs.source)
+            Self.sourcePrecedes(lhs.source, rhs.source)
         }
     }
 
     private func retentionRecords() -> [Record] {
         records.values.filter { $0.accessState != .accessLost }.sorted { lhs, rhs in
-            LibrarySourceProjection.sourcePrecedes(lhs.source, rhs.source)
+            Self.sourcePrecedes(lhs.source, rhs.source)
         }
     }
 
-    private func makeProjection(records included: [Record]) -> LibrarySourceProjection {
+    /// The merged, canonically ordered identities of the main view. A source with higher precedence supplies
+    /// each known field; an item without a known capture time and media type is not part of the view.
+    private func selectedTimelineOrder(records included: [Record]) -> [PhotoUID] {
         var itemsByUID: [PhotoUID: LibrarySourceItem] = [:]
-        var membershipsByUID: [PhotoUID: Set<SourceID>] = [:]
-        var sourcesByID: [SourceID: LibrarySource] = [:]
-        var metadataProvenanceByUID: [PhotoUID: [LibrarySourceMetadataFields: SourceID]] = [:]
-        let itemCapacity = included.reduce(into: 0) { $0 += $1.items.count }
-        itemsByUID.reserveCapacity(itemCapacity)
-        membershipsByUID.reserveCapacity(itemCapacity)
-        sourcesByID.reserveCapacity(included.count)
-        metadataProvenanceByUID.reserveCapacity(itemCapacity)
-
+        itemsByUID.reserveCapacity(included.reduce(into: 0) { $0 += $1.items.count })
         for record in included {
-            sourcesByID[record.source.id] = record.source
             for item in record.items {
-                membershipsByUID[item.uid, default: []].insert(record.source.id)
                 if let preferred = itemsByUID[item.uid] {
-                    for field in LibrarySourceMetadataFields.individualFields
-                    where !preferred.knownFields.contains(field) && item.knownFields.contains(field) {
-                        metadataProvenanceByUID[item.uid, default: [:]][field] = record.source.id
-                    }
                     itemsByUID[item.uid] = Self.merge(preferred: preferred, fallback: item)
                 } else {
                     itemsByUID[item.uid] = item
-                    for field in LibrarySourceMetadataFields.individualFields
-                    where item.knownFields.contains(field) {
-                        metadataProvenanceByUID[item.uid, default: [:]][field] = record.source.id
-                    }
                 }
             }
         }
-
-        let projectedItems = itemsByUID.values.filter {
-            $0.knownFields.contains(.requiredForProjection)
-        }
-        let projectedUIDs = Set(projectedItems.map(\.uid))
-        itemsByUID = itemsByUID.filter { projectedUIDs.contains($0.key) }
-        membershipsByUID = membershipsByUID.filter { projectedUIDs.contains($0.key) }
-        metadataProvenanceByUID = metadataProvenanceByUID.filter {
-            projectedUIDs.contains($0.key)
-        }
-        let orderedItems = TimelineSnapshot(orderedItems: projectedItems.map(\.item)).items
-        let sections =
-            orderedItems.isEmpty
-            ? []
-            : [
-                TimelineSection(
-                    id: "library",
-                    date: orderedItems[0].captureTime,
-                    title: "",
-                    items: orderedItems
-                )
-            ]
-        return LibrarySourceProjection(
-            timeline: TimelineContentProjection(sections: sections),
-            metadataByUID: itemsByUID,
-            membershipsByUID: membershipsByUID,
-            sourcesByID: sourcesByID,
-            metadataProvenanceByUID: metadataProvenanceByUID
-        )
+        let projected = itemsByUID.values.filter { $0.knownFields.contains(.requiredForProjection) }
+        return TimelineSnapshot(orderedItems: projected.map(\.item)).items.map(\.uid)
     }
 
     private func makeScope<Kind: DerivedDataScopeKind>(
@@ -1694,7 +1503,7 @@ public final class LibrarySourceGraph {
 
     /// Higher-precedence known fields win. A lower-precedence source fills only fields which the
     /// preferred source marked unknown; known empty tags and relationships remain authoritative.
-    private static func merge(
+    static func merge(
         preferred: LibrarySourceItem,
         fallback: LibrarySourceItem
     ) -> LibrarySourceItem {
@@ -1722,6 +1531,12 @@ public final class LibrarySourceGraph {
             ),
             knownFields: knownFields
         )
+    }
+
+    /// Higher precedence first, with the source ID as a stable tie-breaker.
+    private static func sourcePrecedes(_ lhs: LibrarySource, _ rhs: LibrarySource) -> Bool {
+        if lhs.precedence != rhs.precedence { return lhs.precedence > rhs.precedence }
+        return sourceIDPrecedes(lhs.id, rhs.id)
     }
 
     private static func sourceIDPrecedes(_ lhs: SourceID, _ rhs: SourceID) -> Bool {

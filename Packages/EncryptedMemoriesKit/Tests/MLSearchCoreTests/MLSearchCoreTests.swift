@@ -60,7 +60,7 @@ import Testing
             using: initialRefresh
         )
         let replacementRefresh = graph.beginRefresh(source.id)!
-        let scope = graph.analysisDerivedDataScope()
+        let scope = graph.snapshot().analysisScope
         let universe = MLAssetUniverse(analysisScope: scope)
 
         #expect(universe.snapshot() == MLAssetInventorySnapshot(analysisScope: scope))
@@ -155,7 +155,7 @@ import Testing
             validationToken: nil,
             using: refreshB
         )
-        let initialScope = graph.analysisDerivedDataScope()
+        let initialScope = graph.snapshot().analysisScope
         let universe = MLAssetUniverse(analysisScope: initialScope)
 
         #expect(initialScope.isAuthoritative)

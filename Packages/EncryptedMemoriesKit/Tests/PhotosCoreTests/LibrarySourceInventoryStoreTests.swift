@@ -97,7 +97,7 @@ final class LibrarySourceInventoryStoreTests: XCTestCase {
         XCTAssertEqual(graph.inventory(for: SourceID("cached"))?.authority, .cached)
         XCTAssertEqual(graph.inventory(for: SourceID("cached"))?.accessState, .temporarilyUnavailable)
         XCTAssertEqual(graph.inventory(for: SourceID("removed"))?.accessState, .accessLost)
-        XCTAssertFalse(graph.retentionDerivedDataScope().isAuthoritative)
+        XCTAssertFalse(graph.snapshot().retentionScope.isAuthoritative)
     }
 
     func testOrderedAccessLossFenceSurvivesRestartWithoutACompleteSnapshotSave() async throws {

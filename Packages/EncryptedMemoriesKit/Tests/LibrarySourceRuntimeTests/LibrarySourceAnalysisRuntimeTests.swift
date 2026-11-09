@@ -489,9 +489,10 @@ func livePhotoTagWithoutMotionDoesNotRejectTheFirstLibraryInventory(
     if admission == .accepted {
         #expect(Set(universe.snapshot().uids) == Set(items.map(\.uid)))
         let initial = await coordinator.snapshot()
-        let taggedMetadata = initial.selectedProjection.metadata(for: items[0].uid)
-        #expect(taggedMetadata?.knownFields.contains(.livePhotoRelationship) == false)
-        #expect(taggedMetadata?.item.tags.contains(.livePhotos) == true)
+        // The tagged still has no known motion, so only the live item adds a companion to the retention scope.
+        #expect(
+            initial.videoRetentionScope.uids
+                == Set(items.map(\.uid)).union([PhotoUID(volumeID: "v", nodeID: "motion")]))
         for item in items {
             #expect(await feed.decoded(for: item.uid) != nil)
             #expect(cache.diskData(for: item.uid) != nil)
@@ -510,7 +511,6 @@ func livePhotoTagWithoutMotionDoesNotRejectTheFirstLibraryInventory(
         // A later incomplete listing must not invent an authoritative removal of the known companion.
         #expect(await runtime.replacePrimaryInventory(items, authority: authority, generation: 3) == .accepted)
         let refreshed = await coordinator.snapshot()
-        #expect(refreshed.selectedProjection.metadata(for: resolved.uid)?.item.relatedVideoID == "resolved-motion")
         #expect(refreshed.videoRetentionScope.uids.contains(PhotoUID(volumeID: "v", nodeID: "resolved-motion")))
         if authority == .cached {
             #expect(refreshed.analysisScope.revision == resolvedRevision)

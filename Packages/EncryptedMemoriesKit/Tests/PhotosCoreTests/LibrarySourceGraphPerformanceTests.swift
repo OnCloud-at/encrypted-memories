@@ -36,7 +36,7 @@ final class LibrarySourceGraphPerformanceTests: XCTestCase {
             }
             let graph = try LibrarySourceGraph(restoring: inventories)
             let expected = graph.snapshot()
-            XCTAssertEqual(expected.selectedProjection.timeline.snapshot.count, 40_000)
+            XCTAssertEqual(expected.selectedScope.orderedUIDs.count, 40_000)
             XCTAssertEqual(expected.retentionScope.uids.count, 40_000 + (sourceCount - 1) * 10_000)
             var samples: [Double] = []
             for _ in 0..<5 {
@@ -45,10 +45,8 @@ final class LibrarySourceGraphPerformanceTests: XCTestCase {
                 let change = graph.snapshot()
                 let elapsed = start.duration(to: clock.now).components
                 samples.append(Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15)
-                XCTAssertEqual(
-                    change.selectedProjection.timeline.snapshot, expected.selectedProjection.timeline.snapshot)
-                XCTAssertEqual(
-                    change.retentionProjection.timeline.snapshot, expected.retentionProjection.timeline.snapshot)
+                XCTAssertEqual(change.selectedScope, expected.selectedScope)
+                XCTAssertEqual(change.retentionScope, expected.retentionScope)
                 XCTAssertEqual(change.analysisScope, expected.analysisScope)
                 XCTAssertEqual(change.thumbnailRetentionScope, expected.thumbnailRetentionScope)
                 XCTAssertEqual(change.videoRetentionScope, expected.videoRetentionScope)
