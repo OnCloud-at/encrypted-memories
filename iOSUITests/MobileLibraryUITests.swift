@@ -14,6 +14,9 @@ final class MobileLibraryUITests: XCTestCase {
             "-AppleLanguages", "(en)",
             "-AppleLocale", "en_US",
         ]
+        if name.contains("testBriskSwipeShowsTheMonthBesideTheScrollIndicator") {
+            app.launchArguments += ["-EncryptedMemoriesScrollDateLabelProbe"]
+        }
         if name.contains("testLargeGridFixtureRetainsSelectionWhileDenseRowScrolls") {
             app.launchArguments += ["-EncryptedMemoriesLargeGridFixture", "-EncryptedMemoriesDenseGridSmoke"]
         }
@@ -73,6 +76,34 @@ final class MobileLibraryUITests: XCTestCase {
     func testLibraryShowsThePhotosOfTheAccount() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60), "the library grid shows no photo")
         XCTAssertTrue(app.buttons["Select"].exists)
+    }
+
+    /// A slow inspection drag shows no date label. A brisk drag shows the month and year beside the scroll indicator,
+    /// and the label fades out after the scrolling stops. The DEBUG test element keeps the last state and counts the
+    /// appearances (and the appearances laid out opaque inside the grid), because XCTest queries wait for an idle app
+    /// and can run after the short-lived label faded.
+    func testBriskSwipeShowsTheMonthBesideTheScrollIndicator() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        let label = app.descendants(matching: .any)["timeline.scrollDateLabel"]
+        XCTAssertTrue(label.waitForExistence(timeout: 10))
+        XCTAssertEqual(label.value as? String, "hidden 0 0", "the date label is not permanent")
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 200)),
+            withVelocity: XCUIGestureVelocity(200), thenHoldForDuration: 0.3)
+        XCTAssertEqual(label.value as? String, "hidden 0 0", "a slow inspection drag shows no date label")
+        start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 360)),
+            withVelocity: XCUIGestureVelocity(1_500), thenHoldForDuration: 0.1)
+        XCTAssertTrue(
+            wait(for: label, "value == 'visible 1 1' OR value == 'hidden 1 1'", timeout: 10),
+            "a brisk drag shows the date label once, opaque and inside the grid, got \(label.value ?? "nil")")
+        XCTAssertTrue(label.label.hasSuffix(" 2026"), "month and year of the fixture photos, got \(label.label)")
+        XCTAssertGreaterThan(label.frame.midX, window.frame.midX, "the label sits on the scroll indicator side")
+        XCTAssertTrue(
+            wait(for: label, "value == 'hidden 1 1'", timeout: 10),
+            "the label fades out after the scrolling stops")
     }
 
     func testAPhotoOpensInTheViewerAndClosesAgain() throws {

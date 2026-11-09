@@ -106,6 +106,7 @@ import Testing
         // The newest photo is a Smart Search result only; it follows the name hits.
         let result = projection("IMG_3350", names: index, semantic: [unnamed.uid], items: [older, named, unnamed])
         #expect(result.presentationItems.map(\.uid) == [named.uid, older.uid, unnamed.uid])
+        #expect(!result.isDateOrdered, "a date label must not describe a list led by name hits")
         // The canonical snapshot and sections keep their date order.
         #expect(result.snapshot.items.map(\.uid) == [older.uid, named.uid, unnamed.uid])
     }
@@ -114,6 +115,7 @@ import Testing
         // "IMG 3350" does not read as a file name: the name hit stays in its date position.
         let result = projection("img 3350", names: names, semantic: [unnamed.uid])
         #expect(result.presentationItems.map(\.uid) == [unnamed.uid, named.uid])
+        #expect(result.isDateOrdered)
     }
 
     /// The name part of one search costs one lookup per photo for the match and one per result for the order,

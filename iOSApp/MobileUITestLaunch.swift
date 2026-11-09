@@ -3,6 +3,8 @@ import PhotosCore
 import SwiftUI
 
 #if DEBUG
+    import TimelineUIKitFeature
+
     /// Starts the app signed in to the offline fixture account when a UI test passes `fixtureArgument`.
     /// Debug builds only: the App Store build contains neither this switch nor the fixture.
     @MainActor
@@ -49,6 +51,8 @@ import SwiftUI
         /// Waits for the session check at launch, so it cannot replace the fixture session afterward.
         static func installFixtureIfRequested(into runtime: MobileAccountRuntime) async {
             guard isRequested, fixture == nil else { return }
+            UIKitTimelineScrollDateLabelTesting.exposesLabel = ProcessInfo.processInfo.arguments.contains(
+                UIKitTimelineScrollDateLabelTesting.launchArgument)
             // The owner can inspect the long library without resetting saved preferences.
             if !usesLargeGridFixture {
                 UserDefaults.standard.removeObject(forKey: AppSettingsKey.blurAppPreview)

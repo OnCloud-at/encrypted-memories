@@ -25,17 +25,24 @@ public enum GridScrollAnchorPolicy {
     /// - When no slot starts in the area (tiles taller than the area), the topmost slot that reaches into it anchors,
     ///   then the topmost slot.
     ///
-    /// Ties keep the first slot in order.
+    /// Ties keep the first slot in order. One pass without allocation, so a host can run it every scroll frame.
     public static func anchor<Slot>(
         among slots: [Slot], visibleTop: CGFloat, visibleBottom: CGFloat,
         isKept: (Slot) -> Bool = { _ in false }, frame: (Slot) -> CGRect
     ) -> Slot? {
-        func startsInView(_ slot: Slot) -> Bool {
-            frame(slot).minY >= visibleTop - 0.5 && frame(slot).minY < visibleBottom
+        var starting: (slot: Slot, minY: CGFloat)?
+        var reaching: (slot: Slot, minY: CGFloat)?
+        var topmost: (slot: Slot, minY: CGFloat)?
+        for slot in slots {
+            let rect = frame(slot)
+            let startsInView = rect.minY >= visibleTop - 0.5 && rect.minY < visibleBottom
+            if startsInView, isKept(slot) { return slot }
+            if startsInView, rect.minY < starting?.minY ?? .infinity { starting = (slot, rect.minY) }
+            if rect.maxY > visibleTop, rect.minY < visibleBottom, rect.minY < reaching?.minY ?? .infinity {
+                reaching = (slot, rect.minY)
+            }
+            if rect.minY < topmost?.minY ?? .infinity { topmost = (slot, rect.minY) }
         }
-        func topmost(_ candidates: [Slot]) -> Slot? { candidates.min(by: { frame($0).minY < frame($1).minY }) }
-        if let kept = slots.first(where: { isKept($0) && startsInView($0) }) { return kept }
-        let reachesIntoView = slots.filter { frame($0).maxY > visibleTop && frame($0).minY < visibleBottom }
-        return topmost(slots.filter(startsInView)) ?? topmost(reachesIntoView) ?? topmost(slots)
+        return starting?.slot ?? reaching?.slot ?? topmost?.slot
     }
 }

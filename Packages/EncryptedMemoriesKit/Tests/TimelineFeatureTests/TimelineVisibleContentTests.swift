@@ -378,7 +378,7 @@ import Testing
         await model.load()
 
         let revision = model.contentRevision
-        let markers = MetalGridProductionAdapter.dateMarkers(items: model.allItems, granularity: .month)
+        let markers = TimelineDateMarkers.markers(items: model.allItems, granularity: .month)
         #expect(markers.map(\.index) == [0, 1])
         #expect(model.allItems.map(\.uid) == [january.uid, february.uid])
         #expect(

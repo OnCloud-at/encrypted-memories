@@ -225,7 +225,7 @@ import Testing
             fixture.persistedUIDs() == [inventoryUID("b")],
             "M684_UNKNOWN_EMPTY_PRESERVES: an unknown inventory is not known-empty")
 
-        let changes = InventoryCounter()
+        let changes = TimelineTestCounter()
         withObservationTracking {
             _ = fixture.timeline.wholeLibraryLocationRevision
         } onChange: {
@@ -1009,7 +1009,7 @@ import Testing
         func coalescedUnknownMutationsConsumeOneCompletePublication() async throws {
             let fixture = try await LocationInventoryFixture.make()
             fixture.seed(["b", "d"])
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = { projections.increment() }
             for _ in 0..<3 { await fixture.reconcile(nil) }
             #expect(projections.value == 0, "G684_COALESCE_UNKNOWN: unknown mutations must not project")
@@ -1035,7 +1035,7 @@ import Testing
             fixture.seed(["b", "d"])
             let release = InventoryGate()
             defer { release.open() }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 if projections.next() == 1 {
                     fixture.events.send(.projectionEntered)
@@ -1071,7 +1071,7 @@ import Testing
                 oldRelease.open()
                 currentRelease.open()
             }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 let attempt = projections.next()
                 fixture.events.send(.projectionEntered)
@@ -1111,7 +1111,7 @@ import Testing
                 release.open()
                 cancelledRelease.open()
             }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 if projections.next() == 1 {
                     fixture.events.send(.projectionEntered)
@@ -1181,7 +1181,7 @@ import Testing
             let release = InventoryGate()
             defer { release.open() }
             let prerequisite = Task { await release.wait() }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 projections.increment()
                 fixture.events.send(.projectionEntered)
@@ -1262,7 +1262,7 @@ import Testing
         func workThatStartsAfterAReconfigurationCannotTouchTheCurrentOwner() async throws {
             let fixture = try await LocationInventoryFixture.make()
             fixture.seed(["b", "d"])
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = { projections.increment() }
             // A trash and a publication of the earlier configuration capture their owner, then wait.
             let earlierOwner = fixture.session.captureOwnerLease()
@@ -1323,7 +1323,7 @@ import Testing
             await fixture.reconcile(nil)
             let release = InventoryGate()
             defer { release.open() }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 if projections.next() == 1 {
                     fixture.events.send(.projectionEntered)
@@ -1368,7 +1368,7 @@ import Testing
                 publicationRelease.open()
                 takeoverRelease.open()
             }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 let attempt = projections.next()
                 fixture.events.send(.projectionEntered)
@@ -1405,7 +1405,7 @@ import Testing
             await fixture.reconcile(nil)
             let releases = [InventoryGate(), InventoryGate(), InventoryGate()]
             defer { releases.forEach { $0.open() } }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 let attempt = projections.next()
                 fixture.events.send(.projectionEntered)
@@ -1445,7 +1445,7 @@ import Testing
                 publicationRelease.open()
                 takeoverRelease.open()
             }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 let attempt = projections.next()
                 fixture.events.send(.projectionEntered)
@@ -1483,7 +1483,7 @@ import Testing
                 publicationRelease.open()
                 takeoverRelease.open()
             }
-            let projections = InventoryCounter()
+            let projections = TimelineTestCounter()
             fixture.session.beforeWholeLibraryUIDProjectionForTesting = {
                 let attempt = projections.next()
                 fixture.events.send(.projectionEntered)
@@ -1832,7 +1832,7 @@ private enum InventoryEvent: Sendable, Equatable {
 private final class InventoryEvents: Sendable {
     let stream: AsyncStream<InventoryEvent>
     private let continuation: AsyncStream<InventoryEvent>.Continuation
-    private let completions = InventoryCounter()
+    private let completions = TimelineTestCounter()
     init() {
         let pair = AsyncStream<InventoryEvent>.makeStream()
         stream = pair.stream
@@ -1881,19 +1881,6 @@ private final class InventorySwitch: @unchecked Sendable {
         get { lock.withLock { on } }
         set { lock.withLock { on = newValue } }
     }
-}
-
-private final class InventoryCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var count = 0
-    func increment() { lock.withLock { count += 1 } }
-    func next() -> Int {
-        lock.withLock {
-            count += 1
-            return count
-        }
-    }
-    var value: Int { lock.withLock { count } }
 }
 
 private func inventoryUID(_ id: String) -> PhotoUID { PhotoUID(volumeID: "inventory", nodeID: id) }

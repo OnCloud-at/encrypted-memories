@@ -59,6 +59,8 @@
         /// instead of making filtered items pop into their new topology during unrelated SwiftUI updates.
         private let contentTransitionSignal: Int
         private let prefersReducedMotion: Bool
+        /// Shows the transient month and year label while the user scrolls briskly. Only for surfaces in date order.
+        private let showsScrollDateLabel: Bool
         private let allowsPhotoActions: Bool
         private let isProvisionalPresentation: Bool
         private let allowsPlaceholderContentReady: Bool
@@ -96,6 +98,7 @@
             restoreScrollSignal: Int = 0,
             contentTransitionSignal: Int = 0,
             prefersReducedMotion: Bool = false,
+            showsScrollDateLabel: Bool = false,
             allowsPhotoActions: Bool = true,
             isProvisionalPresentation: Bool = false,
             allowsPlaceholderContentReady: Bool = false,
@@ -129,6 +132,7 @@
             self.restoreScrollSignal = restoreScrollSignal
             self.contentTransitionSignal = contentTransitionSignal
             self.prefersReducedMotion = prefersReducedMotion
+            self.showsScrollDateLabel = showsScrollDateLabel
             self.allowsPhotoActions = allowsPhotoActions
             self.isProvisionalPresentation = isProvisionalPresentation
             self.allowsPlaceholderContentReady = allowsPlaceholderContentReady
@@ -196,6 +200,8 @@
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
                 isProvisionalPresentation: isProvisionalPresentation, uploadBadges: uploadBadges)
+            view.setScrollDateLabelEnabled(
+                showsScrollDateLabel, reduceMotion: prefersReducedMotion || accessibilityReduceMotion)
             view.setActive(isActive)
             view.setScopeBarGap(scopeBarGap)
             wireProxy(proxy, to: view)
@@ -225,6 +231,8 @@
             if shouldDissolveContent {
                 uiView.completeContentReplacementTransition(prefersReducedMotion: prefersReducedMotion)
             }
+            uiView.setScrollDateLabelEnabled(
+                showsScrollDateLabel, reduceMotion: prefersReducedMotion || accessibilityReduceMotion)
             uiView.setActive(isActive)
             uiView.setScopeBarGap(scopeBarGap)
             wireProxy(proxy, to: uiView)
@@ -267,7 +275,7 @@
         private static let gridClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
         let metalView = UIKitTimelineMetalHostView()
-        let scrollView = UIScrollView()
+        let scrollView = UIKitTimelineScrollView()
         let contentView = UIView()
         private let profileAdapter = UIKitTimelineGridProfileAdapter()
         private let displayLink: UIKitTimelineDisplayLinkDriver
@@ -434,11 +442,22 @@
         private var lastLaidOutSafeAreaInsets: UIEdgeInsets = .zero
         /// The active reserved regions (the iPhone Duo fold, a camera) in viewport coordinates; selection marks move
         /// out of them. Read on every layout; a hinge change asks for a layout.
-        private(set) var reservedRegionLayout: ReservedRegionLayout = .none
+        private(set) var reservedRegionLayout: ReservedRegionLayout = .none {
+            didSet {
+                guard reservedRegionLayout != oldValue else { return }
+                scrollDateLabel.setAvoidedBands(
+                    TimelineScrollDateLabelGeometry.bands(
+                        avoiding: reservedRegionLayout.exclusions,
+                        trailingColumnFrom: TimelineScrollDateLabelMotion.columnMinX(
+                            width: bounds.width, trailingInset: safeAreaInsets.right)))
+            }
+        }
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
         var isApplyingProgrammaticScroll = false
+        /// True only while an explicit newest/top navigation command sets its offset.
+        var isApplyingScrollJump = false
         /// One-shot after a settled frame encodes presentable known photos.
         private var firstContentReported = false
         private var firstContentPending = false
@@ -531,6 +550,15 @@
         /// scene, not per application: on iPad one window can be hidden while another window of the same account
         /// stays on screen, and only the hidden grid must stop rendering, decoding and warming.
         private var sceneIsBackgrounded = false
+        /// The transient month and year label beside the scroll indicator (#777).
+        let scrollDateLabel = UIKitTimelineScrollDateLabelPresenter()
+        /// Layout passes and the host's own animated scrolls move the offset without the user (#777).
+        var scrollDateLabelLayoutDepth = 0
+        var hostAnimatedScrollActive = false
+        /// The system scrolls to the top after a status-bar tap: a jump, not the person's scrolling.
+        var systemScrollToTopActive = false
+        /// The next content change replaces the list instead of refreshing it (a search or filter projection).
+        var pendingScrollDateListReplacement = false
 
         public private(set) var isMetal3Capable = false
 
@@ -611,6 +639,7 @@
             if reportedFeedInteractionActive {
                 wiredFeed?.setUserInteractionActive(false, owner: interactionOwner)
             }
+            let finalScrollDateLabel = scrollDateLabel
             let finalDisplayLink = displayLink
             let finalImagesAvailableWakeRegistration = imagesAvailableWakeRegistration
             let finalTexturePressureRegistration = texturePressureRegistration
@@ -618,6 +647,7 @@
             NotificationCenter.default.removeObserver(self)
             finalImagesAvailableWakeRegistration?.end()
             Task { @MainActor in
+                finalScrollDateLabel.retire()
                 finalDisplayLink.stop()
                 finalTexturePressureRegistration?.end()
             }
@@ -639,6 +669,9 @@
             isProvisionalPresentation: Bool = false,
             uploadBadges: PendingUploadBadges = .empty
         ) {
+            // Content and layout changes in here can move the offset; they never count as user scrolling.
+            scrollDateLabelLayoutDepth += 1
+            defer { scrollDateLabelLayoutDepth -= 1 }
             let provisionalUpdate = isProvisionalPresentation || self.isProvisionalPresentation
             self.isProvisionalPresentation = isProvisionalPresentation
             self.selectionMode = selectionMode
@@ -657,6 +690,7 @@
             }
             swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
+            let wasConfigured = hasConfiguredContent
             if feedChanged { placeholderScroll.reset() }
             var contentChanged: Bool
             if let contentRevision {
@@ -704,6 +738,11 @@
                 hasConfiguredContent = true
                 if uidsChanged { itemUIDs = newUIDs }
                 thumbnailOverlayResolver.update(items: items)
+                // Another feed (account), the first content or a projection replacement shows another list; every
+                // other change refreshes the same list, which keeps the label stable while the library updates.
+                scrollDateLabel.contentChanged(
+                    items, replacesList: feedChanged || !wasConfigured || pendingScrollDateListReplacement)
+                pendingScrollDateListReplacement = false
             } else if contentRevision == nil {
                 // Do not let a later revision-bearing caller match an identity from an earlier surface by accident.
                 configuredContentRevision = nil
@@ -814,6 +853,7 @@
         /// Captures the currently presented Metal surface before a projection replacement.
         /// The snapshot stays above the next frame for one short dissolve, matching Photos filter changes.
         public func prepareContentReplacementTransition(prefersReducedMotion: Bool) {
+            pendingScrollDateListReplacement = true
             contentReplacementSnapshot?.removeFromSuperview()
             contentReplacementUsesSurfaceFade = false
             guard !prefersReducedMotion, window != nil, !bounds.isEmpty else { return }
@@ -871,6 +911,8 @@
         }
 
         public override func layoutSubviews() {
+            scrollDateLabelLayoutDepth += 1
+            defer { scrollDateLabelLayoutDepth -= 1 }
             updateScopeBarClearanceIfNeeded()
             if lastInsetBounds != bounds {
                 lastInsetBounds = bounds
@@ -888,6 +930,7 @@
             lastLaidOutViewportSize = bounds.size
             lastLaidOutSafeAreaInsets = safeAreaInsets
             reservedRegionLayout = currentReservedRegionLayout()
+            scrollDateLabel.layout()
             requestRender()
             invalidateAccessibilityElements()
         }
@@ -911,6 +954,7 @@
                 // suspended; `setActive(true)` resumes later (window is present by then).
                 if framePump.isActive, !sceneIsBackgrounded { resumeRenderLoop() }
             }
+            updateScrollDateLabelGate()
             invalidateAccessibilityElements()
         }
 
@@ -975,6 +1019,7 @@
             } else {
                 suspendRenderLoop()
             }
+            updateScrollDateLabelGate()
             UIHitchLog.gridActivity(
                 active: active, hasWindow: window != nil, displayLinkRunning: displayLink.isRunning,
                 warmInFlight: warmInFlight, aheadWarmInFlight: aheadWarmInFlight, items: items.count)
@@ -1129,6 +1174,7 @@
             contentView.backgroundColor = .clear
             scrollView.addSubview(contentView)
             addSubview(scrollView)
+            scrollDateLabel.attach(to: self, scrollView: scrollView)
 
             // Tap-to-open and pinch-to-change-density ride on the scroll surface so they coexist with the pan/scroll
             // gesture. The tap requires no movement (never fights a scroll); the pinch drives an engine-owned
@@ -1160,12 +1206,14 @@
         /// The hosting window scene left the screen: stop the display link and drop in-flight warm work.
         func hostSceneDidEnterBackground() {
             sceneIsBackgrounded = true
+            updateScrollDateLabelGate()  // Hide the label before the app-switcher snapshot.
             suspendRenderLoop()
         }
 
         /// The hosting window scene returns: one render re-arms and decodes tiles that arrived meanwhile.
         func hostSceneWillEnterForeground() {
             sceneIsBackgrounded = false
+            updateScrollDateLabelGate()
             guard window != nil, framePump.isActive else { return }
             resumeRenderLoop()
         }
@@ -1355,9 +1403,7 @@
             let target = maxContentOffsetY
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
             placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
-            isApplyingProgrammaticScroll = true
-            scrollView.setContentOffset(CGPoint(x: 0, y: target), animated: animated)
-            isApplyingProgrammaticScroll = false
+            setHostContentOffsetY(target, animated: animated)
             if !animated { finishPlaceholderScroll() }
             requestRender()
         }
@@ -1371,13 +1417,22 @@
             let target = -safeAreaInsets.top
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
             placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
-            isApplyingProgrammaticScroll = true
-            scrollView.setContentOffset(CGPoint(x: 0, y: target), animated: animated)
-            isApplyingProgrammaticScroll = false
+            setHostContentOffsetY(target, animated: animated)
             if !animated { finishPlaceholderScroll() }
             needsInitialViewportPlacement = false
             userHasScrolledTimeline = false
             requestRender()
+        }
+
+        /// Moves the viewport for the host itself. `hostAnimatedScrollActive` is set after the call: when a new animation
+        /// replaces a running one, UIKit ends the old one inside the call and its callback clears that flag.
+        func setHostContentOffsetY(_ y: CGFloat, animated: Bool) {
+            isApplyingScrollJump = true
+            defer { isApplyingScrollJump = false }
+            isApplyingProgrammaticScroll = true
+            scrollView.setContentOffset(CGPoint(x: 0, y: y), animated: animated)
+            isApplyingProgrammaticScroll = false
+            hostAnimatedScrollActive = animated && scrollView.isScrollAnimating
         }
 
         func setPreferredContentMode(_ mode: TileContentDisplayMode) {
@@ -1716,6 +1771,7 @@
             else { return .skippedNoSurface }
             let viewportSize = bounds.size
             let overscan = texturePolicy.budget.overscanFraction * viewportSize.height
+            updateScrollDateLabelGate()
             let profile = currentProfile()
             let level = activeLevel(profile: profile)
             let engine = currentEngine(profile: profile)
@@ -1789,6 +1845,9 @@
                 columnPhase: committedPhase
             )
 
+            PhotoPerformanceSignposts.grid.interval("scrollDateLabel.anchor") {
+                updateScrollDateLabelAnchor(plan: plan)
+            }
             let outcome = renderSlotFrame(
                 renderer: renderer,
                 textureCache: textureCache,
@@ -2157,7 +2216,15 @@
         }
 
         func invalidateAccessibilityElements() {
-            accessibilityProvider.onOpen = { [weak self] item in self?.onOpenPhoto?(item) }
+            accessibilityProvider.onOpen = { [weak self] item in self?.openPhoto(item) }
+            #if DEBUG
+                if UIKitTimelineScrollDateLabelTesting.exposesLabel, accessibilityProvider.testElements == nil {
+                    accessibilityProvider.testElements = { [weak self] in
+                        guard let self, scrollDateLabel.isEnabled else { return [] }
+                        return [scrollDateLabel.testElement]
+                    }
+                }
+            #endif
             accessibilityProvider.onToggleSelection = { [weak self] item in self?.onToggleSelection?(item) }
             accessibilityProvider.invalidate()
         }
@@ -2183,7 +2250,7 @@
             if selectionMode {
                 onToggleSelection?(items[slot.index])
             } else {
-                onOpenPhoto?(items[slot.index])
+                openPhoto(items[slot.index])
             }
         }
 
@@ -2282,12 +2349,20 @@
 
     extension UIKitTimelineGridHostView: UIScrollViewDelegate {
         public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            // A touch interrupts a jump animation without an end callback; the person's scrolling starts here.
+            hostAnimatedScrollActive = false
+            systemScrollToTopActive = false
             placeholderScroll.began(visibleIDs: visiblePlaceholderUIDs())
             scrollInputActive = true
             updateFeedInteractionState()
         }
 
         public func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            if !scrollView.isScrollAnimating {
+                // No offset animation runs: a tap, a no-op status-bar tap or another jump ended it without a callback.
+                hostAnimatedScrollActive = false
+                systemScrollToTopActive = false
+            }
             if let lockedY = pinchLockedOffsetY {
                 let clamped = min(max(lockedY, 0), maxContentOffsetY)
                 if abs(scrollView.contentOffset.y - clamped) > 0.5 {
@@ -2295,9 +2370,15 @@
                     scrollView.setContentOffset(CGPoint(x: 0, y: clamped), animated: false)
                     isApplyingProgrammaticScroll = false
                 }
+                scrollDateLabel.viewportMoved(.init(isHostDriven: true), offsetY: scrollView.contentOffset.y)
                 requestRender()
                 invalidateAccessibilityElements()
                 return
+            }
+            PhotoPerformanceSignposts.grid.interval("scrollDateLabel.scroll") {
+                updateScrollDateLabelGate()
+                scrollDateLabel.viewportMoved(scrollDateLabelMovement, offsetY: scrollView.contentOffset.y)
+                scrollDateLabel.layout()
             }
             if !isApplyingProgrammaticScroll,
                 scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating
@@ -2336,7 +2417,17 @@
             requestRender()
         }
 
+        public func scrollViewShouldScrollToTop(_ scrollView: UIScrollView) -> Bool {
+            systemScrollToTopActive = true  // A status-bar tap marks a jump; the date label starts its fade-out.
+            return true
+        }
+
+        public func scrollViewDidScrollToTop(_ scrollView: UIScrollView) {
+            systemScrollToTopActive = false
+        }
+
         public func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+            hostAnimatedScrollActive = false
             finishPlaceholderScroll()
             requestRender()
         }
@@ -2347,6 +2438,57 @@
             guard pinchInputActive != active else { return }
             pinchInputActive = active
             updateFeedInteractionState()
+            updateScrollDateLabelGate()
+        }
+
+        /// Turns the scroll date label on for a chronological surface. Off by default.
+        public func setScrollDateLabelEnabled(_ enabled: Bool, reduceMotion: Bool) {
+            scrollDateLabel.setReduceMotion(reduceMotion)
+            scrollDateLabel.setEnabled(enabled)
+        }
+
+        /// The label shows only while the user can scroll this surface: never during pinch, zoom, density or content
+        /// transitions, on an inactive tab, in a background scene or without a window.
+        func updateScrollDateLabelGate() {
+            scrollDateLabel.updateHost(scrollDateLabelHostState)
+        }
+
+        var scrollDateLabelHostState: TimelineScrollDateLabelHostState {
+            TimelineScrollDateLabelHostState(
+                hasWindow: window != nil, isActive: framePump.isActive, isBackgrounded: sceneIsBackgrounded,
+                isTransforming: pinchInputActive || pinchStartLevel != nil || pinchLockedOffsetY != nil
+                    || zoomTransaction != nil || commitBridgeTransaction != nil || gridTransition.isActive
+                    || overviewDissolve != nil || pinchSettling,
+                hasItems: !itemUIDs.isEmpty,
+                isScrollable: scrollView.contentSize.height + scrollView.contentInset.top
+                    + scrollView.contentInset.bottom > bounds.height + 1)
+        }
+
+        /// How the scroll view moved this time, in the shared classifier's terms.
+        var scrollDateLabelMovement: TimelineScrollDateLabelMovement {
+            TimelineScrollDateLabelMovement.observed(
+                isApplyingProgrammaticScroll: isApplyingProgrammaticScroll,
+                hostAnimationActive: hostAnimatedScrollActive, systemJumpActive: systemScrollToTopActive,
+                isLayout: scrollDateLabelLayoutDepth > 0, isTracking: scrollView.isTracking,
+                isDragging: scrollView.isDragging, isDecelerating: scrollView.isDecelerating,
+                isScrollAnimating: scrollView.isScrollAnimating, isApplyingJump: isApplyingScrollJump)
+        }
+
+        /// Opens a photo; the date label leaves at once, before the viewer covers the grid.
+        func openPhoto(_ item: PhotoItem) {
+            scrollDateLabel.hideForRoute()
+            onOpenPhoto?(item)
+        }
+
+        /// The anchor photo of the label: the first photo whose top edge lies below the top bar (the shared scroll
+        /// anchor rule). Reads the plan this frame draws anyway and allocates nothing.
+        func updateScrollDateLabelAnchor(plan: GridFramePlan) {
+            guard scrollDateLabel.isEnabled else { return }
+            let top = scrollView.contentOffset.y + safeAreaInsets.top
+            let anchor = GridScrollAnchorPolicy.anchor(
+                among: plan.visibleSlots, visibleTop: top,
+                visibleBottom: scrollView.contentOffset.y + bounds.height - safeAreaInsets.bottom, frame: \.slotRect)
+            scrollDateLabel.setAnchor(flatIndex: anchor?.index)
         }
 
         func updateFeedInteractionState() {
