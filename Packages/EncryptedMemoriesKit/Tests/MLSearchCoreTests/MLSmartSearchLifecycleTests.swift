@@ -1284,81 +1284,12 @@ import Testing
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
         await harness.lifecycle.start()
-        await harness.lifecycle.loadModelChoices()
         await harness.lifecycle.enable(with: entry.id)
         let snapshot = await harness.lifecycle.currentSnapshot()
         #expect(!snapshot.isSupported)
         #expect(snapshot.phase == .disabled)
         #expect(!snapshot.isEnabled)
         #expect(harness.provider.builtCount == 0)
-        #expect(harness.transport.downloadCount == 0)
-    }
-
-    @Test func modelChoicesLoadWhileOffWithoutStoringOrDownloadingAnything() async throws {
-        let payloadA = Data("model-a".utf8)
-        let payloadB = Data("model-b".utf8)
-        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
-        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
-        let remote = MLModelCatalog(entries: [entryA, entryB])
-        let catalogProvider = RecordingCatalogProvider(remote)
-        let harness = try makeHarness(
-            catalog: remote,
-            payloads: [urlA: payloadA, urlB: payloadB],
-            assets: [uid("asset")],
-            catalogProvider: catalogProvider
-        )
-        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
-
-        await harness.lifecycle.start()
-        await harness.lifecycle.loadModelChoices()
-        let choosing = await harness.lifecycle.currentSnapshot()
-        #expect(choosing.phase == .disabled)
-        #expect(!choosing.isEnabled)
-        #expect(choosing.selectedModelID == nil)
-        #expect(choosing.availableModels.map(\.id) == [entryA.id, entryB.id])
-        #expect(await catalogProvider.requestCount == 1)
-        #expect(harness.transport.downloadCount == 0)
-        #expect(try harness.stateStore.load() == nil, "choosing a model stores nothing")
-
-        // A second request reuses the loaded catalog.
-        await harness.lifecycle.loadModelChoices()
-        #expect(await catalogProvider.requestCount == 1)
-
-        await harness.lifecycle.enable(with: entryA.id)
-        let stored = try #require(try harness.stateStore.load())
-        #expect(stored.isEnabled)
-        #expect(stored.selectedModelID == entryA.id)
-        #expect(await waitForCompleteIndex(harness, total: 1))
-        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == entryA.id)
-    }
-
-    @Test func failedModelListWhileOffIsRetryableAndStoresNothing() async throws {
-        let payload = Data("model".utf8)
-        let (entry, url) = downloadableEntry(id: "model", payload: payload)
-        let harness = try makeHarness(
-            catalog: MLModelCatalog(entries: []),
-            payloads: [url: payload],
-            assets: [uid("asset")],
-            catalogProvider: FailingOnceCatalogProvider(MLModelCatalog(entries: [entry]))
-        )
-        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
-
-        await harness.lifecycle.start()
-        await harness.lifecycle.loadModelChoices()
-        let failed = await harness.lifecycle.currentSnapshot()
-        #expect(!failed.isEnabled)
-        guard case .failed(let failure) = failed.phase else {
-            Issue.record("a failed model list must stay visible while the person chooses")
-            return
-        }
-        #expect(failure.kind == .catalog && failure.isRetryable)
-        #expect(MLSmartSearchModelPresentation(snapshot: failed).canRetry)
-
-        await harness.lifecycle.retry()
-        let loaded = await harness.lifecycle.currentSnapshot()
-        #expect(loaded.phase == .disabled)
-        #expect(loaded.availableModels.map(\.id) == [entry.id])
-        #expect(try harness.stateStore.load() == nil)
         #expect(harness.transport.downloadCount == 0)
     }
 
@@ -4564,7 +4495,6 @@ import Testing
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
         await harness.lifecycle.start()
-        await harness.lifecycle.loadModelChoices()
         let snapshot = await harness.lifecycle.currentSnapshot()
         #expect(snapshot.availableModels.isEmpty)
 
@@ -4586,7 +4516,6 @@ import Testing
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
         await harness.lifecycle.start()
-        await harness.lifecycle.loadModelChoices()
         await harness.lifecycle.enable(with: MLModelCatalogEntry.tinyCLIPVit40M.id)
 
         let snapshot = await harness.lifecycle.currentSnapshot()
