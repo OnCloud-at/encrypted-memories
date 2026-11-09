@@ -378,6 +378,161 @@ final class LibrarySourceInventoryStoreTests: XCTestCase {
         )
     }
 
+    private func inventory(_ sourceID: String, _ ids: [String]) -> LibrarySourceInventory {
+        LibrarySourceInventory(
+            source: source(sourceID),
+            accessState: .available,
+            authority: .authoritative,
+            items: ids.map(item)
+        )
+    }
+
+    private func saveSigned(
+        _ inventories: [LibrarySourceInventory],
+        signature: LibrarySourcePersistenceSignature?,
+        to store: LibrarySourceInventoryStore,
+        session: LibrarySourceInventoryStore.SessionLease
+    ) async throws -> LibrarySourceInventorySaveResult {
+        let lease = try await store.captureWriteLease(using: session)
+        return try await store.save(
+            inventories,
+            sourceSetAuthority: .authoritative,
+            persistenceSignature: signature,
+            using: lease
+        )
+    }
+
+    private func loadedIDs(
+        _ store: LibrarySourceInventoryStore,
+        _ session: LibrarySourceInventoryStore.SessionLease
+    ) async throws -> [String] {
+        try await store.load(using: session).flatMap { $0.items.map(\.uid.nodeID) }.sorted()
+    }
+
+    private var signatures: (first: LibrarySourcePersistenceSignature, second: LibrarySourcePersistenceSignature) {
+        let graph = LibrarySourceGraph()
+        return (
+            graph.persistenceSignature(additionalStateGeneration: 0),
+            graph.persistenceSignature(additionalStateGeneration: 1)
+        )
+    }
+
+    func testRepeatedPersistenceSignatureSkipsTheWriteAndAnUnsignedSaveStillWrites() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = makeStore(directory)
+        let session = try await activate(store)
+        let (signature, otherSignature) = signatures
+
+        let first = try await saveSigned([inventory("only", ["a"])], signature: signature, to: store, session: session)
+        XCTAssertGreaterThan(first.changedRows, 0)
+
+        // The same identity means the same persisted state: nothing is encoded or written, even though the
+        // inventory passed in differs.
+        let repeated = try await saveSigned(
+            [inventory("only", ["a", "b"])], signature: signature, to: store, session: session)
+        XCTAssertEqual(repeated.changedRows, 0)
+        let afterRepeat = try await loadedIDs(store, session)
+        XCTAssertEqual(afterRepeat, ["a"])
+
+        // Another identity, and a save without one, write the new state.
+        let changed = try await saveSigned(
+            [inventory("only", ["a", "b"])], signature: otherSignature, to: store, session: session)
+        XCTAssertGreaterThan(changed.changedRows, 0)
+        let unsigned = try await saveSigned(
+            [inventory("only", ["a", "b", "c"])], signature: nil, to: store, session: session)
+        XCTAssertGreaterThan(unsigned.changedRows, 0)
+        let final = try await loadedIDs(store, session)
+        XCTAssertEqual(final, ["a", "b", "c"])
+    }
+
+    func testAFailedSaveDoesNotRememberItsPersistenceSignature() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = makeStore(directory)
+        let session = try await activate(store)
+        let (signature, otherSignature) = signatures
+        _ = try await saveSigned([inventory("only", ["a"])], signature: signature, to: store, session: session)
+        let duplicated = item("twice")
+        let invalid = LibrarySourceInventory(
+            source: source("only"), accessState: .available, authority: .authoritative,
+            items: [duplicated, duplicated])
+
+        do {
+            _ = try await saveSigned([invalid], signature: otherSignature, to: store, session: session)
+            XCTFail("duplicate item identities must fail")
+        } catch {
+            XCTAssertEqual(
+                error as? LibrarySourceInventoryValidationError,
+                .duplicateItemUID(sourceID: SourceID("only"), uid: duplicated.uid))
+        }
+
+        // The failed save wrote nothing, so the same identity must not skip the next valid save.
+        let retry = try await saveSigned(
+            [inventory("only", ["a", "b"])], signature: otherSignature, to: store, session: session)
+        XCTAssertGreaterThan(retry.changedRows, 0)
+        let loaded = try await loadedIDs(store, session)
+        XCTAssertEqual(loaded, ["a", "b"])
+    }
+
+    func testActivatingAnotherSessionForgetsThePersistenceSignature() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = makeStore(directory)
+        let first = try await activate(store)
+        let (signature, _) = signatures
+        _ = try await saveSigned([inventory("only", ["a"])], signature: signature, to: store, session: first)
+
+        // A new graph lifetime starts with its own identities; an equal value must not skip its first save.
+        let second = try await activate(store)
+        let result = try await saveSigned(
+            [inventory("only", ["a", "b"])], signature: signature, to: store, session: second)
+        XCTAssertGreaterThan(result.changedRows, 0)
+        let loaded = try await loadedIDs(store, second)
+        XCTAssertEqual(loaded, ["a", "b"])
+    }
+
+    func testPurgeForgetsThePersistenceSignature() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = makeStore(directory)
+        let session = try await activate(store)
+        let (signature, _) = signatures
+        _ = try await saveSigned([inventory("only", ["a"])], signature: signature, to: store, session: session)
+
+        let renewed = try await store.purge(using: session)
+        let purged = try await loadedIDs(store, renewed)
+        XCTAssertEqual(purged, [])
+
+        // The database is empty again, so the same identity must write the state once more.
+        let result = try await saveSigned(
+            [inventory("only", ["a"])], signature: signature, to: store, session: renewed)
+        XCTAssertGreaterThan(result.changedRows, 0)
+        let loaded = try await loadedIDs(store, renewed)
+        XCTAssertEqual(loaded, ["a"])
+    }
+
+    func testAccessLossFenceForgetsThePersistenceSignature() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = makeStore(directory)
+        let session = try await activate(store)
+        let (signature, _) = signatures
+        _ = try await saveSigned([inventory("only", ["a"])], signature: signature, to: store, session: session)
+
+        let fenceLease = try await store.captureWriteLease(using: session)
+        try await store.recordAccessLoss(for: source("only"), using: fenceLease)
+        let fenced = try await loadedIDs(store, session)
+        XCTAssertEqual(fenced, [])
+
+        // The fence removed the stored items, so the earlier identity must not skip the next full save.
+        let result = try await saveSigned(
+            [inventory("only", ["a"])], signature: signature, to: store, session: session)
+        XCTAssertGreaterThan(result.changedRows, 0)
+        let loaded = try await loadedIDs(store, session)
+        XCTAssertEqual(loaded, ["a"])
+    }
+
     func testEquivalentInventoriesWriteNoPersistentRowsAndStayEncrypted() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
