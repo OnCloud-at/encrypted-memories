@@ -187,11 +187,6 @@ public struct GridZoomCommitDelta: Equatable, Sendable {
     public let focusRowOverlap: Double
     /// Visible intersection over visible union across the whole local neighborhood.
     public let neighborhoodOverlap: Double
-
-    /// Horizontal shift in whole columns, rounded; this is the dominant component of the phase seam.
-    public func anchorColumnShift(pitch: CGFloat) -> Int {
-        pitch > 0 ? Int((anchorDelta.width / pitch).rounded()) : 0
-    }
 }
 
 public extension SquareTileGridEngine {

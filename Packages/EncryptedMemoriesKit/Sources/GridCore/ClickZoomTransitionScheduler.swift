@@ -6,22 +6,8 @@
 import CoreGraphics
 
 package enum ClickZoomTransitionScheduler {
-    /// Builds a click transition plan or returns `nil` when the caller must snap.
-    package static func makePlan(
-        source: GridFramePlan, target: GridFramePlan, anchorIndex: Int,
-        viewportSize: CGSize, tuning: GridTransitionTuning = .default
-    ) -> GridTransitionPlan? {
-        guard
-            let lat = GridTransitionComponentBuilder.build(
-                source: source, target: target,
-                anchorIndex: anchorIndex, viewportSize: viewportSize),
-            !lat.components.isEmpty
-        else { return nil }
-        return makePlan(lattice: lat, sourceLevel: source.levelID, targetLevel: target.levelID, tuning: tuning)
-    }
-
-    /// Build a click transition plan from a precomputed presentation lattice. Used by the controller after
-    /// eligibility checks so the expensive relocation lattice is not rebuilt for scheduling.
+    /// Builds a click transition plan from a precomputed presentation lattice, or returns `nil` when the
+    /// caller must snap.
     package static func makePlan(
         lattice lat: GridTransitionLattice, sourceLevel: Int, targetLevel: Int,
         tuning: GridTransitionTuning = .default
