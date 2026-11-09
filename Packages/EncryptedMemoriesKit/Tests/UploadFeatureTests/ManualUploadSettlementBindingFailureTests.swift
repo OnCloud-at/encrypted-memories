@@ -91,7 +91,7 @@ final class ManualUploadSettlementBindingFailureTests: XCTestCase {
         let saved = record()
         XCTAssertTrue(store.upsert(saved))
         try lowerLengthLimit()
-        guard case .unreadable = store.readOutcome(for: saved.queueItemID) else {
+        guard case .unknown = store.readOutcome(for: saved.queueItemID) else {
             return XCTFail("A key that does not bind is no proof that the settlement row is absent")
         }
         try assertBindFailureRecorded()

@@ -496,7 +496,7 @@ public actor UploadManager {
             current = record
         case .absent:
             return .failed(original, message: "Durable manual upload settlement record is missing.")
-        case .unreadable:
+        case .unknown:
             return .failed(original, message: "Durable manual upload settlement could not be read.")
         }
         guard current.isPending else {
@@ -648,7 +648,7 @@ public actor UploadManager {
         notify(includingShuttingDown: true)
     }
 
-    private func durableSettlement(for id: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
+    private func durableSettlement(for id: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord> {
         if let record = jobs[id]?.settlementRecord {
             // A pending copy is safe to serve. After a failed write its stage or last error can
             // differ from the durable row, but both copies are pending, and every settlement
@@ -668,8 +668,8 @@ public actor UploadManager {
             return .found(record)
         case .absent:
             return .absent
-        case .unreadable:
-            return .unreadable
+        case .unknown:
+            return .unknown
         }
     }
 
@@ -715,7 +715,7 @@ public actor UploadManager {
             return .receiptBacked
         case .absent:
             return .allowed
-        case .unreadable:
+        case .unknown:
             // A read that failed is never proof that no receipt exists, even when a later
             // store operation has already healed the recorded failure (#1104).
             return .settlementUnavailable
@@ -950,7 +950,7 @@ public actor UploadManager {
                     return
                 case .absent:
                     break
-                case .unreadable:
+                case .unknown:
                     // The store cannot confirm that no settlement record exists. Never treat the
                     // unreadable row as absence: album attachment and completion would duplicate
                     // a settlement that a later read can still see. Keep the item retryable.
@@ -1008,7 +1008,7 @@ public actor UploadManager {
                 } else {
                     failKeepingUpload(id, message: settlement.settlementMessage)
                 }
-            case .absent, .unreadable:
+            case .absent, .unknown:
                 // Without a readable record the receipt exists only in memory. Keep the item
                 // failed: Retry writes its row again while the store can work (#1226). An
                 // unreadable row is never treated as absence (#1104).
@@ -1396,7 +1396,7 @@ public actor UploadManager {
         // A job without a cached record or receipt has no durable row, as
         // `claimActiveCancellation` explains. Decide from memory, so a store that cannot be read
         // never blocks its Retry; the byte gate still refuses bytes while the store cannot be read.
-        var durable: UploadManualSettlementReadOutcome =
+        var durable: StoreLookup<UploadManualSettlementRecord> =
             job.settlementRecord == nil && job.remoteCommitReceipt == nil ? .absent : durableSettlement(for: id)
         if jobs[id]?.remoteCommitReceipt != nil, case .absent = durable {
             // The receipt lives only in memory: the store refused its row after the remote commit
@@ -1420,8 +1420,8 @@ public actor UploadManager {
             settleReceiptRow(persisted)
             return
 
-        case .unreadable:
-            // An unreadable read is not proof that the row is absent. Fail closed: never fall
+        case .unknown:
+            // A failed read is not proof that the row is absent. Fail closed: never fall
             // through to the byte-upload retry path while the store cannot be read (#1104). The
             // failed read can be lasting, so publish the row again: it may no longer offer Retry.
             notify()

@@ -869,8 +869,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         XCTAssertNil(
             store.record(for: saved.queueItemID),
             "A failed read must never present an existing row as data")
-        guard case .unreadable = store.readOutcome(for: saved.queueItemID) else {
-            return XCTFail("A failed read must surface unreadable, never absence")
+        guard case .unknown = store.readOutcome(for: saved.queueItemID) else {
+            return XCTFail("A failed read must surface unknown, never absence")
         }
         XCTAssertTrue(store.allRecords().isEmpty, "A failed sweep must never look like absence")
         guard case .unreadable = store.readAllOutcome() else {
@@ -900,8 +900,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         XCTAssertFalse(store.isOperational(), "The constraint fault latches the connection lasting")
         XCTAssertTrue(store.hasLastingFailure(), "A refused constraint write is a lasting failure")
         XCTAssertNil(store.record(for: saved.queueItemID))
-        guard case .unreadable = store.readOutcome(for: saved.queueItemID) else {
-            return XCTFail("A latched read must surface unreadable, never absence")
+        guard case .unknown = store.readOutcome(for: saved.queueItemID) else {
+            return XCTFail("A latched read must surface unknown, never absence")
         }
 
         try executeSideSQL("DROP TRIGGER refuse_all_settlement_update;", at: fixture.databaseURL)
@@ -926,8 +926,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         XCTAssertTrue(store.hasLastingFailure(), "The latch recorded inside the transaction stays lasting")
         XCTAssertFalse(store.upsert(saved))
         XCTAssertNil(store.record(for: saved.queueItemID))
-        guard case .unreadable = store.readOutcome(for: saved.queueItemID) else {
-            return XCTFail("A latched read must surface unreadable, never absence")
+        guard case .unknown = store.readOutcome(for: saved.queueItemID) else {
+            return XCTFail("A latched read must surface unknown, never absence")
         }
     }
 
@@ -988,8 +988,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
         let store = fixture.backingStore
 
         try executeOnStoreConnection("BEGIN IMMEDIATE;", store: store)
-        guard case .unreadable = store.readOutcome(for: saved.queueItemID) else {
-            return XCTFail("A read inside an open transaction must surface unreadable, never data")
+        guard case .unknown = store.readOutcome(for: saved.queueItemID) else {
+            return XCTFail("A read inside an open transaction must surface unknown, never data")
         }
         XCTAssertFalse(
             store.remove(queueItemID: saved.queueItemID),

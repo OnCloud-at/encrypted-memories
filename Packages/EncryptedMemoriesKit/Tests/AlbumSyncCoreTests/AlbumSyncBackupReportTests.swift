@@ -64,6 +64,27 @@ import UploadCore
         }
     }
 
+    @Test func anUnreadableDeletionRowNeverBecomesAReportWithoutItsProblem() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".sqlite")
+        let queue = try #require(UploadBackupSyncQueueManifestStore(url: url))
+        defer { queue.close() }
+        #expect(
+            queue.upsert(
+                .init(
+                    source: .init(kind: .photoLibraryAsset, identifier: "photo"), revision: .init(rawValue: 42),
+                    originalFilename: "photo.heic", state: .skippedRemoteDeletion, updatedAt: Date())))
+        var handle: OpaquePointer?
+        #expect(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        // The state rows still read; only the full row of the deletion problem does not decode.
+        #expect(
+            sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil)
+                == SQLITE_OK)
+        #expect(throws: AlbumSyncError.mappingStoreUnavailable) {
+            try AlbumSyncBackupReport.read(from: queue, localIdentifiers: ["photo"])
+        }
+    }
+
     @Test func linklessDeletionKeepsItsReasonAndExactQueueRevision() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".sqlite")
         let queue = try #require(UploadBackupSyncQueueManifestStore(url: url))

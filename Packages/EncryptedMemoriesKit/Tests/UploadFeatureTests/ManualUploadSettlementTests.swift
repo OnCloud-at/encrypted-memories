@@ -91,8 +91,8 @@ private final class ReadCountingSettlementStore: UploadManualSettlementStoreProt
     func remove(queueItemID: UploadQueueItemID) -> Bool { false }
     func close() {}
 
-    func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
-        operational ? .absent : .unreadable
+    func readOutcome(for queueItemID: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord> {
+        operational ? .absent : .unknown
     }
 
     func readAllOutcome() -> UploadManualSettlementListReadOutcome {
@@ -328,12 +328,12 @@ private final class FailingSettlementStore: UploadManualSettlementStoreProtocol,
         }
     }
 
-    func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
+    func readOutcome(for queueItemID: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord> {
         lock.withLock {
-            guard !failed else { return .unreadable }
+            guard !failed else { return .unknown }
             if failOnFirstRead {
                 failed = true
-                return .unreadable
+                return .unknown
             }
             guard let record = records[queueItemID] else { return .absent }
             return .found(record)
@@ -382,7 +382,7 @@ private final class EnqueueGateStore: UploadManualSettlementStoreProtocol, @unch
         }
     }
 
-    func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
+    func readOutcome(for queueItemID: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord> {
         lock.withLock {
             guard let record = records[queueItemID] else { return .absent }
             return .found(record)
@@ -403,11 +403,11 @@ private final class EnqueueGateStore: UploadManualSettlementStoreProtocol, @unch
 
 /// Store double that scripts per-job read results in order (#1104). Tests arm the exact read a
 /// production path performs, so guards are provable against the store's real answers: a queued
-/// `.unreadable` answer, a flip between two reads, or a first read that says `.absent`.
+/// `.unknown` answer, a flip between two reads, or a first read that says `.absent`.
 private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var records: [UploadQueueItemID: UploadManualSettlementRecord] = [:]
-    private var queuedReads: [UploadManualSettlementReadOutcome] = []
+    private var queuedReads: [StoreLookup<UploadManualSettlementRecord>] = []
     private var removed: [UploadQueueItemID] = []
     private var readsFail = false
     private var sweepsFail = false
@@ -431,7 +431,7 @@ private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unc
     /// Scripted answers that no read has consumed yet.
     var unconsumedScriptedReads: Int { lock.withLock { queuedReads.count } }
 
-    /// While set, every single-row read answers `.unreadable`, after any scripted answers.
+    /// While set, every single-row read answers `.unknown`, after any scripted answers.
     func setReadsFail(_ fail: Bool) {
         lock.withLock { readsFail = fail }
     }
@@ -443,7 +443,7 @@ private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unc
 
     /// Queues the next `readOutcome` answers, oldest first. Reads after the queue empties answer
     /// `.absent`, the healthy answer of an empty store.
-    func scriptReads(_ outcomes: [UploadManualSettlementReadOutcome]) {
+    func scriptReads(_ outcomes: [StoreLookup<UploadManualSettlementRecord>]) {
         lock.withLock { queuedReads.append(contentsOf: outcomes) }
     }
 
@@ -457,10 +457,10 @@ private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unc
         }
     }
 
-    func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
+    func readOutcome(for queueItemID: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord> {
         lock.withLock {
             if !queuedReads.isEmpty { return queuedReads.removeFirst() }
-            if readsFail { return .unreadable }
+            if readsFail { return .unknown }
             guard let record = records[queueItemID] else { return .absent }
             return .found(record)
         }
@@ -1582,7 +1582,7 @@ final class ManualUploadSettlementTests: XCTestCase {
         let refused = await waitUntil(manager) { ($0.first?.state.isTerminal ?? false) == true }
         XCTAssertEqual(refused.first?.id, id)
 
-        store.scriptReads([.unreadable])
+        store.scriptReads([.unknown])
         await manager.clearFinished()
         let after = await manager.snapshot()
 
@@ -1881,8 +1881,8 @@ final class ManualUploadSettlementTests: XCTestCase {
         // A closed connection is a lasting failure: no read can succeed again in this session.
         durableStore.close()
         XCTAssertTrue(durableStore.hasLastingFailure())
-        guard case .unreadable = durableStore.readOutcome(for: id) else {
-            XCTFail("Every read of the closed store must be unreadable")
+        guard case .unknown = durableStore.readOutcome(for: id) else {
+            XCTFail("Every read of the closed store must be unknown")
             return (manager, id, uploader)
         }
         return (manager, id, uploader)
@@ -1964,7 +1964,7 @@ final class ManualUploadSettlementTests: XCTestCase {
         // answer must allow the upload; the second is unreadable, which is no proof that no
         // settlement exists, so the item must stay visibly failed and retryable instead of
         // completing without durable proof (#1104).
-        store.scriptReads([.absent, .unreadable])
+        store.scriptReads([.absent, .unknown])
         let ids = await manager.enqueueFiles([try file()], destination: .library)
         let id = try XCTUnwrap(ids.first)
         let items = await waitUntil(manager) { items in
