@@ -117,7 +117,7 @@ class PullRequestWorkflowTests < Minitest::Test
       script = File.join(directory, ".github/scripts/queue_path_policy.py")
       File.write(script, "import os\nopen(os.environ['GITHUB_OUTPUT'], 'a').write('run_macos=' + os.environ.get('POLICY_TEST_RESULT', 'true') + '\\n')\n")
       guard = File.join(directory, ".github/scripts/require_merge_queue.py")
-      File.write(guard, "import os,sys\nsys.exit(0 if os.environ.get('POLICY_STRATEGY') == 'ALLGREEN' else 1)\n")
+      File.write(guard, "import json,os,sys\nif os.environ.get('OLD_READER'): print('unrecognized arguments: --require-allgreen', file=sys.stderr); sys.exit(2)\nsys.exit(0 if sys.argv[1:] == ['--require-allgreen', 'test/repo'] and os.environ.get('POLICY_STRATEGY') == 'ALLGREEN' else 1)\n")
       git.call("add", ".")
       git.call("commit", "-qm", "trusted policy")
       base = git.call("rev-parse", "HEAD")
@@ -142,7 +142,39 @@ class PullRequestWorkflowTests < Minitest::Test
         assert status.success?, text
         assert_equal "run_macos=#{strategy == 'ALLGREEN' ? 'false' : 'true'}\n", File.read(output), strategy
       end
-      assert_includes step.fetch("run"), '[[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA^{commit}"'
+      output = File.join(directory, "output")
+      File.write(output, "")
+      env = {"BASE_SHA" => base, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
+             "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN",
+             "OLD_READER" => "1", "GH_TOKEN" => "synthetic-test-token"}
+      text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+      assert status.success?, text
+      assert_equal "run_macos=true\n", File.read(output)
+      assert_includes text, "unrecognized arguments: --require-allgreen"
+      refute_includes text, "synthetic-test-token"
+      # A head checkout can contain names that shadow Python's standard library.
+      File.write(script, File.read(File.expand_path("queue_path_policy.py", __dir__)))
+      git.call("add", ".")
+      git.call("commit", "-qm", "real policy")
+      real_base = git.call("rev-parse", "HEAD")
+      File.write(File.join(directory, "json.py"), "import sys; sys.exit(0)\n")
+      File.write(File.join(directory, "subprocess.py"), "PIPE=1\nclass Result: stdout=b'Wiki/page\\x00'\ndef run(*args, **kwargs): return Result()\n")
+      FileUtils.mkdir_p(File.join(directory, "App"))
+      File.write(File.join(directory, "App/x.swift"), "change")
+      git.call("add", ".")
+      git.call("commit", "-qm", "shadow standard library")
+      hostile_head = git.call("rev-parse", "HEAD")
+      [[base, "HEADGREEN"], [real_base, "ALLGREEN"]].each do |ref, strategy|
+        output = File.join(directory, "output")
+        File.write(output, "")
+        env = {"BASE_SHA" => ref, "HEAD_SHA" => hostile_head, "GITHUB_OUTPUT" => output,
+               "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => strategy,
+               "POLICY_TEST_RESULT" => "false", "GH_TOKEN" => "synthetic-test-token"}
+        text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+        assert status.success?, text
+        assert_equal "run_macos=true\n", File.read(output), strategy
+        refute_includes text, "synthetic-test-token"
+      end
     end
   end
 

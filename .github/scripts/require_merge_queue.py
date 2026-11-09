@@ -29,10 +29,13 @@ def require_queue(repository):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
-        f"https://api.github.com/repos/{repository}/rules/branches/main", headers=headers
+        f"https://api.github.com/repos/{repository}/rules/branches/main?per_page=100", headers=headers
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
+            link = response.headers.get("Link", "")
+            if re.search(r'(?:^|[,;])\s*rel\s*=\s*(?:"[^"]*\bnext\b[^"]*"|next\b)', link, re.I):
+                raise RulesUnavailable("The effective main rules have another page.")
             rules = json.load(response)
     except urllib.error.HTTPError as error:
         raise RulesUnavailable(f"Cannot read effective main rules: HTTP {error.code}.") from error
@@ -50,11 +53,18 @@ def require_queue(repository):
 def allgreen_queue(repository):
     try:
         rules = require_queue(repository)
-    except QueueGuardError:
+    except QueueGuardError as error:
+        print(str(error), file=sys.stderr)
         return False
     queues = [rule for rule in rules if rule.get("type") == "merge_queue"]
-    return all(isinstance(rule.get("parameters"), dict)
-               and rule["parameters"].get("grouping_strategy") == "ALLGREEN" for rule in queues)
+    for rule in queues:
+        parameters = rule.get("parameters")
+        strategy = parameters.get("grouping_strategy") if isinstance(parameters, dict) else None
+        if strategy != "ALLGREEN":
+            reason = "HEADGREEN" if strategy == "HEADGREEN" else "missing or unrecognized"
+            print(f"Queue grouping strategy is {reason}; ALLGREEN is required.", file=sys.stderr)
+            return False
+    return True
 
 
 def main():
