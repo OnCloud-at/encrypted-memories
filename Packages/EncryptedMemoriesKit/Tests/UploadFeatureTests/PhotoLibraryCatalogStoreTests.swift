@@ -1095,20 +1095,6 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         return try await sync.run(engine: engine, identifiers: identifiers)
     }
 
-    /// Records which candidates the driver enqueued.
-    private final class RecordingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendable {
-        private let lock = NSLock()
-        private var _enqueued: [String] = []
-        var enqueued: [String] { lock.withLock { _enqueued } }
-
-        func enqueue(_ candidate: UploadBackupAssetCandidate) async -> UploadBackupSyncScanResult {
-            lock.withLock { _enqueued.append(candidate.snapshot.source.identifier) }
-            return UploadBackupSyncScanResult()
-        }
-
-        func synchronizeQueueToDisk() -> Bool { true }
-    }
-
     /// Re-opens every offered revision and records each offered photo, which the real engine looks up in the
     /// state and identity stores. Without failures, its first call cancels the pass that called it. With failures,
     /// each listed photo makes one call throw `UploadBackupRemoteProofUnavailable` in turn.
@@ -1333,4 +1319,27 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             }
         }
     }
+}
+
+/// Records which candidates the driver enqueued. With a `ledger`, it also adds each candidate as a row of that store
+/// before `enqueue` returns, keyed by identifier and revision as the queue store keys its rows, so a new revision of a
+/// queued photo is a new row, the record survives a restart, and a failed write throws.
+final class RecordingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let ledger: StorageFaultTable?
+    private var _enqueued: [String] = []
+    var enqueued: [String] { lock.withLock { _enqueued } }
+
+    init(ledger: StorageFaultTable? = nil) { self.ledger = ledger }
+
+    func enqueue(_ candidate: UploadBackupAssetCandidate) async throws -> UploadBackupSyncScanResult {
+        let identifier = candidate.snapshot.source.identifier
+        if let ledger, ledger.insertIfAbsent("\(identifier)#\(candidate.snapshot.revision.rawValue)") == nil {
+            throw UploadError.backend("The queue could not be updated")
+        }
+        lock.withLock { _enqueued.append(identifier) }
+        return UploadBackupSyncScanResult()
+    }
+
+    func synchronizeQueueToDisk() -> Bool { true }
 }
