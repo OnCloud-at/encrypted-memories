@@ -1,4 +1,5 @@
 import argparse
+import http.client
 import json
 import os
 import re
@@ -39,8 +40,8 @@ def require_queue(repository):
             rules = json.load(response)
     except urllib.error.HTTPError as error:
         raise RulesUnavailable(f"Cannot read effective main rules: HTTP {error.code}.") from error
-    except (OSError, urllib.error.URLError, ValueError) as error:
-        raise RulesUnavailable("Cannot read a valid response for effective main rules.") from error
+    except (OSError, urllib.error.URLError, ValueError, http.client.HTTPException, RecursionError):
+        raise RulesUnavailable("Cannot read a valid response for effective main rules.") from None
     if not isinstance(rules, list) or not all(isinstance(rule, dict) for rule in rules):
         raise RulesUnavailable("The effective main rules response has an invalid shape.")
     if not any(rule.get("type") == "merge_queue" for rule in rules):

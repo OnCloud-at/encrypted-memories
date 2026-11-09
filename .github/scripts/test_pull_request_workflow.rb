@@ -144,6 +144,14 @@ class PullRequestWorkflowTests < Minitest::Test
       end
       output = File.join(directory, "output")
       File.write(output, "")
+      tree = git.call("rev-parse", "#{base}^{tree}")
+      env = {"BASE_SHA" => tree, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
+             "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN", "POLICY_TEST_RESULT" => "false"}
+      text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
+      assert status.success?, text
+      assert_equal "run_macos=true\n", File.read(output), "tree base"
+      output = File.join(directory, "output")
+      File.write(output, "")
       env = {"BASE_SHA" => base, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
              "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN",
              "OLD_READER" => "1", "GH_TOKEN" => "synthetic-test-token"}
