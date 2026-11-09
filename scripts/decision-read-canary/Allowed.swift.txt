@@ -1,0 +1,31 @@
+// Decision-read canary (#1148): no line of this file may be reported.
+/// `StoreLookup(catching: { try? read() })` and `try? queue.entry(x)` in a comment are not code.
+func allowed() throws {
+    _ = StoreLookup(catching: { try queue.entry(for: source) })
+    _ = queue.displaySummary() ?? summary
+    try? journal.backUpAgain(revision: revision)
+    _ = try? tempStore.reserve(filename: name, expectedBytes: 0)
+    _ = try? restore.load(from: url)
+    _ = try? queue.readAndDelete(id)
+    _ = restore.load(from: url) ?? fallback
+    _ = queue.count
+    // Known gaps of a regex: a `try?` three closures deep in StoreLookup, a `try?` after a closure with three nested
+    // levels, a `//` in a string earlier on the line, and a brace in a string inside StoreLookup.
+    _ = StoreLookup { a.map { b.map { c.map { try? lookUp($0) } } } }
+    _ = StoreLookup { _ = a.map { b.map { c.map { $0 } } }; return try? lookUp() }
+    let slash = "//"; _ = try? queue.entry(for: source)
+    _ = StoreLookup { log("}"); return try? lookUp() }
+}
+
+// Declarations whose type is StoreLookup are not a StoreLookup closure.
+func readOutcome(for id: Int) -> StoreLookup<Record> {
+    guard (try? prepare()) != nil else { return .unknown }
+    return .absent
+}
+var current: StoreLookup<Int> {
+    let value = try? lookUp()
+    return value.map(StoreLookup.found) ?? .absent
+}
+extension StoreLookup {
+    static func make() -> Self { _ = try? lookUp(); return .unknown }
+}
