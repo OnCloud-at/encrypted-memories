@@ -160,8 +160,8 @@ public struct PendingSourceStatesRead: Sendable, Equatable {
     }
 }
 
-/// One source's latest handoff as read from the store. A readable nil is confirmed absence; `unreadable` means the
-/// query failed or the row did not decode.
+/// One handoff as read from the store, for the latest handoff of a source or for one revision.
+/// A readable nil is confirmed absence; `unreadable` means the query failed or the row did not decode.
 public enum PendingHandoffRead: Sendable, Equatable {
     case unreadable
     case readable(PendingHandoff?)
