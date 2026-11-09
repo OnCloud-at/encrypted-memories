@@ -74,9 +74,12 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
         let outcome = store.recordHandoff(handoff)
         guard outcome != .failed else { return outcome }
         // The store keeps the first time of a repeated upload record, and the coordinator orders by that time.
-        if let recorded = store.handoffTime(for: handoff.key, revision: revision), recorded != handoff.createdAt {
+        guard case .readable(let stored?) = store.handoffRead(for: handoff.key, revision: revision) else {
+            return .failed
+        }
+        if stored.createdAt != handoff.createdAt {
             handoff = PendingHandoff(
-                key: handoff.key, revision: revision, remote: remote, kind: kind, createdAt: recorded)
+                key: handoff.key, revision: revision, remote: remote, kind: kind, createdAt: stored.createdAt)
         }
         if source.resource == .primary {
             replacementLedger.recordHandoff(handoff) { replacementJournal?.entry(for: source).allSuperseded ?? [] }

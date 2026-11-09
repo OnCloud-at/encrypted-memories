@@ -923,8 +923,8 @@ final class PendingBackupStoreTests: XCTestCase {
         try writeV105Handoffs([original, edit, replay])
         store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
 
-        XCTAssertEqual(store.handoffTime(for: key, revision: original.revision), date)
-        XCTAssertEqual(store.handoffTime(for: key, revision: edit.revision), date)
+        XCTAssertEqual(store.handoffRead(for: key, revision: original.revision).handoff?.createdAt, date)
+        XCTAssertEqual(store.handoffRead(for: key, revision: edit.revision).handoff?.createdAt, date)
         XCTAssertEqual(store.unacknowledgedHandoffs().count, 2)
         let latest = try XCTUnwrap(store.latestHandoffs(for: [key])[key])
         XCTAssertEqual(latest, edit, "Equal insert times must still select the newer date revision")
@@ -1026,7 +1026,8 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(store.recordHandoff(handoff(1, "earlier", after: 2)), .recorded)
 
         XCTAssertEqual(store.latestHandoffs(for: [key])[key]?.remote.nodeID, "current")
-        XCTAssertEqual(store.handoffTime(for: key, revision: UploadBackupRevision(rawValue: 1)), date)
+        XCTAssertEqual(
+            store.handoffRead(for: key, revision: UploadBackupRevision(rawValue: 1)).handoff?.createdAt, date)
     }
 
     func testPendingHealthDoesNotProbeDeniedSelect() throws {

@@ -43,7 +43,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 ON CONFLICT(source_kind, source_id, revision_us) DO NOTHING;
                 """
             ) { stmt in
-                bindKey(stmt, key)
+                try bindKey(stmt, key)
                 sqlite3_bind_int64(stmt, 3, revision.rawValue)
                 sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
             }
@@ -70,7 +70,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 revisions.allSatisfy { key, revision in
                     execute("DELETE FROM upload_evidence WHERE source_kind=? AND source_id=? AND revision_us=?;") {
                         stmt in
-                        bindKey(stmt, key)
+                        try bindKey(stmt, key)
                         sqlite3_bind_int64(stmt, 3, revision.rawValue)
                     }
                 }
@@ -111,11 +111,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                           END;
                         """,
                         bind: { stmt in
-                            bindKey(stmt, handoff.key)
+                            try bindKey(stmt, handoff.key)
                             sqlite3_bind_int64(stmt, 3, handoff.revision.rawValue)
-                            bindText(stmt, 4, handoff.remote.volumeID)
-                            bindText(stmt, 5, handoff.remote.nodeID)
-                            bindText(stmt, 6, handoff.kind.rawValue)
+                            try connection.bindText(stmt, 4, handoff.remote.volumeID)
+                            try connection.bindText(stmt, 5, handoff.remote.nodeID)
+                            try connection.bindText(stmt, 6, handoff.kind.rawValue)
                             sqlite3_bind_double(stmt, 7, handoff.createdAt.timeIntervalSince1970)
                         })
                 else { return false }
@@ -144,12 +144,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     WHERE source_kind=? AND source_id=?;
                     """
                 ) { stmt in
-                    bindText(stmt, 1, handoff.remote.volumeID)
-                    bindText(stmt, 2, handoff.remote.nodeID)
+                    try connection.bindText(stmt, 1, handoff.remote.volumeID)
+                    try connection.bindText(stmt, 2, handoff.remote.nodeID)
                     sqlite3_bind_double(stmt, 3, handoff.createdAt.timeIntervalSince1970)
                     sqlite3_bind_double(stmt, 4, handoff.createdAt.timeIntervalSince1970)
-                    bindText(stmt, 5, handoff.key.kind.rawValue)
-                    bindText(stmt, 6, handoff.key.identifier)
+                    try connection.bindText(stmt, 5, handoff.key.kind.rawValue)
+                    try connection.bindText(stmt, 6, handoff.key.identifier)
                 }
             }
             return committed ? outcome : .failed
@@ -157,18 +157,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     public func unacknowledgedHandoffs() -> [PendingHandoff] {
-        connection.withLock { handoffsLocked(where: "acknowledged=0") }
+        connection.withLock { handoffsReadLocked(where: "acknowledged=0").handoffs }
     }
 
-    /// When the handoff of a revision became the current one. A repeated record of the same upload, for example
-    /// the replay of its receipt, keeps the first time.
-    public func handoffTime(for key: PendingSourceKey, revision: UploadBackupRevision) -> Date? {
-        connection.withLock {
-            handoffsLocked(where: "source_kind=? AND source_id=? AND revision_us=?") { stmt in
-                self.bindKey(stmt, key)
-                sqlite3_bind_int64(stmt, 3, revision.rawValue)
-            }.first?.createdAt
-        }
+    /// The stored handoff of a revision, absent when no row exists, or unreadable when its read fails.
+    /// A repeated record of the same upload keeps its first time, including when its receipt is replayed.
+    public func handoffRead(for key: PendingSourceKey, revision: UploadBackupRevision) -> PendingHandoffRead {
+        connection.withLock { handoffReadLocked(key, revision: revision) }
     }
 
     /// The handoff recorded last for each source, acknowledged or not. Undoing an edit can return a photo to an
@@ -179,7 +174,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     /// The latest handoff of each source, or `unreadable` when its query failed or its row did not decode. A failed
-    /// prepare records a failure like every call; a failed step and a row that does not decode record none.
+    /// prepare or bind records a failure like every call; a failed step and a row that does not decode record none.
     public func latestHandoffsRead(for keys: [PendingSourceKey]) -> [PendingSourceKey: PendingHandoffRead] {
         guard !keys.isEmpty else { return [:] }
         return connection.withLock {
@@ -217,7 +212,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     private func latestHandoffLocked(_ key: PendingSourceKey, _ stmt: OpaquePointer?) -> PendingHandoffRead {
-        bindKey(stmt, key)
+        do { try bindKey(stmt, key) } catch { return .unreadable }
         switch sqlite3_step(stmt) {
         case SQLITE_ROW:
             guard let handoff = handoffRow(stmt) else {
@@ -236,7 +231,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return connection.withLock {
             var result: [PendingHandoff] = []
             for linkID in linkIDs {
-                let read = handoffsReadLocked(where: "remote_link_id=?") { self.bindText($0, 1, linkID) }
+                let read = handoffsReadLocked(where: "remote_link_id=?") { try self.connection.bindText($0, 1, linkID) }
                 guard read.complete else { return .unreadable }
                 result += read.handoffs
             }
@@ -254,7 +249,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         "UPDATE handoff SET acknowledged=1 WHERE source_kind=? AND source_id=? AND revision_us=? "
                             + "AND kind IN (\(Self.sqlList(PendingHandoffKind.self)));"
                     ) { stmt in
-                        bindKey(stmt, key)
+                        try bindKey(stmt, key)
                         sqlite3_bind_int64(stmt, 3, revision.rawValue)
                     }
                 }
@@ -371,7 +366,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                             + "WHERE \(kindFilter) AND source_id IN (\(placeholders));",
                         bind: { stmt in
                             for (offset, identifier) in chunk.enumerated() {
-                                self.bindText(stmt, Int32(offset + 1), identifier)
+                                try self.connection.bindText(stmt, Int32(offset + 1), identifier)
                             }
                         }
                     ) { stmt in
@@ -467,16 +462,16 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                               next_attempt_at=excluded.next_attempt_at, updated_at=excluded.updated_at;
                             """,
                             bind: { stmt in
-                                bindKey(stmt, request.key)
+                                try bindKey(stmt, request.key)
                                 sqlite3_bind_int64(stmt, 3, (previous?.generation ?? 0) + 1)
                                 sqlite3_bind_int(stmt, 4, needsTrash ? 1 : 0)
-                                bindOptionalText(stmt, 5, remote?.volumeID)
-                                bindOptionalText(stmt, 6, remote?.nodeID)
+                                try connection.bindText(stmt, 5, remote?.volumeID)
+                                try connection.bindText(stmt, 6, remote?.nodeID)
                                 sqlite3_bind_int(stmt, 7, alreadyTrashed ? 1 : 0)
                                 // A Proton trash entry already represents a photo this path trashed.
                                 sqlite3_bind_int(stmt, 8, alreadyTrashed || needsTrash ? 0 : 1)
                                 sqlite3_bind_double(stmt, 9, date.timeIntervalSince1970)
-                                bindPresentation(stmt, from: 10, presentation)
+                                try bindPresentation(stmt, from: 10, presentation)
                                 sqlite3_bind_double(stmt, 15, date.timeIntervalSince1970)
                                 sqlite3_bind_double(stmt, 16, date.timeIntervalSince1970)
                             }),
@@ -535,14 +530,14 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     """,
                     bind: { stmt in
                         sqlite3_bind_int(stmt, 1, durable == nil ? 0 : 1)
-                        bindOptionalText(stmt, 2, durable?.volumeID)
-                        bindOptionalText(stmt, 3, durable?.nodeID)
+                        try connection.bindText(stmt, 2, durable?.volumeID)
+                        try connection.bindText(stmt, 3, durable?.nodeID)
                         // Like `exclude`: a state without a photo for the trash lists its entry in "Zuletzt gelöscht".
                         sqlite3_bind_int(stmt, 4, durable == nil ? 1 : 0)
                         sqlite3_bind_double(stmt, 5, date.timeIntervalSince1970)
-                        bindKey(stmt, key, from: 6)
+                        try bindKey(stmt, key, from: 6)
                         sqlite3_bind_int64(stmt, 8, generation)
-                        bindText(stmt, 9, remote.nodeID)
+                        try connection.bindText(stmt, 9, remote.nodeID)
                     })
             else { return nil }
             return sourceStateLocked(key).state
@@ -570,11 +565,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                       AND remote_op IS NULL AND remote_volume_id IS NULL AND remote_link_id IS NULL;
                     """,
                     bind: { stmt in
-                        bindText(stmt, 1, remote.volumeID)
-                        bindText(stmt, 2, remote.nodeID)
+                        try connection.bindText(stmt, 1, remote.volumeID)
+                        try connection.bindText(stmt, 2, remote.nodeID)
                         sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
                         sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
-                        bindKey(stmt, key, from: 5)
+                        try bindKey(stmt, key, from: 5)
                         sqlite3_bind_int64(stmt, 7, generation)
                     })
             else { return nil }
@@ -633,7 +628,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                                 sqlite3_bind_int(stmt, 2, restoredInProton ? 1 : 0)
                                 sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
                                 sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
-                                bindKey(stmt, key, from: 5)
+                                try bindKey(stmt, key, from: 5)
                             }),
                         let state = sourceStateLocked(key).state
                     else { return false }
@@ -712,7 +707,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 sql += " WHERE source_kind=? AND source_id=?;"
                 let updated = execute(sql) { stmt in
                     sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
-                    bindKey(stmt, key, from: 2)
+                    try bindKey(stmt, key, from: 2)
                 }
                 guard updated else { return false }
                 if effect != .queueSync, !clearOperationBinding(for: key) { return false }
@@ -770,11 +765,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     WHERE source_kind=? AND source_id=? AND desired='excluded';
                     """,
                     bind: { stmt in
-                        bindText(stmt, 1, target.volumeID)
-                        bindText(stmt, 2, target.nodeID)
+                        try connection.bindText(stmt, 1, target.volumeID)
+                        try connection.bindText(stmt, 2, target.nodeID)
                         sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
                         sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
-                        bindKey(stmt, key, from: 5)
+                        try bindKey(stmt, key, from: 5)
                     })
             else { return false }
             result = .scheduled
@@ -810,7 +805,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             "SELECT key, value FROM pending_info WHERE key GLOB ?;",
             bind: { stmt in
                 // Base64 and the fixed prefix contain no GLOB metacharacters. GLOB keeps case-sensitive source identity.
-                self.bindText(stmt, 1, prefix + "*")
+                try self.connection.bindText(stmt, 1, prefix + "*")
             },
             row: { stmt in
                 guard let encoded = columnText(stmt, 0, roundTrip: true), sqlite3_column_type(stmt, 1) == SQLITE_INTEGER
@@ -868,7 +863,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         execute(
             "INSERT INTO pending_info(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
         ) { stmt in
-            bindText(stmt, 1, key)
+            try connection.bindText(stmt, 1, key)
             sqlite3_bind_int64(stmt, 2, generation)
         }
     }
@@ -880,7 +875,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             execute(
                 "DELETE FROM pending_info WHERE key GLOB ?;",
                 bind: { stmt in
-                    bindText(stmt, 1, Self.trashMetadataPrefix(for: key) + "*")
+                    try connection.bindText(stmt, 1, Self.trashMetadataPrefix(for: key) + "*")
                 })
         else { return false }
         guard let nextGeneration else { return true }
@@ -911,10 +906,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                               AND (remote_op IS NULL OR remote_op IN (\(Self.sqlList(PendingSourceEffect.self))));
                             """,
                             bind: { stmt in
-                                bindText(stmt, 1, effect.rawValue)
-                                bindKey(stmt, state.key, from: 2)
+                                try connection.bindText(stmt, 1, effect.rawValue)
+                                try bindKey(stmt, state.key, from: 2)
                                 sqlite3_bind_int64(stmt, 4, state.generation)
-                                bindText(stmt, 5, state.remote?.nodeID ?? "")
+                                try connection.bindText(stmt, 5, state.remote?.nodeID ?? "")
                             })
                     else { return false }
                     if sqlite3_changes(db) > 0 {
@@ -928,10 +923,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                                   generation=excluded.generation;
                                 """,
                                 bind: { stmt in
-                                    bindKey(stmt, state.key)
-                                    bindText(stmt, 3, effect.rawValue)
-                                    bindText(stmt, 4, state.remote?.volumeID ?? "")
-                                    bindText(stmt, 5, state.remote?.nodeID ?? "")
+                                    try bindKey(stmt, state.key)
+                                    try connection.bindText(stmt, 3, effect.rawValue)
+                                    try connection.bindText(stmt, 4, state.remote?.volumeID ?? "")
+                                    try connection.bindText(stmt, 5, state.remote?.nodeID ?? "")
                                     sqlite3_bind_int64(stmt, 6, state.generation)
                                 })
                         else { return false }
@@ -955,7 +950,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 &stmt)
         else { return nil }
         defer { sqlite3_finalize(stmt) }
-        bindKey(stmt, key)
+        do { try bindKey(stmt, key) } catch { return nil }
         switch sqlite3_step(stmt) {
         case SQLITE_DONE: return true
         case SQLITE_ROW:
@@ -981,11 +976,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             WHERE source_kind=? AND source_id=? AND desired='included' AND remote_op IS NULL
               AND needs_queue_sync=0 AND needs_remote_trash=0 AND needs_remote_restore=0;
             """
-        ) { bindKey($0, key) }
+        ) { try bindKey($0, key) }
     }
 
     private func clearOperationBinding(for key: PendingSourceKey) -> Bool {
-        execute("DELETE FROM remote_operation WHERE source_kind=? AND source_id=?;") { bindKey($0, key) }
+        execute("DELETE FROM remote_operation WHERE source_kind=? AND source_id=?;") { try bindKey($0, key) }
     }
 
     /// Schedules the next attempt of a failed effect with the shared backoff.
@@ -1005,7 +1000,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             ) { stmt in
                 sqlite3_bind_double(stmt, 1, next.timeIntervalSince1970)
                 sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
-                bindKey(stmt, key, from: 3)
+                try bindKey(stmt, key, from: 3)
             }
         }
     }
@@ -1020,14 +1015,14 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 keys.allSatisfy { key in
                     // A row that this build cannot read stays as it is and the other rows go on; a failed read fails
                     // the write (#982).
-                    let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { self.bindKey($0, key) }
+                    let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { try self.bindKey($0, key) }
                     guard read.queried else { return false }
                     guard read.succeeded, !read.states.isEmpty else { return true }
                     return execute(
                         "UPDATE source_state SET listed_in_trash=0, updated_at=? WHERE source_kind=? AND source_id=?;"
                     ) { stmt in
                         sqlite3_bind_double(stmt, 1, date.timeIntervalSince1970)
-                        bindKey(stmt, key, from: 2)
+                        try bindKey(stmt, key, from: 2)
                     }
                 }
             }
@@ -1070,7 +1065,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         bind: { stmt in
                             sqlite3_bind_double(stmt, 1, next.timeIntervalSince1970)
                             sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970)
-                            bindKey(stmt, checked.key, from: 3)
+                            try bindKey(stmt, checked.key, from: 3)
                         })
                 else { return false }
                 guard outcome == .completed else { return true }
@@ -1126,7 +1121,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 """
             ) { stmt in
                 sqlite3_bind_double(stmt, 1, next.timeIntervalSince1970)
-                bindActionKey(stmt, action, from: 2)
+                try bindActionKey(stmt, action, from: 2)
                 sqlite3_bind_int(stmt, 6, action.desired ? 1 : 0)
                 sqlite3_bind_double(stmt, 7, action.createdAt.timeIntervalSince1970)
             }
@@ -1142,7 +1137,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 WHERE source_kind=? AND source_id=? AND kind=? AND album_id=? AND desired=? AND created_at=?;
                 """
             ) { stmt in
-                bindActionKey(stmt, action, from: 1)
+                try bindActionKey(stmt, action, from: 1)
                 sqlite3_bind_int(stmt, 5, action.desired ? 1 : 0)
                 sqlite3_bind_double(stmt, 6, action.createdAt.timeIntervalSince1970)
             }
@@ -1159,7 +1154,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 WHERE source_kind=? AND source_id=? AND kind=? AND album_id=? AND desired=? AND created_at=?;
                 """
             ) { stmt in
-                bindActionKey(stmt, action, from: 1)
+                try bindActionKey(stmt, action, from: 1)
                 sqlite3_bind_int(stmt, 5, action.desired ? 1 : 0)
                 sqlite3_bind_double(stmt, 6, action.createdAt.timeIntervalSince1970)
             }
@@ -1178,9 +1173,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                   remote_link_id=excluded.remote_link_id, saved_at=excluded.saved_at;
                 """
             ) { stmt in
-                bindText(stmt, 1, localIdentifier)
-                bindText(stmt, 2, remote.volumeID)
-                bindText(stmt, 3, remote.nodeID)
+                try connection.bindText(stmt, 1, localIdentifier)
+                try connection.bindText(stmt, 2, remote.volumeID)
+                try connection.bindText(stmt, 3, remote.nodeID)
                 sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
             }
         }
@@ -1201,14 +1196,14 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// The handoff of `revision`, or `unreadable` when its query failed or its row does not decode.
     private func handoffReadLocked(_ key: PendingSourceKey, revision: UploadBackupRevision) -> PendingHandoffRead {
         let read = handoffsReadLocked(where: "source_kind=? AND source_id=? AND revision_us=?") { stmt in
-            self.bindKey(stmt, key)
+            try self.bindKey(stmt, key)
             sqlite3_bind_int64(stmt, 3, revision.rawValue)
         }
         return read.complete ? .readable(read.handoffs.first) : .unreadable
     }
 
     private func sourceStateLocked(_ key: PendingSourceKey) -> PendingSourceStateRead {
-        let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { self.bindKey($0, key) }
+        let read = sourceStatesLocked(where: "source_kind=? AND source_id=?") { try self.bindKey($0, key) }
         guard read.succeeded else { return .unreadable }
         return .readable(read.states.first)
     }
@@ -1221,7 +1216,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     private func sourceStatesLocked(
         where condition: String?,
-        bind: ((OpaquePointer?) -> Void)? = nil
+        bind: ((OpaquePointer?) throws -> Void)? = nil
     ) -> (states: [PendingSourceState], succeeded: Bool, queried: Bool) {
         var result: [PendingSourceState] = []
         var decoded = true
@@ -1286,12 +1281,8 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         PhotoDiagnostics.shared.increment("pending.undecodableRow")
     }
 
-    private func handoffsLocked(where condition: String, bind: ((OpaquePointer?) -> Void)? = nil) -> [PendingHandoff] {
-        handoffsReadLocked(where: condition, bind: bind).handoffs
-    }
-
     private func handoffsReadLocked(
-        where condition: String, bind: ((OpaquePointer?) -> Void)? = nil
+        where condition: String, bind: ((OpaquePointer?) throws -> Void)? = nil
     ) -> (handoffs: [PendingHandoff], complete: Bool) {
         var result: [PendingHandoff] = []
         var decoded = true
@@ -1345,9 +1336,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
               next_attempt_at=excluded.next_attempt_at, failed=0;
             """
         ) { stmt in
-            bindKey(stmt, key)
-            bindText(stmt, 3, kind.rawValue)
-            bindText(stmt, 4, albumID)
+            try bindKey(stmt, key)
+            try connection.bindText(stmt, 3, kind.rawValue)
+            try connection.bindText(stmt, 4, albumID)
             sqlite3_bind_int(stmt, 5, desired ? 1 : 0)
             sqlite3_bind_double(stmt, 6, date.timeIntervalSince1970)
             sqlite3_bind_double(stmt, 7, date.timeIntervalSince1970)
@@ -1355,7 +1346,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     }
 
     private func actionsLocked(
-        where condition: String?, bind: ((OpaquePointer?) -> Void)? = nil
+        where condition: String?, bind: ((OpaquePointer?) throws -> Void)? = nil
     ) -> PendingActionsRead {
         var result: [PendingAction] = []
         var decoded = true
@@ -1442,11 +1433,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return true
     }
 
-    private func execute(_ sql: String, bind: (OpaquePointer?) -> Void) -> Bool {
+    private func execute(_ sql: String, bind: (OpaquePointer?) throws -> Void) -> Bool {
         var stmt: OpaquePointer?
         guard prepare(sql, &stmt) else { return false }
         defer { sqlite3_finalize(stmt) }
-        bind(stmt)
+        do { try bind(stmt) } catch { return false }
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             connection.markFailed(resultCode: sqlite3_extended_errcode(db))
             return false
@@ -1456,13 +1447,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
 
     private func query(
         _ sql: String,
-        bind: ((OpaquePointer?) -> Void)? = nil,
+        bind: ((OpaquePointer?) throws -> Void)? = nil,
         row: (OpaquePointer?) -> Void
     ) -> Bool {
         var stmt: OpaquePointer?
         guard prepare(sql, &stmt) else { return false }
         defer { sqlite3_finalize(stmt) }
-        bind?(stmt)
+        do { try bind?(stmt) } catch { return false }
         var step = sqlite3_step(stmt)
         while step == SQLITE_ROW {
             row(stmt)
@@ -1486,19 +1477,21 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return PendingSourceKey(kind: kind, identifier: identifier)
     }
 
-    private func bindKey(_ stmt: OpaquePointer?, _ key: PendingSourceKey, from index: Int32 = 1) {
-        bindText(stmt, index, key.kind.rawValue)
-        bindText(stmt, index + 1, key.identifier)
+    private func bindKey(_ stmt: OpaquePointer?, _ key: PendingSourceKey, from index: Int32 = 1) throws {
+        try connection.bindText(stmt, index, key.kind.rawValue)
+        try connection.bindText(stmt, index + 1, key.identifier)
     }
 
-    private func bindActionKey(_ stmt: OpaquePointer?, _ action: PendingAction, from index: Int32) {
-        bindKey(stmt, action.key, from: index)
-        bindText(stmt, index + 2, action.kind.rawValue)
-        bindText(stmt, index + 3, action.albumID)
+    private func bindActionKey(_ stmt: OpaquePointer?, _ action: PendingAction, from index: Int32) throws {
+        try bindKey(stmt, action.key, from: index)
+        try connection.bindText(stmt, index + 2, action.kind.rawValue)
+        try connection.bindText(stmt, index + 3, action.albumID)
     }
 
     /// Binds capture_time, media_type, is_live, duration, display_name starting at `index`.
-    private func bindPresentation(_ stmt: OpaquePointer?, from index: Int32, _ value: PendingPresentationMetadata?) {
+    private func bindPresentation(
+        _ stmt: OpaquePointer?, from index: Int32, _ value: PendingPresentationMetadata?
+    ) throws {
         guard let value else {
             sqlite3_bind_null(stmt, index)
             sqlite3_bind_null(stmt, index + 1)
@@ -1508,24 +1501,14 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             return
         }
         sqlite3_bind_double(stmt, index, value.captureTime.timeIntervalSince1970)
-        bindText(stmt, index + 1, value.mediaType)
+        try connection.bindText(stmt, index + 1, value.mediaType)
         sqlite3_bind_int(stmt, index + 2, value.isLivePhoto ? 1 : 0)
         if let duration = value.durationSeconds {
             sqlite3_bind_double(stmt, index + 3, duration)
         } else {
             sqlite3_bind_null(stmt, index + 3)
         }
-        bindText(stmt, index + 4, value.displayName)
-    }
-
-    private let transient = SQLiteStoreSchemaGate.transientDestructor
-
-    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
-        sqlite3_bind_text(stmt, index, value, -1, transient)
-    }
-
-    private func bindOptionalText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) {
-        if let value { bindText(stmt, index, value) } else { sqlite3_bind_null(stmt, index) }
+        try connection.bindText(stmt, index + 4, value.displayName)
     }
 
     /// Reads a text column. With `roundTrip`, reads the full bytes of the column: the writers bind with a C string,
