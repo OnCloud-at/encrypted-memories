@@ -6,7 +6,7 @@
 import CoreGraphics
 
 package enum GridTransitionFallbackReason: String, Sendable {
-    case latticeBuildFailed, selectionRelocates, scheduleDegenerate, none
+    case latticeBuildFailed, scheduleDegenerate, none
 }
 
 package final class GridTransitionController {
@@ -24,49 +24,42 @@ package final class GridTransitionController {
 
     package var isActive: Bool { plan != nil }
 
-    /// Try to begin a click (toolbar +/-) transition. Returns true iff a plan was built and
+    /// Try to begin a click (toolbar +/-) transition. Returns true iff a plan was built.
     /// Returns false when the host must use the stable instant snap.
     @discardableResult
     package func beginClick(
-        source: GridFramePlan, target: GridFramePlan, anchorIndex: Int,
-        viewportSize: CGSize, selection: Set<Int>
+        source: GridFramePlan, target: GridFramePlan, anchorIndex: Int, viewportSize: CGSize
     ) -> Bool {
-        guard
-            let lat = GridTransitionComponentBuilder.build(
-                source: source, target: target,
-                anchorIndex: anchorIndex, viewportSize: viewportSize),
-            !lat.components.isEmpty
-        else { return fail(.latticeBuildFailed) }
-        let relocating = GridTransitionSelectionEligibility.relocatingIdentities(in: lat)
-        guard GridTransitionSelectionEligibility.isEligible(selection: selection, relocatingIdentities: relocating)
-        else { return fail(.selectionRelocates) }
-        guard
-            let p = ClickZoomTransitionScheduler.makePlan(
-                lattice: lat, sourceLevel: source.levelID,
-                targetLevel: target.levelID, tuning: tuning)
-        else { return fail(.scheduleDegenerate) }
-        plan = p
-        q = 0
-        elapsed = 0
-        lastFallback = .none
-        emit(
-            "GridTransition",
-            [
-                "event": "PLAN_BUILT",
-                "durationMs": "\(Int(tuning.clickDurationMs))", "components": "\(p.components.count)",
-                "src": "\(source.levelID)", "tgt": "\(target.levelID)",
-            ])
-        return true
+        begin(
+            source: source, target: target, anchorIndex: anchorIndex, viewportSize: viewportSize,
+            schedule: {
+                ClickZoomTransitionScheduler.makePlan(
+                    lattice: $0, sourceLevel: source.levelID, targetLevel: target.levelID, tuning: self.tuning)
+            },
+            extraFields: ["durationMs": "\(Int(tuning.clickDurationMs))"])
     }
 
-    /// Try to begin a live pinch transition. It uses the same eligibility gate as a click, but the plan's
-    /// progress `q` is then driven by `setProgress` during interactive scrubbing instead of the trapezoidal
-    /// time profile - there is no `advanceClick`/timer for a pinch plan. Returns true iff a plan was built
+    /// Try to begin a live pinch transition. The plan's progress `q` is then driven by `setProgress` during
+    /// interactive scrubbing instead of the trapezoidal time profile - there is no `advanceClick`/timer for a
+    /// pinch plan. Returns true iff a plan was built.
     /// Returns false when the host must use the geometry-only reflow fallback.
     @discardableResult
     package func beginPinch(
-        source: GridFramePlan, target: GridFramePlan, anchorIndex: Int,
-        viewportSize: CGSize, selection: Set<Int>
+        source: GridFramePlan, target: GridFramePlan, anchorIndex: Int, viewportSize: CGSize
+    ) -> Bool {
+        begin(
+            source: source, target: target, anchorIndex: anchorIndex, viewportSize: viewportSize,
+            schedule: {
+                PinchZoomTransitionScheduler.makePlan(
+                    lattice: $0, sourceLevel: source.levelID, targetLevel: target.levelID, tuning: self.tuning)
+            },
+            extraFields: [:])
+    }
+
+    /// Builds the lattice, schedules it and publishes the plan. `extraFields` join the `PLAN_BUILT` event.
+    private func begin(
+        source: GridFramePlan, target: GridFramePlan, anchorIndex: Int, viewportSize: CGSize,
+        schedule: (GridTransitionLattice) -> GridTransitionPlan?, extraFields: [String: String]
     ) -> Bool {
         guard
             let lat = GridTransitionComponentBuilder.build(
@@ -74,24 +67,18 @@ package final class GridTransitionController {
                 anchorIndex: anchorIndex, viewportSize: viewportSize),
             !lat.components.isEmpty
         else { return fail(.latticeBuildFailed) }
-        let relocating = GridTransitionSelectionEligibility.relocatingIdentities(in: lat)
-        guard GridTransitionSelectionEligibility.isEligible(selection: selection, relocatingIdentities: relocating)
-        else { return fail(.selectionRelocates) }
-        guard
-            let p = PinchZoomTransitionScheduler.makePlan(
-                lattice: lat, sourceLevel: source.levelID,
-                targetLevel: target.levelID, tuning: tuning)
-        else { return fail(.scheduleDegenerate) }
+        guard let p = schedule(lat) else { return fail(.scheduleDegenerate) }
         plan = p
         q = 0
         elapsed = 0
         lastFallback = .none
         emit(
             "GridTransition",
-            [
-                "event": "PLAN_BUILT",
-                "components": "\(p.components.count)", "src": "\(source.levelID)", "tgt": "\(target.levelID)",
-            ])
+            extraFields.merging(
+                [
+                    "event": "PLAN_BUILT",
+                    "components": "\(p.components.count)", "src": "\(source.levelID)", "tgt": "\(target.levelID)",
+                ], uniquingKeysWith: { $1 }))
         return true
     }
 

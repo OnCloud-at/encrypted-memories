@@ -252,8 +252,7 @@
                 source: sourcePlan,
                 target: targetPlan,
                 anchorIndex: tx.anchorGlobalIndex,
-                viewportSize: viewportSize,
-                selection: selectedFlatIndices()
+                viewportSize: viewportSize
             )
             if built {
                 let targetUIDs = targetPlan.visibleSlots.compactMap { slot -> PhotoUID? in
@@ -277,11 +276,6 @@
             return GridPinchDetentFrame(
                 phase: committedPhase,
                 scrollY: min(max(pinchLockedOffsetY ?? scrollView.contentOffset.y, 0), maxContentOffsetY))
-        }
-
-        private func selectedFlatIndices() -> Set<Int> {
-            guard selectionMode, !selectedUIDs.isEmpty else { return [] }
-            return Set(selectedUIDs.compactMap { itemIndexByUID[$0] })
         }
 
         private func beginOverviewDissolveIfPossible(source: Int, target: Int, engine: SquareTileGridEngine) -> Bool {

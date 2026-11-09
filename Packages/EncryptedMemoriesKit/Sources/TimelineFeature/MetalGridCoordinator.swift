@@ -96,7 +96,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         PhotoDiagnostics.shared.emit(event.name, event.fields)
     })
     private var transitionPrevNow: CFTimeInterval = 0
-    private var selectedFlatIndices: Set<Int> { Set(selectedUIDs.compactMap { indexByUID[$0] }) }
 
     // Live pinch: each adjacent segment is a `.pinch` plan driven by the host's scrub driver. Nothing is
     // committed until release; segments rebuild when the gesture crosses a detent.
@@ -1699,7 +1698,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         let began = PhotoPerformanceSignposts.grid.interval("transition.planBuild") {
             gridTransition.beginClick(
                 source: src, target: tgt, anchorIndex: a.flatIndex,
-                viewportSize: lvp, selection: selectedFlatIndices)
+                viewportSize: lvp)
         }
         guard began else { return nil }
         committedPhase = tgtPhase  // commit settled target state (post-transition frame is the target)
@@ -1803,7 +1802,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         let began = PhotoPerformanceSignposts.grid.interval("transition.planBuild") {
             gridTransition.beginPinch(
                 source: srcPlan, target: tgtPlan, anchorIndex: tx.anchorGlobalIndex,
-                viewportSize: lvp, selection: selectedFlatIndices)
+                viewportSize: lvp)
         }
         guard began else { return false }
         pinchSegmentSource = s
