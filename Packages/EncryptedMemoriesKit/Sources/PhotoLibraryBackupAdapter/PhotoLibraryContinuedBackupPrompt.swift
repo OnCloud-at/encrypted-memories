@@ -75,8 +75,8 @@ public enum PhotoLibraryContinuedBackupPrompt {
         private let claim: Claim
         private let marker: Marker
         private let calmDelay: Duration
-        private let place = UUID()
-        /// Since when the scene is active and the place uncovered; nil while it is not.
+        /// Since when the scene is active and the place uncovered; nil while it is not, so a set value also says that
+        /// the scene is active and nothing covers the place.
         private var calmSince: ContinuousClock.Instant?
         private var isActive = false
         private var isCovered = false
@@ -92,6 +92,25 @@ public enum PhotoLibraryContinuedBackupPrompt {
         public func sceneBecameActive(at now: ContinuousClock.Instant) {
             isActive = true
             if !isCovered { calmSince = now }
+        }
+
+        /// The scene is inactive: in the app switcher, under Control Center or a system alert. It asks nothing then; a
+        /// question that shows stays, and nothing counts as an answer.
+        public func sceneBecameInactive() {
+            isActive = false
+            calmSince = nil
+        }
+
+        /// The question closed without either answer. It frees the claim and sets no marker.
+        public func questionClosed() {
+            if isPresenting { stopPresenting() }
+        }
+
+        /// The conditions that cost nothing to read let this place ask, so the view may read the catalog and the
+        /// screen. With fewer than `itemsThatAlwaysAsk` photos left, the volume can still decide.
+        public func isWaitingToAsk(_ status: BackupStatus, isTaskActive: Bool) -> Bool {
+            isActive && !isPresenting && !isTaskActive && !marker.isSet()
+                && isWorthAsking(status, estimatedBytes: needsVolume(status) ? .max : nil)
         }
 
         /// The scene went to the background while the question showed: that counts as "Not Now".
@@ -117,18 +136,18 @@ public enum PhotoLibraryContinuedBackupPrompt {
 
         /// The backup state changed. A drained backlog may be asked about again.
         public func backupChanged(_ status: BackupStatus, isSyncing: Bool) {
-            if backlogDrained(status, isSyncing: isSyncing) { marker.set(false) }
+            if marker.isSet(), backlogDrained(status, isSyncing: isSyncing) { marker.set(false) }
         }
 
         public func next(
             _ status: BackupStatus, estimatedBytes: Int64?, isTaskActive: Bool, at now: ContinuousClock.Instant
         ) -> Next {
-            guard !isPresenting, isActive, !isCovered, let calmSince else { return .none }
+            guard !isPresenting, let calmSince else { return .none }
             let situation = Situation(isTaskActive: isTaskActive, wasAsked: marker.isSet())
             guard shouldAsk(status, estimatedBytes: estimatedBytes, in: situation) else { return .none }
             let calmIn = calmDelay - (now - calmSince)
             if calmIn > .zero { return .wait(calmIn) }
-            guard claim.claim(place) else { return .none }
+            guard claim.claim(self) else { return .none }
             isPresenting = true
             return .ask
         }
@@ -142,7 +161,7 @@ public enum PhotoLibraryContinuedBackupPrompt {
 
         private func stopPresenting() {
             isPresenting = false
-            claim.release(place)
+            claim.release(self)
         }
     }
 
@@ -151,20 +170,21 @@ public enum PhotoLibraryContinuedBackupPrompt {
     @MainActor
     public final class Claim {
         public static let shared = Claim()
-        private var holder: UUID?
+        /// Held weakly: a place that goes away, as with a scene that ends without a last phase, frees the claim.
+        private weak var holder: AnyObject?
 
         public init() {}
 
         /// Takes the claim for `place` when nobody holds it; the holder keeps it.
-        public func claim(_ place: UUID) -> Bool {
-            guard holder == nil || holder == place else { return false }
+        public func claim(_ place: AnyObject) -> Bool {
+            guard holder == nil || holder === place else { return false }
             holder = place
             return true
         }
 
         /// Ends the claim of `place`; another place's claim stays.
-        public func release(_ place: UUID) {
-            if holder == place { holder = nil }
+        public func release(_ place: AnyObject) {
+            if holder === place { holder = nil }
         }
     }
 

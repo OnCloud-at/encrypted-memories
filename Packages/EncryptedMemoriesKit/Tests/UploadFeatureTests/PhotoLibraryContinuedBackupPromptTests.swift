@@ -109,10 +109,12 @@ import UploadCore
 }
 
 @MainActor @Suite struct PhotoLibraryContinuedBackupPromptClaimTests {
+    private final class Place {}
+
     @Test func onePlaceShowsThePromptAtATime() {
         let claim = PhotoLibraryContinuedBackupPrompt.Claim()
-        let root = UUID()
-        let backupScreen = UUID()
+        let root = Place()
+        let backupScreen = Place()
 
         #expect(claim.claim(backupScreen))
         #expect(claim.claim(backupScreen), "the holder keeps its claim")
@@ -122,6 +124,15 @@ import UploadCore
         #expect(!claim.claim(root), "only the holder releases")
         claim.release(backupScreen)
         #expect(claim.claim(root))
+    }
+
+    /// A place that goes away without releasing, as a scene that ends without a last phase, must not block the others.
+    @Test func aPlaceThatIsGoneHoldsNoClaim() {
+        let claim = PhotoLibraryContinuedBackupPrompt.Claim()
+        var gone: Place? = Place()
+        #expect(claim.claim(gone!))
+        gone = nil
+        #expect(claim.claim(Place()))
     }
 }
 
@@ -216,7 +227,7 @@ import UploadCore
 
         #expect(!asker.isPresenting)
         #expect(!marker.value, "the person did not answer")
-        #expect(claim.claim(UUID()), "the claim is free for another place")
+        #expect(claim.claim(Asker(claim: claim, marker: marker.marker)), "the claim is free for another place")
     }
 
     @Test func onlyOnePlaceAsksAtATime() {
@@ -226,6 +237,62 @@ import UploadCore
         let second = askerAfterTheCalmTime(marker, claim: claim)
         #expect(first.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .ask)
         #expect(second.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .none)
+    }
+
+    @Test func anInactiveSceneDoesNotAskAndClosesNothing() {
+        let marker = MarkerBox()
+        let asker = askerAfterTheCalmTime(marker)
+        asker.sceneBecameInactive()
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(5)) == .none)
+        #expect(!asker.isWaitingToAsk(busy(), isTaskActive: false))
+
+        // Back to active: the calm time starts again.
+        asker.sceneBecameActive(at: start + .seconds(6))
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(7)) == .wait(.seconds(1)))
+
+        // A question that shows stays, and the inactive scene sets no marker.
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(8)) == .ask)
+        asker.sceneBecameInactive()
+        #expect(asker.isPresenting)
+        #expect(!marker.value)
+    }
+
+    @Test func aQuestionThatClosedWithoutAnAnswerFreesTheClaimWithoutTheMarker() {
+        let marker = MarkerBox()
+        let claim = PhotoLibraryContinuedBackupPrompt.Claim()
+        let asker = askerAfterTheCalmTime(marker, claim: claim)
+        _ = asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3))
+
+        asker.questionClosed()
+
+        #expect(!asker.isPresenting)
+        #expect(!marker.value)
+        #expect(claim.claim(Asker(claim: claim, marker: marker.marker)))
+    }
+
+    /// The view reads the catalog and the screen only while the cheap conditions let the place ask.
+    @Test func itWaitsToAskOnlyWhileTheCheapConditionsHold() {
+        let marker = MarkerBox()
+        let asker = askerAfterTheCalmTime(marker)
+        #expect(asker.isWaitingToAsk(busy(), isTaskActive: false))
+        #expect(asker.isWaitingToAsk(busy(remaining: 50), isTaskActive: false), "the volume may still decide")
+        #expect(!asker.isWaitingToAsk(busy(), isTaskActive: true))
+        var idle = busy()
+        idle.phase = .idle
+        #expect(!asker.isWaitingToAsk(idle, isTaskActive: false))
+        marker.value = true
+        #expect(!asker.isWaitingToAsk(busy(), isTaskActive: false))
+        #expect(!Asker(claim: .init(), marker: MarkerBox().marker).isWaitingToAsk(busy(), isTaskActive: false))
+    }
+
+    @Test func aDrainedBacklogTouchesTheMarkerOnlyWhenItIsSet() {
+        var writes = 0
+        let asker = Asker(claim: .init(), marker: .init(isSet: { false }, set: { _ in writes += 1 }))
+        var drained = busy(remaining: 0)
+        drained.phase = .completed
+        asker.backupChanged(drained, isSyncing: false)
+        asker.backupChanged(drained, isSyncing: false)
+        #expect(writes == 0)
     }
 
     @Test func theMarkerResetsWhenTheProjectedBacklogDrained() {
