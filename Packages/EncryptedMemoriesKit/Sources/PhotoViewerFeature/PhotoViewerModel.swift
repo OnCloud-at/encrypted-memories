@@ -130,6 +130,8 @@ public final class PhotoViewerModel {
     private let mutationAction: ViewerMutationAction?
     /// Host work after a revert, for example the removal of the edited photo from the timeline.
     private let onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)?
+    /// Host reaction to a revert that fails after this viewer closed: the host shows the failure, because no viewer is left.
+    private let onRevertFailedAfterClose: (@MainActor () -> Void)?
     /// The confirmation, the run and the failure of "Revert to Original".
     public let revert = EditedPhotoRevertController()
     /// The originals of edited photos that this viewer found, and whether the page shows one.
@@ -153,6 +155,7 @@ public final class PhotoViewerModel {
         editedPhotoReverter: (any EditedPhotoReverting)? = nil,
         mutationAction: ViewerMutationAction? = nil,
         onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)? = nil,
+        onRevertFailedAfterClose: (@MainActor () -> Void)? = nil,
         editedOriginalLookup: EditedPhotoOriginalLookup = EditedPhotoOriginalLookup(),
         silentRetryDelays: @escaping (VideoPlaybackError) -> [Duration] = { $0.silentRetryDelays },
         silentRetryWait: @escaping (Duration) async -> Void = { try? await Task.sleep(for: $0) }
@@ -181,6 +184,7 @@ public final class PhotoViewerModel {
         self.editedPhotoReverter = editedPhotoReverter
         self.mutationAction = mutationAction
         self.onReverted = onReverted
+        self.onRevertFailedAfterClose = onRevertFailedAfterClose
         self.previewCache = previewCache
         self.originalsCache = originalsCache
         self.cacheOriginals = cacheOriginals
@@ -318,7 +322,7 @@ public final class PhotoViewerModel {
         }
         revert.confirm(
             main: baseCurrent, original: original, reverter: editedPhotoReverter, onReverted: onReverted,
-            onSuccess: onSuccess)
+            onSuccess: onSuccess, onFailureAfterClose: onRevertFailedAfterClose)
     }
 
     /// Switches the page between the edited version and its original.
