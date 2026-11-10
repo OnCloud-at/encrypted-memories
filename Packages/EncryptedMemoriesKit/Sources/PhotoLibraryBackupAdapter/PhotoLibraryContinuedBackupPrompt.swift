@@ -62,7 +62,9 @@ public enum PhotoLibraryContinuedBackupPrompt {
             public static func stored(in defaults: UserDefaults = .standard) -> Marker {
                 Marker(
                     isSet: { defaults.bool(forKey: askedMarkerKey) },
-                    set: { $0 ? defaults.set(true, forKey: askedMarkerKey) : defaults.removeObject(forKey: askedMarkerKey) })
+                    set: {
+                        $0 ? defaults.set(true, forKey: askedMarkerKey) : defaults.removeObject(forKey: askedMarkerKey)
+                    })
             }
         }
 
