@@ -248,7 +248,8 @@ import UploadCore
 
         // Back to active: the calm time starts again.
         asker.sceneBecameActive(at: start + .seconds(6))
-        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(7)) == .wait(.seconds(1)))
+        #expect(
+            asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(7)) == .wait(.seconds(1)))
 
         // A question that shows stays, and the inactive scene sets no marker.
         #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(8)) == .ask)
