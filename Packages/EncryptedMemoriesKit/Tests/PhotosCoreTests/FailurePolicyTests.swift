@@ -58,7 +58,8 @@ final class FailurePolicyTests: XCTestCase {
                     for exhausted in [false, true] {
                         let actual = FailurePolicy.resolve(
                             cause, situation: situation, safety: safety, retriesExhausted: exhausted)
-                        let cell = cause == .protonRestriction && situation == .background
+                        let cell =
+                            cause == .protonRestriction && situation == .background
                             ? silent : expected[index * 2 + (exhausted ? 1 : 0)]
                         if actual.retry != cell.0 || actual.presentation != cell.1 {
                             failures.append("\(cause), \(situation), \(safety), exhausted=\(exhausted): \(actual)")

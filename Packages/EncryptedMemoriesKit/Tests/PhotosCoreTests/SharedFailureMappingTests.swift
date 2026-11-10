@@ -17,7 +17,8 @@ final class SharedFailureMappingTests: XCTestCase {
         XCTAssertEqual(VideoPlaybackError.malformedContent.failureCause, .permanent)
         XCTAssertEqual(OriginalExportWriter.Failure.lowDisk.failureCause, .deviceStorage)
         XCTAssertEqual(DragOutStagingFailure.cancelled.failureCause, .cancelled)
-        XCTAssertEqual(DragOutStagingFailure.diskSpaceInsufficient(required: 2, available: 1).failureCause, .deviceStorage)
+        XCTAssertEqual(
+            DragOutStagingFailure.diskSpaceInsufficient(required: 2, available: 1).failureCause, .deviceStorage)
         XCTAssertEqual(DragOutStagingFailure.writeFailed("x").failureCause, .unknown)
         XCTAssertEqual(VideoPlaybackError.rangeNotSupported.failureCause, .unknown)
         XCTAssertEqual(VideoPlaybackError.playerItemFailed(detail: nil).failureCause, .unknown)
