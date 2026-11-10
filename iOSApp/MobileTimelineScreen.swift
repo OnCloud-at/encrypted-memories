@@ -567,9 +567,7 @@ struct MobileTimelineScreen: View {
         if !showsSearchLanding {
             ZStack {
                 if isProjectionPending {
-                    LoadingMark()
-                        .frame(width: 64, height: 64)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    GridLoadingMark()
                         .background(ProtonColor.backgroundNorm)
                         .transition(.opacity)
                 } else if !networkMonitor.isOnline && model.items.isEmpty

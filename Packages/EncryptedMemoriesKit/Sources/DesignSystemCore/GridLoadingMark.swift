@@ -21,6 +21,11 @@ public struct GridLoadingMark: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(caption ?? L10n.string("loading.content"))
+        .accessibilityLabel(Self.accessibilityLabel(caption))
+    }
+
+    /// VoiceOver reads the caption, or "Loading" without one, like the shared spinner.
+    nonisolated static func accessibilityLabel(_ caption: String?) -> String {
+        ProgressSpinner.label(caption)
     }
 }
