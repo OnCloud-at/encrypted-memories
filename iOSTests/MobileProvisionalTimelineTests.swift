@@ -29,7 +29,7 @@ import UIKit
             into: model, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         model.setApplicationActive(false)
-        let runtime = await installRuntime(into: model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
         do {
             try #require(await repository.waitForPage(), "SETUP: the listing reached its held second page")
@@ -78,7 +78,7 @@ import UIKit
             into: model, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         model.setApplicationActive(false)
-        let runtime = await installRuntime(into: model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let screen = try mountScreen(model: model)
         let window = screen.window
         defer { screen.close() }
@@ -135,7 +135,7 @@ import UIKit
         fixture.install(
             into: model, backend: fixture.backend, sections: [], thumbnailFeed: feed, thumbnailCache: cache)
         model.setApplicationActive(false)
-        let runtime = await installRuntime(into: model, fixture: fixture, feed: feed)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, feed: feed)
         let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
         do {
             if listingCompleted {
@@ -199,7 +199,7 @@ import UIKit
             into: model, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         model.setApplicationActive(false)
-        let runtime = await installRuntime(into: model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let screen = try mountScreen(model: model)
         defer { screen.close() }
         let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
@@ -261,7 +261,7 @@ import UIKit
             into: model, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         model.setApplicationActive(false)
-        let runtime = await installRuntime(into: model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let screen = try mountScreen(model: model)
         defer { screen.close() }
         let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
@@ -333,7 +333,7 @@ import UIKit
             into: model, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         model.setApplicationActive(false)
-        let runtime = await installRuntime(into: model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let screen = try mountScreen(model: model)
         defer { screen.close() }
         let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: first) }
@@ -409,20 +409,6 @@ import UIKit
         )
     }
 
-    private func installRuntime(
-        into model: MobileLibraryModel, fixture: MobileSignedInFixture, feed: UIKitThumbnailFeed? = nil
-    ) async -> LibrarySourceAnalysisRuntime {
-        let source = MobileProvisionalSources()
-        let coordinator = LibrarySourceCoordinator(
-            remote: source, thumbnailLoader: fixture.backend, inventoryStore: nil)
-        await coordinator.prepare()
-        let runtime = LibrarySourceAnalysisRuntime(
-            coordinator: coordinator, feed: (feed ?? fixture.feed).feedCore,
-            assets: MLAssetUniverse(), initiallyActive: false, onAssetsChanged: {})
-        model.installIsolatedSourceAnalysisForTests(runtime)
-        return runtime
-    }
-
     private func waitUntil(_ condition: () -> Bool) async throws {
         let held = try await pollUntil(timeout: .seconds(10), condition)
         try #require(held)
@@ -477,9 +463,4 @@ private actor MobileHeldProvisionalRepository: PhotosRepository {
         continuation?.resume()
         continuation = nil
     }
-}
-
-private struct MobileProvisionalSources: LibrarySourceRemoteBackend {
-    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] { [] }
-    func librarySourceItems(for _: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] { [] }
 }
