@@ -1603,7 +1603,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     // MARK: - LibraryStatsProvider
 
-    /// Rows persisted in the local SQLite timeline store - surfaced as "metadata rows" in Settings.
+    /// Rows persisted in the local SQLite timeline store for offline cache status.
     func metadataRowCount() async -> Int {
         (try? await withOpenSession(cause: .local) { bridge in
             bridge.timelineStore?.count() ?? 0

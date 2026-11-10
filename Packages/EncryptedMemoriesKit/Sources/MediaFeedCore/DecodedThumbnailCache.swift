@@ -76,8 +76,7 @@ final class DecodedThumbnailCache: @unchecked Sendable {
     }
 
     /// Stores the sharpest result and evicts older entries while retaining one oversized result.
-    @discardableResult
-    func set(_ image: DecodedThumbnail, for uid: PhotoUID, decodePixelCap: Int) -> Bool {
+    func set(_ image: DecodedThumbnail, for uid: PhotoUID, decodePixelCap: Int) {
         let cap = max(1, decodePixelCap)
         let cost = max(0, image.decodedCostBytes)
         lock.lock()
@@ -85,7 +84,7 @@ final class DecodedThumbnailCache: @unchecked Sendable {
         if let node = map[uid] {
             guard cap >= node.decodePixelCap else {
                 moveToFront(node)
-                return false
+                return
             }
             totalCost += cost - node.cost
             node.image = image
@@ -99,7 +98,6 @@ final class DecodedThumbnailCache: @unchecked Sendable {
             totalCost += cost
         }
         evictToBudget(keeping: uid)
-        return true
     }
 
     func setCostLimit(_ bytes: Int) {

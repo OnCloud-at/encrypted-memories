@@ -15,10 +15,6 @@ public struct DecodedThumbnail: @unchecked Sendable {
         self.pixelHeight = image.height
     }
 
-    public var aspectRatio: CGFloat {
-        CGFloat(pixelWidth) / max(CGFloat(pixelHeight), 1)
-    }
-
     public var decodedCostBytes: Int {
         max(1, pixelWidth * pixelHeight * 4)
     }

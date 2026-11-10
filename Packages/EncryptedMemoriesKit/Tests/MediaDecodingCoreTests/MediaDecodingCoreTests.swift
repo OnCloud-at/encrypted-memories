@@ -14,7 +14,7 @@ struct MediaDecodingCoreTests {
         #expect(max(decoded.pixelWidth, decoded.pixelHeight) <= 8)
         #expect(decoded.pixelWidth > 0)
         #expect(decoded.pixelHeight > 0)
-        #expect(abs(decoded.aspectRatio - 2.0) < 0.2)
+        #expect(abs(CGFloat(decoded.pixelWidth) / CGFloat(decoded.pixelHeight) - 2.0) < 0.2)
         #expect(decoded.decodedCostBytes == decoded.pixelWidth * decoded.pixelHeight * 4)
     }
 
