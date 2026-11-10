@@ -1,6 +1,8 @@
 import Foundation
+import PhotosCore
 import ProtonAuth
 import Testing
+import UploadCore
 
 @testable import ProtonDriveBackend
 
@@ -137,14 +139,15 @@ extension DriveSessionStubSuite {
                 responses: [
                     Self.albumPage("a", more: true, anchor: "x"),
                     Self.albumPage("b", more: true, anchor: "x"),
-                    Self.albumPage("c", more: false),
                 ])
 
-            await #expect(throws: DrivePaginationError.repeatedAlbumAnchor("x")) {
+            await #expect(
+                throws: UploadError.retryableBackend(code: nil, message: L10n.string("albums.load_failed_message"))
+            ) {
                 _ = try await makeSessionForPhotosListTests().fetchAlbumPhotos(
                     volumeID: "vol1", albumLinkID: "album1")
             }
-            #expect(StubURLProtocol.requests().count == 2, "the repeated anchor is never requested a third time")
+            #expect(StubURLProtocol.requests().count == 3, "the repeated page is retried once before failing")
         }
 
         @Test func invalidPageSizeZeroThrowsWithoutNetwork() async throws {
@@ -222,7 +225,7 @@ extension DriveSessionStubSuite {
     }
 }
 
-private func makeSessionForPhotosListTests() -> DriveSession {
+func makeSessionForPhotosListTests() -> DriveSession {
     DriveSession(
         session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
         store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),

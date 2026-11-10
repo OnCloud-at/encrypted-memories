@@ -89,7 +89,7 @@ public enum FailureCancellation {
     }
 }
 
-/// A policy recommendation for future consumers. Existing retry and presentation paths do not use it yet.
+/// Album page reads in DriveSession use this policy for one retry. Other retry and presentation paths do not use it yet.
 /// The model supersedes VideoPlaybackError, BackupIssueKind and MLRuntimeFailure `isRetryable`, AlbumWriteCause
 /// `isTransient`, MLRuntimeFailure `isPermanent`, `offersUserRetry`, `canRetry`, and the follow-up replacement of
 /// `canRetryMerge` in ExactDuplicatesModel.
