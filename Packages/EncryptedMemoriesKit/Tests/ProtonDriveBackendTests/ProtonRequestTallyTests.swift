@@ -120,10 +120,10 @@ struct ProtonRequestTallyTests {
         // A cancelled request is no network failure; a response that arrived keeps its own class.
         #expect(ProtonRequestStatusClass(statusCode: nil, cancelled: true) == .cancelled)
         #expect(ProtonRequestStatusClass(statusCode: 200, cancelled: true) == .success)
-        #expect(ProtonRequestStatusClass.isCancellation(CancellationError()))
-        #expect(ProtonRequestStatusClass.isCancellation(URLError(.cancelled)))
-        #expect(!ProtonRequestStatusClass.isCancellation(URLError(.timedOut)))
-        #expect(!ProtonRequestStatusClass.isCancellation(URLError(.notConnectedToInternet)))
+        #expect(FailureCancellation.isCancellation(CancellationError()))
+        #expect(FailureCancellation.isCancellation(URLError(.cancelled)))
+        #expect(!FailureCancellation.isCancellation(URLError(.timedOut)))
+        #expect(!FailureCancellation.isCancellation(URLError(.notConnectedToInternet)))
     }
 
     @Test func aCancelledDriveSessionRequestCountsAsCancelledNotAsTransport() async throws {

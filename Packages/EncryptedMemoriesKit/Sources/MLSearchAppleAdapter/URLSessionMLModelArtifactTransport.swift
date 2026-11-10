@@ -1,9 +1,6 @@
 import Foundation
 import MLSearchCore
-
-#if ENCRYPTED_MEMORIES_UPGRADE_TEST
-    import PhotosCore
-#endif
+import PhotosCore
 
 public enum MLArtifactTransportError: Error, Equatable {
     case httpStatus(Int)
@@ -354,7 +351,7 @@ private final class RangeDownloadSessionDelegate: NSObject, URLSessionDownloadDe
                 if let downloadedURL = download.downloadedURL {
                     try? FileManager.default.removeItem(at: downloadedURL)
                 }
-                if (error as? URLError)?.code == .cancelled {
+                if FailureCancellation.isCancellation(error) {
                     download.continuation.resume(throwing: CancellationError())
                 } else {
                     download.continuation.resume(throwing: error)

@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import ProtonAuth
 import Testing
 
@@ -167,7 +168,7 @@ struct AccountDataRefreshRetryTests {
 
         let error = try #require(await task.value)
 
-        #expect(ProtonRequestStatusClass.isCancellation(error))
+        #expect(FailureCancellation.isCancellation(error))
         #expect(fixture.requestCount(for: AccountDataRefreshFixture.refreshPath) == 0)
         #expect(fixture.session.current == fixture.initial)
         #expect(fixture.session.authorization().generation == 0)

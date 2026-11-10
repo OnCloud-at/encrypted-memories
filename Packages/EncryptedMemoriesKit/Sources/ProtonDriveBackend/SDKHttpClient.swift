@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import ProtonDriveSDK
 
 /// `HttpClientProtocol` implementation backed by `URLSession`. The SDK builds Drive API and
@@ -111,7 +112,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                 ))
         } catch {
             await requestGovernor.finish(
-                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
+                permit, statusCode: nil, cancelled: FailureCancellation.isCancellation(error))
             // Prefer a stream-side error (encryption/producer) over the generic transport error.
             return .failure((streamError.value ?? error) as NSError)
         }
@@ -215,7 +216,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     statusCode: http.statusCode
                 ))
         } catch {
-            completion.finish(statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
+            completion.finish(statusCode: nil, cancelled: FailureCancellation.isCancellation(error))
             return .failure(error as NSError)
         }
     }
@@ -384,7 +385,7 @@ struct PermitFinishingAsyncSequence: AsyncSequence {
                 }
                 return value
             } catch {
-                completion.finish(statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
+                completion.finish(statusCode: nil, cancelled: FailureCancellation.isCancellation(error))
                 throw error
             }
         }

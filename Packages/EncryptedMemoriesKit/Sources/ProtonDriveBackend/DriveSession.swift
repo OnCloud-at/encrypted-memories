@@ -360,7 +360,7 @@ extension DriveSession {
             (data, response) = try await storageSession.data(for: req)
         } catch {
             await requestGovernor.finish(
-                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
+                permit, statusCode: nil, cancelled: FailureCancellation.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {

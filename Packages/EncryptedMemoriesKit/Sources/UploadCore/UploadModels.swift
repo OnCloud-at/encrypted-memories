@@ -608,7 +608,7 @@ public enum UploadError: LocalizedError, Equatable {
 
     /// Cancellation can cross the transport boundary without cancelling the enclosing Swift task.
     public static func isCancellation(_ error: any Error) -> Bool {
-        if error is CancellationError || (error as? URLError)?.code == .cancelled { return true }
+        if FailureCancellation.isCancellation(error) { return true }
         guard let uploadError = error as? UploadError else { return false }
         switch uploadError {
         case .cancelled: return true

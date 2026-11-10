@@ -82,7 +82,7 @@ extension DriveSessionStubSuite {
                 _ = try await service.resolve()
                 Issue.record("Cancellation must fail")
             } catch {
-                #expect(ProtonRequestStatusClass.isCancellation(error))
+                #expect(FailureCancellation.isCancellation(error))
             }
         }
 

@@ -139,6 +139,62 @@ final class ExactDuplicateRelatedFileTransferTests: XCTestCase {
         }
     }
 
+    func testTransferCancellationKeepsExistingErrorClassification() async throws {
+        let cases: [(String, any Error, Bool)] = [
+            ("upload cancelled", UploadError.cancelled, false),
+            ("upload transport", UploadError.transport(code: NSURLErrorCancelled, message: ""), true),
+            ("task cancellation", CancellationError(), true),
+            ("URL domain", NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled), true),
+            ("foreign domain", NSError(domain: "foreign", code: NSURLErrorCancelled), false),
+            ("URL timeout", URLError(.timedOut), false),
+            (
+                "wrapped upload transport",
+                NSError(
+                    domain: "wrapper", code: 1,
+                    userInfo: [NSUnderlyingErrorKey: UploadError.transport(code: NSURLErrorCancelled, message: "")]),
+                true
+            ),
+            (
+                "wrapped task cancellation",
+                NSError(domain: "wrapper", code: 1, userInfo: [NSUnderlyingErrorKey: CancellationError()]), true
+            ),
+            (
+                "wrapped upload cancelled",
+                NSError(
+                    domain: "wrapper", code: 1, userInfo: [NSUnderlyingErrorKey: UploadError.cancelled]), false
+            ),
+        ]
+        let source = source()
+        for (label, failure, isCancellation) in cases {
+            do {
+                _ = try await transfer().download(
+                    to: destination, allowsExpensiveNetwork: false, source: { source },
+                    stream: { _ in throw failure })
+                XCTFail("\(label): download must fail")
+            } catch {
+                if isCancellation {
+                    XCTAssertTrue(error is CancellationError, "\(label): \(error)")
+                } else {
+                    XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .copyFailed(.transfer), label)
+                }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path), label)
+            try bytes.write(to: destination)
+            let uploadRequest = try request()
+            do {
+                _ = try await transfer().upload(uploadRequest) { _ in throw failure }
+                XCTFail("\(label): upload must fail")
+            } catch {
+                if isCancellation {
+                    XCTAssertTrue(error is CancellationError, "\(label): \(error)")
+                } else {
+                    XCTAssertEqual(error as? ExactDuplicateRelatedFileTransferError, .copyFailed(.transfer), label)
+                }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path), label)
+        }
+    }
+
     func testUnderlyingCancellationPrecedesAnOuterWiFiRefusalOnBothRoutes() async throws {
         let source = source()
         let inner = NSError(

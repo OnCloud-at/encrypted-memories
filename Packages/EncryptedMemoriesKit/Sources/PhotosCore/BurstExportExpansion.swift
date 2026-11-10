@@ -20,7 +20,7 @@ public enum BurstExportExpansion {
         /// must be exported yet, and no failure happened. The viewer waits for the read.
         /// Only `BurstSelectionModel.viewerExportDecision` returns it; `expand` never does.
         case burstLoading
-        /// A read ended as a cancellation (`LibraryActionFailureMessage.isCancellation`);
+        /// A read ended as a cancellation (`FailureCancellation.isCancellation`);
         /// nothing was exported and no failure happened, so the host shows no alert.
         case cancelled
     }
@@ -71,7 +71,7 @@ public enum BurstExportExpansion {
                 } catch {
                     // The export failure alert uses the same classification, so a cancel that
                     // stays quiet there stays quiet here.
-                    if LibraryActionFailureMessage.isCancellation(error) {
+                    if FailureCancellation.isCancellation(error) {
                         return .cancelled
                     }
                     failedSources.append(item)
