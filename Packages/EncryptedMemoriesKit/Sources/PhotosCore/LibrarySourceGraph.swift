@@ -619,6 +619,20 @@ public final class LibrarySourceGraph {
         /// Changes only when the persisted item payload changes. Transient refresh-state changes do
         /// not force a complete item comparison in the persistence layer after a no-op refresh.
         var itemGeneration: UInt64
+
+        mutating func clearInventory() {
+            items = []
+            itemIndexByUID = [:]
+            burstOwnersByMemberUID = [:]
+            validationToken = nil
+        }
+
+        mutating func installInventory(_ items: [LibrarySourceItem], validationToken: String?) {
+            self.items = items
+            itemIndexByUID = LibrarySourceGraph.itemIndexByUID(items)
+            burstOwnersByMemberUID = LibrarySourceGraph.burstOwnersByMemberUID(items)
+            self.validationToken = validationToken
+        }
     }
 
     private var records: [SourceID: Record] = [:]
@@ -735,10 +749,7 @@ public final class LibrarySourceGraph {
             if !record.items.isEmpty { record.itemGeneration &+= 1 }
             record.accessState = .accessLost
             record.authority = .authoritative
-            record.items = []
-            record.itemIndexByUID = [:]
-            record.burstOwnersByMemberUID = [:]
-            record.validationToken = nil
+            record.clearInventory()
             records[sourceID] = record
         }
 
@@ -753,10 +764,7 @@ public final class LibrarySourceGraph {
                     if !record.items.isEmpty { record.itemGeneration &+= 1 }
                     record.accessState = .temporarilyUnavailable
                     record.authority = .hydrating
-                    record.items = []
-                    record.itemIndexByUID = [:]
-                    record.burstOwnersByMemberUID = [:]
-                    record.validationToken = nil
+                    record.clearInventory()
                 }
                 if !reactivating, record.source.capabilities != discoveredSource.capabilities {
                     record.accessGeneration &+= 1
@@ -838,10 +846,7 @@ public final class LibrarySourceGraph {
             record.itemGeneration &+= 1
         }
         record.refreshGeneration &+= 1
-        record.items = canonicalItems
-        record.itemIndexByUID = Self.itemIndexByUID(canonicalItems)
-        record.burstOwnersByMemberUID = Self.burstOwnersByMemberUID(canonicalItems)
-        record.validationToken = validationToken
+        record.installInventory(canonicalItems, validationToken: validationToken)
         record.accessState = .available
         record.authority = .authoritative
         records[lease.sourceID] = record
@@ -879,10 +884,7 @@ public final class LibrarySourceGraph {
             record.itemGeneration &+= 1
         }
         record.refreshGeneration &+= 1
-        record.items = canonicalItems
-        record.itemIndexByUID = Self.itemIndexByUID(canonicalItems)
-        record.burstOwnersByMemberUID = Self.burstOwnersByMemberUID(canonicalItems)
-        record.validationToken = validationToken
+        record.installInventory(canonicalItems, validationToken: validationToken)
         record.accessState = .temporarilyUnavailable
         record.authority = nextAuthority
         records[sourceID] = record
@@ -937,10 +939,7 @@ public final class LibrarySourceGraph {
         if !record.items.isEmpty { record.itemGeneration &+= 1 }
         record.accessState = .accessLost
         record.authority = .authoritative
-        record.items = []
-        record.itemIndexByUID = [:]
-        record.burstOwnersByMemberUID = [:]
-        record.validationToken = nil
+        record.clearInventory()
         records[sourceID] = record
         revision &+= 1
         return makeChange(previousRetentionUIDs: previousRetentionUIDs)
