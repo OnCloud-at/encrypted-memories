@@ -98,14 +98,57 @@ final class TimelineOrderFirstLaunchTests: XCTestCase {
     func testASecondReaderRebuildDoesNotRestartTheSamePassAgain() async throws {
         let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
         let task = await owner.start(Self.photos(10_000), action: .readerRebuildTwice)
-        let succeeded = await task.value
+        defer { task.cancel() }
+        let taskResult = await boundedValue(of: task)
+        let succeeded = try XCTUnwrap(taskResult, "order synchronization did not finish within the test deadline")
         XCTAssertFalse(succeeded, "a pass may resume after only one reader rebuild")
-        _ = await owner.probeResult()
-        let rebuilds = await owner.rebuildCount()
+        let probeList = Task { await owner.probeTasks() }
+        let probeListResult = await boundedValue(of: probeList)
+        let probes = try XCTUnwrap(probeListResult, "reader probe list did not arrive within the test deadline")
+        defer { probes.forEach { $0.cancel() } }
+        XCTAssertEqual(probes.count, 2, "the fixture must schedule both reader probes")
+        for (index, probe) in probes.enumerated() {
+            let result = await boundedValue(of: probe)
+            _ = try XCTUnwrap(result, "reader probe \(index + 1) did not finish within the test deadline")
+        }
+        let checks = Task {
+            let rebuilds = await owner.rebuildCount()
+            let rows = await owner.rowCount()
+            await owner.close()
+            return (rebuilds, rows)
+        }
+        let checkResult = await boundedValue(of: checks)
+        let (rebuilds, rows) = try XCTUnwrap(checkResult, "reader verification did not finish within the test deadline")
         XCTAssertEqual(rebuilds, 2, "the fixture must rebuild during both synchronization attempts")
-        let rows = await owner.rowCount()
         XCTAssertEqual(rows, 2, "a third synchronization must not replace the second reader's checkpoint")
-        await owner.close()
+    }
+
+    func testBoundedWaitCancelsAStalledTask() async {
+        let signal = AsyncTestSignal()
+        let task = Task {
+            await signal.wait()
+            return true
+        }
+        let result = await boundedValue(of: task, limit: .milliseconds(100))
+        XCTAssertNil(result)
+        XCTAssertTrue(task.isCancelled)
+        _ = await task.value
+    }
+
+    private func boundedValue<Value: Sendable>(
+        of task: Task<Value, Never>, limit: Duration = .seconds(300)
+    ) async -> Value? {
+        let finished = AsyncTestSignal()
+        let waiter = Task {
+            _ = await task.value
+            finished.fire()
+        }
+        guard await finished.wait(limit: limit) else {
+            task.cancel()
+            waiter.cancel()
+            return nil
+        }
+        return await task.value
     }
 
     func testCancellationAfterReaderRebuildDoesNotBeginAnotherSQLPass() async throws {
@@ -288,7 +331,7 @@ private actor CacheOwner {
     private let url: URL
     private let gate = JoinedShutdownGate()
     private var task: Task<Bool, Never>?
-    private var probe: Task<Probe, Never>?
+    private var probes: [Task<Probe, Never>] = []
     private var shutdownTask: Task<Void, Never>?
     private var classified = 0
     private var retryReplacementScheduled = false
@@ -302,7 +345,7 @@ private actor CacheOwner {
     func start(_ items: [PhotoItem], action: Action, probeAfter: Int = 1) -> Task<Bool, Never> {
         classified = 0
         retryReplacementScheduled = false
-        probe = nil
+        probes = []
         let task = Task(priority: .background) {
             (try? await self.gate.withAdmission {
                 await self.synchronize(items, action: action, probeAfter: probeAfter)
@@ -330,9 +373,10 @@ private actor CacheOwner {
                     if action == .readerRebuildThenReplace, inspectionAction == .replace {
                         self.retryReplacementScheduled = true
                     }
-                    self.probe = Task(priority: .userInitiated) {
-                        await self.inspect(items[0], action: inspectionAction, queuedAt: queuedAt)
-                    }
+                    self.probes.append(
+                        Task(priority: .userInitiated) {
+                            await self.inspect(items[0], action: inspectionAction, queuedAt: queuedAt)
+                        })
                 }
                 return true
             })
@@ -400,7 +444,12 @@ private actor CacheOwner {
         _ = try? store.publishCompletedSeconds()
     }
 
-    func probeResult() async -> Probe { await probe?.value ?? Probe() }
+    func probeTasks() -> [Task<Probe, Never>] { probes }
+    func probeResult() async -> Probe {
+        var last = Probe()
+        for probe in probes { last = await probe.value }
+        return last
+    }
     func waitForShutdown() async { await shutdownTask?.value }
     func rebuildCount() -> UInt64 { store.rebuildRevision }
     func firstUnknown() throws -> PhotoUID? { try store.nextPage().first?.uid }
