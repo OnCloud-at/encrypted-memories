@@ -1893,7 +1893,7 @@ public final class PhotoLibraryBackupController {
                             originalFilename: "\(kind.rawValue) fixture.heic", state: state,
                             lastError: BackupIssueRecord(
                                 kind: kind, detail: "Fixture technical detail",
-                                nextAttemptAt: kind.category == .automatic ? retryAt : nil
+                                nextAttemptAt: BackupItemOutcome(issue: kind).category == .automatic ? retryAt : nil
                             ).persistedValue, updatedAt: retryAt))
                 else { return false }
             }
