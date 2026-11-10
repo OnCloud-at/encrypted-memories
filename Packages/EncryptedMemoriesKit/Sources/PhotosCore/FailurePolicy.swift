@@ -37,7 +37,9 @@ public enum FailureCause: Sendable, Equatable, CaseIterable {
     /// The operation changed remote state for part of its scope, or for an unconfirmed part, so repeating it can
     /// duplicate or conflict. Carriers include AlbumError.partialAdd and partialAddWithCauses,
     /// albumCreatedButPhotosNotAdded, FavoriteMutationError with non-empty succeeded,
-    /// UploadRemoteCommitSettlementError and receipt-bearing UploadRemoteCommitRecoveryError cases.
+    /// UploadRemoteCommitSettlementError and UploadRemoteCommitRecoveryError.storeUnavailable,
+    /// descriptorUnavailable, descriptorMismatch and receiptRemovalFailed. Those recovery failures may retain a
+    /// receipt. Malformed or invalid receipt data cannot be settled and maps to permanent instead.
     case partialCompletion
     /// The available evidence does not identify the cause.
     case unknown
