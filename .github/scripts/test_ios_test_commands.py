@@ -571,5 +571,65 @@ if sys.argv[1:2] == ['xcodebuild']:
                 self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
 
 
+class PackageLockSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(prefix='lock-selection-')
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        self.repo = Path(__file__).resolve().parents[2]
+        (self.root / 'scripts').mkdir()
+        shutil.copy(self.repo / 'scripts/merge-package-resolved.py', self.root / 'scripts')
+        self.write_lock('Packages/EncryptedMemoriesKit/Package.resolved', 'photos')
+        self.project = self.root / 'EncryptedMemories.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved'
+        self.workspace = self.root / 'EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved'
+
+    def write_lock(self, relative, identity):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'version': 2, 'pins': [{'identity': identity}]}))
+
+    def pin(self):
+        environment = dict(os.environ)
+        environment.pop('ENCRYPTED_MEMORIES_BUILD_PATHS_LOADED', None)
+        return subprocess.run(
+            ['bash', '-c', 'source "$1"; encryptedmemories_pin_generated_project_packages "$2"',
+             'bash', str(self.repo / 'scripts/build-paths.sh'), str(self.root)],
+            env=environment, capture_output=True, text=True)
+
+    def assert_pins(self, *identities):
+        project = json.loads(self.project.read_text())
+        self.assertEqual(json.loads(self.workspace.read_text()), project)
+        self.assertEqual({pin['identity'] for pin in project['pins']}, set(identities))
+
+    def test_canonical_lock_wins_when_both_exist(self):
+        self.write_lock('BuildSupport/Package.resolved', 'canonical')
+        self.write_lock('Vendor/sdk-swift/Package.resolved', 'fallback')
+        result = self.pin()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_pins('photos', 'canonical')
+
+    def test_missing_canonical_lock_uses_sdk_lock(self):
+        self.write_lock('Vendor/sdk-swift/Package.resolved', 'fallback')
+        result = self.pin()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_pins('photos', 'fallback')
+
+    def test_missing_both_secondary_locks_fails_without_output(self):
+        result = self.pin()
+        self.assertEqual(result.returncode, 66)
+        self.assertIn('Missing package lock file:', result.stderr)
+        self.assertFalse(self.project.exists())
+        self.assertFalse(self.workspace.exists())
+
+    def test_missing_primary_lock_fails_without_output(self):
+        self.write_lock('BuildSupport/Package.resolved', 'canonical')
+        (self.root / 'Packages/EncryptedMemoriesKit/Package.resolved').unlink()
+        result = self.pin()
+        self.assertEqual(result.returncode, 66)
+        self.assertIn('Missing package lock file:', result.stderr)
+        self.assertFalse(self.project.exists())
+        self.assertFalse(self.workspace.exists())
+
+
 if __name__ == '__main__':
     unittest.main()
