@@ -1,3 +1,4 @@
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 import UploadCore
@@ -37,9 +38,11 @@ public struct BulkPhotoActionControls: View {
         VStack(spacing: 0) {
             if runner.isRunning, ownsActivity() {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(progress)
-                        .accessibilityIdentifier("backup.bulk.progress")
-                    ProgressView(value: Double(runner.processed), total: Double(max(1, runner.total)))
+                    ActivityProgressRow(
+                        title: nil, detail: progress,
+                        fraction: Self.progressFraction(processed: runner.processed, total: runner.total)
+                    )
+                    .accessibilityIdentifier("backup.bulk.progress")
                     Text(
                         outcome(
                             completed: runner.completed, total: runner.total,
@@ -189,6 +192,11 @@ public struct BulkPhotoActionControls: View {
     }
 
     private func number(_ value: Int) -> String { value.formatted(.number) }
+
+    /// The share of the photos that the run has checked.
+    nonisolated static func progressFraction(processed: Int, total: Int) -> Double {
+        total > 0 ? Double(processed) / Double(total) : 0
+    }
 
     private func clearConfirmation() {
         showsConfirmation = false
