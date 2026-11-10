@@ -1,6 +1,7 @@
 import AlbumCore
 import AlbumsFeature
 import AppKit
+import AppRouteIntents
 import CoreLocation
 import DesignSystem
 import DesignSystemCore
@@ -62,6 +63,8 @@ struct MainView: View {
     @State private var showCreateAlbum = false
     @State private var showAlbumDestination = false
     @State private var selection: PhotoFilter = .all
+    /// Identifies this window for the shared route inbox.
+    @State private var routeWindow = UUID()
     @State private var mapClusterPresentation: MapClusterPresentation?
     /// The Duplicates route of this account. Nil while the account cannot merge duplicates.
     @State private var duplicates: ExactDuplicatesModel?
@@ -194,6 +197,26 @@ struct MainView: View {
         _sidebarOpen = State(initialValue: true)
         _sidebarWidth = State(initialValue: width)
         _columnVisibility = State(initialValue: .all)
+    }
+
+    /// Opens a pending link or Shortcuts route once the shared gate allows it. The viewer, sheets, alerts and
+    /// dialogs block it; the gate is checked again until the route opens.
+    private func openPendingRoute() async {
+        while AppRoutes.inbox.pending != nil, !Task.isCancelled {
+            let libraryWindow = NSApp.windows.first { $0.identifier?.rawValue == "library" }
+            let route = AppRoutes.inbox.open(
+                window: routeWindow,
+                isActiveWindow: true,
+                libraryReady: !timelineModel.initialLibraryLoadState.isLoading,
+                presentationBlocked: viewerModel != nil || duplicateViewerGroup != nil
+                    || libraryWindow?.attachedSheet != nil || NSApp.modalWindow != nil
+            )
+            if let route {
+                selection = route.photoFilter
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
     }
 
     var body: some View {
@@ -477,6 +500,7 @@ struct MainView: View {
             }
         )
         .coordinateSpace(name: "root")
+        .task(id: AppRoutes.inbox.pending) { await openPendingRoute() }
         .animation(Self.sidebarAnimation, value: sidebarOpen)
         .sheet(isPresented: $showCreateAlbum) {
             AlbumCreationSheet(

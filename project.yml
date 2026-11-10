@@ -72,9 +72,12 @@ targets:
     sources:
       - App
       - Shared/PrivacyInfo.xcprivacy
+      - Shared/AppIntents.xcstrings
     dependencies:
       - package: EncryptedMemoriesKit
         product: PhotosCore
+      - package: EncryptedMemoriesKit
+        product: AppRouteIntents
       - package: EncryptedMemoriesKit
         product: LibraryRuntimeAppleAdapter
       - package: EncryptedMemoriesKit
@@ -159,9 +162,12 @@ targets:
     sources:
       - iOSApp
       - Shared/PrivacyInfo.xcprivacy
+      - Shared/AppIntents.xcstrings
     dependencies:
       - package: EncryptedMemoriesKit
         product: PhotosCore
+      - package: EncryptedMemoriesKit
+        product: AppRouteIntents
       - package: EncryptedMemoriesKit
         product: PrivacyFeature
       - package: EncryptedMemoriesKit

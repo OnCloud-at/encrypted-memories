@@ -10,6 +10,19 @@ extension XCUIApplication {
         ).firstMatch
     }
 
+    /// The first photo of the visible grid; every grid photo reports a label that starts with "Photo, ".
+    var firstPhoto: XCUIElement {
+        descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '")).firstMatch
+    }
+
+    /// Opens Recently Deleted from the visible Collections list, which may need scrolling first.
+    func openRecentlyDeleted() {
+        let recentlyDeleted = buttons["Recently Deleted"].firstMatch
+        for _ in 0..<4 where !recentlyDeleted.waitForExistence(timeout: 3) { swipeUp() }
+        XCTAssertTrue(recentlyDeleted.waitForExistence(timeout: 10))
+        recentlyDeleted.tap()
+    }
+
     /// Read a rendered screen pixel in window coordinates, outside the native button backgrounds.
     func screenshotPixel(at point: CGPoint, in window: CGRect) throws -> [UInt8] {
         let image = try XCTUnwrap(screenshot().image.cgImage)

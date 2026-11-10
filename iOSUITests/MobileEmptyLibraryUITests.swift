@@ -56,9 +56,7 @@ final class MobileEmptyLibraryUITests: XCTestCase {
     func testFirstSignInShowsLoadingUntilPhotosArrive() {
         launch("later")
         assertLoadingWithoutEmpty()
-        let photo = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
-            .firstMatch
-        XCTAssertTrue(photo.waitForExistence(timeout: 60))
+        XCTAssertTrue(app.firstPhoto.waitForExistence(timeout: 60))
         XCTAssertFalse(app.staticTexts["No photos yet"].exists)
         attachScreen("First sign-in after known photos arrive")
     }

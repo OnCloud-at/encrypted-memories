@@ -21,6 +21,8 @@ struct MobileCollectionsScreen: View {
     @Environment(MobileLibraryModel.self) private var model
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    /// The pushed smart collections; a link or Shortcuts action can set it.
+    @Binding var path: [PhotoTag]
     @State private var showCreateAlbum = false
     @State private var pendingSharedAlbumLeave: SharedAlbumSummary?
 
@@ -35,13 +37,11 @@ struct MobileCollectionsScreen: View {
     private var smartCategories: [PhotoTag] { Self.smartCategories }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
                 Section(String(localized: "collections.section_library")) {
                     ForEach(smartCategories, id: \.rawValue) { tag in
-                        NavigationLink {
-                            MobileFilterGridScreen(title: tag.title, filter: .tag(tag))
-                        } label: {
+                        NavigationLink(value: tag) {
                             MobileCollectionRow(systemImage: tag.systemImage, title: tag.title)
                         }
                     }
@@ -75,6 +75,9 @@ struct MobileCollectionsScreen: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .navigationDestination(for: PhotoTag.self) { tag in
+                MobileFilterGridScreen(title: tag.title, filter: .tag(tag))
+            }
             .mobileNavigationTitle(String(localized: "tab.collections"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
