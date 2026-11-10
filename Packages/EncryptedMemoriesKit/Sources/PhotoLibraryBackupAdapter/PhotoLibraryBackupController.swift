@@ -447,7 +447,11 @@ public final class PhotoLibraryBackupController {
                     guard PhotoLibraryResourceResolver.photosNoLongerLists(source.identifier) else { return false }
                     return catalogStore.recordUnavailableSource(source, at: Date())
                 },
-                events: pendingRecorder
+                events: pendingRecorder,
+                // A missing or failed hint file keeps the normal order; it never stops the backup.
+                localReadFailureHints: BackupLocalReadFailureHintStore(
+                    url: directory.appendingPathComponent(BackupLocalReadFailureHintStore.databaseFileName),
+                    policy: configuration.databasePolicy)
             )
         } else {
             engine = nil
