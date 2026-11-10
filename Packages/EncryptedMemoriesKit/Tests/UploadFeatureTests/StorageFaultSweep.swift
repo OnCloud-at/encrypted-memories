@@ -6,17 +6,23 @@ import XCTest
 // Fault-injection sweep for storage-changing operations (#1141).
 //
 // A storage-changing operation is registered once, as a `StorageFaultCase` in `storageFaultCases`. The sweep then runs
-// it on real store files and fails each SQLite statement of its fault targets in turn. The terms below have one
-// meaning:
+// it on real store files and fails each statement and file write of its fault targets in turn. The terms below have
+// one meaning:
 //
-// - Statement: one SQLite statement that starts on the connection of a fault target (SQLITE_TRACE_STMT), including
-//   BEGIN, COMMIT, ROLLBACK, PRAGMA and reads. A fault target is a store of the world; a cross-store operation lists
-//   every store it writes, so that a crash between the writes of two stores is a point too.
-// - Point k: the k-th statement of the fault-free reference run, counted across all fault targets in the order they
-//   start. The sweep visits every point once.
-// - Failure at point k: statement k fails with SQLITE_INTERRUPT. The operation's own error handling then runs.
-// - Crash image at point k: a copy of every file of the world, except the `-shm` index, taken just before statement k
-//   runs. It models a process kill at that moment (iOS ends the app), not a power loss. The image keeps its WAL
+// - Fault target: a store of the world that the operation writes. A SQLite store offers its statements; a
+//   `StorageFaultFiles` offers the file writes of the journals that write through it (#1149). A cross-store operation
+//   lists every store it writes, so that a crash between the writes of two stores is a point too.
+// - Statement: one SQLite statement that starts on the connection of a SQLite fault target (SQLITE_TRACE_STMT),
+//   including BEGIN, COMMIT, ROLLBACK, PRAGMA and reads.
+// - File write: one atomic replacement, one append write or one truncation through `StorageFaultFiles`. A truncation
+//   runs only after a failed append write, on the error path, so the sweep never fails one; the writer's unit tests do.
+// - Point k: the k-th statement or file write of the fault-free reference run, counted across all fault targets in
+//   the order they start. The sweep visits every point once.
+// - Failure at point k: statement k fails with SQLITE_INTERRUPT; file write k fails as a full disk does, and an append
+//   write leaves the first half of its bytes. The operation's own error handling then runs.
+// - Crash image at point k: a copy of every file of the world, except the `-shm` index, taken just before statement
+//   or file write k runs; for an append write, just after its first half, as when the process ends during the write.
+//   It models a process kill at that moment (iOS ends the app), not a power loss. The image keeps its WAL
 //   unrecovered: the restart's own stores open it first, as after a real kill, so a store that cannot open a WAL that
 //   a killed process left behind fails rule I4.
 // - Restart: new store objects open the files, as a launch does, and run the operation once more without a fault. A
@@ -26,7 +32,9 @@ import XCTest
 // - State: every row of every table of the world's stores, compared for equality. A text column that holds JSON
 //   compares by content, because `JSONEncoder` writes keys in no fixed order.
 //
-// After every point the sweep checks these fixed rules. A case chooses only its atomicity.
+// After every point the sweep checks these fixed rules. A case chooses only its atomicity. A case may also accept a
+// known violation of today's code at one named point (`StorageFaultAcceptance`), with its reason: the report prints it
+// with that reason, and an acceptance that does not cover exactly one violation fails the sweep.
 //
 // - I1 No loss: every record that exists before the operation and after the fault-free run exists after the failure
 //   and in the crash image. A record that only the successful run removes may disappear. After a restart, I4 already
@@ -41,17 +49,18 @@ import XCTest
 //   fault-free run.
 //
 // The sweep is deterministic: every point starts from a copy of one seed, the cases use fixed clocks, and nothing
-// waits for wall-clock time. The sweep also checks that each fault hits the statement that its point names (the SQL
-// text before binding, on the same target): a run that ends before point k reports `faultDidNotFire`, and a run whose
-// k-th statement differs reports `faultHitAnotherStatement`. The check compares the SQL text before binding: an
-// order change between statements with different SQL text fails the sweep; statements with identical text, such as
-// two inserts of one prepared statement with different values, are not told apart.
+// waits for wall-clock time. The sweep also checks that each fault hits the point it names (on the same target): a run
+// that ends before point k reports `faultDidNotFire`, and a run whose k-th point differs reports
+// `faultHitAnotherStatement`. The check compares the SQL text before binding, or the kind and file name of a file
+// write: an order change between points with different text fails the sweep; points with identical text, such as two
+// inserts of one prepared statement with different values, are not told apart.
 //
 // Never faulted, so outside these rules: statements of `seed`, `open` (schema gate, start-up replays) and `close`;
 // statements of the error path after the failed statement (ROLLBACK, compensating writes such as
-// `clearFullScanResumePoint`); a second fault in the same run; any failure other than SQLITE_INTERRUPT, such as a full
-// disk or a busy database; faults in the SQLite VFS (page write, sync, truncate); file writes outside SQLite until
-// #1149 adds their fault point; and power loss, where an unsynced write is lost.
+// `clearFullScanResumePoint`); a second fault in the same run; for statements, any failure other than SQLITE_INTERRUPT,
+// such as a full disk or a busy database; faults in the SQLite VFS (page write, sync, truncate); the seam calls
+// `openForAppending`, `seekToEnd` and `close`; file writes that do not go through `StorageFaultFiles`; reads; and power
+// loss, where an unsynced write is lost.
 
 enum StorageFaultAtomicity: Sendable {
     /// One transaction: a failure leaves the state before the operation.
@@ -68,6 +77,22 @@ enum StorageFaultRule: String, Sendable {
     case honestOutcome = "I5 honest outcome"
     case faultDidNotFire = "the injected fault did not fire"
     case faultHitAnotherStatement = "the injected fault hit another statement"
+    case acceptanceMismatch = "an acceptance does not cover exactly one violation"
+}
+
+/// A violation of today's code that a case accepts on purpose: one rule, in one phase, at the point with this text. It
+/// covers exactly one violation of the sweep, and the sweep reports it as accepted, with the reason, instead of hiding
+/// it. An acceptance that covers no violation or several covers none of them. Each acceptance names its reason and the
+/// issue that holds the decision.
+struct StorageFaultAcceptance: Sendable {
+    let rule: StorageFaultRule
+    let phase: StorageFaultPhase
+    let point: String
+    let reason: String
+
+    func covers(_ violation: StorageFaultViolation) -> Bool {
+        violation.rule == rule && violation.phase == phase && violation.statement == point
+    }
 }
 
 /// Where in a point the sweep checks a rule.
@@ -90,9 +115,20 @@ struct StorageFaultViolation: CustomStringConvertible {
     }
 }
 
+/// A violation that a case accepts, with the reason of its acceptance.
+struct StorageFaultAcceptedViolation: CustomStringConvertible {
+    let violation: StorageFaultViolation
+    let reason: String
+
+    var description: String { "accepted: \(violation) — \(reason)" }
+}
+
 struct StorageFaultSweepReport {
-    var statements: [String] = []
+    /// The statements and file writes of the reference run, in the order they start.
+    var points: [String] = []
     var violations: [StorageFaultViolation] = []
+    /// The violations that the case accepts (`StorageFaultCase.acceptances`), still reported.
+    var accepted: [StorageFaultAcceptedViolation] = []
     var seconds: Double = 0
     /// Each violated rule with the phase that found it, as "rule, phase".
     var violatedChecks: Set<String> { Set(violations.map { "\($0.rule.rawValue), \($0.phase.rawValue)" }) }
@@ -146,13 +182,20 @@ protocol StorageFaultCase: Sendable {
     func seed(in directory: URL, remote: StorageFaultRemote) async throws
     /// Opens new store objects on the files in `directory`, as a launch does, with its start-up replays.
     func open(_ directory: URL, remote: StorageFaultRemote) throws -> World
-    /// Every store of the world that the operation writes. Each has a `connection: SQLiteStoreConnection`.
+    /// Every store of the world that the operation writes: a SQLite store with a `connection: SQLiteStoreConnection`,
+    /// or the `StorageFaultFiles` that its journals write through.
     func faultTargets(of world: World) -> [Any]
     /// The operation. True when it reports success.
     func run(_ world: World) async -> Bool
     func close(_ world: World)
     /// The state and records of the files in `directory`. The sweep passes a copy that no store has open.
     func state(in directory: URL) throws -> StorageFaultState
+    /// Known violations of today's code that this case accepts. Empty for almost every case.
+    var acceptances: [StorageFaultAcceptance] { get }
+}
+
+extension StorageFaultCase {
+    var acceptances: [StorageFaultAcceptance] { [] }
 }
 
 enum StorageFaultSweep {
@@ -175,12 +218,7 @@ enum StorageFaultSweep {
         let statements = StatementLog()
         let world = try faultCase.open(reference, remote: seedRemote.copy())
         let recorders = try faultCase.faultTargets(of: world).enumerated().map { target, store in
-            try SQLiteReadInterrupt(
-                in: store,
-                matches: {
-                    statements.append(target: target, sql: $0)
-                    return true
-                }, occurrence: .max)
+            try FaultPoints(in: store, onStart: { statements.append(target: target, sql: $0) })
         }
         let referenceSucceeded = await faultCase.run(world)
         recorders.forEach { $0.stop() }
@@ -202,14 +240,12 @@ enum StorageFaultSweep {
             let crash = CrashCapture()
             let world = try faultCase.open(failed, remote: remote)
             let started = StatementLog()
-            let fault = try SQLiteReadInterrupt(
-                in: faultCase.faultTargets(of: world)[point.target],
-                matches: {
-                    started.append(target: point.target, sql: $0)
-                    return true
-                }, occurrence: occurrence,
+            let fault = try FaultPoints(
+                in: faultCase.faultTargets(of: world)[point.target], failing: occurrence,
+                onStart: { started.append(target: point.target, sql: $0) },
                 onFire: {
-                    // The kill happens before the statement writes; a later restart opens this copy.
+                    // The kill happens before the statement or file write changes a file, or halfway through an
+                    // append write; a later restart opens this copy.
                     do {
                         try copy(failed, to: image)
                         crash.remote = remote.copy()
@@ -222,7 +258,7 @@ enum StorageFaultSweep {
             faultCase.close(world)
             if let error = crash.error { throw error }
             guard let crashRemote = crash.remote else {
-                check.report(.faultDidNotFire, .failedRun, "the run ended before this statement")
+                check.report(.faultDidNotFire, .failedRun, "the run ended before this point")
                 try? FileManager.default.removeItem(at: pointDirectory)
                 continue
             }
@@ -241,8 +277,25 @@ enum StorageFaultSweep {
             try await check.restart(faultCase, in: image, remote: crashRemote, .restartFromCrashImage)
             try? FileManager.default.removeItem(at: pointDirectory)
         }
+        // An acceptance that covers exactly one violation moves it to `accepted`, with its reason. An acceptance that
+        // covers none or several is a violation itself, and the violations it covers stay.
+        var violations = check.violations
+        var accepted: [StorageFaultAcceptedViolation] = []
+        for acceptance in faultCase.acceptances {
+            let covered = violations.filter(acceptance.covers)
+            if covered.count == 1, let violation = covered.first {
+                violations.removeAll(where: acceptance.covers)
+                accepted.append(StorageFaultAcceptedViolation(violation: violation, reason: acceptance.reason))
+            } else {
+                violations.append(
+                    StorageFaultViolation(
+                        rule: .acceptanceMismatch, phase: acceptance.phase, point: 0, statement: acceptance.point,
+                        detail: "\(acceptance.rule.rawValue) is accepted here and occurred \(covered.count) times"))
+            }
+        }
         return StorageFaultSweepReport(
-            statements: points.map(\.sql), violations: check.violations, seconds: Date().timeIntervalSince(started))
+            points: points.map(\.sql), violations: violations, accepted: accepted,
+            seconds: Date().timeIntervalSince(started))
     }
 
     /// Copies every file of `source` except the SQLite `-shm` index, which SQLite rebuilds when a file opens.
@@ -333,6 +386,115 @@ private struct StorageFaultCheck {
         }
         return "the tables differ"
     }
+}
+
+/// The points of one fault target: the statements of a SQLite store or the file writes of a `StorageFaultFiles`. It
+/// names every point as it starts and fails the `failing`-th one; `.max` never fails.
+private struct FaultPoints {
+    private let interrupt: SQLiteReadInterrupt?
+    private let files: StorageFaultFiles?
+
+    init(in target: Any, failing: Int = .max, onStart: @escaping (String) -> Void, onFire: (() -> Void)? = nil) throws {
+        if let files = target as? StorageFaultFiles {
+            files.watch(failing: [failing], onStart: onStart, onFire: onFire ?? {})
+            self.files = files
+            interrupt = nil
+        } else {
+            interrupt = try SQLiteReadInterrupt(
+                in: target,
+                matches: {
+                    onStart($0)
+                    return true
+                }, occurrence: failing, onFire: onFire)
+            files = nil
+        }
+    }
+
+    func stop() {
+        interrupt?.stop()
+        files?.stopWatching()
+    }
+}
+
+/// The local disk as a fault target for file writes (#1149). Every atomic replacement, append write and truncation is
+/// a numbered write. A failing write throws as a full disk does: a replacement changes nothing, an append write leaves
+/// the first half of its bytes, and a truncation leaves the file as it is.
+final class StorageFaultFiles: DurableFileSystem, @unchecked Sendable {
+    struct Full: Error {}
+
+    private let local = LocalDurableFileSystem()
+    private let lock = NSLock()
+    private var started = 0
+    private var failing: Set<Int> = []
+    private var onStart: (String) -> Void = { _ in }
+    private var onFire: () -> Void = {}
+
+    /// Names every later write as "<kind> <file name>" when it starts, and fails the writes with these one-based
+    /// numbers. `onFire` runs at each failing write: before a replacement or truncation, after the first half of an
+    /// append write.
+    func watch(failing: Set<Int>, onStart: @escaping (String) -> Void = { _ in }, onFire: @escaping () -> Void = {}) {
+        lock.withLock {
+            started = 0
+            self.failing = failing
+            self.onStart = onStart
+            self.onFire = onFire
+        }
+    }
+
+    func stopWatching() { watch(failing: []) }
+
+    /// Starts one write and answers whether it fails.
+    fileprivate func start(_ kind: String, _ url: URL) -> Bool {
+        let (fails, onStart) = lock.withLock { () -> (Bool, (String) -> Void) in
+            started += 1
+            return (failing.contains(started), self.onStart)
+        }
+        onStart("\(kind) \(url.lastPathComponent)")
+        return fails
+    }
+
+    fileprivate func fire() { lock.withLock { onFire }() }
+
+    func replace(_ url: URL, with data: Data) throws {
+        if start("replace", url) {
+            fire()
+            throw Full()
+        }
+        try local.replace(url, with: data)
+    }
+
+    func openForAppending(_ url: URL) throws -> any DurableFileAppending {
+        FaultAppender(url: url, file: try local.openForAppending(url), files: self)
+    }
+}
+
+private final class FaultAppender: DurableFileAppending {
+    let url: URL
+    let file: any DurableFileAppending
+    let files: StorageFaultFiles
+
+    init(url: URL, file: any DurableFileAppending, files: StorageFaultFiles) {
+        self.url = url
+        self.file = file
+        self.files = files
+    }
+
+    func seekToEnd() throws -> UInt64 { try file.seekToEnd() }
+
+    func write(_ data: Data) throws {
+        guard files.start("append", url) else { return try file.write(data) }
+        try file.write(data.prefix(data.count / 2))
+        files.fire()
+        throw StorageFaultFiles.Full()
+    }
+
+    func truncate(atOffset offset: UInt64) throws {
+        guard files.start("truncate", url) else { return try file.truncate(atOffset: offset) }
+        files.fire()
+        throw StorageFaultFiles.Full()
+    }
+
+    func close() throws { try file.close() }
 }
 
 /// The statements of the reference run in the order they start, each with the index of its fault target.
@@ -431,7 +593,7 @@ func withSQLiteDatabase<Result>(
 
 /// A text that holds a JSON object or array, written with sorted keys. `JSONEncoder` writes keys in no fixed order, so
 /// two writes of the same value can differ in bytes; the stores read such a column only by decoding it.
-private func canonicalJSON(_ text: String) -> String {
+func canonicalJSON(_ text: String) -> String {
     guard text.first == "{" || text.first == "[",
         let value = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
         let sorted = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])

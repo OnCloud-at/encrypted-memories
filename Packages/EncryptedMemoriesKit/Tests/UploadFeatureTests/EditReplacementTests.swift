@@ -335,6 +335,104 @@ final class EditReplacementTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: earlierURL), EditReplacementJournalFileStore.earlierBuildBarrier)
     }
 
+    // MARK: - Log bytes
+
+    /// The line format of the log, as the journal writes it. A fixture copy of the private type, so the tests can
+    /// pin the bytes of each line.
+    private struct LogLine: Encodable {
+        let key: String
+        let entry: EditReplacementJournalEntry?
+    }
+
+    private func logKey(_ source: UploadSourceIdentity) -> String {
+        "\(source.kind.rawValue)|\(source.identifier)|\(source.resource.rawValue)"
+    }
+
+    /// `line` holds exactly the bytes that `JSONEncoder` writes for `expected`: the same length and the same JSON
+    /// content. Only the order of the keys can differ, as it does between two writes of one value.
+    private func assertLine(
+        _ line: Data, is expected: LogLine, file: StaticString = #filePath, line number: UInt = #line
+    ) throws {
+        let encoded = try JSONEncoder().encode(expected)
+        XCTAssertEqual(line.count, encoded.count, "the line has the encoded length", file: file, line: number)
+        XCTAssertEqual(
+            canonicalJSON(String(decoding: line, as: UTF8.self)),
+            canonicalJSON(String(decoding: encoded, as: UTF8.self)),
+            "the line holds the encoded content", file: file, line: number)
+    }
+
+    func testEachChangeAppendsExactlyItsEncodedLineAfterTheEarlierBytes() throws {
+        let other = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-2")
+        let changes: [(UploadSourceIdentity, () throws -> Void)] = [
+            (asset, { try self.journal.recordUpload(edited: true, for: self.asset) }),
+            (other, { try self.journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "old"), for: other) }),
+            (asset, { try self.journal.startDeletionCheck(at: Date(timeIntervalSince1970: 7), for: self.asset) }),
+            (other, { try self.journal.settle(["old"], related: ["old-pair"], trashed: true, for: other) }),
+            (asset, { try self.journal.clearDeletionCheck(for: self.asset) }),
+            (asset, { try self.journal.recordUpload(edited: false, for: self.asset) }),
+        ]
+        var earlier = Data()
+        for (source, change) in changes {
+            try change()
+            let bytes = try Data(contentsOf: logURL)
+            XCTAssertEqual(bytes.prefix(earlier.count), earlier, "a change keeps every earlier byte")
+            let added = bytes.dropFirst(earlier.count)
+            XCTAssertEqual(added.last, UInt8(ascii: "\n"), "the line ends with a newline")
+            XCTAssertEqual(added.filter { $0 == UInt8(ascii: "\n") }.count, 1, "a change adds one line")
+            let entry = journal.entry(for: source)
+            try assertLine(Data(added.dropLast()), is: LogLine(key: logKey(source), entry: entry.isEmpty ? nil : entry))
+            earlier = bytes
+        }
+        XCTAssertTrue(journal.entry(for: asset).isEmpty, "the last line of asset-1 holds no entry")
+        XCTAssertEqual(
+            try Data(contentsOf: directory.appendingPathComponent(EditReplacementJournalFileStore.fileName)),
+            EditReplacementJournalFileStore.earlierBuildBarrier)
+    }
+
+    /// The bytes of a rewritten log: one line for each entry, sorted by key, each with its newline.
+    private func assertRewrittenLog(
+        _ entries: [UploadSourceIdentity: EditReplacementJournalEntry], file: StaticString = #filePath,
+        line number: UInt = #line
+    ) throws {
+        let bytes = try Data(contentsOf: logURL)
+        XCTAssertEqual(bytes.last, UInt8(ascii: "\n"), file: file, line: number)
+        let lines = bytes.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false).dropLast()
+        let expected = entries.map { LogLine(key: logKey($0.key), entry: $0.value) }.sorted { $0.key < $1.key }
+        XCTAssertEqual(lines.count, expected.count, "one line for each entry", file: file, line: number)
+        for (line, expectedLine) in zip(lines, expected) {
+            try assertLine(Data(line), is: expectedLine, file: file, line: number)
+        }
+    }
+
+    func testOpeningALogWithACutOffLineRewritesItAsOneSortedLinePerEntry() throws {
+        let other = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-0")
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "a"), for: asset)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "b"), for: other)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "c"), for: asset)
+        let handle = try FileHandle(forWritingTo: logURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(#"{"key":"photo"#.utf8))
+        try handle.close()
+
+        let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+
+        try assertRewrittenLog([asset: reopened.entry(for: asset), other: reopened.entry(for: other)])
+    }
+
+    func testAnEarlierBuildFileBecomesOneSortedLinePerEntryBehindTheBarrier() throws {
+        let earlierURL = directory.appendingPathComponent(EditReplacementJournalFileStore.fileName)
+        try Data(
+            (#"{"photoLibraryAsset|asset-9|primary":{"superseded":[],"retired":["x"]},"#
+                + #""photoLibraryAsset|asset-1|primary":{"superseded":[],"retired":["old"]}}"#).utf8
+        ).write(to: earlierURL)
+        let later = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-9")
+
+        let migrated = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+
+        try assertRewrittenLog([asset: migrated.entry(for: asset), later: migrated.entry(for: later)])
+        XCTAssertEqual(try Data(contentsOf: earlierURL), EditReplacementJournalFileStore.earlierBuildBarrier)
+    }
+
     func testTheAppOpensOneJournalForEachDirectory() throws {
         let other = directory.appendingPathComponent("other", isDirectory: true)
         try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)

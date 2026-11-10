@@ -223,19 +223,22 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     }
 
     private let logURL: URL
+    private let fileSystem: any DurableFileSystem
     private let lock = NSLock()
+    /// Writes the log. After a failed line that it could not remove, the log accepts no further line.
+    private var log: DurableFileWriter
     private var entries: [String: EditReplacementJournalEntry]
     private var lineCount: Int
-    /// Set when a failed write could not be undone. The log then accepts no further line.
-    private var writeFailed = false
 
     /// Nil when the journal exists but cannot be read. Edits then keep their earlier uploads instead of losing the
     /// photos that still wait for their replacement. The app opens it through `shared(accountDataDirectory:)`.
-    init?(accountDataDirectory: URL) {
+    init?(accountDataDirectory: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem()) {
         let logURL = accountDataDirectory.appendingPathComponent(Self.logFileName)
         self.logURL = logURL
+        self.fileSystem = fileSystem
+        log = DurableFileWriter(url: logURL, fileSystem: fileSystem)
         let earlierURL = accountDataDirectory.appendingPathComponent(Self.fileName)
-        defer { Self.placeBarrier(at: earlierURL, whenLogExists: logURL) }
+        defer { Self.placeBarrier(at: earlierURL, whenLogExists: logURL, fileSystem: fileSystem) }
         if FileManager.default.fileExists(atPath: logURL.path) {
             guard let data = try? Data(contentsOf: logURL), let replay = Self.replay(data) else { return nil }
             entries = replay.entries
@@ -258,11 +261,13 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     }
 
     /// Keeps earlier builds away from the log's history once the log exists.
-    private static func placeBarrier(at earlierURL: URL, whenLogExists logURL: URL) {
+    private static func placeBarrier(
+        at earlierURL: URL, whenLogExists logURL: URL, fileSystem: any DurableFileSystem
+    ) {
         guard FileManager.default.fileExists(atPath: logURL.path),
             (try? Data(contentsOf: earlierURL)) != earlierBuildBarrier
         else { return }
-        try? earlierBuildBarrier.write(to: earlierURL, options: .atomic)
+        try? fileSystem.replace(earlierURL, with: earlierBuildBarrier)
     }
 
     private static func replay(
@@ -452,30 +457,15 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     }
 
     private func append(_ line: Line) throws {
-        guard !writeFailed else { throw UploadError.backend("Edit replacement journal could not be written") }
+        guard !log.writeFailed else { throw UploadError.backend("Edit replacement journal could not be written") }
         var data = try JSONEncoder().encode(line)
         data.append(UInt8(ascii: "\n"))
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            try data.write(to: logURL, options: .atomic)
-            Self.placeBarrier(
-                at: logURL.deletingLastPathComponent().appendingPathComponent(Self.fileName), whenLogExists: logURL)
-            return
-        }
-        let handle = try FileHandle(forWritingTo: logURL)
-        defer { try? handle.close() }
-        let end = try handle.seekToEnd()
-        do {
-            try handle.write(contentsOf: data)
-        } catch {
-            // A part of the line may be in the file, for example when the disk filled up. The next line would join
-            // it, so the log goes back to its length before this write.
-            do {
-                try handle.truncate(atOffset: end)
-            } catch {
-                writeFailed = true
-            }
-            throw error
-        }
+        // A new log is created with its first line in one atomic write; a later line is appended, and a line that
+        // fails halfway is cut off again.
+        guard try log.append(data) else { return }
+        Self.placeBarrier(
+            at: logURL.deletingLastPathComponent().appendingPathComponent(Self.fileName), whenLogExists: logURL,
+            fileSystem: fileSystem)
     }
 
     /// Replaces the log with one line for each entry, in one atomic write.
@@ -486,7 +476,7 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             data.append(try encoder.encode(Line(key: key, entry: entry)))
             data.append(UInt8(ascii: "\n"))
         }
-        try data.write(to: logURL, options: .atomic)
+        try log.replace(with: data)
         lineCount = entries.count
     }
 
