@@ -118,6 +118,8 @@ import os
                 installDeletedBackupFixture(failedItems: true)
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesPausedBackupFixture") {
                 installPausedBackupFixture()
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesContinuedBackupPromptFixture") {
+                installContinuedBackupPromptFixture()
             }
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncReasonsFixture") {
                 installAlbumSyncReasonsFixture()
@@ -328,27 +330,45 @@ import os
 
         /// One Apple Photos photo that waits for its upload in the grid while the person paused the backup.
         private func installPausedBackupFixture() {
-            let directory = cacheDirectory.appendingPathComponent("paused-backup", isDirectory: true)
+            guard installBackupFixture(named: "paused-backup", install: { $0.installPausedBackupFixtureForTesting() })
+            else { return }
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesExcludedBackupFixture") {
+                excludeWaitingPhoto()
+            }
+        }
+
+        /// A first backup that checks many photos, so the app asks whether it may continue in the background (#1108).
+        /// The question's answer of an earlier run is forgotten, so each launch can ask.
+        private func installContinuedBackupPromptFixture() {
+            UserDefaults.standard.removeObject(forKey: PhotoLibraryContinuedBackupPrompt.askedMarkerKey)
+            _ = installBackupFixture(
+                named: "continued-backup-prompt", install: { $0.installContinuedBackupPromptFixtureForTesting() })
+        }
+
+        /// A backup controller on its own fixture stores, installed into the library model when `install` prepared it.
+        private func installBackupFixture(
+            named name: String, install: (PhotoLibraryBackupController) -> Bool
+        ) -> Bool {
+            let directory = cacheDirectory.appendingPathComponent(name, isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                guard let defaults = UserDefaults(suiteName: "paused-backup-fixture"),
+                guard let defaults = UserDefaults(suiteName: "\(name)-fixture"),
                     let store = PendingGridSession.openStore(accountDataDirectory: directory, policy: .conservative)
-                else { return }
-                defaults.removePersistentDomain(forName: "paused-backup-fixture")
+                else { return false }
+                defaults.removePersistentDomain(forName: "\(name)-fixture")
                 let controller = PhotoLibraryBackupController(
                     configuration: .init(
                         accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
                     identityResolver: MobileFixtureBackupBackend(), uploader: MobileFixtureBackupBackend(),
                     pendingStore: store, requiresPendingStore: true)
-                guard controller.installPausedBackupFixtureForTesting() else { return }
+                guard install(controller) else { return false }
                 backupFixture = controller
                 runtime.libraryModel.installIsolatedPendingBackupForTesting(
                     controller, store: store, remote: MobileFixturePendingRemoteEffects())
-                if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesExcludedBackupFixture") {
-                    excludeWaitingPhoto()
-                }
+                return true
             } catch {
-                assertionFailure("The paused backup fixture could not be installed")
+                assertionFailure("The \(name) fixture could not be installed")
+                return false
             }
         }
 
