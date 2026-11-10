@@ -63,7 +63,7 @@ struct VideoPlaybackTests {
         let slices = map.slices(offset: 90, length: 120)  // [90,210) - blocks 1,2,3
         #expect(slices.map(\.blockIndex) == [1, 2, 3])
         // Contiguity: concatenated slice lengths == requested length.
-        #expect(slices.reduce(0) { $0 + $1.inBlock.length } == 120)
+        #expect(slices.reduce(0) { $0 + $1.inBlock.upper - $1.inBlock.lower } == 120)
         #expect(slices[0].inBlock == ByteRange(lower: 90, upper: 100))
         #expect(slices[1].inBlock == ByteRange(lower: 0, upper: 100))
         #expect(slices[2].inBlock == ByteRange(lower: 0, upper: 10))
@@ -71,7 +71,7 @@ struct VideoPlaybackTests {
 
     @Test func sliceClampsToFileSize() {
         let slices = map.slices(offset: 250, length: 1000)  // clamps to [250,300)
-        #expect(slices.reduce(0) { $0 + $1.inBlock.length } == 50)
+        #expect(slices.reduce(0) { $0 + $1.inBlock.upper - $1.inBlock.lower } == 50)
         #expect(slices.last?.blockIndex == 3)
         #expect(map.slices(offset: 300, length: 10).isEmpty)  // fully past EOF
     }

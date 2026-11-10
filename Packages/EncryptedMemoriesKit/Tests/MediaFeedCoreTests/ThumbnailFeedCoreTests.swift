@@ -2523,7 +2523,10 @@ struct ThumbnailFeedCoreTests {
         #expect(result.mainThreadDecodeCount == 0)
         #expect(await loader.requestCount() == 0)
         #expect(feed.memoryDecoded(for: uid) != nil)
-        #expect(feed.memoryDecoded(for: uid).map { abs($0.aspectRatio - 2.0) < 0.2 } == true)
+        #expect(
+            feed.memoryDecoded(for: uid).map {
+                abs(CGFloat($0.pixelWidth) / CGFloat($0.pixelHeight) - 2.0) < 0.2
+            } == true)
 
         let after = await feed.cacheState(for: ThumbnailRequest(uid: uid))
         #expect(after.diskThumbnail)
@@ -3715,17 +3718,31 @@ struct ThumbnailFeedCoreTests {
     }
 
     #if DEBUG
-        @Test func decodedCacheRejectsLateLowerResolutionAndReportsTheCurrentSource() {
+        @Test func decodedCacheRejectsLateLowerResolutionAndKeepsTheSharperSource() {
             let cache = DecodedThumbnailCache(costLimit: 10_000_000)
             let a = Self.uid("dc-upgrade")
-            #expect(cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))  // 400 bytes
-            #expect(cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320))
+            cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16)  // 400 bytes
+            cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320)
             #expect(cache.snapshotForTesting().count == 1)
             #expect(cache.snapshotForTesting().cost == 1600)
-            // The late lower-resolution source is rejected and reported as not stored.
-            #expect(!cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))
+            // The late lower-resolution source is rejected.
+            cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16)
             #expect(cache.snapshotForTesting().cost == 1600)
             #expect(cache.image(for: a)?.pixelWidth == 20)
+        }
+
+        @Test func rejectedLowerResolutionInsertPromotesExistingEntry() {
+            let cache = DecodedThumbnailCache(costLimit: 800)
+            let a = Self.uid("dc-promoted")
+            let b = Self.uid("dc-older")
+            let c = Self.uid("dc-newest")
+            cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 320)
+            cache.set(Self.decodedThumb(10, 10), for: b, decodePixelCap: 320)
+            cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16)
+            cache.set(Self.decodedThumb(10, 10), for: c, decodePixelCap: 320)
+            #expect(cache.contains(a))
+            #expect(!cache.contains(b))
+            #expect(cache.contains(c))
         }
     #endif
 

@@ -11,8 +11,6 @@ public struct ByteRange: Equatable, Sendable {
         self.lower = lower
         self.upper = upper
     }
-
-    public var length: Int { upper - lower }
 }
 
 /// One cleartext block of the file: its index plus where its decrypted bytes live in the whole file.

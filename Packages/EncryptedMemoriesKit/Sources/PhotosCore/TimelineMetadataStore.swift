@@ -194,8 +194,8 @@ public enum TimelineMetadataReadError: Error {
 /// - Timeline order is `(t, vol, node)` everywhere; `idx_photos_timeline` serves the ordered scan.
 /// - Saves upsert only changed `photos` rows: a digest no-op short-circuit skips unchanged refreshes; a
 ///   changed refresh upserts only rows whose content actually differs and anti-joins the enumerated key
-///   set to sweep vanished rows - never a full-table rewrite of `photos`. The tag and burst tables are
-///   rewritten per changed save. Reading the enumeration (digest, key scratch set, guarded upsert per
+///   set to sweep vanished rows - never a full-table rewrite of `photos`. The tag and burst tables also
+///   write only changed rows. Reading the enumeration (digest, key scratch set, guarded upsert per
 ///   photo) costs O(N) statements.
 /// - `schema_info` versions each feature's tables explicitly; an unknown newer version fails
 ///   closed without modifying or deleting the last usable timeline.
