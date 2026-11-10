@@ -1012,7 +1012,7 @@ public actor BackupSyncRunner {
             let omitsMissingPairedVideo =
                 configuration.leavesOutMissingLivePhotoVideos && !isSourceRecheck
                 && Self.usedReportedMissingChecks(resolvingEntry, now: now())
-            let readAdmission: BackupResourceReadAdmission = {
+            let readAdmission: BackupResourceReadAdmission = { _ in
                 try Task.checkCancellation()
                 if isSourceRecheck {
                     guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw BackupWorkDeferredError() }
@@ -1021,7 +1021,7 @@ public actor BackupSyncRunner {
             resolved = try await resourceCoordinator.withHeavyPermit(
                 Self.materializationRequest(workIntent)
             ) { _ in
-                try readAdmission()
+                try readAdmission(.sourceRead)
                 return try await resolver.resolve(
                     resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission,
                     omittingMissingPairedVideo: omitsMissingPairedVideo)

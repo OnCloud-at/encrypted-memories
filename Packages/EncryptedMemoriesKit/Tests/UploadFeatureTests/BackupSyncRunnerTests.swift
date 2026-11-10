@@ -244,7 +244,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         omittingMissingPairedVideo: Bool
     ) async throws -> BackupResolvedResource? {
         lock.withLock { omissionRequests[entry.source.identifier, default: []].append(omittingMissingPairedVideo) }
-        try readAdmission()
+        try readAdmission(.sourceRead)
         guard omittingMissingPairedVideo else {
             return try await resolve(entry, onPreparationProgress: onPreparationProgress)
         }
@@ -2257,7 +2257,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let plain = DefaultOnlyResolver(inner: resolver)
 
         let resolved = try await plain.resolve(
-            entry, onPreparationProgress: { _ in }, readAdmission: {}, omittingMissingPairedVideo: true)
+            entry, onPreparationProgress: { _ in }, readAdmission: { _ in }, omittingMissingPairedVideo: true)
 
         XCTAssertEqual(resolved?.omitsMissingPairedVideo, false)
         XCTAssertEqual(resolved?.secondaries.map(\.descriptor.filename), ["live.mov"])

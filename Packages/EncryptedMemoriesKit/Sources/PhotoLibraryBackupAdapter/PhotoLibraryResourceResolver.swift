@@ -36,7 +36,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> BackupResolvedResource? {
-        try await resolve(entry, onPreparationProgress: onPreparationProgress, readAdmission: {})
+        try await resolve(entry, onPreparationProgress: onPreparationProgress, readAdmission: { _ in })
     }
 
     public func resolve(
@@ -55,7 +55,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         readAdmission: @escaping BackupResourceReadAdmission,
         omittingMissingPairedVideo: Bool
     ) async throws -> BackupResolvedResource? {
-        try readAdmission()
+        try readAdmission(.sourceRead)
         #if ENCRYPTED_MEMORIES_UPGRADE_TEST
             if UpgradeTestProbe.isRequested { return try await UpgradeTestPhotoLibrary.resolve(entry) }
         #endif
@@ -544,7 +544,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             throw CancellationError()
         } catch {
             // Not on this device (PhotoKit reports that network access is required). Any other local failure also
-            // gets one networked pass, which reports the definitive error.
+            // gets one networked pass, which reports the definitive error. The runner's admission learns that the local
+            // read failed, so a background pass can back up photos on the device first.
         }
 
         let knownSize = Self.knownSize(of: resource)
@@ -552,7 +553,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         let sink = PhotoKitStagingSink(tempStore: tempStore, filename: filename, expectedBytes: exactSize)
         do {
             try await Self.requestData(
-                for: resource, networkAccessAllowed: true, progressGate: progressGate, readAdmission: readAdmission
+                for: resource, networkAccessAllowed: true, progressGate: progressGate,
+                readAdmission: readAdmission, read: .afterFailedLocalRead
             ) { data in
                 sink.receive(data)
             }
@@ -614,7 +616,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let box = WriteBox()
             do {
                 try await requestData(
-                    for: resource, networkAccessAllowed: true, progressGate: progressGate, readAdmission: readAdmission
+                    for: resource, networkAccessAllowed: true, progressGate: progressGate,
+                    readAdmission: readAdmission, read: .sourceRead
                 ) { data in
                     try tempStore.recordWrite(to: partialURL, byteCount: data.count)
                     try handle.write(contentsOf: data)
@@ -645,14 +648,15 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         for resource: PHAssetResource,
         networkAccessAllowed: Bool,
         progressGate: FractionProgressGate,
-        readAdmission: @escaping BackupResourceReadAdmission = {},
+        readAdmission: @escaping BackupResourceReadAdmission = { _ in },
+        read: BackupResourceRead = .sourceRead,
         receive: @escaping (Data) throws -> Void
     ) async throws {
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = networkAccessAllowed
         let manager = PHAssetResourceManager.default()
-        let networkAdmission: BackupResourceReadAdmission = {
-            if networkAccessAllowed { try readAdmission() }
+        let networkAdmission: @Sendable () throws -> Void = {
+            if networkAccessAllowed { try readAdmission(read) }
         }
         let liveness = PhotoKitResourceRequestLivenessGuard<PHAssetResourceDataRequestID>(
             requestAdmission: networkAdmission,

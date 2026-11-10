@@ -203,8 +203,17 @@ public struct BackupResolvedResource: BackupResourceMaterializing {
     }
 }
 
+/// The source read that asks for admission.
+public enum BackupResourceRead: Sendable, Equatable {
+    /// A read that may use the network: the start of a resolve, or the copy of a file that Core chose to upload.
+    case sourceRead
+    /// The identity pass reads the original once more with network access because its local read failed: the original
+    /// is only in iCloud, the library volume is offline, or the local read failed for another reason.
+    case afterFailedLocalRead
+}
+
 /// Rechecks the runner's admission immediately before a source read starts network access.
-public typealias BackupResourceReadAdmission = @Sendable () throws -> Void
+public typealias BackupResourceReadAdmission = @Sendable (BackupResourceRead) throws -> Void
 
 /// Platform seam: turn a persisted queue entry back into a readable local resource.
 /// Contract: return `nil` when the source is verifiably gone, which removes its queue work.
@@ -247,7 +256,7 @@ public extension BackupResourceResolving {
         onPreparationProgress: @escaping BackupResourcePreparationHandler,
         readAdmission: @escaping BackupResourceReadAdmission
     ) async throws -> BackupResolvedResource? {
-        try readAdmission()
+        try readAdmission(.sourceRead)
         return try await resolve(entry, onPreparationProgress: onPreparationProgress)
     }
 

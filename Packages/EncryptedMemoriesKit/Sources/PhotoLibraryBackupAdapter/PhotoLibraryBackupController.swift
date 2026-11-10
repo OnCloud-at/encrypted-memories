@@ -1005,7 +1005,7 @@ public final class PhotoLibraryBackupController {
         do {
             let inputs = runtimeSignals.current
             let policy = BackupThrottlePolicy()
-            let admission: BackupResourceReadAdmission = {
+            let admission: BackupResourceReadAdmission = { _ in
                 try Task.checkCancellation()
                 guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw BulkSourceReadDeferred() }
             }
@@ -1013,7 +1013,7 @@ public final class PhotoLibraryBackupController {
             let resolved = try await bulkResourceCoordinator.withHeavyPermit(
                 LibraryWorkRequest(workload: .backupMaterialization, intent: .userInitiated, memoryClass: .large)
             ) { _ in
-                try admission()
+                try admission(.sourceRead)
                 return try await resolver.resolve(entry, onPreparationProgress: { _ in }, readAdmission: admission)
             }
             guard let resource = resolved else { return false }

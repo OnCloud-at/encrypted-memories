@@ -1334,12 +1334,12 @@ final class MissingSourceReconciliationTests: XCTestCase {
         }
 
         func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
-            try await resolve(entry, onPreparationProgress: { _ in }, readAdmission: {})
+            try await resolve(entry, onPreparationProgress: { _ in }, readAdmission: { _ in })
         }
 
         func resolve(
             _ entry: UploadBackupSyncQueueEntry, onPreparationProgress: @escaping BackupResourcePreparationHandler,
-            readAdmission: @escaping @Sendable () throws -> Void
+            readAdmission: @escaping BackupResourceReadAdmission
         ) async throws -> BackupResolvedResource? {
             let local = PhotoKitResourceRequestLivenessGuard<Int>(
                 automaticallyStartsWatchdog: false, cancelRequest: { _ in })
@@ -1356,7 +1356,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
             await locallyRead.arriveAndWait()
             await allowFallback.arriveAndWait()
             let network = PhotoKitResourceRequestLivenessGuard<Int>(
-                automaticallyStartsWatchdog: false, requestAdmission: readAdmission, cancelRequest: { _ in })
+                automaticallyStartsWatchdog: false, requestAdmission: { try readAdmission(.afterFailedLocalRead) },
+                cancelRequest: { _ in })
             try await network.waitForCompletion {
                 self.lock.withLock { self.flags.append(true) }
                 network.complete(error: nil)
