@@ -3562,6 +3562,73 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        /// The person's own pass, started by "Back up now" in the foreground, runs while the person accepts the continued
+        /// processing task. The task carries that pass instead of standing aside (#1108).
+        private func makeRunningManualPass(
+            prefix: String
+        ) async throws -> (fixture: LaunchResumeFixture, runtime: LibraryRuntimeState, runID: String) {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .foregroundActive
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeLaunchResumeFixture(prefix: prefix, source: .mobileDataOff(runtime))
+            await fixture.controller.retryFailedAndSync()
+            _ = await waitUntil { fixture.scan.starts.count == 1 }
+            XCTAssertEqual(fixture.scan.owners.values, [.manual], "the person's tap runs its own pass")
+            return (fixture, runtime, try XCTUnwrap(fixture.controller.activeExecutionRunID))
+        }
+
+        func testAContinuedTaskCarriesThePersonsPassInTheForeground() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-carries-manual")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let scan = manual.fixture.scan
+            let task = startWindow(controller, scan: scan, owner: .iOSContinuedTask)
+
+            let carried = await waitUntil(timeout: .seconds(2)) { task.record.runIDs.count == 1 }
+            XCTAssertTrue(carried, "the task carries the running pass")
+            XCTAssertEqual(task.record.runIDs, [manual.runID])
+            XCTAssertFalse(task.record.hasEnded, "the task stays open while the pass runs")
+
+            scan.open.value = true
+            let ended = await waitUntil(timeout: .seconds(5)) { task.record.hasEnded }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(task.record.completedScansAtEnd, 1, "the task ends only after the pass")
+            XCTAssertEqual(scan.owners.values, [.manual], "the pass keeps its owner; no second pass starts")
+            await task.task.value
+            await controller.shutdown()
+        }
+
+        func testAnExpiredContinuedTaskStopsItsPassOnlyWhileTheAppIsInTheBackground() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-expiry-stop")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+
+            // The person watches the app: the pass continues as theirs.
+            controller.stopBackgroundWindowRun(runID: manual.runID, for: .iOSContinuedTask)
+            XCTAssertFalse(controller.isRunnerStopPendingForTesting, "a pass the person sees keeps going")
+
+            manual.runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            controller.stopBackgroundWindowRun(runID: manual.runID, for: .iOSContinuedTask)
+            XCTAssertTrue(controller.isRunnerStopPendingForTesting, "in the background the expiry stops the pass")
+            XCTAssertEqual(controller.runnerStopRunIDForTesting, manual.runID)
+
+            manual.fixture.scan.open.value = true
+            _ = await waitUntil(timeout: .seconds(5)) { !controller.isSyncing }
+            await controller.shutdown()
+        }
+
+        /// A pass of the continued processing task runs for the person who accepted it, so resource limits treat it like
+        /// the person's own pass. Windows stay automatic work.
+        func testAContinuedTaskPassIsThePersonsWork() {
+            XCTAssertEqual(PhotoLibraryBackupController.workIntent(for: .iOSContinuedTask), .userInitiated)
+            XCTAssertEqual(PhotoLibraryBackupController.workIntent(for: .manual), .userInitiated)
+            for owner: BackupExecutionOwner in [.foreground, .iOSBackgroundTask, .iOSRefreshTask, .background] {
+                XCTAssertEqual(PhotoLibraryBackupController.workIntent(for: owner), .automatic)
+            }
+        }
+
         func testAnExpiredWindowStopsTheResumeAtLaunchItTookOverWhileTheAppStaysInTheBackground() async throws {
             let launch = try await makeRunningLaunchResume(prefix: "backup-launch-resume-window-expired")
             defer { launch.fixture.cleanup() }
@@ -3957,10 +4024,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let record: BackgroundWindowRecord
         }
 
-        private func startWindow(_ controller: PhotoLibraryBackupController, scan: HeldScan) -> BackgroundWindowProbe {
+        private func startWindow(
+            _ controller: PhotoLibraryBackupController, scan: HeldScan, owner: BackupExecutionOwner = .iOSBackgroundTask
+        ) -> BackgroundWindowProbe {
             let record = BackgroundWindowRecord()
             let task = Task { @MainActor in
-                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { record.received($0) }
+                await controller.backgroundCatchUp(owner: owner) { record.received($0) }
                 record.end(completedScans: scan.completions.count)
             }
             return BackgroundWindowProbe(task: task, record: record)

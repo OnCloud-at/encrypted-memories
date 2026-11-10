@@ -1163,8 +1163,9 @@ public final class PhotoLibraryBackupController {
             backgroundLog.notice(.photoBackup, "window.waitsForFirstPath", [(.init("owner"), Self.logValue(owner))])
             started = await waitForDeferredStart(onAdmitted: onRunAdmitted)
             if started == nil, waitsForFirstNetworkPath { return .noNetworkPath }
-        } else if started == nil, let run = automaticRunInTheBackground() {
-            // Nobody watches this automatic pass, so it runs on the window's time until it ends or the window ends.
+        } else if started == nil, let run = runToCarry(for: owner) {
+            // The pass runs on the window's time until it ends or the window ends: nobody watches an automatic pass in the
+            // background, and the person accepted the continued task for the pass that runs.
             backgroundLog.notice(.photoBackup, "window.tookOver", [(.init("owner"), Self.logValue(owner))])
             onRunStarted?(run.runID)
             await waitForAdoptedRun(run)
@@ -1416,7 +1417,7 @@ public final class PhotoLibraryBackupController {
             self?.beginScanPhase()
             let scanDone = BackupScanSignal()
             var scanFinished = false
-            let workIntent: LibraryWorkIntent = owner == .manual ? .userInitiated : .automatic
+            let workIntent = Self.workIntent(for: owner)
             #if DEBUG
                 self?.reconcileStartsForTesting += 1
             #endif
@@ -1735,12 +1736,21 @@ public final class PhotoLibraryBackupController {
         stopCurrentSync()
     }
 
-    /// Stops the run of an expired OS background window. A run that the window took over from an automatic pass keeps
-    /// going when a scene is in the foreground again, because the person now watches it.
-    public func stopBackgroundWindowRun(runID: String) {
+    /// Stops the run of an expired OS background window of `owner`. While a scene is in the foreground, the person
+    /// watches the backup: a window keeps a run that it took over from an automatic pass, and a continued processing
+    /// task keeps every run it carries, because the person accepted it for that backup (#1108).
+    public func stopBackgroundWindowRun(runID: String, for owner: BackupExecutionOwner = .iOSBackgroundTask) {
         guard activeRunID == runID else { return }
-        if activeRunOwner == .foreground, !runtimeSignals.current().isAppInBackground { return }
+        if !runtimeSignals.current().isAppInBackground, owner == .iOSContinuedTask || activeRunOwner == .foreground {
+            return
+        }
         stopCurrentSync()
+    }
+
+    /// The person's own pass and a pass of the continued processing task that the person accepted are the person's work;
+    /// resource limits treat every other pass as automatic work.
+    static func workIntent(for owner: BackupExecutionOwner) -> LibraryWorkIntent {
+        owner == .manual || owner == .iOSContinuedTask ? .userInitiated : .automatic
     }
 
     /// Explicit user actions may stop whichever run is currently active.
@@ -2233,6 +2243,15 @@ public final class PhotoLibraryBackupController {
         }
     }
 
+    /// The running pass that a window of `owner` carries. A continued processing task carries every pass except a refresh
+    /// scan, also in the foreground and also the person's own: the person accepted it for the backup that runs (#1108).
+    /// Its start may also have been taken by a pass of the controller, such as the person's pending Wi-Fi retry.
+    private func runToCarry(for owner: BackupExecutionOwner) -> StartedBackupRun? {
+        guard owner == .iOSContinuedTask else { return automaticRunInTheBackground() }
+        guard activeRefreshScan == nil, let activeRunID, let syncTask else { return nil }
+        return StartedBackupRun(runID: activeRunID, task: syncTask)
+    }
+
     /// The running automatic pass, while no scene is in the foreground. An explicit pass is never returned: a window
     /// must not own or stop it.
     private func automaticRunInTheBackground() -> StartedBackupRun? {
@@ -2415,6 +2434,7 @@ public final class PhotoLibraryBackupController {
         case .foreground: .word("foreground")
         case .iOSBackgroundTask: .word("iosBackgroundTask")
         case .iOSRefreshTask: .word("iosRefreshTask")
+        case .iOSContinuedTask: .word("iosContinuedTask")
         case .macOSBackgroundActivity: .word("macosBackgroundActivity")
         case .background: .word("background")
         case .manual: .word("manual")
