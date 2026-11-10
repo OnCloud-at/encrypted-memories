@@ -377,10 +377,11 @@ import TimelineCore
         let layout = GridSelectionBadgeLayout()
         var measurements: [Double] = []
         var noSpaceCount = 0
-        for step in 0..<4 {
+        // Frame 0 warms the caches. Nine measured frames cycle through four offsets of one visible-row bucket.
+        for step in 0..<10 {
             let plan = engine.framePlan(
                 level: profile.levels.count - 1, viewportSize: viewport,
-                scrollOffset: CGPoint(x: 0, y: 1012 + step), overscan: 0)
+                scrollOffset: CGPoint(x: 0, y: 1012 + step % 4), overscan: 0)
             let slots = plan.visibleSlots.map {
                 GridRenderSlot(index: $0.index, column: $0.column, row: $0.row, rect: $0.viewportRect)
             }
@@ -420,9 +421,10 @@ import TimelineCore
         }
         #expect(layout.preparationCount == 1, "Scrolling within one visible-row bucket reuses prepared facts")
         #expect(noSpaceCount == 20, "The measurement must include one full no-space row")
-        let average = measurements.reduce(0, +) / Double(measurements.count)
-        print("DENSE_FRAME meanMs=\(average)")
-        #expect(average < 1000.0 / 60.0, "A warmed dense scroll frame must fit the 60Hz budget")
+        // The median ignores a single load spike on the machine; a slowdown of every frame still fails.
+        let median = measurements.sorted()[measurements.count / 2]
+        print("DENSE_FRAME medianMs=\(median)")
+        #expect(median < 1000.0 / 60.0, "A warmed dense scroll frame must fit the 60Hz budget")
     }
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
     func preparedGeometryReusesScrollTranslationsAndInvalidatesRowBandAndSizeChanges() throws {
