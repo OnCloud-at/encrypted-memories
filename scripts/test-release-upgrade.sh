@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Upload-free rehearsal and CI entry point. Invoke local runs through build-turn.sh.
+# Upload-free rehearsal and CI entry point. Invoke local runs through the configured shared build queue.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/build-paths.sh"
