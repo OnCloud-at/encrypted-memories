@@ -1,3 +1,4 @@
+import PhotosCore
 import Testing
 
 @testable import DesignSystemCore
@@ -16,6 +17,12 @@ import Testing
         let short = try Self.inkPixels(ProtonLoadingView(caption: "Signing out…"))
         let long = try Self.inkPixels(ProtonLoadingView(caption: "Signing out of every window…"))
         #expect(long > short)
+    }
+
+    @Test func voiceOverReadsTheCaptionOrLoading() {
+        #expect(ProtonLoadingView.accessibilityLabel(nil) == L10n.string("loading.content"))
+        #expect(ProtonLoadingView.accessibilityLabel("") == L10n.string("loading.content"))
+        #expect(ProtonLoadingView.accessibilityLabel(Self.caption) == Self.caption)
     }
 
     @MainActor private static func inkPixels(_ view: ProtonLoadingView) throws -> Int {
