@@ -229,12 +229,26 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     private var log: DurableFileWriter
     private var entries: [String: EditReplacementJournalEntry]
     private var lineCount: Int
+    private let scheduleCompaction: CompactionScheduler
+    /// The lines appended, as written, since a waiting compaction took its snapshot of the entries; nil when no
+    /// compaction waits.
+    private var compactionDelta: [Data]?
+    /// Set by `close()`: no compaction writes the log any more.
+    private var closed = false
+
+    /// Runs a compaction of the log away from the caller: the app on a utility queue, a test when it chooses.
+    typealias CompactionScheduler = @Sendable (@escaping @Sendable () -> Void) -> Void
+    static let onUtilityQueue: CompactionScheduler = { DispatchQueue.global(qos: .utility).async(execute: $0) }
 
     /// Nil when the journal exists but cannot be read. Edits then keep their earlier uploads instead of losing the
     /// photos that still wait for their replacement. The app opens it through `shared(accountDataDirectory:)`.
-    init?(accountDataDirectory: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem()) {
+    init?(
+        accountDataDirectory: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem(),
+        scheduleCompaction: @escaping CompactionScheduler = onUtilityQueue
+    ) {
         let logURL = accountDataDirectory.appendingPathComponent(Self.logFileName)
         self.logURL = logURL
+        self.scheduleCompaction = scheduleCompaction
         self.fileSystem = fileSystem
         log = DurableFileWriter(url: logURL, fileSystem: fileSystem)
         let earlierURL = accountDataDirectory.appendingPathComponent(Self.fileName)
@@ -442,42 +456,76 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     }
 
     private func update(_ source: UploadSourceIdentity, _ change: (inout EditReplacementJournalEntry) -> Void) throws {
-        try lock.withLock {
+        let compaction: (@Sendable () -> Void)? = try lock.withLock {
             let key = Self.key(source)
             var entry = entries[key] ?? EditReplacementJournalEntry()
             change(&entry)
             let next = entry.isEmpty ? nil : entry
-            guard next != entries[key] else { return }
-            try append(Line(key: key, entry: next))
+            guard next != entries[key] else { return nil }
+            let line = try append(Line(key: key, entry: next))
             entries[key] = next
             lineCount += 1
-            // The change is saved in the log. A failed compaction loses nothing; the next change tries it again.
-            if lineCount > max(1_000, entries.count * 2) { try? rewrite() }
+            compactionDelta?.append(line)
+            // The change is saved in the log. The compaction runs away from the caller; a failed one loses nothing,
+            // and a later change starts another.
+            guard compactionDelta == nil, lineCount > max(1_000, entries.count * 2) else { return nil }
+            compactionDelta = []
+            let snapshot = entries
+            return { [weak self] in self?.compact(snapshot) }
         }
+        compaction.map(scheduleCompaction)
     }
 
-    private func append(_ line: Line) throws {
+    /// Appends `line` and returns its bytes as written.
+    private func append(_ line: Line) throws -> Data {
         guard !log.writeFailed else { throw UploadError.backend("Edit replacement journal could not be written") }
         var data = try JSONEncoder().encode(line)
         data.append(UInt8(ascii: "\n"))
         // A new log is created with its first line in one atomic write; a later line is appended, and a line that
         // fails halfway is cut off again.
-        guard try log.append(data) else { return }
+        guard try log.append(data) else { return data }
         Self.placeBarrier(
             at: logURL.deletingLastPathComponent().appendingPathComponent(Self.fileName), whenLogExists: logURL,
             fileSystem: fileSystem)
+        return data
+    }
+
+    /// Stops every later compaction, and waits for a running one to finish its replacement, so no compaction writes the
+    /// log after the account's stores close. A change after `close()` still appends its line.
+    public func close() {
+        lock.withLock { closed = true }
+    }
+
+    /// Encodes `snapshot` without the lock, then replaces the log under the lock with those lines and every line
+    /// appended since, in their order: no change can write between them, and none is lost. A failed write keeps the
+    /// log; a log that keeps a half line is not replaced.
+    private func compact(_ snapshot: [String: EditReplacementJournalEntry]) {
+        let compacted = try? Self.sortedLines(of: snapshot)
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed, let delta = compactionDelta else { return }
+        compactionDelta = nil
+        guard var data = compacted, !log.writeFailed else { return }
+        for line in delta { data.append(line) }
+        guard (try? log.replace(with: data)) != nil else { return }
+        lineCount = snapshot.count + delta.count
     }
 
     /// Replaces the log with one line for each entry, in one atomic write.
     private func rewrite() throws {
+        try log.replace(with: Self.sortedLines(of: entries))
+        lineCount = entries.count
+    }
+
+    /// One line for each entry, sorted by key.
+    private static func sortedLines(of entries: [String: EditReplacementJournalEntry]) throws -> Data {
         let encoder = JSONEncoder()
         var data = Data()
         for (key, entry) in entries.sorted(by: { $0.key < $1.key }) {
             data.append(try encoder.encode(Line(key: key, entry: entry)))
             data.append(UInt8(ascii: "\n"))
         }
-        try log.replace(with: data)
-        lineCount = entries.count
+        return data
     }
 
     private static func key(_ source: UploadSourceIdentity) -> String {
