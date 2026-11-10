@@ -57,24 +57,6 @@ public enum BackupIssueKind: String, Codable, Sendable, Equatable {
         let value = try decoder.singleValueContainer().decode(String.self)
         self = Self(rawValue: value) ?? .unknown
     }
-
-    public var category: BackupIssueCategory {
-        switch self {
-        case .network, .deviceStorage, .remoteDraft, .remoteService: .automatic
-        case .accountStorage, .permission, .localState, .unknown: .userResolvable
-        case .remoteDeletion, .deletedElsewhere: .decision
-        case .remoteDraftStale, .sourceMissing, .unsupported: .permanent
-        }
-    }
-
-    public var isRetryable: Bool {
-        switch self {
-        case .remoteDraftStale, .sourceMissing, .permission, .unsupported, .remoteDeletion, .deletedElsewhere:
-            false
-        default:
-            true
-        }
-    }
 }
 
 /// Versioned payload stored in the queue's `last_error` column. `nextAttemptAt` is explicit so
