@@ -162,6 +162,14 @@ struct StorageFaultState: Equatable {
     }
 }
 
+extension StorageFaultState {
+    /// The tables of the SQLite file at `url` alone.
+    init(tablesOf url: URL) throws {
+        self.init()
+        try addSQLiteTables(of: url)
+    }
+}
+
 /// The upload record of the fake remote. The remote lives outside the device, so a restart or a crash keeps it.
 final class StorageFaultRemote: @unchecked Sendable {
     private let lock = NSLock()
@@ -517,7 +525,7 @@ private final class StatementLog: @unchecked Sendable {
 
 /// A small key-value SQLite store with the connection type of the production stores, so the sweep injects into it the
 /// same way. The probe operations use it, and a case uses it to model a store whose production type it does not run.
-final class StorageFaultTable {
+final class StorageFaultTable: @unchecked Sendable {
     let connection: SQLiteStoreConnection
 
     init(url: URL) throws {
@@ -548,22 +556,67 @@ final class StorageFaultTable {
 
     /// Adds the row `key` unless it exists. True when it added the row, false when the row existed, nil on failure.
     func insertIfAbsent(_ key: String, value: String = "") -> Bool? {
+        step("INSERT OR IGNORE INTO item VALUES(?,?);", binding: [key, value]) { database, statement in
+            guard sqlite3_step(statement) == SQLITE_DONE else { return nil }
+            return sqlite3_changes(database) > 0
+        }
+    }
+
+    /// Writes the row `key` with `value`, replacing an earlier value. False on failure.
+    func set(_ key: String, value: String) -> Bool {
+        step("INSERT OR REPLACE INTO item VALUES(?,?);", binding: [key, value]) { _, statement in
+            sqlite3_step(statement) == SQLITE_DONE ? true : nil
+        } ?? false
+    }
+
+    /// Removes the row `key`. False on failure.
+    func remove(_ key: String) -> Bool {
+        step("DELETE FROM item WHERE key=?;", binding: [key]) { _, statement in
+            sqlite3_step(statement) == SQLITE_DONE ? true : nil
+        } ?? false
+    }
+
+    /// The value of the row `key`, nil when the row is absent. A failed read throws; it never reads as absent.
+    func value(of key: String) throws -> String? {
+        let read: String?? = step("SELECT value FROM item WHERE key=?;", binding: [key]) { _, statement in
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW: return .some(sqlite3_column_text(statement, 0).map { String(cString: $0) })
+            case SQLITE_DONE: return .some(nil)
+            default: return nil
+            }
+        }
+        guard let read else { throw StorageFaultSweepError("the row \(key) cannot be read") }
+        return read
+    }
+
+    /// True when a row key starts with `prefix`. A failed read throws; it never reads as absent.
+    func hasKey(withPrefix prefix: String) throws -> Bool {
+        let sql = "SELECT 1 FROM item WHERE substr(key, 1, length(?1)) = ?1 LIMIT 1;"
+        let read: Bool? = step(sql, binding: [prefix]) { _, statement in
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW: return true
+            case SQLITE_DONE: return false
+            default: return nil
+            }
+        }
+        guard let read else { throw StorageFaultSweepError("the rows of \(prefix) cannot be read") }
+        return read
+    }
+
+    /// Prepares `sql` under the connection lock, binds `texts` in order and hands the statement to `body`. Nil when the
+    /// statement does not prepare or bind, or when `body` returns nil.
+    private func step<Result>(
+        _ sql: String, binding texts: [String], _ body: (OpaquePointer, OpaquePointer?) -> Result?
+    ) -> Result? {
         connection.withLock {
             guard let database = connection.database else { return nil }
             var statement: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(database, "INSERT OR IGNORE INTO item VALUES(?,?);", -1, &statement, nil)
-                    == SQLITE_OK
-            else { return nil }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
             defer { sqlite3_finalize(statement) }
-            do {
-                try connection.bindText(statement, 1, key)
-                try connection.bindText(statement, 2, value)
-            } catch {
-                return nil
+            for (index, text) in texts.enumerated() {
+                guard (try? connection.bindText(statement, Int32(index + 1), text)) != nil else { return nil }
             }
-            guard sqlite3_step(statement) == SQLITE_DONE else { return nil }
-            return sqlite3_changes(database) > 0
+            return body(database, statement)
         }
     }
 

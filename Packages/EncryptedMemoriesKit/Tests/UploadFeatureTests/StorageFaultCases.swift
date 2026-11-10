@@ -9,8 +9,11 @@ import XCTest
 /// covers it from then on.
 let storageFaultCases: [any StorageFaultCase] = [
     CatalogUpsertBatchCase(),
-    CatalogScanCase(id: "catalog.fullScan", identifiers: nil),
-    CatalogScanCase(id: "catalog.changeScan", identifiers: ["asset-2", "asset-3", "asset-4"]),
+    CatalogPassCase(id: "catalog.fullScan", pass: .fullScan),
+    CatalogPassCase(id: "catalog.changeScan", pass: .changeScan(["asset-2", "asset-3", "asset-4"])),
+    CatalogPassCase(id: "catalog.missingSources", pass: .missingSources),
+    CatalogPassCase(id: "catalog.lateRenders", pass: .lateRenders),
+    CatalogPassCase(id: "catalog.expiredHistory", pass: .expiredHistory),
     EditReplacementJournalUpdateCase(id: "journal.editReplacement.update", seededChanges: 2),
     EditReplacementJournalUpdateCase(id: "journal.editReplacement.compact", seededChanges: 1_000),
     EditReplacementJournalCreateCase(),
@@ -174,47 +177,118 @@ struct CatalogUpsertBatchCase: StorageFaultCase {
     }
 }
 
-/// A catalog scan (`PhotoLibraryCatalogSync.run`) over several chunks: the full scan with its snapshot and removal
-/// sweep when `identifiers` is nil, otherwise the targeted scan of the changed photos. A table next to the catalog
-/// models the queue, so the sweep fails and crashes the queue writes too, and a crash image holds both stores at one
-/// moment.
-struct CatalogScanCase: StorageFaultCase {
+/// A catalog pass of `PhotoLibraryCatalogSync` over chunks of two photos. A table next to the catalog models the queue,
+/// so the sweep fails and crashes the queue writes too, and a crash image holds both stores at one moment.
+/// - `fullScan`: the full scan with its snapshot and removal sweep (`run`).
+/// - `changeScan`: the targeted scan of the changed photos (`run(identifiers:)`).
+/// - `missingSources`: the recovery of the photos whose queue rows an earlier build dropped (`reconcileMissingSources`).
+/// - `lateRenders`: the one-time pass that re-opens stored edits that list their rendered file
+///   (`reconcileLateRendersOnce`).
+/// - `expiredHistory`: a pass whose change history expired (`runPass`). A third table holds the change token that the
+///   pass moves once its snapshot is saved; it is no fault target, as the token lives outside the stores. A restart
+///   whose token moved sees no expired history and must still finish the scan.
+struct CatalogPassCase: StorageFaultCase {
+    enum Pass: Sendable {
+        case fullScan
+        case changeScan([String])
+        case missingSources
+        case lateRenders
+        case expiredHistory
+    }
+
     struct World {
         let store: PhotoLibraryCatalogManifestStore
         let queueTable: StorageFaultTable
         let queue: RecordingEnqueuer
+        let tokenTable: StorageFaultTable
     }
 
     let id: String
-    let identifiers: [String]?
+    let pass: Pass
     let atomicity = StorageFaultAtomicity.convergesAfterRestart
+
+    /// The late-render pass removes the settled queue row of a re-opened revision and then queues it again, as
+    /// `UploadBackupSyncEngine.reopenBackedUpRevisions` and `enqueueBatch` do. When the second write fails (the only
+    /// insert of the pass), the row is missing until a restart: the state stays pending, the pass stays owed, and the
+    /// restart queues the revision again (I4 holds).
+    var acceptsMissingReopenedRow = true
+
+    var acceptances: [StorageFaultAcceptance] {
+        guard case .lateRenders = pass, acceptsMissingReopenedRow else { return [] }
+        let point = "INSERT OR IGNORE INTO item VALUES(?,?);"
+        let reason = "the re-opened row is missing until the next pass queues it again; decision on #1155"
+        return [
+            StorageFaultAcceptance(rule: .noLoss, phase: .failedRun, point: point, reason: reason),
+            StorageFaultAcceptance(rule: .noLoss, phase: .crashImage, point: point, reason: reason),
+        ]
+    }
     private let libraries = catalogLibraries()
     private static let queueName = "queue.sqlite"
-
-    init(id: String, identifiers: [String]?) {
-        self.id = id
-        self.identifiers = identifiers
-    }
+    private static let tokenName = "token.sqlite"
+    /// The token of the expired change history, and the token that the pass stores.
+    private static let expiredToken = "expired"
+    private static let currentToken = "current"
 
     func seed(in directory: URL, remote: StorageFaultRemote) async throws {
         let world = try open(directory, remote: remote)
         defer { close(world) }
-        try await sync(libraries.seed, at: 100, store: world.store).run(engine: world.queue)
+        switch pass {
+        case .fullScan, .changeScan, .missingSources, .expiredHistory:
+            try await sync(libraries.seed, at: 100, store: world.store).run(engine: world.queue)
+        case .lateRenders:
+            // An earlier build stored asset-2 with its rendered file listed next to the original.
+            try await sync(libraries.current, at: 100, store: world.store).run(engine: world.queue)
+        }
+        switch pass {
+        case .missingSources:
+            // An earlier build dropped the queue rows of two photos that the catalog keeps.
+            XCTAssertTrue(
+                world.queueTable.execute("DELETE FROM item WHERE key LIKE 'asset-2#%' OR key LIKE 'asset-3#%';"))
+        case .lateRenders:
+            // The earlier build finished the backup of every photo: its queue row is settled, and its state complete.
+            let settled = RecordingEnqueuer.settled
+            XCTAssertTrue(
+                world.queueTable.execute(
+                    "UPDATE item SET value='\(settled)'; "
+                        + "INSERT INTO item SELECT '\(RecordingEnqueuer.statePrefix)' || key, '\(settled)' FROM item;"))
+        case .expiredHistory:
+            XCTAssertEqual(world.tokenTable.insertIfAbsent("token", value: Self.expiredToken), true)
+        case .fullScan, .changeScan:
+            break
+        }
     }
 
     func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
         let queueTable = try StorageFaultTable(url: directory.appendingPathComponent(Self.queueName))
         return World(
-            store: try catalogStore(in: directory), queueTable: queueTable, queue: RecordingEnqueuer(ledger: queueTable)
-        )
+            store: try catalogStore(in: directory), queueTable: queueTable,
+            queue: RecordingEnqueuer(ledger: queueTable),
+            tokenTable: try StorageFaultTable(url: directory.appendingPathComponent(Self.tokenName)))
     }
 
     func faultTargets(of world: World) -> [Any] { [world.store, world.queueTable] }
 
     func run(_ world: World) async -> Bool {
         do {
-            try await sync(libraries.current, at: 200, store: world.store).run(
-                engine: world.queue, identifiers: identifiers)
+            switch pass {
+            case .fullScan:
+                try await sync(libraries.current, at: 200, store: world.store).run(engine: world.queue)
+            case .changeScan(let identifiers):
+                try await sync(libraries.current, at: 200, store: world.store).run(
+                    engine: world.queue, identifiers: identifiers)
+            case .missingSources:
+                try await sync(libraries.seed, at: 200, store: world.store).reconcileMissingSources(engine: world.queue)
+            case .lateRenders:
+                try await sync(libraries.current, at: 200, store: world.store).reconcileLateRendersOnce(
+                    engine: world.queue)
+            case .expiredHistory:
+                let token = world.tokenTable
+                let expired = try token.value(of: "token") == Self.expiredToken
+                try await sync(libraries.current, at: 200, store: world.store).runPass(
+                    engine: world.queue,
+                    changes: .init(changedIdentifiers: [], deletedIdentifiers: [], requiresFullRescan: expired),
+                    commitChanges: { _ = token.execute("UPDATE item SET value='\(Self.currentToken)';") })
+            }
             return true
         } catch {
             return false
@@ -224,14 +298,20 @@ struct CatalogScanCase: StorageFaultCase {
     func close(_ world: World) {
         world.store.close()
         world.queueTable.close()
+        world.tokenTable.close()
     }
 
     func state(in directory: URL) throws -> StorageFaultState {
         var state = try catalogState(in: directory)
         let queue = directory.appendingPathComponent(Self.queueName)
         try state.addSQLiteTables(of: queue)
-        // One record per photo revision, as `RecordingEnqueuer` keys the ledger.
-        try state.addRecords("queued photo revision", of: queue, sql: "SELECT key FROM item;")
+        // One record per photo revision, as `RecordingEnqueuer` keys the ledger; the modeled backup states are no queue
+        // rows.
+        try state.addRecords(
+            "queued photo revision", of: queue,
+            sql: "SELECT key FROM item WHERE substr(key, 1, \(RecordingEnqueuer.statePrefix.count)) "
+                + "!= '\(RecordingEnqueuer.statePrefix)';")
+        try state.addSQLiteTables(of: directory.appendingPathComponent(Self.tokenName))
         return state
     }
 

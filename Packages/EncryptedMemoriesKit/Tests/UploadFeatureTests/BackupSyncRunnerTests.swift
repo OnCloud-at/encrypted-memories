@@ -4246,15 +4246,10 @@ final class BackupSyncRunnerTests: XCTestCase {
             pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
         XCTAssertNotNil(pending.include([key], at: clock.now))
         let resolving = SourceRemovedDuringResolveResolver(inner: resolver)
-        let path = pendingURL.path
+        let url = pendingURL
         resolving.onResolve = { entry in
             guard entry.source == waiting.source else { return }
-            var handle: OpaquePointer?
-            XCTAssertEqual(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-            XCTAssertEqual(
-                sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
-                SQLITE_OK)
-            sqlite3_close(handle)
+            do { try Self.markWrittenByANewerBuild(url) } catch { XCTFail("\(error)") }
         }
         let recorder = PendingBackupEventRecorder(store: pending)
         let runner = makeRunner(
@@ -4285,12 +4280,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertNotNil(
             pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
         XCTAssertNotNil(pending.include([key], at: clock.now))
-        var handle: OpaquePointer?
-        XCTAssertEqual(sqlite3_open_v2(pendingURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-        XCTAssertEqual(
-            sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
-            SQLITE_OK)
-        sqlite3_close(handle)
+        try Self.markWrittenByANewerBuild(pendingURL)
         let recorder = PendingBackupEventRecorder(store: pending)
         let runner = makeRunner(events: recorder)
 
@@ -4333,7 +4323,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
         XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
 
-        try withRawDatabase(at: pendingURL) {
+        try withSQLiteDatabase(at: pendingURL) {
             XCTAssertEqual(sqlite3_exec($0, "UPDATE source_state SET desired='included';", nil, nil, nil), SQLITE_OK)
         }
         clock.advance(by: kept.updatedAt.timeIntervalSince(clock.now) + 1)
@@ -4357,13 +4347,15 @@ final class BackupSyncRunnerTests: XCTestCase {
                 nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active, linkID: "remote-1")
         ]
         try makePendingRowUnreadable(waiting.source, in: pending, at: pendingURL)
-        let before = try pendingStoreRows(at: pendingURL)
+        let before = try StorageFaultState(tablesOf: pendingURL).tables
+        XCTAssertFalse(
+            before["\(pendingURL.lastPathComponent)/source_state"]?.isEmpty ?? true, "the dump reads the store")
         let recorder = PendingBackupEventRecorder(store: pending)
 
         _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
         recorder.finish()
 
-        XCTAssertEqual(try pendingStoreRows(at: pendingURL), before, "the pending store stays unchanged")
+        XCTAssertEqual(try StorageFaultState(tablesOf: pendingURL).tables, before, "the pending store stays unchanged")
         XCTAssertNotEqual(state(of: waiting), .alreadyBackedUp)
         XCTAssertTrue(uploader.requests.isEmpty)
     }
@@ -4471,27 +4463,22 @@ final class BackupSyncRunnerTests: XCTestCase {
             pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
         XCTAssertNotNil(pending.include([key], at: clock.now))
         let resolving = SourceRemovedDuringResolveResolver(inner: resolver)
-        let path = pendingURL.path
+        let url = pendingURL
         resolving.onResolve = { _ in
-            var handle: OpaquePointer?
-            XCTAssertEqual(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-            XCTAssertEqual(
-                sqlite3_exec(handle, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
-                SQLITE_OK)
-            sqlite3_close(handle)
+            do { try Self.markWrittenByANewerBuild(url) } catch { XCTFail("\(error)") }
         }
         let recorder = PendingBackupEventRecorder(store: pending)
 
         _ = await makeRunner(resolver: resolving, events: recorder).runUntilDrained(mode: .eligibleOnly)
         recorder.finish()
-        let rows = try pendingStoreRows(at: pendingURL)
+        let rows = try StorageFaultState(tablesOf: pendingURL).tables
 
         let kept = try XCTUnwrap(queueStore.entry(for: waiting.source, revision: waiting.revision))
         XCTAssertEqual(kept.attempts, waiting.attempts, "waiting spends no attempt")
         XCTAssertNotEqual(kept.state, .alreadyBackedUp)
         XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
         XCTAssertTrue(uploader.requests.isEmpty)
-        XCTAssertEqual(rows["handoff"] ?? [], [], "no upload record")
+        XCTAssertEqual(rows["\(pendingURL.lastPathComponent)/handoff"] ?? [], [], "no upload record")
     }
 
     /// A photo with a saved upload receipt whose pending row cannot be read keeps its receipt and is not exported
@@ -4550,47 +4537,16 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertNotNil(
             pending.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: nil)], at: clock.now))
         XCTAssertNotNil(pending.include([key], at: clock.now))
-        try withRawDatabase(at: url) {
+        try Self.markWrittenByANewerBuild(url)
+    }
+
+    /// Writes a desired state that only a newer build knows into every pending source row.
+    private static func markWrittenByANewerBuild(_ url: URL) throws {
+        try withSQLiteDatabase(at: url) {
             XCTAssertEqual(
                 sqlite3_exec($0, "UPDATE source_state SET desired='written-by-a-newer-build';", nil, nil, nil),
                 SQLITE_OK)
         }
-    }
-
-    private func withRawDatabase(at url: URL, _ body: (OpaquePointer) throws -> Void) throws {
-        var handle: OpaquePointer?
-        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-        let db = try XCTUnwrap(handle)
-        defer { sqlite3_close(db) }
-        try body(db)
-    }
-
-    /// Every row of every table of the pending store, as text.
-    private func pendingStoreRows(at url: URL) throws -> [String: [[String?]]] {
-        var tables: [String: [[String?]]] = [:]
-        try withRawDatabase(at: url) { db in
-            var names: [String] = []
-            var list: OpaquePointer?
-            XCTAssertEqual(
-                sqlite3_prepare_v2(
-                    db, "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;", -1, &list, nil), SQLITE_OK)
-            while sqlite3_step(list) == SQLITE_ROW { names.append(String(cString: sqlite3_column_text(list, 0))) }
-            sqlite3_finalize(list)
-            for name in names {
-                var stmt: OpaquePointer?
-                XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT * FROM \"\(name)\";", -1, &stmt, nil), SQLITE_OK)
-                var rows: [[String?]] = []
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    rows.append(
-                        (0..<sqlite3_column_count(stmt)).map { column in
-                            sqlite3_column_text(stmt, column).map { String(cString: $0) }
-                        })
-                }
-                sqlite3_finalize(stmt)
-                tables[name] = rows.sorted { $0.description < $1.description }
-            }
-        }
-        return tables
     }
 
     func testPhotoDeletedDuringItsIdentityPassReleasesItsTempFiles() async throws {
@@ -7623,13 +7579,12 @@ extension BackupSyncRunnerTests {
     func testAnUndecodableQueueRowStillStopsTheNextPass() async throws {
         let entry = seedEntry("waiting.jpg")
         XCTAssertTrue(queueStore.synchronizeToDisk())
-        var handle: OpaquePointer?
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
-        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
-        defer { sqlite3_close(handle) }
-        XCTAssertEqual(
-            sqlite3_exec(handle, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
-            SQLITE_OK)
+        try withSQLiteDatabase(at: url) {
+            XCTAssertEqual(
+                sqlite3_exec($0, "UPDATE backup_sync_queue SET remote_commit_reconciliation=X'7B';", nil, nil, nil),
+                SQLITE_OK)
+        }
         XCTAssertThrowsError(try queueStore.entry(for: entry.source, revision: entry.revision))
 
         _ = await makeRunner().runUntilDrained()
