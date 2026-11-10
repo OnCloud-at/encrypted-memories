@@ -7417,6 +7417,87 @@ extension PhotoLibraryBackupControllerStateTests {
     #endif
 }
 
+/// The large first backup guide ends for every view once the person leaves the backup settings (#275).
+extension PhotoLibraryBackupControllerStateTests {
+    #if DEBUG
+        /// The guided backup completes after a scan that counted every photo; leaving the settings then ends the
+        /// headline for every view.
+        func testLeavingTheBackupSettingsEndsTheFirstBackupHeadlineForEveryView() async throws {
+            let fixture = try makeControllerFixture(
+                prefix: "photo-backup-first-backup-guide", identityResolver: FakeIdentityResolver(),
+                runtimeSignals: .wiFiWithMobileDataOff)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            XCTAssertTrue(
+                queue.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "guided"),
+                        revision: UploadBackupRevision(rawValue: 1), originalFilename: "guided.heic", state: .completed,
+                        updatedAt: Date())))
+            queue.close()
+            fixture.defaults.set(
+                BackupFirstBackupGuide.State.running.rawValue, forKey: BackupFirstBackupGuide.defaultsKey)
+            controller.setEnabledForTesting()
+            controller.setAccessStateForTesting(.full)
+            controller.replaceScanForTesting {}
+
+            controller.syncNow()
+            let unseen = await waitUntil { controller.status.firstBackupGuide == .completedUnseen }
+            XCTAssertTrue(unseen, "the completed first backup is not shown")
+            await controller.waitForSyncRunCompletionForTesting()
+            XCTAssertEqual(controller.status.photoDisplayProgress?.isTotalKnown, true)
+            XCTAssertEqual(controller.status.firstBackupGuide, .completedUnseen)
+
+            controller.firstBackupScreenSeen()
+
+            let seen = await waitUntil { controller.status.firstBackupGuide == .done }
+            XCTAssertTrue(seen, "the controller status still shows the first backup headline")
+            let reopened = BackupStatusRowModel()
+            reopened.ingest(controller.status)
+            XCTAssertEqual(
+                reopened.displayed.headlineKey, "backup.phase_completed", "a reopened screen shows it again")
+            await controller.shutdown()
+        }
+    #endif
+
+    /// A status the controller publishes itself, for example while the backup waits for Wi-Fi or after it is turned
+    /// off, keeps the guide's step, so the hint does not disappear until the projector publishes again.
+    func testADirectStatusKeepsTheLargeFirstBackupGuide() async throws {
+        let suite = "photo-backup-first-backup-direct-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "waiting"),
+                    revision: UploadBackupRevision(rawValue: 1), originalFilename: "waiting.heic",
+                    state: .queuedForUpload, updatedAt: Date())))
+        queue.close()
+        defaults.set(BackupFirstBackupGuide.State.running.rawValue, forKey: BackupFirstBackupGuide.defaultsKey)
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: nil, uploader: MockUploader())
+        let projected = await waitUntil { controller.status.firstBackupGuide == .running }
+        XCTAssertTrue(projected, "the projector did not publish the guide")
+
+        controller.disableBackup()
+
+        XCTAssertEqual(controller.status.firstBackupGuide, .running, "the direct status dropped the guide")
+        await controller.shutdown()
+    }
+}
+
 /// The lines of a recorded background log.
 final class RecordedLogLines: @unchecked Sendable {
     private let lock = NSLock()

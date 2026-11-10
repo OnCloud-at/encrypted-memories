@@ -208,6 +208,8 @@ public final class PhotoLibraryBackupController {
     private nonisolated let catalogRetryRows = PhotoLibraryCatalogRetryRows()
     private let lockStore: BackupExecutionLockManifestStore?
     private let statusProjector: BackupStatusProjector?
+    /// The large first backup guide; the projector moves it on with every status (#275).
+    private let firstBackupGuide: BackupFirstBackupGuideStore
     private let statusProjectionGeneration = UUID()
     private var statusProjectionRevision: UInt64 = 0
     private var lastAppliedStatusProjectionRevision: UInt64 = 0
@@ -400,8 +402,11 @@ public final class PhotoLibraryBackupController {
         )
         self.queueStore = queueStore
         self.stateStore = stateStore
+        // The large first backup guide follows every status of the photo library backup, with or without a view (#275).
+        let firstBackupGuide = BackupFirstBackupGuideStore(defaults: configuration.defaults)
+        self.firstBackupGuide = firstBackupGuide
         statusProjector = queueStore.map {
-            BackupStatusProjector(queue: $0)
+            BackupStatusProjector(queue: $0, firstBackupGuide: firstBackupGuide)
         }
         // Catalog + lock are independent of the upload composition: they open even before an
         // identity resolver exists, so inventory/ownership survive a partial account bring-up.
@@ -730,6 +735,13 @@ public final class PhotoLibraryBackupController {
     /// waiting rows due at once (each reason and its retry count stay); lifecycle/change-driven calls honor backoff.
     public func syncNow() {
         _ = startSync(owner: .foreground)
+    }
+
+    /// The person left the backup settings while they showed a completed first backup (#275). The guide ends, and the
+    /// status is projected again, so every view shows the plain completion from now on.
+    public func firstBackupScreenSeen() {
+        guard firstBackupGuide.screenSeen() else { return }
+        refreshFromQueue()
     }
 
     /// The "Use Cellular Data" setting changed. A backup that waits for Wi-Fi starts again when the wait no longer
@@ -2763,6 +2775,8 @@ public final class PhotoLibraryBackupController {
             executionOpportunityIssue: executionOpportunityIssue)
         snapshot.photoDisplayProgress = projectionContext.photoProgress(
             for: snapshot, fraction: status.photoDisplayProgress?.fraction)
+        // Only the projector moves the large first backup guide on; a direct status keeps its stored step (#275).
+        snapshot.firstBackupGuide = firstBackupGuide.state
         status = snapshot
     }
 
