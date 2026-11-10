@@ -444,6 +444,142 @@ struct ProtonRequestTallyTests {
         #expect(base.count == 0, "the account's stores may already be closed")
     }
 
+    @Test func aRateLimitAnswerRecordsTheStateTheGovernorSetsAfterIt() async throws {
+        let clock = TallyTestClock()
+        let governor = Self.governor(clock: clock, initial: 4)
+        try await governor.causes.run(.backup) {
+            let first = try await governor.acquire(scope: .api)
+            let second = try await governor.acquire(scope: .api)
+            let limited = try await governor.acquire(scope: .api)
+            await governor.finish(first, statusCode: 200)
+            await governor.finish(second, statusCode: 200)
+            await governor.finish(limited, statusCode: 429, retryAfter: 7)
+        }
+
+        let snapshot = await governor.requestSupportSnapshot()
+        let event = try #require(snapshot.rateLimitEvents.first)
+        #expect(snapshot.rateLimitEvents.count == 1)
+        #expect(event.scope == "api")
+        #expect(event.cause == "backup")
+        #expect(event.offsetMilliseconds == 1_000_000)
+        #expect(event.retryAfterSeconds == 7)
+        #expect(event.cooldownSeconds == 7)
+        // Two successes in the last second give 2 requests per second; the spacing is 1 / (0.8 x 2) s and the
+        // concurrency limit halves from 4 to 2.
+        #expect(event.successesLastMinute == 2)
+        #expect(event.observedRequestsPerSecond == 2)
+        #expect(event.concurrencyLimit == 2)
+        #expect(event.admissionIntervalMilliseconds == 625)
+        // The record states what the scope reports; the 429 itself changes the governor exactly as before.
+        let api = try #require(snapshot.scopes.first { $0.scope == "api" })
+        #expect(api.concurrencyLimit == event.concurrencyLimit)
+        #expect(api.admissionIntervalMilliseconds == event.admissionIntervalMilliseconds)
+        #expect(api.rateLimitedLastMinute == 1)
+    }
+
+    @Test func anAnswerWithoutRetryAfterRecordsTheFallbackCooldownAndNoRetryAfter() async throws {
+        let clock = TallyTestClock()
+        let governor = Self.governor(clock: clock, initial: 4)
+        let permit = try await governor.acquire(scope: .storageDownload)
+        await governor.finish(permit, statusCode: 429)
+
+        let event = try #require(await governor.requestSupportSnapshot().rateLimitEvents.first)
+        #expect(event.scope == "storageDownload")
+        #expect(event.cause == "unattributed")
+        #expect(event.retryAfterSeconds == nil)
+        // The first 429 of a streak waits 2 seconds.
+        #expect(event.cooldownSeconds == 2)
+    }
+
+    @Test func aNonFiniteRetryAfterNeverReachesTheEvent() async throws {
+        let governor = Self.governor(clock: TallyTestClock(), initial: 4)
+        let permit = try await governor.acquire(scope: .api)
+        let negative = try await governor.acquire(scope: .api)
+        await governor.finish(permit, statusCode: 429, retryAfter: .infinity)
+        await governor.finish(negative, statusCode: 429, retryAfter: -5)
+
+        let snapshot = await governor.requestSupportSnapshot()
+        #expect(snapshot.rateLimitEvents.count == 2)
+        #expect(snapshot.rateLimitEvents.allSatisfy { $0.retryAfterSeconds == nil })
+        #expect(snapshot.rateLimitEvents.allSatisfy { $0.cooldownSeconds.isFinite })
+        _ = try JSONEncoder().encode(snapshot)
+    }
+
+    @Test func onlyA429RecordsAnEvent() async throws {
+        let governor = Self.governor(clock: TallyTestClock(), initial: 16)
+        // All permits first: a status that wrongly closed the scope would block a later acquire instead of failing.
+        var permits: [ProtonRequestGovernor.Permit] = []
+        for _ in 0..<9 { permits.append(try await governor.acquire(scope: .api)) }
+        for (permit, status) in zip(permits, [200, 304, 401, 404, 408, 500, 503, nil] as [Int?]) {
+            await governor.finish(permit, statusCode: status)
+        }
+        await governor.finish(permits[8], statusCode: nil, cancelled: true)
+
+        #expect(await governor.requestSupportSnapshot().rateLimitEvents.isEmpty)
+    }
+
+    @Test func everyAnswerOfAStreakRecordsItsOwnEvent() async throws {
+        let clock = TallyTestClock()
+        let governor = Self.governor(clock: clock, initial: 4)
+        let first = try await governor.acquire(scope: .api)
+        let second = try await governor.acquire(scope: .api)
+        await governor.finish(first, statusCode: 429, retryAfter: 3)
+        clock.now = clock.now.addingTimeInterval(1)
+        await governor.finish(second, statusCode: 429, retryAfter: 5)
+
+        let events = await governor.requestSupportSnapshot().rateLimitEvents
+        #expect(events.map(\.offsetMilliseconds) == [1_000_000, 1_001_000])
+        #expect(events.map(\.retryAfterSeconds) == [3, 5])
+        // The second answer halves the limit again, from 2 to 1.
+        #expect(events.map(\.concurrencyLimit) == [2, 1])
+    }
+
+    @Test func theEventRingKeepsTheNewest32AnswersOldestFirst() async throws {
+        let clock = TallyTestClock()
+        let governor = Self.governor(clock: clock, initial: 64)
+        var permits: [ProtonRequestGovernor.Permit] = []
+        for _ in 0..<40 { permits.append(try await governor.acquire(scope: .api)) }
+        for permit in permits {
+            await governor.finish(permit, statusCode: 429, retryAfter: 1)
+            clock.now = clock.now.addingTimeInterval(1)
+        }
+
+        let events = await governor.requestSupportSnapshot().rateLimitEvents
+        #expect(events.count == 32)
+        // Answers 9 to 40 remain: the offsets run from the ninth answer to the last one.
+        #expect(events.first?.offsetMilliseconds == 1_008_000)
+        #expect(events.last?.offsetMilliseconds == 1_039_000)
+        #expect(events.map(\.offsetMilliseconds) == events.map(\.offsetMilliseconds).sorted())
+    }
+
+    @Test func theEncodedEventHoldsOnlyTheClosedFields() async throws {
+        let governor = Self.governor(clock: TallyTestClock(), initial: 4)
+        try await governor.causes.run(.duplicatesRead) {
+            let permit = try await governor.acquire(
+                scope: .api, label: .api(method: "GET", path: "/drive/volumes/\(Self.volumeID)/photos"))
+            await governor.finish(permit, statusCode: 429, retryAfter: 7)
+        }
+
+        let data = try JSONEncoder().encode(await governor.requestSupportSnapshot())
+        let root = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let events = try #require(root["rateLimitEvents"] as? [[String: Any]])
+        let event = try #require(events.first)
+        #expect(
+            Set(event.keys) == [
+                "scope", "offsetMilliseconds", "cause", "retryAfterSeconds", "cooldownSeconds", "concurrencyLimit",
+                "admissionIntervalMilliseconds", "observedRequestsPerSecond", "successesLastMinute",
+            ])
+        // No route, identifier or name: the text values are the scope and the cause only.
+        let texts = event.values.compactMap { $0 as? String }
+        #expect(Set(texts) == ["api", "duplicates.read"])
+    }
+
+    private static func governor(clock: TallyTestClock, initial: Int) -> ProtonRequestGovernor {
+        ProtonRequestGovernor(
+            configuration: configuration(initial: initial), now: { clock.now }, summaryLog: { _ in },
+            traceNow: { Int64(clock.now.timeIntervalSince1970 * 1_000) })
+    }
+
     private static func configuration(initial: Int) -> ProtonRequestGovernor.Configuration {
         let scope = ProtonRequestGovernor.Configuration.Scope(initialConcurrency: initial, maximumConcurrency: initial)
         return .init(

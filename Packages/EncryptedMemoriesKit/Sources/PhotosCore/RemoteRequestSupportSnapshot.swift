@@ -5,6 +5,7 @@ import Foundation
 /// The report holds only route shapes, causes, status classes and counts. The route shape is a heuristic: a path word
 /// is kept when it looks like a route word (3 to 32 lowercase letters, underscores or hyphens), so a token of that
 /// shape inside a path segment would be kept.
+/// It also holds the newest 32 rate-limit answers as closed fields: scope, cause and numbers.
 public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
     /// One completed transport attempt. Admission is the start; response/error completion is the end.
     /// Offsets use the process-wide monotonic clock, including time while the system sleeps.
@@ -86,6 +87,42 @@ public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
         }
     }
 
+    /// One 429 answer and the state the governor set because of it. The values are the numbers that decide a request
+    /// cap: how fast the scope ran before the answer, and how far the governor slowed down after it.
+    public struct RateLimitEvent: Codable, Sendable, Equatable {
+        public let scope: String
+        /// Offset on the same monotonic clock as `Request`.
+        public let offsetMilliseconds: Int64
+        public let cause: String
+        /// The Retry-After the response asked for; nil when it sent none or an unusable value.
+        public let retryAfterSeconds: Double?
+        /// The wait the governor applied before it admitted the next request of the scope.
+        public let cooldownSeconds: Double
+        /// The concurrency limit and admission interval after the answer.
+        public let concurrencyLimit: Int
+        public let admissionIntervalMilliseconds: Int
+        /// The successful requests per second of the scope before the answer: the larger of the last second and the
+        /// mean of the last minute.
+        public let observedRequestsPerSecond: Double
+        public let successesLastMinute: Int
+
+        public init(
+            scope: String, offsetMilliseconds: Int64, cause: String, retryAfterSeconds: Double?,
+            cooldownSeconds: Double, concurrencyLimit: Int, admissionIntervalMilliseconds: Int,
+            observedRequestsPerSecond: Double, successesLastMinute: Int
+        ) {
+            self.scope = scope
+            self.offsetMilliseconds = offsetMilliseconds
+            self.cause = cause
+            self.retryAfterSeconds = retryAfterSeconds
+            self.cooldownSeconds = cooldownSeconds
+            self.concurrencyLimit = concurrencyLimit
+            self.admissionIntervalMilliseconds = admissionIntervalMilliseconds
+            self.observedRequestsPerSecond = observedRequestsPerSecond
+            self.successesLastMinute = successesLastMinute
+        }
+    }
+
     public let counts: [Count]
     /// Requests that arrived after the bounded key table was full; they are counted here only.
     public let overflowRequests: Int
@@ -94,10 +131,13 @@ public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
     public let recentRequests: [Request]
     public let droppedRequestRecords: Int
     public let traceCapturedAtMilliseconds: Int64
+    /// The newest 32 rate-limit answers, oldest first.
+    public let rateLimitEvents: [RateLimitEvent]
 
     public init(
         counts: [Count], overflowRequests: Int, scopes: [Scope], recentRequests: [Request] = [],
-        droppedRequestRecords: Int = 0, traceCapturedAtMilliseconds: Int64 = 0
+        droppedRequestRecords: Int = 0, traceCapturedAtMilliseconds: Int64 = 0,
+        rateLimitEvents: [RateLimitEvent] = []
     ) {
         self.counts = counts
         self.overflowRequests = overflowRequests
@@ -105,6 +145,7 @@ public struct RemoteRequestSupportSnapshot: Codable, Sendable, Equatable {
         self.recentRequests = recentRequests
         self.droppedRequestRecords = droppedRequestRecords
         self.traceCapturedAtMilliseconds = traceCapturedAtMilliseconds
+        self.rateLimitEvents = rateLimitEvents
     }
 }
 
