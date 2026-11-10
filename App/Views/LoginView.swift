@@ -36,7 +36,7 @@ struct LoginView: View {
         switch model.auth {
         case .authenticating(let status):
             VStack(spacing: 16) {
-                ProgressView().controlSize(.large)
+                ProgressSpinner(.large)
                 Text(status)
                     .font(.system(size: 13))
                     .foregroundStyle(ProtonColor.textWeak)

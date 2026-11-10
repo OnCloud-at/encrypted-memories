@@ -319,7 +319,7 @@ private struct AlbumNameForm: View {
             }
             .overlay {
                 if coordinator.isWorking {
-                    ProgressView().controlSize(.large)
+                    ProgressSpinner(.large)
                 }
             }
             .onAppear { nameFocused = true }
