@@ -1125,7 +1125,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             await controller.finishSyncForTesting(runID: "carried")
             XCTAssertTrue(controller.isRetiringInstantWorkForTesting, "the writer outlasted the bounded wait")
-            XCTAssertEqual(controller.activeExecutionRunID, "carried", "the run keeps its lock while its writer retires")
+            XCTAssertEqual(
+                controller.activeExecutionRunID, "carried", "the run keeps its lock while its writer retires")
 
             let settled = CompletionLatch()
             let waiter = Task {
