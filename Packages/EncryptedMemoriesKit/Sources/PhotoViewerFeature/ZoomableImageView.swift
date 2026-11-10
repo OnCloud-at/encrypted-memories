@@ -120,6 +120,9 @@ struct ZoomableImageView: NSViewRepresentable {
     var onForceClick: () -> Void = {}
     /// The force-click was released (finger lifted) - stops the motion clip, crossfading back to the still.
     var onForceClickEnded: () -> Void = {}
+    /// A direct finger hold uses the same playback route without changing force-click handling.
+    var onMotionStart: (() -> Void)?
+    var onMotionStop: (() -> Void)?
     /// Native horizontal trackpad paging. The AppKit adapter recognizes the gesture; Core owns its direction.
     var onPageSwipe: (ViewerPageSwipeDirection) -> Void = { _ in }
     /// Reports the displayed photo rect (aspect-fit area, magnification/pan-transformed) in the view's
@@ -161,6 +164,21 @@ struct ZoomableImageView: NSViewRepresentable {
         scrollView.documentView = imageView
 
         context.coordinator.imageView = imageView
+        let hold = context.coordinator.motionHold
+        configureMotionHold(hold)
+        hold.textOwnsPoint = { [weak coordinator = context.coordinator] point in
+            coordinator?.liveTextOwns(point) ?? false
+        }
+        hold.textIsSelected = { [weak coordinator = context.coordinator] in
+            coordinator?.liveTextOverlay?.hasActiveTextSelection == true
+        }
+        imageView.addGestureRecognizer(hold)
+        scrollView.motionHold = hold
+        for name in [NSScrollView.didLiveScrollNotification, NSScrollView.willStartLiveMagnifyNotification] {
+            NotificationCenter.default.addObserver(
+                context.coordinator, selector: #selector(Coordinator.motionGestureBegan(_:)), name: name,
+                object: scrollView)
+        }
         context.coordinator.itemIdentity = itemIdentity
         context.coordinator.isSharp = isSharp
         context.coordinator.updateLiveText(analysis: liveTextAnalysis, highlighted: liveTextHighlighted)
@@ -169,6 +187,10 @@ struct ZoomableImageView: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        if context.coordinator.itemIdentity != itemIdentity {
+            context.coordinator.motionHold.cancel(.pageChange, afterViewUpdate: true)
+        }
+        configureMotionHold(context.coordinator.motionHold)
         if let z = scrollView as? ZoomScrollView {
             z.onPinchDismissBegan = onPinchDismissBegan
             z.onPinchDismissChanged = onPinchDismissChanged
@@ -203,13 +225,47 @@ struct ZoomableImageView: NSViewRepresentable {
         context.coordinator.updateLiveText(analysis: liveTextAnalysis, highlighted: liveTextHighlighted)
     }
 
+    private func configureMotionHold(_ hold: AppKitLivePhotoHoldAdapter) {
+        hold.updateCallbacks(start: onMotionStart, stop: onMotionStop)
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator {
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        coordinator.motionHold.cancel(.teardown, afterViewUpdate: true)
+        coordinator.imageView?.removeGestureRecognizer(coordinator.motionHold)
+        NotificationCenter.default.removeObserver(coordinator)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, ImageAnalysisOverlayViewDelegate {
         weak var imageView: NSImageView?
+        let motionHold = AppKitLivePhotoHoldAdapter()
         var itemIdentity: String?
         var isSharp = false
-        private var liveTextOverlay: ImageAnalysisOverlayView?
+        fileprivate var liveTextOverlay: ImageAnalysisOverlayView?
+
+        @objc func motionGestureBegan(_ notification: Notification) {
+            motionHold.cancel(notification.name == NSScrollView.willStartLiveMagnifyNotification ? .pinch : .scroll)
+        }
+
+        func liveTextOwns(_ point: NSPoint) -> Bool {
+            guard let overlay = liveTextOverlay, let imageView else { return false }
+            let location = overlay.convert(point, from: imageView)
+            return overlay.analysisHasText(at: location)
+                || (overlay.selectableItemsHighlighted && overlay.hasInteractiveItem(at: location))
+        }
+
+        func overlayView(
+            _ overlayView: ImageAnalysisOverlayView, shouldShowMenuForEvent event: NSEvent, atPoint point: CGPoint
+        ) -> Bool {
+            // A stationary finger can emulate a right click. Keep that menu out of an active playback hold.
+            !motionHold.policy.isActive
+        }
+
+        func textSelectionDidChange(_ overlayView: ImageAnalysisOverlayView) {
+            if overlayView.hasActiveTextSelection { motionHold.cancel(.textSelection) }
+        }
 
         /// Places the Live Text overlay inside the image view, so it follows magnification and pan, and tracks the
         /// image view's fitted image rect. Without an analysis the overlay is removed and no event reaches it.
@@ -225,6 +281,7 @@ struct ZoomableImageView: NSViewRepresentable {
                 overlay = existing
             } else {
                 overlay = ImageAnalysisOverlayView(frame: imageView.bounds)
+                overlay.delegate = self
                 overlay.autoresizingMask = [.width, .height]
                 overlay.preferredInteractionTypes = .automaticTextOnly
                 // The viewer toolbar owns the Show Text action; the system button would scale with the zoom.
@@ -278,6 +335,7 @@ private extension NSImageView {
 /// Keeps the document view equal to the actual fitted media, lets `NSScrollView` grow/scroll it when magnified,
 /// and turns a pinch-out at fit-scale into a "fly closed" dismiss.
 final class ZoomScrollView: NSScrollView {
+    weak var motionHold: AppKitLivePhotoHoldAdapter?
     var onPinchDismissBegan: () -> Void = {}
     var onPinchDismissChanged: (CGFloat) -> Void = { _ in }
     var onPinchDismissEnded: (Bool) -> Void = { _ in }
@@ -437,6 +495,13 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        // A mayBegin or zero-delta event does not move content. Legacy wheels have no phase.
+        let phase = event.momentumPhase.isEmpty ? event.phase : event.momentumPhase
+        if phase.isEmpty || phase.contains(.began) || phase.contains(.changed),
+            event.scrollingDeltaX != 0 || event.scrollingDeltaY != 0
+        {
+            motionHold?.cancel(.scroll)
+        }
         guard magnification <= minMagnification + 0.001 else {
             super.scrollWheel(with: event)
             return
@@ -446,6 +511,11 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func magnify(with event: NSEvent) {
+        if event.phase.isEmpty || event.phase.contains(.began) || event.phase.contains(.changed),
+            event.magnification != 0
+        {
+            motionHold?.cancel(.pinch)
+        }
         let atBase = magnification <= minMagnification + 0.001
         // Intercept only a pinch-OUT that starts at fit-scale - otherwise let the scroll view zoom.
         guard atBase, pinchDismiss.claims(magnification: event.magnification) else {

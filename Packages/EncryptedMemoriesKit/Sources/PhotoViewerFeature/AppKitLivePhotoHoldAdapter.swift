@@ -1,0 +1,105 @@
+import AppKit
+import PhotoViewerCore
+
+/// A touch-only press that coexists with native recognizers and cancels when another interaction takes over.
+@MainActor
+class AppKitLivePhotoHoldAdapter: NSPressGestureRecognizer, NSGestureRecognizerDelegate {
+    var onStart: (() -> Void)?
+    var onStop: (() -> Void)?
+    /// Recognized text uses photo coordinates and excludes only the initial press.
+    var textOwnsPoint: (NSPoint) -> Bool = { _ in false }
+    var textIsSelected: () -> Bool = { false }
+    private(set) var policy = LivePhotoHoldPolicy()
+    private var holdOrigin: NSPoint?
+
+    init() {
+        super.init(target: nil, action: nil)
+        target = self
+        action = #selector(pressed)
+        delegate = self
+        name = "LivePhotoHold"
+        allowedTouchTypes = .direct
+        buttonMask = 0
+        numberOfTouchesRequired = 1
+        minimumPressDuration = LivePhotoHoldPolicy.minimumPressDuration
+        // With no mouse buttons in the mask, NSPress derives no mouse delays; other delays default to false.
+        if #available(macOS 27.0, *) { isCancellableByScrollGesture = true }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: NSGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+    ) -> Bool { true }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
+        !textIsSelected() && !textOwnsPoint(gestureRecognizer.location(in: view))
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: NSGestureRecognizer, shouldReceive touch: NSTouch) -> Bool {
+        if holdOrigin == nil, touch.type == .direct, let view {
+            holdOrigin = view.convert(touch.location(in: view), to: nil)
+        }
+        return true
+    }
+
+    override func reset() {
+        super.reset()
+        holdOrigin = nil
+    }
+
+    @objc private func pressed() { consume(state, at: location(in: nil)) }
+
+    /// Points are in window coordinates, independent of the image magnification.
+    func consume(_ state: NSGestureRecognizer.State, at point: NSPoint) {
+        if state == .changed, let origin = holdOrigin,
+            hypot(point.x - origin.x, point.y - origin.y) > allowableMovement
+        {
+            // NSPress has no movement limit after recognition, so stop a moving hold explicitly.
+            cancel(.pan)
+            return
+        }
+        let event: LivePhotoHoldPolicy.Event
+        switch state {
+        case .began:
+            if holdOrigin == nil { holdOrigin = point }
+            event = .began
+        case .changed: event = .changed
+        case .ended: event = .ended
+        case .cancelled: event = .cancelled
+        case .failed: event = .failed
+        default: event = .possible
+        }
+        let action = policy.consume(event, textIsSelected: textIsSelected())
+        action?.deliver(start: onStart, stop: onStop)
+    }
+
+    func updateCallbacks(start: (() -> Void)?, stop: (() -> Void)?) {
+        if start == nil { cancel(.cancelled, afterViewUpdate: true) }
+        onStart = start
+        onStop = stop
+        setEnabled(start != nil)
+    }
+
+    func cancel(_ event: LivePhotoHoldPolicy.Event, afterViewUpdate: Bool = false) {
+        let action = policy.consume(event)
+        if afterViewUpdate {
+            let start = onStart
+            let stop = onStop
+            DispatchQueue.main.async { action?.deliver(start: start, stop: stop) }
+        } else {
+            action?.deliver(start: onStart, stop: onStop)
+        }
+        // Disabling cancels a gesture currently being recognized.
+        // Toggle enabled to request a reset of a press that may still be waiting for its threshold.
+        let enabled = isEnabled
+        setEnabled(false)
+        setEnabled(enabled)
+    }
+
+    private func setEnabled(_ value: Bool) {
+        if isEnabled != value { isEnabled = value }
+    }
+}

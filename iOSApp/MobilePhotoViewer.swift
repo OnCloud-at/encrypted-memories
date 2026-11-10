@@ -2542,7 +2542,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         if onMotionStart != nil {
             let longPress = UILongPressGestureRecognizer(
                 target: context.coordinator, action: #selector(Coordinator.handleLongPress(_:)))
-            longPress.minimumPressDuration = 0.3
+            longPress.minimumPressDuration = LivePhotoHoldPolicy.minimumPressDuration
             longPress.delegate = context.coordinator
             scrollView.addGestureRecognizer(longPress)
             context.coordinator.motionPress = longPress
@@ -2603,7 +2603,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         weak var motionPress: UILongPressGestureRecognizer?
         private var liveTextInteraction: ImageAnalysisInteraction?
         private var dismissPanActive = false
-        private var motionActive = false
+        private var motionHold = LivePhotoHoldPolicy()
         private var updatingZoomGeometry = false
         private var lastZoomViewport: CGSize = .zero
         private var lastZoomMediaSize: CGSize = .zero
@@ -2623,21 +2623,19 @@ struct MobileZoomableImage: UIViewRepresentable {
             self.reduceMotion = reduceMotion
         }
 
-        /// Live Photo playback: begin on the long-press threshold, end on release/cancel. The `motionActive`
-        /// guard means a stray terminal state without a matching `.began` can never fire a spurious stop.
+        /// UIKit supplies recognizer states; the shared policy owns playback transitions.
         @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
+            let event: LivePhotoHoldPolicy.Event
             switch gesture.state {
-            case .began:
-                motionActive = true
-                onMotionStart?()
-            case .ended, .cancelled, .failed:
-                if motionActive {
-                    motionActive = false
-                    onMotionStop?()
-                }
-            default:
-                break
+            case .began: event = .began
+            case .changed: event = .changed
+            case .ended: event = .ended
+            case .cancelled: event = .cancelled
+            case .failed: event = .failed
+            default: event = .possible
             }
+            let action = motionHold.consume(event)
+            action?.deliver(start: onMotionStart, stop: onMotionStop)
         }
 
         /// Keeps UIKit's zoom document equal to the actual fitted media, rather than the whole viewport.
