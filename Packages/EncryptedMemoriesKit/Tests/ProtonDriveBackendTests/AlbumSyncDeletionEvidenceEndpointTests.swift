@@ -43,7 +43,8 @@ extension DriveSessionStubSuite {
             StubURLProtocol.reset()
             let driveSession = session()
             let client = try await ProtonDriveClient(
-                configuration: ProtonDriveClientConfiguration(baseURL: "https://fixture.invalid/", clientUID: "fixture"),
+                configuration: ProtonDriveClientConfiguration(
+                    baseURL: "https://fixture.invalid/", clientUID: "fixture"),
                 httpClient: SDKHttpClient(
                     driveSession: driveSession, requestGovernor: ProtonRequestGovernor(),
                     urlProtocolClasses: [StubURLProtocol.self]),
