@@ -13,10 +13,11 @@ final class PhotoBackupProcessingAttempt {
     /// The work of this window. Expiration cancels it, so a pass that still waits for the first network path ends.
     var work: Task<Void, Never>?
     private let protection: BackgroundBackupRunProtection
-    private let endShortGrace: @MainActor () -> Void
+    /// The window carries one run at a time. After the pass it took over, it can run a pass of its own for the person's
+    /// retry and holds that run instead. A new hold ends the short grace that a pass began before: the window carries the
+    /// run from then on, and the grace would only warn and hold.
+    private let hold: BackgroundBackupRunHold
     private weak var controller: PhotoLibraryBackupController?
-    private var protectionToken: UUID?
-    private var protectedRunID: String?
     #if DEBUG
         var beforeRunAdmissionForTesting: ((String) -> Void)?
         private(set) var cancellationReleaseEndedForTesting = false
@@ -27,14 +28,14 @@ final class PhotoBackupProcessingAttempt {
         endShortGrace: @escaping @MainActor () -> Void = { PhotoBackupBackgroundGrace.shared.end() }
     ) {
         self.protection = protection
-        self.endShortGrace = endShortGrace
+        hold = BackgroundBackupRunHold(protection: protection, onHold: endShortGrace)
     }
 
     func run(controller: PhotoLibraryBackupController) async -> BackgroundCatchUpEnd {
         guard !didExpire, !Task.isCancelled else { return .done }
         self.controller = controller
         defer {
-            releaseProtection()
+            hold.release()
             runID = nil
             self.controller = nil
         }
@@ -47,23 +48,23 @@ final class PhotoBackupProcessingAttempt {
                         self.beforeRunAdmissionForTesting?(runID)
                     #endif
                     if self.didExpire || Task.isCancelled {
-                        self.releaseProtection()
+                        self.hold.release()
                         if !self.protection.isProtected(owner: controller, runID: runID) {
                             controller.stopBackgroundWindowRun(runID: runID)
                         }
                     } else {
-                        self.holdProtection(controller: controller, runID: runID)
+                        self.hold.hold(owner: controller, runID: runID)
                     }
                 },
                 onRunAdmitted: { runID in
                     // The run starts for this window, and a waiting window resumes only later: the short grace can
                     // expire before that, so the protection begins now. `onRunStarted` decides whether the run stays.
                     guard !self.didExpire else { return }
-                    self.holdProtection(controller: controller, runID: runID)
+                    self.hold.hold(owner: controller, runID: runID)
                 })
         } onCancel: {
             Task { @MainActor in
-                self.releaseProtection()
+                self.hold.release()
                 #if DEBUG
                     self.cancellationReleaseEndedForTesting = true
                 #endif
@@ -73,7 +74,7 @@ final class PhotoBackupProcessingAttempt {
 
     func expire() {
         didExpire = true
-        releaseProtection()
+        hold.release()
         work?.cancel()
         if let controller, let runID, !protection.isProtected(owner: controller, runID: runID) {
             controller.stopBackgroundWindowRun(runID: runID)
@@ -84,22 +85,6 @@ final class PhotoBackupProcessingAttempt {
     func noteRefreshRun(controller: PhotoLibraryBackupController?, runID: String) {
         self.runID = runID
         if didExpire { controller?.stopBackgroundWindowRun(runID: runID) }
-    }
-
-    private func holdProtection(controller: PhotoLibraryBackupController, runID: String) {
-        guard protectedRunID != runID else { return }
-        // After the pass it took over, a window can run a pass of its own for the person's retry; it protects that run.
-        releaseProtection()
-        protectionToken = protection.hold(owner: controller, runID: runID)
-        protectedRunID = runID
-        // The window carries the run from now on; a short grace that a pass began before would only warn and hold.
-        endShortGrace()
-    }
-
-    private func releaseProtection() {
-        if let protectionToken { protection.release(protectionToken) }
-        protectionToken = nil
-        protectedRunID = nil
     }
 }
 
