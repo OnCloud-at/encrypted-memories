@@ -93,6 +93,8 @@ public final class PhotoLibraryBackupController {
         var makeChangeMonitor: (URL) -> PhotoLibraryChangeMonitor = { PhotoLibraryChangeMonitor(tokenURL: $0) }
         /// The device log of passes and background windows; tests record it.
         var backgroundLog: BackgroundWorkLog = .system
+        /// The installed build. A new build reopens the photos that Proton refused until the backup stopped.
+        var appBuild: String? = AppBuildInfo().build
         var currentAccessState: () -> PhotoBackupAccessState = PhotoLibraryAuthorization.currentState
         var changeSleep: @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
         /// How often a pass renews its execution lock. The lease lets a crashed owner go after 120 s.
@@ -123,6 +125,8 @@ public final class PhotoLibraryBackupController {
 
     private static let enabledDefaultsKey = "photoBackup.enabled.v1"
     private static let userPausedDefaultsKey = "photoBackup.userPaused.v1"
+    /// The build that last reopened the photos that Proton refused until the backup stopped.
+    static let refusalReopenBuildDefaultsKey = "photoBackup.refusalReopenBuild.v1"
     static let queueDatabaseFileName = "photo-backup-sync-queue-v1.sqlite"
     static let stateDatabaseFileName = "photo-backup-state-v1.sqlite"
     static let catalogDatabaseFileName = "photo-library-catalog-v1.sqlite"
@@ -217,6 +221,7 @@ public final class PhotoLibraryBackupController {
     private let currentAccessState: () -> PhotoBackupAccessState
     private let changeSleep: @Sendable (UInt64) async throws -> Void
     private let defaults: UserDefaults
+    private let appBuild: String?
     private let runtimeSignals: BackupRuntimeSignalSource
     private let retryPolicy: BackupRetryPolicy
     private var statusSetupTask: Task<Void, Never>?
@@ -363,6 +368,7 @@ public final class PhotoLibraryBackupController {
         self.pendingStore = pendingStore
         self.requiresPendingStore = requiresPendingStore
         defaults = configuration.defaults
+        appBuild = configuration.appBuild
         let runtimeSignals = configuration.runtimeSignals
         self.runtimeSignals = runtimeSignals
         bulkPolicyPaused = BackupThrottlePolicy().maxConcurrentItems(for: runtimeSignals.current()) == 0
@@ -1081,6 +1087,31 @@ public final class PhotoLibraryBackupController {
         }
     }
 
+    /// A new build can change what the backup sends, so each photo that Proton refused until the backup stopped gets
+    /// one more round under it; its refusal rounds stay, so the next refusal stops it again. The build is recorded only
+    /// after every reopen write succeeded: a failed read or write tries again at the next launch.
+    func reopenStoppedRefusals(in queueStore: UploadBackupSyncQueueManifestStore, at date: Date) {
+        guard let appBuild, defaults.string(forKey: Self.refusalReopenBuildDefaultsKey) != appBuild else { return }
+        var stopped: [UploadBackupSyncQueueEntry] = []
+        do {
+            try queueStore.decisionForEachProblemEntry { entry in
+                if entry.state == .failedPermanent,
+                    BackupIssueRecord.decode(entry.lastError)?.serviceRejection?.stopsRetrying == true
+                {
+                    stopped.append(entry)
+                }
+                return true
+            }
+        } catch {
+            return
+        }
+        for entry in stopped {
+            // A row that the runner or the person changed meanwhile keeps its new state; the marker stays unwritten.
+            guard queueStore.reopenForUserRetry(entry, attempts: 0, updatedAt: date) else { return }
+        }
+        defaults.set(appBuild, forKey: Self.refusalReopenBuildDefaultsKey)
+    }
+
     /// Re-dates only rows the person can resolve. Automatic backoff and every reason stay intact.
     public func retryUserResolvableWork() async {
         guard let queueStore else { return }
@@ -1337,6 +1368,7 @@ public final class PhotoLibraryBackupController {
         if !didAutoRetryFailedThisLaunch {
             didAutoRetryFailedThisLaunch = true
             queueStore.requeueFailed(updatedAt: Date())
+            reopenStoppedRefusals(in: queueStore, at: Date())
         }
         logPassStart(owner: owner, scanOnly: scanOnly)
 
