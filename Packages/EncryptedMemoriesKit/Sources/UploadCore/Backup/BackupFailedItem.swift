@@ -58,8 +58,9 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
             id: "\(entry.source.kind.rawValue)/\(entry.source.identifier)/\(entry.source.resource.rawValue)"
                 + "#\(entry.revision.rawValue)",
             filename: entry.originalFilename, reason: outcome.reason, isPermanent: outcome.isPermanent,
-            issue: outcome.issue, nextAttemptAt: Self.effectiveNextAttempt(record, entry: entry), source: entry.source,
-            revision: entry.revision, category: outcome.category, technicalDetail: record?.detail ?? entry.lastError)
+            issue: outcome.issue, nextAttemptAt: Self.effectiveNextAttempt(record, entry: entry),
+            isRetryable: outcome.isRetryable, source: entry.source, revision: entry.revision,
+            category: outcome.category, technicalDetail: record?.detail ?? entry.lastError)
     }
 
     /// A manual retry makes a row due before the date that its reason names; the row's own date then wins.
@@ -74,6 +75,8 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
     /// read), and of a row whose file Photos reports as missing. The runner counts the waits of each separately.
     static let sourceUnavailableDetail = "backup.issue_source_unavailable"
     static let sourceReportedMissingDetail = "backup.issue_source_unavailable.reported_missing"
+    /// The detail of a row whose photo the camera still processes.
+    static let sourceNotReadyDetail = "error.upload_source_not_ready"
 
     static func isWaitingForPhotos(_ detail: String?) -> Bool {
         detail == sourceUnavailableDetail || detail == sourceReportedMissingDetail

@@ -1,9 +1,10 @@
 import Foundation
 import PhotosCore
 
-/// What a person sees for one backup item: its section, its reason, and whether a retry can help. This is the one
-/// place that decides it, for queue rows and for reasons without a row (Album Sync rows and their last-run file).
-/// Presentation only: it never changes queue eligibility or automatic retry policy.
+/// What a person sees for one stored queue row: its section, its reason, and whether a retry can help. For a reason
+/// without a row it supplies the category and retry fallback; Album Sync applies its own context rule on top
+/// (`AlbumSyncProblemList.albumItem`). The category also selects the rows that Try again reopens; it never changes
+/// automatic retry policy.
 public struct BackupItemOutcome: Sendable, Equatable {
     public let issue: BackupIssueKind
     public let category: BackupIssueCategory
@@ -26,7 +27,7 @@ public struct BackupItemOutcome: Sendable, Equatable {
         let waitsForOriginal = BackupFailedItem.isWaitingForOriginal(detail)
         let waitsForPhotos = BackupFailedItem.isWaitingForPhotos(detail)
         let isSourceWait =
-            issue == .unknown && (detail == "error.upload_source_not_ready" || waitsForOriginal || waitsForPhotos)
+            issue == .unknown && (detail == BackupFailedItem.sourceNotReadyDetail || waitsForOriginal || waitsForPhotos)
         // A failed row is no longer planned by the app: whatever its cause, only the person's retry runs it again.
         let isManualRetry = state == .failed && (Self.category(of: issue) == .automatic || issue == .unknown)
         let isPermanentState = state == .sourceMissing || state == .failedPermanent
