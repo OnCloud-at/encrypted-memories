@@ -264,6 +264,11 @@ public final class TimelineViewModel {
     /// Whole-library crawl setup is background work. Keep it cancellable and outside the cached-token/visible
     /// launch path so checkpoint I/O and UID ordering never hold the launch veil up.
     @ObservationIgnored private var prefetchStartTask: Task<Void, Never>?
+    /// This model starts the whole-library crawl once. It does not restart it for a later photo: that photo reaches the
+    /// feed through the host's incremental update coordinator (`TimelineRefreshResult.addedUIDs`). The feed itself still
+    /// restarts its crawl when the source scope changes (`ThumbnailFeedCore.reconcile`). A route crawl replaces the
+    /// crawl list; All Photos then starts the whole-library crawl again.
+    @ObservationIgnored private var wholeLibraryCrawlIsCurrent = false
     /// Indexed view of the same `.all` projection. It is built together with the normalized sections off-main,
     /// then retained so Map/viewer lookups never rebuild a whole-library dictionary on the main actor.
     @ObservationIgnored private var wholeLibrarySnapshot = TimelineSnapshot()
@@ -432,7 +437,7 @@ public final class TimelineViewModel {
             if items != allItems {
                 allItems = items
                 state = items.isEmpty ? .empty : .loaded(sections)
-                await feed.startPrefetch(ThumbnailCrawlOrder.newestToOldest(items))
+                await startRouteCrawl(items)
             } else if case .loaded = state {
                 // identical to what we already showed from cache - nothing to do
             } else {
@@ -506,7 +511,7 @@ public final class TimelineViewModel {
             : [TimelineSection(id: sectionID, date: items.first?.captureTime ?? .distantPast, title: "", items: items)]
         allItems = items
         state = items.isEmpty ? .empty : .loaded(sections)
-        await feed.startPrefetch(ThumbnailCrawlOrder.newestToOldest(items))
+        await startRouteCrawl(items)
     }
 
     /// Resolves map UID lists against the last known whole-library snapshot. This keeps Map taps independent
@@ -874,12 +879,11 @@ public final class TimelineViewModel {
         state = .failed(message, retryable: initialLibraryLoadState.failure?.retryable ?? true)
     }
 
-    /// Show `.all` content and restart the thumbnail crawl only when the flattened item sequence differs from
-    /// the displayed sequence. The `.loaded`/`.empty` guard lets the first empty load leave `.loading`.
+    /// Show `.all` content when the flattened item sequence differs from the displayed sequence, and start the
+    /// whole-library crawl when none is current. The `.loaded`/`.empty` guard lets the first empty load leave `.loading`.
     private func applyAllContent(_ projection: TimelineContentProjection) async {
-        let gridChanged = projection.uids != wholeLibraryUIDs
         updateAllRouteSnapshot(projection)
-        await displayAllContent(projection.sections, restartPrefetch: gridChanged)
+        await displayAllContent(projection.sections)
     }
 
     /// Makes a current whole-library result the whole library for location work, the viewer and the Map while another
@@ -890,7 +894,7 @@ public final class TimelineViewModel {
     }
 
     /// Re-publishes already retained `.all` sections without rebuilding their canonical snapshot/index.
-    private func displayAllContent(_ sections: [TimelineSection], restartPrefetch: Bool = true) async {
+    private func displayAllContent(_ sections: [TimelineSection]) async {
         let settled: Bool
         switch state {
         case .loaded, .empty: settled = true
@@ -904,12 +908,13 @@ public final class TimelineViewModel {
         allItems = items
         state = items.isEmpty ? .empty : .loaded(sections)
         noteRefresh("applied")
-        if restartPrefetch {
-            scheduleThumbnailPrefetch(items)
-        }
+        scheduleThumbnailPrefetch(items)
     }
 
+    /// Starts the whole-library crawl unless one is current. An empty library does not use up the start.
     private func scheduleThumbnailPrefetch(_ items: [PhotoItem]) {
+        guard !items.isEmpty, !wholeLibraryCrawlIsCurrent else { return }
+        wholeLibraryCrawlIsCurrent = true
         prefetchStartTask?.cancel()
         let feed = self.feed
         prefetchStartTask = Task {
@@ -919,6 +924,14 @@ public final class TimelineViewModel {
             guard !Task.isCancelled else { return }
             await feed.startPrefetch(uids)
         }
+    }
+
+    /// Crawls the photos of another route. This replaces the crawl list, so All Photos starts the whole-library crawl
+    /// again later. A whole-library start that is still being prepared is cancelled; it would replace this route crawl.
+    private func startRouteCrawl(_ items: [PhotoItem]) async {
+        wholeLibraryCrawlIsCurrent = false
+        prefetchStartTask?.cancel()
+        await feed.startPrefetch(ThumbnailCrawlOrder.newestToOldest(items))
     }
 
     private func refreshCurrent(uploadedUID: PhotoUID?) async -> TimelineRefreshResult {
@@ -986,8 +999,9 @@ public final class TimelineViewModel {
                 ? wholeLibraryChange?.addedUIDs
                     ?? LibraryInventoryDelta.addedUIDs(previous: previousWholeLibraryUIDs, current: projection.uids)
                 : []
-            let gridChanged =
-                f != .all || (wholeLibraryChange?.identitiesChanged ?? (projection.uids != wholeLibraryUIDs))
+            // Compared before the snapshot below replaces `wholeLibraryUIDs`; only All Photos uses it.
+            let identitiesChanged =
+                f == .all && (wholeLibraryChange?.identitiesChanged ?? (projection.uids != wholeLibraryUIDs))
             allItems = items
             state = items.isEmpty ? .empty : .loaded(sections)
             if f == .all {
@@ -997,8 +1011,10 @@ public final class TimelineViewModel {
                 filterCache.insert(sections, for: f, activeRoute: filter)
             }  // keep the route's instant-revisit view fresh
             noteRefresh("applied")
-            if gridChanged {
-                await feed.startPrefetch(ThumbnailCrawlOrder.newestToOldest(items))
+            if f != .all {
+                await startRouteCrawl(items)
+            } else if identitiesChanged {
+                scheduleThumbnailPrefetch(items)
             }
             let foundItem = uploadedUID.flatMap { uid in items.first { $0.uid == uid } }
             return TimelineRefreshResult(
