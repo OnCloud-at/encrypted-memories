@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// Shared admission, buffered transport and independent one-shot HTTP retry budgets.
 enum BufferedHTTPExecutor {
@@ -65,7 +66,7 @@ enum BufferedHTTPExecutor {
             (data, response) = try await urlSession.data(for: request, delegate: taskDelegate)
         } catch {
             await governor.finish(
-                permit, statusCode: nil, cancelled: ProtonRequestStatusClass.isCancellation(error))
+                permit, statusCode: nil, cancelled: FailureCancellation.isCancellation(error))
             throw error
         }
         guard let http = response as? HTTPURLResponse else {

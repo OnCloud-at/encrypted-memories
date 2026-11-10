@@ -33,9 +33,9 @@ public enum LibraryActionFailureMessage {
     ) -> String? {
         if case .albumCover = action {
             if let specificAlbumReason { return specificAlbumReason }
-            if let underlyingError, isCancellation(underlyingError) { return nil }
+            if let underlyingError, FailureCancellation.isCancellation(underlyingError) { return nil }
         }
-        if isCancellation(error) { return nil }
+        if FailureCancellation.isCancellation(error) { return nil }
         switch action {
         case .albumCover:
             return text(.albumCover)
@@ -45,11 +45,5 @@ public enum LibraryActionFailureMessage {
         case .saveToLibrary:
             return ""
         }
-    }
-
-    /// The one rule for a cancelled library action: Swift's `CancellationError`, or the raw
-    /// `URLError(.cancelled)` that the URLSession transport rethrows. Neither is a failure.
-    static func isCancellation(_ error: any Error) -> Bool {
-        FailureCancellation.isCancellation(error)
     }
 }

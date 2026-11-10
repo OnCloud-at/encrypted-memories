@@ -22,6 +22,7 @@ final class SharedFailureMappingTests: XCTestCase {
         XCTAssertEqual(DragOutStagingFailure.writeFailed("x").failureCause, .unknown)
         XCTAssertEqual(VideoPlaybackError.rangeNotSupported.failureCause, .unknown)
         XCTAssertEqual(VideoPlaybackError.playerItemFailed(detail: nil).failureCause, .unknown)
+        XCTAssertEqual(VideoPlaybackError.unknown(detail: "fixture").failureCause, .unknown)
     }
     func testPartialFavoriteMutationRequiresReconciliation() {
         let uid = PhotoUID(volumeID: "v", nodeID: "n")

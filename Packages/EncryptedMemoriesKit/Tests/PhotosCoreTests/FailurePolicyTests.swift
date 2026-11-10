@@ -1,8 +1,17 @@
+import Foundation
 import XCTest
 
 @testable import PhotosCore
 
 final class FailurePolicyTests: XCTestCase {
+    func testCancellationRequiresURLDomainForNSError() {
+        XCTAssertTrue(FailureCancellation.isCancellation(CancellationError()))
+        XCTAssertTrue(FailureCancellation.isCancellation(URLError(.cancelled)))
+        XCTAssertTrue(FailureCancellation.isCancellation(NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)))
+        XCTAssertFalse(FailureCancellation.isCancellation(NSError(domain: "foreign", code: NSURLErrorCancelled)))
+        XCTAssertFalse(FailureCancellation.isCancellation(URLError(.timedOut)))
+    }
+
     func testSafeReadAndMutationCanBothBeAwaited() {
         let read = FailurePolicy.resolve(.network, situation: .awaitedByPerson, safety: .safeRead)
         XCTAssertEqual(read.retry, .automatic)

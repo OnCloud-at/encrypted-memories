@@ -55,7 +55,7 @@ actor PhotosVolumeBootstrapService {
             do {
                 return try await Self.createContext(session: session, crypto: crypto)
             } catch {
-                if Task.isCancelled || ProtonRequestStatusClass.isCancellation(error) { throw error }
+                if Task.isCancelled || FailureCancellation.isCancellation(error) { throw error }
                 if case .apiError? = error as? ProtonAuthError { throw error }
                 throw PhotosVolumeBootstrapError.creationFailed(underlying: error)
             }
@@ -148,14 +148,14 @@ actor PhotosVolumeBootstrapService {
             // Another signed-in client may have won the cross-device creation race. Accept only
             // an active server result; otherwise preserve the original creation failure.
             let creationError = error
-            if Task.isCancelled || ProtonRequestStatusClass.isCancellation(creationError) {
+            if Task.isCancelled || FailureCancellation.isCancellation(creationError) {
                 throw CancellationError()
             }
             let existing: PhotosShareContext?
             do {
                 existing = try await fetchActiveContext(session: session)
             } catch {
-                if Task.isCancelled || ProtonRequestStatusClass.isCancellation(error) { throw CancellationError() }
+                if Task.isCancelled || FailureCancellation.isCancellation(error) { throw CancellationError() }
                 existing = nil
             }
             try Task.checkCancellation()
