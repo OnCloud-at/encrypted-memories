@@ -15,7 +15,11 @@
         }
 
         #if DEBUG
+            /// Runs only with `BACKUP_PROBLEM_WRITER_MEASURE=1`; writer overlap depends on scheduling.
             func testMeasureConcurrentWriterWaitAtFiveThousandPhotos() async throws {
+                try XCTSkipUnless(
+                    ProcessInfo.processInfo.environment["BACKUP_PROBLEM_WRITER_MEASURE"] == "1",
+                    "set BACKUP_PROBLEM_WRITER_MEASURE=1")
                 let samples = try await Task.detached(priority: .userInitiated) {
                     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
                     defer { try? FileManager.default.removeItem(at: directory) }
