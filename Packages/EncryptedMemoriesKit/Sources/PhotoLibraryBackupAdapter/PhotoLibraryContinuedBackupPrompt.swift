@@ -44,7 +44,9 @@ public enum PhotoLibraryContinuedBackupPrompt {
             case ask
             /// Ask again after this time; the calm time has not passed.
             case wait(Duration)
-            /// Do not ask now.
+            /// Look again soon: something covers the place, or another place asks.
+            case held
+            /// Do not ask: only a change of the backup or the scene can let the place ask.
             case none
         }
 
@@ -76,7 +78,7 @@ public enum PhotoLibraryContinuedBackupPrompt {
         private let marker: Marker
         private let calmDelay: Duration
         /// Since when the scene is active and the place uncovered; nil while it is not, so a set value also says that
-        /// the scene is active and nothing covers the place.
+        /// the scene is active and nothing covers the place, and nil in an active scene says that something covers it.
         private var calmSince: ContinuousClock.Instant?
         private var isActive = false
         private var isCovered = false
@@ -109,8 +111,8 @@ public enum PhotoLibraryContinuedBackupPrompt {
         /// The conditions that cost nothing to read let this place ask, so the view may read the catalog and the
         /// screen. With fewer than `itemsThatAlwaysAsk` photos left, the volume can still decide.
         public func isWaitingToAsk(_ status: BackupStatus, isTaskActive: Bool) -> Bool {
-            isActive && !isPresenting && !isTaskActive && !marker.isSet()
-                && isWorthAsking(status, estimatedBytes: needsVolume(status) ? .max : nil)
+            isActive && !isPresenting
+                && shouldAsk(status, estimatedBytes: needsVolume(status) ? .max : nil, in: situation(isTaskActive))
         }
 
         /// The scene went to the background while the question showed: that counts as "Not Now".
@@ -142,12 +144,13 @@ public enum PhotoLibraryContinuedBackupPrompt {
         public func next(
             _ status: BackupStatus, estimatedBytes: Int64?, isTaskActive: Bool, at now: ContinuousClock.Instant
         ) -> Next {
-            guard !isPresenting, let calmSince else { return .none }
-            let situation = Situation(isTaskActive: isTaskActive, wasAsked: marker.isSet())
-            guard shouldAsk(status, estimatedBytes: estimatedBytes, in: situation) else { return .none }
+            guard !isPresenting, shouldAsk(status, estimatedBytes: estimatedBytes, in: situation(isTaskActive)) else {
+                return .none
+            }
+            guard let calmSince else { return isActive ? .held : .none }
             let calmIn = calmDelay - (now - calmSince)
             if calmIn > .zero { return .wait(calmIn) }
-            guard claim.claim(self) else { return .none }
+            guard claim.claim(self) else { return .held }
             isPresenting = true
             return .ask
         }
@@ -157,6 +160,10 @@ public enum PhotoLibraryContinuedBackupPrompt {
             marker.set(true)
             stopPresenting()
             return accepted
+        }
+
+        private func situation(_ isTaskActive: Bool) -> Situation {
+            Situation(isTaskActive: isTaskActive, wasAsked: marker.isSet())
         }
 
         private func stopPresenting() {
