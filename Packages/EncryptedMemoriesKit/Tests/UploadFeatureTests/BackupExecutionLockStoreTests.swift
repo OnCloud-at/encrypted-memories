@@ -496,6 +496,24 @@ final class BackupExecutionLockStoreTests: XCTestCase {
             ).didAcquire)
     }
 
+    /// Removing the app in the app switcher ends a continued processing task without a callback (#1108). The next start
+    /// reaps the lock of the ended process and keeps the owner as stored.
+    func testAContinuedTaskLockOfAnEndedProcessIsRecoveredOnTheNextStart() throws {
+        let store = try makeStore(lease: 120)
+        XCTAssertTrue(
+            store.acquire(
+                owner: .iOSContinuedTask, runID: "continued", phase: "uploading", processContext: "ios/pid-123"
+            ).didAcquire)
+        XCTAssertEqual(store.currentLock()?.owner.rawValue, "iosContinuedTask")
+        XCTAssertFalse(store.acquire(owner: .foreground, runID: "fg").didAcquire, "the live task keeps the queue")
+
+        let recovered = store.recoverAbandonedProcessLocks(
+            currentProcessContext: "ios/pid-456", isProcessAlive: { pid in pid != 123 })
+
+        XCTAssertEqual(recovered.map(\.owner), [.iOSContinuedTask])
+        XCTAssertTrue(store.acquire(owner: .foreground, runID: "fg").didAcquire)
+    }
+
     func testAbandonedProcessRecoveryDoesNotStealLiveOrUnrelatedLocks() throws {
         let store = try makeStore(lease: 120)
         XCTAssertTrue(
