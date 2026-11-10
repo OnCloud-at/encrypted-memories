@@ -209,7 +209,9 @@ import UploadCore
     @Test func aCoverHoldsTheQuestionAndItsEndStartsTheCalmTimeAgain() {
         let asker = askerAfterTheCalmTime(MarkerBox())
         asker.coverChanged(isCovered: true, at: start + .seconds(1))
-        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(5)) == .none)
+        #expect(
+            asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(5)) == .held,
+            "the place looks at the cover again")
 
         asker.coverChanged(isCovered: false, at: start + .seconds(6))
         #expect(
@@ -236,7 +238,30 @@ import UploadCore
         let first = askerAfterTheCalmTime(marker, claim: claim)
         let second = askerAfterTheCalmTime(marker, claim: claim)
         #expect(first.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .ask)
-        #expect(second.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .none)
+        #expect(
+            second.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .held,
+            "the second place looks again when the first one's question closes")
+    }
+
+    /// A place stops looking when only a change of the backup or the scene can let it ask: it keeps looking only while a
+    /// cover or another place's question holds it.
+    @Test func aBacklogThatTakesTooLittleTimeHoldsNothing() {
+        let asker = askerAfterTheCalmTime(MarkerBox())
+        let short = busy(remaining: 30)
+        #expect(asker.isWaitingToAsk(short, isTaskActive: false), "the volume may still decide")
+        #expect(asker.next(short, estimatedBytes: 30_000_000, isTaskActive: false, at: start + .seconds(3)) == .none)
+
+        asker.coverChanged(isCovered: true, at: start + .seconds(4))
+        #expect(
+            asker.next(short, estimatedBytes: 30_000_000, isTaskActive: false, at: start + .seconds(5)) == .none,
+            "a cover holds only a place that could ask")
+        #expect(
+            asker.next(short, estimatedBytes: 600_000_000, isTaskActive: false, at: start + .seconds(5)) == .held)
+
+        asker.sceneBecameInactive()
+        #expect(
+            asker.next(short, estimatedBytes: 600_000_000, isTaskActive: false, at: start + .seconds(6)) == .none,
+            "an inactive scene waits for its next phase")
     }
 
     @Test func anInactiveSceneDoesNotAskAndClosesNothing() {
