@@ -7,14 +7,17 @@ import Testing
 @Suite @MainActor struct TimelineThumbnailOverlayResolverTests {
     private actor MetadataStub: PhotoMetadataProvider {
         let values: [PhotoUID: Double]
+        let delay: Duration
         private var requested: [PhotoUID] = []
 
-        init(values: [PhotoUID: Double]) {
+        init(values: [PhotoUID: Double], delay: Duration = .zero) {
             self.values = values
+            self.delay = delay
         }
 
         func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
             requested.append(uid)
+            if delay > .zero { try await Task.sleep(for: delay) }
             return PhotoMetadata(durationSeconds: values[uid])
         }
 
@@ -38,7 +41,8 @@ import Testing
         let video = item("video", mime: "video/quicktime")
         let known = item("known", mime: "video/quicktime", duration: 15)
         let photo = item("photo", mime: "image/jpeg")
-        let provider = MetadataStub(values: [video.uid: 42.4])
+        // A slow provider keeps the publication behind the test. A fixed number of yields cannot wait for it.
+        let provider = MetadataStub(values: [video.uid: 42.4], delay: .milliseconds(50))
         let resolver = TimelineThumbnailOverlayResolver(
             items: [video, known, photo],
             settleDelay: .zero,
@@ -46,9 +50,7 @@ import Testing
         )
 
         resolver.noteVisible([photo.uid, known.uid, video.uid], metadataProvider: provider)
-        for _ in 0..<100 where resolver.overlay(for: video.uid).durationText == nil {
-            await Task.yield()
-        }
+        #expect(await waitUntil { @MainActor in resolver.overlay(for: video.uid).durationText != nil })
 
         #expect(resolver.overlay(for: video.uid).durationText == "0:42")
         #expect(resolver.overlay(for: known.uid).durationText == "0:15")
@@ -68,10 +70,7 @@ import Testing
         resolver.noteVisible([first.uid], metadataProvider: provider)
         resolver.noteVisible([second.uid], metadataProvider: provider)
         // This verifies cancellation and identity. Allow scheduler contention without duplicate requests.
-        let timeout = ContinuousClock.now.advanced(by: .seconds(5))
-        while resolver.overlay(for: second.uid).durationText == nil, ContinuousClock.now < timeout {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+        #expect(await waitUntil { @MainActor in resolver.overlay(for: second.uid).durationText != nil })
 
         #expect(resolver.overlay(for: first.uid).durationText == nil)
         #expect(resolver.overlay(for: second.uid).durationText == "0:20")
@@ -80,16 +79,14 @@ import Testing
 
     @Test func itemRefreshKeepsResolvedDurationWhenEnumerationStillOmitsIt() async {
         let video = item("video", mime: "video/quicktime")
-        let provider = MetadataStub(values: [video.uid: 9])
+        let provider = MetadataStub(values: [video.uid: 9], delay: .milliseconds(50))
         let resolver = TimelineThumbnailOverlayResolver(
             items: [video],
             settleDelay: .zero,
             maxConcurrentLoads: 1
         )
         resolver.noteVisible([video.uid], metadataProvider: provider)
-        for _ in 0..<100 where resolver.overlay(for: video.uid).durationText == nil {
-            await Task.yield()
-        }
+        #expect(await waitUntil { @MainActor in resolver.overlay(for: video.uid).durationText != nil })
 
         resolver.update(items: [video])
         #expect(resolver.overlay(for: video.uid).durationText == "0:09")
