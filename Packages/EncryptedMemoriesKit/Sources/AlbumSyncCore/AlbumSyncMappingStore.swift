@@ -80,7 +80,8 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
                     ) == SQLITE_OK)
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_text(stmt, 1, localAlbumID, -1, Self.transient)
+            // A key that does not bind is no proof that the mapping is absent (#1194).
+            do { try connection.bindText(stmt, 1, localAlbumID) } catch { return nil }
             let result = sqlite3_step(stmt)
             if result == SQLITE_DONE { return nil }
             guard connection.requireOperational(result == SQLITE_ROW), let mapping = Self.rowToMapping(stmt) else {
@@ -140,10 +141,15 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
                     ) == SQLITE_OK)
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_text(stmt, 1, mapping.localAlbumID, -1, Self.transient)
-            sqlite3_bind_text(stmt, 2, mapping.remoteAlbumID, -1, Self.transient)
-            sqlite3_bind_text(stmt, 3, mapping.title, -1, Self.transient)
-            sqlite3_bind_text(stmt, 4, mapping.mode.rawValue, -1, Self.transient)
+            // A failed bind leaves its parameter NULL; it records the failure and fails the write (#1194).
+            do {
+                try connection.bindText(stmt, 1, mapping.localAlbumID)
+                try connection.bindText(stmt, 2, mapping.remoteAlbumID)
+                try connection.bindText(stmt, 3, mapping.title)
+                try connection.bindText(stmt, 4, mapping.mode.rawValue)
+            } catch {
+                return false
+            }
             sqlite3_bind_double(stmt, 5, mapping.createdAt.timeIntervalSinceReferenceDate)
             if let synced = mapping.lastSyncedAt {
                 sqlite3_bind_double(stmt, 6, synced.timeIntervalSinceReferenceDate)
@@ -208,8 +214,13 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
                     ) == SQLITE_OK)
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_text(stmt, 1, selection.localAlbumID, -1, Self.transient)
-            sqlite3_bind_text(stmt, 2, selection.title, -1, Self.transient)
+            // A failed bind leaves its parameter NULL; it records the failure and fails the write (#1194).
+            do {
+                try connection.bindText(stmt, 1, selection.localAlbumID)
+                try connection.bindText(stmt, 2, selection.title)
+            } catch {
+                return false
+            }
             sqlite3_bind_double(stmt, 3, selection.addedAt.timeIntervalSinceReferenceDate)
             return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
@@ -226,14 +237,13 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
                 )
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_text(stmt, 1, localAlbumID, -1, Self.transient)
+            // A key that does not bind removes nothing; that is no successful removal (#1194).
+            do { try connection.bindText(stmt, 1, localAlbumID) } catch { return false }
             return connection.requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
     }
 
     // MARK: Row mapping
-
-    private static let transient = SQLiteStoreSchemaGate.transientDestructor
 
     private static func rowToMapping(_ stmt: OpaquePointer?) -> AlbumSyncMapping? {
         guard let local = sqlite3_column_text(stmt, 0).map({ String(cString: $0) }),
