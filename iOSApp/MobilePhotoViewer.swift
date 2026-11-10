@@ -1478,19 +1478,8 @@ struct MobileImagePage: View {
         .onChange(of: isCurrent) { _, current in
             if !current { cancelZoomDecode() }
         }
-        .onAppear {
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] page appear uid=\(MobileViewerLog.short(item.uid), privacy: .public) current=\(isCurrent) kind=photo"
-                )
-            }
-        }
         .onDisappear {
             cancelZoomDecode()
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] page disappear uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
-            }
             motion.teardown()
         }
     }
@@ -1542,22 +1531,14 @@ struct MobileImagePage: View {
             if thumb == nil { thumb = await imageStore.cachedThumbnail(for: item.uid) }
             if let thumb, !Task.isCancelled, image == nil {
                 _ = installIfNotLowerQuality(thumb)
-                if MobileViewerLog.isEnabled {
-                    MobileViewerLog.logger.notice(
-                        "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=thumbnail")
-                }
             }
         }
         // Load a screen-bounded preview for the current page only.
         guard ViewerImageLoadPolicy.shouldLoadDisplay(distanceFromCurrent: isCurrent ? 0 : 1) else { return }
         if let display = await imageStore.displayImage(for: item.uid, maxPixelSize: cap), !Task.isCancelled,
-            cap >= displayedCap, installIfNotLowerQuality(display, requestedCap: cap)
+            cap >= displayedCap
         {
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=\(display.source, privacy: .public)"
-                )
-            }
+            _ = installIfNotLowerQuality(display, requestedCap: cap)
         }
         await loadFullResolutionLivePhotoStill(maxPixelSize: cap)
         // The full original remains deferred until a settled zoom requests more pixels. Live Photos load the
@@ -1577,11 +1558,6 @@ struct MobileImagePage: View {
         }
         _ = installIfNotLowerQuality(sharp, requestedCap: maxPixelSize)
         isFullResolutionStillReady = true
-        if MobileViewerLog.isEnabled {
-            MobileViewerLog.logger.notice(
-                "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=livePhotoOriginal"
-            )
-        }
     }
 
     /// After zoom settles beyond fit, decode the original at the size this zoom needs and swap it in.
@@ -1599,11 +1575,6 @@ struct MobileImagePage: View {
                 !Task.isCancelled, isCurrent
             else { return }
             _ = installIfNotLowerQuality(sharp, requestedCap: cap)
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=zoomed cap=\(cap)"
-                )
-            }
         }
     }
 
@@ -1623,14 +1594,6 @@ struct MobileImagePage: View {
                 candidateLongestPixelSide: candidate.longestPixelSide
             )
         else {
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    """
-                    [ViewerPerf] reject downgrade uid=\(MobileViewerLog.short(item.uid), privacy: .public) \
-                    currentPx=\(displayedLongestPixelSide) candidatePx=\(candidate.longestPixelSide)
-                    """
-                )
-            }
             return false
         }
         image = candidate.image
@@ -2126,18 +2089,7 @@ private struct MobileVideoPage: View {
             [playbackGeneration] note in
             handleEndNotification(note, generation: playbackGeneration)
         }
-        .onAppear {
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] page appear uid=\(MobileViewerLog.short(item.uid), privacy: .public) current=\(isCurrent) kind=video"
-                )
-            }
-        }
         .onDisappear {
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] page disappear uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
-            }
             teardown()
         }
     }
@@ -2340,10 +2292,6 @@ private struct MobileVideoPage: View {
         defer {
             if playbackActivity !== activity { activity.end() }
         }
-        if MobileViewerLog.isEnabled {
-            MobileViewerLog.logger.notice(
-                "[ViewerPerf] video prepare start uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
-        }
         do {
             let streaming = try await VideoPreparationRetry.run {
                 item.uid.isLocalPending
@@ -2466,25 +2414,7 @@ private struct MobileVideoPage: View {
     ) {
         guard isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem) else { return }
         failure = error
-        detachTransport()
-        playbackGeneration &+= 1
-        playbackAttachment = nil
-        playbackSourceIdentity = nil
-        playbackSourceRevision = nil
-        observedPlayer.pause()
-        observedPlayer.replaceCurrentItem(with: nil)
-        player = nil
-        streamingAsset?.close()
-        streamingAsset = nil
-        playbackActivity?.end()
-        playbackActivity = nil
-        if holdsVideoAudio {
-            VideoAudioSession.end()
-            holdsVideoAudio = false
-        }
-        playbackIsPlaying = false
-        playbackIntendsToPlay = false
-        playbackIsBuffering = false
+        teardown()
     }
 }
 
@@ -2503,7 +2433,7 @@ private struct ViewerDragState {
 }
 
 /// UIScrollView-backed zoomable image: pinch + double-tap to zoom, single-tap toggles chrome. At minimum zoom
-/// the scroll view does not pan, so the enclosing page TabView keeps its swipe - and a pinch-IN at minimum
+/// the scroll view does not pan, so the enclosing page view controller keeps its swipe - and a pinch-IN at minimum
 /// zoom hands the image to the shared pinch-to-close interaction (`ViewerPinchDismissPolicy`): it sticks to
 /// the fingers, springs back below the threshold, closes past it.
 private final class MobileViewerZoomScrollView: UIScrollView {
@@ -2597,7 +2527,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         scrollView.addGestureRecognizer(dismissPinch)
 
         // One-finger drag-to-close begins only on a clearly vertical drag while unzoomed (shared policy +
-        // `gestureRecognizerShouldBegin`), so a horizontal drag falls through to the page TabView's swipe and a
+        // `gestureRecognizerShouldBegin`), so a horizontal drag falls through to the page view controller's swipe and a
         // zoomed image still pans normally. It tracks the finger and closes / springs back on release.
         let dismissPan = UIPanGestureRecognizer(
             target: context.coordinator, action: #selector(Coordinator.handleDismissPan(_:)))
@@ -2837,7 +2767,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         }
 
         /// Gate the dismiss pan so it begins only on a clearly vertical drag while the image is unzoomed - a
-        /// horizontal drag then falls through to the page TabView's paging swipe, and a zoomed image keeps its
+        /// horizontal drag then falls through to the page view controller's paging swipe, and a zoomed image keeps its
         /// scroll-view pan. Every other recognizer begins normally.
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             // A press on recognized text selects it, as in Photos; a press anywhere else plays the Live Photo.
