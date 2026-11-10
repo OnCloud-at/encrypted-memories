@@ -5096,6 +5096,42 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     }
 
+    /// The continued backup prompt estimates a short backlog by the catalog rows of the photos that still send bytes;
+    /// settled rows and rows whose bytes are committed already do not count (#1108).
+    func testTheOutstandingVolumeComesFromTheCatalogRowsOfThePhotosThatStillSendBytes() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-continued-volume", enabled: true)
+        defer { fixture.cleanup() }
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.catalogDatabaseFileName)))
+        let photo = PhotoBackupAssetInfo(
+            localIdentifier: "catalogued-photo", creationDate: nil, modificationDate: Date(timeIntervalSince1970: 200),
+            pixelWidth: 4_000, pixelHeight: 3_000, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+            resources: [.init(role: .originalPhoto, originalFilename: "photo.heic", mimeType: "image/heic")])
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: photo, observedAt: Date())]))
+        catalog.close()
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        func row(_ identifier: String, _ state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry {
+            UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: identifier), revision: .init(rawValue: 1),
+                originalFilename: "\(identifier).heic", state: state, lastError: nil, updatedAt: Date())
+        }
+        XCTAssertTrue(
+            queue.upsertBatch([
+                row("catalogued-photo", .discovered), row("uncatalogued-photo", .uploading),
+                row("committed-photo", .needsRemoteReconciliation), row("done-photo", .completed),
+            ]))
+        queue.close()
+
+        let bytes = await fixture.controller.estimatedOutstandingBytes(limit: 99)
+        XCTAssertEqual(bytes, 12_000_000, "a 12 MP photo of the catalog and an unknown item count as 6 MB each")
+        let tooMany = await fixture.controller.estimatedOutstandingBytes(limit: 1)
+        XCTAssertNil(tooMany, "more photos than the limit: the count decides")
+        await fixture.controller.shutdown()
+    }
+
     func testBackupThatIsOffAtLaunchOrTurnedOffReportsThatNoIndexBuildIsNeeded() async throws {
         let resolver = FakeIdentityResolver()
         let fixture = try makeControllerFixture(prefix: "backup-off-index", enabled: false, identityResolver: resolver)
