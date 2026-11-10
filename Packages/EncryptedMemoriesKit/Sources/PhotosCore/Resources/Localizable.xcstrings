@@ -1509,6 +1509,34 @@
         "de": { "stringUnit": { "state": "translated", "value": "Backup unvollständig" } }
       }
     },
+    "backup.continued_prompt_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Keep backing up in the background?" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Backup im Hintergrund fortsetzen?" } }
+      }
+    },
+    "backup.continued_prompt_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Many photos are still waiting. The backup can continue while you use other apps." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Viele Fotos warten noch. Das Backup kann weiterlaufen, während du andere Apps verwendest." } }
+      }
+    },
+    "backup.continued_prompt_continue": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Continue" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fortsetzen" } }
+      }
+    },
+    "backup.continued_prompt_not_now": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not Now" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht jetzt" } }
+      }
+    },
     "backup.phase_waiting_photos": {
       "extractionState": "manual",
       "localizations": {
