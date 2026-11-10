@@ -1,6 +1,7 @@
 import Foundation
 
-/// Presentation categories do not change queue eligibility or automatic retry policy.
+/// Presentation categories. The category also selects the rows that Try again reopens; it never changes automatic
+/// retry policy.
 public enum BackupIssueCategory: String, Sendable, Equatable {
     case automatic
     case userResolvable
@@ -36,7 +37,8 @@ public enum BackupIssueSection: String, CaseIterable, Sendable, Identifiable {
 
 /// Stable, platform-neutral reason why a backup item is not complete. The queue persists this code
 /// alongside the human-readable backend detail so scheduling and UI never have to parse localized
-/// text to decide whether work is retryable or needs the user.
+/// text to decide whether work is retryable or needs the user, except the two legacy waiting-original sentences of
+/// older builds.
 public enum BackupIssueKind: String, Codable, Sendable, Equatable {
     case network
     case deviceStorage
@@ -56,24 +58,6 @@ public enum BackupIssueKind: String, Codable, Sendable, Equatable {
     public init(from decoder: any Decoder) throws {
         let value = try decoder.singleValueContainer().decode(String.self)
         self = Self(rawValue: value) ?? .unknown
-    }
-
-    public var category: BackupIssueCategory {
-        switch self {
-        case .network, .deviceStorage, .remoteDraft, .remoteService: .automatic
-        case .accountStorage, .permission, .localState, .unknown: .userResolvable
-        case .remoteDeletion, .deletedElsewhere: .decision
-        case .remoteDraftStale, .sourceMissing, .unsupported: .permanent
-        }
-    }
-
-    public var isRetryable: Bool {
-        switch self {
-        case .remoteDraftStale, .sourceMissing, .permission, .unsupported, .remoteDeletion, .deletedElsewhere:
-            false
-        default:
-            true
-        }
     }
 }
 

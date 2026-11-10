@@ -37,7 +37,8 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         category: BackupIssueCategory? = nil,
         technicalDetail: String? = nil
     ) {
-        self.category = category ?? issue.category
+        let outcome = BackupItemOutcome(issue: issue)
+        self.category = category ?? outcome.category
         self.technicalDetail = technicalDetail
         self.id = id
         self.filename = filename
@@ -45,57 +46,21 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         self.isPermanent = isPermanent || self.category == .permanent
         self.issue = issue
         self.nextAttemptAt = nextAttemptAt
-        self.isRetryable = isRetryable ?? (!self.isPermanent && issue.isRetryable)
+        self.isRetryable = isRetryable ?? (!self.isPermanent && outcome.isRetryable)
         self.source = source
         self.revision = revision
     }
 
     public init(entry: UploadBackupSyncQueueEntry) {
         let record = BackupIssueRecord.decode(entry.lastError)
-        let issue = record?.kind ?? Self.defaultIssue(for: entry.state)
-        let waitingKey = record?.detail
-        let waitsForOriginal = Self.isWaitingForOriginal(waitingKey)
-        let waitsForPhotos = Self.isWaitingForPhotos(waitingKey)
-        let isSourceWait =
-            issue == .unknown
-            && (waitingKey == "error.upload_source_not_ready" || waitsForOriginal || waitsForPhotos)
-        // A failed row is no longer planned by the app: whatever its cause, only the person's retry runs it again.
-        let isManualRetry = entry.state == .failed && (issue.category == .automatic || issue == .unknown)
-        let isPermanentState = entry.state == .sourceMissing || entry.state == .failedPermanent
-        let category: BackupIssueCategory
-        if isPermanentState {
-            category = issue == .deletedElsewhere ? .decision : .permanent
-        } else if isSourceWait || (issue == .unknown && entry.state != .failed) {
-            category = .automatic
-        } else if isManualRetry {
-            category = .userResolvable
-        } else {
-            category = issue.category
-        }
-        let reason: String
-        if category == .permanent && issue.category != .permanent {
-            reason = L10n.string("backup.issue_permanent")
-        } else if isSourceWait {
-            reason =
-                waitsForOriginal
-                ? L10n.string("backup.issue_waiting_original")
-                : waitsForPhotos
-                    ? L10n.string("backup.issue_source_unavailable") : L10n.string("backup.issue_source_not_ready")
-        } else if issue == .unknown && category == .automatic {
-            reason = L10n.string("backup.issue_unknown_waiting")
-        } else if isManualRetry && issue == .unknown {
-            reason = L10n.string("backup.fail_reason_generic")
-        } else {
-            reason = Self.localizedReason(for: issue)
-        }
+        let outcome = BackupItemOutcome(state: entry.state, record: record)
         self.init(
             id: "\(entry.source.kind.rawValue)/\(entry.source.identifier)/\(entry.source.resource.rawValue)"
                 + "#\(entry.revision.rawValue)",
-            filename: entry.originalFilename, reason: reason,
-            isPermanent: isPermanentState,
-            issue: issue, nextAttemptAt: Self.effectiveNextAttempt(record, entry: entry), source: entry.source,
-            revision: entry.revision,
-            category: category, technicalDetail: record?.detail ?? entry.lastError)
+            filename: entry.originalFilename, reason: outcome.reason, isPermanent: outcome.isPermanent,
+            issue: outcome.issue, nextAttemptAt: Self.effectiveNextAttempt(record, entry: entry),
+            isRetryable: outcome.isRetryable, source: entry.source, revision: entry.revision,
+            category: outcome.category, technicalDetail: record?.detail ?? entry.lastError)
     }
 
     /// A manual retry makes a row due before the date that its reason names; the row's own date then wins.
@@ -110,6 +75,8 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
     /// read), and of a row whose file Photos reports as missing. The runner counts the waits of each separately.
     static let sourceUnavailableDetail = "backup.issue_source_unavailable"
     static let sourceReportedMissingDetail = "backup.issue_source_unavailable.reported_missing"
+    /// The detail of a row whose photo the camera still processes.
+    static let sourceNotReadyDetail = "error.upload_source_not_ready"
 
     static func isWaitingForPhotos(_ detail: String?) -> Bool {
         detail == sourceUnavailableDetail || detail == sourceReportedMissingDetail
@@ -123,34 +90,6 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
             "Das bearbeitete Foto wartet auf seine Originalressourcen. "
                 + "Das Backup versucht es automatisch erneut.",
         ].contains(detail ?? "")
-    }
-
-    private static func defaultIssue(for state: UploadBackupSyncQueueState) -> BackupIssueKind {
-        switch state {
-        case .sourceMissing: .sourceMissing
-        case .blockedByDraft: .remoteDraft
-        case .failedPermanent: .remoteDraftStale
-        case .skippedRemoteDeletion: .remoteDeletion
-        default: .unknown
-        }
-    }
-
-    private static func localizedReason(for issue: BackupIssueKind) -> String {
-        switch issue {
-        case .network: L10n.string("backup.issue_network")
-        case .deviceStorage: L10n.string("backup.issue_device_storage")
-        case .remoteDraft: L10n.string("backup.issue_remote_draft")
-        case .remoteDraftStale: L10n.string("backup.issue_remote_draft_stale")
-        case .sourceMissing: L10n.string("backup.issue_source_missing")
-        case .permission: L10n.string("backup.issue_permission")
-        case .unsupported: L10n.string("backup.issue_unsupported")
-        case .remoteService: L10n.string("backup.issue_remote_service")
-        case .localState: L10n.string("backup.error_local_state_unavailable")
-        case .remoteDeletion: L10n.string("backup.state_skipped_remote_deletion")
-        case .deletedElsewhere: L10n.string("backup.issue_deleted_elsewhere")
-        case .accountStorage: L10n.string("backup.issue_account_storage")
-        case .unknown: L10n.string("backup.fail_reason_generic")
-        }
     }
 }
 

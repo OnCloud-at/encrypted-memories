@@ -57,11 +57,11 @@ public enum AlbumSyncProblemList {
         if let problem = backup.problems[identifier], problem.issue == .remoteDeletion {
             return albumItem(from: problem)
         }
+        let outcome = BackupItemOutcome(issue: .remoteDeletion)
         return BackupFailedItem(
             id: "album/\(identifier)",
             filename: backup.filenames[identifier] ?? L10n.string("albumsync.issue_photo_fallback"),
-            reason: L10n.string("backup.state_skipped_remote_deletion"), isPermanent: false,
-            issue: .remoteDeletion, isRetryable: false,
+            reason: outcome.reason, isPermanent: false, issue: outcome.issue,
             source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier))
     }
 

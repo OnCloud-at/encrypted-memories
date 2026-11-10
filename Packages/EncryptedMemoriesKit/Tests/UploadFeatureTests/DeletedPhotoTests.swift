@@ -187,7 +187,7 @@ final class DeletedPhotoTests: XCTestCase {
             "encryptedmemories-backup-issue-v1:"
             + "eyJraW5kIjoiZGVsZXRlZEVsc2V3aGVyZSIsImRldGFpbCI6IlJlbW92ZWQiLCJhdXRvbWF0aWNSZXRyeUF0dGVtcHQiOjB9"
         XCTAssertEqual(BackupIssueRecord.decode(knownValue)?.kind, .deletedElsewhere)
-        XCTAssertFalse(BackupIssueKind.deletedElsewhere.isRetryable)
+        XCTAssertFalse(BackupItemOutcome(issue: .deletedElsewhere).isRetryable)
     }
 
     func testRunnerDefersWithoutSuccessThenParksAndInvalidatesOncePerPass() async throws {

@@ -2482,7 +2482,7 @@ public actor BackupSyncRunner {
             deferSource(
                 entry, from: oldState, until: recheck,
                 issue: BackupIssueRecord(
-                    kind: .unknown, detail: "error.upload_source_not_ready", nextAttemptAt: recheck))
+                    kind: .unknown, detail: BackupFailedItem.sourceNotReadyDetail, nextAttemptAt: recheck))
             return
         }
         // Photos cannot hand out the file yet: it waits for iCloud, an offline library volume, or an interrupted read.
