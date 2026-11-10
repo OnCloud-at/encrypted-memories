@@ -147,7 +147,7 @@ struct TestMLVectorCipher: MLVectorCipher {
             let loaded = store.vectorBlock(for: descriptorV1)
             #expect(loaded.uids == [uid("a0")])
             // Rows persist as binary16: the round trip returns the fp16-quantized values.
-            let expected = ContiguousArray<Float32>([0.1, 0.2, 0.3, 0.4].map(MLFloat16Codec.quantized))
+            let expected = ContiguousArray<Float32>([0.1, 0.2, 0.3, 0.4].map(quantizedFloat16))
             #expect(loaded.vectors == [expected])
             for (stored, original) in zip(loaded.vector(at: 0), [0.1, 0.2, 0.3, 0.4] as [Float32]) {
                 #expect(abs(stored - original) <= abs(original) * 0.001)

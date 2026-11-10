@@ -149,7 +149,7 @@ import Testing
         let currentOCR = try identity(stage: "ocr", revision: "revision3", output: output)
         let unchangedBarcode = try identity(stage: "barcodes", revision: "revision1", output: .barcodePayload)
         let unrelatedPeople = try MLDerivedArtifactIdentity(
-            pipelineID: .people,
+            pipelineID: .init(rawValue: "people"),
             stageID: .init(rawValue: "faces"),
             producer: .model(id: .init("sface"), revision: "r1", role: .regionEmbedder),
             preprocessingRevision: "face-crop-v1",

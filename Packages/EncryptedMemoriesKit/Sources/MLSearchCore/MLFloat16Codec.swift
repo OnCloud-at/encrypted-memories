@@ -24,27 +24,6 @@ public enum MLFloat16Codec {
         return data
     }
 
-    /// Decode packed little-endian binary16 bytes into a `Float32` vector, or `nil` when the
-    /// byte count does not match `dimension` exactly (corrupt row).
-    public static func decodeLittleEndian(_ bytes: UnsafeRawBufferPointer, dimension: Int) -> ContiguousArray<Float32>?
-    {
-        guard bytes.count == dimension * bytesPerElement else { return nil }
-        var vector = ContiguousArray<Float32>()
-        vector.reserveCapacity(dimension)
-        for index in 0..<dimension {
-            let bits = UInt16(
-                littleEndian: bytes.loadUnaligned(fromByteOffset: index * bytesPerElement, as: UInt16.self))
-            vector.append(float32(fromBits: bits))
-        }
-        return vector
-    }
-
-    /// The value a `Float32` becomes after an encode/decode round trip (quantization oracle
-    /// for parity tests).
-    public static func quantized(_ value: Float32) -> Float32 {
-        float32(fromBits: float16Bits(from: value))
-    }
-
     /// Converts `Float32` to a binary16 bit pattern with round-to-nearest-even, overflow to ±inf, gradual
     /// underflow to subnormals, NaN preserved.
     public static func float16Bits(from value: Float32) -> UInt16 {

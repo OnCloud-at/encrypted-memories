@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import Testing
 
 @testable import MLSearchCore
@@ -55,24 +56,30 @@ import Testing
         let vector = ContiguousArray<Float32>((0..<512).map { Float32($0) / 512 - 0.5 })
         let encoded = MLFloat16Codec.encodeLittleEndian(vector)
         #expect(encoded.count == 512 * MLFloat16Codec.bytesPerElement)
-        let decoded = encoded.withUnsafeBytes { MLFloat16Codec.decodeLittleEndian($0, dimension: 512) }
-        let roundTripped = try #require(decoded)
+        var block = MLVectorBlock(descriptor: .init(identifier: "fixture", version: 1, embeddingDimension: 512))
+        let appended = encoded.withUnsafeBytes {
+            block.append(uid: PhotoUID(volumeID: "v", nodeID: "n"), rawLittleEndianFloat16: $0)
+        }
+        try #require(appended)
+        let roundTripped = block.vector(at: 0)
         for (original, stored) in zip(vector, roundTripped) {
             #expect(abs(stored - original) <= max(abs(original) * 0.001, 1e-6))
-            #expect(stored == MLFloat16Codec.quantized(original))
+            #expect(stored == quantizedFloat16(original))
         }
     }
 
     @Test func decodeRejectsWrongByteCounts() {
         let vector = ContiguousArray<Float32>([1, 2, 3, 4])
         let encoded = MLFloat16Codec.encodeLittleEndian(vector)
-        encoded.withUnsafeBytes { raw in
-            #expect(MLFloat16Codec.decodeLittleEndian(raw, dimension: 5) == nil)
-            #expect(MLFloat16Codec.decodeLittleEndian(raw, dimension: 3) == nil)
-            #expect(MLFloat16Codec.decodeLittleEndian(raw, dimension: 4) != nil)
+        let uid = PhotoUID(volumeID: "v", nodeID: "n")
+        for dimension in [5, 3, 4] {
+            var block = MLVectorBlock(
+                descriptor: .init(identifier: "fixture", version: 1, embeddingDimension: dimension))
+            let appended = encoded.withUnsafeBytes { block.append(uid: uid, rawLittleEndianFloat16: $0) }
+            #expect(appended == (dimension == 4))
         }
-        Data([0x00]).withUnsafeBytes { raw in
-            #expect(MLFloat16Codec.decodeLittleEndian(raw, dimension: 1) == nil)
-        }
+        var block = MLVectorBlock(descriptor: .init(identifier: "fixture", version: 1, embeddingDimension: 1))
+        let appended = Data([0x00]).withUnsafeBytes { block.append(uid: uid, rawLittleEndianFloat16: $0) }
+        #expect(!appended)
     }
 }

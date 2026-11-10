@@ -8,9 +8,9 @@ import Testing
     @Test func twoPipelinesAdvanceAndPurgeIndependently() async throws {
         let store = InMemoryMLDerivedPipelineStore()
         let nativeArtifact = try artifact(pipeline: .nativeSearch, stage: "ocr", revision: "revision3")
-        let peopleArtifact = try artifact(pipeline: .people, stage: "faces", revision: "revision1")
+        let peopleArtifact = try artifact(pipeline: .init(rawValue: "people"), stage: "faces", revision: "revision1")
         let nativeKey = try executionKey(pipeline: .nativeSearch, artifacts: [nativeArtifact])
-        let peopleKey = try executionKey(pipeline: .people, artifacts: [peopleArtifact])
+        let peopleKey = try executionKey(pipeline: .init(rawValue: "people"), artifacts: [peopleArtifact])
         let assets = try [asset("1"), asset("2")]
         #expect(store.enqueue(assets, for: nativeKey))
         #expect(store.enqueue(assets, for: peopleKey))
