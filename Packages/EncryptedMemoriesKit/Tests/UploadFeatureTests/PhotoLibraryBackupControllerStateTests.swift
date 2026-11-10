@@ -3619,6 +3619,149 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        /// One continued processing task over a real controller: the card updates, the device log lines and the one result
+        /// that the OS hears, in the order in which they happened.
+        /// The device log events and the results that the OS heard, in their order.
+        private final class ContinuedTaskEvents: @unchecked Sendable {
+            private let lock = NSLock()
+            private var log: [String] = []
+            private var heard: [(success: Bool, settled: Bool)] = []
+
+            var events: [String] { lock.withLock { log } }
+            var results: [Bool] { lock.withLock { heard.map(\.success) } }
+            var settledAtResult: [Bool] { lock.withLock { heard.map(\.settled) } }
+
+            func record(_ event: String) { lock.withLock { log.append(event) } }
+            func heard(_ success: Bool, settled: Bool) {
+                lock.withLock {
+                    log.append("completed")
+                    heard.append((success, settled))
+                }
+            }
+        }
+
+        /// One continued processing task over a real controller.
+        @MainActor
+        private final class ContinuedTaskProbe {
+            let session: PhotoLibraryContinuedBackupSession
+            let protection = BackgroundBackupRunProtection()
+            let ledger: BackgroundWindowLedger
+            let recorded = ContinuedTaskEvents()
+            var task: Task<Void, Never>?
+
+            var events: [String] { recorded.events }
+            var results: [Bool] { recorded.results }
+            var settledAtResult: [Bool] { recorded.settledAtResult }
+
+            init(controller: PhotoLibraryBackupController, directory: URL, settlementWait: Duration = .seconds(5)) {
+                ledger = BackgroundWindowLedger(
+                    fileURL: directory.appendingPathComponent("continued-windows.json"), isPurgePending: { false })
+                let recorded = recorded
+                let completion = BackgroundWindowCompletion(kind: .continuedBackup, ledger: ledger) {
+                    [weak controller] success in
+                    let settled = MainActor.assumeIsolated { controller?.activeExecutionRunID == nil }
+                    recorded.heard(success, settled: settled)
+                }
+                session = PhotoLibraryContinuedBackupSession(
+                    controller: controller, completion: completion, protection: protection, endShortGrace: {},
+                    log: BackgroundWorkLog { _, line in recorded.record(String(line.prefix { $0 != " " })) },
+                    settlementWait: settlementWait, progressInterval: .milliseconds(20), report: { _ in })
+            }
+
+            func start() { task = Task { await session.run() } }
+        }
+
+        func testAContinuedTaskChoosesItsResultOnlyAfterTheCarriedPassSettled() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-result-after-settlement")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            let carried = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+            XCTAssertTrue(carried, "the task protects the person's pass from the short grace")
+            XCTAssertTrue(probe.results.isEmpty, "no result while the pass runs")
+
+            manual.fixture.scan.open.value = true
+            await probe.task?.value
+            XCTAssertEqual(probe.results.count, 1, "the OS hears one result")
+            XCTAssertEqual(probe.settledAtResult, [true], "the result is chosen after the pass settled")
+            XCTAssertFalse(probe.protection.isProtected(owner: controller, runID: manual.runID), "protection released")
+            XCTAssertEqual(probe.ledger.records().map(\.kind), [.continuedBackup])
+            await controller.shutdown()
+        }
+
+        func testAnExpiredContinuedTaskInTheBackgroundStopsItsPassAndReportsAStopOnce() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-expiry")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+
+            manual.runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            probe.session.expire()
+            probe.session.expire()
+            XCTAssertTrue(controller.isRunnerStopPendingForTesting, "the expiry stops the pass in the background")
+            XCTAssertFalse(probe.protection.isProtected(owner: controller, runID: manual.runID))
+
+            manual.fixture.scan.open.value = true
+            await probe.task?.value
+            XCTAssertEqual(probe.results, [false], "work was left: a stop, reported once")
+            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.expired])
+            let endLogged = await waitUntil { probe.events.contains("continued.end") }
+            XCTAssertTrue(endLogged)
+            XCTAssertLessThan(
+                try XCTUnwrap(probe.events.firstIndex(of: "continued.end")),
+                try XCTUnwrap(probe.events.firstIndex(of: "completed")),
+                "the end is logged before the OS hears the result")
+            await controller.shutdown()
+        }
+
+        func testAContinuedTaskEndsAtTheBoundWhenItsStoppedPassDoesNotSettle() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-bound")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let stopRelease = LockedFlag(false)
+            controller.installRunnerStopOperationForTesting {
+                while !stopRelease.value { try? await Task.sleep(for: .milliseconds(5)) }
+            }
+            let probe = ContinuedTaskProbe(
+                controller: controller, directory: manual.fixture.fixture.directory, settlementWait: .milliseconds(200))
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+            manual.runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            manual.fixture.scan.open.value = true
+            probe.session.expire()
+
+            let ended = await waitUntil(timeout: .seconds(3)) { !probe.results.isEmpty }
+            XCTAssertTrue(ended, "the task ends at the bound although the stop has not returned")
+            XCTAssertEqual(probe.results, [false])
+            XCTAssertEqual(probe.settledAtResult, [false], "the pass had not settled at the bound")
+
+            stopRelease.value = true
+            await probe.task?.value
+            _ = await waitUntil { !controller.isSyncing }
+            XCTAssertEqual(probe.results, [false], "a late settlement adds no second result")
+            await controller.shutdown()
+        }
+
+        func testPausingDuringAContinuedTaskEndsItWithoutSuccess() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-pause")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+
+            controller.pauseBackup()
+            manual.fixture.scan.open.value = true
+            await probe.task?.value
+            XCTAssertEqual(probe.results, [false])
+            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.notNeeded], "a paused backup ends the task")
+            XCTAssertEqual(manual.fixture.scan.starts.count, 1, "no further pass starts")
+            await controller.shutdown()
+        }
+
         /// A pass of the continued processing task runs for the person who accepted it, so resource limits treat it like
         /// the person's own pass. Windows stay automatic work.
         func testAContinuedTaskPassIsThePersonsWork() {

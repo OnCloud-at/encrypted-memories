@@ -109,3 +109,24 @@ public enum PhotoLibraryContinuedBackupEnd: String, Sendable, BackgroundLogName 
         return backupRuns ? .waiting : .turnedOff
     }
 }
+
+/// The texts of the system card of a continued backup task. They are the app's own texts, so the card never says
+/// something else than the backup screen.
+public enum PhotoLibraryContinuedBackupCard {
+    public static var title: String { L10n.string("backup.summary_backing_up") }
+
+    /// "Preparing…" until the goal is fixed, then the photos left, the same number as the app's status line.
+    public static func subtitle(for status: BackupStatus, goal: PhotoLibraryContinuedBackupGoal) -> String {
+        guard goal.total != nil else { return L10n.string("upload.state_preparing") }
+        return L10n.string("backup.detail_left \(status.remainingCount)")
+    }
+
+    /// The title at the end: the app's own headline for the settled status. After a stop, or with the backup off, the
+    /// app would show a resting state, so the card says that the backup is incomplete.
+    public static func finalTitle(after end: PhotoLibraryContinuedBackupEnd, settled: BackupStatus) -> String {
+        switch end {
+        case .stopped, .turnedOff: L10n.string("backup.phase_waiting")
+        case .completed, .needsAttention, .waiting: BackupStatusPresentation(settled).localizedHeadline
+        }
+    }
+}
