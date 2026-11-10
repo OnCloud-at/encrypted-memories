@@ -20,6 +20,7 @@ let package = Package(
     platforms: [.macOS("26.0"), .iOS("26.0")],
     products: [
         .library(name: "PhotosCore", targets: ["PhotosCore"]),
+        .library(name: "AppRouteIntents", targets: ["AppRouteIntents"]),
         .library(name: "LibrarySourceRuntime", targets: ["LibrarySourceRuntime"]),
         .library(name: "LibraryRuntimeAppleAdapter", targets: ["LibraryRuntimeAppleAdapter"]),
         .library(name: "AppleSecurityCore", targets: ["AppleSecurityCore"]),
@@ -85,6 +86,11 @@ let package = Package(
         // PhotosCore owns the package-wide localization catalog.
         .target(name: "PhotosCore", resources: [.process("Resources")], swiftSettings: disableDynamicActorIsolation),
         .testTarget(name: "PhotosCoreTests", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
+        // App Intents for Shortcuts and Siri. They only hand a route to the app; navigation stays in the apps.
+        .target(name: "AppRouteIntents", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
+        .testTarget(
+            name: "AppRouteIntentsTests", dependencies: ["AppRouteIntents", "PhotosCore"],
+            swiftSettings: disableDynamicActorIsolation),
         // AppleSecurityCore is the package boundary for Security.framework.
         .target(name: "AppleSecurityCore", swiftSettings: disableDynamicActorIsolation),
         .testTarget(

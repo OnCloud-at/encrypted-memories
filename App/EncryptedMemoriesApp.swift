@@ -1,8 +1,10 @@
 import AppKit
+import AppRouteIntents
 import DesignSystem
 import DesignSystemCore
 import LibraryRuntimeAppleAdapter
 import MetalRenderingCore
+import Observation
 import PhotoViewerFeature
 import PhotosCore
 import SwiftUI
@@ -45,6 +47,9 @@ struct EncryptedMemoriesApp: App {
             .frame(minWidth: 720, minHeight: 480)
             .background(WindowConfigurator())
             .background { TipJarCelebrationWindowOverlay() }
+            // The library window is the only window that opens links; the delegate shows it for every route.
+            .onOpenURL { url in AppRoutes.receive(url, for: .activeWindow) }
+            .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model?.smartSearch?.noteConditionsChanged()
                 model?.refreshLibrarySources()
@@ -142,6 +147,32 @@ final class EncryptedMemoriesAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        showLibraryForRoutes()
+    }
+
+    /// Every link or Shortcuts action shows the library window, also after Command-W only hid it, and also when the
+    /// route is dropped or the link names none, so the activated app never stays without a window.
+    @MainActor
+    private func showLibraryForRoutes() {
+        withObservationTracking {
+            _ = AppRoutes.inbox.arrivals
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                Self.showLibraryWindow()
+                self?.showLibraryForRoutes()
+            }
+        }
+    }
+
+    @MainActor
+    private static func showLibraryWindow() {
+        NSApp.activate()
+        if !LibraryWindowVisibilityController.shared.showLibrary() {
+            NSApp.windows.first(where: { $0.identifier?.rawValue == "library" })?.makeKeyAndOrderFront(nil)
+        }
+    }
+
     func applicationDidBecomeActive(_ notification: Notification) {
         AppleLibraryRuntimeAdapter.shared.setExecutionOpportunity(.foregroundActive)
     }
@@ -155,10 +186,7 @@ final class EncryptedMemoriesAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        sender.activate()
-        if !LibraryWindowVisibilityController.shared.showLibrary() {
-            sender.windows.first(where: { $0.identifier?.rawValue == "library" })?.makeKeyAndOrderFront(nil)
-        }
+        Self.showLibraryWindow()
         // The retained library window has been handled here; suppress AppKit's default untitled-window route.
         return false
     }
@@ -177,10 +205,7 @@ final class EncryptedMemoriesAppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     @objc private func showLibraryFromDock(_ sender: Any?) {
-        NSApp.activate()
-        if !LibraryWindowVisibilityController.shared.showLibrary() {
-            NSApp.windows.first(where: { $0.identifier?.rawValue == "library" })?.makeKeyAndOrderFront(nil)
-        }
+        Self.showLibraryWindow()
     }
 }
 
@@ -500,7 +525,23 @@ private final class WindowAttachmentView: NSView {
 struct RootView: View {
     let model: AppModel
 
+    /// The account state for links and Shortcuts actions: they wait while the saved session is checked and are
+    /// dropped without a usable account, including while someone signs in or out.
+    private var routeSession: AppRouteSessionState {
+        switch model.auth {
+        case .checking: .restoring
+        case .signedIn: .usable
+        case .signedOut, .authenticating, .signingOut, .signOutFailed: .signedOut
+        }
+    }
+
     var body: some View {
+        content.onChange(of: routeSession, initial: true) { _, session in
+            AppRoutes.inbox.update(session: session)
+        }
+    }
+
+    @ViewBuilder private var content: some View {
         switch model.auth {
         case .checking:
             ProtonLoadingView()

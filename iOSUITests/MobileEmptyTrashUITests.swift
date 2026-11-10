@@ -18,11 +18,8 @@ final class MobileEmptyTrashUITests: XCTestCase {
         let collections = app.buttons["Collections"].firstMatch
         XCTAssertTrue(collections.waitForExistence(timeout: 60))
         collections.tap()
-        let recentlyDeleted = app.buttons["Recently Deleted"].firstMatch
-        for _ in 0..<4 where !recentlyDeleted.waitForExistence(timeout: 3) { app.swipeUp() }
-        XCTAssertTrue(recentlyDeleted.waitForExistence(timeout: 10))
-        recentlyDeleted.tap()
-        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 20), "Recently Deleted lists the fixture photos")
+        app.openRecentlyDeleted()
+        XCTAssertTrue(app.firstPhoto.waitForExistence(timeout: 20), "Recently Deleted lists the fixture photos")
 
         let more = app.buttons["More album actions"].firstMatch
         XCTAssertTrue(more.waitForExistence(timeout: 10))
@@ -36,13 +33,9 @@ final class MobileEmptyTrashUITests: XCTestCase {
 
         let gone = NSPredicate(format: "exists == false")
         XCTAssertEqual(
-            XCTWaiter.wait(for: [expectation(for: gone, evaluatedWith: firstPhoto)], timeout: 20), .completed,
+            XCTWaiter.wait(for: [expectation(for: gone, evaluatedWith: app.firstPhoto)], timeout: 20), .completed,
             "Recently Deleted is empty")
         XCTAssertFalse(
             app.alerts["Couldn’t Empty Recently Deleted"].exists, "no merge is open, so emptying succeeds")
-    }
-
-    private var firstPhoto: XCUIElement {
-        app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '")).firstMatch
     }
 }

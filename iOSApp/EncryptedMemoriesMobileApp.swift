@@ -1,3 +1,4 @@
+import AppRouteIntents
 import DesignSystemCore
 import DesignSystemUIKitAdapter
 import Foundation
@@ -97,6 +98,10 @@ private struct MobileSupportedAppRoot: View {
             }
             .onChange(of: scenePhase) { _, _ in updatePrivacyPreviewShield() }
             .onChange(of: blurAppPreview) { _, _ in updatePrivacyPreviewShield() }
+            // A link opens in the window that receives it. Every open window accepts links and the active one
+            // prefers them, so SwiftUI never creates a new window for a link.
+            .onOpenURL { url in AppRoutes.receive(url, for: .window(sceneContext.id)) }
+            .handlesExternalEvents(preferring: scenePhase == .active ? ["*"] : [], allowing: ["*"])
             .background {
                 TipJarCelebrationWindowOverlay(horizontalBias: confettiMotion.horizontalBias)
             }
@@ -129,6 +134,7 @@ private struct MobileSupportedAppRoot: View {
             .onDisappear {
                 confettiMotion.stop()
                 sceneContext.onWindowChange = nil
+                AppRoutes.inbox.windowClosed(sceneContext.id)
             }
     }
 
@@ -211,6 +217,17 @@ enum MobileRootPresentation: Equatable {
         if isCheckingSession { return .restoringSession }
         return hasSession ? .signedIn : .signedOut
     }
+
+    /// The account state for links and Shortcuts actions: they wait while the saved session is restored and are
+    /// dropped without a usable account, including while a sign-out runs or its cleanup failed.
+    func routeSession(isSigningOut: Bool) -> AppRouteSessionState {
+        if isSigningOut { return .signedOut }
+        return switch self {
+        case .restoringSession: .restoring
+        case .signedIn: .usable
+        case .signedOut, .unsupportedDevice: .signedOut
+        }
+    }
 }
 
 enum MobileSignOutCleanupPresentation: Equatable {
@@ -228,16 +245,24 @@ private struct MobileRootView: View {
     @EnvironmentObject private var sessionModel: MobileSessionModel
     @Environment(MobileLibraryModel.self) private var libraryModel
 
+    private var presentation: MobileRootPresentation {
+        MobileRootPresentation.resolve(
+            // `EncryptedMemoriesMobileApp` gates this root before it is created.
+            metalSupported: true,
+            isCheckingSession: sessionModel.isCheckingSession,
+            hasSession: sessionModel.session != nil
+        )
+    }
+
+    private var isSigningOut: Bool {
+        sessionModel.isSigningOut || libraryModel.isSigningOut
+    }
+
     var body: some View {
         ZStack {
             ProtonColor.backgroundNorm.ignoresSafeArea()
 
-            switch MobileRootPresentation.resolve(
-                // `EncryptedMemoriesMobileApp` gates this root before it is created.
-                metalSupported: true,
-                isCheckingSession: sessionModel.isCheckingSession,
-                hasSession: sessionModel.session != nil
-            ) {
+            switch presentation {
             case .unsupportedDevice:
                 MobileUnsupportedDeviceView()
             case .restoringSession:
@@ -256,7 +281,7 @@ private struct MobileRootView: View {
         }
         .overlay {
             switch MobileSignOutCleanupPresentation.resolve(
-                isSigningOut: sessionModel.isSigningOut || libraryModel.isSigningOut,
+                isSigningOut: isSigningOut,
                 cleanupFailed: libraryModel.signOutCleanupFailed
             ) {
             case .hidden:
@@ -272,6 +297,12 @@ private struct MobileRootView: View {
                 MobileSignOutFailureView(onRetry: libraryModel.retrySignOutCleanup)
             }
         }
+        .onChange(
+            of: presentation.routeSession(isSigningOut: isSigningOut || libraryModel.signOutCleanupFailed),
+            initial: true
+        ) { _, session in
+            AppRoutes.inbox.update(session: session)
+        }
     }
 }
 
@@ -282,6 +313,8 @@ private struct MobileMainTabView: View {
         AppSettingsDefault.mapAndPlacesEnabled
     @Environment(MobileSceneContext.self) private var sceneContext
     @State private var selection: MobileTab = .photos
+    /// The smart collections pushed in the Collections tab, so a route can open one.
+    @State private var collectionsPath: [PhotoTag] = []
     @Environment(\.scenePhase) private var scenePhase
     @State private var searchText = ""
     @State private var searchActivity: LibraryRuntimeActivityRegistration?
@@ -317,6 +350,38 @@ private struct MobileMainTabView: View {
         }
     }
 
+    /// Opens a pending link or Shortcuts route in this window once the shared gate allows it. Sheets, alerts and
+    /// covers are presented view controllers; the gate is checked again until the route opens or another
+    /// window takes it.
+    private func openPendingRoute() async {
+        while let pending = AppRoutes.inbox.pending, !Task.isCancelled {
+            // A link that another window received is that window's to open.
+            if case .window(let target) = pending.target, target != sceneContext.id { return }
+            let route = AppRoutes.inbox.open(
+                window: sceneContext.id,
+                isActiveWindow: scenePhase == .active && sceneContext.window?.isKeyWindow == true,
+                libraryReady: !libraryModel.loadState.isLoading && !libraryModel.isRecoveringScope,
+                presentationBlocked: viewerRouter.presentation != nil
+                    || sceneContext.window?.rootViewController?.presentedViewController != nil
+            )
+            if let route {
+                show(route)
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    private func show(_ route: AppRoute) {
+        switch route {
+        case .library:
+            selection = .photos
+        case .collection(let tag):
+            selection = .collections
+            collectionsPath = [tag]
+        }
+    }
+
     private var loadingActivityMessage: String {
         networkMonitor.isOnline
             ? "\(L10n.string("library.title_activity")) …"
@@ -330,9 +395,11 @@ private struct MobileMainTabView: View {
     var body: some View {
         @Bindable var sceneContext = sceneContext
         let shell = MobileAdaptiveTabShell(
-            selection: $selection, searchText: $searchText, mapAndPlacesEnabled: mapAndPlacesEnabled
+            selection: $selection, collectionsPath: $collectionsPath, searchText: $searchText,
+            mapAndPlacesEnabled: mapAndPlacesEnabled
         )
         shell.environment(viewerRouter)
+            .task(id: AppRoutes.inbox.pending) { await openPendingRoute() }
             .task(id: suggestionsRevision) {
                 updateSearchActivity()
                 libraryModel.searchSuggestions.update(
@@ -425,6 +492,7 @@ private struct MobileMainTabView: View {
 
 private struct MobileAdaptiveTabShell: View {
     @Binding var selection: MobileTab
+    @Binding var collectionsPath: [PhotoTag]
     @Binding var searchText: String
     let mapAndPlacesEnabled: Bool
     /// Bumped when the already-active Photos tab is retapped, so the timeline scrolls to the newest photos.
@@ -457,7 +525,7 @@ private struct MobileAdaptiveTabShell: View {
                 MobileTab.collections.title, systemImage: MobileTab.collections.systemImage,
                 value: MobileTab.collections
             ) {
-                MobileCollectionsScreen()
+                MobileCollectionsScreen(path: $collectionsPath)
             }
             if mapAndPlacesEnabled {
                 Tab(MobileTab.map.title, systemImage: MobileTab.map.systemImage, value: MobileTab.map) {

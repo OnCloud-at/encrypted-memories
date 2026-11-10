@@ -2,6 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>at.oncloud.encryptedmemories</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>encryptedmemories</string>
+			</array>
+		</dict>
+	</array>
 	<key>EncryptedMemoriesBuildCommit</key>
 	<string>$(ENCRYPTED_MEMORIES_BUILD_COMMIT)</string>
 	<key>EncryptedMemoriesProtonChannel</key>

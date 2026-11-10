@@ -1,0 +1,40 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "Show ${target} in ${applicationName}": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show ${target} in ${applicationName}"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zeig ${target} in ${applicationName}"
+          }
+        }
+      }
+    },
+    "Show my library in ${applicationName}": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show my library in ${applicationName}"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zeig meine Mediathek in ${applicationName}"
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

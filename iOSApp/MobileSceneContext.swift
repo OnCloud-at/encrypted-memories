@@ -10,6 +10,9 @@ import UIKit
 @MainActor
 @Observable
 final class MobileSceneContext {
+    /// Identifies this window for a link that it received.
+    let id = UUID()
+
     /// Settings is a scene-level presentation: the toolbar button and the keyboard command both open it over
     /// whichever tab this window shows.
     var settingsPresented = false
