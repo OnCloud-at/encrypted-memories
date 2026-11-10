@@ -1,5 +1,12 @@
 import Foundation
 
+/// Callers round dates before conversion; durations keep truncation toward zero.
+package func checkedBackupInteger(_ value: Double, multipliedBy multiplier: Int64 = 1) -> Int64? {
+    guard let integer = Int64(exactly: value.rounded(.towardZero)) else { return nil }
+    let (scaled, overflow) = integer.multipliedReportingOverflow(by: multiplier)
+    return overflow ? nil : scaled
+}
+
 /// Microsecond-quantized asset revision. Core stores revisions as integers so SQLite/user-default
 /// round-trips cannot introduce floating-point drift.
 public struct UploadBackupRevision: Sendable, Hashable, Comparable, Codable {
@@ -12,7 +19,9 @@ public struct UploadBackupRevision: Sendable, Hashable, Comparable, Codable {
     }
 
     public init(date: Date) {
-        self.rawValue = Int64((date.timeIntervalSinceReferenceDate * Self.scale).rounded())
+        self.rawValue =
+            checkedBackupInteger((date.timeIntervalSinceReferenceDate * Self.scale).rounded())
+            ?? Self(date: .distantPast).rawValue
     }
 
     public var date: Date {
@@ -52,7 +61,10 @@ public struct UploadBackupExternalIdentity: Sendable, Hashable, Equatable, Codab
         self.init(
             identifier: identifier,
             revision: UploadBackupRevision(
-                rawValue: Int64((modificationDate.timeIntervalSinceReferenceDate * 1_000).rounded()) * 1_000
+                rawValue:
+                    checkedBackupInteger(
+                        (modificationDate.timeIntervalSinceReferenceDate * 1_000).rounded(), multipliedBy: 1_000)
+                    ?? UploadBackupRevision(date: .distantPast).rawValue
             )
         )
     }
