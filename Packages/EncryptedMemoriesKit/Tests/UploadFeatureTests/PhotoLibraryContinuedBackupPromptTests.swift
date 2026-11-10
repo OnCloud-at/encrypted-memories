@@ -112,3 +112,20 @@ import UploadCore
         #expect(Prompt.isWorthAsking(status(remaining: 3), estimatedBytes: Int64.max))
     }
 }
+
+@MainActor @Suite struct PhotoLibraryContinuedBackupPromptClaimTests {
+    @Test func onePlaceShowsThePromptAtATime() {
+        let claim = PhotoLibraryContinuedBackupPrompt.Claim()
+        let root = UUID()
+        let backupScreen = UUID()
+
+        #expect(claim.claim(backupScreen))
+        #expect(claim.claim(backupScreen), "the holder keeps its claim")
+        #expect(!claim.claim(root), "a second place waits, also in another window")
+
+        claim.release(root)
+        #expect(!claim.claim(root), "only the holder releases")
+        claim.release(backupScreen)
+        #expect(claim.claim(root))
+    }
+}

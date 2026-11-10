@@ -35,6 +35,28 @@ public enum PhotoLibraryContinuedBackupPrompt {
         }
     }
 
+    /// Only one place shows the question at a time, across every window of the app: HIG Alerts allow one alert at a
+    /// time, and two windows side by side must not both ask.
+    @MainActor
+    public final class Claim {
+        public static let shared = Claim()
+        private var holder: UUID?
+
+        public init() {}
+
+        /// Takes the claim for `place` when nobody holds it; the holder keeps it.
+        public func claim(_ place: UUID) -> Bool {
+            guard holder == nil || holder == place else { return false }
+            holder = place
+            return true
+        }
+
+        /// Ends the claim of `place`; another place's claim stays.
+        public func release(_ place: UUID) {
+            if holder == place { holder = nil }
+        }
+    }
+
     /// From this many photos left, the count alone reaches the time; no volume estimate is needed.
     public static var itemsThatAlwaysAsk: Int { Int((askAfterSeconds / secondsPerItem).rounded(.up)) }
 
