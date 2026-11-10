@@ -134,6 +134,8 @@ private func waitUntil(timeout: Duration = .seconds(5), _ condition: @MainActor 
         let crawl = LocationCrawl(throttle: .zero)
         let firstGate = CrawlLatch()
         let secondGate = CrawlLatch()
+        let (cancellationEvents, cancellationSignal) = AsyncStream<Void>.makeStream()
+        defer { cancellationSignal.finish() }
         let first = uid("first")
         let second = uid("second")
 
@@ -141,8 +143,12 @@ private func waitUntil(timeout: Duration = .seconds(5), _ condition: @MainActor 
             uids: [first],
             captureDates: [:],
             location: { _ in
-                await firstGate.wait()
-                return .found(latitude: 47.0, longitude: 13.0)
+                await withTaskCancellationHandler {
+                    await firstGate.wait()
+                    return .found(latitude: 47.0, longitude: 13.0)
+                } onCancel: {
+                    cancellationSignal.yield(())
+                }
             },
             index: index,
             store: store
@@ -161,7 +167,26 @@ private func waitUntil(timeout: Duration = .seconds(5), _ condition: @MainActor 
                 store: store
             )
         }
-        await yieldToScheduledWork()
+        let cancellationObserved = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in cancellationEvents { return true }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(30))
+                return false
+            }
+            let observed = await group.next() ?? false
+            group.cancelAll()
+            return observed
+        }
+        guard cancellationObserved else {
+            Issue.record("The old crawl did not receive cancellation within 30 seconds")
+            await firstGate.release()
+            await secondGate.release()
+            await restart.value
+            return
+        }
         let secondEnteredBeforeRelease = await secondGate.hasEntered()
         #expect(!secondEnteredBeforeRelease, "a replacement crawl must wait for the old generation")
 
