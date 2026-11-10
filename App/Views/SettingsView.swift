@@ -630,6 +630,14 @@ private struct PhotoLibraryBackupSection: View {
                                 .fixedSize(horizontal: false, vertical: true)
                                 .transition(.opacity.combined(with: .move(edge: .top)))
                         }
+                        if let hint = display.localizedLargeBackupHint {
+                            // A large first backup runs: what makes it faster on a Mac (#275).
+                            Text(hint)
+                                .font(.caption)
+                                .foregroundStyle(ProtonColor.textWeak)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                         if let dedupeWarning = display.localizedDedupeWarning {
                             Text(dedupeWarning)
                                 .font(.caption)
@@ -712,7 +720,11 @@ private struct PhotoLibraryBackupSection: View {
         }
         .onAppear { rowModel.ingest(controller.status) }
         .onChange(of: controller.status) { _, status in rowModel.ingest(status) }
-        .onDisappear { rowModel.cancel() }
+        .onDisappear {
+            // The person saw a completed first backup here; next time it shows as a plain completion.
+            controller.firstBackupScreenSeen()
+            rowModel.cancel()
+        }
     }
 
     /// Known-total backup status reserves its count line while work runs.
