@@ -298,7 +298,8 @@ public final class TimelineViewModel {
     @ObservationIgnored private var initialLoadTask: Task<Void, Never>?
     /// The whole-library listing that a surface over another route started; concurrent callers share it.
     @ObservationIgnored private var wholeLibraryLoadTask: Task<String?, Never>?
-    /// All Photos' first load or its retry while their listing runs, and the callers that wait for it to end.
+    /// All Photos' own loads (its first load, its retry or a switch to All Photos) while their listing runs, and the
+    /// callers that wait for it to end.
     @ObservationIgnored private var runningWholeLibraryListings = 0
     @ObservationIgnored private var wholeLibraryListingWaiters: [CheckedContinuation<Void, Never>] = []
     /// Completion of that single-flight startup request is intentionally separate from presentation readiness:
@@ -646,8 +647,8 @@ public final class TimelineViewModel {
 
     /// Loads the whole library for a surface over another route, such as the album picker, and leaves the route's
     /// grid as it is. Returns nil once the whole library is known, or the failure message. It waits for All Photos'
-    /// first load or its retry while their listing runs, concurrent callers share one listing, and a newer
-    /// whole-library publication overtakes its result.
+    /// own load (its first load, its retry or a switch to All Photos) while its listing runs, concurrent callers share
+    /// one listing, and a newer whole-library publication overtakes its result.
     @discardableResult
     public func loadWholeLibraryIfNeeded() async -> String? {
         if let initialLoadTask { await initialLoadTask.value }
@@ -670,8 +671,9 @@ public final class TimelineViewModel {
         return failure
     }
 
-    /// Counts the listing of All Photos' first load or its retry, so `loadWholeLibraryIfNeeded` waits for it instead
-    /// of reading again. A refresh is not counted: it drops its listing when the route switches.
+    /// Counts the listing of All Photos' own load (its first load, its retry or a switch to All Photos), which settles
+    /// the whole library even after a route switch, so `loadWholeLibraryIfNeeded` waits for it instead of reading
+    /// again. A refresh is not counted: it drops its listing when the route switches.
     private func countingWholeLibraryListing<Result>(_ listing: () async throws -> Result) async rethrows -> Result {
         runningWholeLibraryListings += 1
         defer {
