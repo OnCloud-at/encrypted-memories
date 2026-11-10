@@ -93,20 +93,10 @@ public final class TimelineOrderMetadataStore {
                 verifyVersion: version.verify, stampVersion: version.stamp,
                 probe: probe, openReadWrite: openReadWrite)
         }
-        switch open() {
-        case .opened(let handle):
-            db = handle
-        case .retryLater:
-            // The file may be fine: another connection holds it, or a full disk stopped the inspection. It stays
-            // on disk, so the next open of the store, at the next launch or sign-in, can read it.
-            return nil
-        case .failed:
-            // Every other failed open replaces the cache.
-            guard SQLiteStoreSchemaGate.removeDatabaseFiles(at: url), case .opened(let handle) = open() else {
-                return nil
-            }
-            db = handle
-        }
+        // A file that cannot be checked now (another connection holds it, or a full disk stopped the inspection) stays
+        // on disk for the next open, at the next launch or sign-in. Every other failed open replaces the cache.
+        guard let handle = SQLiteStoreSchemaGate.openReplacingFailedStore(at: url, open: open) else { return nil }
+        db = handle
         recorder.install(on: db)
         switch Self.check(db, recorder: recorder, probe: probe) {
         case .healthy:

@@ -18,6 +18,8 @@ final class StorageFaultSweepTests: XCTestCase {
         "trashedSeries.update": 10, "trashedSeries.finish": 10, "catalog.lateRenderScan": 13,
         "backup.replaceRemoteDeletion.keep": 10, "backup.replaceRemoteDeletion.backUpAgain": 10,
         "backup.settleRemoteDeletion.keep": 5, "backup.settleRemoteDeletion.backUpAgain": 5,
+        "localReadFailureHints.insert": 4, "localReadFailureHints.remove": 4,
+        "localReadFailureHints.saveSweepCursor": 3,
     ]
 
     func testEncodedIssueComparisonKeepsAllFieldsValuesAndArrayOrder() {

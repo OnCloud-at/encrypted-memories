@@ -212,6 +212,23 @@ public enum SQLiteStoreSchemaGate {
         }
     }
 
+    /// Opens a cache that may be lost: `open` runs once more after a failed open removed the files, because an
+    /// unreadable or damaged file is not worth keeping. A file that cannot be checked now (`retryLater`) stays on disk
+    /// untouched for a later open, and nil is returned. A failed removal or second open also returns nil.
+    public static func openReplacingFailedStore(
+        at url: URL, open: () -> SQLiteRebuildableStoreOutcome
+    ) -> OpaquePointer? {
+        switch open() {
+        case .opened(let handle):
+            return handle
+        case .retryLater:
+            return nil
+        case .failed:
+            guard removeDatabaseFiles(at: url), case .opened(let handle) = open() else { return nil }
+            return handle
+        }
+    }
+
     /// Removes a database file and its `-wal` and `-shm` files. Missing files count as removed.
     public static func removeDatabaseFiles(at url: URL) -> Bool {
         guard !url.hasDirectoryPath else { return false }

@@ -37,6 +37,9 @@ let storageFaultCases: [any StorageFaultCase] = [
     TrashedSeriesRestoreCase(id: "trashedSeries.record", step: .record),
     TrashedSeriesRestoreCase(id: "trashedSeries.update", step: .update),
     TrashedSeriesRestoreCase(id: "trashedSeries.finish", step: .finish),
+    LocalReadFailureHintCase(id: "localReadFailureHints.insert", step: .insert),
+    LocalReadFailureHintCase(id: "localReadFailureHints.remove", step: .remove),
+    LocalReadFailureHintCase(id: "localReadFailureHints.saveSweepCursor", step: .saveSweepCursor),
 ]
 
 /// A deletion decision on the real queue and journal, by its production operations. By `start`:
@@ -822,5 +825,65 @@ struct TrashedSeriesRestoreCase: StorageFaultCase {
                 .init(uid: PhotoUID(volumeID: "volume", nodeID: $0), mainPhotoLinkID: main, trashTime: 1_001)
             },
             retryAt: Date(timeIntervalSince1970: 100))
+    }
+}
+
+/// One transaction of the rebuildable list of photos whose local read failed (`BackupLocalReadFailureHintStore`), as the
+/// backup runner runs it:
+/// - `insert`: a new hint in a full list, which drops the oldest hint;
+/// - `remove`: the hints of two photos whose work is done;
+/// - `saveSweepCursor`: the position of the next sweep page.
+struct LocalReadFailureHintCase: StorageFaultCase {
+    enum Step: Sendable {
+        case insert
+        case remove
+        case saveSweepCursor
+    }
+
+    let id: String
+    let step: Step
+    let atomicity = StorageFaultAtomicity.allOrNothing
+    /// Small enough that the seeded list is full, so the insert also drops a hint.
+    private static let capacity = 2
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let store = try open(directory, remote: remote)
+        defer { store.close() }
+        XCTAssertTrue(store.insert(Self.photo("a")))
+        XCTAssertTrue(store.insert(Self.photo("b")))
+        XCTAssertTrue(store.saveSweepCursor(1))
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> BackupLocalReadFailureHintStore {
+        try XCTUnwrap(
+            BackupLocalReadFailureHintStore(
+                url: directory.appendingPathComponent(BackupLocalReadFailureHintStore.databaseFileName),
+                capacity: Self.capacity))
+    }
+
+    func faultTargets(of world: BackupLocalReadFailureHintStore) -> [Any] { [world] }
+
+    func run(_ store: BackupLocalReadFailureHintStore) async -> Bool {
+        switch step {
+        case .insert: store.insert(Self.photo("c"))
+        case .remove: store.remove([Self.photo("a"), Self.photo("b")])
+        case .saveSweepCursor: store.saveSweepCursor(2)
+        }
+    }
+
+    func close(_ world: BackupLocalReadFailureHintStore) { world.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let url = directory.appendingPathComponent(BackupLocalReadFailureHintStore.databaseFileName)
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: url)
+        try state.addRecords(
+            "local read failure hint", of: url,
+            sql: "SELECT source_kind || '/' || source_id FROM local_read_failure_hint;")
+        return state
+    }
+
+    private static func photo(_ identifier: String) -> UploadSourceIdentity {
+        UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
     }
 }
