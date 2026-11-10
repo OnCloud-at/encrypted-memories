@@ -9,4 +9,9 @@ import Testing
         #expect(ProgressSpinner.label("") == L10n.string("loading.content"))
         #expect(ProgressSpinner.label("Albums") == "Albums")
     }
+
+    @Test func theInlineSpinnerIsSmallAndTheWaitingSurfaceSpinnerIsLarge() {
+        #expect(ProgressSpinner.controlSize(.small) == .small)
+        #expect(ProgressSpinner.controlSize(.large) == .large)
+    }
 }
