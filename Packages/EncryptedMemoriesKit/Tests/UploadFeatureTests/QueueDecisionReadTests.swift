@@ -37,6 +37,24 @@ final class QueueDecisionReadTests: XCTestCase {
 
     private static let problemSQL = "WHERE state IN ('failed', 'failedPermanent', 'sourceMissing', 'blockedByDraft')"
 
+    func testKeyedReadDistinguishesMissingFromInterruptedAndRecovers() throws {
+        let queue = try makeQueue()
+        defer { queue.close() }
+        let existing = row("existing", state: .discovered)
+        let missing = row("missing", state: .discovered)
+        XCTAssertTrue(queue.upsert(existing))
+        XCTAssertEqual(try queue.entry(for: existing.source, revision: existing.revision), existing)
+        XCTAssertNil(try queue.entry(for: missing.source, revision: missing.revision))
+
+        let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
+        XCTAssertThrowsError(try queue.entry(for: existing.source, revision: existing.revision))
+        fault.stop()
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(queue.isOperational())
+        XCTAssertEqual(try queue.entry(for: existing.source, revision: existing.revision), existing)
+        XCTAssertNil(try queue.entry(for: missing.source, revision: missing.revision))
+    }
+
     /// An unknown due date wakes the drain after a short wait instead of waiting for the next queue write.
     func testAnUnknownDueDateWakesTheDrainAfterThirtySeconds() throws {
         let queue = try makeQueue()
