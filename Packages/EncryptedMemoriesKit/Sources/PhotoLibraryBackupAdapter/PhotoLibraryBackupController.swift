@@ -1904,6 +1904,38 @@ public final class PhotoLibraryBackupController {
             return true
         }
 
+        /// A first backup that checks 120 waiting photos in a pass that holds until the app ends, so the continued backup
+        /// question can come (#1108). It uses the real queue, catalog and pass start.
+        public func installContinuedBackupPromptFixtureForTesting() -> Bool {
+            guard let queueStore, let catalogStore, pendingRecorder != nil else { return false }
+            let date = Date(timeIntervalSince1970: 1_781_352_000)
+            let infos = (1...120).map { index in
+                PhotoBackupAssetInfo(
+                    localIdentifier: "fixture-continued-photo-\(index)", creationDate: date, modificationDate: date,
+                    pixelWidth: 160, pixelHeight: 160, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                    resources: [
+                        .init(role: .originalPhoto, originalFilename: "Waiting \(index).heic", mimeType: "image/heic")
+                    ])
+            }
+            let rows = infos.map { info in
+                UploadBackupSyncQueueEntry(
+                    source: .init(kind: .photoLibraryAsset, identifier: info.localIdentifier),
+                    revision: .init(rawValue: 1), originalFilename: info.resources[0].originalFilename,
+                    state: .discovered, updatedAt: date)
+            }
+            guard catalogStore.upsertBatch(infos.map { PhotoLibraryCatalogMapper.entry(for: $0, observedAt: date) }),
+                queueStore.upsertBatch(rows)
+            else { return false }
+            passBodyForTesting = {
+                while !Task.isCancelled { try? await Task.sleep(for: .seconds(1)) }
+            }
+            isEnabled = true
+            isUserPaused = false
+            accessState = .full
+            refreshFromQueue()
+            return startSync(owner: .manual) != nil || lastStartWasDeferred
+        }
+
         /// Open problem lists that wait for the start or end of a pass.
         internal var passStateWakeCountForTesting: Int { passStateWakes.count }
 
