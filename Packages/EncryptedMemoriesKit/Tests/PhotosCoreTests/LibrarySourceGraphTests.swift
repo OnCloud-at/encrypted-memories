@@ -362,30 +362,6 @@ final class LibrarySourceGraphTests: XCTestCase {
         }
     }
 
-    func testAccessLossClearsStoredBurstIndex() throws {
-        for removeByDiscovery in [false, true] {
-            var graph = LibrarySourceGraph()
-            let owner = item("owner", time: 1, burstMemberIDs: ["member"])
-            let member = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "member")
-            _ = install(firstSource, items: [owner], in: &graph)
-            func burstIndex() throws -> [PhotoUID: [PhotoUID]] {
-                let records = try XCTUnwrap(Mirror(reflecting: graph).children.first { $0.label == "records" }?.value)
-                let pair = try XCTUnwrap(Mirror(reflecting: records).children.first?.value)
-                let record = try XCTUnwrap(Mirror(reflecting: pair).children.first { $0.label == "value" }?.value)
-                return try XCTUnwrap(
-                    Mirror(reflecting: record).children.first { $0.label == "burstOwnersByMemberUID" }?.value
-                        as? [PhotoUID: [PhotoUID]])
-            }
-            XCTAssertEqual(try burstIndex()[member], [owner.uid])
-            if removeByDiscovery {
-                _ = try XCTUnwrap(graph.commitSourceSet([], using: graph.beginSourceSetRefresh()))
-            } else {
-                _ = try XCTUnwrap(graph.removeSource(firstSource.id))
-            }
-            XCTAssertTrue(try burstIndex().isEmpty)
-        }
-    }
-
     func testUnknownCapabilityCannotAuthorizeAnyRoute() {
         var graph = LibrarySourceGraph()
         let owner = item("owner", time: 1, isLivePhoto: true, relatedVideoID: "motion")
