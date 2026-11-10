@@ -13,7 +13,7 @@ public protocol AlbumManaging: AlbumOperations {
 
 /// Default implementation over separate catalog and write backends. This split makes the SDK the
 /// only owned/shared catalog and membership reader while preserving the narrow HTTP write surface
-/// for operations the Swift API of SDK 0.33.0 does not expose.
+/// for operations the Swift API of the SDK does not expose.
 public actor AlbumsRepository: AlbumManaging {
     public nonisolated let capabilities: AlbumCapabilities
     private let catalogBackend: any AlbumCatalogBackend

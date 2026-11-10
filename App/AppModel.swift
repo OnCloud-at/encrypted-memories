@@ -11,7 +11,6 @@ import MediaFeedCore
 import PhotoLibraryBackupAdapter
 import PhotosCore
 import ProtonAuth
-import ProtonCoreCryptoPatchedGoImplementation
 import ProtonDriveBackend
 import TimelineCore
 import UploadCore
@@ -219,8 +218,8 @@ final class AppModel {
             store: store,
             authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)
         )
-        // Wire ProtonCore's CryptoGo to the patched GopenPGP implementation before any crypto runs.
-        injectDefaultCryptoImplementation()
+        // Prepare the Proton runtime before any crypto runs.
+        ProtonRuntime.prepareProcess()
         beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
     }
 
