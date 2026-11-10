@@ -263,7 +263,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
             }
             guard shouldLog else { return }
         }
-        let logFields = sanitizedSupportFields(event: event, fields: fields) ?? fields
+        let logFields = Self.sanitizedSupportFields(event: event, fields: fields) ?? fields
         let payload = logFields.sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: " ")
@@ -343,7 +343,7 @@ public final class PhotoDiagnostics: @unchecked Sendable {
     }
 
     private func recordSupportEvent(event: String, fields: [String: String], timestamp: Date) {
-        guard let sanitized = sanitizedSupportFields(event: event, fields: fields) else { return }
+        guard let sanitized = Self.sanitizedSupportFields(event: event, fields: fields) else { return }
         lock.withLock {
             supportEvents.append(
                 SupportDiagnosticEvent(
@@ -357,7 +357,9 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         }
     }
 
-    private func sanitizedSupportFields(event: String, fields: [String: String]) -> [String: String]? {
+    /// The one allowlist of support-file fields: the fields of the named event that may leave the device, or nil for an
+    /// event that has none. Everything that reaches a support-file section as plain fields passes it.
+    static func sanitizedSupportFields(event: String, fields: [String: String]) -> [String: String]? {
         let allowedFields: Set<String>
         switch event {
         case "ResourceState":
@@ -381,6 +383,12 @@ public final class PhotoDiagnostics: @unchecked Sendable {
             allowedFields = ["action", "headroom", "pressure", "reason", "tier"]
         case "MetricKit":
             allowedFields = ["diagnosticPayloads", "metricPayloads"]
+        case "MetricKitDiagnostic":
+            allowedFields = Set([
+                "kind", "rangeStart", "rangeEnd", "appVersion", "appBuild", "osBuild", "exceptionType", "signal",
+                "terminationNamespace", "terminationCode", "hangSeconds", "cpuSeconds", "sampledSeconds",
+                "launchSeconds", "writtenMB",
+            ]).union(MetricKitDiagnosticSummary.frameKeys)
         case "SearchSuggestions":
             allowedFields = [
                 "action", "result", "durationMs", "event", "outcome", "versionMatches", "modelMatches",

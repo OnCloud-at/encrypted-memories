@@ -85,7 +85,7 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         XCTAssertEqual(section["droppedLines"] as? Int, 0)
     }
 
-    func testSchemaFourExportsOnlyUnavailableD1MeasurementsWithoutSource() async throws {
+    func testSchemaFiveExportsOnlyUnavailableD1MeasurementsWithoutSource() async throws {
         let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
         let runtime = LibraryRuntimeState()
         let data = try await SupportDiagnosticsExporter.makeJSONData(
@@ -95,12 +95,52 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
             bundle: Bundle(for: Self.self), sources: sources, trail: SupportEventTrail())
         let report = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
 
-        XCTAssertEqual(report["schemaVersion"] as? Int, 4)
+        XCTAssertEqual(report["schemaVersion"] as? Int, 5)
         let measurements = try XCTUnwrap(report["measurements"] as? [String: Any])
         XCTAssertEqual(Set(measurements.keys), Set(["availability", "passes", "governorWaits"]))
         XCTAssertEqual(measurements["availability"] as? Int, 0)
         XCTAssertEqual((measurements["passes"] as? [Any])?.count, 0)
         XCTAssertEqual((measurements["governorWaits"] as? [Any])?.count, 0)
+    }
+
+    func testTheReportCarriesTheMetricKitDiagnosticSummaries() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SupportMetricKit-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("metrickit-diagnostics-v1.json")
+        let log = MetricKitDiagnosticLog(fileURL: fileURL, isPurgePending: { false })
+        let tree = MetricKitDiagnosticFixtures.tree([
+            (roots: [MetricKitDiagnosticFixtures.chain(["start", "VectorKit"])], attributed: true)
+        ])
+
+        func report(_ log: MetricKitDiagnosticLog) async throws -> [String: Any] {
+            let runtime = LibraryRuntimeState()
+            let data = try await SupportDiagnosticsExporter.makeJSONData(
+                runtimeState: runtime,
+                resourceCoordinator: LibraryResourceCoordinator(runtimeState: runtime),
+                diagnostics: PhotoDiagnostics(debugConsoleLogsEnabled: false),
+                bundle: Bundle(for: Self.self), sources: SupportDiagnosticsSources(trail: SupportEventTrail()),
+                trail: SupportEventTrail(), metricKitDiagnostics: log)
+            return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        let emptyReport = try await report(log)
+        let empty = try XCTUnwrap(emptyReport["metricKitDiagnostics"] as? [String: Any])
+        XCTAssertEqual(Set(empty.keys), Set(["entries", "dropped"]))
+        XCTAssertEqual((empty["entries"] as? [Any])?.count, 0)
+        XCTAssertEqual(empty["dropped"] as? Int, 0)
+
+        log.record(MetricKitDiagnosticFixtures.input(callStackTreeJSON: tree))
+        let filledReport = try await report(log)
+        let section = try XCTUnwrap(filledReport["metricKitDiagnostics"] as? [String: Any])
+        let entries = try XCTUnwrap(section["entries"] as? [[String: String]])
+        XCTAssertEqual(entries.count, 1)
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry["kind"], "crash")
+        XCTAssertEqual(entry["signal"], "11")
+        XCTAssertEqual(entry["frame0"], "VectorKit+1001")
+        XCTAssertEqual(entry["frame1"], "start+1000")
+        XCTAssertEqual(section["dropped"] as? Int, 0)
     }
 
     func testSuggestionCacheDiagnosticsExposeOutcomesWithoutContent() {
@@ -246,7 +286,7 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         )
         let text = String(decoding: data, as: UTF8.self)
 
-        XCTAssertTrue(text.contains("\"schemaVersion\" : 4"))
+        XCTAssertTrue(text.contains("\"schemaVersion\" : 5"))
         XCTAssertTrue(text.contains("\"appBuild\""))
         XCTAssertTrue(text.contains("\"appCommit\""))
         XCTAssertTrue(text.contains("serious"))

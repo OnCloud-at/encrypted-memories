@@ -59,6 +59,8 @@ public enum SupportDiagnosticsExporter {
         /// was never recorded.
         let backgroundWindows: BackgroundWindowSupportSnapshot
         let backgroundLog: BackgroundLog
+        /// One summary per MetricKit crash, hang, CPU, disk-write or launch report that reached the app, oldest first.
+        let metricKitDiagnostics: MetricKitDiagnosticSupportSnapshot
         let schemaVersion: Int
         let generatedAt: Date
         let appVersion: String
@@ -82,7 +84,8 @@ public enum SupportDiagnosticsExporter {
         sources: SupportDiagnosticsSources = .shared,
         trail: SupportEventTrail = .shared,
         backgroundWindows: BackgroundWindowLedger = .shared,
-        backgroundLog: BackgroundWorkLogFile = .shared
+        backgroundLog: BackgroundWorkLogFile = .shared,
+        metricKitDiagnostics: MetricKitDiagnosticLog = .shared
     ) async throws -> Data {
         let snapshot = runtimeState.snapshot()
         let metrics = await resourceCoordinator.metrics()
@@ -103,7 +106,8 @@ public enum SupportDiagnosticsExporter {
             recentEvents: Report.RecentEvents(events: trailExport.events, dropped: trailExport.dropped),
             backgroundWindows: backgroundWindows.supportSnapshot(),
             backgroundLog: Report.BackgroundLog(lines: logExport.lines, droppedLines: logExport.droppedLines),
-            schemaVersion: 4,
+            metricKitDiagnostics: metricKitDiagnostics.supportSnapshot(),
+            schemaVersion: 5,
             generatedAt: now,
             appVersion: buildInfo.version ?? "unknown",
             appBuild: buildInfo.build ?? "unknown",

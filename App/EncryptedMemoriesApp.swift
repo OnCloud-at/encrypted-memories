@@ -20,6 +20,7 @@ struct EncryptedMemoriesApp: App {
         self.metal3Supported = metal3Supported
         if metal3Supported {
             AppleLibraryRuntimeAdapter.shared.install()
+            AppleMetricKitCollector.shared.install()
         }
         _model = State(initialValue: metal3Supported ? AppModel() : nil)
         // SwiftUI exposes no per-view tooltip delay. Use a responsive 400 ms AppKit delay.
