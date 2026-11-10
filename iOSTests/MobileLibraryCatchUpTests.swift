@@ -22,7 +22,7 @@ import TimelineCore
                 sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
                 timelineLoader: { await probe.snapshot() }, changeTokenLoader: { await probe.token() }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
-        let runtime = try await installRuntime(model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .authoritative)
         model.setApplicationActive(false)
         model.settleIsolatedLibraryForTesting(initialToken: "a")
         await probe.advance()
@@ -39,7 +39,8 @@ import TimelineCore
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         fixture.install(into: model)
-        let runtime = try await installRuntime(model, fixture: fixture, generation: 100)
+        let runtime = await installSourceRuntime(
+            into: model, fixture: fixture, startingWith: .authoritative, generation: 100)
         let before = model.timelineRevision
         let outcome = await model.refreshIsolatedLibraryForTesting()
         #expect(outcome == .retry, "The source runtime superseded this projection; no revision was published")
@@ -65,7 +66,8 @@ import TimelineCore
                 sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
                 timelineLoader: { await probe.snapshot() }, changeTokenLoader: { await probe.token() }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
-        let runtime = try await installRuntime(model, fixture: fixture, generation: 100)
+        let runtime = await installSourceRuntime(
+            into: model, fixture: fixture, startingWith: .authoritative, generation: 100)
         model.setApplicationActive(true)
         try await model.publishIsolatedInitialSnapshotForTesting(
             TimelineLoadSnapshot(sections: attemptedSections, validationToken: "b"))
@@ -83,7 +85,8 @@ import TimelineCore
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         fixture.install(into: model)
-        let runtime = try await installRuntime(model, fixture: fixture, generation: 100)
+        let runtime = await installSourceRuntime(
+            into: model, fixture: fixture, startingWith: .authoritative, generation: 100)
         model.setApplicationActive(false)
         let accepted = try await model.publishIsolatedValidatedCacheForTesting(
             CachedTimelineSnapshot(sections: fixture.sections, validationToken: "b"))
@@ -109,7 +112,7 @@ import TimelineCore
                 sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
                 timelineLoader: { await probe.snapshot() }, changeTokenLoader: { await probe.token() }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
-        let runtime = try await installRuntime(model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .authoritative)
         let key = TimelineSearchProjectionKey(
             sourceRevision: model.timelineRevision,
             query: route == "search" ? "video" : "", context: .init(favoriteUIDs: [fixture.items[0].uid]),
@@ -148,7 +151,7 @@ import TimelineCore
                 sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
                 changeTokenLoader: { "a" }, cachedTimelineLoader: { await cache.read() }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
-        let runtime = try await installRuntime(model, fixture: fixture, authority: .cached)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .cached)
         model.setApplicationActive(false)
         let accepted = try await model.validateIsolatedCacheForTesting(
             CachedTimelineSnapshot(sections: fixture.sections, validationToken: "a"))
@@ -173,7 +176,7 @@ import TimelineCore
                 sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
                 changeTokenLoader: { "a" }, cachedTimelineLoader: { await cache.read() }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
-        let runtime = try await installRuntime(model, fixture: fixture, authority: .cached)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .cached)
         model.setApplicationActive(false)
         let validation = Task {
             try await model.validateIsolatedCacheForTesting(
@@ -212,7 +215,7 @@ import TimelineCore
         fixture.install(
             into: model, backend: backend,
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
-        let runtime = try await installRuntime(model, fixture: fixture, authority: .cached)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .cached)
         model.setApplicationActive(false)
         let startup = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: backend) }
         #expect(await probe.waitUntilRereadIsHeld())
@@ -256,7 +259,7 @@ import TimelineCore
                 favoriteLoader: { await probe.loadFavorites() },
                 favoriteWriter: { uids, favorite in await probe.write(uids, favorite: favorite) }),
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
-        let runtime = try await installRuntime(model, fixture: fixture)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .authoritative)
         model.settleIsolatedLibraryForTesting()
         try await waitUntil { model.favoriteFilterAvailability == .available && model.favoriteUIDs == [a] }
 
@@ -303,33 +306,10 @@ import TimelineCore
         await runtime.shutdown()
     }
 
-    private func installRuntime(
-        _ model: MobileLibraryModel, fixture: MobileSignedInFixture, generation: UInt64 = 0,
-        authority: SourceInventoryAuthority = .authoritative
-    ) async throws -> LibrarySourceAnalysisRuntime {
-        let remote = NoAdditionalCatchUpSources()
-        let coordinator = LibrarySourceCoordinator(
-            remote: remote, thumbnailLoader: fixture.backend, inventoryStore: nil)
-        await coordinator.prepare()
-        let runtime = LibrarySourceAnalysisRuntime(
-            coordinator: coordinator, feed: fixture.feed.feedCore, assets: MLAssetUniverse(),
-            initiallyActive: false, onAssetsChanged: {})
-        #expect(
-            await runtime.start(primaryItems: fixture.items, authority: authority, generation: generation)
-                == .accepted)
-        model.installIsolatedSourceAnalysisForTests(runtime)
-        return runtime
-    }
-
     private func waitUntil(_ condition: () async -> Bool) async throws {
         let held = try await pollUntil(timeout: .seconds(12), condition)
         #expect(held)
     }
-}
-
-private struct NoAdditionalCatchUpSources: LibrarySourceRemoteBackend {
-    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] { [] }
-    func librarySourceItems(for _: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] { [] }
 }
 
 private actor MobileCatchUpProbe {

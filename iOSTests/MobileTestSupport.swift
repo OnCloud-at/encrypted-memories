@@ -1,5 +1,14 @@
+import AlbumCore
+import LibrarySourceRuntime
+import MLSearchCore
+import MediaCacheUIKitAdapter
+import PhotosCore
+import Testing
 import UIKit
 import XCTest
+
+@testable import EncryptedMemoriesMobile
+@testable import ProtonDriveBackend
 
 /// The view and all of its subviews, depth first.
 @MainActor func descendants(_ view: UIView) -> [UIView] {
@@ -32,6 +41,33 @@ private func poll(
         try await pause()
     }
     return await condition()
+}
+
+/// Installs a source analysis runtime without album sources into `model`. With an authority, the runtime first
+/// admits the fixture photos with that authority and generation.
+@MainActor func installSourceRuntime(
+    into model: MobileLibraryModel, fixture: MobileSignedInFixture, feed: UIKitThumbnailFeed? = nil,
+    startingWith authority: SourceInventoryAuthority? = nil, generation: UInt64 = 0
+) async -> LibrarySourceAnalysisRuntime {
+    let coordinator = LibrarySourceCoordinator(
+        remote: NoLibrarySources(), thumbnailLoader: fixture.backend, inventoryStore: nil)
+    await coordinator.prepare()
+    let runtime = LibrarySourceAnalysisRuntime(
+        coordinator: coordinator, feed: (feed ?? fixture.feed).feedCore,
+        assets: MLAssetUniverse(), initiallyActive: false, onAssetsChanged: {})
+    if let authority {
+        #expect(
+            await runtime.start(primaryItems: fixture.items, authority: authority, generation: generation)
+                == .accepted)
+    }
+    model.installIsolatedSourceAnalysisForTests(runtime)
+    return runtime
+}
+
+/// A library without album sources.
+private struct NoLibrarySources: LibrarySourceRemoteBackend {
+    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] { [] }
+    func librarySourceItems(for _: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] { [] }
 }
 
 extension XCTestCase {
