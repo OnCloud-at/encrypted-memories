@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 // Polling waits that several test files share. Each keeps the timeout, interval and failure style of the copies it
@@ -29,4 +30,18 @@ func assertEventually(
 ) async {
     for _ in 0..<2_000 where !condition() { try? await Task.sleep(for: .milliseconds(1)) }
     XCTAssertTrue(condition(), message, file: file, line: line)
+}
+
+/// Polls every 20 ms for at most 10 s, records a failure on timeout, and propagates cancellation.
+func pollUntilOrFail(
+    _ condition: () -> Bool, isolation: isolated (any Actor)? = #isolation,
+    file: StaticString = #filePath, line: UInt = #line
+) async throws {
+    let deadline = Date().addingTimeInterval(10)
+    while !condition() {
+        guard Date() < deadline else {
+            return XCTFail("The condition did not hold within 10 seconds", file: file, line: line)
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
 }
