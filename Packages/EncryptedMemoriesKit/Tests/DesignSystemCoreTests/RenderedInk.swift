@@ -7,6 +7,14 @@ enum RenderedInk {
     @MainActor static func pixels<V: View>(
         _ view: V, width: CGFloat = 480, height: CGFloat = 360
     ) throws -> Int {
+        try pixels(view, width: width, height: height) { red, green, blue in red < 200 || green < 200 || blue < 200 }
+    }
+
+    /// Counts the rendered pixels whose red, green and blue values match `matches`.
+    @MainActor static func pixels<V: View>(
+        _ view: V, width: CGFloat = 480, height: CGFloat = 360,
+        matching matches: (_ red: UInt8, _ green: UInt8, _ blue: UInt8) -> Bool
+    ) throws -> Int {
         let framed =
             view
             .frame(width: width, height: height)
@@ -28,7 +36,7 @@ enum RenderedInk {
         }
         guard drawn else { throw RenderError.noContext }
         return stride(from: 0, to: bytes.count, by: 4).reduce(0) { count, offset in
-            count + (bytes[offset] < 200 || bytes[offset + 1] < 200 || bytes[offset + 2] < 200 ? 1 : 0)
+            count + (matches(bytes[offset], bytes[offset + 1], bytes[offset + 2]) ? 1 : 0)
         }
     }
 
