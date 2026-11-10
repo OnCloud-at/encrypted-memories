@@ -12,8 +12,9 @@ import UploadCore
 /// HIG Alerts: an alert interrupts, so it comes once per backlog, at a calm point and never over other content; the
 /// preferred action is the default button, and "Not Now" has the cancel role.
 struct MobileContinuedBackupPromptModifier: ViewModifier {
-    /// How often the place looks at the backup and at what covers it. Presentations post no notification.
-    static let checkInterval: Duration = .milliseconds(500)
+    /// How often the place looks at what covers it, only while it waits to ask or while the question shows:
+    /// presentations post no notification.
+    static let coverCheckInterval: Duration = .milliseconds(500)
 
     let controller: PhotoLibraryBackupController?
 
@@ -25,6 +26,23 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
 
     private typealias Prompt = PhotoLibraryContinuedBackupPrompt
 
+    /// What can let the place ask, or stop asking: the place looks again when one of them changes.
+    private struct Trigger: Equatable {
+        let phase: BackupStatus.Phase?
+        let remaining: Int
+        let owesWork: Bool
+        let isSyncing: Bool
+        let scenePhase: ScenePhase
+        let isPresented: Bool
+    }
+
+    private var trigger: Trigger {
+        Trigger(
+            phase: controller?.status.phase, remaining: controller?.status.remainingCount ?? 0,
+            owesWork: controller?.status.hasOutstandingWork ?? false, isSyncing: controller?.isSyncing ?? false,
+            scenePhase: scenePhase, isPresented: isPresented)
+    }
+
     func body(content: Content) -> some View {
         content
             .background(MobileContinuedBackupPromptProbe.Anchor(probe: probe))
@@ -35,46 +53,57 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
             } message: {
                 Text(L10n.string("backup.continued_prompt_message"))
             }
-            .task {
-                while !Task.isCancelled {
-                    await check()
-                    try? await Task.sleep(for: Self.checkInterval)
-                }
-            }
+            .task(id: trigger) { await look() }
             .onAppear { if scenePhase == .active { asker.sceneBecameActive(at: .now) } }
             .onChange(of: scenePhase) { _, phase in
-                // Only the background leaves the scene. Control Center or a system alert make it inactive and close
-                // nothing.
                 switch phase {
                 case .active: asker.sceneBecameActive(at: .now)
+                case .inactive: asker.sceneBecameInactive()
                 case .background:
                     asker.sceneEnteredBackground()
                     isPresented = false
-                default: break
+                @unknown default: asker.sceneBecameInactive()
                 }
             }
+            .onChange(of: isPresented) { _, shows in
+                // The alert went away without a button, for example with its place: no answer.
+                if !shows { asker.questionClosed() }
+            }
             .onDisappear {
-                // The place is gone; the question goes with it, without an answer.
-                asker.coverChanged(isCovered: true, at: .now)
+                asker.questionClosed()
                 isPresented = false
             }
     }
 
-    private func check() async {
+    /// Looks at the backup when it changes. While the place waits to ask, or while the question shows, it also looks
+    /// at what covers the place until that changes.
+    private func look() async {
         guard let controller else { return }
-        let status = controller.status
-        asker.backupChanged(status, isSyncing: controller.isSyncing)
-        // The own question is one presentation over the place; anything more, or text input, covers it.
-        let covered =
-            probe.presentationsOverPlace() > (asker.isPresenting ? 1 : 0)
-            || MobileContinuedBackupPromptProbe.isEditingText
-        asker.coverChanged(isCovered: covered, at: .now)
-        if isPresented, !asker.isPresenting { isPresented = false }
-        guard !asker.isPresenting else { return }
-        let next = asker.next(
-            status, estimatedBytes: await estimatedBytes(for: status, of: controller),
-            isTaskActive: PhotoBackupContinuedTask.shared.submission.hasActiveTask, at: .now)
-        if next == .ask { isPresented = true }
+        asker.backupChanged(controller.status, isSyncing: controller.isSyncing)
+        while !Task.isCancelled {
+            if asker.isPresenting {
+                asker.coverChanged(isCovered: probe.coversPlace(ownQuestionShows: true), at: .now)
+                if !asker.isPresenting {
+                    isPresented = false
+                    return
+                }
+                try? await Task.sleep(for: Self.coverCheckInterval)
+                continue
+            }
+            let isTaskActive = PhotoBackupContinuedTask.shared.submission.hasActiveTask
+            guard asker.isWaitingToAsk(controller.status, isTaskActive: isTaskActive) else { return }
+            // The bytes come first; the cover and the decision follow without a pause in between.
+            let bytes = await estimatedBytes(for: controller.status, of: controller)
+            guard !Task.isCancelled else { return }
+            asker.coverChanged(isCovered: probe.coversPlace(ownQuestionShows: false), at: .now)
+            switch asker.next(controller.status, estimatedBytes: bytes, isTaskActive: isTaskActive, at: .now) {
+            case .ask:
+                isPresented = true
+                return
+            case .wait(let calmIn): try? await Task.sleep(for: calmIn)
+            case .none: try? await Task.sleep(for: Self.coverCheckInterval)
+            }
+        }
     }
 
     /// The volume only for a short list, read once for each count of photos left.
@@ -93,34 +122,52 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
     }
 }
 
-/// What covers a place of the question, read from UIKit's own state: the view controller that holds the place and the
-/// view controllers presented over it (`UIViewController.presentedViewController`: "The view controller that is
-/// presented by this view controller, or one of its ancestors in the view controller hierarchy."), and text input
-/// (`UITextField.textDidBeginEditingNotification` and the matching end and text view notifications).
+/// What covers a place of the question, read from UIKit's own state:
+/// - the view controller that holds the place (`UIResponder.next`: "Returns the next responder in the responder
+///   chain") and the view controllers presented over it (`UIViewController.presentedViewController`: "The view
+///   controller that is presented by this view controller, or one of its ancestors in the view controller hierarchy.");
+/// - a text field or text view of the place's own window scene that is being edited
+///   (`UITextField.textDidBeginEditingNotification`: "A notification that alerts observers when an editing session
+///   begins in a text field", and the matching end and text view notifications).
 @MainActor
 final class MobileContinuedBackupPromptProbe {
     /// A view without content inside the place, so the probe finds the place's view controller.
     struct Anchor: UIViewRepresentable {
         let probe: MobileContinuedBackupPromptProbe
 
-        func makeUIView(context: Context) -> UIView {
-            let view = UIView()
-            view.isUserInteractionEnabled = false
-            probe.view = view
-            return view
-        }
+        func makeUIView(context: Context) -> UIView { probe.anchorView() }
 
         func updateUIView(_ view: UIView, context: Context) {}
     }
 
     private weak var view: UIView?
 
-    /// How many view controllers are presented over the place, one over the other; 0 when nothing covers it.
-    func presentationsOverPlace() -> Int {
-        // `UIResponder.next` leads from the view to the view controller that holds it.
+    init() {
+        TextEditing.startObserving()
+    }
+
+    /// The view that marks the place in its view hierarchy.
+    func anchorView() -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        self.view = view
+        return view
+    }
+
+    /// Something covers the place: more presentations than the own question, or text input in its window scene. A
+    /// place whose view controller is not found counts as covered, so it never asks blind.
+    func coversPlace(ownQuestionShows: Bool) -> Bool {
+        guard let presentations = presentationsOverPlace() else { return true }
+        return presentations > (ownQuestionShows ? 1 : 0) || isEditingText
+    }
+
+    /// How many view controllers are presented over the place, one over the other; nil when the place has no view
+    /// controller yet.
+    func presentationsOverPlace() -> Int? {
         var responder: UIResponder? = view
         while let current = responder, !(current is UIViewController) { responder = current.next }
-        var presented = (responder as? UIViewController)?.presentedViewController
+        guard let controller = responder as? UIViewController else { return nil }
+        var presented = controller.presentedViewController
         var count = 0
         while let current = presented {
             count += 1
@@ -129,17 +176,20 @@ final class MobileContinuedBackupPromptProbe {
         return count
     }
 
-    /// A text field or text view in this app is being edited.
-    static var isEditingText: Bool { !TextEditing.shared.editors.isEmpty }
+    /// A text field or text view in the place's own window scene is being edited.
+    var isEditingText: Bool {
+        guard let scene = view?.window?.windowScene else { return false }
+        return TextEditing.editors.allObjects.contains { $0.isFirstResponder && $0.window?.windowScene === scene }
+    }
 
-    /// The text fields and text views that are being edited, from UIKit's notifications.
+    /// The text fields and text views that began editing, held weakly, from UIKit's notifications.
     @MainActor
-    private final class TextEditing {
-        static let shared = TextEditing()
-        private(set) var editors = Set<ObjectIdentifier>()
-        private var observers: [NSObjectProtocol] = []
+    private enum TextEditing {
+        static let editors = NSHashTable<UIView>.weakObjects()
+        private static var observers: [NSObjectProtocol] = []
 
-        private init() {
+        static func startObserving() {
+            guard observers.isEmpty else { return }
             let center = NotificationCenter.default
             for (began, ended) in [
                 (UITextField.textDidBeginEditingNotification, UITextField.textDidEndEditingNotification),
@@ -147,15 +197,13 @@ final class MobileContinuedBackupPromptProbe {
             ] {
                 observers.append(
                     center.addObserver(forName: began, object: nil, queue: .main) { note in
-                        guard let object = note.object as AnyObject? else { return }
-                        let id = ObjectIdentifier(object)
-                        MainActor.assumeIsolated { TextEditing.shared.editors.insert(id) }
+                        guard let editor = note.object as? UIView else { return }
+                        MainActor.assumeIsolated { editors.add(editor) }
                     })
                 observers.append(
                     center.addObserver(forName: ended, object: nil, queue: .main) { note in
-                        guard let object = note.object as AnyObject? else { return }
-                        let id = ObjectIdentifier(object)
-                        MainActor.assumeIsolated { _ = TextEditing.shared.editors.remove(id) }
+                        guard let editor = note.object as? UIView else { return }
+                        MainActor.assumeIsolated { editors.remove(editor) }
                     })
             }
         }
