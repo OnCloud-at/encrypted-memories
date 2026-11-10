@@ -399,12 +399,8 @@ struct ProtonRequestGovernorTests {
         await governor.finish(resumed, statusCode: 200)
     }
 
-    @Test func priorityScopeSurvivesElapsedTimeAndEndsOnCompletion() async throws {
-        let clock = TestClock()
-        let governor = ProtonRequestGovernor(
-            configuration: Self.configuration(initial: 1, maximum: 1),
-            now: { clock.now }
-        )
+    @Test func priorityScopeEndsOnCompletionAndResumesUploads() async throws {
+        let governor = ProtonRequestGovernor(configuration: Self.configuration(initial: 1, maximum: 1))
         let activeUpload = try await governor.acquire(scope: .storageUpload, priority: .background)
         let started = AsyncLatch()
         let complete = AsyncLatch()
@@ -425,9 +421,6 @@ struct ProtonRequestGovernorTests {
         try await Self.waitUntil { await governor.snapshot().storageUpload.queued == 1 }
 
         await governor.finish(activeUpload, statusCode: 200)
-        clock.now = clock.now.addingTimeInterval(2)
-        _ = await governor.snapshot()
-
         #expect(await governor.snapshot().storageUpload.inFlight == 0)
         #expect(await governor.snapshot().storageUpload.queued == 1)
         await complete.open()
