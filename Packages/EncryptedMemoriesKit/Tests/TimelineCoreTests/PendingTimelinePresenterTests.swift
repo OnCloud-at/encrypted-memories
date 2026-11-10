@@ -1514,13 +1514,26 @@ import Testing
                 == .recorded)
     }
 
-    func wait(_ predicate: (PendingBackupSnapshot) -> Bool) async -> PendingBackupSnapshot {
-        let deadline = ContinuousClock.now + .seconds(5)
-        while ContinuousClock.now < deadline {
-            let snapshot = await coordinator.currentSnapshot()
-            if predicate(snapshot) { return snapshot }
-            try? await Task.sleep(for: .milliseconds(2))
+    func wait(_ predicate: @escaping @Sendable (PendingBackupSnapshot) -> Bool) async -> PendingBackupSnapshot {
+        let coordinator = coordinator
+        let matched = await withTaskGroup(of: PendingBackupSnapshot?.self) { group in
+            group.addTask {
+                let current = await coordinator.currentSnapshot()
+                if predicate(current) { return current }
+                for await snapshot in coordinator.snapshots {
+                    if predicate(snapshot) { return snapshot }
+                }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(30))
+                return nil
+            }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
         }
+        if let matched { return matched }
         let snapshot = await coordinator.currentSnapshot()
         #expect(predicate(snapshot), "the coordinator must reach the requested phase")
         return snapshot
