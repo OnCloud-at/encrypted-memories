@@ -39,6 +39,30 @@ extension DriveSessionStubSuite {
                 ])
         }
 
+        @Test func deviceEnumerationKeepsTransport404AsSDKError() async throws {
+            StubURLProtocol.reset()
+            let driveSession = session()
+            let client = try await ProtonDriveClient(
+                configuration: ProtonDriveClientConfiguration(baseURL: "https://fixture.invalid/", clientUID: "fixture"),
+                httpClient: SDKHttpClient(
+                    driveSession: driveSession, requestGovernor: ProtonRequestGovernor(),
+                    urlProtocolClasses: [StubURLProtocol.self]),
+                accountClient: SDKAccountClient(addresses: [], unlockedByKeyID: [:]),
+                logCallback: { _ in }, recordMetricEventCallback: { _ in },
+                featureFlagProviderCallback: { _, completion in completion(false) })
+            let transport = ProtonDriveDeviceRootTransport(client: client, ownerAddresses: [])
+            do {
+                _ = try await transport.devices()
+                Issue.record("the enumeration must fail")
+            } catch let error as ProtonDriveSDKError {
+                #expect(error.asHTTPNetworkError?.httpCode == 404)
+                #expect(error.asAPINetworkError == nil)
+            } catch {
+                Issue.record("expected SDK transport failure: \(error)")
+            }
+            #expect(!StubURLProtocol.requests().isEmpty)
+        }
+
         /// A busy service waits like every other request; it must not use up the retry budget of the photo.
         @Test(arguments: [408, 429, 500, 503])
         func duplicateLookupTurnsABusyServiceIntoARetryableWait(status: Int) async throws {
@@ -60,10 +84,21 @@ extension DriveSessionStubSuite {
             #expect(code == status)
         }
 
-        private func duplicateLookupFailure(status: Int) async throws -> any Error {
+        @Test(arguments: [408, 429, 500, 503])
+        func visibilityLookupTurnsABusyServiceIntoARetryableWait(status: Int) async throws {
+            let failure = try await duplicateLookupFailure(status: status, visibility: true)
+            guard case .retryableBackend(let code, _)? = failure as? UploadCore.UploadError else {
+                Issue.record("expected retryableBackend, got \(failure)")
+                return
+            }
+            #expect(code == status)
+        }
+
+        private func duplicateLookupFailure(status: Int, visibility: Bool = false) async throws -> any Error {
             StubURLProtocol.reset()
+            let path = visibility ? "/drive/shares/share/links/fetch_metadata" : "/drive/volumes/vol/photos/duplicates"
             StubURLProtocol.route(
-                "POST /drive/volumes/vol/photos/duplicates", status: status,
+                "POST \(path)", status: status,
                 json: #"{"Code":2028,"Error":"Service answer"}"#)
             let manifest = try #require(
                 UploadIdentityManifestStore(
@@ -77,9 +112,13 @@ extension DriveSessionStubSuite {
                     rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
                 contextProvider: { throw UploadError.backend("resolved test material must be reused") })
             do {
-                _ = try await service.findDuplicates(nameHashes: ["name-hash"])
+                if visibility {
+                    _ = try await service.linkVisibility(of: ["photo"])
+                } else {
+                    _ = try await service.findDuplicates(nameHashes: ["name-hash"])
+                }
             } catch {
-                #expect(StubURLProtocol.requests().allSatisfy { $0.path == "/drive/volumes/vol/photos/duplicates" })
+                #expect(StubURLProtocol.requests().allSatisfy { $0.path == path })
                 return error
             }
             Issue.record("the lookup must fail for HTTP \(status)")

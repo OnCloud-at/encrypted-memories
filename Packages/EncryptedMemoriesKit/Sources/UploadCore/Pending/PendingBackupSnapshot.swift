@@ -134,7 +134,7 @@ public struct PendingSourceMetadataAnswer: Sendable, Equatable {
 /// Outcome of one remote effect.
 public enum PendingEffectResult: Sendable, Equatable {
     case done
-    /// Transport, 408, 429, 5xx or an unknown error.
+    /// A transport error, a status that `ProtonFailureClassifier.httpStatus` calls temporary, or an unknown error.
     case retry
     /// A confirmed terminal condition, for example a deleted album.
     case permanentFailure
