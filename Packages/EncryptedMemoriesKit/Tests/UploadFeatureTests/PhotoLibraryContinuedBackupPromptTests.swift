@@ -163,6 +163,10 @@ import UploadCore
     @Test func withoutAnActiveSceneItDoesNotAsk() {
         let asker = Asker(claim: .init(), marker: MarkerBox().marker)
         #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(60)) == .none)
+
+        let left = askerAfterTheCalmTime(MarkerBox())
+        left.sceneEnteredBackground()
+        #expect(left.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(60)) == .none)
     }
 
     @Test func eitherAnswerSetsTheMarkerAndOnlyContinueStartsTheTask() {
