@@ -2,78 +2,72 @@ import Foundation
 import PhotosCore
 import UploadCore
 
-/// The finite goal of one continued backup task (#1108): the photos that its first assessment left to do. Photos that
-/// arrive later are not part of it; the normal background windows or the next tap handle them.
+/// The finite goal of one continued backup task (#1108): the photos that were left when the scan after the session start
+/// ended. Photos that arrive later are not part of it; the normal background windows or the next prompt handle them.
 ///
-/// The progress for the system card uses a fixed scale. A task that starts before the assessment ended shows the scan as
-/// the first quarter (`PhotoLibraryBackupExecutionProgress`). The reported progress never goes back: a new scan or a
-/// retry that makes failed rows due again can lower the underlying counts.
+/// - `total` (m) is fixed once, at the first status after the session start whose scan ended: the photos that remain
+///   plus those that the session already backed up.
+/// - `backedUp` (n) counts the photos backed up since the session start, never more than m. Settled rows of other
+///   outcomes are not backed up and never count.
+/// - The progress for the system card has a fixed scale: a short preparing share follows the catalog scan until m is
+///   fixed, and the rest follows n and the share of the item in flight. It never goes back and does not depend on the
+///   size of the library.
 public struct PhotoLibraryContinuedBackupGoal: Sendable, Equatable {
     public struct Progress: Sendable, Equatable {
         /// Units on the fixed scale `PhotoLibraryContinuedBackupGoal.scale`.
         public let units: BackupExecutionProgress
-        /// Photos of the goal that are backed up; nil until the first assessment ended.
+        /// Photos of the goal that are backed up; nil until m is fixed.
         public let backedUp: Int?
-        /// The photos of the goal; nil until the first assessment ended.
+        /// The photos of the goal (m); nil until it is fixed.
         public let total: Int?
     }
 
     public static let scale: Int64 = 1_000_000
-    private static let unitsPerItem = 1_000.0
+    /// The share of the range that the scan before the goal shows.
+    static let preparingShare = 0.05
+    /// The share of one item that a transfer in flight can show, so the next whole item stays above it.
+    private static let largestItemShare = 0.999
 
-    /// The photos that the first assessment left to do; nil until it ended.
+    /// The photos of the goal (m); nil until the scan after the session start ended.
     public private(set) var total: Int?
-    /// The task started before the assessment ended, so its progress includes the scan.
-    private var includesAssessment: Bool?
-    private var settledAtGoal = 0
-    private var itemEquivalentsAtGoal = 0.0
-    private var backedUpAtGoal = 0
-    private var attentionAtGoal = 0
+    /// The backed-up count when the session started.
+    private var backedUpAtStart: Int?
     private var reportedUnits: Int64 = 0
 
     public init() {}
 
-    /// Takes the newest status. The first status after the assessment fixes the goal.
+    /// Takes the newest status. The first status fixes the session start; the first status after it whose scan ended
+    /// fixes m.
     public mutating func update(status: BackupStatus, catalog: PhotoLibraryCatalogProgress?) -> Progress {
+        let backedUpAtStart = self.backedUpAtStart ?? status.backedUp
+        self.backedUpAtStart = backedUpAtStart
+        let backedUpSinceStart = max(0, status.backedUp - backedUpAtStart)
         if total == nil, status.totalConsidered != nil, status.phase != .scanning {
-            total = status.remainingCount
-            settledAtGoal = status.settled
-            itemEquivalentsAtGoal = Self.itemEquivalents(status)
-            backedUpAtGoal = status.backedUp
-            attentionAtGoal = status.needsAttentionCount
+            total = status.remainingCount + backedUpSinceStart
         }
-        if includesAssessment == nil { includesAssessment = total == nil }
-        let complete = BackupExecutionProgress(completedUnitCount: 1, totalUnitCount: 1)
-        let assessment = includesAssessment == true ? (total == nil ? catalog?.executionProgress : complete) : nil
-        let work = total.map { goal -> BackupExecutionProgress in
-            guard goal > 0 else { return complete }
-            let done = max(0, Self.itemEquivalents(status) - itemEquivalentsAtGoal)
-            return BackupExecutionProgress(
-                completedUnitCount: Int64((done * Self.unitsPerItem).rounded(.down)),
-                totalUnitCount: Int64(goal) * Int64(Self.unitsPerItem))
+        let fraction: Double
+        if let total {
+            let done = min(total, backedUpSinceStart)
+            let inFlight = done < total ? min(Self.largestItemShare, max(0, status.activeExecutionItemEquivalents)) : 0
+            let work = total == 0 ? 1 : (Double(done) + inFlight) / Double(total)
+            fraction = Self.preparingShare + (1 - Self.preparingShare) * work
+        } else {
+            let scan = catalog?.executionProgress.map {
+                Double($0.completedUnitCount) / Double(max(1, $0.totalUnitCount))
+            } ?? 0
+            fraction = Self.preparingShare * min(1, max(0, scan))
         }
-        let combined = PhotoLibraryBackupExecutionProgress.combined(
-            catalog: assessment, queue: work, isScanning: total == nil)
-        reportedUnits = max(reportedUnits, combined?.completedUnitCount ?? 0)
+        reportedUnits = max(reportedUnits, Int64((fraction * Double(Self.scale)).rounded(.down)))
         return Progress(
             units: BackupExecutionProgress(completedUnitCount: reportedUnits, totalUnitCount: Self.scale),
-            backedUp: total.map { min($0, max(0, status.backedUp - backedUpAtGoal)) },
+            backedUp: total.map { min($0, backedUpSinceStart) },
             total: total)
     }
 
-    /// The goal's work settled: nothing remains, or as many rows settled as the goal holds while newer photos wait.
+    /// The backup owes no more work, also none for photos that arrived after the session start or rows that wait for a
+    /// retry or a Photos re-check.
     public func isReached(by status: BackupStatus) -> Bool {
-        guard let total else { return false }
-        return status.remainingCount == 0 || status.settled - settledAtGoal >= total
-    }
-
-    /// Photos that need attention appeared after the goal was fixed.
-    func hasNewProblems(in status: BackupStatus) -> Bool {
-        status.needsAttentionCount > attentionAtGoal
-    }
-
-    private static func itemEquivalents(_ status: BackupStatus) -> Double {
-        Double(status.settled) + status.activeExecutionItemEquivalents
+        total != nil && !status.hasOutstandingWork
     }
 }
 
@@ -81,9 +75,9 @@ public struct PhotoLibraryContinuedBackupGoal: Sendable, Equatable {
 /// goal settled reports success also when its expiry came first (#1108; the removed first attempt reported a failure for
 /// a completed backup).
 public enum PhotoLibraryContinuedBackupEnd: String, Sendable, BackgroundLogName {
-    /// The goal settled without new problems.
+    /// The goal settled, and no photo needs attention.
     case completed
-    /// The goal settled, and photos of it need attention.
+    /// The goal settled, and photos need attention; the app shows them too.
     case needsAttention
     /// The person stopped the task on the system card, or iOS expired it, before the goal settled.
     case stopped
@@ -92,7 +86,7 @@ public enum PhotoLibraryContinuedBackupEnd: String, Sendable, BackgroundLogName 
     /// The backup is paused, turned off, or has no photo access.
     case turnedOff
 
-    /// iOS hears success only for a settled goal without new problems.
+    /// iOS hears success only for a settled goal without photos that need attention.
     public var reportsSuccess: Bool { self == .completed }
 
     /// The record of the window ledger.
@@ -110,7 +104,7 @@ public enum PhotoLibraryContinuedBackupEnd: String, Sendable, BackgroundLogName 
     public static func after(
         goal: PhotoLibraryContinuedBackupGoal, settled: BackupStatus, didExpire: Bool, backupRuns: Bool
     ) -> Self {
-        if goal.isReached(by: settled) { return goal.hasNewProblems(in: settled) ? .needsAttention : .completed }
+        if goal.isReached(by: settled) { return settled.needsAttentionCount > 0 ? .needsAttention : .completed }
         if didExpire { return .stopped }
         return backupRuns ? .waiting : .turnedOff
     }

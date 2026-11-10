@@ -8,157 +8,191 @@ import UploadCore
     private static let scale = PhotoLibraryContinuedBackupGoal.scale
 
     private func status(
-        phase: BackupStatus.Phase = .uploading, total: Int? = 100, remaining: Int, settled: Int,
-        backedUp: Int = 0, failed: Int = 0, active: Double = 0
+        phase: BackupStatus.Phase = .uploading, total: Int? = 100, remaining: Int, backedUp: Int = 0,
+        failed: Int = 0, active: Double = 0
     ) -> BackupStatus {
         var status = BackupStatus()
         status.phase = phase
         status.totalConsidered = total
         status.remainingCount = remaining
-        status.settled = settled
         status.uploaded = backedUp
         status.failed = failed
         status.activeExecutionItemEquivalents = active
+        status.hasOutstandingWork = remaining > 0
         return status
     }
+
+    private func scanning(backedUp: Int = 0) -> BackupStatus {
+        status(phase: .scanning, total: nil, remaining: 0, backedUp: backedUp)
+    }
+
+    /// Equal up to one unit: the fraction is computed in floating point.
+    private func near(_ value: Int64, _ expected: Int64) -> Bool { abs(value - expected) <= 1 }
 
     private func catalog(_ completed: Int64, of total: Int64) -> PhotoLibraryCatalogProgress {
         PhotoLibraryCatalogProgress(executionCompletedUnitCount: completed, executionTotalUnitCount: total)
     }
 
-    @Test func theGoalIsTheWorkLeftWhenTheFirstAssessmentEnds() {
+    // MARK: - n and m
+
+    @Test func theGoalIsWhatRemainsWhenTheScanEndsPlusWhatTheSessionBackedUpBefore() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(phase: .scanning, total: nil, remaining: 0, settled: 0), catalog: nil)
+        _ = goal.update(status: scanning(backedUp: 60), catalog: nil)
         #expect(goal.total == nil)
 
-        let first = goal.update(status: status(remaining: 40, settled: 60, backedUp: 60), catalog: nil)
-        #expect(goal.total == 40)
-        #expect(first.total == 40)
-        #expect(first.backedUp == 0)
+        let fixed = goal.update(status: status(remaining: 40, backedUp: 65), catalog: nil)
+        #expect(goal.total == 45)
+        #expect(fixed.total == 45)
+        #expect(fixed.backedUp == 5)
 
-        // Photos that arrive later do not raise the goal; the normal windows or the next tap handle them.
-        let later = goal.update(status: status(total: 150, remaining: 80, settled: 70, backedUp: 70), catalog: nil)
-        #expect(goal.total == 40)
-        #expect(later.total == 40)
+        // Photos that arrive later do not raise the goal.
+        let later = goal.update(status: status(total: 150, remaining: 80, backedUp: 70), catalog: nil)
+        #expect(later.total == 45)
         #expect(later.backedUp == 10)
+    }
+
+    @Test func settledRowsOfOtherOutcomesAreNotBackedUp() {
+        var goal = PhotoLibraryContinuedBackupGoal()
+        _ = goal.update(status: status(remaining: 10), catalog: nil)
+        var failedOnly = status(remaining: 8, failed: 2)
+        failedOnly.settled = 2
+        let progress = goal.update(status: failedOnly, catalog: nil)
+        #expect(progress.backedUp == 0)
+        #expect(progress.units.completedUnitCount == Self.scale * 5 / 100, "only the preparing share")
     }
 
     @Test func theBackedUpCountNeverPassesTheGoal() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(remaining: 5, settled: 0), catalog: nil)
-        let progress = goal.update(status: status(total: 120, remaining: 9, settled: 20, backedUp: 20), catalog: nil)
+        _ = goal.update(status: status(remaining: 5), catalog: nil)
+        let progress = goal.update(status: status(total: 120, remaining: 9, backedUp: 20), catalog: nil)
         #expect(progress.backedUp == 5)
         #expect(progress.units.completedUnitCount == Self.scale)
     }
 
-    @Test func aTapDuringTheAssessmentShowsTheScanAsTheFirstQuarter() {
-        var goal = PhotoLibraryContinuedBackupGoal()
-        let scanning = goal.update(
-            status: status(phase: .scanning, total: nil, remaining: 0, settled: 0), catalog: catalog(50, of: 100))
-        #expect(scanning.units.totalUnitCount == Self.scale)
-        #expect(scanning.units.completedUnitCount == Self.scale / 8)
-        #expect(scanning.total == nil)
+    // MARK: - Progress units
 
-        // The assessment ended: its quarter is complete, and the goal's work fills the rest.
-        let assessed = goal.update(status: status(remaining: 10, settled: 0), catalog: nil)
-        #expect(assessed.units.completedUnitCount == Self.scale / 4)
-        let half = goal.update(status: status(remaining: 5, settled: 5, backedUp: 5), catalog: nil)
-        #expect(half.units.completedUnitCount == Self.scale / 4 + Self.scale * 3 / 8)
+    @Test func theScanBeforeTheGoalFillsOnlyThePreparingShare() {
+        var goal = PhotoLibraryContinuedBackupGoal()
+        let scan = goal.update(status: scanning(), catalog: catalog(50, of: 100))
+        #expect(scan.units.totalUnitCount == Self.scale)
+        #expect(scan.units.completedUnitCount == Self.scale / 40)
+        #expect(scan.total == nil)
+
+        let fixed = goal.update(status: status(remaining: 10), catalog: nil)
+        #expect(fixed.units.completedUnitCount == Self.scale / 20)
+        let half = goal.update(status: status(remaining: 5, backedUp: 5), catalog: nil)
+        #expect(near(half.units.completedUnitCount, Self.scale * 525 / 1000))
     }
 
-    @Test func aTapAfterTheAssessmentShowsOnlyTheGoalsWork() {
+    @Test func theProgressDoesNotDependOnTheSizeOfTheLibrary() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(remaining: 10, settled: 90, backedUp: 90), catalog: catalog(1, of: 1))
-        let progress = goal.update(
-            status: status(remaining: 8, settled: 91, backedUp: 91, active: 1.5), catalog: catalog(1, of: 1))
-        #expect(progress.units.completedUnitCount == Self.scale * 25 / 100)
-        #expect(progress.backedUp == 1)
+        let start = goal.update(status: status(total: 10_000, remaining: 300, backedUp: 9_700), catalog: catalog(1, of: 1))
+        #expect(start.units.completedUnitCount == Self.scale / 20, "300 of 10,000 left starts near the beginning")
+        #expect(start.total == 300)
+    }
+
+    @Test func theItemInFlightMovesTheProgressButNeverReachesTheNextWholeItem() {
+        var goal = PhotoLibraryContinuedBackupGoal()
+        _ = goal.update(status: status(remaining: 10), catalog: nil)
+        let half = goal.update(status: status(remaining: 9, backedUp: 1, active: 0.5), catalog: nil)
+        #expect(near(half.units.completedUnitCount, Self.scale * 1925 / 10_000))
+        let many = goal.update(status: status(remaining: 9, backedUp: 1, active: 3), catalog: nil)
+        #expect(many.units.completedUnitCount > half.units.completedUnitCount)
+        #expect(many.units.completedUnitCount < Self.scale * 24 / 100, "below 2 of 10 items")
     }
 
     @Test func theReportedProgressNeverGoesBack() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        let scanned = goal.update(
-            status: status(phase: .scanning, total: nil, remaining: 0, settled: 0), catalog: catalog(80, of: 100))
+        let scanned = goal.update(status: scanning(), catalog: catalog(80, of: 100))
         // A new scan starts its catalog progress again.
-        let rescanned = goal.update(
-            status: status(phase: .scanning, total: nil, remaining: 0, settled: 0), catalog: catalog(10, of: 100))
+        let rescanned = goal.update(status: scanning(), catalog: catalog(10, of: 100))
         #expect(rescanned.units.completedUnitCount == scanned.units.completedUnitCount)
 
-        _ = goal.update(status: status(remaining: 10, settled: 0), catalog: nil)
-        let moved = goal.update(status: status(remaining: 6, settled: 4, backedUp: 4), catalog: nil)
-        // A retry makes failed rows due again, so the settled count can drop.
-        let requeued = goal.update(status: status(remaining: 8, settled: 2, backedUp: 2), catalog: nil)
-        #expect(requeued.units.completedUnitCount == moved.units.completedUnitCount)
+        _ = goal.update(status: status(remaining: 10), catalog: nil)
+        let moving = goal.update(status: status(remaining: 6, backedUp: 4, active: 0.9), catalog: nil)
+        // The item in flight failed and its share went away.
+        let failed = goal.update(status: status(remaining: 6, backedUp: 4, failed: 1), catalog: nil)
+        #expect(failed.units.completedUnitCount == moving.units.completedUnitCount)
     }
 
     @Test func anEmptyGoalIsReachedAtOnce() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        let progress = goal.update(status: status(phase: .completed, remaining: 0, settled: 100), catalog: nil)
+        let settled = status(phase: .completed, remaining: 0, backedUp: 100)
+        let progress = goal.update(status: settled, catalog: nil)
         #expect(goal.total == 0)
         #expect(progress.units.completedUnitCount == Self.scale)
-        #expect(goal.isReached(by: status(phase: .completed, remaining: 0, settled: 100)))
+        #expect(goal.isReached(by: settled))
     }
 
     // MARK: - Result from the settled state
 
     @Test func aGoalThatSettledReportsSuccessAlsoWhenTheExpiryCameFirst() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(remaining: 3, settled: 0), catalog: nil)
-        let settled = status(phase: .completed, remaining: 0, settled: 3, backedUp: 3)
+        _ = goal.update(status: status(remaining: 3), catalog: nil)
+        let settled = status(phase: .completed, remaining: 0, backedUp: 3)
         let end = PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: settled, didExpire: true, backupRuns: true)
         #expect(end == .completed)
         #expect(end.reportsSuccess)
         #expect(end.windowOutcome == .ran)
     }
 
-    @Test func theGoalCountsAsReachedWhenItsCountSettledWhileNewPhotosWait() {
+    @Test func aGoalIsReachedOnlyWhenNothingRemains() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(remaining: 3, settled: 0), catalog: nil)
-        let settled = status(total: 105, remaining: 2, settled: 3, backedUp: 3)
-        #expect(goal.isReached(by: settled))
+        _ = goal.update(status: status(remaining: 3), catalog: nil)
+        // The goal's count is backed up, but photos that arrived later still wait.
+        var newerWait = status(total: 105, remaining: 2, backedUp: 3)
+        newerWait.settled = 3
+        #expect(!goal.isReached(by: newerWait))
         #expect(
-            PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: settled, didExpire: false, backupRuns: true)
-                == .completed)
+            PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: newerWait, didExpire: false, backupRuns: true)
+                == .waiting)
+    }
+
+    @Test func rowsThatWaitForARetryKeepTheGoalOpen() {
+        var goal = PhotoLibraryContinuedBackupGoal()
+        _ = goal.update(status: status(remaining: 3), catalog: nil)
+        var blocked = status(phase: .waiting, remaining: 0, backedUp: 3)
+        blocked.waitingRetry = 1
+        blocked.hasOutstandingWork = true
+        #expect(!goal.isReached(by: blocked))
+        #expect(
+            PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: blocked, didExpire: false, backupRuns: true)
+                == .waiting)
     }
 
     @Test func anExpiryWithWorkLeftReportsAStop() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(remaining: 3, settled: 0), catalog: nil)
-        let settled = status(phase: .waiting, remaining: 2, settled: 1, backedUp: 1)
+        _ = goal.update(status: status(remaining: 3), catalog: nil)
+        let settled = status(phase: .waiting, remaining: 2, backedUp: 1)
         let end = PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: settled, didExpire: true, backupRuns: true)
         #expect(end == .stopped)
         #expect(!end.reportsSuccess)
         #expect(end.windowOutcome == .expired)
     }
 
-    @Test func anExpiryBeforeTheAssessmentEndedReportsAStop() {
-        let goal = PhotoLibraryContinuedBackupGoal()
-        let settled = status(phase: .scanning, total: nil, remaining: 0, settled: 0)
+    @Test func anExpiryBeforeTheScanEndedReportsAStop() {
+        var goal = PhotoLibraryContinuedBackupGoal()
+        _ = goal.update(status: scanning(), catalog: nil)
         #expect(
-            PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: settled, didExpire: true, backupRuns: true)
+            PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: scanning(), didExpire: true, backupRuns: true)
                 == .stopped)
     }
 
-    @Test func newProblemsInTheGoalReportNoSuccess() {
+    @Test func photosThatNeedAttentionReportNoSuccess() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(remaining: 3, settled: 0, failed: 1), catalog: nil)
-        let settled = status(phase: .needsAttention, remaining: 0, settled: 3, backedUp: 2, failed: 2)
+        _ = goal.update(status: status(remaining: 3, failed: 1), catalog: nil)
+        // The app shows the problem too, also one from before the start; the card agrees with it.
+        let settled = status(phase: .needsAttention, remaining: 0, backedUp: 3, failed: 1)
         let end = PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: settled, didExpire: false, backupRuns: true)
         #expect(end == .needsAttention)
         #expect(!end.reportsSuccess)
         #expect(end.windowOutcome == .ran)
-
-        // A problem that existed before the goal does not count against it.
-        let clean = status(phase: .needsAttention, remaining: 0, settled: 3, backedUp: 3, failed: 1)
-        #expect(
-            PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: clean, didExpire: false, backupRuns: true)
-                == .completed)
     }
 
     @Test func workThatWaitsOrABackupThatStoppedReportsNoSuccess() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        _ = goal.update(status: status(remaining: 3, settled: 0), catalog: nil)
-        let waiting = status(phase: .waitingForWiFi, remaining: 3, settled: 0)
+        _ = goal.update(status: status(remaining: 3), catalog: nil)
+        let waiting = status(phase: .waitingForWiFi, remaining: 3)
         let ran = PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: waiting, didExpire: false, backupRuns: true)
         #expect(ran == .waiting)
         #expect(!ran.reportsSuccess)

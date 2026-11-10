@@ -220,7 +220,18 @@ final class BackupStatusTests: XCTestCase {
         XCTAssertEqual(status.checked, 4 + 5 + 1 + 1 + 1 + 1 + 2)
     }
 
-    func testExecutionProgressAddsFractionalTransferWithoutInflatingBackedUpCount() throws {
+    /// A continued backup task reports success only when no work is owed (#1108). Rows that wait for a retry count as
+    /// owed work although they are not in `remainingCount`.
+    func testOwedWorkIncludesRowsThatWaitForARetry() {
+        let waitingForRetry = BackupStatus(progress: progress(total: 10, alreadyBackedUp: 9, blocked: 1), isScanning: false)
+        XCTAssertEqual(waitingForRetry.remainingCount, 0)
+        XCTAssertTrue(waitingForRetry.hasOutstandingWork)
+
+        let done = BackupStatus(progress: progress(total: 10, alreadyBackedUp: 9, failed: 1), isScanning: false)
+        XCTAssertFalse(done.hasOutstandingWork, "a failed row needs attention, but no work is owed")
+    }
+
+    func testAFractionalTransferAddsItemEquivalentsWithoutInflatingBackedUpCount() throws {
         let transfer = BackupActiveTransferProgress(
             activeItemCount: 1,
             completedBytes: 50,
@@ -237,9 +248,7 @@ final class BackupStatusTests: XCTestCase {
 
         XCTAssertEqual(status.backedUp, 5)
         XCTAssertEqual(status.settled, 6)
-        let execution = try XCTUnwrap(status.executionProgress)
-        XCTAssertEqual(execution.totalUnitCount, 10_000)
-        XCTAssertEqual(execution.completedUnitCount, 6_500)
+        XCTAssertEqual(status.activeExecutionItemEquivalents, 0.5)
     }
 
     func testManualCheckMapsToSharedPhasesWithoutClaimingUpload() {

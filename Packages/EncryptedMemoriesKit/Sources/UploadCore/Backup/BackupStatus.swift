@@ -94,6 +94,9 @@ public struct BackupStatus: Sendable, Equatable {
     /// Rows the backup still works on: waiting, being checked or being uploaded. Failed, missing, dismissed and
     /// draft-blocked rows are not counted.
     public var remainingCount = 0
+    /// Work that the backup still owes, also rows that wait for a retry or a Photos re-check. Taken from
+    /// `BackupSyncProgress.hasOutstandingWork`, the one rule for it.
+    public var hasOutstandingWork = false
     /// Smoothed upload speed. Only the projector knows it; it is nil whenever the backup does not send.
     public var uploadSpeedBytesPerSecond: Double?
     /// Dominant typed reason for unfinished work and the next time Core can honestly retry it.
@@ -165,6 +168,7 @@ public struct BackupStatus: Sendable, Equatable {
         sourceMissing = progress.sourceMissing
         waitingRetry = progress.blocked
         remainingCount = progress.waiting + progress.checking + progress.uploading
+        hasOutstandingWork = progress.hasOutstandingWork
         settled = progress.settled
         activeTransfer = progress.activeTransfer
         activeExecutionItemEquivalents = max(
@@ -341,21 +345,5 @@ public struct BackupStatus: Sendable, Equatable {
             }
             return L10n.string("backup.detail_attention \(needsAttentionCount)")
         }
-    }
-
-    /// Scaled units let a continued-processing task advance within one large item while preserving
-    /// item-based durable totals. 1,000 subunits per item is enough for one-percent SDK progress and
-    /// does not change the user-visible backed-up count.
-    public var executionProgress: BackupExecutionProgress? {
-        guard let total = totalConsidered, total > 0 else { return nil }
-        let scale: Int64 = 1_000
-        let activeEquivalent = activeExecutionItemEquivalents
-        let completed = Int64(
-            ((Double(settled) + activeEquivalent) * Double(scale)).rounded(.down)
-        )
-        return BackupExecutionProgress(
-            completedUnitCount: completed,
-            totalUnitCount: Int64(total) * scale
-        )
     }
 }
