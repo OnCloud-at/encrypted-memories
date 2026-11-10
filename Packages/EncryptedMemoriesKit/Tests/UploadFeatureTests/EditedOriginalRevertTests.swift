@@ -61,6 +61,26 @@ final class EditedOriginalRevertTests: XCTestCase {
         XCTAssertTrue(server.invalidatedCachedRemoteState())
     }
 
+    func testTheRestoredCopyKeepsTheMetadataOfTheHiddenOriginal() async throws {
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        let modified = Date(timeIntervalSince1970: 1_700_000_500)
+        let camera = PhotoUploadAdditionalMetadata(name: "Camera", utf8JsonValue: Data("{}".utf8))
+        server.setOriginalSource(
+            SeriesMemberSource(
+                filename: "IMG_0001.jpg", mediaType: "image/jpeg",
+                captureTime: captured, modificationDate: modified, additionalMetadata: [camera]))
+
+        _ = try await makeOrchestrator().revert(
+            editedMain: editedMain, original: original, restoredName: "IMG_0001 (original).jpg")
+
+        let request = try XCTUnwrap(server.uploadRequests().first)
+        XCTAssertEqual(request.mediaType, "image/jpeg")
+        XCTAssertEqual(request.captureTime, captured)
+        XCTAssertEqual(request.modificationDate, modified)
+        XCTAssertEqual(request.additionalMetadata.first, camera)
+        XCTAssertEqual(request.additionalMetadata.count, 2, "the source metadata plus the lineage marker")
+    }
+
     func testForeignDraftBlocksAndLeavesNothingTrashed() async throws {
         server.setForeignDraft(clientUID: "other")
         do {
@@ -1069,6 +1089,12 @@ private final class FakeRevertRemote: EditedOriginalRevertRemote, SeriesAlbumCar
             "edited": ("edited.heic", .active, nil, "ch-edited"),
         ]
     private var uploads: [(name: String, uid: PhotoUID)] = []
+    private var _uploadRequests: [PhotoUploadRequest] = []
+    /// What `originalSource(for:)` reports for the hidden original.
+    private var _originalSource = SeriesMemberSource(
+        filename: "original.heic", mediaType: "image/heic",
+        captureTime: Date(timeIntervalSince1970: 1), modificationDate: Date(timeIntervalSince1970: 2),
+        additionalMetadata: [])
     private var _trashCalls: [[PhotoUID]] = []
     private var _favorites: Set<String> = ["edited"]
     private var _albumMemberships: [String: Set<String>] = ["album1": ["edited"], "album2": ["edited"]]
@@ -1231,6 +1257,10 @@ private final class FakeRevertRemote: EditedOriginalRevertRemote, SeriesAlbumCar
     func downloads() -> Int { lock.withLock { downloadCount } }
 
     func uploadNames() -> [String] { lock.withLock { uploads.map(\.name) } }
+    func uploadRequests() -> [PhotoUploadRequest] { lock.withLock { _uploadRequests } }
+
+    /// Replaces what the fake reports as the metadata of the hidden original.
+    func setOriginalSource(_ source: SeriesMemberSource) { lock.withLock { _originalSource = source } }
     func trashCalls() -> [[PhotoUID]] { lock.withLock { _trashCalls } }
     func favoriteWrites() -> Set<PhotoUID> { lock.withLock { Set(_favorites.compactMap { uid($0) }) } }
     func albumAdds() -> [(uid: PhotoUID, album: SeriesAlbumReference)] { lock.withLock { _albumAdds } }
@@ -1304,13 +1334,8 @@ private final class FakeRevertRemote: EditedOriginalRevertRemote, SeriesAlbumCar
 
     // OriginalFileProvider
 
-    func originalSource(for uid: PhotoUID) async throws -> EditedOriginalSource {
-        lock.withLock {
-            let node = nodes[uid.nodeID]!
-            return EditedOriginalSource(
-                filename: node.name, mediaType: "image/heic",
-                captureTime: Date(), modificationDate: Date(), additionalMetadata: [])
-        }
+    func originalSource(for uid: PhotoUID) async throws -> SeriesMemberSource {
+        lock.withLock { _originalSource }
     }
 
     func writeOriginal(
@@ -1352,6 +1377,7 @@ private final class FakeRevertRemote: EditedOriginalRevertRemote, SeriesAlbumCar
             }
             let uid = PhotoUID(volumeID: ownVolumeID, nodeID: "copy-\(uploads.count)")
             uploads.append((request.name, uid))
+            _uploadRequests.append(request)
             nodes[uid.nodeID] = (request.name, .active, nil, contentHashForUploaded)
             _operationLog.append("upload:\(uid.nodeID)")
             onProgress(.init(phase: .uploading, fraction: 1))

@@ -1,19 +1,6 @@
 import Foundation
 import PhotosCore
 
-/// Metadata of a source file that becomes a standalone copy. Both the series dissolution (a series member) and the
-/// revert to original (the hidden original file) conform, so one copy helper serves both features without duplication.
-public protocol RelatedPhotoCopySourceInfo: Sendable {
-    var filename: String { get }
-    var mediaType: String { get }
-    var captureTime: Date { get }
-    var modificationDate: Date { get }
-    var additionalMetadata: [PhotoUploadAdditionalMetadata] { get }
-}
-
-/// A series member's metadata conforms to the copy source rule.
-extension SeriesMemberSource: RelatedPhotoCopySourceInfo {}
-
 /// One error from the shared copy helper that each caller maps to its own domain error.
 public enum RelatedPhotoCopyError: Error, Equatable {
     /// Another client's draft occupies the upload name. The operation stays resumable. `occupiedName` is the
@@ -21,9 +8,6 @@ public enum RelatedPhotoCopyError: Error, Equatable {
     /// that name the person's file.
     case blockedByForeignDraft(occupiedName: String, sourceFilename: String)
 }
-
-/// The hidden original's metadata conforms to the copy source rule.
-extension EditedOriginalSource: RelatedPhotoCopySourceInfo {}
 
 /// Downloads a source file and makes it a standalone photo under the copy rule that ignores the source compound.
 ///
@@ -57,7 +41,7 @@ public struct RelatedPhotoCopier: Sendable {
     /// second half. A retry repeats no write twice.
     public func makeStandaloneCopy(
         sourceUID: PhotoUID,
-        source: any RelatedPhotoCopySourceInfo,
+        source: SeriesMemberSource,
         uploadName: String,
         extraMetadata: [PhotoUploadAdditionalMetadata],
         sourceLinkID: String,

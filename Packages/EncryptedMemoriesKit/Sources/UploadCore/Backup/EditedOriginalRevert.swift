@@ -3,41 +3,9 @@ import PhotosCore
 
 /// Remote reads and writes of the revert to original. The backend implements it; tests use a fake.
 public protocol EditedOriginalRevertRemote: EditReplacementRemote, OriginalFileProvider {
-    /// Metadata of the hidden original: filename, type, capture time and encrypted sections.
-    func originalSource(for uid: PhotoUID) async throws -> EditedOriginalSource
-}
-
-/// Metadata of the hidden original that the restored copy keeps. The revert to original uses this source
-/// alongside the shared copy helper, mirroring the series dissolution without duplication.
-public struct EditedOriginalSource: Sendable, Equatable {
-    public let filename: String
-    public let mediaType: String
-    public let captureTime: Date
-    public let modificationDate: Date
-    public let additionalMetadata: [PhotoUploadAdditionalMetadata]
-
-    public init(
-        filename: String,
-        mediaType: String,
-        captureTime: Date,
-        modificationDate: Date,
-        additionalMetadata: [PhotoUploadAdditionalMetadata]
-    ) {
-        self.filename = filename
-        self.mediaType = mediaType
-        self.captureTime = captureTime
-        self.modificationDate = modificationDate
-        self.additionalMetadata = additionalMetadata
-    }
-}
-
-extension EditedOriginalSource {
-    /// The hidden original is read like a series member: both reads keep the metadata that the copy carries.
-    public init(_ member: SeriesMemberSource) {
-        self.init(
-            filename: member.filename, mediaType: member.mediaType, captureTime: member.captureTime,
-            modificationDate: member.modificationDate, additionalMetadata: member.additionalMetadata)
-    }
+    /// Metadata of the hidden original that the restored copy keeps: filename, type, capture time and encrypted
+    /// sections. The hidden original is read like a series member.
+    func originalSource(for uid: PhotoUID) async throws -> SeriesMemberSource
 }
 
 /// The outcome of a resume attempt that finished in the trash step. The host reports the restored copy or the

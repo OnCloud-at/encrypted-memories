@@ -3,8 +3,9 @@ import PhotosCore
 
 // MARK: - Seams
 
-/// What the standalone copy of one series member keeps from its source: the original filename, type and
-/// capture time, plus Proton's encrypted metadata sections that do not identify the source asset.
+/// What the standalone copy of a source file keeps from it: the original filename, type and capture time, plus
+/// Proton's encrypted metadata sections that do not identify the source asset. A series member, a related file of
+/// the duplicates merge and the hidden original of the revert to original use it.
 public struct SeriesMemberSource: Sendable, Equatable {
     public let filename: String
     public let mediaType: String

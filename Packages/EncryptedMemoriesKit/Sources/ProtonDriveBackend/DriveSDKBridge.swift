@@ -3168,10 +3168,9 @@ extension DriveSDKBridge: EditReplacementRemote {}
 extension DriveSDKBridge: EditedOriginalRevertRemote {
     /// The hidden original is read like a series member: the same node read supplies the metadata that the restored
     /// copy keeps, and the copy drops the sections that describe the edited photo.
-    func originalSource(for uid: PhotoUID) async throws -> EditedOriginalSource {
+    func originalSource(for uid: PhotoUID) async throws -> SeriesMemberSource {
         try await withOpenSession(cause: .carryOver) { bridge in
-            EditedOriginalSource(
-                try await SDKPhotoMetadataReader.seriesMemberSource(for: uid, client: bridge.photosClient))
+            try await SDKPhotoMetadataReader.seriesMemberSource(for: uid, client: bridge.photosClient)
         }
     }
 }

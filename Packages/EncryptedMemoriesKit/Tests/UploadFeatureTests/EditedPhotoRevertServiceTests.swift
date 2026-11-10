@@ -118,19 +118,6 @@ final class EditedPhotoRevertServiceTests: XCTestCase {
             XCTAssertEqual(error, .blockedByForeignDraft("IMG_0001.heic"))
         }
     }
-
-    func testTheHiddenOriginalSourceKeepsTheMetadataOfTheSeriesMemberSource() {
-        let member = SeriesMemberSource(
-            filename: "IMG_0001-originalPhoto-1.heic", mediaType: "image/heic",
-            captureTime: Date(timeIntervalSince1970: 10), modificationDate: Date(timeIntervalSince1970: 20),
-            additionalMetadata: [PhotoUploadAdditionalMetadata(name: "Camera", utf8JsonValue: Data("{}".utf8))])
-        let source = EditedOriginalSource(member)
-        XCTAssertEqual(source.filename, member.filename)
-        XCTAssertEqual(source.mediaType, member.mediaType)
-        XCTAssertEqual(source.captureTime, member.captureTime)
-        XCTAssertEqual(source.modificationDate, member.modificationDate)
-        XCTAssertEqual(source.additionalMetadata, member.additionalMetadata)
-    }
 }
 
 private actor SpyReverter: EditedOriginalReverting {
