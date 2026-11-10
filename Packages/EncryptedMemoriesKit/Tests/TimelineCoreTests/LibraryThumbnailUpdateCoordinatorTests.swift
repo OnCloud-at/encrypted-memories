@@ -36,14 +36,14 @@ import Testing
         coordinator.reconcile(currentUIDs: added, addedUIDs: added) { uids, _ in
             await availability.resolution(for: uids)
         }
-        await eventually { coordinator.state.pendingCount == 2 }
+        #expect(await waitUntil { @MainActor in coordinator.state.pendingCount == 2 })
         try? await Task.sleep(for: .milliseconds(30))
         #expect(coordinator.state.pendingCount == 2)
 
         await availability.makeAvailable(uid("new-1"))
-        await eventually { coordinator.state.pendingCount == 1 }
+        #expect(await waitUntil { @MainActor in coordinator.state.pendingCount == 1 })
         await availability.makeAvailable(uid("new-2"))
-        await eventually { !coordinator.state.isActive }
+        #expect(await waitUntil { @MainActor in !coordinator.state.isActive })
     }
 
     @Test func laterRefreshMergesNewIDsAndRemovesDeletedPendingIDs() async {
@@ -56,15 +56,15 @@ import Testing
         coordinator.reconcile(currentUIDs: [first, deleted], addedUIDs: [first, deleted]) { uids, _ in
             await availability.resolution(for: uids)
         }
-        await eventually { coordinator.state.pendingCount == 2 }
+        #expect(await waitUntil { @MainActor in coordinator.state.pendingCount == 2 })
         coordinator.reconcile(currentUIDs: [first, later], addedUIDs: [later]) { uids, _ in
             await availability.resolution(for: uids)
         }
-        await eventually { coordinator.state.pendingCount == 2 }
+        #expect(await waitUntil { @MainActor in coordinator.state.pendingCount == 2 })
 
         await availability.makeAvailable(first)
         await availability.makeTerminal(later)
-        await eventually { !coordinator.state.isActive }
+        #expect(await waitUntil { @MainActor in !coordinator.state.isActive })
     }
 
     @Test func cancelHidesPresentationAndJoinsRetiringWorker() async {
@@ -74,7 +74,7 @@ import Testing
             try? await Task.sleep(for: .seconds(5))
             return LibraryThumbnailResolutionSnapshot()
         }
-        await eventually { coordinator.state.isActive }
+        #expect(await waitUntil { @MainActor in coordinator.state.isActive })
 
         let retiring = coordinator.cancel()
         await retiring?.value
@@ -95,7 +95,7 @@ import Testing
                 LibraryThumbnailResolutionSnapshot(availableUIDs: uids)
             }
         )
-        await eventually { !coordinator.state.isActive }
+        #expect(await waitUntil { @MainActor in !coordinator.state.isActive })
 
         #expect(states.first?.pendingCount == 1)
         #expect(states.last == .idle)
@@ -111,14 +111,6 @@ import Testing
 
     private func uid(_ value: String) -> PhotoUID {
         PhotoUID(volumeID: "v", nodeID: value)
-    }
-
-    private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
-        for _ in 0..<100 {
-            if condition() { return }
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        Issue.record("Condition did not become true")
     }
 }
 
