@@ -619,6 +619,20 @@ public final class LibrarySourceGraph {
         /// Changes only when the persisted item payload changes. Transient refresh-state changes do
         /// not force a complete item comparison in the persistence layer after a no-op refresh.
         var itemGeneration: UInt64
+
+        mutating func clearInventory() {
+            items = []
+            itemIndexByUID = [:]
+            burstOwnersByMemberUID = [:]
+            validationToken = nil
+        }
+
+        mutating func installInventory(_ items: [LibrarySourceItem], validationToken: String?) {
+            self.items = items
+            itemIndexByUID = LibrarySourceGraph.itemIndexByUID(items)
+            burstOwnersByMemberUID = LibrarySourceGraph.burstOwnersByMemberUID(items)
+            self.validationToken = validationToken
+        }
     }
 
     private var records: [SourceID: Record] = [:]
@@ -735,10 +749,7 @@ public final class LibrarySourceGraph {
             if !record.items.isEmpty { record.itemGeneration &+= 1 }
             record.accessState = .accessLost
             record.authority = .authoritative
-            record.items = []
-            record.itemIndexByUID = [:]
-            record.burstOwnersByMemberUID = [:]
-            record.validationToken = nil
+            record.clearInventory()
             records[sourceID] = record
         }
 
@@ -753,10 +764,7 @@ public final class LibrarySourceGraph {
                     if !record.items.isEmpty { record.itemGeneration &+= 1 }
                     record.accessState = .temporarilyUnavailable
                     record.authority = .hydrating
-                    record.items = []
-                    record.itemIndexByUID = [:]
-                    record.burstOwnersByMemberUID = [:]
-                    record.validationToken = nil
+                    record.clearInventory()
                 }
                 if !reactivating, record.source.capabilities != discoveredSource.capabilities {
                     record.accessGeneration &+= 1
@@ -838,10 +846,7 @@ public final class LibrarySourceGraph {
             record.itemGeneration &+= 1
         }
         record.refreshGeneration &+= 1
-        record.items = canonicalItems
-        record.itemIndexByUID = Self.itemIndexByUID(canonicalItems)
-        record.burstOwnersByMemberUID = Self.burstOwnersByMemberUID(canonicalItems)
-        record.validationToken = validationToken
+        record.installInventory(canonicalItems, validationToken: validationToken)
         record.accessState = .available
         record.authority = .authoritative
         records[lease.sourceID] = record
@@ -879,10 +884,7 @@ public final class LibrarySourceGraph {
             record.itemGeneration &+= 1
         }
         record.refreshGeneration &+= 1
-        record.items = canonicalItems
-        record.itemIndexByUID = Self.itemIndexByUID(canonicalItems)
-        record.burstOwnersByMemberUID = Self.burstOwnersByMemberUID(canonicalItems)
-        record.validationToken = validationToken
+        record.installInventory(canonicalItems, validationToken: validationToken)
         record.accessState = .temporarilyUnavailable
         record.authority = nextAuthority
         records[sourceID] = record
@@ -937,10 +939,7 @@ public final class LibrarySourceGraph {
         if !record.items.isEmpty { record.itemGeneration &+= 1 }
         record.accessState = .accessLost
         record.authority = .authoritative
-        record.items = []
-        record.itemIndexByUID = [:]
-        record.burstOwnersByMemberUID = [:]
-        record.validationToken = nil
+        record.clearInventory()
         records[sourceID] = record
         revision &+= 1
         return makeChange(previousRetentionUIDs: previousRetentionUIDs)
@@ -973,20 +972,13 @@ public final class LibrarySourceGraph {
     ) -> [PhotoUID: SourceAccessLease] {
         let requested = uids.intersection(identitiesOutsideInventory)
         guard !requested.isEmpty, !capability.isEmpty, capability.subtracting(.all).isEmpty else { return [:] }
-        var selectedID: SourceID?
-        for (sourceID, record) in records
-        where record.accessState != .accessLost
-            && (includeExcludedSources || record.source.isIncluded)
-            && record.source.capabilities.contains(capability)
-        {
-            if let selectedID, let selected = records[selectedID],
-                !Self.sourcePrecedes(record.source, selected.source)
-            {
-                continue
-            }
-            selectedID = sourceID
-        }
-        guard let selectedID, let record = records[selectedID] else { return [:] }
+        guard
+            let (selectedID, record) = bestRecord(where: { record in
+                record.accessState != .accessLost
+                    && (includeExcludedSources || record.source.isIncluded)
+                    && record.source.capabilities.contains(capability)
+            })
+        else { return [:] }
         return Dictionary(
             uniqueKeysWithValues: requested.map { uid in
                 (
@@ -1084,21 +1076,14 @@ public final class LibrarySourceGraph {
         includeExcludedSources: Bool = true
     ) -> SourceAccessLease? {
         guard !capability.isEmpty, capability.subtracting(.all).isEmpty else { return nil }
-        var selectedID: SourceID?
-        for (sourceID, record) in records
-        where record.accessState != .accessLost
-            && (includeExcludedSources || record.source.isIncluded)
-            && record.source.capabilities.contains(capability)
-            && record.itemIndexByUID[uid] != nil
-        {
-            if let selectedID, let selected = records[selectedID],
-                !Self.sourcePrecedes(record.source, selected.source)
-            {
-                continue
-            }
-            selectedID = sourceID
-        }
-        guard let selectedID, let record = records[selectedID] else { return nil }
+        guard
+            let (selectedID, record) = bestRecord(where: { record in
+                record.accessState != .accessLost
+                    && (includeExcludedSources || record.source.isIncluded)
+                    && record.source.capabilities.contains(capability)
+                    && record.itemIndexByUID[uid] != nil
+            })
+        else { return nil }
         return SourceAccessLease(
             sourceID: selectedID,
             uid: uid,
@@ -1123,27 +1108,22 @@ public final class LibrarySourceGraph {
         guard !capability.isEmpty, capability.subtracting(.all).isEmpty,
             resourceUID.volumeID == ownerUID.volumeID
         else { return nil }
-        var selectedID: SourceID?
-        for (sourceID, record) in records {
-            guard record.accessState != .accessLost,
-                includeExcludedSources || record.source.isIncluded,
-                record.source.capabilities.contains(capability),
-                let itemIndex = record.itemIndexByUID[ownerUID],
-                Self.establishes(
-                    relationship,
-                    from: ownerUID,
-                    to: resourceUID,
-                    sourceItem: record.items[itemIndex]
-                )
-            else { continue }
-            if let selectedID, let selected = records[selectedID],
-                !Self.sourcePrecedes(record.source, selected.source)
-            {
-                continue
-            }
-            selectedID = sourceID
-        }
-        guard let selectedID, let record = records[selectedID] else { return nil }
+        guard
+            let (selectedID, record) = bestRecord(where: { record in
+                guard record.accessState != .accessLost,
+                    includeExcludedSources || record.source.isIncluded,
+                    record.source.capabilities.contains(capability),
+                    let itemIndex = record.itemIndexByUID[ownerUID],
+                    Self.establishes(
+                        relationship,
+                        from: ownerUID,
+                        to: resourceUID,
+                        sourceItem: record.items[itemIndex]
+                    )
+                else { return false }
+                return true
+            })
+        else { return nil }
         return SourceAccessLease(
             sourceID: selectedID,
             uid: resourceUID,
@@ -1531,6 +1511,15 @@ public final class LibrarySourceGraph {
             ),
             knownFields: knownFields
         )
+    }
+
+    private func bestRecord(where isEligible: (Record) -> Bool) -> (SourceID, Record)? {
+        var selected: (SourceID, Record)?
+        for (sourceID, record) in records where isEligible(record) {
+            if let current = selected, !Self.sourcePrecedes(record.source, current.1.source) { continue }
+            selected = (sourceID, record)
+        }
+        return selected
     }
 
     /// Higher precedence first, with the source ID as a stable tie-breaker.

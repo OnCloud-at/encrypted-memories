@@ -310,6 +310,145 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertTrue(graph.snapshot().retentionScope.orderedUIDs.isEmpty)
     }
 
+    func testBothAccessLossPathsClearInventoryAndRejectOldLeasesAfterReactivation() throws {
+        for removeByDiscovery in [false, true] {
+            var graph = LibrarySourceGraph()
+            let owner = item("owner", time: 10, burstMemberIDs: ["owner", "member"])
+            let member = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "member")
+            _ = install(firstSource, items: [owner], in: &graph)
+            let tokenRefresh = try XCTUnwrap(graph.beginRefresh(firstSource.id))
+            _ = try XCTUnwrap(graph.commit([.complete(owner)], validationToken: "old", using: tokenRefresh))
+            let oldAccess = try XCTUnwrap(graph.accessLease(for: owner.uid, requiring: .readThumbnail))
+            let oldRefresh = try XCTUnwrap(graph.beginRefresh(firstSource.id))
+            XCTAssertNotNil(graph.burstMemberAccessLeases(for: [member], requiring: .readThumbnail)[member])
+
+            if removeByDiscovery {
+                let sourceSet = graph.beginSourceSetRefresh()
+                _ = try XCTUnwrap(graph.commitSourceSet([], using: sourceSet))
+            } else {
+                _ = try XCTUnwrap(graph.removeSource(firstSource.id))
+            }
+            let lost = try XCTUnwrap(graph.inventory(for: firstSource.id))
+            XCTAssertEqual(lost.accessState, .accessLost)
+            XCTAssertEqual(lost.authority, .authoritative)
+            XCTAssertTrue(lost.items.isEmpty)
+            XCTAssertNil(lost.validationToken)
+            XCTAssertNil(graph.accessLease(for: owner.uid, requiring: .readThumbnail))
+            XCTAssertNil(
+                graph.relatedAccessLease(
+                    for: member, of: owner.uid, relationship: .burstMember, requiring: .readThumbnail))
+            XCTAssertNil(graph.burstMemberAccessLeases(for: [member], requiring: .readThumbnail)[member])
+            XCTAssertFalse(graph.isCurrent(oldAccess))
+            XCTAssertNil(graph.commit([.complete(owner)], validationToken: "stale", using: oldRefresh))
+            let lostRevision = graph.revision
+            XCTAssertNil(graph.beginRefresh(firstSource.id))
+            XCTAssertNil(graph.removeSource(firstSource.id))
+            XCTAssertEqual(graph.revision, lostRevision)
+
+            let sourceSet = graph.beginSourceSetRefresh()
+            _ = try XCTUnwrap(graph.commitSourceSet([firstSource], using: sourceSet))
+            let reactivated = try XCTUnwrap(graph.inventory(for: firstSource.id))
+            XCTAssertEqual(reactivated.accessState, .temporarilyUnavailable)
+            XCTAssertEqual(reactivated.authority, .hydrating)
+            XCTAssertTrue(reactivated.items.isEmpty)
+            XCTAssertNil(reactivated.validationToken)
+            XCTAssertNil(graph.accessLease(for: owner.uid, requiring: .readThumbnail))
+            XCTAssertNil(graph.burstMemberAccessLeases(for: [member], requiring: .readThumbnail)[member])
+            let fresh = try XCTUnwrap(graph.beginRefresh(firstSource.id))
+            _ = try XCTUnwrap(graph.commit([.complete(owner)], validationToken: "new", using: fresh))
+            XCTAssertFalse(graph.isCurrent(oldAccess))
+            XCTAssertNil(graph.commit([.complete(owner)], validationToken: "stale", using: oldRefresh))
+            XCTAssertNotNil(graph.burstMemberAccessLeases(for: [member], requiring: .readThumbnail)[member])
+        }
+    }
+
+    func testUnknownCapabilityCannotAuthorizeAnyRoute() {
+        var graph = LibrarySourceGraph()
+        let owner = item("owner", time: 1, isLivePhoto: true, relatedVideoID: "motion")
+        let motion = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "motion")
+        let outside = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "outside")
+        let unknown = LibrarySourceCapabilities(rawValue: 1 << 15)
+        _ = install(firstSource, items: [owner], in: &graph)
+        _ = graph.setIdentitiesOutsideInventory([outside])
+        XCTAssertTrue(graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: unknown).isEmpty)
+        XCTAssertNil(graph.accessLease(for: owner.uid, requiring: unknown))
+        XCTAssertNil(
+            graph.relatedAccessLease(for: motion, of: owner.uid, relationship: .livePhotoMotion, requiring: unknown))
+    }
+
+    func testCachedInventoryNoOpKeepsRevisionAndChangedInventoryInvalidatesLease() throws {
+        let graph = LibrarySourceGraph()
+        let sourceSet = graph.beginSourceSetRefresh()
+        _ = try XCTUnwrap(graph.commitSourceSet([firstSource], using: sourceSet))
+        let first = LibrarySourceItem.complete(item("cached", time: 1))
+        _ = try XCTUnwrap(graph.installCachedInventory([first], validationToken: "one", for: firstSource.id))
+        let lease = try XCTUnwrap(graph.accessLease(for: first.uid, requiring: .readThumbnail))
+        let revision = graph.revision
+        let originalSignature = graph.persistenceSignature(additionalStateGeneration: 0)
+        _ = try XCTUnwrap(graph.installCachedInventory([first], validationToken: "one", for: firstSource.id))
+        XCTAssertEqual(graph.revision, revision)
+        XCTAssertTrue(graph.isCurrent(lease))
+        XCTAssertEqual(graph.persistenceSignature(additionalStateGeneration: 0), originalSignature)
+
+        _ = try XCTUnwrap(graph.installCachedInventory([first], validationToken: "token-only", for: firstSource.id))
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.validationToken, "token-only")
+        XCTAssertTrue(graph.isCurrent(lease))
+        let tokenSignature = graph.persistenceSignature(additionalStateGeneration: 0)
+
+        let changed = LibrarySourceItem.complete(item("cached", time: 1, tags: [.favorites]))
+        _ = try XCTUnwrap(graph.installCachedInventory([changed], validationToken: "token-only", for: firstSource.id))
+        XCTAssertFalse(graph.isCurrent(lease))
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [changed])
+        XCTAssertNotEqual(graph.persistenceSignature(additionalStateGeneration: 0), tokenSignature)
+    }
+
+    func testCachedInventoryCannotReplaceAuthoritativeInventory() throws {
+        var graph = LibrarySourceGraph()
+        let authoritative = item("authoritative", time: 1)
+        _ = install(firstSource, items: [authoritative], in: &graph)
+        let revision = graph.revision
+        XCTAssertNil(
+            graph.installCachedInventory(
+                [.complete(item("stale-cache", time: 2))], validationToken: "stale", for: firstSource.id))
+        XCTAssertEqual(graph.revision, revision)
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [.complete(authoritative)])
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.authority, .authoritative)
+    }
+
+    func testCachedInventoryRejectsDuplicateItemsWithoutChangingState() throws {
+        let graph = LibrarySourceGraph()
+        let sourceSet = graph.beginSourceSetRefresh()
+        _ = try XCTUnwrap(graph.commitSourceSet([firstSource], using: sourceSet))
+        let original = LibrarySourceItem.complete(item("cached", time: 1))
+        _ = try XCTUnwrap(graph.installCachedInventory([original], validationToken: "one", for: firstSource.id))
+        let revision = graph.revision
+        XCTAssertNil(graph.installCachedInventory([original, original], validationToken: "two", for: firstSource.id))
+        XCTAssertEqual(graph.revision, revision)
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [original])
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.validationToken, "one")
+    }
+
+    func testInvalidSourceDescriptorCannotRevokeExistingInventory() throws {
+        var graph = LibrarySourceGraph()
+        let resource = item("retained", time: 1)
+        _ = install(firstSource, items: [resource], in: &graph)
+        let discovery = graph.beginSourceSetRefresh()
+        let invalid = LibrarySource(id: SourceID("invalid"), capabilities: .readContent)
+        XCTAssertNil(graph.commitSourceSet([invalid], using: discovery))
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [.complete(resource)])
+        XCTAssertNil(graph.inventory(for: invalid.id))
+    }
+
+    func testDuplicateSourceSetCannotRevokeExistingInventory() throws {
+        var graph = LibrarySourceGraph()
+        let resource = item("retained", time: 1)
+        _ = install(firstSource, items: [resource], in: &graph)
+        let discovery = graph.beginSourceSetRefresh()
+        XCTAssertNil(graph.commitSourceSet([secondSource, secondSource], using: discovery))
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [.complete(resource)])
+        XCTAssertNil(graph.inventory(for: secondSource.id))
+    }
+
     func testTransientFailureRetainsCachedInventoryButDefersDestructiveReconciliation() throws {
         let cached = item("cached", time: 10)
         var graph = LibrarySourceGraph()
@@ -880,6 +1019,89 @@ final class LibrarySourceGraphTests: XCTestCase {
             )?.sourceID,
             secondSource.id
         )
+    }
+
+    func testRouteSelectorsKeepTheirOwnEligibilityAndPrecedence() throws {
+        let owner = item("owner", time: 10, isLivePhoto: true, relatedVideoID: "motion")
+        let motion = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "motion")
+        let outside = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "outside")
+        let excluded = LibrarySource(
+            id: firstSource.id, capabilities: firstSource.capabilities,
+            precedence: firstSource.precedence, isIncluded: false)
+        var graph = LibrarySourceGraph()
+        _ = install(excluded, items: [owner], in: &graph)
+        _ = install(secondSource, items: [owner], in: &graph)
+        _ = graph.setIdentitiesOutsideInventory([outside])
+
+        XCTAssertEqual(graph.accessLease(for: owner.uid, requiring: .readThumbnail)?.sourceID, excluded.id)
+        XCTAssertEqual(
+            graph.accessLease(for: owner.uid, requiring: .readThumbnail, includeExcludedSources: false)?.sourceID,
+            secondSource.id)
+        XCTAssertEqual(
+            graph.relatedAccessLease(
+                for: motion, of: owner.uid, relationship: .livePhotoMotion,
+                requiring: .readContent, includeExcludedSources: false)?.sourceID, secondSource.id)
+        XCTAssertEqual(
+            graph.identityOutsideInventoryAccessLeases(
+                for: [outside], requiring: .readThumbnail, includeExcludedSources: false)[outside]?.sourceID,
+            secondSource.id)
+        XCTAssertNil(graph.accessLease(for: outside, requiring: .readThumbnail))
+        XCTAssertNil(
+            graph.relatedAccessLease(
+                for: motion, of: outside, relationship: .livePhotoMotion, requiring: .readContent))
+        XCTAssertTrue(graph.identityOutsideInventoryAccessLeases(for: [owner.uid], requiring: .readThumbnail).isEmpty)
+        XCTAssertNil(
+            graph.relatedAccessLease(
+                for: PhotoUID(volumeID: "other-volume", nodeID: "motion"), of: owner.uid,
+                relationship: .livePhotoMotion, requiring: .readContent))
+        XCTAssertNil(
+            graph.relatedAccessLease(
+                for: motion, of: owner.uid, relationship: .livePhotoMotion, requiring: []))
+        XCTAssertNil(graph.accessLease(for: owner.uid, requiring: []))
+        XCTAssertTrue(graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: []).isEmpty)
+    }
+
+    func testOutsideInventoryRouteRequiresTheRequestedCapability() throws {
+        let thumbnailOnly = LibrarySource(id: firstSource.id, capabilities: .readThumbnail, precedence: 10)
+        let outside = PhotoUID(volumeID: "volume", nodeID: "outside-capability")
+        var graph = LibrarySourceGraph()
+        _ = install(thumbnailOnly, items: [], in: &graph)
+        _ = install(secondSource, items: [], in: &graph)
+        _ = graph.setIdentitiesOutsideInventory([outside])
+        XCTAssertEqual(
+            graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: .readContent)[outside]?.sourceID,
+            secondSource.id)
+        _ = try XCTUnwrap(graph.removeSource(secondSource.id))
+        XCTAssertTrue(graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: .readContent).isEmpty)
+    }
+
+    func testOutsideInventoryLeaseStopsWhenIdentityIsUnregistered() throws {
+        let outside = PhotoUID(volumeID: "volume", nodeID: "outside-removed")
+        var graph = LibrarySourceGraph()
+        _ = install(firstSource, items: [], in: &graph)
+        _ = graph.setIdentitiesOutsideInventory([outside])
+        let lease = try XCTUnwrap(
+            graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: .readThumbnail)[outside])
+        XCTAssertTrue(graph.isCurrent(lease))
+        _ = graph.setIdentitiesOutsideInventory([])
+        XCTAssertFalse(graph.isCurrent(lease))
+    }
+
+    func testRelatedRouteRequiresTheRequestedCapability() throws {
+        let thumbnailOnly = LibrarySource(id: firstSource.id, capabilities: .readThumbnail, precedence: 10)
+        let owner = item("owner", time: 1, isLivePhoto: true, relatedVideoID: "motion")
+        let motion = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "motion")
+        var graph = LibrarySourceGraph()
+        _ = install(thumbnailOnly, items: [owner], in: &graph)
+        _ = install(secondSource, items: [owner], in: &graph)
+        XCTAssertEqual(
+            graph.relatedAccessLease(
+                for: motion, of: owner.uid, relationship: .livePhotoMotion,
+                requiring: .readContent)?.sourceID, secondSource.id)
+        _ = try XCTUnwrap(graph.removeSource(secondSource.id))
+        XCTAssertNil(
+            graph.relatedAccessLease(
+                for: motion, of: owner.uid, relationship: .livePhotoMotion, requiring: .readContent))
     }
 
     func testSelectedAccessLeaseCannotBecomeCurrentAfterExclusionToggle() throws {
