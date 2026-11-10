@@ -424,7 +424,7 @@ package enum MetalGridFrameComposer {
         _ target: TileContentLayout,
         progress: CGFloat
     ) -> TileContentLayout {
-        let p = Float(progress * progress * (3 - 2 * progress))
+        let p = Float(gridSmoothstep(progress))
         let cg = CGFloat(p)
         let rect = CGRect(
             x: source.contentRect.minX + (target.contentRect.minX - source.contentRect.minX) * cg,
