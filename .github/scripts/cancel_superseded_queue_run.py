@@ -260,7 +260,8 @@ def watch(head_sha, run_id, worker_names, repository, gh, sleep=time.sleep,
         run_state = {"run_age_seconds": age, "jobs_answer": jobs_answer, "entry_seen": entry_seen}
         decision = decide(head_sha, queue_answer, run_state, worker_names)
         if decision == CANCEL:
-            print("The entry of this run ({}) is no longer in the merge queue of {}.".format(head_sha, QUEUE_BRANCH))
+            print("The previously seen entry {} of run {} is no longer in the merge queue of {}.".format(
+                head_sha, run_id, QUEUE_BRANCH))
             ok, output = gh.cancel(run_id)
             if ok or ALREADY_ENDED.search(output):
                 print("The run is cancelled.")

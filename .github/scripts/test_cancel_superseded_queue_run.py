@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -241,6 +243,18 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(0, status)
         self.assertEqual([["run", "cancel", "4242"]], gh.cancel_calls)
         self.assertEqual([script.POLL_INTERVAL_SECONDS], clock.sleeps)
+
+    def test_cancel_log_identifies_the_run_and_why_it_was_cancelled(self):
+        gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer("in_progress")])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status, _ = self.watch(gh)
+        self.assertEqual(0, status)
+        self.assertEqual([["run", "cancel", "4242"]], gh.cancel_calls)
+        self.assertIn("run 4242", output.getvalue())
+        self.assertIn(HEAD_SHA, output.getvalue())
+        self.assertIn("previously seen", output.getvalue())
+        self.assertIn("no longer in the merge queue", output.getvalue())
 
     def test_an_entry_that_was_never_in_the_queue_is_not_cancelled(self):
         gh = FakeGh([[queue_page([OTHER_SHA])]], [jobs_answer("in_progress")], [(True, "")])
