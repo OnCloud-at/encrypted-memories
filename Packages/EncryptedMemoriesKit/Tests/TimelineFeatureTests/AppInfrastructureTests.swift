@@ -113,10 +113,10 @@ struct AppInfrastructureTests {
         #expect(VideoPlayerItemStatus.failed.nextState(error: .decryptionFailed) == .failed(.decryptionFailed))
         #expect(VideoPlayerItemStatus.unknown.nextState(error: nil) == nil)  // keep current state
 
-        #expect(VideoViewerState.downloading(0.42).progress == 0.42)
+        #expect(VideoViewerState.buffering(0.42).progress == 0.42)
         #expect(VideoViewerState.playing.progress == 1)
         #expect(VideoViewerState.resolving.isBusy)
-        #expect(VideoViewerState.downloading(0.1).isBusy)
+        #expect(VideoViewerState.buffering(0.1).isBusy)
         #expect(VideoViewerState.buffering(nil).isBusy)
         #expect(!VideoViewerState.playing.isBusy)  // no infinite spinner once playing
         #expect(!VideoViewerState.failed(.timedOut).isBusy)  // …or once failed
@@ -128,14 +128,14 @@ struct AppInfrastructureTests {
 
     @Test func videoLogFieldsContract() {
         let fields = videoViewerLogFields(
-            state: .downloading(0.5),
+            state: .buffering(0.5),
             localURLExists: true,
             assetPlayable: false,
             playerItemStatus: 0,
             error: nil
         )
         #expect(fields["uid"] == nil, "the diagnostic never carries the identifier of a photo")
-        #expect(fields["state"] == "downloading")
+        #expect(fields["state"] == "buffering")
         #expect(fields["progress"] == "0.50")
         #expect(fields["localURLExists"] == "true")
         #expect(fields["assetPlayable"] == "false")

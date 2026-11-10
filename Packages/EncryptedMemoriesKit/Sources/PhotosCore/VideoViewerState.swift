@@ -9,9 +9,8 @@ import Foundation
 /// readable error*. There is no path that leaves the UI loading forever.
 public enum VideoViewerState: Equatable, Sendable {
     case idle  // not a video / nothing to play yet
-    case resolving  // fetching the link + keys, deciding stream vs download
+    case resolving  // fetching the link + keys
     case preparingStream  // building the AVURLAsset + resource loader for range streaming
-    case downloading(Double)  // full-download fallback in progress (0…1)
     case buffering(Double?)  // player exists but is waiting on bytes (streaming stall / initial fill)
     case ready  // a playable AVPlayer exists, awaiting first frame
     case playing  // AVPlayer.timeControlStatus reached .playing
@@ -23,7 +22,6 @@ public enum VideoViewerState: Equatable, Sendable {
         case .idle: return "idle"
         case .resolving: return "resolving"
         case .preparingStream: return "preparingStream"
-        case .downloading: return "downloading"
         case .buffering: return "buffering"
         case .ready: return "ready"
         case .playing: return "playing"
@@ -34,7 +32,6 @@ public enum VideoViewerState: Equatable, Sendable {
 
     public var progress: Double {
         switch self {
-        case .downloading(let p): return p
         case .buffering(let p): return p ?? 0
         case .playing, .ready: return 1
         default: return 0
@@ -53,7 +50,7 @@ public enum VideoViewerState: Equatable, Sendable {
     /// player (if any) is not yet usefully playing.
     public var isBusy: Bool {
         switch self {
-        case .resolving, .preparingStream, .downloading, .buffering, .seeking: return true
+        case .resolving, .preparingStream, .buffering, .seeking: return true
         default: return false
         }
     }
