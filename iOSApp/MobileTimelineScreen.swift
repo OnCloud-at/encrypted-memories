@@ -862,10 +862,16 @@ struct MobileViewerMutation: Equatable {
 @MainActor @Observable final class MobileViewerRouter {
     var presentation: MobileViewerPresentation?
     private(set) var completedMutation: MobileViewerMutation?
+    /// A revert to original failed after its viewer closed. This scene shows the failure once, when no viewer is up.
+    private(set) var revertFailedAfterViewerClosed = false
 
     func noteCompletedMutation(uid: PhotoUID) {
         completedMutation = MobileViewerMutation(uid: uid)
     }
+
+    func noteRevertFailedAfterViewerClosed() { revertFailedAfterViewerClosed = true }
+
+    func clearRevertFailure() { revertFailedAfterViewerClosed = false }
 }
 
 /// Frost height uses the scene window's top inset plus the inline navigation-bar height.
