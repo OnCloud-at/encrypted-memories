@@ -23,7 +23,6 @@ package struct GridTransitionTuning: Equatable, Sendable {
     package var pinchVelocityEmaAlpha: Double = 0.25
     package var pinchDirectionResolveQ: Double = 0.02
     package var pinchDetentHysteresisQ: Double = 0.02
-    package var pinchDisplayLowPassAlpha: Double = 1.0
 
     // Click-window placement.
     package var leadInFrames60: Int = 1

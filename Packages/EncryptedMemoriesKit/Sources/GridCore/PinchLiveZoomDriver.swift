@@ -19,9 +19,6 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
         /// Hysteresis (level units) around an integer detent before the active interval switches - prevents
         /// rebuild thrash when the finger holds right on a detent.
         package var detentHysteresisQ: Double = 0.02
-        /// Low-pass on `segmentQ`. 1.0 = pass-through (DEFAULT - exact 1:1, no lag); < 1 = light filter.
-        package var displayQLowPassAlpha: Double = 1.0
-
         package init() {}
         package init(from t: GridTransitionTuning) {
             releaseCommitQ = t.pinchReleaseCommitQ
@@ -31,7 +28,6 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
             velocityEmaAlpha = t.pinchVelocityEmaAlpha
             directionResolveQ = t.pinchDirectionResolveQ
             detentHysteresisQ = t.pinchDetentHysteresisQ
-            displayQLowPassAlpha = t.pinchDisplayLowPassAlpha
         }
     }
 
@@ -128,7 +124,6 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
 
         // Move the active interval toward x with hysteresis, one detent at a time (handles a fast multi-level
         // flick: x can jump several intervals in one update).
-        let segBefore = seg
         var guardIter = 0
         while seg > chainLo, Double(seg) - x > tuning.detentHysteresisQ {
             seg -= 1
@@ -141,12 +136,7 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
             if guardIter > 64 { break }
         }
 
-        let rawQ = min(1, max(0, Double(seg + 1) - x))
-        let a = tuning.displayQLowPassAlpha
-        // The low-pass carries state, so it must reset on an interval swap: across a crossing rawQ jumps from
-        // ~1 (old segment's target detent) to ~0 (new segment's source detent), and a smeared value would
-        // bypass the shared-detent seam. So snap to rawQ on a crossing (and at the pass-through default).
-        segmentQ = (a >= 1 || seg != segBefore) ? rawQ : (a * rawQ + (1 - a) * segmentQ)
+        segmentQ = min(1, max(0, Double(seg + 1) - x))
         return Update(segmentSource: segmentSource, segmentTarget: segmentTarget, segmentQ: segmentQ, hasSegment: true)
     }
 
@@ -196,23 +186,15 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
     /// higher levels (denser thumbnails / pinch-out).
     @discardableResult
     package mutating func releaseTowardAdjacent(direction: Int, cancelled: Bool = false) -> Update {
-        guard phase == .scrub, chainable, !cancelled else {
-            _ = release(cancelled: cancelled)
-            return Update(
-                segmentSource: segmentSource, segmentTarget: segmentTarget, segmentQ: segmentQ, hasSegment: false)
-        }
         let step = direction < 0 ? -1 : (direction > 0 ? 1 : 0)
-        guard step != 0 else {
+        guard phase == .scrub, chainable, !cancelled, step != 0,
+            step < 0 ? startLevel > chainLo : startLevel < chainHi
+        else {
             _ = release(cancelled: cancelled)
             return Update(
                 segmentSource: segmentSource, segmentTarget: segmentTarget, segmentQ: segmentQ, hasSegment: false)
         }
         let target = startLevel + step
-        guard target >= chainLo, target <= chainHi else {
-            _ = release(cancelled: cancelled)
-            return Update(
-                segmentSource: segmentSource, segmentTarget: segmentTarget, segmentQ: segmentQ, hasSegment: false)
-        }
 
         if step < 0 {
             // Interval [target, startLevel]: startLevel is the source end (q=0), target is q=1.
