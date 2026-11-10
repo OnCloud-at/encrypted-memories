@@ -24,7 +24,11 @@ final class PhotoBackupContinuedTask {
                 Task { @MainActor in PhotoBackupContinuedTask.shared.launch(task, identifier: identifier) }
             }
         },
-        submit: { identifier, completion in Self.submitToScheduler(identifier: identifier, completion: completion) })
+        blocking: { try BGTaskScheduler.shared.submit(Self.request(identifier: $0)) },
+        offMainThread: { identifier in
+            guard #available(iOS 27.0, *) else { return nil }
+            return { try await BGTaskScheduler.shared.submitTaskRequest(Self.request(identifier: identifier)) }
+        })
 
     private init() {}
 
@@ -37,26 +41,10 @@ final class PhotoBackupContinuedTask {
     nonisolated static func request(identifier: String) -> BGContinuedProcessingTaskRequest {
         let request = BGContinuedProcessingTaskRequest(
             identifier: identifier, title: PhotoLibraryContinuedBackupCard.title,
-            subtitle: L10n.string("upload.state_preparing"))
+            subtitle: PhotoLibraryContinuedBackupCard.preparingSubtitle)
         request.strategy = .fail
         request.requiredResources = []
         return request
-    }
-
-    /// iOS 26 submits at once; iOS 27 submits off the main thread, as its header requires.
-    private static func submitToScheduler(
-        identifier: String, completion: @escaping @MainActor ((any Error)?) -> Void
-    ) {
-        let submitter = BackgroundTaskRequestSubmitter(
-            cancelRequest: { BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: identifier) },
-            onErrorAfterCancel: { _ in })
-        var offMainThread: (@Sendable () async throws -> Void)?
-        if #available(iOS 27.0, *) {
-            offMainThread = { try await BGTaskScheduler.shared.submitTaskRequest(request(identifier: identifier)) }
-        }
-        submitter.submit(
-            blocking: { try BGTaskScheduler.shared.submit(request(identifier: identifier)) },
-            offMainThread: offMainThread, completion: completion)
     }
 
     private func launch(_ task: BGTask, identifier: String) {
