@@ -9,6 +9,8 @@ import Testing
         var sceneActive = true
         var registrationSucceeds = true
         var submitError: (any Error)?
+        /// The scheduler answers off the main thread, as `submitTaskRequest(_:)` from iOS 27 does.
+        var answersOffTheMainThread = false
         private(set) var registered: [String] = []
         private(set) var submitted: [String] = []
         private var counter = 0
@@ -24,9 +26,18 @@ import Testing
                     registered.append(identifier)
                     return registrationSucceeds
                 },
-                submit: { [unowned self] identifier, completion in
+                blocking: { [unowned self] identifier in
                     submitted.append(identifier)
-                    completion(submitError)
+                    if let submitError { throw submitError }
+                },
+                offMainThread: { [unowned self] identifier in
+                    guard answersOffTheMainThread else { return nil }
+                    submitted.append(identifier)
+                    let error = submitError.map { _ in CocoaError(.featureUnsupported) }
+                    return {
+                        try await Task.sleep(for: .milliseconds(10))
+                        if let error { throw error }
+                    }
                 },
                 log: BackgroundWorkLog { _, _ in })
         }
@@ -94,6 +105,22 @@ import Testing
         // Each identifier is registered once: a second registration of one identifier ends the app.
         #expect(scheduler.registered == ["continued.1", "continued.2"])
         #expect(submission.hasActiveTask)
+    }
+
+    /// iOS 27 answers after a delay and off the main thread. The answer must still arrive, so a refusal frees the slot.
+    @Test func anAnswerOffTheMainThreadArrivesAndARefusalFreesTheSlot() async {
+        let scheduler = Scheduler()
+        scheduler.answersOffTheMainThread = true
+        scheduler.submitError = CocoaError(.featureUnsupported)
+        let submission = scheduler.makeSubmission()
+
+        submission.submitIfAllowed(owesWork: true)
+        #expect(submission.hasActiveTask, "the task counts as active until the answer")
+        let deadline = ContinuousClock.now + .seconds(2)
+        while submission.hasActiveTask, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+
+        #expect(scheduler.submitted == ["continued.1"])
+        #expect(!submission.hasActiveTask, "the refusal arrived and freed the slot")
     }
 
     @Test func aFailedRegistrationSubmitsNothing() {

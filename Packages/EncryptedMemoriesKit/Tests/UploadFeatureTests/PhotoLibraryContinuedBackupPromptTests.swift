@@ -17,8 +17,6 @@ import UploadCore
         return status
     }
 
-    private let calm = Prompt.Situation(isCalm: true, isTaskActive: false, wasAsked: false)
-
     private func entry(
         _ kind: PhotoLibraryCatalogMediaKind = .image, width: Int = 4_032, height: Int = 3_024, seconds: Double = 0,
         live: Bool = false
@@ -67,14 +65,9 @@ import UploadCore
 
     @Test func theSituationMustAllowTheQuestion() {
         let busy = status(remaining: 500)
-        #expect(Prompt.shouldAsk(busy, estimatedBytes: nil, in: calm))
-        #expect(
-            !Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: false, isTaskActive: false, wasAsked: false))
-        )
-        #expect(
-            !Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: true, isTaskActive: true, wasAsked: false)))
-        #expect(
-            !Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: true, isTaskActive: false, wasAsked: true)))
+        #expect(Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isTaskActive: false, wasAsked: false)))
+        #expect(!Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isTaskActive: true, wasAsked: false)))
+        #expect(!Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isTaskActive: false, wasAsked: true)))
     }
 
     @Test func theMarkerResetsOnlyWhenASettledBackupOwesNothing() {
@@ -83,6 +76,8 @@ import UploadCore
         var waitingForRetry = status(.waiting, remaining: 0)
         waitingForRetry.hasOutstandingWork = true
         #expect(!Prompt.backlogDrained(waitingForRetry, isSyncing: false), "rows wait for a retry")
+        // A controller that has not projected its queue yet, at a cold start, shows an empty status.
+        #expect(!Prompt.backlogDrained(BackupStatus(), isSyncing: false), "an unprojected status says nothing")
     }
 
     // MARK: - Volume estimate
@@ -127,5 +122,115 @@ import UploadCore
         #expect(!claim.claim(root), "only the holder releases")
         claim.release(backupScreen)
         #expect(claim.claim(root))
+    }
+}
+
+/// The rules of one place that shows the question: the marker, the calm time and the cover (#1108).
+@MainActor @Suite struct PhotoLibraryContinuedBackupPromptAskerTests {
+    private typealias Asker = PhotoLibraryContinuedBackupPrompt.Asker
+
+    @MainActor private final class MarkerBox {
+        var value = false
+        var marker: Asker.Marker { Asker.Marker(isSet: { self.value }, set: { self.value = $0 }) }
+    }
+
+    private let start = ContinuousClock.now
+
+    private func busy(remaining: Int = 500) -> BackupStatus {
+        var status = BackupStatus()
+        status.phase = .uploading
+        status.totalConsidered = 1_000
+        status.remainingCount = remaining
+        status.hasOutstandingWork = remaining > 0
+        return status
+    }
+
+    private func askerAfterTheCalmTime(_ marker: MarkerBox, claim: PhotoLibraryContinuedBackupPrompt.Claim = .init())
+        -> Asker
+    {
+        let asker = Asker(claim: claim, marker: marker.marker)
+        asker.sceneBecameActive(at: start)
+        return asker
+    }
+
+    @Test func itAsksOnlyAfterTheSceneWasActiveForTheCalmTime() {
+        let asker = askerAfterTheCalmTime(MarkerBox())
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(1)) == .wait(.seconds(1)))
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(2)) == .ask)
+        #expect(asker.isPresenting)
+    }
+
+    @Test func withoutAnActiveSceneItDoesNotAsk() {
+        let asker = Asker(claim: .init(), marker: MarkerBox().marker)
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(60)) == .none)
+    }
+
+    @Test func eitherAnswerSetsTheMarkerAndOnlyContinueStartsTheTask() {
+        for accepted in [false, true] {
+            let marker = MarkerBox()
+            let asker = askerAfterTheCalmTime(marker)
+            #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .ask)
+            #expect(asker.answered(accepted: accepted) == accepted)
+            #expect(marker.value, "the answer closes the question for this backlog")
+            #expect(!asker.isPresenting)
+            #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(9)) == .none)
+        }
+    }
+
+    @Test func goingToTheBackgroundWhileItAsksCountsAsNotNow() {
+        let marker = MarkerBox()
+        let asker = askerAfterTheCalmTime(marker)
+        _ = asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3))
+
+        asker.sceneEnteredBackground()
+
+        #expect(marker.value)
+        #expect(!asker.isPresenting)
+    }
+
+    @Test func aCoverHoldsTheQuestionAndItsEndStartsTheCalmTimeAgain() {
+        let asker = askerAfterTheCalmTime(MarkerBox())
+        asker.coverChanged(isCovered: true, at: start + .seconds(1))
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(5)) == .none)
+
+        asker.coverChanged(isCovered: false, at: start + .seconds(6))
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(7)) == .wait(.seconds(1)))
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(8)) == .ask)
+    }
+
+    @Test func aCoverOverTheQuestionClosesItWithoutTheMarker() {
+        let marker = MarkerBox()
+        let claim = PhotoLibraryContinuedBackupPrompt.Claim()
+        let asker = askerAfterTheCalmTime(marker, claim: claim)
+        _ = asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3))
+
+        asker.coverChanged(isCovered: true, at: start + .seconds(4))
+
+        #expect(!asker.isPresenting)
+        #expect(!marker.value, "the person did not answer")
+        #expect(claim.claim(UUID()), "the claim is free for another place")
+    }
+
+    @Test func onlyOnePlaceAsksAtATime() {
+        let claim = PhotoLibraryContinuedBackupPrompt.Claim()
+        let marker = MarkerBox()
+        let first = askerAfterTheCalmTime(marker, claim: claim)
+        let second = askerAfterTheCalmTime(marker, claim: claim)
+        #expect(first.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .ask)
+        #expect(second.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(3)) == .none)
+    }
+
+    @Test func theMarkerResetsWhenTheProjectedBacklogDrained() {
+        let marker = MarkerBox()
+        marker.value = true
+        let asker = askerAfterTheCalmTime(marker)
+
+        asker.backupChanged(BackupStatus(), isSyncing: false)
+        #expect(marker.value, "a cold start's empty status keeps the answer")
+
+        var drained = busy(remaining: 0)
+        drained.phase = .completed
+        asker.backupChanged(drained, isSyncing: false)
+        #expect(!marker.value)
     }
 }

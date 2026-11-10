@@ -3,15 +3,20 @@ import PhotosCore
 
 /// The one submit point of the continued backup task (#1108). Only the person's "Continue" in the continued-backup
 /// prompt calls it, and it submits only from the foreground, while the backup owes work and no task of this app runs.
-/// The platform adapter supplies the scheduler: `register` registers the launch handler of one identifier, and `submit`
-/// sends its request and reports the scheduler's answer.
+/// The platform adapter supplies the scheduler: `register` registers the launch handler of one identifier; `blocking`
+/// sends its request at once (before iOS 27), and `offMainThread` gives the iOS 27 call, which must not run on the main
+/// thread. Both go through one `BackgroundTaskRequestSubmitter`.
 @MainActor
 public final class PhotoLibraryContinuedBackupSubmission {
     private let isSceneActive: @MainActor () -> Bool
     private let makeIdentifier: @MainActor () -> String
     private let register: @MainActor (String) -> Bool
-    private let submit: @MainActor (String, @escaping @MainActor ((any Error)?) -> Void) -> Void
+    private let blocking: @MainActor (String) throws -> Void
+    private let offMainThread: @MainActor (String) -> (@Sendable () async throws -> Void)?
     private let log: BackgroundWorkLog
+    /// Lives as long as this submission: on iOS 27 the request is sent and answered later, off the main thread. The
+    /// continued task is never cancelled, so the submitter needs no cancel.
+    private let submitter = BackgroundTaskRequestSubmitter()
     /// The identifier of the task that is submitted or runs. One task at a time.
     private var activeIdentifier: String?
 
@@ -19,13 +24,15 @@ public final class PhotoLibraryContinuedBackupSubmission {
         isSceneActive: @escaping @MainActor () -> Bool,
         makeIdentifier: @escaping @MainActor () -> String,
         register: @escaping @MainActor (String) -> Bool,
-        submit: @escaping @MainActor (String, @escaping @MainActor ((any Error)?) -> Void) -> Void,
+        blocking: @escaping @MainActor (String) throws -> Void,
+        offMainThread: @escaping @MainActor (String) -> (@Sendable () async throws -> Void)?,
         log: BackgroundWorkLog = .system
     ) {
         self.isSceneActive = isSceneActive
         self.makeIdentifier = makeIdentifier
         self.register = register
-        self.submit = submit
+        self.blocking = blocking
+        self.offMainThread = offMainThread
         self.log = log
     }
 
@@ -45,11 +52,13 @@ public final class PhotoLibraryContinuedBackupSubmission {
         }
         // The launch can come before the scheduler's answer, so the task counts as active from here.
         activeIdentifier = identifier
-        submit(identifier) { [weak self] error in
-            self?.log.requestSubmitted(
-                .continuedBackup, earliestBegin: nil, errorCode: error.map { ($0 as NSError).code })
-            if error != nil { self?.taskEnded(identifier) }
-        }
+        submitter.submit(
+            blocking: { [blocking] in try blocking(identifier) }, offMainThread: offMainThread(identifier),
+            completion: { [weak self] error in
+                self?.log.requestSubmitted(
+                    .continuedBackup, earliestBegin: nil, errorCode: error.map { ($0 as NSError).code })
+                if error != nil { self?.taskEnded(identifier) }
+            })
     }
 
     /// The task with `identifier` ended, or its request was refused.
