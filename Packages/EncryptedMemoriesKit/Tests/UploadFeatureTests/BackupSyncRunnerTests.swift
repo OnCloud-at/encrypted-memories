@@ -237,6 +237,21 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         lock.withLock { omissionRequests[identifier] ?? [] }
     }
 
+    private var localReadFailures: Set<String> = []
+    private var failedLocalReadAdmissions: [String: Int] = [:]
+    /// The most networked reads a test allows per photo. One more fails the item, so a loop ends the test, never hangs.
+    static let failedLocalReadAdmissionBound = 3
+
+    /// Every resolve of `identifier` asks for a networked read after its local read failed, as the photo library
+    /// resolver does for an original in iCloud.
+    func setLocalReadFails(for identifier: String) {
+        _ = lock.withLock { localReadFailures.insert(identifier) }
+    }
+
+    func failedLocalReadAdmissionCount(for identifier: String) -> Int {
+        lock.withLock { failedLocalReadAdmissions[identifier] ?? 0 }
+    }
+
     func resolve(
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler,
@@ -245,6 +260,17 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
     ) async throws -> BackupResolvedResource? {
         lock.withLock { omissionRequests[entry.source.identifier, default: []].append(omittingMissingPairedVideo) }
         try readAdmission(.sourceRead)
+        let id = entry.source.identifier
+        if lock.withLock({ localReadFailures.contains(id) }) {
+            let admissions = lock.withLock {
+                failedLocalReadAdmissions[id, default: 0] += 1
+                return failedLocalReadAdmissions[id] ?? 0
+            }
+            guard admissions <= Self.failedLocalReadAdmissionBound else {
+                throw UploadError.backend("networked read bound exceeded for \(id)")
+            }
+            try readAdmission(.afterFailedLocalRead)
+        }
         guard omittingMissingPairedVideo else {
             return try await resolve(entry, onPreparationProgress: onPreparationProgress)
         }
@@ -545,6 +571,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     /// When set, the first keyed read after a refused receipt write answers unknown: the read that tells a removed row
     /// from a failed write.
     var unknownReadAfterRefusedMark = false
+    /// True: hint writes to the claim list report success, although the spy's claims still answer `unknown` (#274).
+    var acceptsLocalReadFailureHints = false
     private var unknownEntryReadCount = 0
     /// An error other than a failed read, which the keyed read throws once it is set.
     var entryReadFailure: (any Error)? {
@@ -626,6 +654,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         log.append("queue.claimRunnable")
         return inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
+
+    func addLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool { acceptsLocalReadFailureHints }
 
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
     {
@@ -3362,7 +3392,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
         runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
         schedulerClock: (any BackupSchedulerClock)? = nil,
-        leavesOutMissingLivePhotoVideos: Bool = false
+        leavesOutMissingLivePhotoVideos: Bool = false,
+        localReadFailureHints: BackupLocalReadFailureHintStore? = nil
     ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queue ?? queueStore,
@@ -3384,6 +3415,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             runtimeChanges: runtimeChanges,
             clock: schedulerClock ?? clock,
             events: events,
+            localReadFailureHints: localReadFailureHints,
             now: { [clock] in clock!.now }
         )
     }
@@ -7688,5 +7720,237 @@ extension BackupSyncRunnerTests {
         XCTAssertEqual(faults.firedCount, 1, "the write that saves the issue failed")
         let operational = await runner.isQueueOperational()
         XCTAssertFalse(operational, "a pass that could not save its issue reports it unknown")
+    }
+}
+
+/// A background pass backs up photos on the device first (#274). Four photos in claim order A, B, C, D (oldest
+/// `updatedAt` first, same revision); the local reads of A and C fail, as for originals that only iCloud holds.
+extension BackupSyncRunnerTests {
+    private func seedLocalReadFailureLibrary() -> [UploadBackupSyncQueueEntry] {
+        let rows = [("a.heic", 40.0), ("b.heic", 30.0), ("c.heic", 20.0), ("d.heic", 10.0)].map {
+            seedEntry($0.0, ageSeconds: $0.1)
+        }
+        resolver.setLocalReadFails(for: rows[0].source.identifier)
+        resolver.setLocalReadFails(for: rows[2].source.identifier)
+        return rows
+    }
+
+    private func localReadFailureHintStore() throws -> BackupLocalReadFailureHintStore {
+        try XCTUnwrap(
+            BackupLocalReadFailureHintStore(
+                url: tempDir.appendingPathComponent(BackupLocalReadFailureHintStore.databaseFileName)))
+    }
+
+    private func hintedNames(in store: BackupLocalReadFailureHintStore) throws -> [String] {
+        try XCTUnwrap(store.page(after: 0, limit: 100)).sources.map {
+            URL(fileURLWithPath: $0.identifier).lastPathComponent
+        }
+    }
+
+    private func uploadOrder() -> [String] {
+        uploader.requests.map(\.name)
+    }
+
+    private static let inBackground: @Sendable () -> BackupThrottleInputs = {
+        BackupThrottleInputs(isAppInBackground: true)
+    }
+
+    private func assertEveryPhotoBackedUpOnce(
+        _ rows: [UploadBackupSyncQueueEntry], file: StaticString = #filePath, line: UInt = #line
+    ) {
+        for row in rows {
+            XCTAssertEqual(state(of: row), .completed, row.originalFilename, file: file, line: line)
+            XCTAssertEqual(
+                uploader.requests.filter { $0.name == row.originalFilename }.count, 1, row.originalFilename,
+                file: file, line: line)
+        }
+    }
+
+    func testABackgroundPassBacksUpThePhotosOnTheDeviceFirstAndLaterSweepsTheHints() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        let runner = makeRunner(
+            throttle: BackupThrottlePolicy(baseConcurrency: 1), throttleInputs: Self.inBackground,
+            localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        let order = uploadOrder()
+        XCTAssertEqual(Array(order.prefix(2)), ["b.heic", "d.heic"], "photos on the device first")
+        XCTAssertEqual(Set(order.dropFirst(2)), ["a.heic", "c.heic"], "then the photos whose local read failed")
+        assertEveryPhotoBackedUpOnce(rows)
+        XCTAssertEqual(resolver.failedLocalReadAdmissionCount(for: rows[0].source.identifier), 2, "one wait, one read")
+        XCTAssertEqual(try hintedNames(in: hints), ["a.heic", "c.heic"])
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(try hintedNames(in: hints), [], "the next pass removes the hints of backed-up photos")
+    }
+
+    /// A hint from an earlier background pass does not move its photo in the foreground, and no new hint is written.
+    func testAForegroundPassKeepsTodaysOrderAndWritesNoHint() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        XCTAssertTrue(hints.insert(rows[0].source))
+        let runner = makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1), localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(uploadOrder(), ["a.heic", "b.heic", "c.heic", "d.heic"])
+        assertEveryPhotoBackedUpOnce(rows)
+        XCTAssertEqual(try hintedNames(in: hints), ["a.heic"], "the old hint stays until a sweep, no new one")
+    }
+
+    /// "Back up now" keeps today's order, also when the device locks during the pass.
+    func testAPassThePersonStartedKeepsTodaysOrderInTheBackground() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        let runner = makeRunner(
+            throttle: BackupThrottlePolicy(baseConcurrency: 1), throttleInputs: Self.inBackground,
+            localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: .userInitiated)
+
+        XCTAssertEqual(uploadOrder(), ["a.heic", "b.heic", "c.heic", "d.heic"])
+        assertEveryPhotoBackedUpOnce(rows)
+        XCTAssertEqual(try hintedNames(in: hints), [])
+    }
+
+    func testWithoutAHintStoreABackgroundPassKeepsTodaysOrder() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        let runner = makeRunner(throttle: BackupThrottlePolicy(baseConcurrency: 1), throttleInputs: Self.inBackground)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(uploadOrder(), ["a.heic", "b.heic", "c.heic", "d.heic"])
+        assertEveryPhotoBackedUpOnce(rows)
+    }
+
+    /// A hint that cannot be stored never lets a photo wait: its next claim could not order it last. Another
+    /// connection holds the write lock of the hint file, so the list loads but no hint can be written.
+    func testAHintThatCannotBeStoredNeverLetsAPhotoWait() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        let url = tempDir.appendingPathComponent(BackupLocalReadFailureHintStore.databaseFileName)
+        let hints = try XCTUnwrap(
+            BackupLocalReadFailureHintStore(
+                url: url, policy: LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)))
+        defer { hints.close() }
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        defer { sqlite3_close(blocker) }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        defer { sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil) }
+        XCTAssertNotNil(hints.page(after: 0, limit: 1), "the list still loads")
+        XCTAssertFalse(hints.insert(rows[1].source), "no hint can be written")
+        let runner = makeRunner(
+            throttle: BackupThrottlePolicy(baseConcurrency: 1), throttleInputs: Self.inBackground,
+            localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(uploadOrder(), ["a.heic", "b.heic", "c.heic", "d.heic"])
+        assertEveryPhotoBackedUpOnce(rows)
+        XCTAssertEqual(resolver.failedLocalReadAdmissionCount(for: rows[0].source.identifier), 1)
+    }
+
+    /// A queue that cannot say whether a photo is hinted answers `unknown`, and an unknown photo never waits.
+    func testAnUnknownAnswerNeverLetsAPhotoWait() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        let queue = SpyQueueStore(inner: try XCTUnwrap(queueStore), log: BackupEventLog())
+        // Every write would succeed, so only the unknown answer keeps the photos from waiting.
+        queue.acceptsLocalReadFailureHints = true
+        let runner = makeRunner(
+            queue: queue, throttle: BackupThrottlePolicy(baseConcurrency: 1), throttleInputs: Self.inBackground,
+            localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(uploadOrder(), ["a.heic", "b.heic", "c.heic", "d.heic"])
+        assertEveryPhotoBackedUpOnce(rows)
+        XCTAssertEqual(try hintedNames(in: hints), [])
+    }
+
+    /// Two revisions of one photo in one claim: the first waits, the second reads at once instead of waiting again.
+    /// Two upload slots let one claim return both revisions. The admission bound of the test resolver fails the item if
+    /// a source waits more than once.
+    func testASourceWaitsAtMostOncePerPass() async throws {
+        let older = seedEntry("e.heic", ageSeconds: 50, revisionOffset: -1)
+        let newer = seedEntry("e.heic", ageSeconds: 50)
+        resolver.setLocalReadFails(for: newer.source.identifier)
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        let runner = makeRunner(
+            throttle: BackupThrottlePolicy(baseConcurrency: 2), throttleInputs: Self.inBackground,
+            localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        // The first revision waits; the second reads at once and backs up the current file, so the first then finds
+        // the photo backed up. A second wait would add one more read.
+        XCTAssertEqual(resolver.failedLocalReadAdmissionCount(for: newer.source.identifier), 2, "one wait, one read")
+        XCTAssertNotEqual(state(of: newer), .failed)
+        XCTAssertNotEqual(state(of: older), .failed)
+        XCTAssertEqual(uploader.requests.filter { $0.name == "e.heic" }.count, 1)
+    }
+
+    /// The check of a photo that the person dismissed after Photos reported it missing never waits: it keeps today's
+    /// check, and no hint is written for it.
+    func testTheCheckOfADismissedPhotoNeverWaits() async throws {
+        let entry = seedLibraryEntry("IMG_RECHECK.HEIC")
+        let reason = BackupIssueRecord(kind: .sourceMissing, detail: "backup.issue_source_missing").persistedValue
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 0, lastError: reason,
+                updatedAt: clock.now.addingTimeInterval(-60)))
+        XCTAssertEqual(
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.isDismissedSourceRecheck, true)
+        resolver.setLocalReadFails(for: entry.source.identifier)
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        let runner = makeRunner(throttleInputs: Self.inBackground, localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(resolver.failedLocalReadAdmissionCount(for: entry.source.identifier), 1, "read once, no wait")
+        XCTAssertEqual(try hintedNames(in: hints), [])
+    }
+
+    /// A photo hinted in an earlier pass comes last and then downloads at once, without waiting again.
+    func testAPhotoHintedBeforeTheClaimDownloadsWithoutWaiting() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        XCTAssertTrue(hints.insert(rows[0].source))
+        let runner = makeRunner(
+            throttle: BackupThrottlePolicy(baseConcurrency: 1), throttleInputs: Self.inBackground,
+            localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(Array(uploadOrder().prefix(2)), ["b.heic", "d.heic"])
+        assertEveryPhotoBackedUpOnce(rows)
+        XCTAssertEqual(resolver.failedLocalReadAdmissionCount(for: rows[0].source.identifier), 1, "no second wait")
+        XCTAssertEqual(resolver.failedLocalReadAdmissionCount(for: rows[2].source.identifier), 2)
+    }
+
+    /// A Live Photo whose photo reads locally but whose video does not waits as a whole, then backs up both.
+    func testALivePhotoWhoseVideoReadFailsWaitsAsAWhole() async throws {
+        let rows = seedLocalReadFailureLibrary()
+        resolver.setSecondaries(["a.mov"], for: rows[0].source.identifier)
+        let hints = try localReadFailureHintStore()
+        defer { hints.close() }
+        let runner = makeRunner(
+            throttle: BackupThrottlePolicy(baseConcurrency: 1), throttleInputs: Self.inBackground,
+            localReadFailureHints: hints)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(Array(uploadOrder().prefix(2)), ["b.heic", "d.heic"])
+        XCTAssertEqual(uploader.requests.filter { $0.name == "a.mov" }.count, 1)
+        assertEveryPhotoBackedUpOnce(rows)
     }
 }
