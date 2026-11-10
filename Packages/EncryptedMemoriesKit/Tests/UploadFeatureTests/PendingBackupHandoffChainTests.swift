@@ -659,8 +659,7 @@ private final class PersistentHandoffChain {
     }
 
     func interruptDutyRead(number: Int, body: () throws -> Void) throws {
-        let connection = try XCTUnwrap(
-            Mirror(reflecting: store).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
+        let connection = try storeConnection(store)
         let db = try XCTUnwrap(connection.database)
         let fault = PendingDutyReadFailure(db: db, number: number)
         let context = Unmanaged.passUnretained(fault).toOpaque()
@@ -695,31 +694,22 @@ private final class PersistentHandoffChain {
     }
 
     func denyOnce(_ operation: Int32, body: () throws -> Void) throws {
-        let connection = try XCTUnwrap(
-            Mirror(reflecting: store).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
-        let db = try XCTUnwrap(connection.database)
-        let failure = PendingMetadataFailure(operation)
-        sqlite3_set_authorizer(
-            db,
-            { context, action, table, _, _, _ in
-                guard let context, let table else { return SQLITE_OK }
-                let failure = Unmanaged<PendingMetadataFailure>.fromOpaque(context).takeUnretainedValue()
-                if !failure.fired, action == failure.operation, String(cString: table) == "pending_info" {
-                    failure.fired = true
+        var fired = false
+        try withSQLiteAuthorization(
+            in: store,
+            authorizing: { action, table, _ in
+                if !fired, action == operation, table == "pending_info" {
+                    fired = true
                     return SQLITE_DENY
                 }
                 return SQLITE_OK
-            }, Unmanaged.passUnretained(failure).toOpaque())
-        defer { sqlite3_set_authorizer(db, nil, nil) }
-        try body()
-        XCTAssertTrue(failure.fired, "the fixture must refuse the intended metadata statement")
+            },
+            {
+                try body()
+                XCTAssertTrue(fired, "the fixture must refuse the intended metadata statement")
+            }
+        )
     }
-}
-
-private final class PendingMetadataFailure {
-    let operation: Int32
-    var fired = false
-    init(_ operation: Int32) { self.operation = operation }
 }
 
 private final class PendingDutyReadFailure {
