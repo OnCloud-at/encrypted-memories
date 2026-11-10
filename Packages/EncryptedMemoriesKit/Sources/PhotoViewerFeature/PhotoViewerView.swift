@@ -268,12 +268,7 @@ public struct PhotoViewerView: View {
         } message: {
             Text(L10n.string("viewer.revert_original_message"))
         }
-        .alert(
-            L10n.string("viewer.revert_original_failed"),
-            isPresented: Binding(get: { model.revert.showsFailure }, set: { _ in })
-        ) {
-            Button(L10n.string("action.ok"), role: .cancel) { model.revert.dismissFailure() }
-        }
+        .revertToOriginalFailedAlert(isPresented: model.revert.showsFailure) { model.revert.dismissFailure() }
         .onAppear {
             model.start()
         }
