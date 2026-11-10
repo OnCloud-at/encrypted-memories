@@ -156,6 +156,118 @@ import Testing
     #endif
 }
 
+/// The whole library for a picker that opens over an album: the grid keeps the album, one listing settles the library.
+@Suite @MainActor struct WholeLibraryLoadUnderAnotherRouteTests {
+    @Test(.timeLimit(.minutes(1)))
+    func anAlbumRouteLoadsTheWholeLibraryOnceAndKeepsItsGrid() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == nil)
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority != .authoritative)
+
+        let failure = await fixture.timeline.loadWholeLibraryIfNeeded()
+
+        #expect(failure == nil)
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority == .authoritative)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        #expect(fixture.timeline.wholeLibraryTimeline.items == fixture.items)
+        #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")], "the album grid stays")
+        #expect(fixture.timeline.filter == LocationInventoryRepository.album)
+        #expect(await fixture.repository.fullReads == 1)
+
+        #expect(await fixture.timeline.loadWholeLibraryIfNeeded() == nil)
+        #expect(await fixture.repository.fullReads == 1, "a known library is not read again")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func concurrentCallersShareOneListing() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let first = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
+        // Stops at the end of the stream too, so a listing that never starts fails instead of spinning.
+        while let event = await events.next(), event != .fullReadEntered {}
+        let second = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
+        gate.open()
+
+        #expect(await first.value == nil)
+        #expect(await second.value == nil)
+        #expect(await fixture.repository.fullReads == 1)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aRouteSwitchDuringTheLoadSettlesTheLibraryOnce() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let picker = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
+        // Stops at the end of the stream too, so a listing that never starts fails instead of spinning.
+        while let event = await events.next(), event != .fullReadEntered {}
+
+        // The held listing was read before a new photo arrived. All Photos then publishes the newer library.
+        let newer = fixture.items + [inventoryItem("d")]
+        await fixture.repository.setItems(newer)
+        await fixture.timeline.select(.all)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == newer)
+        gate.open()
+        #expect(await picker.value == nil)
+
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == newer, "the older listing must not settle again")
+        #expect(fixture.timeline.allItems == newer, "All Photos keeps its grid")
+        #expect(await fixture.repository.fullReads == 2, "All Photos keeps its own listing, as before")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aPickerAfterARouteSwitchJoinsTheRunningFirstLoad() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let launch = Task { await fixture.timeline.load() }
+        // Stops at the end of the stream too, so a listing that never starts fails instead of spinning.
+        while let event = await events.next(), event != .fullReadEntered {}
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        let picker = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
+        gate.open()
+        await launch.value
+
+        #expect(await picker.value == nil)
+        #expect(await fixture.repository.fullReads == 1, "the picker waits for the first load instead of reading again")
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")])
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aFailedLoadReportsItsMessageAndARetrySucceeds() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        await fixture.repository.failNextFullReads(1)
+
+        let failure = await fixture.timeline.loadWholeLibraryIfNeeded()
+
+        #expect(failure?.isEmpty == false)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == nil)
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority != .authoritative)
+        #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")], "a failure leaves the album grid")
+
+        #expect(await fixture.timeline.loadWholeLibraryIfNeeded() == nil)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        await fixture.close()
+    }
+}
+
 @Suite @MainActor struct WholeLibraryLocationInventoryTests {
     @Test(.timeLimit(.minutes(1)))
     func offlineAlbumAndTwoReconnectsWaitForWholeLibrary() async throws {

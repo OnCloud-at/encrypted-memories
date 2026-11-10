@@ -286,6 +286,8 @@ public final class TimelineViewModel {
     /// SwiftUI/AppKit may transiently mount more than one timeline host while the window settles. All callers
     /// must await the same startup refresh so validation, persistence, and monitor-token capture run once.
     @ObservationIgnored private var initialLoadTask: Task<Void, Never>?
+    /// The whole-library listing that a surface over another route started; concurrent callers share it.
+    @ObservationIgnored private var wholeLibraryLoadTask: Task<String?, Never>?
     /// Completion of that single-flight startup request is intentionally separate from presentation readiness:
     /// a rendered non-empty cache may uncover while this remains false and validation continues in the task.
     @ObservationIgnored private var initialLoadCompleted = false
@@ -610,6 +612,46 @@ public final class TimelineViewModel {
     /// `wholeLibraryItemsForViewer`, it never falls back to the open route or to a cached snapshot.
     public var wholeLibraryItemsForLocations: [PhotoItem]? {
         wholeLibraryLocationRevision == nil ? nil : wholeLibrarySnapshot.items
+    }
+
+    /// Loads the whole library for a surface over another route, such as the album picker, and leaves the route's
+    /// grid as it is. Returns nil once the whole library is known, or the failure message. It waits for a running
+    /// first load, concurrent callers share one listing, and a newer whole-library publication overtakes its result.
+    @discardableResult
+    public func loadWholeLibraryIfNeeded() async -> String? {
+        if let initialLoadTask { await initialLoadTask.value }
+        guard wholeLibraryInventoryAuthority != .authoritative else { return nil }
+        if let wholeLibraryLoadTask { return await wholeLibraryLoadTask.value }
+        let task = Task { @MainActor [weak self] () -> String? in
+            guard let self else { return nil }
+            // One more listing when a cached publication or a trash overtook the first one without making the
+            // library known.
+            if let failure = await self.readWholeLibrary() { return failure }
+            guard self.wholeLibraryInventoryAuthority != .authoritative else { return nil }
+            return await self.readWholeLibrary()
+        }
+        wholeLibraryLoadTask = task
+        let failure = await task.value
+        wholeLibraryLoadTask = nil
+        return failure
+    }
+
+    /// One whole-library listing that settles without touching the shown route, like a route switch during a load.
+    private func readWholeLibrary() async -> String? {
+        let publishedBeforeLoad = wholeLibraryPublication
+        do {
+            let listing = try await repository.loadTimelineSnapshot()
+            let projection = await normalizeOffMain(listing.sections, for: .all)
+            guard publishedBeforeLoad == wholeLibraryPublication else { return nil }
+            // The source inventory admits the listing first, as on every other path that settles the whole library.
+            let admission = await admit(projection, as: .authoritative)
+            guard publishedBeforeLoad == wholeLibraryPublication, admission != .superseded else { return nil }
+            guard admission == .accepted else { return L10n.string("error.load_library_title") }
+            settleWholeLibrary(projection)
+            return nil
+        } catch {
+            return LibraryLoadFailureMessage.message(for: error)
+        }
     }
 
     /// Manual user-triggered reload of the currently visible library/filter. A person waits for it.
