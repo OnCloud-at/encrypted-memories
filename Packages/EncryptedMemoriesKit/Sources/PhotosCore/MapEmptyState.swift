@@ -10,4 +10,10 @@ public enum MapEmptyState: Equatable, Sendable {
 
     /// Only a failed scan can be tried again.
     public var offersRetry: Bool { self == .failed }
+
+    /// The share of the scanned photos while the total is known; no other state shows a bar.
+    public var progressFraction: Double? {
+        guard case .scanning(let scanned, let total) = self, total > 0 else { return nil }
+        return Double(scanned) / Double(total)
+    }
 }
