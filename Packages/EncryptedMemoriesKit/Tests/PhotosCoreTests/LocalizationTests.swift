@@ -294,6 +294,34 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    /// Pins the approved text of the large first backup guide (#275), with the singular and plural detail.
+    func testFirstBackupGuideCopyUsesTheApprovedEnglishAndGermanText() throws {
+        let texts: [(String, String, String)] = [
+            ("backup.phase_first_completed", "First backup complete", "Erste Sicherung abgeschlossen"),
+            (
+                "backup.hint_large_backup", "Faster with the app open and on Wi-Fi.",
+                "Schneller, wenn die App geöffnet ist und WLAN nutzt."
+            ),
+            ("backup.hint_large_backup_mac", "Faster on Wi-Fi or Ethernet.", "Schneller mit WLAN oder Ethernet."),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+        let details: [(language: String, count: Int, text: String)] = [
+            ("en", 1, "1 file backed up."), ("en", 1_200, "All 1,200 files backed up."),
+            ("de", 1, "1 Datei gesichert."), ("de", 1_200, "Alle 1.200 Dateien gesichert."),
+        ]
+        for (language, count, text) in details {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            let translated = String(
+                localized: "backup.detail_first_completed \(count)", bundle: bundle,
+                locale: Locale(identifier: language))
+            XCTAssertEqual(translated, text, "\(language) \(count)")
+        }
+    }
+
     func testPartialMergeFailureReasonIsEnglishAndGerman() throws {
         for (language, text) in [
             ("en", "These groups could not be merged."),
