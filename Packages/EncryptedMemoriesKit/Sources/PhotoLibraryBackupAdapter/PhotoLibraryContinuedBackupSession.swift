@@ -38,6 +38,8 @@ public final class PhotoLibraryContinuedBackupSession {
     private var expiredAt: ContinuousClock.Instant?
     private var endWaiter: CheckedContinuation<Void, Never>?
     private var didEndWait = false
+    /// The last carried run has settled; nil while no run was carried.
+    private var carriedRunSettled: Bool?
 
     public init(
         controller: PhotoLibraryBackupController,
@@ -62,7 +64,6 @@ public final class PhotoLibraryContinuedBackupSession {
     /// Runs the task to its one end.
     public func run() async {
         let reporter = Task { [weak self] in await self?.reportProgress() }
-        defer { reporter.cancel() }
         attempt.work = Task { [weak self] in
             await self?.carryPasses()
             self?.endWait()
@@ -70,14 +71,22 @@ public final class PhotoLibraryContinuedBackupSession {
         await withCheckedContinuation { continuation in
             if didEndWait { continuation.resume() } else { endWaiter = continuation }
         }
+        // The running card stops before the final card, so no later tick can show "Backing up" over the end.
+        reporter.cancel()
         // A pass that did not settle within the wait goes on; its rows are checkpointed and the next pass resumes them.
         let settled = controller.status
         let end = PhotoLibraryContinuedBackupEnd.after(
             goal: goal, settled: settled, didExpire: expiredAt != nil, backupRuns: backupRuns)
         let progress = goal.update(status: settled, catalog: controller.lastCatalogProgress)
+        // A completed goal fills the ring, also when some of its photos ended as respected remote deletions.
+        let units =
+            end == .completed
+            ? BackupExecutionProgress(
+                completedUnitCount: PhotoLibraryContinuedBackupGoal.scale,
+                totalUnitCount: PhotoLibraryContinuedBackupGoal.scale) : progress.units
         report(
             Card(
-                progress: progress.units,
+                progress: units,
                 title: PhotoLibraryContinuedBackupCard.finalTitle(after: end, settled: settled),
                 subtitle: PhotoLibraryContinuedBackupCard.subtitle(for: settled, goal: goal)))
         log.notice(
@@ -86,7 +95,7 @@ public final class PhotoLibraryContinuedBackupSession {
                 (.init("end"), .name(end)), (.init("success"), .flag(end.reportsSuccess)),
                 (.init("expired"), .flag(expiredAt != nil)),
                 (.init("waitMs"), expiredAt.map { .milliseconds(ContinuousClock.now - $0) } ?? .word("none")),
-                (.init("settled"), .flag(controller.activeExecutionRunID == nil)),
+                (.init("settled"), carriedRunSettled.map { .flag($0) } ?? .word("none")),
             ])
         await completion.finish(after: {}, deciding: { (end.windowOutcome, end.reportsSuccess) })
     }
@@ -104,8 +113,10 @@ public final class PhotoLibraryContinuedBackupSession {
         }
     }
 
+    /// The backup may run: it is on, not paused, has photo access, and its controller did not shut down for a sign-out.
     private var backupRuns: Bool {
-        controller.isEnabled && !controller.isUserPaused && controller.accessState.allowsBackup
+        !controller.isShutDown && controller.isEnabled && !controller.isUserPaused
+            && controller.accessState.allowsBackup
     }
 
     private func carryPasses() async {
@@ -113,7 +124,11 @@ public final class PhotoLibraryContinuedBackupSession {
             let carriedBefore = attempt.lastRunID
             let backedUpBefore = controller.status.backedUp
             _ = await attempt.run(controller: controller)
-            if let runID = attempt.lastRunID { await controller.waitUntilRunSettled(runID) }
+            if let runID = attempt.lastRunID, runID != carriedBefore {
+                carriedRunSettled = false
+                await controller.waitUntilRunSettled(runID)
+                carriedRunSettled = true
+            }
             _ = goal.update(status: controller.status, catalog: controller.lastCatalogProgress)
             guard expiredAt == nil, attempt.lastRunID != carriedBefore, backupRuns,
                 !goal.isReached(by: controller.status), controller.status.backedUp > backedUpBefore
@@ -124,7 +139,7 @@ public final class PhotoLibraryContinuedBackupSession {
 
     private func reportProgress() async {
         var lastLog: ContinuousClock.Instant?
-        while !Task.isCancelled {
+        while !Task.isCancelled, !didEndWait {
             let status = controller.status
             let progress = goal.update(status: status, catalog: controller.lastCatalogProgress)
             report(

@@ -326,9 +326,9 @@ public final class PhotoLibraryBackupController {
         internal private(set) var launchResumeEndedForTesting = false
     #endif
     /// Ended passes whose completion (lock release, final status projection and the next wake) still runs, and the
-    /// callers that wait for it. A waiter without a run ID waits until no pass settles any more.
+    /// callers that wait for the settlement of a pass, by its run ID.
     private var settlingRunIDs: Set<String> = []
-    private var settlementWaiters: [(runID: String?, continuation: CheckedContinuation<Void, Never>)] = []
+    private var settlementWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 
     /// Platform hook: invoked with `true` when a backup pass is actively running (so the host app may
     /// keep the display awake / request background time) and `false` the moment backup goes idle,
@@ -1163,7 +1163,10 @@ public final class PhotoLibraryBackupController {
             backgroundLog.notice(.photoBackup, "window.waitsForFirstPath", [(.init("owner"), Self.logValue(owner))])
             started = await waitForDeferredStart(onAdmitted: onRunAdmitted)
             if started == nil, waitsForFirstNetworkPath { return .noNetworkPath }
-        } else if started == nil, let run = runToCarry(for: owner) {
+        }
+        // A pass that runs already, or one that the first network path started for the person instead of this window, is
+        // carried when this window may carry it.
+        if started == nil, let run = runToCarry(for: owner) {
             // The pass runs on the window's time until it ends or the window ends: nobody watches an automatic pass in the
             // background, and the person accepted the continued task for the pass that runs.
             backgroundLog.notice(.photoBackup, "window.tookOver", [(.init("owner"), Self.logValue(owner))])
@@ -1720,21 +1723,22 @@ public final class PhotoLibraryBackupController {
             ])
     }
 
-    /// The queue states whose photos still send bytes. A row whose bytes are committed remotely only reconciles.
-    nonisolated private static let statesThatSendBytes: Set<UploadBackupSyncQueueState> = [
-        .discovered, .queuedForUpload, .checking, .hashing, .duplicateChecking, .uploading, .finalizing,
-    ]
+    /// The queue states whose photos still send bytes: rows that wait for their turn and rows in work. A row whose
+    /// bytes are committed remotely only reconciles.
+    nonisolated private static func sendsBytes(_ state: UploadBackupSyncQueueState) -> Bool {
+        state.isActive || state == .discovered || state == .queuedForUpload
+    }
 
     /// The estimated bytes that the photos still to back up will send, from their catalog rows, read off the main actor
-    /// (#1108). Nil when a read fails or more than `limit` photos are left: the continued backup prompt then decides by
-    /// the count alone. A photo without a readable catalog row counts as an unknown item.
+    /// (#1108). Nil when the queue read fails or more than `limit` photos are left: the continued backup prompt then
+    /// decides by the count alone. A photo whose catalog row is missing or unreadable counts as an unknown item.
     public func estimatedOutstandingBytes(limit: Int) async -> Int64? {
         guard let queueStore, let catalogStore else { return nil }
         return await Task.detached(priority: .utility) {
             guard let rows = try? queueStore.decisionUnsettledRows() else { return nil }
             let identifiers = Set(
                 rows.lazy
-                    .filter { $0.source.kind == .photoLibraryAsset && Self.statesThatSendBytes.contains($0.state) }
+                    .filter { $0.source.kind == .photoLibraryAsset && Self.sendsBytes($0.state) }
                     .map(\.source.identifier))
             guard identifiers.count <= limit else { return nil }
             let presence = catalogStore.presence(for: Array(identifiers))
@@ -1745,11 +1749,15 @@ public final class PhotoLibraryBackupController {
     /// Returns when the pass `runID` has settled: its completion released the lock and projected the final state, or
     /// ended early at a shutdown. A pass whose instant work outlasts the bounded retirement wait settles only when that
     /// work returned, so `run.task.value` alone does not prove it (#1108). Returns at once for a run that is neither
-    /// active nor settling.
+    /// active nor settling. The wait ignores cancellation: a caller that needs a bound, such as the continued backup
+    /// session after an expiry, ends its own wait.
     public func waitUntilRunSettled(_ runID: String) async {
         guard activeRunID == runID || settlingRunIDs.contains(runID) else { return }
-        await withCheckedContinuation { settlementWaiters.append((runID, $0)) }
+        await withCheckedContinuation { settlementWaiters[runID, default: []].append($0) }
     }
+
+    /// The controller shut down for a sign-out or teardown; it starts no pass any more.
+    public var isShutDown: Bool { isShuttingDown }
 
     /// Stops only the active run identified by the caller. OS expiration handlers must use this
     /// overload so an expired attempt cannot cancel a foreground run or a later replacement run.
@@ -1952,8 +1960,7 @@ public final class PhotoLibraryBackupController {
 
         /// Returns when every ended pass has finished its completion, including the decision about its next wake.
         internal func waitForSyncRunCompletionForTesting() async {
-            guard !settlingRunIDs.isEmpty else { return }
-            await withCheckedContinuation { settlementWaiters.append((nil, $0)) }
+            while let runID = settlingRunIDs.first { await waitUntilRunSettled(runID) }
         }
 
         /// Background windows that wait for their deferred pass.
@@ -2722,12 +2729,7 @@ public final class PhotoLibraryBackupController {
 
     private func endSettlement(of runID: String) {
         settlingRunIDs.remove(runID)
-        let isReady = { (waiter: (runID: String?, continuation: CheckedContinuation<Void, Never>)) in
-            waiter.runID == runID || (waiter.runID == nil && self.settlingRunIDs.isEmpty)
-        }
-        let ready = settlementWaiters.filter(isReady)
-        settlementWaiters.removeAll(where: isReady)
-        for waiter in ready { waiter.continuation.resume() }
+        for waiter in settlementWaiters.removeValue(forKey: runID) ?? [] { waiter.resume() }
     }
 
     private func completeSyncRun(runID: String) async {
