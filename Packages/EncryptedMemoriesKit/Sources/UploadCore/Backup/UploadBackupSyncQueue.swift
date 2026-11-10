@@ -250,6 +250,19 @@ public enum UploadBackupCatalogReplayState: Int, Sendable, Codable {
     case completed = 2
 }
 
+/// A row that a background claim reserved, and whether an earlier background pass found the local read of its photo
+/// failing (#274). `found`: the photo is in the loaded list. `absent`: the claim checked the list and the photo is not
+/// in it. `unknown`: no list was checked; the runner then treats the row as today.
+public struct UploadBackupClaimedEntry: Sendable {
+    public let entry: UploadBackupSyncQueueEntry
+    public let localReadFailure: StoreLookup<Void>
+
+    public init(entry: UploadBackupSyncQueueEntry, localReadFailure: StoreLookup<Void>) {
+        self.entry = entry
+        self.localReadFailure = localReadFailure
+    }
+}
+
 public protocol UploadBackupSyncQueueStore: Sendable {
     /// Optional atomic restore recheck capability. Nil means unsupported, without changing the store.
     /// The operation returns true after the exact terminal row reopens, false after a lost CAS, or nil on failure.
@@ -307,6 +320,19 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
     ) -> [UploadBackupSyncQueueEntry]?
+    /// The same claim for a background pass (#274): rows of photos in the loaded local read failure list come after all
+    /// other runnable rows, and each claimed row says whether its photo is in that list. Without a loaded list the order
+    /// is the one of `claimRunnable`, and every answer is `unknown`.
+    func claimRunnableOrderingLocalReadFailuresLast(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupClaimedEntry]?
+    /// Replaces the local read failure list that only background claims read. The list lives with this connection,
+    /// never in the queue file. False leaves no list: the claims then keep the normal order.
+    func loadLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool
+    /// Adds photos to a loaded list. False when no list is loaded or the write failed; a failed write drops the list.
+    func addLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool
+    /// Drops the list: later background claims answer `unknown` until the next load.
+    func dropLocalReadFailureHints()
     /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, oldest first.
     /// The runner uses this to find parked `blockedByDraft` rows whose re-check backoff elapsed.
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
@@ -326,8 +352,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool
     /// Monotonic count of missing Photo Library sources removed from this queue. Nil means a failed read.
     func missingSourceDiscardGeneration() -> Int64?
-    /// Sources with any queue row, across resources and revisions. Nil means a failed read.
-    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>?
+    /// Sources with a queue row outside `excludedStates`, across resources and revisions. Nil means a failed read.
+    func sourcesWithEntries(
+        _ sources: [UploadSourceIdentity], outside excludedStates: [UploadBackupSyncQueueState]
+    ) -> Set<UploadSourceIdentity>?
     /// Inserts only sources without any queue row. Existing rows, including user decisions, stay untouched.
     @discardableResult
     func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
@@ -391,6 +419,11 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 }
 
 public extension UploadBackupSyncQueueStore {
+    /// Sources with any queue row, across resources and revisions. Nil means a failed read.
+    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? {
+        sourcesWithEntries(sources, outside: [])
+    }
+
     @discardableResult
     func dismissPermanentFailure(
         source: UploadSourceIdentity,

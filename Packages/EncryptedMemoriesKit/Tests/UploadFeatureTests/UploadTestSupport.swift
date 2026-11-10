@@ -335,7 +335,9 @@ extension UploadBackupSyncQueueStore {
     }
 
     func missingSourceDiscardGeneration() -> Int64? { 0 }
-    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? { nil }
+    func sourcesWithEntries(
+        _ sources: [UploadSourceIdentity], outside excludedStates: [UploadBackupSyncQueueState]
+    ) -> Set<UploadSourceIdentity>? { nil }
     func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool { false }
 
     func nextRunnableDate() -> Date? {
@@ -345,6 +347,19 @@ extension UploadBackupSyncQueueStore {
     func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry]? {
         claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
     }
+
+    /// A store without a local read failure list claims in the normal order and knows nothing about the rows.
+    func claimRunnableOrderingLocalReadFailuresLast(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupClaimedEntry]? {
+        claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)?.map {
+            UploadBackupClaimedEntry(entry: $0, localReadFailure: .unknown)
+        }
+    }
+
+    func loadLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool { false }
+    func addLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool { false }
+    func dropLocalReadFailureHints() {}
 
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         entries.allSatisfy(upsert)

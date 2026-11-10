@@ -22,6 +22,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private let legacyObserverID = UUID()
     private var changeObservers: [UUID: @Sendable (UploadBackupSyncQueueChange) -> Void] = [:]
     private let supportTrail: SupportEventTrail
+    /// True while `temp.backup_local_read_failure` holds the list that background claims read (#274). The list lives
+    /// with this connection only; the queue file and its schema never contain it. Read and write under the lock.
+    private var localReadFailureHintsLoaded = false
 
     public init?(
         url: URL, policy: LibraryDatabasePolicy = .conservative, supportTrail: SupportEventTrail = .shared
@@ -392,101 +395,137 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    /// Selects and moves runnable rows to `checking` in one transaction. With `ordersLocalReadFailuresLast` and a loaded
+    /// list, rows of listed photos come last, and each row says whether its photo is listed; otherwise the order is the
+    /// normal one, and every answer is `unknown`.
     private func claimRunnableUnobserved(
-        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity]
-    ) -> [UploadBackupSyncQueueEntry]? {
+        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], ordersLocalReadFailuresLast: Bool = false
+    ) -> [UploadBackupClaimedEntry]? {
+        connection.withLock {
+            guard ordersLocalReadFailuresLast, localReadFailureHintsLoaded else {
+                return claimRunnableLocked(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources).rows
+            }
+            let ordered = claimRunnableLocked(
+                limit: limit, claimedAt: claimedAt, excludedSources: excludedSources, readsList: true)
+            guard ordered.listReadFailed else { return ordered.rows }
+            // The list is a cache of this connection: a failed read of it drops the list and never marks the queue
+            // failed. The claim then runs again in a new transaction, in the normal order.
+            localReadFailureHintsLoaded = false
+            return claimRunnableLocked(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources).rows
+        }
+    }
+
+    /// Call inside `withLock`. One claim transaction. With `readsList`, a failed prepare or step of the select ends the
+    /// transaction without a change and without marking the queue failed, and `listReadFailed` is true.
+    private func claimRunnableLocked(
+        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], readsList: Bool = false
+    ) -> (rows: [UploadBackupClaimedEntry]?, listReadFailed: Bool) {
         let clampedLimit = max(1, limit)
         let exclusion = SourceExclusion(excludedSources)
-        return connection.withLock {
-            var claimed: [UploadBackupSyncQueueEntry] = []
-            var updateStmt: OpaquePointer?
-            // The update statement ends after the transaction, as before.
-            defer { sqlite3_finalize(updateStmt) }
-            let committed = connection.immediateTransaction {
-                var selected: [UploadBackupSyncQueueEntry] = []
-                var selectStmt: OpaquePointer?
-                guard
-                    requireOperational(
-                        sqlite3_prepare_v2(
-                            db,
-                            """
-                            SELECT \(Self.entryColumns)
-                            FROM backup_sync_queue
-                            WHERE state IN (\(Self.runnableStateList))
-                              AND updated_at <= ?\(exclusion.clause)
-                            ORDER BY revision_us DESC, updated_at ASC
-                            LIMIT ?;
-                            """,
-                            -1, &selectStmt, nil
-                        ) == SQLITE_OK)
+        var claimed: [UploadBackupClaimedEntry] = []
+        var listReadFailed = false
+        var updateStmt: OpaquePointer?
+        // The update statement ends after the transaction, as before.
+        defer { sqlite3_finalize(updateStmt) }
+        let committed = connection.immediateTransaction {
+            var selected: [UploadBackupClaimedEntry] = []
+            var selectStmt: OpaquePointer?
+            let listColumn =
+                readsList
+                ? """
+                ,
+                       EXISTS(SELECT 1 FROM temp.backup_local_read_failure h
+                              WHERE h.source_kind = backup_sync_queue.source_kind
+                                AND h.source_id = backup_sync_queue.source_id) AS local_read_failed
+                """ : ""
+            let selectSQL = """
+                SELECT \(Self.entryColumns)\(listColumn)
+                FROM backup_sync_queue
+                WHERE state IN (\(Self.runnableStateList))
+                  AND updated_at <= ?\(exclusion.clause)
+                ORDER BY \(readsList ? "local_read_failed ASC, " : "")revision_us DESC, updated_at ASC
+                LIMIT ?;
+                """
+            let prepared = sqlite3_prepare_v2(db, selectSQL, -1, &selectStmt, nil) == SQLITE_OK
+            if readsList, !prepared {
+                sqlite3_finalize(selectStmt)
+                listReadFailed = true
+                return false
+            }
+            guard requireOperational(prepared) else {
+                return false
+            }
+            sqlite3_bind_double(selectStmt, 1, claimedAt.timeIntervalSince1970)
+            // An exclusion that does not bind must not hide every row of its kind (#1194).
+            guard let limitParameter = try? bind(exclusion, to: selectStmt, from: 2) else {
+                sqlite3_finalize(selectStmt)
+                return false
+            }
+            sqlite3_bind_int(selectStmt, limitParameter, Int32(clamping: clampedLimit))
+            var selectResult = sqlite3_step(selectStmt)
+            while selectResult == SQLITE_ROW {
+                guard let source = sourceFromColumns(selectStmt, kindColumn: 0, idColumn: 1, resourceColumn: 2)
                 else {
-                    return false
-                }
-                sqlite3_bind_double(selectStmt, 1, claimedAt.timeIntervalSince1970)
-                // An exclusion that does not bind must not hide every row of its kind (#1194).
-                guard let limitParameter = try? bind(exclusion, to: selectStmt, from: 2) else {
+                    connection.markFailed()
                     sqlite3_finalize(selectStmt)
                     return false
                 }
-                sqlite3_bind_int(selectStmt, limitParameter, Int32(clamping: clampedLimit))
-                var selectResult = sqlite3_step(selectStmt)
-                while selectResult == SQLITE_ROW {
-                    guard let source = sourceFromColumns(selectStmt, kindColumn: 0, idColumn: 1, resourceColumn: 2)
-                    else {
-                        connection.markFailed()
-                        sqlite3_finalize(selectStmt)
-                        return false
-                    }
-                    let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(selectStmt, 3))
-                    guard let entry = row(selectStmt, source: source, revision: revision, offset: 4) else {
-                        sqlite3_finalize(selectStmt)
-                        return false
-                    }
-                    selected.append(entry)
-                    selectResult = sqlite3_step(selectStmt)
-                }
-                sqlite3_finalize(selectStmt)
-                guard requireOperational(selectResult == SQLITE_DONE) else {
+                let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(selectStmt, 3))
+                guard let entry = row(selectStmt, source: source, revision: revision, offset: 4) else {
+                    sqlite3_finalize(selectStmt)
                     return false
                 }
+                let localReadFailure: StoreLookup<Void> =
+                    readsList ? (sqlite3_column_int(selectStmt, 11) != 0 ? .found(()) : .absent) : .unknown
+                selected.append(UploadBackupClaimedEntry(entry: entry, localReadFailure: localReadFailure))
+                selectResult = sqlite3_step(selectStmt)
+            }
+            sqlite3_finalize(selectStmt)
+            if readsList, selectResult != SQLITE_DONE {
+                listReadFailed = true
+                return false
+            }
+            guard requireOperational(selectResult == SQLITE_DONE) else {
+                return false
+            }
 
-                guard !selected.isEmpty else { return true }
+            guard !selected.isEmpty else { return true }
 
-                guard
-                    requireOperational(
-                        sqlite3_prepare_v2(
-                            db,
-                            """
-                            UPDATE backup_sync_queue
-                            SET state='checking', updated_at=?
-                            WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
-                              AND state IN (\(Self.runnableStateList));
-                            """,
-                            -1, &updateStmt, nil
-                        ) == SQLITE_OK)
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        UPDATE backup_sync_queue
+                        SET state='checking', updated_at=?
+                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
+                          AND state IN (\(Self.runnableStateList));
+                        """,
+                        -1, &updateStmt, nil
+                    ) == SQLITE_OK)
+            else {
+                return false
+            }
+            for selection in selected {
+                let entry = selection.entry
+                sqlite3_reset(updateStmt)
+                sqlite3_clear_bindings(updateStmt)
+                sqlite3_bind_double(updateStmt, 1, claimedAt.timeIntervalSince1970)
+                guard connection.bindUploadSource(entry.source, to: updateStmt, from: 2) else {
+                    return false
+                }
+                sqlite3_bind_int64(updateStmt, 5, entry.revision.rawValue)
+                guard requireOperational(sqlite3_step(updateStmt) == SQLITE_DONE),
+                    requireOperational(sqlite3_changes(db) > 0)
                 else {
                     return false
                 }
-                for entry in selected {
-                    sqlite3_reset(updateStmt)
-                    sqlite3_clear_bindings(updateStmt)
-                    sqlite3_bind_double(updateStmt, 1, claimedAt.timeIntervalSince1970)
-                    guard connection.bindUploadSource(entry.source, to: updateStmt, from: 2) else {
-                        return false
-                    }
-                    sqlite3_bind_int64(updateStmt, 5, entry.revision.rawValue)
-                    guard requireOperational(sqlite3_step(updateStmt) == SQLITE_DONE),
-                        requireOperational(sqlite3_changes(db) > 0)
-                    else {
-                        return false
-                    }
-                    claimed.append(entry)
-                }
-
-                return true
+                claimed.append(selection)
             }
-            return committed ? claimed : nil
+
+            return true
         }
+        return (committed ? claimed : nil, listReadFailed)
     }
 
     /// Streams the rows that keep the backup incomplete, newest revision first, until `body` returns false.
@@ -1381,14 +1420,19 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    public func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? {
-        connection.withLock {
+    public func sourcesWithEntries(
+        _ sources: [UploadSourceIdentity], outside excludedStates: [UploadBackupSyncQueueState]
+    ) -> Set<UploadSourceIdentity>? {
+        let stateFilter =
+            excludedStates.isEmpty
+            ? "" : " AND state NOT IN (\(excludedStates.map { "'\($0.rawValue)'" }.joined(separator: ", ")))"
+        return connection.withLock {
             var stmt: OpaquePointer?
             guard
                 requireOperational(
                     sqlite3_prepare_v2(
                         db,
-                        "SELECT 1 FROM backup_sync_queue WHERE source_kind=? AND source_id=? LIMIT 1;",
+                        "SELECT 1 FROM backup_sync_queue WHERE source_kind=? AND source_id=?\(stateFilter) LIMIT 1;",
                         -1, &stmt, nil) == SQLITE_OK)
             else { return nil }
             defer { sqlite3_finalize(stmt) }
@@ -1726,9 +1770,89 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
     ) -> [UploadBackupSyncQueueEntry]? {
-        let claimed = claimRunnableUnobserved(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources)
-        if let claimed, !claimed.isEmpty { notify(UploadBackupSyncQueueChange(sources: claimed.map(\.source))) }
+        claimNotifying(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources)?.map(\.entry)
+    }
+
+    public func claimRunnableOrderingLocalReadFailuresLast(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupClaimedEntry]? {
+        claimNotifying(
+            limit: limit, claimedAt: claimedAt, excludedSources: excludedSources, ordersLocalReadFailuresLast: true)
+    }
+
+    private func claimNotifying(
+        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], ordersLocalReadFailuresLast: Bool = false
+    ) -> [UploadBackupClaimedEntry]? {
+        let claimed = claimRunnableUnobserved(
+            limit: limit, claimedAt: claimedAt, excludedSources: excludedSources,
+            ordersLocalReadFailuresLast: ordersLocalReadFailuresLast)
+        if let claimed, !claimed.isEmpty { notify(UploadBackupSyncQueueChange(sources: claimed.map(\.entry.source))) }
         return claimed
+    }
+
+    /// Replaces the list in one write on this connection's temporary database. A failure drops the list and leaves the
+    /// queue state untouched: the list is only a cache of the hint file, so it never marks the queue failed.
+    public func loadLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool {
+        connection.withLock {
+            localReadFailureHintsLoaded = false
+            guard let db,
+                sqlite3_exec(
+                    db,
+                    """
+                    CREATE TEMP TABLE IF NOT EXISTS backup_local_read_failure(
+                      source_kind TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY(source_kind, source_id)
+                    ) WITHOUT ROWID;
+                    DELETE FROM temp.backup_local_read_failure;
+                    """, nil, nil, nil) == SQLITE_OK
+            else { return false }
+            guard insertLocalReadFailureHintsLocked(sources, db: db) else {
+                sqlite3_exec(db, "DELETE FROM temp.backup_local_read_failure;", nil, nil, nil)
+                return false
+            }
+            localReadFailureHintsLoaded = true
+            return true
+        }
+    }
+
+    public func addLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool {
+        connection.withLock {
+            guard localReadFailureHintsLoaded, let db else { return false }
+            guard insertLocalReadFailureHintsLocked(sources, db: db) else {
+                localReadFailureHintsLoaded = false
+                return false
+            }
+            return true
+        }
+    }
+
+    public func dropLocalReadFailureHints() {
+        connection.withLock {
+            localReadFailureHintsLoaded = false
+            if let db { sqlite3_exec(db, "DELETE FROM temp.backup_local_read_failure;", nil, nil, nil) }
+        }
+    }
+
+    /// Inserts photo keys into the temporary list. Binds with `SQLiteBinding`, not `connection.bindText`, because a
+    /// failure here must not count as a queue failure. Call under the lock.
+    private func insertLocalReadFailureHintsLocked(_ sources: [UploadSourceIdentity], db: OpaquePointer) -> Bool {
+        var stmt: OpaquePointer?
+        guard
+            sqlite3_prepare_v2(
+                db, "INSERT OR IGNORE INTO temp.backup_local_read_failure(source_kind, source_id) VALUES(?, ?);", -1,
+                &stmt, nil) == SQLITE_OK
+        else {
+            sqlite3_finalize(stmt)
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        for source in sources {
+            sqlite3_reset(stmt)
+            guard SQLiteBinding.text(stmt, 1, source.kind.rawValue) == SQLITE_OK,
+                SQLiteBinding.text(stmt, 2, source.identifier) == SQLITE_OK,
+                sqlite3_step(stmt) == SQLITE_DONE
+            else { return false }
+        }
+        return true
     }
 
     @discardableResult

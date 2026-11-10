@@ -2473,6 +2473,175 @@ extension UploadBackupSyncQueueTests {
     }
 }
 
+/// Background claims order photos whose local read failed last (#274).
+extension UploadBackupSyncQueueTests {
+    private func localReadFailureQueue() throws -> UploadBackupSyncQueueManifestStore {
+        let store = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
+        for (name, seconds) in [("a", 30.0), ("b", 20.0), ("c", 10.0)] {
+            XCTAssertTrue(
+                store.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: source(name), revision: revision(seconds), originalFilename: "\(name).heic",
+                        state: .discovered, updatedAt: Date(timeIntervalSince1970: 1))))
+        }
+        return store
+    }
+
+    private func answers(_ claimed: [UploadBackupClaimedEntry]?) -> [String] {
+        (claimed ?? []).map {
+            let answer: String
+            switch $0.localReadFailure {
+            case .found: answer = "found"
+            case .absent: answer = "absent"
+            case .unknown: answer = "unknown"
+            }
+            return "\($0.entry.source.identifier):\(answer)"
+        }
+    }
+
+    func testABackgroundClaimTakesPhotosWithAFailedLocalReadLastAndAnswersForEachRow() throws {
+        let store = try localReadFailureQueue()
+        defer { store.close() }
+        let now = Date(timeIntervalSince1970: 100)
+        XCTAssertTrue(store.loadLocalReadFailureHints([source("a"), source("c", resource: .livePairedVideo)]))
+
+        XCTAssertEqual(
+            answers(store.claimRunnableOrderingLocalReadFailuresLast(limit: 2, claimedAt: now, excludingSourcesOf: [])),
+            ["b:absent", "a:found"])
+        XCTAssertEqual(
+            answers(store.claimRunnableOrderingLocalReadFailuresLast(limit: 2, claimedAt: now, excludingSourcesOf: [])),
+            ["c:found"])
+        XCTAssertEqual(try store.entry(for: source("c"), revision: revision(10))?.state, .checking)
+    }
+
+    /// The foreground claim and a claim without a loaded list keep today's order: newest revision first.
+    func testWithoutALoadedListAndInTheForegroundTheOrderStaysAsToday() throws {
+        let store = try localReadFailureQueue()
+        defer { store.close() }
+        let now = Date(timeIntervalSince1970: 100)
+
+        XCTAssertEqual(
+            answers(store.claimRunnableOrderingLocalReadFailuresLast(limit: 1, claimedAt: now, excludingSourcesOf: [])),
+            ["a:unknown"])
+        XCTAssertTrue(store.loadLocalReadFailureHints([source("b")]))
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: now)?.map(\.source.identifier), ["b"])
+    }
+
+    func testAnAddedHintCountsAtTheNextClaimAndAReloadReplacesTheList() throws {
+        let store = try localReadFailureQueue()
+        defer { store.close() }
+        let now = Date(timeIntervalSince1970: 100)
+        XCTAssertFalse(store.addLocalReadFailureHints([source("a")]), "no list is loaded yet")
+        XCTAssertTrue(store.loadLocalReadFailureHints([]))
+        XCTAssertTrue(store.addLocalReadFailureHints([source("a")]))
+
+        XCTAssertEqual(
+            answers(store.claimRunnableOrderingLocalReadFailuresLast(limit: 1, claimedAt: now, excludingSourcesOf: [])),
+            ["b:absent"])
+        XCTAssertTrue(store.loadLocalReadFailureHints([source("c")]))
+        XCTAssertEqual(
+            answers(store.claimRunnableOrderingLocalReadFailuresLast(limit: 2, claimedAt: now, excludingSourcesOf: [])),
+            ["a:absent", "c:found"])
+    }
+
+    /// The list is a cache: a failed read of it drops the list, and the claim runs again in the normal order. The
+    /// queue stays operational, so the background pass goes on instead of ending as a failed store.
+    func testAFailedReadOfTheListDropsItAndClaimsInTheNormalOrder() throws {
+        let store = try localReadFailureQueue()
+        defer { store.close() }
+        let now = Date(timeIntervalSince1970: 100)
+        XCTAssertTrue(store.loadLocalReadFailureHints([source("a")]))
+        let fault = try SQLiteReadInterrupt(in: store, matching: "AS local_read_failed")
+        defer { fault.stop() }
+
+        XCTAssertEqual(
+            answers(store.claimRunnableOrderingLocalReadFailuresLast(limit: 1, claimedAt: now, excludingSourcesOf: [])),
+            ["a:unknown"])
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(store.isOperational(), "a failed read of the list never marks the queue failed")
+        XCTAssertEqual(
+            answers(store.claimRunnableOrderingLocalReadFailuresLast(limit: 1, claimedAt: now, excludingSourcesOf: [])),
+            ["b:unknown"], "the dropped list stays dropped until the next load")
+    }
+
+    func testTheExclusionStillAppliesToABackgroundClaim() throws {
+        let store = try localReadFailureQueue()
+        defer { store.close() }
+        XCTAssertTrue(store.loadLocalReadFailureHints([source("a")]))
+
+        XCTAssertEqual(
+            answers(
+                store.claimRunnableOrderingLocalReadFailuresLast(
+                    limit: 3, claimedAt: Date(timeIntervalSince1970: 100), excludingSourcesOf: [source("b")])),
+            ["c:absent", "a:found"])
+        XCTAssertEqual(try store.entry(for: source("b"), revision: revision(20))?.state, .discovered)
+    }
+
+    /// The hint sweep keeps a hint only while its photo still has a row outside the settled states.
+    func testSourcesWithEntriesOutsideStatesIgnoresRowsInThoseStates() throws {
+        let store = try localReadFailureQueue()
+        defer { store.close() }
+        XCTAssertTrue(
+            store.updateState(
+                source: source("a"), revision: revision(30), state: .completed, attempts: nil, lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 2)))
+
+        XCTAssertEqual(
+            store.sourcesWithEntries([source("a"), source("b"), source("missing")], outside: [.completed]),
+            [source("b")])
+        XCTAssertEqual(store.sourcesWithEntries([source("a"), source("b")]), [source("a"), source("b")])
+    }
+
+    /// The worst case of the background claim: 50,000 hinted photos are newer than the photos on the device. The test
+    /// reports the time of both claims; the packet compares them. It fails only on a wrong order.
+    func testABackgroundClaimBehindFiftyThousandHintedPhotosStillTakesTheLocalPhotoFirst() throws {
+        let store = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
+        defer { store.close() }
+        let hinted = (0..<50_000).map { source(String(format: "hinted-%05d", $0)) }
+        var rows = hinted.enumerated().map { index, photo in
+            UploadBackupSyncQueueEntry(
+                source: photo, revision: revision(TimeInterval(1_000_000 - index)), originalFilename: "h.heic",
+                state: .discovered, updatedAt: Date(timeIntervalSince1970: 1))
+        }
+        rows += (0..<1_000).map {
+            UploadBackupSyncQueueEntry(
+                source: source(String(format: "local-%04d", $0)), revision: revision(TimeInterval(1_000 - $0)),
+                originalFilename: "l.heic", state: .discovered, updatedAt: Date(timeIntervalSince1970: 1))
+        }
+        XCTAssertTrue(store.upsertBatch(rows))
+        let now = Date(timeIntervalSince1970: 100)
+
+        let loadStart = Date()
+        XCTAssertTrue(store.loadLocalReadFailureHints(hinted))
+        let load = Date().timeIntervalSince(loadStart)
+        var background: [TimeInterval] = []
+        var claimedLocal: [String] = []
+        for _ in 0..<5 {
+            let start = Date()
+            let claimed = store.claimRunnableOrderingLocalReadFailuresLast(
+                limit: 1, claimedAt: now, excludingSourcesOf: [])
+            background.append(Date().timeIntervalSince(start))
+            claimedLocal += answers(claimed)
+        }
+        var today: [TimeInterval] = []
+        for _ in 0..<5 {
+            let start = Date()
+            _ = store.claimRunnable(limit: 1, claimedAt: now)
+            today.append(Date().timeIntervalSince(start))
+        }
+
+        XCTAssertEqual(claimedLocal, (0..<5).map { String(format: "local-%04d:absent", $0) })
+        let ms = { (values: [TimeInterval]) in String(format: "%.1f", (values.min() ?? 0) * 1000) }
+        print(
+            "[#274 timing] hinted=50000 local=1000 load=\(String(format: "%.1f", load * 1000))ms "
+                + "backgroundClaimMin=\(ms(background))ms todayClaimMin=\(ms(today))ms")
+    }
+}
+
 private final class RecordedQueueChanges: @unchecked Sendable {
     private let lock = NSLock()
     private var changes: [UploadBackupSyncQueueChange] = []
