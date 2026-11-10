@@ -334,6 +334,9 @@ final class LibrarySourceGraphTests: XCTestCase {
             XCTAssertTrue(lost.items.isEmpty)
             XCTAssertNil(lost.validationToken)
             XCTAssertNil(graph.accessLease(for: owner.uid, requiring: .readThumbnail))
+            XCTAssertNil(
+                graph.relatedAccessLease(
+                    for: member, of: owner.uid, relationship: .burstMember, requiring: .readThumbnail))
             XCTAssertNil(graph.burstMemberAccessLeases(for: [member], requiring: .readThumbnail)[member])
             XCTAssertFalse(graph.isCurrent(oldAccess))
             XCTAssertNil(graph.commit([.complete(owner)], validationToken: "stale", using: oldRefresh))
@@ -357,6 +360,44 @@ final class LibrarySourceGraphTests: XCTestCase {
             XCTAssertNil(graph.commit([.complete(owner)], validationToken: "stale", using: oldRefresh))
             XCTAssertNotNil(graph.burstMemberAccessLeases(for: [member], requiring: .readThumbnail)[member])
         }
+    }
+
+    func testAccessLossClearsStoredBurstIndex() throws {
+        for removeByDiscovery in [false, true] {
+            var graph = LibrarySourceGraph()
+            let owner = item("owner", time: 1, burstMemberIDs: ["member"])
+            let member = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "member")
+            _ = install(firstSource, items: [owner], in: &graph)
+            func burstIndex() throws -> [PhotoUID: [PhotoUID]] {
+                let records = try XCTUnwrap(Mirror(reflecting: graph).children.first { $0.label == "records" }?.value)
+                let pair = try XCTUnwrap(Mirror(reflecting: records).children.first?.value)
+                let record = try XCTUnwrap(Mirror(reflecting: pair).children.first { $0.label == "value" }?.value)
+                return try XCTUnwrap(
+                    Mirror(reflecting: record).children.first { $0.label == "burstOwnersByMemberUID" }?.value
+                        as? [PhotoUID: [PhotoUID]])
+            }
+            XCTAssertEqual(try burstIndex()[member], [owner.uid])
+            if removeByDiscovery {
+                _ = try XCTUnwrap(graph.commitSourceSet([], using: graph.beginSourceSetRefresh()))
+            } else {
+                _ = try XCTUnwrap(graph.removeSource(firstSource.id))
+            }
+            XCTAssertTrue(try burstIndex().isEmpty)
+        }
+    }
+
+    func testUnknownCapabilityCannotAuthorizeAnyRoute() {
+        var graph = LibrarySourceGraph()
+        let owner = item("owner", time: 1, isLivePhoto: true, relatedVideoID: "motion")
+        let motion = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "motion")
+        let outside = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "outside")
+        let unknown = LibrarySourceCapabilities(rawValue: 1 << 15)
+        _ = install(firstSource, items: [owner], in: &graph)
+        _ = graph.setIdentitiesOutsideInventory([outside])
+        XCTAssertTrue(graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: unknown).isEmpty)
+        XCTAssertNil(graph.accessLease(for: owner.uid, requiring: unknown))
+        XCTAssertNil(
+            graph.relatedAccessLease(for: motion, of: owner.uid, relationship: .livePhotoMotion, requiring: unknown))
     }
 
     func testCachedInventoryNoOpKeepsRevisionAndChangedInventoryInvalidatesLease() throws {
@@ -1029,6 +1070,9 @@ final class LibrarySourceGraphTests: XCTestCase {
                 for: [outside], requiring: .readThumbnail, includeExcludedSources: false)[outside]?.sourceID,
             secondSource.id)
         XCTAssertNil(graph.accessLease(for: outside, requiring: .readThumbnail))
+        XCTAssertNil(
+            graph.relatedAccessLease(
+                for: motion, of: outside, relationship: .livePhotoMotion, requiring: .readContent))
         XCTAssertTrue(graph.identityOutsideInventoryAccessLeases(for: [owner.uid], requiring: .readThumbnail).isEmpty)
         XCTAssertNil(
             graph.relatedAccessLease(
