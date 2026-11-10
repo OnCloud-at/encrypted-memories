@@ -70,7 +70,7 @@ import Testing
         for (x, q) in [(2.9, 0.1), (2.8, 0.2), (2.7, 0.3), (2.55, 0.45)] {
             let out = d.update(continuousLevel: x, dt: 0.1)
             #expect(out.segmentSource == 3 && out.segmentTarget == 2)
-            #expect(abs(out.segmentQ - q) < 1e-9)  // segmentQ == (seg+1) − x exactly (lowpass 1.0)
+            #expect(abs(out.segmentQ - q) < 1e-9)  // segmentQ == (seg+1) − x exactly
         }
     }
 
@@ -94,6 +94,7 @@ import Testing
         let after = d.update(continuousLevel: 1.80, dt: 0.05)  // crossed below L2 (past hysteresis)
         #expect(after.segmentSource == 2 && after.segmentTarget == 1)  // interval swapped
         #expect(after.segmentQ < 0.3)  // q reset toward the new source
+        #expect(abs(after.segmentQ - 0.20) < 1e-9)
     }
 
     // Adjacent segments share the same detent endpoint.
@@ -216,6 +217,27 @@ import Testing
         #expect(ticks <= 26)
     }
 
+    @Test func shortPinchFallbacksUseTheNormalRelease() {
+        func check(_ initial: PinchLiveZoomDriver, direction: Int, cancelled: Bool = false) {
+            var expected = initial
+            _ = expected.release(cancelled: cancelled)
+            var actual = initial
+            let update = actual.releaseTowardAdjacent(direction: direction, cancelled: cancelled)
+            #expect(actual == expected)
+            #expect(!update.hasSegment)
+            #expect(update.segmentSource == actual.segmentSource)
+            #expect(update.segmentTarget == actual.segmentTarget)
+            #expect(update.segmentQ == actual.segmentQ)
+        }
+
+        check(PinchLiveZoomDriver(), direction: -1)
+        check(started(start: 1, lo: 1, hi: 1), direction: -1)
+        check(started(start: 2), direction: -1, cancelled: true)
+        check(started(start: 2), direction: 0)
+        check(started(start: 0), direction: -1)
+        check(started(start: 3), direction: 1)
+    }
+
     // An interior start chains in both directions.
     @Test func interiorStartChainsBothWays() {
         var down = started(start: 2)
@@ -254,19 +276,6 @@ import Testing
         let out = d.update(continuousLevel: 3.0, dt: 0.05)  // attempt to chain - must stay inert
         #expect(!out.hasSegment)
         #expect(d.release() == 4)  // commits the start level, no chaining
-    }
-
-    // The low-pass filter does not smear across a detent crossing.
-    @Test func lowPassResetsAtCrossing() {
-        var t = PinchLiveZoomDriver.Tunables()
-        t.displayQLowPassAlpha = 0.25
-        var d = PinchLiveZoomDriver(tuning: t)
-        d.begin(startLevel: 3, chainLo: 0, chainHi: 3)
-        _ = d.update(continuousLevel: 2.05, dt: 0.05)  // [3 to 2] near the L2 detent
-        let after = d.update(continuousLevel: 1.80, dt: 0.05)  // crossed below L2
-        #expect(after.segmentSource == 2 && after.segmentTarget == 1)
-        // seam-correct value for the new segment is 2 − 1.80 = 0.20; the filter must not carry the old ~1.0.
-        #expect(abs(after.segmentQ - 0.20) < 1e-9)
     }
 
     // Reset returns the driver to idle for reuse.
