@@ -72,17 +72,21 @@ public struct BackupIssueRecord: Codable, Sendable, Equatable {
     /// Persisted ordinal for environmental retries. It is deliberately separate from the queue row's
     /// finite item-failure attempts, so a long outage gets capped backoff without stranding valid media.
     public var automaticRetryAttempt: Int
+    /// Proton's repeated refusal of this revision. Older builds ignore the field and keep the row as it is.
+    public var serviceRejection: BackupServiceRejection?
 
     public init(
         kind: BackupIssueKind,
         detail: String,
         nextAttemptAt: Date? = nil,
-        automaticRetryAttempt: Int = 0
+        automaticRetryAttempt: Int = 0,
+        serviceRejection: BackupServiceRejection? = nil
     ) {
         self.kind = kind
         self.detail = detail
         self.nextAttemptAt = nextAttemptAt
         self.automaticRetryAttempt = max(0, automaticRetryAttempt)
+        self.serviceRejection = serviceRejection
     }
 
     public var persistedValue: String {
@@ -100,6 +104,40 @@ public struct BackupIssueRecord: Codable, Sendable, Equatable {
             return BackupIssueRecord(kind: .unknown, detail: value)
         }
         return record
+    }
+}
+
+/// Rounds of Proton refusing one revision. A round is one park after the full attempt budget. A park at least a day
+/// after the previous round starts the next one; manual retries within a day add no round. The runner stops retrying
+/// after three rounds that span at least three days.
+public struct BackupServiceRejection: Codable, Sendable, Equatable {
+    public var rounds: Int
+    public var firstRoundAt: Date
+    public var lastRoundAt: Date
+
+    public init(rounds: Int, firstRoundAt: Date, lastRoundAt: Date) {
+        self.rounds = rounds
+        self.firstRoundAt = firstRoundAt
+        self.lastRoundAt = lastRoundAt
+    }
+
+    /// The least time between two rounds, and the least time that the rounds must cover before the runner stops.
+    static let roundSpacing: TimeInterval = 24 * 3600
+    static let stopSpan: TimeInterval = 72 * 3600
+    static let stopRounds = 3
+
+    /// The rounds after one more park at `now`.
+    public static func afterPark(_ previous: Self?, at now: Date) -> Self {
+        guard var next = previous else { return Self(rounds: 1, firstRoundAt: now, lastRoundAt: now) }
+        if now.timeIntervalSince(next.lastRoundAt) >= roundSpacing {
+            next.rounds += 1
+            next.lastRoundAt = now
+        }
+        return next
+    }
+
+    public var stopsRetrying: Bool {
+        rounds >= Self.stopRounds && lastRoundAt.timeIntervalSince(firstRoundAt) >= Self.stopSpan
     }
 }
 

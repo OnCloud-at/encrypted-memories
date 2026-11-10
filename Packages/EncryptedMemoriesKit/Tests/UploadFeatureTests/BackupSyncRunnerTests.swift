@@ -5137,6 +5137,118 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
+    // MARK: Proton refusals
+
+    private func refusal(of entry: UploadBackupSyncQueueEntry) throws -> BackupIssueRecord? {
+        BackupIssueRecord.decode(try queueStore.entry(for: entry.source, revision: entry.revision)?.lastError)
+    }
+
+    /// Runs until the photo parks, then lets the app's launch re-queue run `hours` later.
+    private func parkAndRelaunch(after hours: Double, retry: BackupRetryPolicy) async {
+        _ = await makeRunner(retry: retry).runUntilDrained()
+        clock.advance(by: hours * 3600)
+        queueStore.requeueFailed(updatedAt: clock.now)
+    }
+
+    func testRepeatedProtonRefusalStopsOnlyAfterRoundsThatCoverThreeDays() async throws {
+        let entry = seedEntry("refused.jpg")
+        uploader.rejectedNames = ["refused.jpg"]
+        let retry = BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 2)
+
+        for round in 1...3 {
+            await parkAndRelaunch(after: 24, retry: retry)
+            XCTAssertEqual(try refusal(of: entry)?.serviceRejection?.rounds, round)
+            XCTAssertEqual(state(of: entry), .discovered, "round \(round) keeps the photo in the queue")
+        }
+        _ = await makeRunner(retry: retry).runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .failedPermanent, "the fourth daily round covers three days")
+        let record = try XCTUnwrap(refusal(of: entry))
+        XCTAssertEqual(record.kind, .remoteService)
+        XCTAssertEqual(record.serviceRejection?.rounds, 4)
+        XCTAssertEqual(record.detail, L10n.string("backup.fail_reason_generic"), "no server text is stored")
+        XCTAssertEqual(uploader.requests.count, 8)
+
+        XCTAssertEqual(queueStore.requeueFailed(updatedAt: clock.now), 0, "the launch re-queue skips a stopped photo")
+        _ = await makeRunner(retry: retry).makeRetryableWorkEligibleNow()
+        _ = await makeRunner(retry: retry).runUntilDrained()
+        XCTAssertEqual(state(of: entry), .failedPermanent, "Back Up Now never retries a stopped photo")
+        XCTAssertEqual(uploader.requests.count, 8)
+    }
+
+    func testAManualRetryOnTheSameDayAddsNoRound() async throws {
+        let entry = seedEntry("refused.jpg")
+        uploader.rejectedNames = ["refused.jpg"]
+        let retry = BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 2)
+
+        for _ in 1...5 {
+            _ = await makeRunner(retry: retry).runUntilDrained()
+            XCTAssertEqual(state(of: entry), .failed)
+            clock.advance(by: 3600)
+            _ = await makeRunner(retry: retry).makeRetryableWorkEligibleNow()
+        }
+
+        XCTAssertEqual(try refusal(of: entry)?.serviceRejection?.rounds, 1)
+        XCTAssertNotEqual(state(of: entry), .failedPermanent)
+    }
+
+    func testAnotherFailureStartsTheRefusalRoundsAgain() async throws {
+        let entry = seedEntry("refused.jpg")
+        uploader.rejectedNames = ["refused.jpg"]
+        let retry = BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 2)
+        await parkAndRelaunch(after: 24, retry: retry)
+        XCTAssertEqual(try refusal(of: entry)?.serviceRejection?.rounds, 1)
+
+        _ = await makeRunner(uploader: MockUploader(failNames: ["refused.jpg"]), retry: retry).runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .failed)
+        XCTAssertNil(try refusal(of: entry)?.serviceRejection, "a different failure is not the same refusal")
+    }
+
+    func testAnotherFailureBeforeParkingRestartsTheRefusalRounds() async throws {
+        let entry = seedEntry("refused.jpg")
+        uploader.rejectedNames = ["refused.jpg"]
+        let retry = BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 2)
+        await parkAndRelaunch(after: 24, retry: retry)
+        XCTAssertEqual(try refusal(of: entry)?.serviceRejection?.rounds, 1)
+        let otherFailure = MockUploader(
+            workDuration: .milliseconds(1), deliverProgress: false, failNames: ["refused.jpg"])
+
+        _ = await makeRunner(uploader: otherFailure, retry: retry).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(otherFailure.requests.count, 1)
+        let between = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(between.state, .discovered, "the other failure has not parked")
+        XCTAssertEqual(between.attempts, 1)
+        XCTAssertNil(BackupIssueRecord.decode(between.lastError)?.serviceRejection)
+
+        clock.advance(by: 1)
+        _ = await makeRunner(retry: retry).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(state(of: entry), .failed)
+        XCTAssertEqual(try refusal(of: entry)?.serviceRejection?.rounds, 1, "the earlier round was reset")
+        XCTAssertEqual(uploader.requests.count, 3, "two refusals in the first round and one after the other failure")
+    }
+
+    func testANewRevisionOfAStoppedPhotoBacksUp() async throws {
+        // The stopped row is the older revision; the resolver reports the edited photo as the current one.
+        var stopped = seedEntry("refused.jpg", state: .failedPermanent, attempts: 2, revisionOffset: -1)
+        stopped.lastError =
+            BackupIssueRecord(
+                kind: .remoteService, detail: L10n.string("backup.fail_reason_generic"),
+                serviceRejection: .init(
+                    rounds: 3, firstRoundAt: clock.now.addingTimeInterval(-72 * 3600), lastRoundAt: clock.now)
+            ).persistedValue
+        queueStore.upsert(stopped)
+        let edited = seedEntry("refused.jpg")
+
+        _ = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(state(of: edited), .completed)
+        XCTAssertNil(state(of: stopped), "the backed-up edit replaces the stopped revision")
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
     func testRetryableServiceFailureDoesNotExhaustItemBudget() async throws {
         let entry = seedEntry("server-flaky.jpg")
         let flakyUploader = MockUploader(

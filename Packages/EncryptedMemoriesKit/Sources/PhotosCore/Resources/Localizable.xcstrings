@@ -1850,7 +1850,7 @@
     },
     "backup.fail_reason_generic": {
       "extractionState": "manual",
-      "comment": "Fallback reason for a failed backup item when no specific error message was stored.",
+      "comment": "Reason for a failed backup item when no specific error message was stored or a Proton refusal deliberately uses generic text.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "The backup did not succeed." } },
         "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung ist nicht gelungen." } }

@@ -9,6 +9,7 @@ extension UploadError: FailureClassifiable {
         case .permissionDenied: .permission
         case .transport: .network
         case .retryableBackend(let code, _): code == 429 ? .rateLimited : .serviceTemporary
+        case .serviceRejected: .protonRestriction
         case .cancelled: .cancelled
         case .accountStorageFull: .accountStorage
         case .tagAdderUnavailable: .localState

@@ -2598,13 +2598,28 @@ public actor BackupSyncRunner {
 
         let attempts = entry.attempts + 1
         let issue = Self.issueKind(for: error)
+        // Proven refusals continue the rounds even when their HTTP status changes; another item failure resets them.
+        let earlierRefusal: BackupServiceRejection? =
+            if case UploadError.serviceRejected = error {
+                BackupIssueRecord.decode(entry.lastError)?.serviceRejection
+            } else {
+                nil
+            }
         if configuration.retry.shouldPark(attempts: attempts) {
+            var record = BackupIssueRecord(kind: issue, detail: message)
+            var parked = UploadBackupSyncQueueState.failed
+            if case UploadError.serviceRejected = error {
+                let refusal = BackupServiceRejection.afterPark(earlierRefusal, at: now())
+                record.serviceRejection = refusal
+                // A stopped photo is final: no re-queue picks it up again, and a new revision is a new row.
+                if refusal.stopsRetrying { parked = .failedPermanent }
+            }
             guard
                 queue.updateState(
                     source: entry.source, revision: entry.revision,
-                    state: .failed,
+                    state: parked,
                     attempts: attempts,
-                    lastError: BackupIssueRecord(kind: issue, detail: message).persistedValue,
+                    lastError: record.persistedValue,
                     updatedAt: now()
                 )
             else {
@@ -2612,14 +2627,14 @@ public actor BackupSyncRunner {
                 return
             }
             clearRemoteIndexExecutionFraction()
-            adjustProgress(from: oldState, to: .failed)
+            adjustProgress(from: oldState, to: parked)
             emitProgress()
         } else {
             let eligibleAt = now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempts))
             persist(
                 entry, from: oldState, to: .discovered, attempts: attempts,
                 lastError: BackupIssueRecord(
-                    kind: issue, detail: message, nextAttemptAt: eligibleAt
+                    kind: issue, detail: message, nextAttemptAt: eligibleAt, serviceRejection: earlierRefusal
                 ).persistedValue,
                 updatedAt: eligibleAt)
         }
@@ -2805,7 +2820,7 @@ public actor BackupSyncRunner {
             return .permission
         case UploadError.transport:
             return .network
-        case UploadError.retryableBackend, UploadError.backend, UploadError.albumStep:
+        case UploadError.retryableBackend, UploadError.backend, UploadError.serviceRejected, UploadError.albumStep:
             return .remoteService
         case UploadError.tagAdderUnavailable:
             return .localState

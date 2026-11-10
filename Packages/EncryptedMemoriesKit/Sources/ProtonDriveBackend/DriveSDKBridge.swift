@@ -3070,9 +3070,9 @@ extension DriveSDKBridge: PhotoUploading {
         return tags.sorted()
     }
 
-    /// Preserve the SDK's typed failure domain at the Core boundary. URL/socket failures retry as
-    /// network problems; HTTP 408/429/5xx retry as temporary service failures; other API responses
-    /// retain Proton's concrete message and follow the ordinary finite item retry policy.
+    /// Preserve the SDK's typed failure domain at the Core boundary. URL/socket failures retry as network problems.
+    /// HTTP 408, 423, 425, 429 and 5xx retry as temporary service failures. A proven API refusal becomes serviceRejected
+    /// without the server text; other API answers keep backend(message).
     nonisolated static func uploadError(from error: Error, filename: String) -> any Error {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         let nsError = error as NSError
@@ -3091,7 +3091,7 @@ extension DriveSDKBridge: PhotoUploading {
             return UploadCore.UploadError.transport(code: NSURLErrorNetworkConnectionLost, message: message)
         }
         if let transport = sdkError.underlyingHTTPNetworkError {
-            if let code = transport.httpCode, code == 408 || code == 429 || (500...599).contains(code) {
+            if let code = transport.httpCode, ProtonFailureClassifier.httpStatus(code) == .temporary {
                 return UploadCore.UploadError.retryableBackend(code: code, message: message)
             }
             switch transport.errorType {
@@ -3104,11 +3104,12 @@ extension DriveSDKBridge: PhotoUploading {
                 )
             }
         }
-        if let api = sdkError.underlyingAPINetworkError,
-            let code = api.httpCode,
-            code == 408 || code == 429 || (500...599).contains(code)
-        {
-            return UploadCore.UploadError.retryableBackend(code: code, message: message)
+        if let code = sdkError.underlyingAPINetworkError?.httpCode {
+            switch ProtonFailureClassifier.httpStatus(code) {
+            case .temporary: return UploadCore.UploadError.retryableBackend(code: code, message: message)
+            case .serviceRejection: return UploadCore.UploadError.serviceRejected(code: code)
+            case .unproven: break
+            }
         }
         return UploadCore.UploadError.backend(message)
     }

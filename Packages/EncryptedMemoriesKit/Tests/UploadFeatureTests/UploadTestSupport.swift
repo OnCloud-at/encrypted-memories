@@ -140,6 +140,13 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
         self.serviceFailures = serviceFailures
     }
 
+    private var _rejectedNames: Set<String> = []
+    /// Names that Proton refuses with HTTP 422 on every upload, until a test removes them.
+    var rejectedNames: Set<String> {
+        get { lock.withLock { _rejectedNames } }
+        set { lock.withLock { _rejectedNames = newValue } }
+    }
+
     private var _remoteCapacityBytes: Int64?
     /// Remaining account storage the capacity check reports; nil means unknown, so every upload proceeds.
     var remoteCapacityBytes: Int64? {
@@ -217,6 +224,7 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
             return count
         }
         if service > 0 { throw UploadError.retryableBackend(code: 503, message: "service unavailable") }
+        if rejectedNames.contains(request.name) { throw UploadError.serviceRejected(code: 422) }
         if failNames.contains(request.name) { throw UploadError.backend("mock failure for \(request.name)") }
         return lock.withLock {
             let earlier = _uploaded.filter { $0.request.name == request.name }.count
