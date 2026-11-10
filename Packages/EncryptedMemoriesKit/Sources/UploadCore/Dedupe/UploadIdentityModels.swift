@@ -749,14 +749,6 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     @discardableResult
     func invalidateRemoteContentIndexBuild(hashKeyEpoch: String) -> Bool
     @discardableResult
-    func replaceRemoteContentIndex(
-        _ records: [UploadRemoteContentIndexRecord],
-        remoteAssetRecords: [UploadRemoteAssetIndexRecord],
-        unresolvedIssues: [UploadRemoteContentIndexIssue],
-        hashKeyEpoch: String,
-        checkpoint: UploadRemoteContentIndexCheckpoint
-    ) -> Bool
-    @discardableResult
     func applyRemoteContentIndexChanges(
         upserting records: [UploadRemoteContentIndexRecord],
         upsertingRemoteAssetRecords: [UploadRemoteAssetIndexRecord],

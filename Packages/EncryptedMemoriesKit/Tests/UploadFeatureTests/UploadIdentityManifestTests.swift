@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import PhotosCore
 import SQLite3
+import UploadTestSupport
 import XCTest
 
 @testable import UploadCore
@@ -559,7 +560,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         do {
             let store = try XCTUnwrap(UploadIdentityManifestStore(url: url))
             XCTAssertTrue(
-                store.replaceRemoteContentIndex(
+                store.seedRemoteContentIndex(
                     records,
                     unresolvedIssues: [],
                     hashKeyEpoch: "epoch-1",
@@ -778,7 +779,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         let store = try makeStore()
         let epoch = "epoch-live-fence"
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [],
                 unresolvedIssues: [],
                 hashKeyEpoch: epoch,
@@ -833,7 +834,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         do {
             let store = try XCTUnwrap(UploadIdentityManifestStore(url: url))
             XCTAssertTrue(
-                store.replaceRemoteContentIndex(
+                store.seedRemoteContentIndex(
                     [],
                     remoteAssetRecords: [proof],
                     unresolvedIssues: [],
@@ -881,7 +882,7 @@ final class UploadIdentityManifestTests: XCTestCase {
             hashKeyEpoch: "epoch-1"
         )
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [], remoteAssetRecords: [proof], unresolvedIssues: [], hashKeyEpoch: "epoch-1",
                 checkpoint: UploadRemoteContentIndexCheckpoint(
                     eventID: "event-100", refreshedAt: Date(timeIntervalSince1970: 1_700_000_100))
@@ -923,7 +924,7 @@ final class UploadIdentityManifestTests: XCTestCase {
             hashKeyEpoch: "epoch-1"
         )
         XCTAssertFalse(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [],
                 remoteAssetRecords: [malformed],
                 unresolvedIssues: [],
@@ -944,7 +945,7 @@ final class UploadIdentityManifestTests: XCTestCase {
             refreshedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [
                     UploadRemoteContentIndexRecord(
                         contentHash: "shared-content",
@@ -1002,7 +1003,7 @@ final class UploadIdentityManifestTests: XCTestCase {
             remoteLinkID: "link-1"
         )
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [original],
                 unresolvedIssues: [],
                 hashKeyEpoch: "epoch-1",
@@ -1040,7 +1041,7 @@ final class UploadIdentityManifestTests: XCTestCase {
             refreshedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [initial],
                 unresolvedIssues: [],
                 hashKeyEpoch: "epoch-1",
@@ -1085,7 +1086,7 @@ final class UploadIdentityManifestTests: XCTestCase {
             refreshedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [],
                 unresolvedIssues: [],
                 hashKeyEpoch: "epoch-1",
@@ -1118,7 +1119,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         do {
             let store = try XCTUnwrap(UploadIdentityManifestStore(url: url))
             XCTAssertTrue(
-                store.replaceRemoteContentIndex(
+                store.seedRemoteContentIndex(
                     [],
                     unresolvedIssues: [
                         remoteIssue("unresolved-link", generation: "event-100", observedAt: firstCheckpoint.refreshedAt)
@@ -1170,7 +1171,7 @@ final class UploadIdentityManifestTests: XCTestCase {
             indexGeneration: "event-1"
         )
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [],
                 unresolvedIssues: [initial],
                 hashKeyEpoch: "epoch-1",

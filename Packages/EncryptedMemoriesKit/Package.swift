@@ -147,6 +147,7 @@ let package = Package(
             name: "ProtonDriveBackendTests",
             dependencies: [
                 "ProtonDriveBackend", "ProtonAuth", "PhotosCore", "AlbumSyncCore", "DeviceRootCore", "UploadCore",
+                "UploadTestSupport",
                 .product(name: "ProtonDriveSDK", package: "ProtonDriveSDK"),
                 .product(name: "ProtonCoreCryptoGoInterface", package: "protoncore_ios"),
                 // Crypto round-trip tests require the implementation injected by the app.
@@ -307,6 +308,8 @@ let package = Package(
             name: "DeviceRootAppleAdapterTests", dependencies: ["DeviceRootAppleAdapter", "DeviceRootCore"]),
         .target(name: "UploadCore", dependencies: ["PhotosCore"]),
         .target(
+            name: "UploadTestSupport", dependencies: ["UploadCore"], path: "Tests/UploadTestSupport"),
+        .target(
             name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore", "DesignSystemCore", "MediaFeedCore"]),
         // PhotoLibraryBackupAdapter is the package boundary for PhotoKit.
         .target(
@@ -318,6 +321,7 @@ let package = Package(
             name: "UploadFeatureTests",
             dependencies: [
                 "UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter", "AlbumSyncCore",
+                "UploadTestSupport",
                 // The Duplicates screenshots render the shared viewer with its merge tools.
                 "PhotoViewerFeature", "MediaCache", "MediaByteCache", "ProtonDriveBackend",
                 .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),

@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import SQLite3
+import UploadTestSupport
 import XCTest
 
 @testable import UploadCore
@@ -180,7 +181,7 @@ final class UploadIdentityManifestBindingFailureTests: XCTestCase {
         let link = String(repeating: "k", count: 1_000)
         let saved = proof(link: link, epoch: "e")
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [UploadRemoteContentIndexRecord(contentHash: "c", hashKeyEpoch: "e", remoteLinkID: link)],
                 remoteAssetRecords: [saved], unresolvedIssues: [], hashKeyEpoch: "e", checkpoint: checkpoint("e1")))
         // The link binds in the content-index and unresolved-link deletes; it fails to bind only in the asset-proof
@@ -203,23 +204,33 @@ final class UploadIdentityManifestBindingFailureTests: XCTestCase {
         try assertBindFailureRecorded()
     }
 
-    /// A rebuild deletes the asset proofs of its epoch before it writes the new ones. When the epoch does not bind in
-    /// that delete, the rebuild must fail: stale proofs must never be reported under the rebuilt checkpoint.
-    func testReplaceIndexWithAnEpochThatDoesNotBindInTheProofDeleteFailsAndKeepsTheOldCheckpoint() throws {
+    /// A full build deletes the asset proofs of its epoch before it writes the new ones. When the epoch does not bind in
+    /// that delete, finishing the build must fail: stale proofs must never be reported under the rebuilt checkpoint.
+    func testRebuildWithAnEpochThatDoesNotBindInTheProofDeleteFailsAndKeepsTheOldCheckpoint() throws {
         let epoch = longLink
         let saved = proof(link: "x", epoch: epoch)
         XCTAssertTrue(
-            store.replaceRemoteContentIndex(
+            store.seedRemoteContentIndex(
                 [], remoteAssetRecords: [saved], unresolvedIssues: [], hashKeyEpoch: epoch, checkpoint: checkpoint("e1")
             ))
-        // The epoch binds in the earlier deletes; it fails to bind from the asset-proof deletes on.
+        // The next full build starts and stages its rows while the epoch still binds.
+        let build = try XCTUnwrap(
+            store.beginRemoteContentIndexBuild(
+                hashKeyEpoch: epoch, eventID: "e2", sourceFingerprint: "source", total: 0,
+                updatedAt: Date(timeIntervalSince1970: 2)))
+        XCTAssertTrue(
+            store.appendRemoteContentIndexBuild(
+                records: [], unresolvedIssues: [], externalIdentities: [], hashKeyEpoch: epoch, buildID: build.buildID,
+                nextCursor: 0, updatedAt: Date(timeIntervalSince1970: 2)))
+        // In the finish, the epoch binds in the content-index statements; it fails to bind from the asset-proof deletes
+        // on, which follow the delete of the resolved unresolved-link rows.
         let fault = BindFailureUntilStep(
             on: try connection(), statement: "DELETE FROM remote_asset_index_link WHERE key_epoch=?;",
-            after: "DELETE FROM remote_content_build_checkpoint WHERE key_epoch=?;", limit: Self.limit)
+            after: "DELETE FROM remote_content_unresolved", limit: Self.limit)
         defer { fault.remove() }
         XCTAssertFalse(
-            store.replaceRemoteContentIndex(
-                [], remoteAssetRecords: [], unresolvedIssues: [], hashKeyEpoch: epoch, checkpoint: checkpoint("e2")),
+            store.finishRemoteContentIndexBuild(
+                remoteAssetRecords: [], hashKeyEpoch: epoch, buildID: build.buildID, checkpoint: checkpoint("e2")),
             "An epoch that does not bind must fail the rebuild")
         XCTAssertTrue(fault.lowered, "The fault reached the asset-proof delete")
         XCTAssertFalse(fault.stepped, "A delete whose bind failed must not run")
