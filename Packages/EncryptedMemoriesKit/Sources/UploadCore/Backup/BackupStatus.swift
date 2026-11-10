@@ -1,9 +1,8 @@
 import Foundation
 import PhotosCore
 
-/// Normalized execution units for OS/runtime progress surfaces. The user-facing backed-up count
-/// remains separate; these units may also include deliberately-settled rows and fractional active
-/// transfers so a long video proves liveness before the whole compound becomes terminal.
+/// Progress in units for an OS progress surface, such as the system card of the continued backup task and the catalog
+/// scan. It is never shown as a backed-up count.
 public struct BackupExecutionProgress: Sendable, Equatable {
     public let completedUnitCount: Int64
     public let totalUnitCount: Int64
