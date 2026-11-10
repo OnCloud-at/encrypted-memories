@@ -24,9 +24,10 @@ final class MobileContinuedBackupPromptUITests: XCTestCase {
         launch(language: "en", locale: "en_US")
         let question = app.alerts["Keep backing up in the background?"]
         XCTAssertTrue(question.waitForExistence(timeout: 60), "a large backup does not ask")
-        XCTAssertTrue(question.staticTexts[
-            "Many photos are still waiting. The backup can continue while you use other apps."
-        ].exists)
+        XCTAssertTrue(
+            question.staticTexts[
+                "Many photos are still waiting. The backup can continue while you use other apps."
+            ].exists)
 
         question.buttons["Not Now"].tap()
 
