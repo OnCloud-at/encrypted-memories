@@ -1440,7 +1440,7 @@ public final class LibrarySourceGraph {
         return firstByUID.values.sorted(by: sourceItemPrecedes)
     }
 
-    private static func sourceItemPrecedes(_ lhs: LibrarySourceItem, _ rhs: LibrarySourceItem) -> Bool {
+    static func sourceItemPrecedes(_ lhs: LibrarySourceItem, _ rhs: LibrarySourceItem) -> Bool {
         let lhsHasTime = lhs.knownFields.contains(.captureTime)
         let rhsHasTime = rhs.knownFields.contains(.captureTime)
         if lhsHasTime != rhsHasTime { return lhsHasTime }
@@ -1528,7 +1528,7 @@ public final class LibrarySourceGraph {
         return sourceIDPrecedes(lhs.id, rhs.id)
     }
 
-    private static func sourceIDPrecedes(_ lhs: SourceID, _ rhs: SourceID) -> Bool {
+    static func sourceIDPrecedes(_ lhs: SourceID, _ rhs: SourceID) -> Bool {
         lhs.rawValue.utf8.lexicographicallyPrecedes(rhs.rawValue.utf8)
     }
 }
