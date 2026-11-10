@@ -34,17 +34,6 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
         store = try XCTUnwrap(PendingBackupManifestStore(url: url))
     }
 
-    private final class BindingRefusal {
-        let action: Int32
-        var hit = false
-        init(_ action: Int32) { self.action = action }
-    }
-
-    private func connection() throws -> SQLiteStoreConnection {
-        try XCTUnwrap(
-            Mirror(reflecting: store!).children.first { $0.label == "connection" }?.value as? SQLiteStoreConnection)
-    }
-
     func testQueueCompletionKeepsItsIndependentRemoteOperationBinding() throws {
         let excluded = try exclude(first)
         XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [excluded]), [key])
@@ -52,7 +41,7 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
         let current = try XCTUnwrap(store.sourceState(for: key))
         XCTAssertFalse(current.needsQueueSync)
         XCTAssertEqual(current.remoteOperation, .remoteTrash)
-        let connection = try connection()
+        let connection = try storeConnection(store!)
         connection.withLock {
             var stmt: OpaquePointer?
             XCTAssertEqual(
@@ -145,20 +134,18 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
 
     func testRefusedOperationBindingRollsBackTheDispatchMarker() throws {
         let current = try exclude(first)
-        let connection = try connection()
-        connection.withLock {
-            sqlite3_set_authorizer(
-                connection.database,
-                { _, action, name, _, _, _ in
-                    action == SQLITE_INSERT && name.map { String(cString: $0) } == "remote_operation"
-                        ? SQLITE_DENY : SQLITE_OK
-                }, nil)
-        }
-        defer { connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) } }
+        try withSQLiteAuthorization(
+            in: store!,
+            authorizing: { action, table, _ in
+                action == SQLITE_INSERT && table == "remote_operation" ? SQLITE_DENY : SQLITE_OK
+            },
+            {
+                XCTAssertNil(store.beginRemoteOperation(.remoteTrash, for: [current]))
 
-        XCTAssertNil(store.beginRemoteOperation(.remoteTrash, for: [current]))
-
-        XCTAssertNil(store.sourceState(for: key)?.remoteOperation, "an unbound operation must never be dispatched")
+                XCTAssertNil(
+                    store.sourceState(for: key)?.remoteOperation, "an unbound operation must never be dispatched")
+            }
+        )
     }
 
     func testUnreadableOrMalformedBindingNeverAuthorizesACompletion() throws {
@@ -170,7 +157,7 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
             let current = try exclude(first)
             XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [current]), [key])
             let before = try XCTUnwrap(store.sourceState(for: key))
-            let connection = try connection()
+            let connection = try storeConnection(store!)
             connection.withLock {
                 XCTAssertEqual(
                     sqlite3_exec(connection.database, "UPDATE remote_operation SET \(assignment);", nil, nil, nil),
@@ -191,28 +178,24 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
             let current = try exclude(first)
             XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [current]), [key])
             let before = try XCTUnwrap(store.sourceState(for: key))
-            let connection = try connection()
-            let fault = BindingRefusal(action)
-            let context = Unmanaged.passRetained(fault)
-            defer { context.release() }
-            connection.withLock {
-                sqlite3_set_authorizer(
-                    connection.database,
-                    { context, action, name, _, _, _ in
-                        let fault = Unmanaged<BindingRefusal>.fromOpaque(context!).takeUnretainedValue()
-                        if !fault.hit, action == fault.action, name.map({ String(cString: $0) }) == "remote_operation" {
-                            fault.hit = true
-                            return SQLITE_DENY
-                        }
-                        return SQLITE_OK
-                    }, context.toOpaque())
-            }
-            let result = store.completeEffect(
-                .remoteTrash, for: key, generation: current.generation, remoteLinkID: first.nodeID, at: date)
-            connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) }
+            var hit = false
+            try withSQLiteAuthorization(
+                in: store!,
+                authorizing: { operation, table, _ in
+                    if !hit, operation == action, table == "remote_operation" {
+                        hit = true
+                        return SQLITE_DENY
+                    }
+                    return SQLITE_OK
+                },
+                {
+                    let result = store.completeEffect(
+                        .remoteTrash, for: key, generation: current.generation, remoteLinkID: first.nodeID, at: date)
+                    XCTAssertFalse(result)
+                }
+            )
 
-            XCTAssertTrue(fault.hit)
-            XCTAssertFalse(result)
+            XCTAssertTrue(hit)
             XCTAssertEqual(store.sourceState(for: key), before)
             try reopen()
         }
@@ -229,7 +212,7 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
         let current = try exclude(first)
         XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [current]), [key])
         let before = try XCTUnwrap(store.sourceState(for: key))
-        let connection = try connection()
+        let connection = try storeConnection(store!)
         let fault = BindingStepFault(try XCTUnwrap(connection.database))
         let context = Unmanaged.passRetained(fault)
         connection.withLock {
@@ -269,18 +252,16 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
         let excluded = try exclude(first)
         XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: [excluded]), [key])
         let included = try XCTUnwrap(store.include([key], at: date)?.first)
-        let connection = try connection()
-        connection.withLock {
-            sqlite3_set_authorizer(
-                connection.database,
-                { _, action, name, _, _, _ in
-                    action == SQLITE_DELETE && name.map { String(cString: $0) } == "remote_operation"
-                        ? SQLITE_DENY : SQLITE_OK
-                }, nil)
-        }
-        let result = store.finishRestoreRecheck(included, outcome: .completed, at: date)
-        connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) }
-        XCTAssertFalse(result)
+        try withSQLiteAuthorization(
+            in: store!,
+            authorizing: { action, table, _ in
+                action == SQLITE_DELETE && table == "remote_operation" ? SQLITE_DENY : SQLITE_OK
+            },
+            {
+                let result = store.finishRestoreRecheck(included, outcome: .completed, at: date)
+                XCTAssertFalse(result)
+            }
+        )
         XCTAssertEqual(store.sourceState(for: key), included)
     }
 
@@ -292,7 +273,7 @@ final class PendingRemoteOperationOwnershipTests: XCTestCase {
         XCTAssertTrue(store.finishRestoreRecheck(included, outcome: .completed, at: date))
 
         XCTAssertNil(store.sourceState(for: key)?.remoteOperation)
-        let connection = try connection()
+        let connection = try storeConnection(store!)
         connection.withLock {
             var stmt: OpaquePointer?
             XCTAssertEqual(

@@ -67,26 +67,24 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
         let expected = try XCTUnwrap(store.currentLock())
         let authorization = SelectAuthorization()
-        connection.withLock { authorization.install(on: connection.database) }
-        defer { connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) } }
-
-        XCTAssertNil(store.currentLock())
-        XCTAssertGreaterThan(authorization.deniedSelects, 0)
-        connection.withLock {
-            XCTAssertEqual(
-                sqlite3_exec(
-                    connection.database,
-                    """
-                    INSERT INTO backup_execution_lock(lock_name, owner, run_id, acquired_at, heartbeat_at)
-                    VALUES('authorizer-control', 'manual', 'control', 0, 0)
-                    ON CONFLICT(lock_name) DO UPDATE SET run_id=excluded.run_id;
-                    """, nil, nil, nil), SQLITE_OK)
-            XCTAssertFalse(connection.operationFailed)
+        try withSQLiteAuthorization(in: store, authorizing: authorization.authorize) {
+            XCTAssertNil(store.currentLock())
+            XCTAssertGreaterThan(authorization.deniedSelects, 0)
+            connection.withLock {
+                XCTAssertEqual(
+                    sqlite3_exec(
+                        connection.database,
+                        """
+                        INSERT INTO backup_execution_lock(lock_name, owner, run_id, acquired_at, heartbeat_at)
+                        VALUES('authorizer-control', 'manual', 'control', 0, 0)
+                        ON CONFLICT(lock_name) DO UPDATE SET run_id=excluded.run_id;
+                        """, nil, nil, nil), SQLITE_OK)
+                XCTAssertFalse(connection.operationFailed)
+            }
+            XCTAssertGreaterThan(authorization.allowedInserts, 0)
+            XCTAssertGreaterThan(authorization.allowedUpdates, 0)
+            XCTAssertGreaterThan(authorization.allowedReads, 0)
         }
-        XCTAssertGreaterThan(authorization.allowedInserts, 0)
-        XCTAssertGreaterThan(authorization.allowedUpdates, 0)
-        XCTAssertGreaterThan(authorization.allowedReads, 0)
-        connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) }
         XCTAssertEqual(store.currentLock(), expected)
     }
 
@@ -113,37 +111,32 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         connection.withLock { XCTAssertNil(sqlite3_next_stmt(connection.database, nil)) }
         let authorization = SelectAuthorization()
         let interruption = SelectInterruption()
-        connection.withLock {
-            if duringPrepare {
-                authorization.install(on: connection.database)
-            } else {
-                interruption.install(on: connection.database)
-            }
-        }
-        defer {
+        let assertFailedRead = { [self] in
+            XCTAssertEqual(
+                store.acquire(owner: .manual, runID: "contender"), .unavailable,
+                "an unreadable lock must not admit a new owner")
+            XCTAssertGreaterThan(duringPrepare ? authorization.deniedSelects : interruption.interruptedSelects, 0)
+            XCTAssertEqual(
+                store.heartbeat(runID: "owner", phase: "changed"), .unavailable, "an unreadable lock is not a lost lock"
+            )
+            XCTAssertTrue(store.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(1)).isEmpty)
+            XCTAssertTrue(
+                store.recoverAbandonedProcessLocks(
+                    currentProcessContext: "ios/pid-456", isProcessAlive: { _ in false }
+                ).isEmpty)
             connection.withLock {
-                sqlite3_set_authorizer(connection.database, nil, nil)
-                sqlite3_trace_v2(connection.database, 0, nil, nil)
+                XCTAssertNil(sqlite3_next_stmt(connection.database, nil))
+                XCTAssertEqual(
+                    sqlite3_get_autocommit(connection.database), 1, "a failed read must release the transaction")
+                XCTAssertFalse(connection.operationFailed, "the failure is local to the read")
             }
         }
-
-        XCTAssertEqual(
-            store.acquire(owner: .manual, runID: "contender"), .unavailable,
-            "an unreadable lock must not admit a new owner")
-        XCTAssertGreaterThan(duringPrepare ? authorization.deniedSelects : interruption.interruptedSelects, 0)
-        XCTAssertEqual(
-            store.heartbeat(runID: "owner", phase: "changed"), .unavailable, "an unreadable lock is not a lost lock")
-        XCTAssertTrue(store.recoverStaleLocks(olderThan: clock.now.addingTimeInterval(1)).isEmpty)
-        XCTAssertTrue(
-            store.recoverAbandonedProcessLocks(
-                currentProcessContext: "ios/pid-456", isProcessAlive: { _ in false }
-            ).isEmpty)
-        connection.withLock {
-            XCTAssertNil(sqlite3_next_stmt(connection.database, nil))
-            XCTAssertEqual(sqlite3_get_autocommit(connection.database), 1, "a failed read must release the transaction")
-            XCTAssertFalse(connection.operationFailed, "the failure is local to the read")
-            sqlite3_set_authorizer(connection.database, nil, nil)
-            sqlite3_trace_v2(connection.database, 0, nil, nil)
+        if duringPrepare {
+            try withSQLiteAuthorization(in: store, authorizing: authorization.authorize, assertFailedRead)
+        } else {
+            connection.withLock { interruption.install(on: connection.database) }
+            defer { connection.withLock { sqlite3_trace_v2(connection.database, 0, nil, nil) } }
+            assertFailedRead()
         }
         XCTAssertEqual(store.currentLock(), expected, "a failed read must preserve every existing owner field")
         XCTAssertEqual(store.acquire(owner: .manual, runID: "contender"), .busy(expected))
@@ -178,12 +171,11 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
         let acquired = try XCTUnwrap(store.currentLock())
         let authorization = SelectAuthorization()
-        connection.withLock { authorization.install(on: connection.database) }
-
-        clock.advance(by: 30)
-        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable)
-        XCTAssertGreaterThan(authorization.deniedSelects, 0)
-        connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) }
+        try withSQLiteAuthorization(in: store, authorizing: authorization.authorize) {
+            clock.advance(by: 30)
+            XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable)
+            XCTAssertGreaterThan(authorization.deniedSelects, 0)
+        }
         XCTAssertEqual(store.currentLock(), acquired, "a failed read changes nothing")
 
         clock.advance(by: 30)
@@ -220,15 +212,14 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         defer { store.close() }
         XCTAssertTrue(store.acquire(owner: .foreground, runID: "owner").didAcquire)
         let acquired = try XCTUnwrap(store.currentLock())
-        connection.withLock {
-            sqlite3_set_authorizer(
-                connection.database, { _, action, _, _, _, _ in action == SQLITE_UPDATE ? SQLITE_DENY : SQLITE_OK },
-                nil)
-        }
-
-        clock.advance(by: 30)
-        XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable)
-        connection.withLock { sqlite3_set_authorizer(connection.database, nil, nil) }
+        try withSQLiteAuthorization(
+            in: store,
+            authorizing: { action, _, _ in action == SQLITE_UPDATE ? SQLITE_DENY : SQLITE_OK },
+            {
+                clock.advance(by: 30)
+                XCTAssertEqual(store.heartbeat(runID: "owner", phase: nil), .unavailable)
+            }
+        )
         XCTAssertEqual(store.currentLock(), acquired)
 
         clock.advance(by: 30)
@@ -685,24 +676,17 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         private(set) var allowedUpdates = 0
         private(set) var allowedReads = 0
 
-        func install(on handle: OpaquePointer?) {
-            XCTAssertEqual(
-                sqlite3_set_authorizer(
-                    handle,
-                    { context, action, _, _, _, _ in
-                        guard let context else { return SQLITE_DENY }
-                        let authorization = Unmanaged<SelectAuthorization>.fromOpaque(context).takeUnretainedValue()
-                        switch action {
-                        case SQLITE_SELECT:
-                            authorization.deniedSelects += 1
-                            return SQLITE_DENY
-                        case SQLITE_INSERT: authorization.allowedInserts += 1
-                        case SQLITE_UPDATE: authorization.allowedUpdates += 1
-                        case SQLITE_READ: authorization.allowedReads += 1
-                        default: break
-                        }
-                        return SQLITE_OK
-                    }, Unmanaged.passUnretained(self).toOpaque()), SQLITE_OK)
+        func authorize(_ action: Int32, _: String?, _: String?) -> Int32 {
+            switch action {
+            case SQLITE_SELECT:
+                deniedSelects += 1
+                return SQLITE_DENY
+            case SQLITE_INSERT: allowedInserts += 1
+            case SQLITE_UPDATE: allowedUpdates += 1
+            case SQLITE_READ: allowedReads += 1
+            default: break
+            }
+            return SQLITE_OK
         }
     }
 
