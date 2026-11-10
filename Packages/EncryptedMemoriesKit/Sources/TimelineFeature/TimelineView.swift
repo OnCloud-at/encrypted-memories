@@ -179,9 +179,7 @@ public struct TimelineView: View {
                     }
 
                     if isSearchResultPending {
-                        LoadingMark()
-                            .frame(width: 64, height: 64)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        GridLoadingMark()
                             .padding(.leading, leadingInset)
                             .background(timelineSurfaceBackground)
                             .transition(.opacity)
