@@ -27,16 +27,16 @@ extension DriveSessionStubSuite {
                 do {
                     let clock = ContinuousClock()
                     let deadline = clock.now + .seconds(10)
-                    while !SecondMetadataPageGate.isWaiting, clock.now < deadline {
+                    while !HeldRequestGate.isHolding, clock.now < deadline {
                         try await Task.sleep(for: .milliseconds(10))
                     }
-                    if !SecondMetadataPageGate.isWaiting {
+                    if !HeldRequestGate.isHolding {
                         print("SETUP: load failure=\(String(describing: observations.snapshot().failure))")
                         let paths = StubURLProtocol.requests().map { $0.method + " " + $0.path }
                         print("SETUP: requests=\(paths)")
                     }
                     try #require(
-                        SecondMetadataPageGate.isWaiting,
+                        HeldRequestGate.isHolding,
                         "SETUP: the real bridge must reach the held second metadata request")
                     let expected = Set((0..<500).map { PhotoUID(volumeID: "vol1", nodeID: "photo-\($0)") })
                     let beforeCompletion = observations.snapshot()
@@ -51,7 +51,7 @@ extension DriveSessionStubSuite {
                     #expect(requests.allSatisfy { $0.method == "GET" }, "A provisional page performs no remote write")
                     #expect(!requests.contains { $0.path.contains("/trash") }, "No page-driven trash reconciliation")
 
-                    SecondMetadataPageGate.release()
+                    Self.releaseSecondPage()
                     let completed = try await load.value
                     let finalUIDs = Set(completed.sections.flatMap(\.items).map(\.uid))
                     #expect(finalUIDs == expected.union([PhotoUID(volumeID: "vol1", nodeID: "last")]))
@@ -63,7 +63,7 @@ extension DriveSessionStubSuite {
                             == TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-1"))
                 } catch {
                     load.cancel()
-                    SecondMetadataPageGate.release()
+                    Self.releaseSecondPage()
                     await bridge.shutdown()
                     _ = await load.result
                     throw error
@@ -77,10 +77,10 @@ extension DriveSessionStubSuite {
                 let secondState = ProvisionalObservations()
                 let first = observedLoad(bridge, state: firstState)
                 defer { first.cancel() }
-                try #require(await eventually { SecondMetadataPageGate.isWaiting })
+                try #require(await eventually(timeout: .seconds(10)) { HeldRequestGate.isHolding })
                 let second = observedLoad(bridge, state: secondState)
                 defer { second.cancel() }
-                try #require(await eventually { secondState.snapshot().pageCounts.last == 500 })
+                try #require(await eventually(timeout: .seconds(10)) { secondState.snapshot().pageCounts.last == 500 })
                 #expect(firstState.snapshot().pages.last == secondState.snapshot().pages.last)
                 #expect(StubURLProtocol.requests().filter { $0.path.contains("/photos?") }.count == 1)
                 first.cancel()
@@ -88,10 +88,10 @@ extension DriveSessionStubSuite {
                     await eventually(timeout: .seconds(1)) { firstState.snapshot().failure != nil },
                     "Cancellation must end this observer's wait before the other caller releases page two")
                 #expect(!secondState.snapshot().completed)
-                #expect(SecondMetadataPageGate.isWaiting, "The other caller still owns the listing")
+                #expect(HeldRequestGate.isHolding, "The other caller still owns the listing")
                 #expect(try store.load() == [old])
                 #expect(store.validationToken() == oldToken)
-                SecondMetadataPageGate.release()
+                Self.releaseSecondPage()
                 await #expect(throws: CancellationError.self) { try await first.value }
                 let completed = try await second.value
                 #expect(completed.sections.flatMap(\.items).count == 501)
@@ -105,9 +105,9 @@ extension DriveSessionStubSuite {
                 let failedState = ProvisionalObservations()
                 let failed = observedLoad(bridge, state: failedState)
                 defer { failed.cancel() }
-                try #require(await eventually { SecondMetadataPageGate.isWaiting })
-                try #require(await eventually { failedState.snapshot().pageCounts.last == 500 })
-                SecondMetadataPageGate.release(status: 403)
+                try #require(await eventually(timeout: .seconds(10)) { HeldRequestGate.isHolding })
+                try #require(await eventually(timeout: .seconds(10)) { failedState.snapshot().pageCounts.last == 500 })
+                Self.releaseSecondPage(status: 403)
                 await #expect(throws: (any Error).self) { try await failed.value }
                 #expect(!failedState.snapshot().completed)
                 #expect(try store.load() == [old])
@@ -118,12 +118,12 @@ extension DriveSessionStubSuite {
                 let nextState = ProvisionalObservations()
                 let next = observedLoad(bridge, state: nextState)
                 defer { next.cancel() }
-                try #require(await eventually { SecondMetadataPageGate.isWaiting })
+                try #require(await eventually(timeout: .seconds(10)) { HeldRequestGate.isHolding })
                 let expected = Set((0..<500).map { PhotoUID(volumeID: "vol1", nodeID: "new-\($0)") })
-                try #require(await eventually { nextState.snapshot().pages.last == expected })
+                try #require(await eventually(timeout: .seconds(10)) { nextState.snapshot().pages.last == expected })
                 #expect(nextState.snapshot().pages.allSatisfy { $0 == expected }, "No projection from the failed load")
                 #expect(store.validationToken() == oldToken)
-                SecondMetadataPageGate.release()
+                Self.releaseSecondPage()
                 let completed = try await next.value
                 #expect(
                     Set(completed.sections.flatMap(\.items).map(\.uid))
@@ -153,12 +153,12 @@ extension DriveSessionStubSuite {
                 defer { load.cancel() }
                 var shutdown: Task<Void, Never>?
                 do {
-                    try #require(await eventually { await callback.hasEntered() })
+                    try #require(await eventually(timeout: .seconds(10)) { await callback.hasEntered() })
                     shutdown = Task {
                         await bridge.shutdown()
                         closed.finished()
                     }
-                    try #require(await eventually { state.snapshot().wasCancelled })
+                    try #require(await eventually(timeout: .seconds(10)) { state.snapshot().wasCancelled })
                     #expect(!closed.snapshot().completed, "Shutdown must join the held observer before store closure")
                     await callback.release()
                     await shutdown?.value
@@ -185,15 +185,21 @@ extension DriveSessionStubSuite {
                 #expect(state.snapshot().pageCounts == [10])
                 #expect(Set(completed.sections.flatMap(\.items).map(\.uid)) == expected)
                 #expect(try store.load().count == 10)
-                #expect(!SecondMetadataPageGate.isWaiting)
+                #expect(!HeldRequestGate.isHolding)
             }
         }
 
         private func metadataResponse(prefix: String = "photo", count: Int = 500) -> String {
-            let page = (0..<count).map {
-                #"{"LinkID":"\#(prefix)-\#($0)","CaptureTime":\#($0 + 10),"Tags":[],"RelatedPhotos":[]}"#
-            }.joined(separator: ",")
-            return #"{"Code":1000,"Photos":[\#(page)]}"#
+            StubbedLibrary.listingBody((0..<count).map { "\(prefix)-\($0)" })
+        }
+
+        /// Answers the held second Photos page: one more photo, or the failure `status`.
+        private static func releaseSecondPage(status: Int = 200) {
+            HeldRequestGate.release(
+                status: status,
+                body: status == 200
+                    ? #"{"Code":1000,"Photos":[{"LinkID":"last","CaptureTime":1000,"Tags":[],"RelatedPhotos":[]}]}"#
+                    : #"{"Code":\#(status)}"#)
         }
 
         private func observedLoad(
@@ -211,65 +217,37 @@ extension DriveSessionStubSuite {
             }
         }
 
-        private func eventually(timeout: Duration = .seconds(10), _ condition: () async -> Bool) async -> Bool {
-            let clock = ContinuousClock()
-            let deadline = clock.now + timeout
-            while !(await condition()), clock.now < deadline {
-                do { try await Task.sleep(for: .milliseconds(10)) } catch { return false }
-            }
-            return await condition()
-        }
-
         private func withFixture(
             _ body: (DriveSDKBridge, TimelineMetadataStore, PhotoItem, String) async throws -> Void
         ) async throws {
             StubURLProtocol.reset()
-            SecondMetadataPageGate.reset()
-            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
-            let old = PhotoItem(
-                uid: PhotoUID(volumeID: "vol1", nodeID: "old"),
-                captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg")
-            let oldToken = TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-0")
-            #expect(store.save([old], validationToken: oldToken).succeeded)
-            StubURLProtocol.route(
-                "GET /drive/shares",
-                json: #"{"Code":1000,"Shares":[{"ShareID":"share1","VolumeID":"vol1","LinkID":"root","State":1}]}"#)
-            StubURLProtocol.route(
-                "GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"event-1"}"#)
-            for cursor in ["event-0", "event-1"] {
-                StubURLProtocol.route(
-                    "GET /drive/volumes/vol1/events/\(cursor)",
-                    json: #"{"Code":1000,"EventID":"event-1","More":0,"Refresh":0,"Events":[]}"#)
-                StubURLProtocol.route(
-                    "GET /drive/v2/volumes/vol1/events/\(cursor)",
-                    json: #"{"Code":1000,"EventID":"event-1","More":false,"Refresh":false,"Events":[]}"#)
+            HeldRequestGate.reset()
+            HeldRequestGate.hold {
+                $0.url?.path == "/drive/volumes/vol1/photos"
+                    && $0.url?.query?.contains("PreviousPageLastLinkID=") == true
             }
-            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: metadataResponse())
-            let bridge = try await makeBridge(directory: directory, store: store)
-            do {
-                try await body(bridge, store, old, oldToken)
-            } catch {
-                SecondMetadataPageGate.release()
+            try await StubbedLibrary.withStore { directory, store in
+                let old = PhotoItem(
+                    uid: PhotoUID(volumeID: "vol1", nodeID: "old"),
+                    captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg")
+                let oldToken = TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-0")
+                #expect(store.save([old], validationToken: oldToken).succeeded)
+                StubbedLibrary.routeShare()
+                StubbedLibrary.routeEvents(from: 0)
+                StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: metadataResponse())
+                let (bridge, _) = try await StubbedLibrary.makeBridge(
+                    directory: directory, store: store, uid: "page-fixture",
+                    protocols: [HeldRequestGate.self, StubURLProtocol.self])
+                do {
+                    try await body(bridge, store, old, oldToken)
+                } catch {
+                    Self.releaseSecondPage()
+                    await bridge.shutdown()
+                    throw error
+                }
+                Self.releaseSecondPage()
                 await bridge.shutdown()
-                throw error
             }
-            SecondMetadataPageGate.release()
-            await bridge.shutdown()
-        }
-
-        private func makeBridge(directory: URL, store: TimelineMetadataStore) async throws -> DriveSDKBridge {
-            let governor = ProtonRequestGovernor()
-            let protocols: [AnyClass] = [SecondMetadataPageGate.self, StubURLProtocol.self]
-            let session = DriveSession(
-                session: ProtonSession(uid: "page-fixture", accessToken: "", refreshToken: "", keyPassword: ""),
-                store: SessionKeychainStore(service: "at.oncloud.encryptedmemories.tests.never-used"),
-                accountCacheDirectory: directory, requestGovernor: governor, urlProtocolClasses: protocols)
-            return try await .testBridge(
-                directory: directory, session: session, governor: governor, protocols: protocols,
-                timelineStore: store, startsFirstBuild: true)
         }
     }
 }
@@ -299,44 +277,6 @@ private final class ProvisionalObservations: @unchecked Sendable {
     func recordStoreRead(_ safe: Bool) { lock.withLock { value.storeReadWasSafe = safe } }
     func cancelled() { lock.withLock { value.wasCancelled = true } }
     func snapshot() -> Snapshot { lock.withLock { value } }
-}
-
-/// Holds only the second Photos request; every other request uses the existing recording HTTP fixture.
-private final class SecondMetadataPageGate: URLProtocol {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var waiting: SecondMetadataPageGate?
-
-    static var isWaiting: Bool { lock.withLock { waiting != nil } }
-    static func reset() { lock.withLock { waiting = nil } }
-
-    override class func canInit(with request: URLRequest) -> Bool {
-        request.url?.path == "/drive/volumes/vol1/photos"
-            && request.url?.query?.contains("PreviousPageLastLinkID=") == true
-    }
-
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func startLoading() { Self.lock.withLock { Self.waiting = self } }
-    override func stopLoading() {
-        Self.lock.withLock { if Self.waiting === self { Self.waiting = nil } }
-    }
-
-    static func release(status: Int = 200) {
-        let pending = lock.withLock { () -> SecondMetadataPageGate? in
-            defer { waiting = nil }
-            return waiting
-        }
-        guard let pending, let url = pending.request.url else { return }
-        let response = HTTPURLResponse(
-            url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-        pending.client?.urlProtocol(pending, didReceive: response, cacheStoragePolicy: .notAllowed)
-        pending.client?.urlProtocol(
-            pending,
-            didLoad: Data(
-                (status == 200
-                    ? #"{"Code":1000,"Photos":[{"LinkID":"last","CaptureTime":1000,"Tags":[],"RelatedPhotos":[]}]}"#
-                    : #"{"Code":\#(status)}"#).utf8))
-        pending.client?.urlProtocolDidFinishLoading(pending)
-    }
 }
 
 private actor ProvisionalCallbackHold {
