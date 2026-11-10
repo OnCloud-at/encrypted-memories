@@ -317,6 +317,74 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         }
     }
 
+    func testQueueSpyDecisionReadsKeepAnUnknownResultUnknown() throws {
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("spy.sqlite")))
+        defer { store.close() }
+        let spy = SpyQueueStore(inner: store, log: BackupEventLog(), failsRunnableDateRead: true)
+        XCTAssertNil(spy.nextRunnableDate())
+        XCTAssertFalse(spy.isOperational())
+        XCTAssertThrowsError(try spy.decisionNextRunnableDate(excludingSourcesOf: []))
+        XCTAssertThrowsError(try spy.decisionEarliestEntry(in: .discovered))
+        XCTAssertThrowsError(try spy.decisionEntries(in: .discovered, updatedBefore: .distantFuture, limit: 1))
+        XCTAssertThrowsError(try spy.decisionRuntimeIssue(for: .remoteIndexPreparation))
+    }
+
+    func testTestQueueDefaultsKeepUnknownTokensAndIsolatedRuntimeIssues() throws {
+        let inner = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("defaults.sqlite")))
+        defer { inner.close() }
+        let issue = BackupIssueRecord(kind: .remoteService, detail: "kept")
+        XCTAssertTrue(inner.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+        XCTAssertNotNil(inner.changeToken())
+        let log = BackupEventLog()
+        let stores: [any UploadBackupSyncQueueStore] = [
+            SpyQueueStore(inner: inner, log: log),
+            ReenqueueOnFirstRetryQueueStore(inner: inner, now: { Date(timeIntervalSince1970: 2_000) }),
+        ]
+        for queue in stores {
+            XCTAssertNil(queue.changeToken(), "test stores without a token must always refresh")
+            XCTAssertNil(queue.restoredCompoundReopener, "the test wrapper does not supply atomic restore")
+            XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation))
+            XCTAssertNil(try queue.decisionRuntimeIssue(for: .remoteIndexPreparation))
+            XCTAssertTrue(queue.setRuntimeIssue(nil, for: .remoteIndexPreparation))
+            XCTAssertEqual(
+                inner.runtimeIssue(for: .remoteIndexPreparation), issue, "the test default does not write through")
+        }
+        XCTAssertTrue(log.events.isEmpty)
+    }
+
+    func testGenericReceiptReadRefusesUnknownBeforeReadingStateSlices() throws {
+        let inner = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("receipt-before.sqlite")))
+        defer { inner.close() }
+        let spy = SpyQueueStore(inner: inner, log: BackupEventLog(), failsRunnableDateRead: true)
+        XCTAssertNil(spy.nextRunnableDate())
+        let reads = try SQLiteStatementFaults(in: inner, fails: false) { $0.contains("WHERE state =") }
+        defer { reads.stop() }
+        XCTAssertThrowsError(try spy.entriesWithRemoteCommitReconciliation(limit: 1)) {
+            XCTAssertEqual($0 as? UploadRemoteCommitRecoveryError, .storeUnavailable)
+        }
+        XCTAssertEqual(reads.matchedCount, 0, "an already unknown wrapper starts no state slice")
+    }
+
+    func testGenericReceiptReadRefusesAReadThatBecomesUnknown() throws {
+        let inner = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("receipt-after.sqlite")))
+        defer { inner.close() }
+        let spy = SpyQueueStore(inner: inner, log: BackupEventLog(), failsRunnableDateRead: true)
+        XCTAssertTrue(spy.isOperational())
+        // This branch only takes the spy's lock, so the SQL callback never re-enters its connection.
+        let fault = try SQLiteReadInterrupt(
+            in: inner, matching: "WHERE state = ? AND updated_at < ?",
+            onFire: { _ = spy.nextRunnableDate() })
+        defer { fault.stop() }
+        XCTAssertThrowsError(try spy.entriesWithRemoteCommitReconciliation(limit: 1)) {
+            XCTAssertEqual($0 as? UploadRemoteCommitRecoveryError, .storeUnavailable)
+        }
+        XCTAssertTrue(fault.fired, "the state slice reached the interrupted step")
+        XCTAssertFalse(spy.isOperational(), "the wrapper became unknown during its read")
+    }
+
     func testSQLiteQueueRoundTripsAndOrdersRunnableWork() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))

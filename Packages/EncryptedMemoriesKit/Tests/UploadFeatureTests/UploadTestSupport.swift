@@ -316,6 +316,156 @@ final class UploadCompletionRecorder: @unchecked Sendable {
 }
 
 extension UploadBackupSyncQueueStore {
+    var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? { nil }
+
+    func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+    ) -> Bool? { nil }
+
+    func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        remove(source: source, revision: revision)
+    }
+
+    func missingSourceDiscardGeneration() -> Int64? { 0 }
+    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? { nil }
+    func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool { false }
+
+    func nextRunnableDate() -> Date? {
+        nextRunnableDate(excludingSourcesOf: [])
+    }
+
+    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry]? {
+        claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
+    }
+
+    func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        entries.allSatisfy(upsert)
+    }
+
+    func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry] {
+        guard isOperational() else { throw UploadRemoteCommitRecoveryError.storeUnavailable }
+        let limit = max(1, limit)
+        var result: [UploadBackupSyncQueueEntry] = []
+        result.reserveCapacity(limit)
+        for state in UploadBackupSyncQueueState.allCases {
+            // Generic test stores cannot express a receipt predicate. Inspect their complete state
+            // slice so ordinary rows ahead of a receipt cannot make a complete scan look empty;
+            // the production SQLite store overrides this with a bounded WHERE/limit query.
+            for entry in entries(in: state, updatedBefore: .distantFuture, limit: .max) {
+                if entry.remoteCommitReconciliation != nil {
+                    result.append(entry)
+                    if result.count == limit { return result }
+                }
+            }
+        }
+        guard isOperational() else { throw UploadRemoteCommitRecoveryError.storeUnavailable }
+        return result
+    }
+
+    func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry? {
+        entries(in: state, updatedBefore: .distantFuture, limit: Int.max)
+            .min { $0.updatedAt < $1.updatedAt }
+    }
+
+    func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? { nil }
+
+    /// A store without a stamp is always read again.
+    func changeToken() -> UploadBackupSyncQueueChangeToken? { nil }
+
+    /// Stores without a complete read prove a result by their health after the read.
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
+        let date = nextRunnableDate(excludingSourcesOf: excludedSources)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return date
+    }
+
+    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
+        let entry = earliestEntry(in: state)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return entry
+    }
+
+    func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry] {
+        let result = entries(in: state, updatedBefore: updatedBefore, limit: limit)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return result
+    }
+
+    func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord? {
+        let issue = runtimeIssue(for: key)
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return issue
+    }
+
+    @discardableResult
+    func setRuntimeIssue(_ issue: BackupIssueRecord?, for key: BackupRuntimeIssueKey) -> Bool { true }
+
+    @discardableResult
+    func markNeedsRemoteReconciliation(
+        source: UploadSourceIdentity,
+        revision: UploadBackupRevision,
+        reconciliation: UploadRemoteCommitReconciliation,
+        lastError: String?,
+        updatedAt: Date
+    ) -> Bool {
+        guard var entry = (try? entry(for: source, revision: revision)) ?? nil else { return false }
+        entry.state = .needsRemoteReconciliation
+        entry.lastError = lastError
+        entry.remoteCommitReconciliation = reconciliation
+        entry.updatedAt = updatedAt
+        return upsert(entry)
+    }
+
+    @discardableResult
+    func makeRetryableWorkEligible(updatedAt: Date) -> Int {
+        var changed = 0
+        for state in [
+            UploadBackupSyncQueueState.failed,
+            .blockedByDraft,
+            .discovered,
+            .queuedForUpload,
+            .needsRemoteReconciliation,
+        ] {
+            for entry in entries(in: state, updatedBefore: .distantFuture, limit: .max) {
+                guard !entry.isDismissedSourceRecheck else { continue }
+                let target: UploadBackupSyncQueueState =
+                    switch state {
+                    case .failed, .blockedByDraft: .discovered
+                    default: state
+                    }
+                if updateState(
+                    source: entry.source,
+                    revision: entry.revision,
+                    state: target,
+                    attempts: state == .failed ? 0 : nil,
+                    lastError: entry.lastError,
+                    updatedAt: updatedAt
+                ) {
+                    changed += 1
+                }
+            }
+        }
+        return changed
+    }
+
+    func removeUnsavedEarlierRevisions(
+        of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
+    ) -> Bool {
+        true
+    }
+
+    func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        for entry in entries {
+            guard removeUnsavedEarlierRevisions(of: entry.source, through: entry.revision, except: entry.revision)
+            else {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Read-only view of every runnable row through the store's own state reads; claiming would change the rows.
     func runnableEntries() -> [UploadBackupSyncQueueEntry] {
         UploadBackupSyncQueueManifestStore.runnableStates.flatMap {
