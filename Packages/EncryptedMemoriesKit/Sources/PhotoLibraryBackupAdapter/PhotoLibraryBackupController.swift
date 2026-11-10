@@ -324,10 +324,11 @@ public final class PhotoLibraryBackupController {
         private var launchResumeGateForTesting: (@Sendable () async -> Void)?
         /// The resume at launch returned.
         internal private(set) var launchResumeEndedForTesting = false
-        /// Ended passes whose completion (status projection and the next wake) still runs.
-        private var completingSyncRuns = 0
-        private var syncRunCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     #endif
+    /// Ended passes whose completion (lock release, final status projection and the next wake) still runs, and the
+    /// callers that wait for it. A waiter without a run ID waits until no pass settles any more.
+    private var settlingRunIDs: Set<String> = []
+    private var settlementWaiters: [(runID: String?, continuation: CheckedContinuation<Void, Never>)] = []
 
     /// Platform hook: invoked with `true` when a backup pass is actively running (so the host app may
     /// keep the display awake / request background time) and `false` the moment backup goes idle,
@@ -1718,6 +1719,15 @@ public final class PhotoLibraryBackupController {
             ])
     }
 
+    /// Returns when the pass `runID` has settled: its completion released the lock and projected the final state, or
+    /// ended early at a shutdown. A pass whose instant work outlasts the bounded retirement wait settles only when that
+    /// work returned, so `run.task.value` alone does not prove it (#1108). Returns at once for a run that is neither
+    /// active nor settling.
+    public func waitUntilRunSettled(_ runID: String) async {
+        guard activeRunID == runID || settlingRunIDs.contains(runID) else { return }
+        await withCheckedContinuation { settlementWaiters.append((runID, $0)) }
+    }
+
     /// Stops only the active run identified by the caller. OS expiration handlers must use this
     /// overload so an expired attempt cannot cancel a foreground run or a later replacement run.
     public func stopSync(runID: String) {
@@ -1910,8 +1920,8 @@ public final class PhotoLibraryBackupController {
 
         /// Returns when every ended pass has finished its completion, including the decision about its next wake.
         internal func waitForSyncRunCompletionForTesting() async {
-            guard completingSyncRuns > 0 else { return }
-            await withCheckedContinuation { syncRunCompletionWaiters.append($0) }
+            guard !settlingRunIDs.isEmpty else { return }
+            await withCheckedContinuation { settlementWaiters.append((nil, $0)) }
         }
 
         /// Background windows that wait for their deferred pass.
@@ -2668,6 +2678,16 @@ public final class PhotoLibraryBackupController {
         await completeSyncRun(runID: runID)
     }
 
+    private func endSettlement(of runID: String) {
+        settlingRunIDs.remove(runID)
+        let isReady = { (waiter: (runID: String?, continuation: CheckedContinuation<Void, Never>)) in
+            waiter.runID == runID || (waiter.runID == nil && self.settlingRunIDs.isEmpty)
+        }
+        let ready = settlementWaiters.filter(isReady)
+        settlementWaiters.removeAll(where: isReady)
+        for waiter in ready { waiter.continuation.resume() }
+    }
+
     private func completeSyncRun(runID: String) async {
         let stopTask = runnerStopRunID == runID ? runnerStopTask : nil
         await stopTask?.value
@@ -2692,17 +2712,8 @@ public final class PhotoLibraryBackupController {
         activeRunOwner = nil
         activeRefreshScan = nil
         isSyncing = false
-        #if DEBUG
-            completingSyncRuns += 1
-            defer {
-                completingSyncRuns -= 1
-                if completingSyncRuns == 0 {
-                    let waiters = syncRunCompletionWaiters
-                    syncRunCompletionWaiters.removeAll()
-                    for waiter in waiters { waiter.resume() }
-                }
-            }
-        #endif
+        settlingRunIDs.insert(runID)
+        defer { endSettlement(of: runID) }
         updateIdleTimerIfNeeded()
         isScanning = false
         syncTask = nil

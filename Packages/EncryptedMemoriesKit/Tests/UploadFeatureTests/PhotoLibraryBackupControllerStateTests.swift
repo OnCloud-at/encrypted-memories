@@ -1110,6 +1110,48 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await orchestration.value
         }
 
+        /// A pass whose instant work outlasts the bounded retirement wait still owns its lock, and its final state is not
+        /// projected yet: it has settled only when its completion ran (#1108).
+        func testARunSettlesOnlyAfterItsRetiredInstantWorkCompletedIt() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-run-settles-after-retirement")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            XCTAssertTrue(controller.installSyncRunForTesting(runID: "carried", task: Task {}))
+            let writer = NonCooperativeWriterLatch()
+            let writerTask = makeNonCooperativeWriter(writer)
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(writerTask))
+            await writer.waitUntilStarted()
+            await writer.waitUntilBlocked()
+
+            await controller.finishSyncForTesting(runID: "carried")
+            XCTAssertTrue(controller.isRetiringInstantWorkForTesting, "the writer outlasted the bounded wait")
+            XCTAssertEqual(controller.activeExecutionRunID, "carried", "the run keeps its lock while its writer retires")
+
+            let settled = CompletionLatch()
+            let waiter = Task {
+                await controller.waitUntilRunSettled("carried")
+                await settled.markCompleted()
+            }
+            try await Task.sleep(for: PhotoLibraryBackupController.instantWorkRetirementTimeout + .milliseconds(100))
+            let settledWhileRetiring = await settled.isCompleted()
+            XCTAssertFalse(settledWhileRetiring, "the run has not settled while its writer retires")
+
+            await writer.release()
+            await writerTask.value
+            await waiter.value
+            XCTAssertNil(controller.activeExecutionRunID, "the run settled: its completion released the lock")
+            XCTAssertFalse(controller.isRetiringInstantWorkForTesting)
+            await controller.shutdown()
+        }
+
+        func testWaitingForARunThatIsNeitherActiveNorSettlingReturnsAtOnce() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-run-settled-unknown")
+            defer { fixture.cleanup() }
+            await fixture.controller.waitUntilRunSettled("never-started")
+            XCTAssertNil(fixture.controller.activeExecutionRunID)
+            await fixture.controller.shutdown()
+        }
+
         func testExpirationTracksEveryConcurrentWriterAndRetiresUntilBothReturn() async throws {
             let suite = "photo-backup-controller-retirement-\(UUID().uuidString)"
             let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
