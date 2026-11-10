@@ -39,12 +39,12 @@ struct InfoPanelView: View {
 
     private var captureSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(item.captureTime, format: .dateTime.weekday(.wide).day().month(.wide).year())
+            Text(item.captureTime, format: ViewerInfoCaptureFormat.date)
                 .font(.headline)
-            Text(item.captureTime, format: .dateTime.hour().minute())
+            Text(item.captureTime, format: ViewerInfoCaptureFormat.time)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            if let device = metadata?.device, !device.isEmpty {
+            if let device = metadata.flatMap({ ViewerInfoFileFields(metadata: $0, fallbackDuration: nil).device }) {
                 Label(device, systemImage: "camera")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -99,21 +99,22 @@ struct InfoPanelView: View {
     }
 
     private var fileSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let name = metadata?.filename, !name.isEmpty {
+        let fields = metadata.map { ViewerInfoFileFields(metadata: $0, fallbackDuration: item.durationSeconds) }
+        return VStack(alignment: .leading, spacing: 10) {
+            if let name = fields?.filename {
                 row(L10n.string("infopanel.name"), name)
             }
-            if let w = metadata?.pixelWidth, let h = metadata?.pixelHeight {
-                row(L10n.string("infopanel.dimensions"), "\(w) × \(h)  (\(megapixels(w, h)) MP)")
+            if let dimensions = fields?.dimensions {
+                row(L10n.string("infopanel.dimensions"), dimensions)
             }
-            if let size = metadata?.fileSize {
-                row(L10n.string("infopanel.size"), L10n.fileSize(Int64(size)))
+            if let size = fields?.fileSize {
+                row(L10n.string("infopanel.size"), L10n.fileSize(size))
             }
-            if let d = metadata?.durationSeconds, d > 0 {
-                row(L10n.string("infopanel.duration"), durationString(d))
+            if let duration = fields?.duration {
+                row(L10n.string("infopanel.duration"), duration)
             }
-            if let mime = metadata?.mimeType, !mime.isEmpty {
-                row(L10n.string("infopanel.type"), mime)
+            if let type = ViewerInfoFileFields.mediaType(mimeType: metadata?.mimeType, fallback: item.mediaType) {
+                row(L10n.string("infopanel.type"), type)
             }
             if metadataLoadState == .loading || metadataLoadState == .idle {
                 ProgressSpinner(accessibilityLabel: L10n.string("infopanel.info"))
@@ -160,16 +161,5 @@ struct InfoPanelView: View {
                 .font(.body)
                 .textSelection(.enabled)
         }
-    }
-
-    private func megapixels(_ w: Int, _ h: Int) -> String {
-        String(format: "%.1f", Double(w * h) / 1_000_000)
-    }
-
-    private func durationString(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        let m = total / 60
-        let s = total % 60
-        return String(format: "%d:%02d", m, s)
     }
 }

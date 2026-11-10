@@ -11,8 +11,7 @@ package enum TimelineThumbnailOverlayPolicy {
     }
 
     package static func durationText(for seconds: Double?) -> String? {
-        guard let seconds, seconds.isFinite, seconds > 0, seconds < Double(Int.max) else { return nil }
-        let total = Int(seconds.rounded())
+        guard let total = PhotoDuration.roundedSeconds(seconds) else { return nil }
         let hours = total / 3_600
         let minutes = (total % 3_600) / 60
         let remainder = total % 60

@@ -55,13 +55,13 @@ struct MobileViewerInfoSheet: View {
 
     private var captureSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(item.captureTime, format: MobileViewerCaptureFormat.date)
+            Text(item.captureTime, format: ViewerInfoCaptureFormat.date)
                 .font(.headline)
-            Text(item.captureTime, format: MobileViewerCaptureFormat.time)
+            Text(item.captureTime, format: ViewerInfoCaptureFormat.time)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 
-            if let device = metadata?.device, !device.isEmpty {
+            if let device = metadata.flatMap({ ViewerInfoFileFields(metadata: $0, fallbackDuration: nil).device }) {
                 Label(device, systemImage: "camera")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -74,7 +74,7 @@ struct MobileViewerInfoSheet: View {
 
     private var fileSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let type = mediaType {
+            if let type = ViewerInfoFileFields.mediaType(mimeType: metadata?.mimeType, fallback: item.mediaType) {
                 metadataRow(L10n.string("infopanel.type"), value: type)
             }
 
@@ -110,24 +110,18 @@ struct MobileViewerInfoSheet: View {
 
     @ViewBuilder
     private func loadedMetadataSection(_ metadata: PhotoMetadata) -> some View {
-        if let filename = nonEmpty(metadata.filename) {
+        let fields = ViewerInfoFileFields(metadata: metadata, fallbackDuration: item.durationSeconds)
+        if let filename = fields.filename {
             metadataRow(L10n.string("infopanel.name"), value: filename)
         }
-        if let width = metadata.pixelWidth, let height = metadata.pixelHeight,
-            width > 0, height > 0
-        {
-            metadataRow(
-                L10n.string("infopanel.dimensions"),
-                value: "\(width) × \(height) (\(megapixels(width, height)) MP)"
-            )
+        if let dimensions = fields.dimensions {
+            metadataRow(L10n.string("infopanel.dimensions"), value: dimensions)
         }
-        if let size = metadata.fileSize, size >= 0 {
-            metadataRow(L10n.string("infopanel.size"), value: L10n.fileSize(Int64(size)))
+        if let size = fields.fileSize {
+            metadataRow(L10n.string("infopanel.size"), value: L10n.fileSize(size))
         }
-
-        let duration = metadata.durationSeconds ?? item.durationSeconds
-        if let duration, duration > 0 {
-            metadataRow(L10n.string("infopanel.duration"), value: durationString(duration))
+        if let duration = fields.duration {
+            metadataRow(L10n.string("infopanel.duration"), value: duration)
         }
     }
 
@@ -212,13 +206,6 @@ struct MobileViewerInfoSheet: View {
         }
     }
 
-    private var mediaType: String? {
-        if let mimeType = nonEmpty(metadata?.mimeType) {
-            return mimeType
-        }
-        return nonEmpty(item.mediaType)
-    }
-
     private func metadataRow(_ label: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
@@ -232,26 +219,6 @@ struct MobileViewerInfoSheet: View {
         }
         .accessibilityElement(children: .combine)
     }
-
-    private func nonEmpty(_ value: String?) -> String? {
-        guard let value, !value.isEmpty else { return nil }
-        return value
-    }
-
-    private func megapixels(_ width: Int, _ height: Int) -> String {
-        String(format: "%.1f", (Double(width) * Double(height)) / 1_000_000)
-    }
-
-    private func durationString(_ seconds: Double) -> String {
-        let total = max(0, Int(seconds.rounded()))
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
-}
-
-/// The capture date and time formats of the viewer's details, shared by the inspector and the folded details.
-enum MobileViewerCaptureFormat {
-    static let date = Date.FormatStyle.dateTime.weekday(.wide).day().month(.wide).year()
-    static let time = Date.FormatStyle.dateTime.hour().minute()
 }
 
 /// The photo details in the lower part of the folded layout: the date and time as its title, the place, and the albums
@@ -299,12 +266,12 @@ struct MobileViewerDetailsSummary: View {
     }
 
     private var dateText: some View {
-        Text(item.captureTime, format: MobileViewerCaptureFormat.date)
+        Text(item.captureTime, format: ViewerInfoCaptureFormat.date)
             .font(.title3.weight(.semibold))
     }
 
     private var timeText: some View {
-        Text(item.captureTime, format: MobileViewerCaptureFormat.time)
+        Text(item.captureTime, format: ViewerInfoCaptureFormat.time)
             .font(.subheadline)
             .foregroundStyle(.secondary)
     }
