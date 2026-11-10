@@ -92,4 +92,3 @@ public final class PhotoLibraryBackupWindowAttempt {
         if didExpire { controller?.stopBackgroundWindowRun(runID: runID) }
     }
 }
-
