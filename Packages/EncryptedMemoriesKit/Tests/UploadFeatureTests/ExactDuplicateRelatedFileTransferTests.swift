@@ -145,6 +145,19 @@ final class ExactDuplicateRelatedFileTransferTests: XCTestCase {
             ("upload transport", UploadError.transport(code: NSURLErrorCancelled, message: ""), true),
             ("task cancellation", CancellationError(), true),
             ("URL domain", NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled), true),
+            ("foreign domain", NSError(domain: "foreign", code: NSURLErrorCancelled), false),
+            ("URL timeout", URLError(.timedOut), false),
+            (
+                "wrapped upload transport",
+                NSError(
+                    domain: "wrapper", code: 1,
+                    userInfo: [NSUnderlyingErrorKey: UploadError.transport(code: NSURLErrorCancelled, message: "")]),
+                true
+            ),
+            (
+                "wrapped task cancellation",
+                NSError(domain: "wrapper", code: 1, userInfo: [NSUnderlyingErrorKey: CancellationError()]), true
+            ),
             (
                 "wrapped upload cancelled",
                 NSError(
