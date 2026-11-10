@@ -28,8 +28,8 @@ struct MobileBackupScreen: View {
             }
         }
         .mobileNavigationTitle(String(localized: "settings.section_backup"))
-        // The backup screen is shown in a sheet; its own place asks while it is on top (#1108).
-        .continuedBackupPrompt(controller: controller, at: .backupScreen)
+        // The backup screen is shown in a sheet that covers the root; it asks itself while nothing covers it (#1108).
+        .continuedBackupPrompt(controller: controller)
     }
 }
 
