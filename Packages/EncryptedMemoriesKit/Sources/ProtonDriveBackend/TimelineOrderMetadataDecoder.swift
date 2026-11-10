@@ -1,15 +1,10 @@
 import Foundation
 import PhotosCore
+import UploadCore
 
 /// Reads independent optional sections. Unsupported client metadata cannot break the existing MIME reconciliation.
 struct TimelineOrderMetadataDecoder {
-    private let fractional = ISO8601DateFormatter()
-    private let standard = ISO8601DateFormatter()
-
-    init() {
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        standard.formatOptions = [.withInternetDateTime]
-    }
+    private let dates = IOSPhotosModificationTimeParser()
 
     func decode(_ data: Data) -> TimelineOrderMetadata {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -26,7 +21,7 @@ struct TimelineOrderMetadataDecoder {
 
     private func decode(camera: [String: Any]?, source: [String: Any]?) -> TimelineOrderMetadata {
         let raw = camera?["CaptureTime"] as? String
-        let date = raw.flatMap { fractional.date(from: $0) ?? standard.date(from: $0) }
+        let date = raw.flatMap(dates.date(from:))
         return TimelineOrderMetadata(exactCaptureTime: date, stableIdentity: source?["ICloudID"] as? String)
     }
 }
