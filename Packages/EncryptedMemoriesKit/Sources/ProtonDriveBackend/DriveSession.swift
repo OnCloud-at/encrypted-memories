@@ -745,15 +745,7 @@ struct TrashLink: Decodable {
 
 /// `GET /drive/volumes/{id}/trash` - id groups only, no link bodies.
 private struct VolumeTrashResponse: Decodable {
-    let trash: [Group]?
-    struct Group: Decodable {
-        let shareID: String
-        let linkIDs: [String]
-        enum CodingKeys: String, CodingKey {
-            case shareID = "ShareID"
-            case linkIDs = "LinkIDs"
-        }
-    }
+    let trash: [VolumeTrashGroup]?
     enum CodingKeys: String, CodingKey { case trash = "Trash" }
 }
 
