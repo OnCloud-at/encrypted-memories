@@ -16,7 +16,6 @@ public typealias PhotosBackend = PhotosRepository
     & FavoritesProvider
     & PhotoLibrarySaving
     & TrashProvider
-    & LibraryStatsProvider
 
 /// The video-block cache budget is not part of this policy. `DiskCacheBudgetPolicy.videoBudget` is the
 /// single source, and `VideoByteRangeCache` applies it.

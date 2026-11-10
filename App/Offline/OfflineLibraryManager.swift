@@ -69,26 +69,14 @@ final class OfflineLibraryManager {
 
     @ObservationIgnored private var thumbnailSupportSource: (any ThumbnailCacheSupportSource)?
     private var feed: ThumbnailFeed?
-    private var statsProvider: (any LibraryStatsProvider)?
     private let statsCoordinator = OfflineLibraryStatsCoordinator()
     private var statsSession: OfflineLibraryStatsCoordinator.Session?
     private var statsTeardownSession: OfflineLibraryStatsCoordinator.Session?
     private var accountTeardownInProgress = false
-    /// Live count of photos currently loaded into the timeline (pushed by `MainView`).
-    var liveAssetCount = 0 {
-        didSet {
-            if liveAssetCount != oldValue { markStatusDirty() }
-        }
-    }
-
     private struct StatusReadContext: Sendable {
-        let feed: ThumbnailFeed?
-        let statsProvider: (any LibraryStatsProvider)?
         let cache: ThumbnailCache
         let previewCache: ThumbnailCache
         let originalsCache: ThumbnailCache
-        let offlineEnabled: Bool
-        let liveAssetCount: Int
     }
 
     private init(root: URL? = nil, sources: SupportDiagnosticsSources = .shared, defaults: UserDefaults = .standard) {
@@ -129,9 +117,8 @@ final class OfflineLibraryManager {
 
     /// Called by `MainView` after backend and feed creation. Thumbnail crawling is grid infrastructure
     /// and remains enabled independently of the offline-originals setting.
-    func attach(feed: ThumbnailFeed, stats: any LibraryStatsProvider) {
+    func attach(feed: ThumbnailFeed) {
         self.feed = feed
-        self.statsProvider = stats
         markStatusDirty()
         Task {
             await feed.setPrefetchEnabled(true)
@@ -150,7 +137,6 @@ final class OfflineLibraryManager {
             statsTeardownSession = statsSession
             self.statsSession = nil
         }
-        liveAssetCount = 0
         isLibraryActivityActive = false
         status = OfflineCacheStatus()
     }
@@ -274,8 +260,6 @@ final class OfflineLibraryManager {
         locationIndex.updateScanProgress(PhotoLocationScanProgress())
         let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
         feed = nil
-        statsProvider = nil
-        liveAssetCount = 0
         configuredAccountUID = nil
         await activeLocationConfiguration?.value
         await activeLocationCrawlStarter?.value
@@ -449,34 +433,16 @@ final class OfflineLibraryManager {
                 in: session,
                 satisfying: requiredDemand
             ) { [weak self] in
-                guard let initial = await self?.statusReadContext(for: session) else { return nil }
-                let prefetch = await initial.feed?.prefetchStatus()
-                let metadataRows = await initial.statsProvider?.metadataRowCount() ?? 0
-                // Revalidate the account owner after the asynchronous providers and before synchronous disk walks.
+                // Validate the account owner before synchronous disk walks.
                 guard let current = await self?.statusReadContext(for: session) else { return nil }
 
                 let thumbnailSizeBytes = current.cache.trackedDiskSizeBytes()
                 let previewSizeBytes = current.previewCache.trackedDiskSizeBytes()
                 let originalsSizeBytes = current.originalsCache.trackedDiskSizeBytes()
-                let totalAssets = max(current.liveAssetCount, metadataRows)
                 var snapshot = OfflineCacheStatus()
-                snapshot.offlineEnabled = current.offlineEnabled
-                snapshot.totalAssets = totalAssets
-                snapshot.metadataRows = metadataRows
-                // Source-aware feeds report coverage for the primary projection only. Physical cache bytes still
-                // include authorized analysis-only derivatives and remain reflected in `cacheSizeBytes` below.
-                snapshot.thumbnailsOnDisk = prefetch?.diskFileCount ?? current.cache.diskFileCount()
-                snapshot.thumbnailsMissing = max(0, totalAssets - snapshot.thumbnailsOnDisk)
-                snapshot.ramDecodedEstimate = prefetch?.ramDecodedCount ?? 0
-                snapshot.prefetchQueueDepth = prefetch?.currentQueueLength ?? 0
-                snapshot.activePrefetchJobs = prefetch?.activeJobs ?? 0
-                // Thumbnails always crawl, so the offline toggle never reports "disabled" here.
-                snapshot.prefetchPausedReason = prefetch?.pausedReason ?? "none"
-                snapshot.failedThumbnailCount = prefetch?.failed ?? 0
                 snapshot.cacheSizeBytes = thumbnailSizeBytes
                 snapshot.previewCacheSizeBytes = previewSizeBytes
                 snapshot.originalsCacheSizeBytes = originalsSizeBytes
-                snapshot.lastError = prefetch?.lastErrors.last
                 return snapshot
             }
             guard let measurement,
@@ -502,13 +468,9 @@ final class OfflineLibraryManager {
     ) -> StatusReadContext? {
         guard statsSession == session, !accountTeardownInProgress else { return nil }
         return StatusReadContext(
-            feed: feed,
-            statsProvider: statsProvider,
             cache: cache,
             previewCache: previewCache,
-            originalsCache: originalsCache,
-            offlineEnabled: offlineEnabled,
-            liveAssetCount: liveAssetCount
+            originalsCache: originalsCache
         )
     }
 }

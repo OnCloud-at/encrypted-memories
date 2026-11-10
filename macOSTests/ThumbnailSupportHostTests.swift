@@ -81,6 +81,40 @@ final class ThumbnailSupportHostTests: XCTestCase {
         await manager.stopForAccountTeardown()
         await manager.previewCache.flushAutomaticDiskCap()
     }
+
+    @MainActor func testStatusReportsEachCacheSizeAndClearsAtTeardown() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "issue919-host-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: AppSettingsKey.offlineOriginalsCapUnlimited)
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        let manager = OfflineLibraryManager(testRoot: root, testSources: sources, testDefaults: defaults)
+        manager.configure(
+            session: ProtonSession(
+                uid: "fixture", accessToken: "fixture", refreshToken: "fixture", keyPassword: "fixture"))
+        let uid = PhotoUID(volumeID: "volume", nodeID: "photo")
+        manager.cache.storeToDisk(Data(repeating: 1, count: 11), for: uid)
+        manager.previewCache.storeToDisk(Data(repeating: 2, count: 19), for: uid)
+        manager.originalsCache.storeToDisk(Data(repeating: 3, count: 29), for: uid)
+        let thumbnailBytes = manager.cache.trackedDiskSizeBytes()
+        let previewBytes = manager.previewCache.trackedDiskSizeBytes()
+        let originalBytes = manager.originalsCache.trackedDiskSizeBytes()
+        XCTAssertGreaterThan(thumbnailBytes, 0)
+        XCTAssertGreaterThan(previewBytes, 0)
+        XCTAssertGreaterThan(originalBytes, 0)
+        let status = await manager.refreshStatus()
+        XCTAssertEqual(status.cacheSizeBytes, thumbnailBytes)
+        XCTAssertEqual(status.previewCacheSizeBytes, previewBytes)
+        XCTAssertEqual(status.originalsCacheSizeBytes, originalBytes)
+        XCTAssertEqual(status.totalCacheSizeBytes, thumbnailBytes + previewBytes + originalBytes)
+        manager.prepareForAccountTeardown()
+        let cleared = await manager.refreshStatus()
+        XCTAssertEqual(cleared.totalCacheSizeBytes, 0)
+        await manager.stopForAccountTeardown()
+        await manager.previewCache.flushAutomaticDiskCap()
+    }
 }
 
 private final class CallbackSource: ThumbnailCacheSupportSource, @unchecked Sendable {

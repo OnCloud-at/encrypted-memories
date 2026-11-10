@@ -97,15 +97,12 @@ struct AppInfrastructureTests {
         #expect(restored == finalFrame)
     }
 
-    @Test func cacheCoverageMath() {
+    @Test func cacheSizeMath() {
         var status = OfflineCacheStatus()
-        #expect(status.thumbnailCoverage == 0)  // no authoritative inventory yet
-        status.totalAssets = 200
-        status.thumbnailsOnDisk = 50
-        #expect(abs(status.thumbnailCoverage - 0.25) < 1e-9)
         status.cacheSizeBytes = 10
         status.previewCacheSizeBytes = 7
-        #expect(status.totalCacheSizeBytes == 17)
+        status.originalsCacheSizeBytes = 3
+        #expect(status.totalCacheSizeBytes == 20)
     }
 
     @Test func videoStateMachineTransitions() {
