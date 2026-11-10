@@ -44,7 +44,8 @@ public enum PhotoLibraryContinuedBackupPrompt {
             case ask
             /// Ask again after this time; the calm time has not passed.
             case wait(Duration)
-            /// Look again soon: something covers the place, or another place asks.
+            /// Look again soon: something covers the place, the place has not looked at its cover yet, or another
+            /// place asks.
             case held
             /// Do not ask: only a change of the backup or the scene can let the place ask.
             case none
@@ -78,10 +79,12 @@ public enum PhotoLibraryContinuedBackupPrompt {
         private let marker: Marker
         private let calmDelay: Duration
         /// Since when the scene is active and the place uncovered; nil while it is not, so a set value also says that
-        /// the scene is active and nothing covers the place, and nil in an active scene says that something covers it.
+        /// the scene is active and nothing covers the place, and nil in an active scene says that something covers it
+        /// or that the place has not looked at its cover yet.
         private var calmSince: ContinuousClock.Instant?
         private var isActive = false
-        private var isCovered = false
+        /// Whether something covers the place; nil after the place stopped looking, until it looks again.
+        private var isCovered: Bool? = false
         /// The question is shown by this place.
         public private(set) var isPresenting = false
 
@@ -93,7 +96,7 @@ public enum PhotoLibraryContinuedBackupPrompt {
 
         public func sceneBecameActive(at now: ContinuousClock.Instant) {
             isActive = true
-            if !isCovered { calmSince = now }
+            if isCovered == false { calmSince = now }
         }
 
         /// The scene is inactive: in the app switcher, under Control Center or a system alert. It asks nothing then; a
@@ -134,6 +137,13 @@ public enum PhotoLibraryContinuedBackupPrompt {
             } else if isActive {
                 calmSince = now
             }
+        }
+
+        /// The place stops looking at its cover. What covers it is unknown until it looks again, and the calm time
+        /// then starts again, so a cover that came and went meanwhile cannot let it ask at once.
+        public func stoppedLooking() {
+            calmSince = nil
+            isCovered = nil
         }
 
         /// The backup state changed. A drained backlog may be asked about again.

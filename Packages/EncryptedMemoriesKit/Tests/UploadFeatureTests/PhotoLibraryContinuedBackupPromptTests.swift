@@ -264,6 +264,26 @@ import UploadCore
             "an inactive scene waits for its next phase")
     }
 
+    /// A place that stopped looking does not know what covered it meanwhile: its next look starts the calm time again.
+    @Test func aPlaceThatStoppedLookingStartsTheCalmTimeAgain() {
+        let asker = askerAfterTheCalmTime(MarkerBox())
+        asker.coverChanged(isCovered: false, at: start)
+        asker.stoppedLooking()
+
+        // A sheet opened and closed while the place did not look; the backlog grew, and the place looks again.
+        asker.coverChanged(isCovered: false, at: start + .seconds(60))
+        let lookedAgain = start + .seconds(60)
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: lookedAgain) == .wait(.seconds(2)))
+        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(62)) == .ask)
+
+        let returned = askerAfterTheCalmTime(MarkerBox())
+        returned.stoppedLooking()
+        returned.sceneBecameActive(at: start + .seconds(70))
+        #expect(
+            returned.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(75)) == .held,
+            "the place looks at its cover before the calm time starts")
+    }
+
     @Test func anInactiveSceneDoesNotAskAndClosesNothing() {
         let marker = MarkerBox()
         let asker = askerAfterTheCalmTime(marker)
