@@ -222,11 +222,12 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     private func copyingFinder(
-        _ remote: CopyingDuplicateRemote,
+        _ remote: CopyingDuplicateRemote, stagingParent: URL? = nil,
         network: @escaping @Sendable () -> BackupThrottleInputs = { BackupThrottleInputs(usesMobileData: false) }
     ) -> ExactDuplicateFinder {
         var result = finder(remote: remote)
         result.copyNetwork = network
+        if let stagingParent { result.relatedFileStagingParent = stagingParent }
         return result
     }
 
@@ -935,14 +936,19 @@ final class ExactDuplicateFinderTests: XCTestCase {
         _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
         indexServer()
         let group = try await onlyGroup()
-        let rendezvous = CopyRendezvous(parties: 2)
-        setup.remote.beforeUpload = { _ in await rendezvous.arrive() }
-        let first = copyingFinder(setup.remote)
-        let second = copyingFinder(setup.remote)
+        let rendezvous = UploadTestBarrier(participantCount: 2)
+        setup.remote.beforeUpload = { request in
+            await rendezvous.arriveAndWait()
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: request.fileURL.path),
+                "Each device retains its staged file while the other device starts")
+        }
+        // Separate devices do not share the staging folder that each merge clears.
+        let first = copyingFinder(setup.remote, stagingParent: directory.appendingPathComponent("device-1"))
+        let second = copyingFinder(setup.remote, stagingParent: directory.appendingPathComponent("device-2"))
 
         async let a = first.merge(group, keeping: setup.kept)
         async let b = second.merge(group, keeping: setup.kept)
-        await rendezvous.releaseWhenAllArrive()
         let outcomes = try await [a, b]
 
         XCTAssertTrue(
@@ -5373,25 +5379,6 @@ private struct CopyStoppingJournal: ExactDuplicateMergeJournaling {
         return recorded
     }
     func clear(_ intents: [ExactDuplicateMergeIntent]) -> Bool { base.clear(intents) }
-}
-
-/// A deterministic simultaneous pre-upload race, without sleeps or shared production state.
-private actor CopyRendezvous {
-    let parties: Int
-    private var arrivals = 0
-    private let allArrived = XCTestExpectation(description: "Both devices reached upload after their re-read")
-    private let gate = FinderGate()
-    init(parties: Int) { self.parties = parties }
-    func arrive() async {
-        arrivals += 1
-        if arrivals == parties { allArrived.fulfill() }
-        await gate.pass()
-    }
-    func releaseWhenAllArrive() async {
-        let result = await XCTWaiter.fulfillment(of: [allArrived], timeout: 5)
-        gate.open()
-        XCTAssertEqual(result, .completed, "Always release both held device operations, including on failure")
-    }
 }
 
 private final class VisibilityReadLog: @unchecked Sendable {
