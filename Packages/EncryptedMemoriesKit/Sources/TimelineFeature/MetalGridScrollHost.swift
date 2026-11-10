@@ -383,15 +383,11 @@ final class MetalGridScrollHost: NSView {
             : coordinator.presentationStartScrollY - coordinator.presentationVerticalShift
         stickToBottom = false
         applyContentSize(coordinator.contentSize())
-        let maxScrollY = max(0, spacer.frame.height - scrollView.contentView.bounds.height)
-        let settledY = min(max(0, finalScrollY), maxScrollY)
+        let settledY = clampedScrollY(finalScrollY)
         // The detent fly-into-place only applies to a width reflow; a pure vertical resize settles instantly.
         let animating = widthChanged && coordinator.beginResizeSettle(targetScrollY: settledY)
         coordinator.endPresentationResize()
-        if abs(settledY - scrollView.contentView.bounds.origin.y) > 0.5 {
-            scrollView.contentView.scroll(to: CGPoint(x: 0, y: settledY))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-        }
+        if abs(settledY - scrollView.contentView.bounds.origin.y) > 0.5 { scrollClip(toY: settledY) }
         if animating { resizeSettleStart = CACurrentMediaTime() }
         let finalFrame = viewportScreenFrame()
         let profileOldFrame = liveResizeStartFrame == .zero ? lastViewportScreenFrame : liveResizeStartFrame
@@ -636,14 +632,7 @@ final class MetalGridScrollHost: NSView {
         var didFinishPresentation = false
         if coordinator.isSidebarResizing {
             let (settleScroll, _) = coordinator.endSidebarResize()
-            stickToBottom = false
-            applyContentSize(coordinator.contentSize())
-            let maxScrollY = max(0, spacer.frame.height - scrollView.contentView.bounds.height)
-            let settledY = min(max(0, settleScroll), maxScrollY)
-            if abs(settledY - scrollView.contentView.bounds.origin.y) > 0.5 {
-                scrollView.contentView.scroll(to: CGPoint(x: 0, y: settledY))
-                scrollView.reflectScrolledClipView(scrollView.contentView)
-            }
+            applySidebarSettleScroll(settleScroll)
             didFinishPresentation = true
         }
         if coordinator.isResizeSettling {
@@ -679,17 +668,7 @@ final class MetalGridScrollHost: NSView {
         let previousLevel = coordinator.level
         let anchoredY = coordinator.commitPinchChain(
             toLevel: pinchDriver.finalLevel, viewportSize: metalView.bounds.size)
-        let clipH = scrollView.contentView.bounds.height
-        let content = coordinator.contentSize()
-        let committedY = min(max(0, anchoredY), max(0, content.height - clipH))
-        lastMagnifyEventTime = CACurrentMediaTime()  // arm the post-commit scroll grace
-        scrollLockOrigin = CGPoint(x: 0, y: committedY)
-        applyContentSize(content)
-        scrollView.contentView.scroll(to: CGPoint(x: 0, y: committedY))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        // Edge/corner clamp: if the anchored scroll was out of bounds, slide there instead of snapping.
-        coordinator.beginScrollRebase(fromY: anchoredY, toY: committedY)
-        coordinator.logPostCommitAnchor()
+        applyCommittedAnchorScroll(anchoredY: anchoredY)
         pinchMode = .undecided
         pinchBuiltSegment = nil
         pinchAdvancePrevTime = 0
@@ -743,17 +722,7 @@ final class MetalGridScrollHost: NSView {
         let previousLevel = coordinator.level
         let toTarget = pinchOverviewSettleTo >= 0.5
         let anchoredY = coordinator.commitOverviewDissolve(toTarget: toTarget, viewportSize: metalView.bounds.size)
-        let clipH = scrollView.contentView.bounds.height
-        let content = coordinator.contentSize()
-        let committedY = min(max(0, anchoredY), max(0, content.height - clipH))
-        lastMagnifyEventTime = CACurrentMediaTime()  // arm the post-commit scroll grace
-        scrollLockOrigin = CGPoint(x: 0, y: committedY)
-        applyContentSize(content)
-        scrollView.contentView.scroll(to: CGPoint(x: 0, y: committedY))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        // Edge/corner clamp: if the anchored scroll was out of bounds, slide there instead of snapping.
-        coordinator.beginScrollRebase(fromY: anchoredY, toY: committedY)
-        coordinator.logPostCommitAnchor()
+        applyCommittedAnchorScroll(anchoredY: anchoredY)
         pinchMode = .undecided
         pinchOverviewQ = 0
         commitLevelToBinding(previousLevel: previousLevel)  // sync the SwiftUI level binding (+ arm echo guard)
@@ -780,8 +749,7 @@ final class MetalGridScrollHost: NSView {
         bridgeStart = CACurrentMediaTime()
         applyContentSize(content)
         if !stickToBottom, newY != nil {
-            scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            scrollClip(toY: targetY)
         }
         if !coordinator.isCommitBridging { coordinator.logPostCommitAnchor() }
         requestFrame()
@@ -850,10 +818,43 @@ final class MetalGridScrollHost: NSView {
         onZoomCommit?(coordinator.level)
     }
 
-    private func pinToBottom() {
-        let maxY = max(0, spacer.frame.height - scrollView.contentView.bounds.height)
-        scrollView.contentView.scroll(to: CGPoint(x: 0, y: maxY))
+    /// The largest valid clip origin: the content height minus the visible height.
+    private var maxScrollY: CGFloat { max(0, spacer.frame.height - scrollView.contentView.bounds.height) }
+
+    /// `y` clamped into the content.
+    private func clampedScrollY(_ y: CGFloat) -> CGFloat { min(max(0, y), maxScrollY) }
+
+    /// Moves the clip view to `y` and tells the scroll view, so its scroller follows.
+    private func scrollClip(toY y: CGFloat) {
+        scrollView.contentView.scroll(to: CGPoint(x: 0, y: y))
         scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    /// Ends bottom-pinning and moves the clip to the scroll that a finished sidebar transition settled on.
+    private func applySidebarSettleScroll(_ settleScroll: CGFloat) {
+        stickToBottom = false
+        applyContentSize(coordinator.contentSize())
+        let settledY = clampedScrollY(settleScroll)
+        if abs(settledY - scrollView.contentView.bounds.origin.y) > 0.5 { scrollClip(toY: settledY) }
+    }
+
+    /// Applies the anchored scroll of a committed pinch or overview dissolve: the clamped scroll becomes the
+    /// scroll lock of the post-commit grace, and a clamped anchor rebases instead of snapping.
+    private func applyCommittedAnchorScroll(anchoredY: CGFloat) {
+        let clipH = scrollView.contentView.bounds.height
+        let content = coordinator.contentSize()
+        let committedY = min(max(0, anchoredY), max(0, content.height - clipH))
+        lastMagnifyEventTime = CACurrentMediaTime()  // arm the post-commit scroll grace
+        scrollLockOrigin = CGPoint(x: 0, y: committedY)
+        applyContentSize(content)
+        scrollClip(toY: committedY)
+        // Edge/corner clamp: if the anchored scroll was out of bounds, slide there instead of snapping.
+        coordinator.beginScrollRebase(fromY: anchoredY, toY: committedY)
+        coordinator.logPostCommitAnchor()
+    }
+
+    private func pinToBottom() {
+        scrollClip(toY: maxScrollY)
     }
 
     deinit {
@@ -1020,9 +1021,7 @@ final class MetalGridScrollHost: NSView {
             let y = min(max(0, result.newScrollY), maxY)
             scrollLockOrigin = nil
             if abs(y - oldScrollY) > 0.5 {
-                let rebasedPoint = CGPoint(x: 0, y: y)
-                scrollView.contentView.scroll(to: rebasedPoint)
-                scrollView.reflectScrolledClipView(scrollView.contentView)
+                scrollClip(toY: y)
             }
         }
         commitLevelToBinding(previousLevel: previousLevel)
@@ -1128,14 +1127,7 @@ final class MetalGridScrollHost: NSView {
         sidebarEdgeSource = nil
         let (settleScroll, animating) = coordinator.endSidebarResize()  // commits the inset + bottom-anchored scroll
         coordinator.liveResizeChanged?(false)
-        stickToBottom = false
-        applyContentSize(coordinator.contentSize())
-        let maxScrollY = max(0, spacer.frame.height - scrollView.contentView.bounds.height)
-        let settledY = min(max(0, settleScroll), maxScrollY)
-        if abs(settledY - scrollView.contentView.bounds.origin.y) > 0.5 {
-            scrollView.contentView.scroll(to: CGPoint(x: 0, y: settledY))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-        }
+        applySidebarSettleScroll(settleScroll)
         if animating { resizeSettleStart = CACurrentMediaTime() }
         let oldFrame = lastViewportScreenFrame
         let newFrame = viewportScreenFrame()
@@ -1281,8 +1273,7 @@ final class MetalGridScrollHost: NSView {
         let y = min(max(0, r.newScrollY), maxY)
         scrollLockOrigin = nil  // a resize must NOT restore a pre-resize origin
         if abs(y - oldScrollY) > 0.5 {  // skip a no-op scroll (e.g. top-anchored width change)
-            scrollView.contentView.scroll(to: CGPoint(x: 0, y: y))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            scrollClip(toY: y)
         }
         requestFrame()  // first frame after resize uses the rebased scrollY
     }
@@ -1336,8 +1327,7 @@ final class MetalGridScrollHost: NSView {
         stickToBottom = false
         scrollLockOrigin = nil  // no stale zoom lock may override the placement
         lastMagnifyEventTime = 0  // clear any post-magnify scroll-suppression grace
-        scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
+        scrollClip(toY: targetY)
     }
 
     /// Arm a one-shot initial-viewport policy: reset to the canonical bottom-right phase (so the content height
@@ -1382,31 +1372,19 @@ final class MetalGridScrollHost: NSView {
             ?? CGPoint(x: max(1, bounds.width - coordinator.leadingObstructionInset) / 2, y: origin.y + vh / 2)
         let viewportPoint = CGPoint(x: anchorPoint.x, y: anchorPoint.y - origin.y)
         let trigger: GridZoomTrigger = newLevel < coordinator.level ? .toolbarPlus : .toolbarMinus  // plus = zoom in
-        // Try the single-lattice transition first, including when the grid is freshly bottom-pinned
-        // (`stickToBottom`). Otherwise the early-return below would bypass it. It commits the settled target
-        // Apply the transition's anchored scroll and skip the fallback snap.
+        // Try the single-lattice transition first, then the overview dissolve, including when the grid is freshly
+        // bottom-pinned (`stickToBottom`). Otherwise the early-return below would bypass them. The transition
+        // commits the settled target: apply its anchored scroll and skip the fallback snap.
         if let tY = coordinator.tryBeginClickTransition(
             toLevel: newLevel, anchorContentPoint: anchorPoint,
             viewportPoint: viewportPoint, viewportSize: metalView.bounds.size)
+            ?? coordinator.tryBeginClickOverviewDissolve(
+                toLevel: newLevel, anchorContentPoint: anchorPoint,
+                viewportPoint: viewportPoint, viewportSize: metalView.bounds.size)
         {
             stickToBottom = false  // an anchored zoom ends bottom-pinning (like a scroll)
             applyContentSize(coordinator.contentSize())
-            let maxY = max(0, spacer.frame.height - vh)
-            scrollView.contentView.scroll(to: CGPoint(x: 0, y: min(max(0, tY), maxY)))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-            coordinator.logPostCommitAnchor()
-            requestFrame()
-            return
-        }
-        if let tY = coordinator.tryBeginClickOverviewDissolve(
-            toLevel: newLevel, anchorContentPoint: anchorPoint,
-            viewportPoint: viewportPoint, viewportSize: metalView.bounds.size)
-        {
-            stickToBottom = false
-            applyContentSize(coordinator.contentSize())
-            let maxY = max(0, spacer.frame.height - vh)
-            scrollView.contentView.scroll(to: CGPoint(x: 0, y: min(max(0, tY), maxY)))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            scrollClip(toY: clampedScrollY(tY))
             coordinator.logPostCommitAnchor()
             requestFrame()
             return
@@ -1421,11 +1399,7 @@ final class MetalGridScrollHost: NSView {
         let newY = coordinator.settleScrollOffsetY(
             toLevel: newLevel, anchorContentPoint: anchorPoint, viewportPoint: viewportPoint, trigger: trigger)
         applyContentSize(coordinator.contentSize())
-        if let newY {
-            let maxY = max(0, spacer.frame.height - vh)
-            scrollView.contentView.scroll(to: CGPoint(x: 0, y: min(max(0, newY), maxY)))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-        }
+        if let newY { scrollClip(toY: clampedScrollY(newY)) }
         coordinator.logPostCommitAnchor()
         requestFrame()
     }
@@ -1483,14 +1457,7 @@ final class MetalGridScrollHost: NSView {
     func scrollToItem(_ uid: PhotoUID) {
         stickToBottom = false
         guard let rect = coordinator.cellContentRect(forUID: uid) else { return }
-        let clipH = scrollView.contentView.bounds.height
-        let maxY = max(0, spacer.frame.height - clipH)
-        let targetY = min(max(0, rect.midY - clipH / 2), maxY)
-        coordinator.beginPlaceholderScroll()
-        scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        endPlaceholderScroll()
-        requestFrame()
+        scrollWithPlaceholder(toY: rect.midY - scrollView.contentView.bounds.height / 2)
     }
 
     /// Scroll a flattened timeline index near the top of the viewport. This is the date-jump primitive for the
@@ -1498,14 +1465,16 @@ final class MetalGridScrollHost: NSView {
     func scrollToFlatIndex(_ index: Int) {
         stickToBottom = false
         guard let rect = coordinator.cellContentRect(forFlatIndex: index) else { return }
-        let clipH = scrollView.contentView.bounds.height
-        let maxY = max(0, spacer.frame.height - clipH)
-        let targetY = min(max(0, rect.minY - 24), maxY)
+        scrollWithPlaceholder(toY: rect.minY - 24)
+        onViewportChanged?()
+    }
+
+    /// Scrolls to `y` (clamped into the content) as a programmatic jump: the coordinator treats the scroll as a
+    /// placeholder scroll while it runs.
+    private func scrollWithPlaceholder(toY y: CGFloat) {
         coordinator.beginPlaceholderScroll()
-        scrollView.contentView.scroll(to: CGPoint(x: 0, y: targetY))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
+        scrollClip(toY: clampedScrollY(y))
         endPlaceholderScroll()
         requestFrame()
-        onViewportChanged?()
     }
 }

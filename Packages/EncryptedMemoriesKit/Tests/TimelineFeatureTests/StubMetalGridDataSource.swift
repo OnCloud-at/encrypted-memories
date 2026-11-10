@@ -3,7 +3,7 @@ import PhotosCore
 
 @testable import TimelineFeature
 
-/// A grid data source with its photos in one section. No image is ever ready, and warming does nothing.
+/// A grid data source with no ready images and no warming work.
 @MainActor
 final class StubMetalGridDataSource: MetalGridDataSource {
     let sectionCounts: [Int]
@@ -13,6 +13,11 @@ final class StubMetalGridDataSource: MetalGridDataSource {
     init(uids: [PhotoUID]) {
         sectionCounts = [uids.count]
         flatUIDs = uids
+    }
+
+    init(sections: [Int], volumeID: String = "v") {
+        sectionCounts = sections
+        flatUIDs = (0..<sections.reduce(0, +)).map { PhotoUID(volumeID: volumeID, nodeID: "\($0)") }
     }
 
     convenience init(count: Int, volumeID: String = "v") {
