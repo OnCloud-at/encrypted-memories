@@ -35,4 +35,17 @@ import Testing
             #expect(state.offersRetry == (state == .failed))
         }
     }
+
+    @Test func aScanWithAKnownTotalShowsItsShareOnTheBar() {
+        #expect(MapEmptyState.scanning(scanned: 0, total: 480).progressFraction == 0)
+        #expect(MapEmptyState.scanning(scanned: 120, total: 480).progressFraction == 0.25)
+        #expect(MapEmptyState.scanning(scanned: 480, total: 480).progressFraction == 1)
+    }
+
+    @Test func noBarShowsWithoutATotalOrOutsideAScan() {
+        let states: [MapEmptyState] = [.scanning(scanned: 0, total: 0), .offline, .failed, .completed, .idle]
+        for state in states {
+            #expect(state.progressFraction == nil, "\(state)")
+        }
+    }
 }

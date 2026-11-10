@@ -2,8 +2,9 @@ import PhotosCore
 import SwiftUI
 
 /// The native unavailable view of an empty Map, shared by macOS and iOS: the shared offline view, a scan in
-/// progress, a failed scan with the shared prominent Try again button, a finished scan without places, and the idle
-/// state. Each platform places it itself and supplies what Try again does.
+/// progress with the shared bar while its total is known, a failed scan with the shared prominent Try again button,
+/// a finished scan without places, and the idle state. Each platform places it itself and supplies what Try again
+/// does.
 public struct MapEmptyStateView: View {
     private let state: MapEmptyState
     private let retry: () -> Void
@@ -15,19 +16,18 @@ public struct MapEmptyStateView: View {
 
     @ViewBuilder public var body: some View {
         if let copy = Self.copy(for: state) {
-            if state.offersRetry {
-                ContentUnavailableView {
-                    Label(copy.title, systemImage: copy.systemImage)
-                } description: {
-                    Text(copy.message)
-                } actions: {
+            ContentUnavailableView {
+                Label(copy.title, systemImage: copy.systemImage)
+            } description: {
+                Text(copy.message)
+            } actions: {
+                if state.offersRetry {
                     RetryButton(.prominent, action: retry)
-                }
-            } else {
-                ContentUnavailableView {
-                    Label(copy.title, systemImage: copy.systemImage)
-                } description: {
-                    Text(copy.message)
+                } else if let fraction = state.progressFraction {
+                    // The count is already in the message, so the bar has no detail line of its own.
+                    ActivityProgressStateLayout {
+                        ActivityProgressBar(fraction: fraction, accessibilityLabel: copy.title)
+                    }
                 }
             }
         } else {

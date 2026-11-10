@@ -59,6 +59,20 @@ import Testing
         }
     }
 
+    /// Guards the layout of the states without an action, while the view holds all states in one unavailable view.
+    @MainActor @Test func aStateWithoutAnActionDrawsLikeTheUnavailableViewWithoutActions() throws {
+        for state in [MapEmptyState.scanning(scanned: 0, total: 0), .completed, .idle] {
+            let copy = try #require(MapEmptyStateView.copy(for: state))
+            let plain = try RenderedInk.pixels(
+                ContentUnavailableView {
+                    Label(copy.title, systemImage: copy.systemImage)
+                } description: {
+                    Text(copy.message)
+                })
+            #expect(try RenderedInk.pixels(MapEmptyStateView(state, retry: {})) == plain, "\(state)")
+        }
+    }
+
     @MainActor @Test func theOfflineStateDrawsTheSharedOfflineView() throws {
         let offline = try RenderedInk.pixels(MapEmptyStateView(.offline, retry: {}))
         let shared = try RenderedInk.pixels(OfflineContentUnavailableView())
