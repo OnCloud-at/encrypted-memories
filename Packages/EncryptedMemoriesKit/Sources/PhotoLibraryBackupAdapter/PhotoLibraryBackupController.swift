@@ -1720,6 +1720,28 @@ public final class PhotoLibraryBackupController {
             ])
     }
 
+    /// The queue states whose photos still send bytes. A row whose bytes are committed remotely only reconciles.
+    nonisolated private static let statesThatSendBytes: Set<UploadBackupSyncQueueState> = [
+        .discovered, .queuedForUpload, .checking, .hashing, .duplicateChecking, .uploading, .finalizing,
+    ]
+
+    /// The estimated bytes that the photos still to back up will send, from their catalog rows, read off the main actor
+    /// (#1108). Nil when a read fails or more than `limit` photos are left: the continued backup prompt then decides by
+    /// the count alone. A photo without a readable catalog row counts as an unknown item.
+    public func estimatedOutstandingBytes(limit: Int) async -> Int64? {
+        guard let queueStore, let catalogStore else { return nil }
+        return await Task.detached(priority: .utility) {
+            guard let rows = try? queueStore.decisionUnsettledRows() else { return nil }
+            let identifiers = Set(
+                rows.lazy
+                    .filter { $0.source.kind == .photoLibraryAsset && Self.statesThatSendBytes.contains($0.state) }
+                    .map(\.source.identifier))
+            guard identifiers.count <= limit else { return nil }
+            let presence = catalogStore.presence(for: Array(identifiers))
+            return PhotoLibraryContinuedBackupVolume.bytes(of: identifiers.map { presence.present[$0] })
+        }.value
+    }
+
     /// Returns when the pass `runID` has settled: its completion released the lock and projected the final state, or
     /// ended early at a shutdown. A pass whose instant work outlasts the bounded retirement wait settles only when that
     /// work returned, so `run.task.value` alone does not prove it (#1108). Returns at once for a run that is neither
