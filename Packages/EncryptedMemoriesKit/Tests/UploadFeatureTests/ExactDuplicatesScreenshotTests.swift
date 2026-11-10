@@ -61,6 +61,52 @@
             }
         }
 
+        /// The row of the copies whose details differ on the screen, and their own list.
+        func testRenderTheCopiesWhoseDetailsDiffer() async throws {
+            let directory = try outputDirectory()
+            let members = (0..<5).map { PhotoUID(volumeID: "v", nodeID: "photo-\($0)") }
+            let groups = [
+                ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: Array(members[0..<3])),
+                ExactDuplicateGroup(contentHash: "B", hashKeyEpoch: "e", members: Array(members[3..<5])),
+            ]
+            // The second copy of B has other details, so B lists as differing copies.
+            let finder = ScreenshotFinder(
+                groups: groups, coverage: .complete, build: .none, otherDetails: [members[4]])
+            let model = ExactDuplicatesModel(finder: finder)
+            let items = Dictionary(
+                uniqueKeysWithValues: members.map {
+                    (
+                        $0,
+                        PhotoItem(
+                            uid: $0, captureTime: Date(timeIntervalSince1970: 1_749_456_000), mediaType: "image/png")
+                    )
+                })
+            let (screen, screenHost) = host(model: model)
+            for _ in 0..<200 where model.differingRowTitle == nil { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertNotNil(model.differingRowTitle)
+            let (list, listHost) = host(
+                ExactDuplicatesDifferingView(model: model, item: { items[$0] }, onOpen: { _, _ in }, cover: Self.tile))
+            // Only copies whose details differ: the empty state with its button.
+            let only = ExactDuplicatesModel(
+                finder: ScreenshotFinder(
+                    groups: [groups[1]], coverage: .complete, build: .none, otherDetails: [members[4]]))
+            let (empty, emptyHost) = host(model: only)
+            for _ in 0..<200 where only.differingRowTitle == nil { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertEqual(only.content, .noDuplicates)
+            XCTAssertNotNil(only.differingRowTitle)
+            let renders = [("screen", screen, screenHost), ("list", list, listHost), ("only", empty, emptyHost)]
+            for (name, window, view) in renders {
+                for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                    window.appearance = NSAppearance(named: appearance)
+                    try await Task.sleep(for: .milliseconds(500))
+                    let url = directory.appendingPathComponent(
+                        "duplicates-macos-differing-\(name)-\(appearance == .aqua ? "light" : "dark").png")
+                    try capture(view, to: url)
+                }
+                window.orderOut(nil)
+            }
+        }
+
         func testRenderNarrowAndLargeWaitingWindows() async throws {
             let directory = try outputDirectory()
             let members = (0..<4).map { PhotoUID(volumeID: "v", nodeID: "waiting-\($0)") }
@@ -197,23 +243,32 @@
         private func host(
             model: ExactDuplicatesModel, width: CGFloat = 1400, height: CGFloat = 900
         ) -> (NSWindow, NSView) {
-            let view = ExactDuplicatesView(
-                model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
-                onOpen: { _, _ in }
-            ) { uid in
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color(hue: Self.hue(of: uid), saturation: 0.45, brightness: 0.8))
-                    .frame(width: 132, height: 132)
-            }
-            .frame(width: width, height: height)
-            // The Mac route draws the window background behind the screen, as `MacDuplicatesView` does.
-            .background(Color(nsColor: .windowBackgroundColor))
+            host(
+                ExactDuplicatesView(
+                    model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
+                    onOpen: { _, _ in }, onShowDiffering: {}, isCoveredByDiffering: false, cover: Self.tile),
+                width: width, height: height)
+        }
+
+        private func host(_ screen: some View, width: CGFloat = 1400, height: CGFloat = 900) -> (NSWindow, NSView) {
+            let view =
+                screen
+                .frame(width: width, height: height)
+                // The Mac route draws the window background behind the screen, as `MacDuplicatesView` does.
+                .background(Color(nsColor: .windowBackgroundColor))
             let host = NSHostingView(rootView: view)
             host.frame = NSRect(x: 0, y: 0, width: width, height: height)
             let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
             window.contentView = host
             window.orderFrontRegardless()
             return (window, host)
+        }
+
+        /// A copy in its stable color.
+        private static func tile(_ uid: PhotoUID) -> some View {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(hue: hue(of: uid), saturation: 0.45, brightness: 0.8))
+                .frame(width: 132, height: 132)
         }
 
         /// A stable color for each photo, so the copies of a group look alike between runs.
@@ -240,7 +295,7 @@
             ZStack {
                 ExactDuplicatesView(
                     model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
-                    onOpen: { _, _ in }
+                    onOpen: { _, _ in }, onShowDiffering: {}, isCoveredByDiffering: false
                 ) { uid in
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color(hue: Double(uid.nodeID.count % 7) / 7, saturation: 0.45, brightness: 0.8))
@@ -310,16 +365,19 @@
         let build: Build
         let holdsRanking: Bool
         let holdsScan: Bool
+        /// Copies whose details differ from the other copies of their bytes.
+        let otherDetails: Set<PhotoUID>
 
         init(
             groups: [ExactDuplicateGroup], coverage: ExactDuplicateCoverage, build: Build, holdsRanking: Bool = false,
-            holdsScan: Bool = false
+            holdsScan: Bool = false, otherDetails: Set<PhotoUID> = []
         ) {
             self.groups = groups
             self.coverage = coverage
             self.build = build
             self.holdsRanking = holdsRanking
             self.holdsScan = holdsScan
+            self.otherDetails = otherDetails
         }
 
         @MainActor func isSettled(_ model: ExactDuplicatesModel) -> Bool {
@@ -393,7 +451,10 @@
                 uniqueKeysWithValues: groups.map { group in
                     (
                         group.id,
-                        Dictionary(uniqueKeysWithValues: group.members.map { ($0, ExactDuplicateFingerprint()) })
+                        Dictionary(
+                            uniqueKeysWithValues: group.members.map {
+                                ($0, ExactDuplicateFingerprint(pixelWidth: otherDetails.contains($0) ? 1 : nil))
+                            })
                     )
                 })
             await ranked(
@@ -531,6 +592,7 @@
             ExactDuplicatesView(
                 model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
                 canOpen: { library.canOpen($0) }, libraryRevision: revision.value, onOpen: { _, _ in },
+                onShowDiffering: {}, isCoveredByDiffering: false,
                 cover: { _ in Color.teal.frame(width: 60, height: 60) })
         }
     }

@@ -3507,6 +3507,353 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertTrue(kept.isRanked)
         XCTAssertEqual(finder.rankCalls, ranks, "the screen reads nothing again")
     }
+
+    // MARK: - Copies with the same bytes and other details
+
+    private let differences: [ExactDuplicateDetail] = [.date, .place, .camera, .dimensions]
+
+    func testCopiesWithTheSameBytesAndOtherDetailsAreListedApartFromTheDuplicates() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupB], coverage: .complete)])
+        finder.fingerprints = [b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        XCTAssertEqual(model.groups, [], "no merge takes copies whose details differ")
+        XCTAssertNil(model.knownDuplicateCount)
+        XCTAssertNil(model.copyCountText)
+        XCTAssertEqual(model.content, .noDuplicates, "the screen says that no identical copies exist")
+        XCTAssertEqual(model.differingRowTitle, "\(L10n.string("duplicates.differing_title")) · 1")
+        XCTAssertEqual(
+            model.differingGroups,
+            [ExactDuplicateDifferingGroup(contentHash: "B", members: [b1, b2], differences: differences)])
+        XCTAssertEqual(model.differingGroup(withContentHash: "B"), model.differingGroups.first)
+        XCTAssertNil(model.differingGroup(withContentHash: "A"))
+        let group = try XCTUnwrap(model.differingGroups.first)
+        XCTAssertEqual(
+            group.members.map { model.accessibilityLabel(of: $0, in: group) },
+            [L10n.string("duplicates.member_label \(1) \(2)"), L10n.string("duplicates.member_label \(2) \(2)")])
+    }
+
+    func testTheRouteShowsTheDifferingListUntilItsLastGroupLeftAndKeepsItClosedAfterARescan() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other, b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        var route = ExactDuplicatesRoute()
+        route.showDiffering(of: model)
+        XCTAssertFalse(route.showsDiffering(of: model), "nothing opens before the check lists a group")
+        await model.load()
+
+        route.showDiffering(of: model)
+        XCTAssertTrue(route.showsDiffering(of: model))
+        XCTAssertFalse(route.offersMergeAll(of: model), "Merge All belongs to the duplicates")
+        route.back()
+        XCTAssertFalse(route.showsDiffering(of: model))
+        XCTAssertTrue(route.offersMergeAll(of: model))
+
+        route.showDiffering(of: model)
+        model.didTrashElsewhere([a3, b2])
+        route.follow(model)
+        XCTAssertFalse(route.showsDiffering(of: model), "the list closes when its last group left")
+        // A rescan lists both groups again, as the deleted copies came back.
+        await model.load()
+        route.follow(model)
+        XCTAssertNotNil(model.differingRowTitle)
+        XCTAssertFalse(route.showsDiffering(of: model), "the list opens again only when the person opens it")
+    }
+
+    func testTheRowCountsTheDifferingGroupsAndTheLineNamesTheDetailsThatDiffer() async throws {
+        let c1 = PhotoUID(volumeID: "v", nodeID: "c1")
+        let c2 = PhotoUID(volumeID: "v", nodeID: "c2")
+        let groupC = ExactDuplicateGroup(contentHash: "C", hashKeyEpoch: "e", members: [c1, c2])
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB, groupC], coverage: .complete)])
+        finder.fingerprints = [
+            a1: described, a2: described, a3: other, b1: described, b2: other,
+            c1: ExactDuplicateFingerprint(durationSeconds: 1, mimeType: "video/mp4"),
+            c2: ExactDuplicateFingerprint(durationSeconds: 2, mimeType: "video/quicktime"),
+        ]
+        let (model, _) = makeModel(finder)
+        XCTAssertNil(model.differingRowTitle, "no row before the check")
+        await model.load()
+
+        XCTAssertEqual(model.differingRowTitle, "\(L10n.string("duplicates.differing_title")) · 3")
+        let line = { (words: [String]) in
+            L10n.string("duplicates.differing_line \(ListFormatter.localizedString(byJoining: words))")
+        }
+        let b = try XCTUnwrap(model.differingGroups.first { $0.id == "B" })
+        XCTAssertEqual(
+            model.differenceLine(of: b, item: { _ in nil }),
+            line(["date", "place", "camera", "dimensions"].map { L10n.string(dynamicKey: "duplicates.detail_\($0)") }))
+        let live = { (uid: PhotoUID) in
+            PhotoItem(uid: uid, captureTime: Date(), mediaType: "video/mp4", isLivePhoto: uid == c1)
+        }
+        let c = try XCTUnwrap(model.differingGroups.first { $0.id == "C" })
+        XCTAssertEqual(
+            model.differenceLine(of: c, item: live),
+            line(["duration", "file_type", "live_photo"].map { L10n.string(dynamicKey: "duplicates.detail_\($0)") }))
+    }
+
+    func testACopyWithOtherDetailsIsListedWithEveryCopyOfItsBytes() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        XCTAssertEqual(model.groups.map(\.members), [[a1, a2]], "the equal copies stay one duplicate group")
+        XCTAssertEqual(
+            model.differingGroups,
+            [ExactDuplicateDifferingGroup(contentHash: "A", members: [a1, a2, a3], differences: differences)])
+    }
+
+    func testDifferingCopiesJoinNoMergeNoCountAndNoFreedSpace() async {
+        let finder = FakeDuplicateFinder(
+            scans: [.init(groups: [groupA, groupB], coverage: .complete, byteSizes: ["A": 100, "B": 10])])
+        finder.fingerprints = [a1: described, a2: described, a3: other, b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        XCTAssertEqual(model.differingGroups.map(\.id), ["A", "B"])
+        // The numbers are the ones that the screen showed before it listed differing copies.
+        XCTAssertEqual(model.knownDuplicateCount, 1)
+        XCTAssertEqual(model.copyCount, 2)
+        XCTAssertEqual(model.duplicateCount, 1)
+        XCTAssertEqual(model.totalFreedBytes, 100)
+        XCTAssertTrue(model.canMerge(containing: a1))
+        XCTAssertFalse(model.canMerge(containing: a3))
+        XCTAssertFalse(model.canMerge(containing: b1))
+        XCTAssertFalse(model.canMerge(containing: b2))
+
+        await model.mergeAll()
+
+        XCTAssertEqual(finder.merges, [.init(group: "A", kept: a1)], "Merge All takes only the equal copies")
+    }
+
+    func testCopiesWhoseDetailsAreUnknownAreNotListed() async {
+        for setUp: (FakeDuplicateFinder) -> Void in [
+            { $0.unreadableGroups = ["B"] },
+            { $0.withoutFingerprints = ["B"] },
+            { $0.fingerprints.merge([self.b1: .matchingOnly(self.b1), self.b2: self.described]) { _, new in new } },
+        ] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+            finder.fingerprints = [a1: .matchingOnly(a1), a2: described, a3: other]
+            setUp(finder)
+            let (model, _) = makeModel(finder)
+            await model.load()
+
+            XCTAssertEqual(
+                model.differingGroups,
+                [ExactDuplicateDifferingGroup(contentHash: "A", members: [a2, a3], differences: differences)],
+                "a copy without photo details is left out, and B has no two copies with known details")
+        }
+    }
+
+    func testCopiesWithEqualDetailsAreNotListed() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: described]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        XCTAssertEqual(model.groups.map(\.id), ["A", "B"])
+        XCTAssertEqual(model.differingGroups, [])
+    }
+
+    func testTheDifferingRowWaitsForTheCheckLikeTheDuplicates() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other]
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load(checkAllGroups: true) }
+        await assertEventually({ finder.rankGate.hasWaiters }, "the screen checks metadata")
+        XCTAssertNil(model.differingRowTitle, "the screen shows a count only from a finished check")
+
+        finder.rankGate.open()
+        await load.value
+
+        XCTAssertEqual(model.differingRowTitle, "\(L10n.string("duplicates.differing_title")) · 1")
+        XCTAssertEqual(model.differingGroups.map(\.id), ["A"])
+    }
+
+    func testAnOpenDifferingListStaysWhileALaterCheckRuns() async {
+        let c1 = PhotoUID(volumeID: "v", nodeID: "c1")
+        let c2 = PhotoUID(volumeID: "v", nodeID: "c2")
+        let groupC = ExactDuplicateGroup(contentHash: "C", hashKeyEpoch: "e", members: [c1, c2])
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other, b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        await model.load(checkAllGroups: true)
+        var route = ExactDuplicatesRoute()
+        route.showDiffering(of: model)
+        XCTAssertTrue(route.showsDiffering(of: model))
+        // A later scan, as after an index build, finds a group whose metadata are not read yet.
+        finder.replaceScans([.init(groups: [groupA, groupB, groupC], coverage: .complete)])
+        finder.rankGate.close()
+        let rescan = Task { await model.load(checkAllGroups: true) }
+        await assertEventually({ finder.rankGate.hasWaiters }, "the check reads the new group")
+        XCTAssertTrue(model.isCheckingGroups)
+
+        route.follow(model)
+
+        XCTAssertTrue(route.showsDiffering(of: model), "the open list stays while the check runs")
+        XCTAssertEqual(model.differingGroups.map(\.id), ["A", "B"])
+        finder.rankGate.open()
+        await rescan.value
+        route.follow(model)
+        XCTAssertTrue(route.showsDiffering(of: model))
+    }
+
+    func testAScreenLoadsOnceWhileItLivesAndItsEndStopsTheCheck() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        var screen: ExactDuplicatesScreenLoad? = ExactDuplicatesScreenLoad(model: model)
+        screen?.appear()
+        await assertEventually({ finder.rankGate.hasWaiters }, "the screen checks metadata")
+        XCTAssertTrue(model.isCheckingGroups)
+
+        // Back from the differing copies, the screen appears again without a new load.
+        screen?.appear()
+        XCTAssertEqual(finder.scanCalls, 1)
+        // The screen ends while the differing copies cover it, so no disappearance stopped it.
+        screen = nil
+
+        await assertEventually({ !model.isCheckingGroups }, "the end of the screen stops its check")
+        finder.rankGate.open()
+    }
+
+    func testAScreenThatWentAwayLoadsAgainWhenItAppears() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        let screen = ExactDuplicatesScreenLoad(model: model)
+        screen.appear()
+        await assertEventually({ model.content == .groups }, "the screen loaded")
+
+        screen.stop()
+        screen.appear()
+
+        await assertEventually({ finder.scanCalls == 2 }, "the next appearance loads again")
+    }
+
+    func testADeletedCopyLeavesTheDifferingListAfterTheReload() async {
+        let afterDelete = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: [a1, a2])
+        let finder = FakeDuplicateFinder(scans: [
+            .init(groups: [groupA, groupB], coverage: .complete), .init(groups: [afterDelete], coverage: .complete),
+        ])
+        finder.fingerprints = [a1: described, a2: described, a3: other, b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        XCTAssertEqual(model.differingGroups.map(\.id), ["A", "B"])
+
+        // The person deleted a3 and b2 in the library; B has one copy left, so the scan no longer finds it.
+        await model.load()
+
+        XCTAssertEqual(model.differingGroups, [])
+        XCTAssertEqual(model.groups.map(\.members), [[a1, a2]])
+    }
+
+    func testACopyDeletedInTheLibraryLeavesTheDifferingListAtOnce() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other, b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let scans = finder.scanCalls
+
+        model.didTrashElsewhere([a1])
+
+        XCTAssertEqual(
+            model.differingGroups,
+            [
+                ExactDuplicateDifferingGroup(contentHash: "A", members: [a2, a3], differences: differences),
+                ExactDuplicateDifferingGroup(contentHash: "B", members: [b1, b2], differences: differences),
+            ])
+
+        model.didTrashElsewhere([a3, b2])
+
+        XCTAssertEqual(model.differingGroups, [], "A keeps only equal copies, and B keeps one copy")
+        XCTAssertEqual(finder.scanCalls, scans, "the list follows without a new scan")
+    }
+
+    func testCopiesThatAMergeMovedToRecentlyDeletedLeaveTheDifferingList() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        await model.merge(groupID: "A")
+
+        XCTAssertEqual(finder.merges, [.init(group: "A", kept: a1)])
+        XCTAssertEqual(
+            model.differingGroups,
+            [ExactDuplicateDifferingGroup(contentHash: "A", members: [a1, a3], differences: differences)])
+    }
+
+    func testLivePhotoIsADifferenceOnlyBesideADetailThatDiffers() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        // A's copies differ only in Live Photo, B's also in their details.
+        finder.fingerprints = [b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let live: Set<PhotoUID> = [a1, b1]
+        let item = { (uid: PhotoUID) in
+            PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/heic", isLivePhoto: live.contains(uid))
+        }
+
+        XCTAssertEqual(model.groups.map(\.id), ["A"], "copies that differ only in Live Photo stay duplicates")
+        XCTAssertEqual(model.differingGroups.map(\.id), ["B"])
+        XCTAssertEqual(model.differingGroups.first?.differences(with: item), differences + [.livePhoto])
+        XCTAssertEqual(
+            model.differingGroups.first?.differences(with: { _ in nil }), differences,
+            "without the library items, Live Photo is not named")
+    }
+
+    func testTheViewerOfDifferingCopiesShowsEveryCopyOfItsBytesAndNoOtherGroup() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let item = { (uid: PhotoUID) in
+            uid == self.a2 ? nil : PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/heic")
+        }
+
+        let opened = model.viewerItems(opening: a3, inDiffering: "A", item: item)
+
+        XCTAssertEqual(opened?.items.map(\.uid), [a1, a3], "the copies that the library shows, a2 not yet")
+        XCTAssertEqual(opened?.index, 1)
+        XCTAssertNil(model.viewerItems(opening: a2, inDiffering: "A", item: item), "the tapped copy is not ready")
+        XCTAssertNil(model.viewerItems(opening: a1, inDiffering: "B", item: item))
+        XCTAssertEqual(
+            model.viewerItems(opening: a1, inGroup: "A", item: item)?.items.map(\.uid), [a1],
+            "the identical group shows only its own copies")
+    }
+
+    func testTheMetadataOfAnEarlierLaunchListTheDifferingCopiesWithoutAReading() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.stored = [a1: described, a2: described, a3: other, b1: described, b2: other]
+        // The node reads fail, so only the saved metadata can list the copies.
+        finder.unreadableGroups = ["A", "B"]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        XCTAssertEqual(
+            model.differingGroups,
+            [
+                ExactDuplicateDifferingGroup(contentHash: "A", members: [a1, a2, a3], differences: differences),
+                ExactDuplicateDifferingGroup(contentHash: "B", members: [b1, b2], differences: differences),
+            ])
+    }
+
+    func testAReopenedScreenListsTheDifferingCopiesWithoutReadingThemAgain() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other, b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let listed = model.differingGroups
+        XCTAssertEqual(listed.map(\.id), ["A", "B"])
+        let ranks = finder.rankCalls
+
+        await model.load()
+
+        XCTAssertEqual(model.differingGroups, listed)
+        XCTAssertEqual(finder.rankCalls, ranks, "the screen reads nothing again")
+    }
 }
 
 @MainActor
@@ -3558,6 +3905,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var withoutFingerprints: Set<String> = []
     /// The capture dates that the device knows.
     var dates: [PhotoUID: Date] = [:]
+    /// The metadata that an earlier launch saved.
+    var stored: [PhotoUID: ExactDuplicateFingerprint] = [:]
     /// Holds the scan while it is closed.
     let scanGate = BuildGate()
     /// Holds the ranking while it is closed.
@@ -3611,6 +3960,11 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
 
     func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] {
         lock.withLock { dates.filter { members.contains($0.key) } }
+    }
+
+    func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint] {
+        let members = Set(groups.flatMap(\.members))
+        return lock.withLock { stored.filter { members.contains($0.key) } }
     }
 
     func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {

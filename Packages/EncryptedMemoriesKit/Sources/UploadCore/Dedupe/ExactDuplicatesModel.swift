@@ -310,8 +310,8 @@ public final class ExactDuplicatesModel {
 
         /// The spoken label of `member`: its position, whether it is kept, its badges, and its size.
         public func accessibilityLabel(of member: PhotoUID) -> String {
-            guard let position = members.firstIndex(of: member) else { return "" }
-            var parts = [L10n.string("duplicates.member_label \(position + 1) \(members.count)")]
+            guard members.contains(member) else { return "" }
+            var parts = [ExactDuplicatesModel.positionLabel(of: member, in: members)]
             if member == kept { parts.append(L10n.string("duplicates.member_kept")) }
             parts += badges(of: member).map(\.title)
             if let size = byteSize(of: member) { parts.append(ExactDuplicatesModel.byteText(size)) }
@@ -422,6 +422,9 @@ public final class ExactDuplicatesModel {
     public var visibleGroups: [Group] {
         isCheckingGroups || hasInvalidatedGroups ? [] : groups.filter(\.isRanked)
     }
+    /// The copies with the same bytes whose details differ, each group with the known metadata of every copy. No
+    /// merge, count, or freed space includes them. A later check keeps them, so an open list stays while it runs.
+    public private(set) var differingGroups: [ExactDuplicateDifferingGroup] = []
     /// The screen waits for its scan and metadata check.
     public private(set) var isCheckingGroups = false
     /// The metadata check, else the running library check, for example while a reopened screen reads its groups.
@@ -534,6 +537,11 @@ public final class ExactDuplicatesModel {
     /// The metadata of each copy that a ranking read. A screen that opens again splits its groups at once by them.
     /// A merge that finds other metadata drops those of its group.
     @ObservationIgnored private var knownFingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
+    /// The metadata that an earlier launch saved, as the last scan read them.
+    @ObservationIgnored private var storedFingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
+    /// The groups of the last scan, one for each content hash, in the order of the scan, without the copies that left
+    /// the library since.
+    @ObservationIgnored private var scannedGroups: [ExactDuplicateGroup] = []
     /// The candidates of the last scan that a ranking already read and found to be no duplicates. They leave the list,
     /// but the check of a reopened screen counts them as done.
     @ObservationIgnored private var checkedNonDuplicates = 0
@@ -735,6 +743,46 @@ public final class ExactDuplicatesModel {
         hasCheckedGroups ? L10n.string("duplicates.copy_count \(copyCount)") : nil
     }
 
+    /// The listed differing copies of `contentHash`.
+    public func differingGroup(withContentHash contentHash: String) -> ExactDuplicateDifferingGroup? {
+        differingGroups.first { $0.contentHash == contentHash }
+    }
+
+    /// The spoken label of a differing copy: its position among the copies of its group.
+    public func accessibilityLabel(of member: PhotoUID, in group: ExactDuplicateDifferingGroup) -> String {
+        Self.positionLabel(of: member, in: group.members)
+    }
+
+    /// "Copy 2 of 3" for `member` of `members`.
+    nonisolated static func positionLabel(of member: PhotoUID, in members: [PhotoUID]) -> String {
+        guard let position = members.firstIndex(of: member) else { return "" }
+        return L10n.string("duplicates.member_label \(position + 1) \(members.count)")
+    }
+
+    /// The row that opens the differing copies, with their group count. Nil while no group is listed, and while
+    /// `visibleGroups` is empty for a check, so the screen shows a count only from a finished check.
+    public var differingRowTitle: String? {
+        let count = isCheckingGroups || hasInvalidatedGroups ? 0 : differingGroups.count
+        return count == 0 ? nil : "\(L10n.string("duplicates.differing_title")) · \(count.formatted())"
+    }
+
+    /// The line above a group of differing copies that names the details that differ. `item` finds a copy in the
+    /// library, so a Live Photo among copies that are not is named, too.
+    public func differenceLine(of group: ExactDuplicateDifferingGroup, item: (PhotoUID) -> PhotoItem?) -> String {
+        let words = group.differences(with: item).map { detail in
+            switch detail {
+            case .date: L10n.string("duplicates.detail_date")
+            case .place: L10n.string("duplicates.detail_place")
+            case .camera: L10n.string("duplicates.detail_camera")
+            case .dimensions: L10n.string("duplicates.detail_dimensions")
+            case .duration: L10n.string("duplicates.detail_duration")
+            case .fileType: L10n.string("duplicates.detail_file_type")
+            case .livePhoto: L10n.string("duplicates.detail_live_photo")
+            }
+        }
+        return L10n.string("duplicates.differing_line \(ListFormatter.localizedString(byJoining: words))")
+    }
+
     /// The title and the text of the explanation beside `copyCountText`.
     public var infoTitle: String { L10n.string("duplicates.info_title") }
     public var infoMessage: String { L10n.string("duplicates.info_message") }
@@ -822,7 +870,23 @@ public final class ExactDuplicatesModel {
     public func viewerItems(
         opening member: PhotoUID, inGroup groupID: String, item: (PhotoUID) -> PhotoItem?
     ) -> (items: [PhotoItem], index: Int)? {
-        guard let members = group(withID: groupID)?.members, members.contains(member) else { return nil }
+        group(withID: groupID).flatMap { Self.viewerItems(opening: member, among: $0.members, item: item) }
+    }
+
+    /// The photos to show in the viewer when the person opens `member` of the differing copies of `contentHash`, as
+    /// `viewerItems(opening:inGroup:item:)` finds them. The viewer offers no merge for them.
+    public func viewerItems(
+        opening member: PhotoUID, inDiffering contentHash: String, item: (PhotoUID) -> PhotoItem?
+    ) -> (items: [PhotoItem], index: Int)? {
+        differingGroup(withContentHash: contentHash).flatMap {
+            Self.viewerItems(opening: member, among: $0.members, item: item)
+        }
+    }
+
+    private static func viewerItems(
+        opening member: PhotoUID, among members: [PhotoUID], item: (PhotoUID) -> PhotoItem?
+    ) -> (items: [PhotoItem], index: Int)? {
+        guard members.contains(member) else { return nil }
         let items = members.compactMap(item)
         guard let index = items.firstIndex(where: { $0.uid == member }) else { return nil }
         return (items, index)
@@ -833,6 +897,7 @@ public final class ExactDuplicatesModel {
     /// to the next copy.
     public func didTrashElsewhere(_ uids: [PhotoUID]) {
         let trashed = Set(uids)
+        leaveDifferingGroups(trashed)
         guard groups.contains(where: { group in group.members.contains(where: trashed.contains) }) else { return }
         var updated = groups
         for index in updated.indices.reversed() where updated[index].members.contains(where: trashed.contains) {
@@ -979,6 +1044,9 @@ public final class ExactDuplicatesModel {
                 }
             }
             groups = shown
+            scannedGroups = scan.groups
+            storedFingerprints = stored
+            showDifferingGroups()
             checkedNonDuplicates = nonDuplicates
             // A hash whose members changed needs another verdict, even if it was checked before this rescan.
             rankingRequested.formIntersection(Set(rankingQueue).union(shown.filter(\.isRanked).map(\.id)))
@@ -1189,6 +1257,25 @@ public final class ExactDuplicatesModel {
         }
         if !replacements.isEmpty { updated = updated.indices.flatMap { replacements[$0] ?? [updated[$0]] } }
         if changed { groups = updated }
+        if !replacements.isEmpty { showDifferingGroups() }
+    }
+
+    /// Builds the differing copies from the groups of the last scan and every known fingerprint, read in this session
+    /// or saved by an earlier launch. A group is listed once the metadata of each of its copies are known.
+    private func showDifferingGroups() {
+        let known = storedFingerprints.merging(knownFingerprints) { _, read in read }
+        let differing = scannedGroups.compactMap { $0.differing(by: known) }
+        if differing != differingGroups { differingGroups = differing }
+    }
+
+    /// The copies in `trashed` left the library, so they leave the differing copies at once, without a new scan.
+    private func leaveDifferingGroups(_ trashed: Set<PhotoUID>) {
+        guard scannedGroups.contains(where: { $0.members.contains(where: trashed.contains) }) else { return }
+        scannedGroups = scannedGroups.map { group in
+            let remaining = group.members.filter { !trashed.contains($0) }
+            return remaining.count == group.members.count ? group : group.keeping(remaining)
+        }
+        showDifferingGroups()
     }
 
     /// The position of each group by its ID.
@@ -1510,6 +1597,7 @@ public final class ExactDuplicatesModel {
                 }
             }
             if updated != groups { groups = updated }
+            leaveDifferingGroups(Set(trashed))
             if !trashed.isEmpty { await didTrash(trashed) }
             guard all else { continue }
             mergeAllProgress = ExactDuplicateScanProgress(completed: handled, total: selected.count)

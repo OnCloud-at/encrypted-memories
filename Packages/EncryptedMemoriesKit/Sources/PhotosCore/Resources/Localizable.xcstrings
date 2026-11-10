@@ -6743,6 +6743,77 @@
         "de": { "stringUnit": { "state": "translated", "value": "Duplikate" } }
       }
     },
+    "duplicates.differing_title": {
+      "comment": "Row in the Duplicates summary and title of the list of copies with the same bytes whose details differ.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Same Photo, Different Details" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Gleiches Foto, andere Angaben" } }
+      }
+    },
+    "duplicates.differing_message": {
+      "comment": "Explanation at the top of the list of copies with the same bytes whose details differ.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "These copies have the same image, but their date, place, or other details differ. Open a copy to compare them. Move the copies you don't need to the Trash. You can restore them from Recently Deleted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Diese Kopien haben dasselbe Bild, aber Datum, Ort oder andere Angaben weichen ab. Öffne eine Kopie zum Vergleichen. Lege die Kopien, die du nicht brauchst, in den Papierkorb. Aus „Zuletzt gelöscht“ kannst du sie wiederherstellen." } }
+      }
+    },
+    "duplicates.differing_line %@": {
+      "comment": "Above one group of copies whose details differ. %@ is a list of details, for example date and place.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Differs in %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Abweichend: %@" } }
+      }
+    },
+    "duplicates.detail_date": {
+      "comment": "A detail that differs between copies: the capture date.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "date" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Datum" } }
+      }
+    },
+    "duplicates.detail_place": {
+      "comment": "A detail that differs between copies: the place.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "place" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ort" } }
+      }
+    },
+    "duplicates.detail_camera": {
+      "comment": "A detail that differs between copies: the camera.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "camera" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Kamera" } }
+      }
+    },
+    "duplicates.detail_dimensions": {
+      "comment": "A detail that differs between copies: the pixel width and height.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "dimensions" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Abmessungen" } }
+      }
+    },
+    "duplicates.detail_duration": {
+      "comment": "A detail that differs between copies: the length of a video.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "duration" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dauer" } }
+      }
+    },
+    "duplicates.detail_file_type": {
+      "comment": "A detail that differs between copies: the file type.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "file type" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dateityp" } }
+      }
+    },
+    "duplicates.detail_live_photo": {
+      "comment": "A detail that differs between copies: one is a Live Photo.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Live Photo" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Live Photo" } }
+      }
+    },
     "duplicates.merge": {
       "comment": "Merges one group of duplicates.",
       "localizations": {

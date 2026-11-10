@@ -138,7 +138,7 @@
         private static func host(model: ExactDuplicatesModel) -> (NSWindow, NSView) {
             let view = ExactDuplicatesView(
                 model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
-                onOpen: { _, _ in }
+                onOpen: { _, _ in }, onShowDiffering: {}, isCoveredByDiffering: false
             ) { _ in
                 RoundedRectangle(cornerRadius: 6).fill(Color.teal).frame(width: 132, height: 132)
             }

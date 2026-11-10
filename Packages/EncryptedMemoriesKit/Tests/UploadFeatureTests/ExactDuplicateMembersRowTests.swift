@@ -102,7 +102,7 @@
                 })
             let view = ExactDuplicatesView(
                 model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
-                onOpen: { _, _ in }
+                onOpen: { _, _ in }, onShowDiffering: {}, isCoveredByDiffering: false
             ) { uid in
                 ExactDuplicateThumbnail(uid: uid, side: 132, cornerRadius: 6, thumbnails: thumbnails)
             }

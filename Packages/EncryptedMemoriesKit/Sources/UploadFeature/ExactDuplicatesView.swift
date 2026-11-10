@@ -15,17 +15,25 @@ public struct ExactDuplicatesView<Cover: View>: View {
     private let canOpen: (PhotoUID) -> Bool
     private let libraryRevision: UInt64
     private let onOpen: (PhotoUID, String) -> Void
+    private let onShowDiffering: () -> Void
+    private let isCoveredByDiffering: Bool
     private let cover: (PhotoUID) -> Cover
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The load and the check of this screen, for its whole life. The end of the screen stops them.
+    @State private var load: ExactDuplicatesScreenLoad?
 
     /// `accent` colors the checkmark and the border of the photo to keep.
     /// `cornerRadius` is the corner radius of `cover`. `canOpen` tells whether the library shows a photo yet, so
     /// the viewer can open it; a host whose library is not observed passes a `libraryRevision` that changes with the
     /// photos it shows, so a copy that was not ready redraws. `onOpen` receives a photo and the ID of its group.
+    /// `onShowDiffering` shows `ExactDuplicatesDifferingView`, the copies with the same bytes whose details differ.
+    /// While `isCoveredByDiffering`, that list covers this screen: the screen keeps its load and check, so going back
+    /// reads nothing again.
     public init(
         model: ExactDuplicatesModel, confirmsMergeAll: Binding<Bool>, accent: Color, cornerRadius: CGFloat,
         canOpen: @escaping (PhotoUID) -> Bool = { _ in true }, libraryRevision: UInt64 = 0,
-        onOpen: @escaping (PhotoUID, String) -> Void, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
+        onOpen: @escaping (PhotoUID, String) -> Void, onShowDiffering: @escaping () -> Void,
+        isCoveredByDiffering: Bool, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
     ) {
         self.model = model
         _confirmsMergeAll = confirmsMergeAll
@@ -34,6 +42,8 @@ public struct ExactDuplicatesView<Cover: View>: View {
         self.canOpen = canOpen
         self.libraryRevision = libraryRevision
         self.onOpen = onOpen
+        self.onShowDiffering = onShowDiffering
+        self.isCoveredByDiffering = isCoveredByDiffering
         self.cover = cover
     }
 
@@ -63,8 +73,14 @@ public struct ExactDuplicatesView<Cover: View>: View {
             } message: {
                 if let message = model.notice?.message, !message.isEmpty { Text(message) }
             }
-            .task { await model.load(checkAllGroups: true) }
-            .onDisappear { model.screenDisappeared() }
+            .onAppear {
+                if load == nil { load = ExactDuplicatesScreenLoad(model: model) }
+                load?.appear()
+            }
+            .onDisappear {
+                // Under the differing copies the check goes on; the end of the screen stops it.
+                if !isCoveredByDiffering { load?.stop() }
+            }
     }
 
     /// The waiting and empty states keep a readable width, so a wide Mac window does not stretch their text.
@@ -91,8 +107,14 @@ public struct ExactDuplicatesView<Cover: View>: View {
             .frame(maxWidth: Self.readableWidth)
         case .noDuplicates:
             let copy = model.emptyStateCopy
-            ContentUnavailableView(copy.title, systemImage: copy.systemImage, description: Text(copy.description))
-                .frame(maxWidth: Self.readableWidth)
+            ContentUnavailableView {
+                Label(copy.title, systemImage: copy.systemImage)
+            } description: {
+                Text(copy.description)
+            } actions: {
+                differingButton
+            }
+            .frame(maxWidth: Self.readableWidth)
         case .stillChecking:
             let copy = model.emptyStateCopy
             ContentUnavailableView {
@@ -104,15 +126,26 @@ public struct ExactDuplicatesView<Cover: View>: View {
                     progressRow(line, showsTitle: false)
                         .accessibilityIdentifier("duplicates.checkProgress")
                 }
+                differingButton
             }
             .frame(maxWidth: Self.readableWidth)
         case .groups:
             // Progress of the check changes this view often; the list compares equal and keeps its rows.
             ExactDuplicatesGroupList(
                 model: model, accent: accent, cornerRadius: cornerRadius, reduceMotion: reduceMotion, canOpen: canOpen,
-                libraryRevision: libraryRevision, onOpen: onOpen, cover: cover
+                libraryRevision: libraryRevision, onOpen: onOpen, onShowDiffering: onShowDiffering, cover: cover
             )
             .equatable()
+        }
+    }
+
+    /// Without identical copies, the copies whose details differ open from a button under the empty state.
+    @ViewBuilder private var differingButton: some View {
+        if let title = model.differingRowTitle {
+            Button(title, action: onShowDiffering)
+                .buttonStyle(.bordered)
+                .monospacedDigit()
+                .accessibilityIdentifier("duplicates.differing")
         }
     }
 
@@ -183,60 +216,37 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
     let canOpen: (PhotoUID) -> Bool
     let libraryRevision: UInt64
     let onOpen: (PhotoUID, String) -> Void
+    let onShowDiffering: () -> Void
     let cover: (PhotoUID) -> Cover
-    #if os(iOS)
-        @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    #endif
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.model === rhs.model && lhs.accent == rhs.accent && lhs.cornerRadius == rhs.cornerRadius
             && lhs.reduceMotion == rhs.reduceMotion && lhs.libraryRevision == rhs.libraryRevision
     }
 
-    /// The margin of the cards, and of their content inside them, as the inset grouped list uses it.
-    private var margin: CGFloat {
-        #if os(iOS)
-            horizontalSizeClass == .regular ? 20 : 16
-        #else
-            24
-        #endif
-    }
-
     var body: some View {
         let canMerge = model.canMerge
         let groups = IndexedGroups(base: model.visibleGroups)
-        let list = ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 12) {
-                    ExactDuplicatesSummary(model: model)
-                        .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
-                    ExactDuplicatesStatusRows(model: model, margin: margin)
-                }
-                .padding(.bottom, DuplicatesLayout.cards ? 0 : 10)
-                ForEach(groups, id: \.element.id) { index, group in
-                    section(group, at: index, canMerge: canMerge)
-                }
+        DuplicatesColumn(refreshing: model) { margin in
+            VStack(alignment: .leading, spacing: 12) {
+                ExactDuplicatesSummary(model: model)
+                    .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
+                ExactDuplicatesDifferingRow(model: model, margin: margin, action: onShowDiffering)
+                ExactDuplicatesStatusRows(model: model, margin: margin)
             }
-            .padding(.horizontal, DuplicatesLayout.cards ? margin : 24)
-            .padding(.vertical, 12)
-            // A wide window or iPad adds margins instead of long rows.
-            .frame(maxWidth: DuplicatesLayout.maxWidth, alignment: .leading)
-            .frame(maxWidth: .infinity)
+            .padding(.bottom, DuplicatesLayout.cards ? 0 : 10)
+            ForEach(groups, id: \.element.id) { index, group in
+                section(group, at: index, canMerge: canMerge, margin: margin)
+            }
         }
-        #if os(iOS)
-            return
-                list
-                .background(ProtonColor.groupedBackground.ignoresSafeArea())
-                .refreshable { await model.load() }
-        #else
-            return list
-        #endif
     }
 
     /// One group: its header, its copies, and its footer. The headers scroll with their groups, so none of them
     /// stays under the bars.
     @ViewBuilder
-    private func section(_ group: ExactDuplicatesModel.Group, at index: Int, canMerge: Bool) -> some View {
+    private func section(
+        _ group: ExactDuplicatesModel.Group, at index: Int, canMerge: Bool, margin: CGFloat
+    ) -> some View {
         if DuplicatesLayout.cards {
             VStack(alignment: .leading, spacing: 8) {
                 part(.header, of: group, at: index, canMerge: canMerge)
@@ -302,6 +312,16 @@ private enum DuplicatesLayout {
 }
 
 extension View {
+    /// A pull that reads the groups of `model` again, or no pull without a model.
+    @ViewBuilder
+    fileprivate func refreshable(_ model: ExactDuplicatesModel?) -> some View {
+        if let model {
+            refreshable { await model.load() }
+        } else {
+            self
+        }
+    }
+
     /// A rounded card on the grouped background, as an inset grouped list draws a section.
     fileprivate func duplicatesCard() -> some View {
         #if os(iOS)
@@ -311,6 +331,179 @@ extension View {
         #else
             self
         #endif
+    }
+}
+
+/// The scrolling column of both lists: rounded cards on the grouped background on iPhone and iPad, a calm column on the
+/// Mac. `content` receives the margin of the cards, and of their content inside them, as an inset grouped list uses
+/// it.
+private struct DuplicatesColumn<Content: View>: View {
+    /// A pull on iPhone and iPad reads the groups of this model again. Nil offers no pull.
+    let refreshing: ExactDuplicatesModel?
+    @ViewBuilder let content: (CGFloat) -> Content
+    #if os(iOS)
+        @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
+
+    private var margin: CGFloat {
+        #if os(iOS)
+            horizontalSizeClass == .regular ? 20 : 16
+        #else
+            24
+        #endif
+    }
+
+    var body: some View {
+        let list = ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                content(margin)
+            }
+            .padding(.horizontal, DuplicatesLayout.cards ? margin : 24)
+            .padding(.vertical, 12)
+            // A wide window or iPad adds margins instead of long rows.
+            .frame(maxWidth: DuplicatesLayout.maxWidth, alignment: .leading)
+            .frame(maxWidth: .infinity)
+        }
+        #if os(iOS)
+            return
+                list
+                .background(ProtonColor.groupedBackground.ignoresSafeArea())
+                .refreshable(refreshing)
+        #else
+            return list
+        #endif
+    }
+}
+
+/// The row that opens the copies with the same bytes whose details differ, with their count. Hidden while there are
+/// none.
+private struct ExactDuplicatesDifferingRow: View {
+    let model: ExactDuplicatesModel
+    let margin: CGFloat
+    let action: () -> Void
+
+    var body: some View {
+        if let title = model.differingRowTitle {
+            Button(action: action) {
+                HStack(spacing: 8) {
+                    Text(title)
+                        .monospacedDigit()
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.forward")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+                .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
+                .padding(.vertical, DuplicatesLayout.cards ? 12 : 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .duplicatesCard()
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("duplicates.differing")
+        }
+    }
+}
+
+/// The copies with the same bytes whose details differ: an explanation, then each group with the details that differ
+/// and its copies. A tap or click opens a copy in the viewer of the library, where the person can move it to the
+/// trash. Nothing here merges or keeps a copy.
+public struct ExactDuplicatesDifferingView<Cover: View>: View {
+    private let model: ExactDuplicatesModel
+    private let item: (PhotoUID) -> PhotoItem?
+    /// Changes with the photos that the library shows, so a copy that was not ready redraws.
+    private let libraryRevision: UInt64
+    private let onOpen: (PhotoUID, String) -> Void
+    private let cover: (PhotoUID) -> Cover
+
+    /// `item` finds a copy in the library; a copy that it does not find yet cannot open. A host whose library is not
+    /// observed passes a `libraryRevision` that changes with the photos it shows. `onOpen` receives a copy and the
+    /// content hash of its group, for `ExactDuplicatesModel.viewerItems(opening:inDiffering:item:)`.
+    public init(
+        model: ExactDuplicatesModel, item: @escaping (PhotoUID) -> PhotoItem?, libraryRevision: UInt64 = 0,
+        onOpen: @escaping (PhotoUID, String) -> Void, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
+    ) {
+        self.model = model
+        self.item = item
+        self.libraryRevision = libraryRevision
+        self.onOpen = onOpen
+        self.cover = cover
+    }
+
+    public var body: some View {
+        // Read here, not in the lazy column, so a change of the groups redraws the list.
+        let groups = Array(model.differingGroups.enumerated())
+        DuplicatesColumn(refreshing: nil) { margin in
+            Text(L10n.string("duplicates.differing_message"))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
+                .accessibilityIdentifier("duplicates.differing.message")
+            ForEach(groups, id: \.element.id) { index, group in
+                section(group, at: index, margin: margin)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func section(_ group: ExactDuplicateDifferingGroup, at index: Int, margin: CGFloat) -> some View {
+        let line = Text(model.differenceLine(of: group, item: item))
+            .font(DuplicatesLayout.titleFont)
+            .foregroundStyle(DuplicatesLayout.titleStyle)
+            .accessibilityIdentifier("duplicates.differing.line.\(index)")
+        let model = model
+        let members = ExactDuplicateDifferingMembers(
+            group: group, groupIndex: index, item: item, label: { model.accessibilityLabel(of: $0, in: group) },
+            open: onOpen, cover: cover)
+        if DuplicatesLayout.cards {
+            VStack(alignment: .leading, spacing: 8) {
+                line.padding(.horizontal, margin)
+                members
+                    .padding(.horizontal, margin)
+                    .padding(.vertical, 15)
+                    .duplicatesCard()
+            }
+            .padding(.top, 16)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Divider()
+                line.padding(.top, 8)
+                members
+            }
+            .padding(.bottom, 14)
+        }
+    }
+}
+
+/// The copies of one differing group, side by side. A tap or click opens a copy that the library shows.
+private struct ExactDuplicateDifferingMembers<Cover: View>: View {
+    let group: ExactDuplicateDifferingGroup
+    let groupIndex: Int
+    let item: (PhotoUID) -> PhotoItem?
+    /// The spoken label of a copy.
+    let label: (PhotoUID) -> String
+    let open: (PhotoUID, String) -> Void
+    let cover: (PhotoUID) -> Cover
+
+    var body: some View {
+        ExactDuplicateTileRow {
+            ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
+                let found = item(uid)
+                Button {
+                    if found != nil { open(uid, group.contentHash) }
+                } label: {
+                    cover(uid).overlay {
+                        if found == nil { ProgressView().controlSize(.small) }
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(label(uid))
+                .accessibilityIdentifier("duplicates.differing.member.\(groupIndex).\(index)")
+            }
+        }
+        .accessibilityIdentifier("duplicates.differing.group.\(groupIndex)")
     }
 }
 
@@ -531,41 +724,19 @@ private struct ExactDuplicateMembers<Cover: View>: View {
     let cornerRadius: CGFloat
     let actions: ExactDuplicateGroupActions
     let cover: (PhotoUID) -> Cover
-    /// The width of the copies and of the space for them. The row scrolls only when the copies are wider.
-    @State private var contentWidth: CGFloat = 0
-    @State private var availableWidth: CGFloat = 0
 
     var body: some View {
-        // A row that fits never takes a scroll gesture: a vertical one over it scrolls the list, not the row.
-        // A lazy stack builds only the copies near the screen, so a group of 1,000 copies loads a few thumbnails.
-        ScrollView(.horizontal) {
-            LazyHStack(spacing: 10) {
-                ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
-                    let isKept = uid == group.kept
-                    let keepTitle = group.keepTitle(for: uid)
-                    member(uid, isKept: isKept, keepTitle: keepTitle)
-                        .accessibilityLabel(group.accessibilityLabel(of: uid))
-                        .accessibilityAddTraits(isKept ? .isSelected : [])
-                        .accessibilityAction(named: Text(keepTitle)) { actions.keep(uid, group.id) }
-                        .accessibilityIdentifier("duplicates.member.\(groupIndex).\(index)")
-                }
-            }
-            .padding(.vertical, 4)
-            .onGeometryChange(for: CGFloat.self) {
-                $0.size.width
-            } action: {
-                contentWidth = $0
+        ExactDuplicateTileRow {
+            ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
+                let isKept = uid == group.kept
+                let keepTitle = group.keepTitle(for: uid)
+                member(uid, isKept: isKept, keepTitle: keepTitle)
+                    .accessibilityLabel(group.accessibilityLabel(of: uid))
+                    .accessibilityAddTraits(isKept ? .isSelected : [])
+                    .accessibilityAction(named: Text(keepTitle)) { actions.keep(uid, group.id) }
+                    .accessibilityIdentifier("duplicates.member.\(groupIndex).\(index)")
             }
         }
-        .scrollIndicators(.hidden)
-        .scrollBounceBehavior(.basedOnSize, axes: [.horizontal, .vertical])
-        .scrollDisabled(contentWidth <= availableWidth + 0.5)
-        .onGeometryChange(for: CGFloat.self) {
-            $0.size.width
-        } action: {
-            availableWidth = $0
-        }
-        .accessibilityElement(children: .contain)
     }
 
     /// A tap or click opens the photo; a long press or a secondary click offers Keep This Copy.
@@ -602,6 +773,39 @@ private struct ExactDuplicateMembers<Cover: View>: View {
             .buttonStyle(.plain)
             .contextMenu { keep }
         #endif
+    }
+}
+
+/// Copies side by side, in both lists.
+private struct ExactDuplicateTileRow<Content: View>: View {
+    @ViewBuilder let content: Content
+    /// The width of the copies and of the space for them. The row scrolls only when the copies are wider.
+    @State private var contentWidth: CGFloat = 0
+    @State private var availableWidth: CGFloat = 0
+
+    var body: some View {
+        // A row that fits never takes a scroll gesture: a vertical one over it scrolls the list, not the row.
+        // A lazy stack builds only the copies near the screen, so a group of 1,000 copies loads a few thumbnails.
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 10) {
+                content
+            }
+            .padding(.vertical, 4)
+            .onGeometryChange(for: CGFloat.self) {
+                $0.size.width
+            } action: {
+                contentWidth = $0
+            }
+        }
+        .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize, axes: [.horizontal, .vertical])
+        .scrollDisabled(contentWidth <= availableWidth + 0.5)
+        .onGeometryChange(for: CGFloat.self) {
+            $0.size.width
+        } action: {
+            availableWidth = $0
+        }
+        .accessibilityElement(children: .contain)
     }
 }
 
