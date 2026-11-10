@@ -89,6 +89,7 @@ public actor BackupStatusProjector {
     }
 
     private let queue: any UploadBackupSyncQueueStore
+    private let firstBackupGuide: BackupFirstBackupGuideStore?
     private let coalescingInterval: TimeInterval
     private let now: @Sendable () -> Date
     private let stream: AsyncStream<RunnerEvent>
@@ -137,12 +138,16 @@ public actor BackupStatusProjector {
         private var statusIngestionObserverForTesting: (@Sendable () async -> Void)?
     #endif
 
+    /// The photo library backup passes its guide store, so the guide follows every status even while the backup
+    /// settings are closed (#275). Other backups pass none.
     public init(
         queue: any UploadBackupSyncQueueStore,
+        firstBackupGuide: BackupFirstBackupGuideStore? = nil,
         coalescingInterval: TimeInterval = 0.15,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.queue = queue
+        self.firstBackupGuide = firstBackupGuide
         self.coalescingInterval = max(0, coalescingInterval)
         self.now = now
         let pair = AsyncStream.makeStream(
@@ -426,6 +431,7 @@ public actor BackupStatusProjector {
             speedEstimator.reset()
         }
         decoratePhotoDisplay(&status)
+        status.firstBackupGuide = firstBackupGuide?.update(with: status)
         let projection = BackupStatusProjection(
             generation: generation,
             revision: contextRevision,

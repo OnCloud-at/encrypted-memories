@@ -132,6 +132,19 @@ final class BackupStatusStabilizerTests: XCTestCase {
         XCTAssertNil(done.wakeAt, "completion must never wait for display hysteresis")
     }
 
+    /// The first-backup headline (#275) is a terminal state like the plain completion: it shows at once.
+    func testTheFirstBackupHeadlineAppliesImmediatelyAfterAnActivePhase() {
+        var s = BackupStatusStabilizer(dwell: 5.0)
+        _ = s.ingest(uploading(value: 10, total: 1_200), now: t(0))
+        var first = completed(value: 1_200, total: 1_200)
+        first.headlineKey = "backup.phase_first_completed"
+
+        let done = s.ingest(first, now: t(0.2))
+
+        XCTAssertEqual(done.display.headlineKey, "backup.phase_first_completed")
+        XCTAssertNil(done.wakeAt)
+    }
+
     func testStructuralChangeAppliesImmediatelyEvenWithinDwell() {
         var s = BackupStatusStabilizer(dwell: 5.0)
         _ = s.ingest(checking(), now: t(0))

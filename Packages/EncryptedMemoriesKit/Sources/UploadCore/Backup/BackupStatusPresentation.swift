@@ -64,6 +64,8 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var remoteIndexPreparationFailed: Bool
     public var degradedDedupeUnresolvedCount: Int
     public var executionOpportunityIssue: BackupExecutionOpportunityIssue?
+    /// True while a large first backup runs: the host shows how to make it faster (#275).
+    public var showsLargeBackupHint = false
 
     public var detailLayout: DetailLayout {
         guard total > 0 else { return .compact }
@@ -229,6 +231,12 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 }
             }
         }
+        // The large first backup guide (#275): its hint while it runs, its headline once after a plain completion.
+        let guide = status.firstBackupGuide
+        showsLargeBackupHint = guide == .running && status.phase != .completed && status.phase != .idle
+        if guide == .completedUnseen, headlineKey == "backup.phase_completed" {
+            headlineKey = "backup.phase_first_completed"
+        }
     }
 
     // MARK: - Localized accessors (finite key sets; no dynamic-key lookups)
@@ -249,6 +257,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         case "backup.phase_waiting_account_storage": return L10n.string("backup.phase_waiting_account_storage")
         case "backup.phase_waiting_draft": return L10n.string("backup.phase_waiting_draft")
         case "backup.phase_completed": return L10n.string("backup.phase_completed")
+        case "backup.phase_first_completed": return L10n.string("backup.phase_first_completed")
         case "backup.phase_completed_with_remote_deletions":
             return L10n.string("backup.phase_completed_with_remote_deletions")
         case "backup.phase_completed_with_omissions":
@@ -260,9 +269,13 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         }
     }
 
-    /// "<n> of <m> backed up". Nil when there is no honest total yet (scanning/idle).
+    /// "<n> of <m> backed up", or "All <n> files backed up." after a first backup. Nil when there is no honest total
+    /// yet (scanning, idle, or a photo total that no scan has confirmed since launch): "All <n>" also claims a total.
     public var localizedSubtitle: String? {
         guard total > 0 else { return nil }
+        if headlineKey == "backup.phase_first_completed" {
+            return L10n.string("backup.detail_first_completed \(backedUp)")
+        }
         return L10n.string("backup.progress_backed_up \(backedUp) \(total)")
     }
 

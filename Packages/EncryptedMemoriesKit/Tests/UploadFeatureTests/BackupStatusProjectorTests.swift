@@ -981,3 +981,171 @@ final class BackupStatusProjectorTests: XCTestCase {
         )
     }
 }
+
+/// The large first backup guide follows the published status, whether or not the backup settings are open (#275).
+extension BackupStatusProjectorTests {
+    /// Scan and upload run in parallel: the first status of the pass makes the backup a candidate, photos uploaded
+    /// while the scan runs keep it one, and the first check after the scan starts the guide. The backup settings stay closed.
+    func testTheGuideFollowsEveryPublishedStatusWithoutABackupView() async throws {
+        let suite = "BackupStatusProjectorGuide-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let guide = BackupFirstBackupGuideStore(defaults: defaults)
+        let rows = (0..<(BackupFirstBackupGuide.largeBackupThreshold + 40)).map {
+            entry(id: "photo-\($0)", state: .queuedForUpload)
+        }
+        XCTAssertTrue(queue.upsertBatch(rows))
+        let projector = BackupStatusProjector(queue: queue, firstBackupGuide: guide)
+        let generation = UUID()
+        let recorder = Recorder()
+        await projector.start(
+            generation: generation, context: BackupStatusProjectionContext(isScanning: true, isRunning: true)
+        ) { recorder.append($0) }
+        XCTAssertEqual(recorder.values.last?.status.firstBackupGuide, .candidate)
+
+        func settle(_ settled: ArraySlice<UploadBackupSyncQueueEntry>, as state: UploadBackupSyncQueueState) {
+            for row in settled {
+                XCTAssertTrue(
+                    queue.updateState(
+                        source: row.source, revision: row.revision, state: state, attempts: nil, lastError: nil,
+                        updatedAt: Date()))
+            }
+        }
+        settle(rows.prefix(30), as: .completed)
+        _ = await projector.projectNow(
+            context: BackupStatusProjectionContext(isScanning: true, isRunning: true), generation: generation,
+            revision: 1)
+        XCTAssertEqual(recorder.values.last?.status.uploaded, 30)
+        XCTAssertEqual(recorder.values.last?.status.firstBackupGuide, .candidate, "uploads during the scan count not")
+
+        settle(rows[30..<31], as: .uploading)
+        _ = await projector.projectNow(
+            context: BackupStatusProjectionContext(isRunning: true), generation: generation, revision: 2)
+        XCTAssertEqual(recorder.values.last?.status.phase, .uploading)
+        XCTAssertEqual(recorder.values.last?.status.firstBackupGuide, .running)
+
+        settle(rows[30...], as: .completed)
+        _ = await projector.projectNow(context: BackupStatusProjectionContext(), generation: generation, revision: 3)
+        XCTAssertEqual(recorder.values.last?.status.phase, .completed)
+        XCTAssertEqual(recorder.values.last?.status.firstBackupGuide, .completedUnseen)
+        XCTAssertEqual(guide.state, .completedUnseen, "the step moved on while the backup settings were closed")
+        await projector.stop()
+    }
+
+    /// A fresh first backup keeps new photos discovered and claims only a few at a time, so it reports checking while
+    /// it uploads. The guide starts there, and the hint shows while the phase is still checking.
+    func testTheGuideStartsWhileAFreshFirstBackupStillChecks() async throws {
+        let suite = "BackupStatusProjectorGuideChecking-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let guide = BackupFirstBackupGuideStore(defaults: defaults)
+        let discovered = (0..<(BackupFirstBackupGuide.largeBackupThreshold + 40)).map {
+            entry(id: "discovered-\($0)", state: .discovered)
+        }
+        XCTAssertTrue(queue.upsertBatch(discovered + [entry(id: "claimed", state: .uploading)]))
+        let projector = BackupStatusProjector(queue: queue, firstBackupGuide: guide)
+        let generation = UUID()
+        let recorder = Recorder()
+        await projector.start(
+            generation: generation, context: BackupStatusProjectionContext(isScanning: true, isRunning: true)
+        ) { recorder.append($0) }
+        XCTAssertEqual(recorder.values.last?.status.firstBackupGuide, .candidate)
+
+        _ = await projector.projectNow(
+            context: BackupStatusProjectionContext(isRunning: true), generation: generation, revision: 1)
+
+        let status = try XCTUnwrap(recorder.values.last?.status)
+        XCTAssertEqual(status.phase, .checking)
+        XCTAssertEqual(status.firstBackupGuide, .running)
+        XCTAssertTrue(BackupStatusPresentation(status).showsLargeBackupHint)
+        await projector.stop()
+    }
+
+    /// A count that already reaches the threshold starts the guide while the photo total is still unknown; the row then
+    /// reads "Checking" without a bar, and the hint shows. A smaller count keeps the candidate until a scan has counted
+    /// every photo.
+    func testTheGuideRunsWhileThePhotoTotalIsStillUnknown() async throws {
+        let suite = "BackupStatusProjectorGuideUnknownTotal-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let guide = BackupFirstBackupGuideStore(defaults: defaults)
+        let discovered = (0..<(BackupFirstBackupGuide.largeBackupThreshold + 40)).map {
+            entry(id: "discovered-\($0)", state: .discovered)
+        }
+        XCTAssertTrue(queue.upsertBatch(Array(discovered.prefix(10)) + [entry(id: "claimed", state: .uploading)]))
+        let projector = BackupStatusProjector(queue: queue, firstBackupGuide: guide)
+        let generation = UUID()
+        let recorder = Recorder()
+        let unknown = BackupPhotoDisplayContext(cycleID: UUID())
+        await projector.start(
+            generation: generation,
+            context: BackupStatusProjectionContext(isScanning: true, isRunning: true, photoDisplay: unknown)
+        ) { recorder.append($0) }
+        _ = await projector.projectNow(
+            context: BackupStatusProjectionContext(isRunning: true, photoDisplay: unknown), generation: generation,
+            revision: 1)
+        XCTAssertEqual(recorder.values.last?.status.phase, .checking)
+        XCTAssertEqual(
+            recorder.values.last?.status.firstBackupGuide, .candidate, "a small partial count decides nothing")
+
+        XCTAssertTrue(queue.upsertBatch(Array(discovered.dropFirst(10))))
+        _ = await projector.projectNow(
+            context: BackupStatusProjectionContext(isRunning: true, photoDisplay: unknown), generation: generation,
+            revision: 2)
+
+        let status = try XCTUnwrap(recorder.values.last?.status)
+        XCTAssertEqual(status.firstBackupGuide, .running)
+        XCTAssertEqual(status.photoDisplayProgress?.isTotalKnown, false)
+        let display = BackupStatusPresentation(status)
+        XCTAssertEqual(display.headlineKey, "backup.phase_checking")
+        XCTAssertTrue(display.showsLargeBackupHint)
+        XCTAssertNil(display.progressFraction)
+        await projector.stop()
+    }
+
+    /// A pass that completes while the photo total is unknown, for example after a scan that failed, keeps the guide
+    /// running without the hint. The completion after a scan that counted every photo shows the headline.
+    func testACompletionWhileThePhotoTotalIsUnknownKeepsTheGuideRunning() async throws {
+        let suite = "BackupStatusProjectorGuideUnknownCompletion-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(BackupFirstBackupGuide.State.running.rawValue, forKey: BackupFirstBackupGuide.defaultsKey)
+        let guide = BackupFirstBackupGuideStore(defaults: defaults)
+        XCTAssertTrue(queue.upsertBatch((0..<20).map { entry(id: "partial-\($0)", state: .completed) }))
+        let projector = BackupStatusProjector(queue: queue, firstBackupGuide: guide)
+        let generation = UUID()
+        let recorder = Recorder()
+        let cycle = UUID()
+        await projector.start(
+            generation: generation,
+            context: BackupStatusProjectionContext(photoDisplay: BackupPhotoDisplayContext(cycleID: cycle))
+        ) { recorder.append($0) }
+
+        let partial = try XCTUnwrap(recorder.values.last?.status)
+        XCTAssertEqual(partial.phase, .completed)
+        XCTAssertEqual(partial.photoDisplayProgress?.isTotalKnown, false)
+        XCTAssertEqual(partial.firstBackupGuide, .running)
+        XCTAssertEqual(guide.state, .running)
+        XCTAssertFalse(BackupStatusPresentation(partial).showsLargeBackupHint)
+
+        _ = await projector.projectNow(
+            context: BackupStatusProjectionContext(
+                photoDisplay: BackupPhotoDisplayContext(cycleID: cycle, scanFinished: true)),
+            generation: generation, revision: 1)
+        XCTAssertEqual(recorder.values.last?.status.firstBackupGuide, .completedUnseen)
+        await projector.stop()
+    }
+
+    /// A projector without a guide store, as every backup but the photo library backup has, never touches the guide.
+    func testAProjectorWithoutAGuideStoreLeavesTheGuideAlone() async throws {
+        XCTAssertTrue(queue.upsert(entry(id: "uploading", state: .uploading)))
+        let projector = BackupStatusProjector(queue: queue)
+        let recorder = Recorder()
+        await projector.start(generation: UUID(), context: BackupStatusProjectionContext(isRunning: true)) {
+            recorder.append($0)
+        }
+
+        XCTAssertNil(recorder.values.last?.status.firstBackupGuide)
+        await projector.stop()
+    }
+}
