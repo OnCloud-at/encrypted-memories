@@ -10,6 +10,22 @@ import Vision
 @testable import MLSearchAppleAdapter
 
 @Suite struct AppleVisionPipelineExecutorTests {
+    @Test func realVisionRequestAcceptsSupportedRevisionAndRejectsUnknownRevision() async throws {
+        guard #available(macOS 15.0, iOS 18.0, *) else { return }
+        let revision = try #require(GenerateImageFeaturePrintRequest.supportedRevisions.last)
+        let executor = AppleVisionPipelineExecutor(
+            imageSource: CountingVisionImageSource(outcome: .image(try sourceImage()))
+        )
+        let supported = await executor.execute(
+            try makePlan(kinds: [.imageFeaturePrint], revisions: [.imageFeaturePrint: String(describing: revision)])
+        )
+        let unsupported = await executor.execute(
+            try makePlan(kinds: [.imageFeaturePrint], revisions: [.imageFeaturePrint: "unsupported-revision"])
+        )
+        #expect(try #require(supported.first).outcome != .skipped(.unsupportedCapability))
+        #expect(try #require(unsupported.first).outcome == .skipped(.unsupportedCapability))
+    }
+
     @Test func failureMappingPreservesTextCancellation() {
         struct OtherError: Error {}
         let cases: [(any Error, AppleVisionPipelineExecutor.ArtifactAnalysisResult)] = [

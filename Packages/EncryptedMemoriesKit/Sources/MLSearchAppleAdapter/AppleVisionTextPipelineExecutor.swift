@@ -966,9 +966,7 @@ private extension AppleVisionPipelineExecutor {
         transform: (Request.Result, MLNativeResultContext) throws -> MLDerivedPipelineOutput?
     ) async -> ArtifactAnalysisResult {
         guard
-            let revision = revisions.first(where: {
-                String(describing: $0) == context.requestRevision
-            })
+            let revision = selectedRevision(context.requestRevision, from: revisions)
         else {
             return .unsupported
         }
