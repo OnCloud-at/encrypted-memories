@@ -69,7 +69,7 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
     }
 
     /// Looks at the backup when it changes. While the place waits to ask, or while the question shows, it also looks
-    /// at what covers the place until that changes.
+    /// at what covers the place until that changes. When it stops looking without asking, the rules forget the cover.
     private func look() async {
         guard let controller else { return }
         asker.backupChanged(controller.status, isSyncing: controller.isSyncing)
@@ -78,22 +78,26 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
                 asker.coverChanged(isCovered: probe.coversPlace(ownQuestionShows: true), at: .now)
                 if !asker.isPresenting {
                     isPresented = false
-                    return
+                    break
                 }
                 try? await Task.sleep(for: Self.coverCheckInterval)
                 continue
             }
             let isTaskActive = PhotoBackupContinuedTask.shared.submission.hasActiveTask
-            guard asker.isWaitingToAsk(controller.status, isTaskActive: isTaskActive) else { return }
+            guard asker.isWaitingToAsk(controller.status, isTaskActive: isTaskActive) else { break }
             // The bytes come first; the cover and the decision follow without a pause in between.
             let bytes = await estimatedBytes(for: controller.status, of: controller)
             guard !Task.isCancelled else { return }
             asker.coverChanged(isCovered: probe.coversPlace(ownQuestionShows: false), at: .now)
             let next = asker.next(controller.status, estimatedBytes: bytes, isTaskActive: isTaskActive, at: .now)
-            if next == .ask { isPresented = true }
-            guard let pause = Self.pause(after: next) else { return }
+            if next == .ask {
+                isPresented = true
+                return
+            }
+            guard let pause = Self.pause(after: next) else { break }
             try? await Task.sleep(for: pause)
         }
+        if !Task.isCancelled { asker.stoppedLooking() }
     }
 
     /// How long the place sleeps before it looks again; nil when it stops looking because it asks, or because only a

@@ -1,3 +1,4 @@
+import Foundation
 import PhotoLibraryBackupAdapter
 import Testing
 import UploadCore
@@ -9,21 +10,7 @@ import UploadCore
     private typealias Modifier = MobileContinuedBackupPromptModifier
     private typealias Asker = PhotoLibraryContinuedBackupPrompt.Asker
 
-    @MainActor private final class MarkerBox {
-        var value = false
-        var marker: Asker.Marker { Asker.Marker(isSet: { self.value }, set: { self.value = $0 }) }
-    }
-
     private let start = ContinuousClock.now
-
-    private var busy: BackupStatus {
-        var status = BackupStatus()
-        status.phase = .uploading
-        status.totalConsidered = 1_000
-        status.remainingCount = 500
-        status.hasOutstandingWork = true
-        return status
-    }
 
     @Test func itSleepsThroughTheCalmTimeInSteps() {
         #expect(
@@ -38,9 +25,17 @@ import UploadCore
         #expect(Modifier.pause(after: .none) == nil, "only a change of the backup or the scene can let it ask")
     }
 
-    @Test func anInactiveSceneAsksNothingAndKeepsTheQuestion() {
-        let marker = MarkerBox()
-        let asker = Asker(claim: .init(), marker: marker.marker)
+    @Test func anInactiveSceneAsksNothingAndKeepsTheQuestion() throws {
+        let suite = "MobileContinuedBackupPromptModifierTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let asker = Asker(claim: .init(), marker: .stored(in: defaults))
+        var busy = BackupStatus()
+        busy.phase = .uploading
+        busy.totalConsidered = 1_000
+        busy.remainingCount = 500
+        busy.hasOutstandingWork = true
+
         #expect(Modifier.sceneChanged(to: .active, asker: asker, at: start))
         #expect(Modifier.sceneChanged(to: .inactive, asker: asker, at: start + .seconds(1)))
         #expect(
@@ -51,9 +46,9 @@ import UploadCore
         #expect(asker.next(busy, estimatedBytes: nil, isTaskActive: false, at: start + .seconds(8)) == .ask)
         #expect(Modifier.sceneChanged(to: .inactive, asker: asker, at: start + .seconds(9)), "the question stays")
         #expect(asker.isPresenting)
-        #expect(!marker.value)
+        #expect(!defaults.bool(forKey: PhotoLibraryContinuedBackupPrompt.askedMarkerKey))
 
         #expect(!Modifier.sceneChanged(to: .background, asker: asker, at: start + .seconds(10)), "leaving closes it")
-        #expect(marker.value, "and counts as Not Now")
+        #expect(defaults.bool(forKey: PhotoLibraryContinuedBackupPrompt.askedMarkerKey), "and counts as Not Now")
     }
 }
