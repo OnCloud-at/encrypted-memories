@@ -116,9 +116,12 @@ public enum PhotoLibraryContinuedBackupEnd: String, Sendable, BackgroundLogName 
 public enum PhotoLibraryContinuedBackupCard {
     public static var title: String { L10n.string("backup.summary_backing_up") }
 
+    /// "Preparing…", until the goal is fixed; the request shows it before the task runs.
+    public static var preparingSubtitle: String { L10n.string("upload.state_preparing") }
+
     /// "Preparing…" until the goal is fixed, then the photos left, the same number as the app's status line.
     public static func subtitle(for status: BackupStatus, goal: PhotoLibraryContinuedBackupGoal) -> String {
-        guard goal.total != nil else { return L10n.string("upload.state_preparing") }
+        guard goal.total != nil else { return preparingSubtitle }
         return L10n.string("backup.detail_left \(status.remainingCount)")
     }
 

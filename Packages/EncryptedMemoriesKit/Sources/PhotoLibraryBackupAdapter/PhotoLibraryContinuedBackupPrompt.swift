@@ -16,22 +16,131 @@ public enum PhotoLibraryContinuedBackupPrompt {
     public static let bytesPerSecond = 2_000_000.0
     /// The app asks when the estimated time left reaches this many seconds.
     public static let askAfterSeconds = 300.0
-    /// The marker in the backup defaults: the person answered for the backlog that is still owed.
+    /// The marker in the app's standard defaults, which sign-out clears: the person answered for the backlog that is
+    /// still owed.
     public static let askedMarkerKey = "photoBackup.continuedPrompt.asked.v1"
 
-    /// What the place that shows the question allows.
+    /// What the app allows apart from the place: the place's own calm and cover rules live in `Asker`.
     public struct Situation: Sendable, Equatable {
-        /// The scene is active since a short moment, and nothing else is shown or edited above the place.
-        public let isCalm: Bool
         /// A continued processing task already runs.
         public let isTaskActive: Bool
         /// The person already answered for the backlog that is still owed.
         public let wasAsked: Bool
 
-        public init(isCalm: Bool, isTaskActive: Bool, wasAsked: Bool) {
-            self.isCalm = isCalm
+        public init(isTaskActive: Bool, wasAsked: Bool) {
             self.isTaskActive = isTaskActive
             self.wasAsked = wasAsked
+        }
+    }
+
+    /// The rules of one place that shows the question (#1108): it asks only when its scene has been active and
+    /// uncovered for `calmDelay`, while it holds the shared claim, and once per backlog. The view only shows the alert
+    /// and reports the scene, the cover and the answer.
+    @MainActor
+    public final class Asker {
+        /// What the place does now.
+        public enum Next: Equatable {
+            /// Show the question.
+            case ask
+            /// Ask again after this time; the calm time has not passed.
+            case wait(Duration)
+            /// Do not ask now.
+            case none
+        }
+
+        /// Whether the person answered for the backlog that is still owed, kept by the app.
+        public struct Marker {
+            public let isSet: () -> Bool
+            public let set: (Bool) -> Void
+
+            public init(isSet: @escaping () -> Bool, set: @escaping (Bool) -> Void) {
+                self.isSet = isSet
+                self.set = set
+            }
+
+            /// The marker under `askedMarkerKey` in `defaults`.
+            public static func stored(in defaults: UserDefaults = .standard) -> Marker {
+                Marker(
+                    isSet: { defaults.bool(forKey: askedMarkerKey) },
+                    set: { $0 ? defaults.set(true, forKey: askedMarkerKey) : defaults.removeObject(forKey: askedMarkerKey) })
+            }
+        }
+
+        /// How long the scene is active and the place uncovered before it may ask: HIG Alerts advise against an alert
+        /// at launch, and a question right after a sheet closes would interrupt.
+        public static let calmDelay: Duration = .seconds(2)
+
+        private let claim: Claim
+        private let marker: Marker
+        private let calmDelay: Duration
+        private let place = UUID()
+        /// Since when the scene is active and the place uncovered; nil while it is not.
+        private var calmSince: ContinuousClock.Instant?
+        private var isActive = false
+        private var isCovered = false
+        /// The question is shown by this place.
+        public private(set) var isPresenting = false
+
+        public init(claim: Claim = .shared, marker: Marker, calmDelay: Duration = Asker.calmDelay) {
+            self.claim = claim
+            self.marker = marker
+            self.calmDelay = calmDelay
+        }
+
+        public func sceneBecameActive(at now: ContinuousClock.Instant) {
+            isActive = true
+            if !isCovered { calmSince = now }
+        }
+
+        /// The scene went to the background while the question showed: that counts as "Not Now".
+        public func sceneEnteredBackground() {
+            isActive = false
+            calmSince = nil
+            if isPresenting { marker.set(true) }
+            stopPresenting()
+        }
+
+        /// Something covers the place, or no longer does. A cover over the question closes it without an answer; the
+        /// end of a cover starts the calm time again.
+        public func coverChanged(isCovered covered: Bool, at now: ContinuousClock.Instant) {
+            guard covered != isCovered else { return }
+            isCovered = covered
+            if covered {
+                calmSince = nil
+                stopPresenting()
+            } else if isActive {
+                calmSince = now
+            }
+        }
+
+        /// The backup state changed. A drained backlog may be asked about again.
+        public func backupChanged(_ status: BackupStatus, isSyncing: Bool) {
+            if backlogDrained(status, isSyncing: isSyncing) { marker.set(false) }
+        }
+
+        public func next(
+            _ status: BackupStatus, estimatedBytes: Int64?, isTaskActive: Bool, at now: ContinuousClock.Instant
+        ) -> Next {
+            guard !isPresenting, isActive, !isCovered, let calmSince else { return .none }
+            let situation = Situation(isTaskActive: isTaskActive, wasAsked: marker.isSet())
+            guard shouldAsk(status, estimatedBytes: estimatedBytes, in: situation) else { return .none }
+            let calmIn = calmDelay - (now - calmSince)
+            if calmIn > .zero { return .wait(calmIn) }
+            guard claim.claim(place) else { return .none }
+            isPresenting = true
+            return .ask
+        }
+
+        /// Either answer closes the question for this backlog. Returns whether the person chose to continue.
+        public func answered(accepted: Bool) -> Bool {
+            marker.set(true)
+            stopPresenting()
+            return accepted
+        }
+
+        private func stopPresenting() {
+            isPresenting = false
+            claim.release(place)
         }
     }
 
@@ -75,13 +184,13 @@ public enum PhotoLibraryContinuedBackupPrompt {
     }
 
     public static func shouldAsk(_ status: BackupStatus, estimatedBytes: Int64?, in situation: Situation) -> Bool {
-        situation.isCalm && !situation.isTaskActive && !situation.wasAsked
-            && isWorthAsking(status, estimatedBytes: estimatedBytes)
+        !situation.isTaskActive && !situation.wasAsked && isWorthAsking(status, estimatedBytes: estimatedBytes)
     }
 
-    /// The backlog the person answered for is done: no pass runs and no work is owed. Only then may the app ask again.
+    /// The backlog the person answered for is done: the queue is projected, no pass runs and no work is owed. Only then
+    /// may the app ask again. A status that is not projected yet, as at a cold start, says nothing about the queue.
     public static func backlogDrained(_ status: BackupStatus, isSyncing: Bool) -> Bool {
-        !isSyncing && !status.hasOutstandingWork
+        status.totalConsidered != nil && !isSyncing && !status.hasOutstandingWork
     }
 }
 
