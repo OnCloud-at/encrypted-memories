@@ -52,9 +52,10 @@ public struct PhotoLibraryContinuedBackupGoal: Sendable, Equatable {
             let work = total == 0 ? 1 : (Double(done) + inFlight) / Double(total)
             fraction = Self.preparingShare + (1 - Self.preparingShare) * work
         } else {
-            let scan = catalog?.executionProgress.map {
-                Double($0.completedUnitCount) / Double(max(1, $0.totalUnitCount))
-            } ?? 0
+            let scan =
+                catalog?.executionProgress.map {
+                    Double($0.completedUnitCount) / Double(max(1, $0.totalUnitCount))
+                } ?? 0
             fraction = Self.preparingShare * min(1, max(0, scan))
         }
         reportedUnits = max(reportedUnits, Int64((fraction * Double(Self.scale)).rounded(.down)))

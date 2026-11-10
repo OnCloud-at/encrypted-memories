@@ -223,7 +223,8 @@ final class BackupStatusTests: XCTestCase {
     /// A continued backup task reports success only when no work is owed (#1108). Rows that wait for a retry count as
     /// owed work although they are not in `remainingCount`.
     func testOwedWorkIncludesRowsThatWaitForARetry() {
-        let waitingForRetry = BackupStatus(progress: progress(total: 10, alreadyBackedUp: 9, blocked: 1), isScanning: false)
+        let waitingForRetry = BackupStatus(
+            progress: progress(total: 10, alreadyBackedUp: 9, blocked: 1), isScanning: false)
         XCTAssertEqual(waitingForRetry.remainingCount, 0)
         XCTAssertTrue(waitingForRetry.hasOutstandingWork)
 

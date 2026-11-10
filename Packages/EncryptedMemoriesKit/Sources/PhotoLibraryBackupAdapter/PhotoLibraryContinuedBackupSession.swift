@@ -88,7 +88,7 @@ public final class PhotoLibraryContinuedBackupSession {
                 (.init("waitMs"), expiredAt.map { .milliseconds(ContinuousClock.now - $0) } ?? .word("none")),
                 (.init("settled"), .flag(controller.activeExecutionRunID == nil)),
             ])
-        await completion.finish(after: {}) { (end.windowOutcome, end.reportsSuccess) }
+        await completion.finish(after: {}, deciding: { (end.windowOutcome, end.reportsSuccess) })
     }
 
     /// The OS expired the task, or the person stopped it on the system card. A pass that the person watches in the app

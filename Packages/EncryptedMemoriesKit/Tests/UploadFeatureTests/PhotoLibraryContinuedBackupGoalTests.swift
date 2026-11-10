@@ -86,7 +86,8 @@ import UploadCore
 
     @Test func theProgressDoesNotDependOnTheSizeOfTheLibrary() {
         var goal = PhotoLibraryContinuedBackupGoal()
-        let start = goal.update(status: status(total: 10_000, remaining: 300, backedUp: 9_700), catalog: catalog(1, of: 1))
+        let start = goal.update(
+            status: status(total: 10_000, remaining: 300, backedUp: 9_700), catalog: catalog(1, of: 1))
         #expect(start.units.completedUnitCount == Self.scale / 20, "300 of 10,000 left starts near the beginning")
         #expect(start.total == 300)
     }
@@ -198,7 +199,8 @@ import UploadCore
         #expect(!ran.reportsSuccess)
         #expect(ran.windowOutcome == .failed)
 
-        let off = PhotoLibraryContinuedBackupEnd.after(goal: goal, settled: waiting, didExpire: false, backupRuns: false)
+        let off = PhotoLibraryContinuedBackupEnd.after(
+            goal: goal, settled: waiting, didExpire: false, backupRuns: false)
         #expect(off == .turnedOff)
         #expect(!off.reportsSuccess)
         #expect(off.windowOutcome == .notNeeded)

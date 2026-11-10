@@ -57,7 +57,9 @@ import UploadCore
     }
 
     @Test func onlyAPassThatChecksOrUploadsAsks() {
-        for phase: BackupStatus.Phase in [.idle, .scanning, .paused, .waitingForWiFi, .waiting, .completed, .needsAttention] {
+        for phase: BackupStatus.Phase in [
+            .idle, .scanning, .paused, .waitingForWiFi, .waiting, .completed, .needsAttention,
+        ] {
             #expect(!Prompt.isWorthAsking(status(phase, remaining: 500), estimatedBytes: nil), "\(phase)")
         }
         #expect(Prompt.isWorthAsking(status(.checking, remaining: 500), estimatedBytes: nil))
@@ -66,9 +68,13 @@ import UploadCore
     @Test func theSituationMustAllowTheQuestion() {
         let busy = status(remaining: 500)
         #expect(Prompt.shouldAsk(busy, estimatedBytes: nil, in: calm))
-        #expect(!Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: false, isTaskActive: false, wasAsked: false)))
-        #expect(!Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: true, isTaskActive: true, wasAsked: false)))
-        #expect(!Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: true, isTaskActive: false, wasAsked: true)))
+        #expect(
+            !Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: false, isTaskActive: false, wasAsked: false))
+        )
+        #expect(
+            !Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: true, isTaskActive: true, wasAsked: false)))
+        #expect(
+            !Prompt.shouldAsk(busy, estimatedBytes: nil, in: .init(isCalm: true, isTaskActive: false, wasAsked: true)))
     }
 
     @Test func theMarkerResetsOnlyWhenASettledBackupOwesNothing() {
