@@ -145,7 +145,9 @@ import UploadCore
         return status
     }
 
-    private func askerAfterTheCalmTime(_ marker: MarkerBox, claim: PhotoLibraryContinuedBackupPrompt.Claim = .init())
+    private func askerAfterTheCalmTime(
+        _ marker: MarkerBox, claim: PhotoLibraryContinuedBackupPrompt.Claim = .init()
+    )
         -> Asker
     {
         let asker = Asker(claim: claim, marker: marker.marker)
@@ -155,7 +157,8 @@ import UploadCore
 
     @Test func itAsksOnlyAfterTheSceneWasActiveForTheCalmTime() {
         let asker = askerAfterTheCalmTime(MarkerBox())
-        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(1)) == .wait(.seconds(1)))
+        #expect(
+            asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(1)) == .wait(.seconds(1)))
         #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(2)) == .ask)
         #expect(asker.isPresenting)
     }
@@ -198,7 +201,8 @@ import UploadCore
         #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(5)) == .none)
 
         asker.coverChanged(isCovered: false, at: start + .seconds(6))
-        #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(7)) == .wait(.seconds(1)))
+        #expect(
+            asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(7)) == .wait(.seconds(1)))
         #expect(asker.next(busy(), estimatedBytes: nil, isTaskActive: false, at: start + .seconds(8)) == .ask)
     }
 
