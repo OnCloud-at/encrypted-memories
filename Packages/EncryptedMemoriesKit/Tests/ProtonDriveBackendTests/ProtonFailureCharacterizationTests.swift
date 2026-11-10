@@ -29,13 +29,13 @@ struct ProtonFailureCharacterizationTests {
                 }
                 let mapped = DriveSDKBridge.uploadError(from: ProtonDriveSDKError(protoError: proto), filename: "a")
                 if code == 408 || code == 429 || (500...599).contains(code) {
-                    guard case let .retryableBackend(actual, _) = mapped as? UploadCore.UploadError else {
+                    guard case .retryableBackend(let actual, _) = mapped as? UploadCore.UploadError else {
                         Issue.record("Expected retryable backend for HTTP \(code), wrapped: \(wrapped)")
                         continue
                     }
                     #expect(actual == code)
                 } else if code == 407 || code == 499 {
-                    guard case let .serviceRejected(actual) = mapped as? UploadCore.UploadError else {
+                    guard case .serviceRejected(let actual) = mapped as? UploadCore.UploadError else {
                         Issue.record("Expected service rejection for HTTP \(code), wrapped: \(wrapped)")
                         continue
                     }
@@ -52,7 +52,7 @@ struct ProtonFailureCharacterizationTests {
 
     @Test func urlCancellationRemainsATransportFailure() {
         let mapped = DriveSDKBridge.uploadError(from: URLError(.cancelled), filename: "a")
-        guard case let .transport(code, _) = mapped as? UploadCore.UploadError else {
+        guard case .transport(let code, _) = mapped as? UploadCore.UploadError else {
             Issue.record("Expected transport failure")
             return
         }
@@ -79,10 +79,11 @@ struct ProtonFailureCharacterizationTests {
                             $0.innerError = inner
                         }
                     }
-                    let mapped = DriveSDKBridge.uploadError(
-                        from: ProtonDriveSDKError(protoError: proto), filename: "a") as? UploadCore.UploadError
+                    let mapped =
+                        DriveSDKBridge.uploadError(
+                            from: ProtonDriveSDKError(protoError: proto), filename: "a") as? UploadCore.UploadError
                     if code == 408 || code == 429 || (500...599).contains(code) {
-                        guard case let .retryableBackend(actual, _) = mapped else {
+                        guard case .retryableBackend(let actual, _) = mapped else {
                             Issue.record("Expected retryable HTTP \(code), type \(type), wrapped \(wrapped)")
                             continue
                         }
@@ -93,7 +94,7 @@ struct ProtonFailureCharacterizationTests {
                             continue
                         }
                     } else {
-                        guard case let .transport(actual, _) = mapped else {
+                        guard case .transport(let actual, _) = mapped else {
                             Issue.record("Expected transport HTTP \(code), type \(type), wrapped \(wrapped)")
                             continue
                         }
@@ -126,7 +127,8 @@ struct ProtonFailureCharacterizationTests {
         let result = ProtonFailureClassifier.relatedTransferSignal(ProtonDriveSDKError(protoError: outer))
         #expect((result as? URLError)?.code == .timedOut)
         #expect(
-            ProtonFailureClassifier.relatedTransferSignal(ProtonDriveSDKError(protoError: cancelled)) is CancellationError)
+            ProtonFailureClassifier.relatedTransferSignal(ProtonDriveSDKError(protoError: cancelled))
+                is CancellationError)
         #expect(ProtonFailureClassifier.relatedTransferSignal(NSError(domain: "foreign", code: -999)) == nil)
     }
 
@@ -193,15 +195,23 @@ struct ProtonFailureCharacterizationTests {
 
     @Test func classifierUploadMappingKeepsURLAndForeignErrorsDistinct() {
         for code in [URLError.Code.timedOut, .cancelled] {
-            guard case let .transport(actual, _)? =
-                ProtonFailureClassifier.uploadError(from: URLError(code), filename: "a") as? UploadCore.UploadError
-            else { Issue.record("Expected URL transport failure"); continue }
+            guard
+                case .transport(let actual, _)? =
+                    ProtonFailureClassifier.uploadError(from: URLError(code), filename: "a") as? UploadCore.UploadError
+            else {
+                Issue.record("Expected URL transport failure")
+                continue
+            }
             #expect(actual == code.rawValue)
         }
-        guard case .backend? =
-            ProtonFailureClassifier.uploadError(from: NSError(domain: "foreign", code: -999), filename: "a")
+        guard
+            case .backend? =
+                ProtonFailureClassifier.uploadError(from: NSError(domain: "foreign", code: -999), filename: "a")
                 as? UploadCore.UploadError
-        else { Issue.record("Expected foreign error to remain a backend failure"); return }
+        else {
+            Issue.record("Expected foreign error to remain a backend failure")
+            return
+        }
         #expect(
             ProtonFailureClassifier.uploadFileSystemError(.notFound, filename: "a") as? UploadCore.UploadError
                 == .fileMissing("a"))
@@ -209,11 +219,13 @@ struct ProtonFailureCharacterizationTests {
     }
 
     @Test func sdkFilesystemAndSocketFailuresKeepTheirUploadDomains() {
-        for (code, expected) in [(POSIXErrorCode.ENOENT, UploadCore.UploadError.fileMissing("a")),
-            (.EACCES, .permissionDenied("a"))]
-        {
+        for (code, expected) in [
+            (POSIXErrorCode.ENOENT, UploadCore.UploadError.fileMissing("a")),
+            (.EACCES, .permissionDenied("a")),
+        ] {
             let proto = Proton_Drive_Sdk_Error.from(nsError: POSIXError(code) as NSError)
-            let mapped = ProtonFailureClassifier.uploadError(from: ProtonDriveSDKError(protoError: proto), filename: "a")
+            let mapped = ProtonFailureClassifier.uploadError(
+                from: ProtonDriveSDKError(protoError: proto), filename: "a")
             #expect(mapped as? UploadCore.UploadError == expected)
         }
         let full = Proton_Drive_Sdk_Error.from(nsError: POSIXError(.ENOSPC) as NSError)
@@ -227,10 +239,14 @@ struct ProtonFailureCharacterizationTests {
             $0.primaryCode = 42
             $0.secondaryCode = -1
         }
-        guard case let .transport(code, _)? =
-            ProtonFailureClassifier.uploadError(from: ProtonDriveSDKError(protoError: socket), filename: "a")
+        guard
+            case .transport(let code, _)? =
+                ProtonFailureClassifier.uploadError(from: ProtonDriveSDKError(protoError: socket), filename: "a")
                 as? UploadCore.UploadError
-        else { Issue.record("Expected socket transport failure"); return }
+        else {
+            Issue.record("Expected socket transport failure")
+            return
+        }
         #expect(code == NSURLErrorNetworkConnectionLost)
     }
 
