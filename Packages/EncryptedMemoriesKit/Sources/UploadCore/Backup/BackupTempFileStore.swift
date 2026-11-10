@@ -73,22 +73,6 @@ public final class BackupTempFileStore: @unchecked Sendable {
         )
     }
 
-    convenience init(
-        directory: URL,
-        policyBudget: @Sendable (DiskCacheBudgetPolicy) -> (Int64, Int64),
-        availableCapacity: @Sendable @escaping (URL) -> Int64?,
-        now: @Sendable @escaping () -> Date
-    ) {
-        let (maximumBytes, minimumFreeBytes) = policyBudget(DiskCacheBudgetPolicy(platform: .mobile))
-        self.init(
-            directory: directory,
-            maximumBytes: maximumBytes,
-            minimumFreeBytes: minimumFreeBytes,
-            availableCapacity: availableCapacity,
-            now: now
-        )
-    }
-
     init(
         directory: URL,
         maximumBytes: Int64,
@@ -223,7 +207,10 @@ public final class BackupTempFileStore: @unchecked Sendable {
                 throw BackupTempFileError.diskBudgetExceeded
             }
             reservations[url] = reservation
-            if capacitySample != nil { capacitySample!.accountedWrites += increment }
+            if var sample = capacitySample {
+                sample.accountedWrites += increment
+                capacitySample = sample
+            }
         }
     }
 
@@ -303,11 +290,15 @@ public final class BackupTempFileStore: @unchecked Sendable {
 
     private func sampledFreeBytesLocked(forceRefresh: Bool) -> Int64? {
         let currentTime = now()
-        let shouldRefresh =
-            forceRefresh
-            || capacitySample == nil
-            || capacitySample!.accountedWrites >= Self.capacityResampleBytes
-            || currentTime.timeIntervalSince(capacitySample!.sampledAt) >= Self.capacityResampleInterval
+        let shouldRefresh: Bool
+        if let sample = capacitySample {
+            shouldRefresh =
+                forceRefresh
+                || sample.accountedWrites >= Self.capacityResampleBytes
+                || currentTime.timeIntervalSince(sample.sampledAt) >= Self.capacityResampleInterval
+        } else {
+            shouldRefresh = true
+        }
         if shouldRefresh {
             guard let fresh = availableCapacity(directory) else {
                 capacitySample = nil

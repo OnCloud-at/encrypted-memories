@@ -46,9 +46,9 @@ final class BackupTempFileStoreTests: XCTestCase {
         XCTAssertEqual(store.minimumFreeBytes, policy.backupMinimumFreeBytes)
     }
 
-    func testInjectedPolicyBudgetControlsReservations() {
+    func testExplicitLimitsControlReservations() {
         let store = BackupTempFileStore(
-            directory: directory, policyBudget: { _ in (10, 5) },
+            directory: directory, maximumBytes: 10, minimumFreeBytes: 5,
             availableCapacity: { _ in 100 }, now: Date.init)
         XCTAssertEqual(store.maximumBytes, 10)
         XCTAssertEqual(store.minimumFreeBytes, 5)
@@ -121,12 +121,130 @@ final class BackupTempFileStoreTests: XCTestCase {
         }
     }
 
+    func testEveryReservationRefreshesCapacityBeforeAdmission() throws {
+        let capacity = CapacityProbe(100)
+        let clock = TestNow()
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 50, minimumFreeBytes: 5,
+            availableCapacity: capacity.read, now: { clock.now })
+        _ = try store.reserve(filename: "first", expectedBytes: 6)
+        XCTAssertEqual(capacity.callCount, 1)
+
+        capacity.set(5)
+        XCTAssertThrowsError(try store.reserve(filename: "refused", expectedBytes: 1)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(capacity.callCount, 2)
+        capacity.set(100)
+        XCTAssertNoThrow(try store.reserve(filename: "next", expectedBytes: 1))
+        XCTAssertEqual(capacity.callCount, 3)
+    }
+
+    func testCapacitySampleRefreshesAtTheWrittenByteBoundary() throws {
+        let capacity = CapacityProbe(64 << 20)
+        let clock = TestNow()
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 64 << 20, minimumFreeBytes: 0,
+            availableCapacity: capacity.read, now: { clock.now })
+        let partial = try store.reserve(filename: "stream", expectedBytes: 0)
+        try store.recordWrite(to: partial, byteCount: (16 << 20) - 1)
+        XCTAssertEqual(capacity.callCount, 1)
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 1, "the accepted chunk reaches the sample boundary")
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 2, "the next chunk refreshes at exactly 16 MiB")
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 2, "the new sample resets written-byte accounting")
+    }
+
+    func testCapacitySampleRefreshesAtTheHalfSecondBoundary() throws {
+        let capacity = CapacityProbe(100)
+        let clock = TestNow()
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 50, minimumFreeBytes: 0,
+            availableCapacity: capacity.read, now: { clock.now })
+        let partial = try store.reserve(filename: "stream", expectedBytes: 0)
+        clock.advance(0.25)
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 1)
+        clock.advance(0.25)
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 2)
+        clock.advance(0.25)
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 2)
+    }
+
+    func testUnavailableCapacityIsRetriedAndRejectedWritesKeepTheirAccounting() throws {
+        let capacity = CapacityProbe(nil)
+        let clock = TestNow()
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 50, minimumFreeBytes: 5,
+            availableCapacity: capacity.read, now: { clock.now })
+        let partial = try store.reserve(filename: "stream", expectedBytes: 0)
+        try store.recordWrite(to: partial, byteCount: 3)
+        XCTAssertEqual(capacity.callCount, 2, "an unavailable sample is retried on the next write")
+        capacity.set(7)
+        XCTAssertThrowsError(try store.recordWrite(to: partial, byteCount: 3)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(capacity.callCount, 3)
+        try store.recordWrite(to: partial, byteCount: 1)
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertThrowsError(try store.recordWrite(to: partial, byteCount: 1)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(capacity.callCount, 3, "accepted writes reduce the cached free capacity")
+        capacity.set(100)
+        XCTAssertNoThrow(try store.reserve(filename: "remaining-pool", expectedBytes: 45))
+        XCTAssertThrowsError(try store.reserve(filename: "past-pool", expectedBytes: 1)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(capacity.callCount, 4)
+    }
+
+    func testAForcedRefreshFailureClearsThePreviousCapacitySample() throws {
+        let capacity = CapacityProbe(100)
+        let clock = TestNow()
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 50, minimumFreeBytes: 5,
+            availableCapacity: capacity.read, now: { clock.now })
+        let partial = try store.reserve(filename: "stream", expectedBytes: 0)
+        try store.recordWrite(to: partial, byteCount: 1)
+        capacity.set(nil)
+        XCTAssertTrue(store.hasFreeSpace(forAdditionalBytes: 1))
+        XCTAssertEqual(capacity.callCount, 2)
+        capacity.set(5)
+        XCTAssertThrowsError(try store.recordWrite(to: partial, byteCount: 1)) { error in
+            XCTAssertEqual(error as? BackupTempFileStore.BackupTempFileError, .diskBudgetExceeded)
+        }
+        XCTAssertEqual(capacity.callCount, 3)
+    }
+
+    func testCapacitySamplingRecordsTimeBeforeReadingTheVolume() throws {
+        let capacity = CapacityProbe(100)
+        let clock = TestNow()
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 50, minimumFreeBytes: 0,
+            availableCapacity: { url in
+                clock.advance(0.5)
+                return capacity.read(url)
+            }, now: { clock.now })
+        let partial = try store.reserve(filename: "stream", expectedBytes: 0)
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 2, "the probe's duration counts toward sample age")
+        try store.recordWrite(to: partial, byteCount: 1)
+        XCTAssertEqual(capacity.callCount, 3)
+    }
+
     private final class CapacityProbe: @unchecked Sendable {
         private let lock = NSLock()
-        private var value: Int64
+        private var value: Int64?
         private var calls = 0
 
-        init(_ value: Int64) { self.value = value }
+        init(_ value: Int64?) { self.value = value }
+
+        func set(_ value: Int64?) { lock.withLock { self.value = value } }
 
         func read(_ url: URL) -> Int64? {
             lock.withLock {
