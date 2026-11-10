@@ -214,17 +214,8 @@ public struct TimelineView: View {
     /// The library-load error screen. The Retry affordance appears only when a retry can help
     /// (`retryable`); both platforms read the same flag from the load failure.
     private func errorState(_ message: String, retryable: Bool) -> some View {
-        ContentUnavailableView {
-            Label(L10n.string("error.load_library_title"), systemImage: "exclamationmark.triangle")
-        } description: {
-            if !message.isEmpty {
-                Text(message)
-                    .textSelection(.enabled)
-            }
-        } actions: {
-            if retryable {
-                RetryButton(.prominent) { Task { await model.retry() } }
-            }
+        LibraryLoadErrorView(message: message, retryable: retryable, selectableMessage: true) {
+            Task { await model.retry() }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()

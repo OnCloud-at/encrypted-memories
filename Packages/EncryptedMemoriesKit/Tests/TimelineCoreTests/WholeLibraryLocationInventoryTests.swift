@@ -250,6 +250,57 @@ import Testing
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func aTrashDuringTheListingLeadsToExactlyOneMoreListing() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let picker = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
+        while let event = await events.next(), event != .fullReadEntered {}
+
+        // The trash overtakes the held listing before the library is known, so the listing cannot settle it.
+        await fixture.repository.setItems([inventoryItem("a"), inventoryItem("c")])
+        await fixture.timeline.commitTrash(uids: [inventoryUID("b")])
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority != .authoritative)
+        gate.open()
+
+        #expect(await picker.value == nil)
+        #expect(await fixture.repository.fullReads == 2, "one more listing, not a loop")
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority == .authoritative)
+        #expect(fixture.timeline.wholeLibraryItemsForLocations?.map(\.uid) == [inventoryUID("a"), inventoryUID("c")])
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func aPickerWaitsForARunningAllPhotosListing() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: false)
+        await fixture.timeline.load()
+        #expect(await fixture.repository.fullReads == 1, "the offline launch listing failed")
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority != .authoritative)
+        await fixture.repository.setOnline()
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let allPhotosRetry = Task { await fixture.timeline.retry() }
+        while let event = await events.next(), event != .fullReadEntered {}
+        let picker = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
+        // Let the picker reach its decision while All Photos' listing is still held. The fixture has no hook for
+        // "the picker waits", so a bounded number of yields lets the picker task run first; without the join, the
+        // picker starts its own listing here and the count below becomes 3.
+        for _ in 0..<100 { await Task.yield() }
+        gate.open()
+        await allPhotosRetry.value
+
+        #expect(await picker.value == nil)
+        #expect(await fixture.repository.fullReads == 2, "the picker used All Photos' listing")
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func aFailedLoadReportsItsMessageAndARetrySucceeds() async throws {
         let fixture = try await LocationInventoryFixture.make(online: true)
         await fixture.timeline.select(LocationInventoryRepository.album)
@@ -264,6 +315,47 @@ import Testing
 
         #expect(await fixture.timeline.loadWholeLibraryIfNeeded() == nil)
         #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func theWholeLibraryGridUnderAnAlbumIncludesPhotosThatAreBackingUp() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        await fixture.timeline.select(LocationInventoryRepository.album)
+        #expect(fixture.timeline.wholeLibraryGridItems.isEmpty, "no whole library yet")
+        let local = PhotoItem(
+            uid: PhotoUID(localPending: .photoLibrary, identifier: "asset"), captureTime: .distantPast,
+            mediaType: "image/jpeg")
+        let merged = fixture.items + [local]
+        fixture.timeline.setPendingPresentation(
+            PendingTimelinePresentation(
+                revision: 1, membershipRevision: 1, snapshot: TimelineSnapshot(sections: inventorySections(merged)),
+                localUIDs: [local.uid], favoriteIntents: [:],
+                uploadBadges: PendingUploadBadges(base: [local.uid: .waiting]), isCanonical: false))
+        #expect(fixture.timeline.wholeLibraryGridItems.isEmpty, "pending photos wait for the Proton library")
+
+        await fixture.timeline.loadWholeLibraryIfNeeded()
+
+        // All Photos' own order, pending photos included.
+        #expect(fixture.timeline.wholeLibraryGridItems == fixture.timeline.pendingPresentation.items)
+        #expect(Set(fixture.timeline.wholeLibraryGridItems.map(\.uid)) == Set(merged.map(\.uid)))
+        #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")], "the album grid stays")
+        fixture.timeline.setPendingPresentation(.empty)
+        #expect(fixture.timeline.wholeLibraryGridItems == fixture.items)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func transientItemsShowTheUploadBadgesTheyCarry() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset")
+        let badges = PendingUploadBadges(base: [local: .waiting])
+
+        await fixture.timeline.showTransientItems(fixture.items, sectionID: "picker", uploadBadges: badges)
+        #expect(fixture.timeline.pendingUploadBadges[local] == .waiting)
+
+        await fixture.timeline.showTransientItems(fixture.items, sectionID: "cluster")
+        #expect(fixture.timeline.pendingUploadBadges.isEmpty, "a map cluster shows no badges, as before")
         await fixture.close()
     }
 }

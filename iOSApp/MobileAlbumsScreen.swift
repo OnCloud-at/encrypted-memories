@@ -372,6 +372,8 @@ private struct MobileFilterGridScreen: View {
     @State private var showAlbumPicker = false
     @State private var showAlbumPhotoActions = false
     @State private var isRemovingFromAlbum = false
+    /// The Add Photos picker of this album while it is open.
+    @State private var addPhotosPicker: AlbumPhotoPickerModel?
     @State private var networkMonitor = NetworkMonitor.shared
 
     private enum Phase: Equatable {
@@ -478,6 +480,14 @@ private struct MobileFilterGridScreen: View {
 
     private var alertContent: some View {
         selectionDialogContent
+            .sheet(
+                isPresented: Binding(
+                    get: { addPhotosPicker != nil },
+                    set: { if !$0 { addPhotosPicker = nil } }
+                )
+            ) {
+                if let addPhotosPicker { addPhotosSheet(addPhotosPicker) }
+            }
             .alert(L10n.string("trash.empty_title"), isPresented: $confirmEmptyTrash) {
                 Button(L10n.string("trash.empty_confirm"), role: .destructive) {
                     Task { await emptyTrash() }
@@ -525,6 +535,58 @@ private struct MobileFilterGridScreen: View {
     private var albumID: String? {
         guard case .album(let id, _) = filter else { return nil }
         return id
+    }
+
+    /// The library photos this album can still take, in the library's own grid with its backup badges.
+    private func addPhotosSheet(_ picker: AlbumPhotoPickerModel) -> some View {
+        AlbumPhotoPickerSheet(
+            model: picker,
+            onRetry: {
+                guard let timeline = model.timeline else { return }
+                Task { await picker.loadLibrary(from: timeline) }
+            },
+            onAlbumChanged: {
+                model.noteAlbumsChanged()
+                Task { await load(showsLoading: false) }
+            }
+        ) { picker in
+            if let feed = model.thumbnailFeed {
+                UIKitTimelineGrid(
+                    items: picker.candidates,
+                    // The candidates stay fixed while the sheet shows them.
+                    contentRevision: 1,
+                    thumbnailFeed: feed,
+                    selectionMode: true,
+                    selectedUIDs: picker.selection,
+                    uploadBadges: model.pendingPresentation.uploadBadges,
+                    onOpenPhoto: { picker.toggle($0.uid) },
+                    onToggleSelection: { picker.toggle($0.uid) },
+                    onSelectionChanged: { picker.replaceSelection(with: $0) }
+                )
+                .ignoresSafeArea(edges: .bottom)
+                .accessibilityIdentifier("albums.addPhotos.grid")
+            }
+        }
+        .task(id: model.timeline.map(ObjectIdentifier.init)) {
+            guard let timeline = model.timeline else { return }
+            await picker.loadLibrary(from: timeline)
+        }
+        .task(id: addPhotosInputs(of: picker)) {
+            guard let timeline = model.timeline else { return }
+            await picker.update(from: timeline, albumNodeIDs: addPhotosAlbumNodeIDs)
+        }
+    }
+
+    /// The album's own photos, once its grid loaded.
+    private var addPhotosAlbumNodeIDs: Set<String>? {
+        phase == .loaded ? AlbumPhotoPickerModel.albumNodeIDs(of: snapshot.items) : nil
+    }
+
+    /// Changes whenever an input of the picker changes, so the picker reads them again.
+    private func addPhotosInputs(of picker: AlbumPhotoPickerModel) -> AlbumPhotoPickerModel.TimelineInputs? {
+        model.timeline.map {
+            picker.inputs(from: $0, albumRevision: UInt64(snapshot.count), albumLoaded: phase == .loaded)
+        }
     }
 
     @ToolbarContentBuilder private func routeToolbarContent() -> some ToolbarContent {
@@ -619,6 +681,18 @@ private struct MobileFilterGridScreen: View {
     /// A native toolbar `Menu` receives the system Liquid Glass treatment and morph animation automatically.
     private var albumActionsMenu: some View {
         Menu {
+            if let coordinator = model.albumActions {
+                Button {
+                    guard let albumID else { return }
+                    addPhotosPicker = AlbumPhotoPickerModel(albumID: albumID, coordinator: coordinator)
+                } label: {
+                    Label(L10n.string("albums.add_photos_menu"), systemImage: "plus")
+                }
+                .disabled(
+                    !AlbumPhotoPickerModel.isOffered(for: filter, coordinator: coordinator) || coordinator.isWorking
+                        || isDeletingAlbum)
+            }
+
             Button {
                 selection.toggleMode()
             } label: {
@@ -640,10 +714,11 @@ private struct MobileFilterGridScreen: View {
         .accessibilityLabel(L10n.string("albums.more_actions"))
     }
 
-    private func load() async {
+    /// `showsLoading` false keeps the shown grid until the new content replaces it, as after adding photos.
+    private func load(showsLoading: Bool = true) async {
         guard let backend = model.backend, filter.hasTimeline else { return }
         let token = snapshotReconciler.beginLoad()
-        phase = .loading
+        if showsLoading { phase = .loading }
         do {
             let sections = try await backend.timeline(filter: filter)
             // Build the snapshot off the main actor so opening a large album does not block the transition.

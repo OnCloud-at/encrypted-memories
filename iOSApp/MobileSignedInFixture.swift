@@ -30,6 +30,10 @@ import os
             keyPassword: "fixture-key")
         let sections: [TimelineSection]
         let backend: MobileFixtureBackend
+        /// The owned albums; the backend serves an album's route from their members.
+        let albums = MobileFixtureAlbums(
+            startsEmpty: ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesEmptyAlbumFixture"),
+            failsFirstAdd: ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumAddPartialFailure"))
         let cache: ThumbnailCache
         let feed: UIKitThumbnailFeed
         var items: [PhotoItem] { sections.flatMap(\.items) }
@@ -91,7 +95,8 @@ import os
             }
             thumbnails[Self.editedOriginalUID] = original.jpegData(compressionQuality: 0.8)
             self.sections = sections
-            backend = MobileFixtureBackend(sections: sections, thumbnails: thumbnails)
+            backend = MobileFixtureBackend(
+                sections: sections, thumbnails: thumbnails, albumMembers: { [albums] in albums.members(of: $0) })
             cache = ThumbnailCache(rootDirectory: cacheDirectory, runtimeState: cacheRuntimeState)
             feed = UIKitThumbnailFeed(cache: cache, loader: backend)
             for (uid, data) in thumbnails {
@@ -103,8 +108,6 @@ import os
         /// Signs the shared account runtime in with this fixture. Library content first, then the session, so the
         /// runtime's session observer finds an already configured account and does not start a network backend.
         func install() {
-            let albums = MobileFixtureAlbums(
-                startsEmpty: ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesEmptyAlbumFixture"))
             runtime.libraryModel.installIsolatedLibrary(
                 session: session, store: runtime.sessionModel.sessionStore, backend: backend,
                 sections: MobileUITestLaunch.libraryLoadScenario == nil ? sections : [],
@@ -672,10 +675,20 @@ import os
 
         private let lock = NSLock()
         private let startsEmpty: Bool
+        private var failsNextAdd: Bool
         private var createdAlbums: [(id: AlbumID, title: String)] = []
         private var members: [AlbumID: Set<PhotoUID>] = [:]
 
-        init(startsEmpty: Bool = false) { self.startsEmpty = startsEmpty }
+        /// `failsFirstAdd` adds only the first photo of the first add and reports the rest as failed.
+        init(startsEmpty: Bool = false, failsFirstAdd: Bool = false) {
+            self.startsEmpty = startsEmpty
+            failsNextAdd = failsFirstAdd
+        }
+
+        /// The photos of one album, for its route.
+        func members(of albumID: AlbumID) -> Set<PhotoUID> {
+            lock.withLock { members[albumID] ?? [] }
+        }
 
         func listAlbums() async throws -> [AlbumSummary] {
             lock.withLock {
@@ -707,7 +720,16 @@ import os
         }
         func deleteAlbum(albumID: AlbumID) async throws { throw MobileFixtureError.unavailable }
         func addPhotos(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws {
-            lock.withLock { members[albumID, default: []].formUnion(photoUIDs) }
+            let failsNow = lock.withLock {
+                let fails = failsNextAdd && photoUIDs.count > 1
+                if fails { failsNextAdd = false }
+                members[albumID, default: []].formUnion(fails ? Array(photoUIDs.prefix(1)) : photoUIDs)
+                return fails
+            }
+            if failsNow {
+                throw AlbumError.partialAdd(
+                    succeeded: 1, total: photoUIDs.count, message: "The fixture refused all but the first photo.")
+            }
         }
         func removePhotos(_ photoUIDs: [PhotoUID], from albumID: AlbumID) async throws {
             throw MobileFixtureError.unavailable
@@ -730,6 +752,8 @@ import os
     struct MobileFixtureBackend: PhotosBackend, LibraryChangeTokenProvider {
         let sections: [TimelineSection]
         let thumbnails: [PhotoUID: Data]
+        /// The photos of an owned album; its route lists only these.
+        var albumMembers: (@Sendable (AlbumID) -> Set<PhotoUID>)? = nil
         var timelineLoader: (@Sendable () async throws -> TimelineLoadSnapshot)? = nil
         var changeTokenLoader: (@Sendable () async throws -> String)? = nil
         var cachedTimelineLoader: (@Sendable () async -> CachedTimelineSnapshot?)? = nil
@@ -753,7 +777,20 @@ import os
             return await cachedTimelineLoader()
         }
         func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
-            filter == .trash && trashState.isEmptied ? [] : sections
+            switch filter {
+            case .trash where trashState.isEmptied:
+                return []
+            case .album(let albumID, _):
+                // An album shows only the photos added to it.
+                let members = albumMembers?(albumID) ?? []
+                return sections.compactMap { section in
+                    let items = section.items.filter { members.contains($0.uid) }
+                    return items.isEmpty
+                        ? nil : TimelineSection(id: section.id, date: section.date, title: section.title, items: items)
+                }
+            default:
+                return sections
+            }
         }
 
         func thumbnail(for uid: PhotoUID) async throws -> Data {

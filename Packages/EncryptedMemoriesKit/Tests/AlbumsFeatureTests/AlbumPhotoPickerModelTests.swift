@@ -21,6 +21,7 @@ private func loaded(
 @MainActor
 final class AlbumPhotoPickerModelTests: XCTestCase {
     private let pending = PhotoUID(localPending: .photoLibrary, identifier: "asset-1")
+    private let offline = AlbumPhotoPickerLibrary.Failure(message: "offline", retryable: true)
 
     private func makeModel(_ backend: FakeAlbumBackend) -> AlbumPhotoPickerModel {
         AlbumPhotoPickerModel(albumID: "album", coordinator: AlbumActionCoordinator(repository: repository(backend)))
@@ -38,11 +39,11 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
 
     // MARK: Candidates
 
-    func testCandidatesLeaveOutPhotosOfTheAlbumAndPhotosThatAreNotUploaded() async {
+    func testCandidatesLeaveOutPhotosOfTheAlbumAndKeepPhotosThatAreBackingUp() async {
         let model = await readyModel(
-            library: [pickerUID("a"), pickerUID("b"), pending, pickerUID("c")], members: ["b"])
+            library: [pickerUID("a"), pickerUID("b"), pending, pickerUID("c")], members: ["b", "asset-1"])
 
-        XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("a"), pickerUID("c")])
+        XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("a"), pending, pickerUID("c")])
         XCTAssertEqual(model.content, .choose)
     }
 
@@ -142,18 +143,33 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
         XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("b")])
     }
 
-    func testOnlyPhotosThatAreNotUploadedLeaveNothingToAdd() async {
-        let model = await readyModel(library: [pending], members: [])
+    func testPhotosThatAreBackingUpAreHandedToTheBackupForTheAlbum() async {
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let albums = repository(backend)
+        let recorded = RecordedPendingAlbumAdds()
+        await albums.setPendingAlbumAdds { uids, albumID in
+            await recorded.append(uids, albumID)
+            return true
+        }
+        let model = AlbumPhotoPickerModel(albumID: "album", coordinator: AlbumActionCoordinator(repository: albums))
+        await model.update(library: loaded([pickerUID("a"), pending]), albumNodeIDs: [])
+        XCTAssertEqual(model.content, .choose)
+        model.replaceSelection(with: [pickerUID("a"), pending])
 
-        XCTAssertTrue(model.candidates.isEmpty)
-        XCTAssertNotEqual(model.content, .choose)
+        let outcome = await model.submit()
+
+        XCTAssertEqual(outcome, .added)
+        XCTAssertEqual(backend.added.first?.uids, [pickerUID("a")], "only the uploaded photo reaches Proton now")
+        let handedToBackup = await recorded.adds
+        XCTAssertEqual(handedToBackup.map(\.uids), [[pending]])
+        XCTAssertEqual(handedToBackup.map(\.album), ["album"])
     }
 
     func testALoadFailureThenARetryShowsTheGrid() async {
         let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
 
-        await model.update(library: .failed(message: "offline"), albumNodeIDs: [])
-        XCTAssertEqual(model.content, .failed(message: "offline"))
+        await model.update(library: .loaded([], authority: .hydrating, failure: offline), albumNodeIDs: nil)
+        XCTAssertEqual(model.content, .failed(message: "offline", retryable: true), "no album load can help")
 
         await model.update(library: .loading, albumNodeIDs: [])
         XCTAssertEqual(model.content, .loading)
@@ -162,12 +178,36 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
         XCTAssertEqual(model.content, .choose)
     }
 
+    func testASavedLibraryWithoutPhotosToAddShowsAFailedServerLoad() async {
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+
+        await model.update(library: loaded([pickerUID("a")], authority: .cached), albumNodeIDs: ["a"])
+        XCTAssertEqual(model.content, .loading, "the server listing may still bring photos")
+
+        await model.update(
+            library: .loaded([pickerItem(pickerUID("a"))], authority: .cached, failure: offline), albumNodeIDs: ["a"])
+        XCTAssertEqual(model.content, .failed(message: "offline", retryable: true), "a failed listing never ends")
+
+        await model.update(library: loaded([pickerUID("a"), pickerUID("b")]), albumNodeIDs: ["a"])
+        XCTAssertEqual(model.content, .choose, "a retry that brings photos shows them")
+        XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("b")])
+    }
+
+    func testAFailureThatCannotBeRetriedOffersNoRetry() async {
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+        let final = AlbumPhotoPickerLibrary.Failure(message: "no access", retryable: false)
+
+        await model.update(library: .loaded([], authority: .hydrating, failure: final), albumNodeIDs: [])
+
+        XCTAssertEqual(model.content, .failed(message: "no access", retryable: false))
+    }
+
     func testTheCandidatesStayFixedOnceTheGridShows() async {
         let model = await readyModel(library: [pickerUID("a"), pickerUID("b")])
         model.replaceSelection(with: [pickerUID("a")])
 
         await model.update(library: loaded([pickerUID("b"), pickerUID("c")]), albumNodeIDs: [])
-        await model.update(library: .failed(message: "offline"), albumNodeIDs: [])
+        await model.update(library: .loaded([], authority: .hydrating, failure: offline), albumNodeIDs: [])
 
         XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("a"), pickerUID("b")])
         XCTAssertEqual(model.selection, [pickerUID("a")])
@@ -180,7 +220,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
         let model = await readyModel(library: [pickerUID("a"), pickerUID("b"), pending], members: ["b"])
 
         model.replaceSelection(with: [pickerUID("a"), pickerUID("b"), pending, pickerUID("unknown")])
-        XCTAssertEqual(model.selection, [pickerUID("a")])
+        XCTAssertEqual(model.selection, [pickerUID("a"), pending])
 
         model.toggle(pickerUID("a"))
         model.toggle(pickerUID("b"))

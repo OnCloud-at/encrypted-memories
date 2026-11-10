@@ -577,7 +577,7 @@ struct MobileTimelineScreen: View {
                 } else if model.isCompletelyEmpty && !model.showsPendingPhotos {
                     LibraryEmptyView(backupAction: emptyLibraryBackupAction)
                 } else if let failure = model.loadState.failure {
-                    MobileLibraryErrorView(message: failure.message, retryable: failure.retryable) {
+                    LibraryLoadErrorView(message: failure.message, retryable: failure.retryable) {
                         Task { await model.retry() }
                     }
                 } else if isEmptySearchResult {

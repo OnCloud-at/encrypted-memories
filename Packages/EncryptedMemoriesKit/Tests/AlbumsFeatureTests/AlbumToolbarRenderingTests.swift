@@ -10,46 +10,35 @@
     /// Checks the shared album form and destination picker through their native Mac presentation.
     final class AlbumToolbarRenderingTests: XCTestCase {
         @MainActor func testAlbumSheetKeepsItsTextActionsOnMac() async throws {
-            _ = NSApplication.shared
-            try requireVisionOCR()
             let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
-            let host = NSHostingController(
-                rootView: Color.clear.frame(width: 480, height: 320)
-                    .sheet(isPresented: .constant(true)) { AlbumCreationSheet(coordinator: coordinator) })
-            let window = NSWindow(contentViewController: host)
-            window.orderFrontRegardless()
-            defer { window.orderOut(nil) }
-            for _ in 0..<100 where window.attachedSheet == nil {
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            let sheet = try XCTUnwrap(window.attachedSheet, "Album Mac: attachedSheet unavailable")
-            defer { sheet.orderOut(nil) }
-            try await Task.sleep(for: .milliseconds(500))
-            let contentView = try XCTUnwrap(sheet.contentView, "Album Mac: sheet contentView unavailable")
-            let view = try XCTUnwrap(contentView.superview, "Album Mac: contentView superview unavailable")
-            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
-                sheet.appearance = NSAppearance(named: appearance)
-                try await Task.sleep(for: .milliseconds(300))
-                let bitmap = try snapshot(of: view)
-                let image = try XCTUnwrap(bitmap.cgImage, "Album Mac: bitmap cgImage unavailable")
-                let observations: [VNRecognizedTextObservation]
-                do {
-                    observations = try recognizedText(in: image)
-                } catch {
-                    XCTFail("Album Mac: Vision.perform failed: \(error)")
-                    throw error
-                }
-                let visibleText = observations.compactMap { $0.topCandidates(1).first?.string }
-                print("[Album Mac] visible text=\(visibleText)")
+            let texts = try await visibleTexts(
+                ofSheet: AlbumCreationSheet(coordinator: coordinator), named: "Album sheet", file: "album")
+            for visibleText in texts {
                 XCTAssertTrue(visibleText.contains(L10n.string("action.cancel")))
                 XCTAssertTrue(visibleText.contains(L10n.string("albums.create_action")))
-                let data = try pngData(from: bitmap)
-                let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.png")
-                attachment.name = "Album sheet \(appearance.rawValue)"
-                attachment.lifetime = .keepAlways
-                add(attachment)
-                try saveScreenshotIfRequested(bitmap, named: "album-\(appearance.rawValue).png")
+            }
+        }
+
+        /// The Mac sheet shows the picker's navigation title and selection count above its content.
+        @MainActor func testAddPhotosSheetShowsItsTitleCountAndActionsOnMac() async throws {
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
+            let model = AlbumPhotoPickerModel(
+                albumID: "album", coordinator: AlbumActionCoordinator(repository: repository(backend)))
+            let photos = ["a", "b", "c"].map {
+                PhotoItem(
+                    uid: PhotoUID(volumeID: "volume", nodeID: $0), captureTime: .distantPast, mediaType: "image/jpeg")
+            }
+            await model.update(library: .loaded(photos, authority: .authoritative), albumNodeIDs: [])
+            model.replaceSelection(with: Set(photos.prefix(2).map(\.uid)))
+            let sheet = AlbumPhotoPickerSheet(
+                model: model, onRetry: {}, onAlbumChanged: {}, grid: { _ in Color.gray })
+            let texts = try await visibleTexts(ofSheet: sheet, named: "Add Photos sheet", file: "add-photos")
+            for visibleText in texts {
+                XCTAssertTrue(visibleText.contains(L10n.string("albums.add_photos_title")), "\(visibleText)")
+                XCTAssertTrue(visibleText.contains(L10n.selectionCenterText(selectedCount: 2)), "\(visibleText)")
+                XCTAssertTrue(visibleText.contains(L10n.string("action.cancel")), "\(visibleText)")
+                XCTAssertTrue(visibleText.contains(L10n.string("albums.add_photos_confirm")), "\(visibleText)")
             }
         }
 
@@ -82,6 +71,51 @@
             try saveScreenshotIfRequested(bitmap, named: "album-empty-row.png")
             // OCR excludes the glyph bearings; allow that small difference from the native text's width.
             XCTAssertGreaterThan(textWidth, referenceWidth * 0.9)
+        }
+
+        /// Presents `content` as a sheet, renders it in light and dark, and returns the text that Vision reads in each.
+        @MainActor private func visibleTexts(
+            ofSheet content: some View, named name: String, file: String
+        ) async throws -> [[String]] {
+            _ = NSApplication.shared
+            try requireVisionOCR()
+            let host = NSHostingController(
+                rootView: Color.clear.frame(width: 480, height: 320)
+                    .sheet(isPresented: .constant(true)) { content })
+            let window = NSWindow(contentViewController: host)
+            window.orderFrontRegardless()
+            defer { window.orderOut(nil) }
+            for _ in 0..<100 where window.attachedSheet == nil {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            let sheet = try XCTUnwrap(window.attachedSheet, "\(name): attachedSheet unavailable")
+            defer { sheet.orderOut(nil) }
+            try await Task.sleep(for: .milliseconds(500))
+            let contentView = try XCTUnwrap(sheet.contentView, "\(name): sheet contentView unavailable")
+            let view = try XCTUnwrap(contentView.superview, "\(name): contentView superview unavailable")
+            var texts: [[String]] = []
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                sheet.appearance = NSAppearance(named: appearance)
+                try await Task.sleep(for: .milliseconds(300))
+                let bitmap = try snapshot(of: view)
+                let image = try XCTUnwrap(bitmap.cgImage, "\(name): bitmap cgImage unavailable")
+                let observations: [VNRecognizedTextObservation]
+                do {
+                    observations = try recognizedText(in: image)
+                } catch {
+                    XCTFail("\(name): Vision.perform failed: \(error)")
+                    throw error
+                }
+                let visibleText = observations.compactMap { $0.topCandidates(1).first?.string }
+                print("[\(name)] visible text=\(visibleText)")
+                texts.append(visibleText)
+                let attachment = XCTAttachment(data: try pngData(from: bitmap), uniformTypeIdentifier: "public.png")
+                attachment.name = "\(name) \(appearance.rawValue)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+                try saveScreenshotIfRequested(bitmap, named: "\(file)-\(appearance.rawValue).png")
+            }
+            return texts
         }
 
         @MainActor private func requireVisionOCR() throws {

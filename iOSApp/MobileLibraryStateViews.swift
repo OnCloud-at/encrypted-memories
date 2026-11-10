@@ -126,22 +126,3 @@ final class MobileFrostedBackdropView: UIVisualEffectView {
         )
     }
 }
-
-/// Shown when the first load fails; offers a retry when the failure is retryable.
-struct MobileLibraryErrorView: View {
-    let message: String
-    let retryable: Bool
-    let onRetry: () -> Void
-
-    var body: some View {
-        ContentUnavailableView {
-            Label(L10n.string("error.load_library_title"), systemImage: "exclamationmark.icloud")
-        } description: {
-            if !message.isEmpty { Text(message) }
-        } actions: {
-            if retryable {
-                RetryButton(.prominent, action: onRetry)
-            }
-        }
-    }
-}

@@ -5,15 +5,27 @@ import PhotosCore
 
 /// What the picker knows about the library it offers photos from.
 public enum AlbumPhotoPickerLibrary: Sendable, Equatable {
+    /// The last failed load of the library. `retryable` is false when trying again cannot help, so no Retry shows.
+    public struct Failure: Sendable, Equatable {
+        public let message: String
+        public let retryable: Bool
+
+        public init(message: String, retryable: Bool) {
+            self.message = message
+            self.retryable = retryable
+        }
+    }
+
     case loading
-    case failed(message: String)
-    case loaded([PhotoItem], authority: SourceInventoryAuthority)
+    /// The items shown so far, how far they are known, and the failure of the last load, if it failed. A saved
+    /// library can stay shown after a failed load; the failure then explains why the picker cannot wait for more.
+    case loaded([PhotoItem], authority: SourceInventoryAuthority, failure: Failure? = nil)
 }
 
 /// What the picker shows.
 public enum AlbumPhotoPickerContent: Sendable, Equatable {
     case loading
-    case failed(message: String)
+    case failed(message: String, retryable: Bool)
     case emptyLibrary
     case nothingToAdd
     case choose
@@ -40,6 +52,8 @@ public final class AlbumPhotoPickerModel {
     public private(set) var candidates: [PhotoItem] = []
     public private(set) var selection: Set<PhotoUID> = []
     public private(set) var content: AlbumPhotoPickerContent = .loading
+    /// The failure of the picker's last whole-library load, shown with Retry while the library is not known.
+    public internal(set) var libraryLoadFailure: String?
     let coordinator: AlbumActionCoordinator
     @ObservationIgnored private var candidateUIDs: Set<PhotoUID> = []
     @ObservationIgnored private var updateGeneration: UInt64 = 0
@@ -56,12 +70,13 @@ public final class AlbumPhotoPickerModel {
         return coordinator.canAddPhotos
     }
 
-    /// The one place that decides which library photos the picker offers: photos the album already holds and
-    /// photos that are not uploaded yet stay out. One pass over the library.
+    /// The one place that decides which library photos the picker offers: every photo the library grid shows,
+    /// except those the album already holds. Photos that are still backing up stay in; the album write links them
+    /// after their upload. One pass over the library.
     nonisolated static func candidates(
         from libraryItems: [PhotoItem], excludingAlbumNodeIDs albumNodeIDs: Set<String>
     ) -> [PhotoItem] {
-        libraryItems.filter { !$0.uid.isLocalPending && !albumNodeIDs.contains($0.uid.nodeID) }
+        libraryItems.filter { $0.uid.isLocalPending || !albumNodeIDs.contains($0.uid.nodeID) }
     }
 
     /// Node identities the album holds. Albums and the library live on the same account volume, but grids group
@@ -82,8 +97,13 @@ public final class AlbumPhotoPickerModel {
         guard content != .choose else { return }
         updateGeneration &+= 1
         let generation = updateGeneration
-        guard case .loaded(let items, let authority) = library else {
-            if case .failed(let message) = library { content = .failed(message: message) } else { content = .loading }
+        guard case .loaded(let items, let authority, let failure) = library else {
+            content = .loading
+            return
+        }
+        let failed = failure.map { AlbumPhotoPickerContent.failed(message: $0.message, retryable: $0.retryable) }
+        if items.isEmpty, authority != .authoritative, let failed {
+            content = failed
             return
         }
         guard let albumNodeIDs else {
@@ -99,7 +119,8 @@ public final class AlbumPhotoPickerModel {
             candidateUIDs = Set(computed.map(\.uid))
             content = .choose
         } else if authority != .authoritative {
-            content = .loading
+            // Without a known library only a running load can still bring photos; a failed one cannot.
+            content = failed ?? .loading
         } else {
             content = items.isEmpty ? .emptyLibrary : .nothingToAdd
         }

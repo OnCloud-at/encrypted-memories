@@ -141,6 +141,8 @@ struct MainView: View {
     @State private var isSavingToLibrary = false
     @State private var confirmDeleteAlbum = false
     @State private var isDeletingAlbum = false
+    /// The Add Photos picker of the shown album while it is open.
+    @State private var addPhotosPicker: AlbumPhotoPickerModel?
     @State private var albumDeleteFailureMessage: String?
     @State private var albumCoverFailureMessage: String?
     @State private var isSettingAlbumCover = false
@@ -519,6 +521,14 @@ struct MainView: View {
                 onCompleted: { _ in showCreateAlbum = false }
             )
         }
+        .sheet(
+            isPresented: Binding(
+                get: { addPhotosPicker != nil },
+                set: { if !$0 { addPhotosPicker = nil } }
+            )
+        ) {
+            if let addPhotosPicker { addPhotosSheet(addPhotosPicker) }
+        }
         .alert(trashConfirmationTitle, isPresented: $confirmTrash) {
             Button("alert.move_to_trash", role: .destructive) {
                 let items = pendingTrashItems
@@ -785,6 +795,13 @@ struct MainView: View {
     /// Native toolbar menu for actions on the selected album.
     private var albumActionsToolbarMenu: some View {
         Menu {
+            Button(L10n.string("albums.add_photos_menu")) {
+                guard case .album(let albumID, _) = selection else { return }
+                addPhotosPicker = AlbumPhotoPickerModel(albumID: albumID, coordinator: albumActions)
+            }
+            .disabled(
+                !AlbumPhotoPickerModel.isOffered(for: selection, coordinator: albumActions) || albumActions.isWorking
+                    || isDeletingAlbum)
             Button(selectionMode ? L10n.string("action.done") : L10n.string("action.select")) {
                 selectionMode.toggle()
                 if !selectionMode { selectedUIDs.removeAll() }
@@ -828,6 +845,44 @@ struct MainView: View {
     private func endSelection() {
         selectionMode = false
         selectedUIDs.removeAll()
+    }
+
+    /// The library photos the shown album can still take, in the production grid on a model of its own.
+    private func addPhotosSheet(_ picker: AlbumPhotoPickerModel) -> some View {
+        AlbumPhotoPickerSheet(
+            model: picker,
+            onRetry: { Task { await picker.loadLibrary(from: timelineModel) } },
+            onAlbumChanged: {
+                Task {
+                    await timelineModel.refreshLibrary()
+                    await loadAlbums()
+                }
+            }
+        ) { picker in
+            MacAlbumPhotoPickerGrid(
+                picker: picker, feed: feed, uploadBadges: timelineModel.pendingPresentation.uploadBadges,
+                makeGridModel: { TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend) })
+        }
+        .task { await picker.loadLibrary(from: timelineModel) }
+        .task(
+            id: picker.inputs(
+                from: timelineModel, albumRevision: timelineModel.contentRevision, albumLoaded: isAlbumGridLoaded)
+        ) {
+            await picker.update(from: timelineModel, albumNodeIDs: addPhotosAlbumNodeIDs)
+        }
+    }
+
+    /// The shown album's own photos, once its grid loaded.
+    private var addPhotosAlbumNodeIDs: Set<String>? {
+        isAlbumGridLoaded ? AlbumPhotoPickerModel.albumNodeIDs(of: timelineModel.allItems) : nil
+    }
+
+    private var isAlbumGridLoaded: Bool {
+        guard case .album = selection else { return false }
+        switch timelineModel.gridState {
+        case .loaded, .empty: return true
+        case .loading, .failed: return false
+        }
     }
 
     /// Opens the shared name form.

@@ -147,9 +147,18 @@ public final class TimelineViewModel {
     /// True while the whole-library grid shows pending photos. It waits for the Proton timeline, so a slow
     /// first load never shows only local photos.
     public var showsPendingPhotos: Bool {
-        filter == .all && !pendingPresentation.isCanonical && !pendingPresentation.items.isEmpty
+        filter == .all && wholeLibraryHasPendingPhotos
+    }
+
+    /// The whole library has pending photos to show, whichever route is shown. They wait until the Proton library is
+    /// known or settled empty.
+    private var wholeLibraryHasPendingPhotos: Bool {
+        !pendingPresentation.isCanonical && !pendingPresentation.items.isEmpty
             && (!wholeLibrarySnapshot.items.isEmpty || initialLibraryLoadState.isEmpty)
     }
+
+    /// Upload badges of the items that `showTransientItems` shows.
+    private var transientUploadBadges = PendingUploadBadges.empty
 
     /// Local photos deleted before upload, shown in "Zuletzt gelöscht" with the Proton trash.
     public private(set) var pendingTrash = PendingTrashPresentation.empty
@@ -217,6 +226,7 @@ public final class TimelineViewModel {
         switch filter {
         case .all: pendingPresentation.uploadBadges
         case .trash: pendingTrash.badges
+        case .map: transientUploadBadges
         default: .empty
         }
     }
@@ -288,6 +298,9 @@ public final class TimelineViewModel {
     @ObservationIgnored private var initialLoadTask: Task<Void, Never>?
     /// The whole-library listing that a surface over another route started; concurrent callers share it.
     @ObservationIgnored private var wholeLibraryLoadTask: Task<String?, Never>?
+    /// All Photos' first load or its retry while their listing runs, and the callers that wait for it to end.
+    @ObservationIgnored private var runningWholeLibraryListings = 0
+    @ObservationIgnored private var wholeLibraryListingWaiters: [CheckedContinuation<Void, Never>] = []
     /// Completion of that single-flight startup request is intentionally separate from presentation readiness:
     /// a rendered non-empty cache may uncover while this remains false and validation continues in the task.
     @ObservationIgnored private var initialLoadCompleted = false
@@ -568,14 +581,24 @@ public final class TimelineViewModel {
     /// Shows a caller-provided, already-resolved item set in the existing timeline grid without asking the
     /// backend for a server-side filter. Used by map cluster/member pins: the map owns which UIDs are grouped,
     /// while the grid, selection, export, trash, viewer, and thumbnail prefetch remain the normal timeline path.
-    public func showTransientItems(_ items: [PhotoItem], sectionID: String) async {
+    /// The album photo picker shows its candidates the same way, with the upload badges of photos still backing up.
+    /// It passes `restartsPrefetch: false`. A route crawl replaces the crawl list of the feed that every grid of the
+    /// window shares and cancels a whole-library crawl start that is still being prepared (`startRouteCrawl`); nothing
+    /// restores the crawl of the route under the sheet when the sheet closes. The grid still loads the thumbnails that
+    /// it shows.
+    public func showTransientItems(
+        _ items: [PhotoItem], sectionID: String, uploadBadges: PendingUploadBadges = .empty,
+        restartsPrefetch: Bool = true
+    ) async {
         filter = .map
+        transientUploadBadges = uploadBadges
         let sections =
             items.isEmpty
             ? []
             : [TimelineSection(id: sectionID, date: items.first?.captureTime ?? .distantPast, title: "", items: items)]
         allItems = items
         state = items.isEmpty ? .empty : .loaded(sections)
+        guard restartsPrefetch else { return }
         await startRouteCrawl(items)
     }
 
@@ -608,6 +631,13 @@ public final class TimelineViewModel {
         allRouteSnapshot == nil ? allItems : wholeLibrarySnapshot.items
     }
 
+    /// What All Photos shows, whichever route is shown: the Proton library with the photos that are still backing
+    /// up. Empty until a whole-library snapshot exists, so pending photos never stand in for the library.
+    public var wholeLibraryGridItems: [PhotoItem] {
+        if wholeLibraryHasPendingPhotos { return pendingPresentation.items }
+        return allRouteSnapshot == nil ? [] : wholeLibrarySnapshot.items
+    }
+
     /// The whole library for location work, or nil until a whole-library load succeeded. Unlike
     /// `wholeLibraryItemsForViewer`, it never falls back to the open route or to a cached snapshot.
     public var wholeLibraryItemsForLocations: [PhotoItem]? {
@@ -615,11 +645,15 @@ public final class TimelineViewModel {
     }
 
     /// Loads the whole library for a surface over another route, such as the album picker, and leaves the route's
-    /// grid as it is. Returns nil once the whole library is known, or the failure message. It waits for a running
-    /// first load, concurrent callers share one listing, and a newer whole-library publication overtakes its result.
+    /// grid as it is. Returns nil once the whole library is known, or the failure message. It waits for All Photos'
+    /// first load or its retry while their listing runs, concurrent callers share one listing, and a newer
+    /// whole-library publication overtakes its result.
     @discardableResult
     public func loadWholeLibraryIfNeeded() async -> String? {
         if let initialLoadTask { await initialLoadTask.value }
+        while runningWholeLibraryListings > 0 {
+            await withCheckedContinuation { wholeLibraryListingWaiters.append($0) }
+        }
         guard wholeLibraryInventoryAuthority != .authoritative else { return nil }
         if let wholeLibraryLoadTask { return await wholeLibraryLoadTask.value }
         let task = Task { @MainActor [weak self] () -> String? in
@@ -634,6 +668,21 @@ public final class TimelineViewModel {
         let failure = await task.value
         wholeLibraryLoadTask = nil
         return failure
+    }
+
+    /// Counts the listing of All Photos' first load or its retry, so `loadWholeLibraryIfNeeded` waits for it instead
+    /// of reading again. A refresh is not counted: it drops its listing when the route switches.
+    private func countingWholeLibraryListing<Result>(_ listing: () async throws -> Result) async rethrows -> Result {
+        runningWholeLibraryListings += 1
+        defer {
+            runningWholeLibraryListings -= 1
+            if runningWholeLibraryListings == 0 {
+                let waiters = wholeLibraryListingWaiters
+                wholeLibraryListingWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        }
+        return try await listing()
     }
 
     /// One whole-library listing that settles without touching the shown route, like a route switch during a load.
@@ -930,9 +979,11 @@ public final class TimelineViewModel {
         provisionalGeneration &+= 1
         let progressGeneration = provisionalGeneration
         let access = hadInventoryBaseline ? nil : await feed.beginProvisionalThumbnailAccess()
-        await loadInitialInventorySnapshot(
-            hadInventoryBaseline: hadInventoryBaseline, progressGeneration: progressGeneration,
-            publishedBeforeLoad: publishedBeforeLoad, thumbnailAccess: access)
+        await countingWholeLibraryListing {
+            await loadInitialInventorySnapshot(
+                hadInventoryBaseline: hadInventoryBaseline, progressGeneration: progressGeneration,
+                publishedBeforeLoad: publishedBeforeLoad, thumbnailAccess: access)
+        }
         clearProvisionalTimeline(generation: progressGeneration)
         if let access { await feed.endProvisionalThumbnailAccess(access) }
     }
