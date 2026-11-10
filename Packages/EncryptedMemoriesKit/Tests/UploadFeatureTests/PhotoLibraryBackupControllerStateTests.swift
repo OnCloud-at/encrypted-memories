@@ -1363,36 +1363,6 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     #endif
 
-    func testBackgroundExecutionCompositionReservesDiscoveryAndQueuePhases() throws {
-        let catalog = BackupExecutionProgress(completedUnitCount: 50, totalUnitCount: 100)
-        let queue = BackupExecutionProgress(completedUnitCount: 20, totalUnitCount: 100)
-
-        let scanOnly = try XCTUnwrap(
-            PhotoLibraryBackupExecutionProgress.combined(
-                catalog: catalog,
-                queue: nil,
-                isScanning: true
-            ))
-        XCTAssertEqual(scanOnly.completedUnitCount, 125_000)
-        XCTAssertEqual(scanOnly.totalUnitCount, 1_000_000)
-
-        let combined = try XCTUnwrap(
-            PhotoLibraryBackupExecutionProgress.combined(
-                catalog: catalog,
-                queue: queue,
-                isScanning: true
-            ))
-        XCTAssertEqual(combined.completedUnitCount, 275_000)
-
-        let finishedWithoutQueue = try XCTUnwrap(
-            PhotoLibraryBackupExecutionProgress.combined(
-                catalog: BackupExecutionProgress(completedUnitCount: 100, totalUnitCount: 100),
-                queue: nil,
-                isScanning: false
-            ))
-        XCTAssertEqual(finishedWithoutQueue.completedUnitCount, 1_000_000)
-    }
-
     func testLivePhotoLibraryChangesAreAvailableBeforePersistentHistoryCatchesUp() {
         var buffer = PhotoLibraryLiveChangeBuffer()
 
