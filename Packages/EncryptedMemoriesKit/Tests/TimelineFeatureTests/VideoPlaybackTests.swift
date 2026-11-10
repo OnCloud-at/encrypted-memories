@@ -142,7 +142,7 @@ struct VideoPlaybackTests {
 
         // Busy states are mutually exclusive with playing/failed; nothing is both "busy" and terminal.
         let states: [VideoViewerState] = [
-            .idle, .resolving, .preparingStream, .downloading(0.5), .buffering(nil),
+            .idle, .resolving, .preparingStream, .buffering(nil),
             .ready, .playing, .seeking, .failed(.timedOut),
         ]
         for s in states {

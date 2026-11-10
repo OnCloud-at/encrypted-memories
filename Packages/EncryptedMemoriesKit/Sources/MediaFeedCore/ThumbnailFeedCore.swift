@@ -675,7 +675,7 @@ public actor ThumbnailFeedCore {
             diagnostics.increment("thumb.diskCacheHit")
             guard let image = result.1 else {
                 diagnostics.increment("thumb.diskDecodeFailed")
-                recordError("decode failed for \(Self.key(uid))")
+                recordError("decode failed for \(uid.cacheKey)")
                 return nil
             }
             return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels), access: access)
@@ -725,7 +725,7 @@ public actor ThumbnailFeedCore {
             if result.itemErrors[uid] != nil {
                 scheduleRefusalLapseWake(unfetchable.insert(uid))
             } else if result.withheldUIDs.contains(uid) {
-                recordError("thumbnail withheld for \(Self.key(uid)) after an authorization change")
+                recordError("thumbnail withheld for \(uid.cacheKey) after an authorization change")
             }
             return nil
         }
@@ -937,7 +937,7 @@ public actor ThumbnailFeedCore {
                 if attempts == Self.maxWithheldRequeues {
                     withheldRequeues[uid] = attempts + 1
                     recordError(
-                        "thumbnail withheld for \(Self.key(uid)) \(attempts + 1) times; the next crawl or a visible request loads it"
+                        "thumbnail withheld for \(uid.cacheKey) \(attempts + 1) times; the next crawl or a visible request loads it"
                     )
                 }
                 continue
@@ -1186,7 +1186,7 @@ public actor ThumbnailFeedCore {
         guard let image = tile.decoded else {
             diagnostics.increment("thumb.diskDecodeFailed")
             diagnostics.increment("thumb.ramDecodeFailed")
-            recordError("decode failed for \(Self.key(tile.uid))")
+            recordError("decode failed for \(tile.uid.cacheKey)")
             return
         }
         storeDecoded(image, for: tile.uid, decodePixelCap: tile.decodePixelCap)
@@ -1317,7 +1317,7 @@ public actor ThumbnailFeedCore {
                                 missing += 1
                                 diagnostics.increment("thumb.diskDecodeFailed")
                                 diagnostics.increment("thumb.ramDecodeFailed")
-                                recordError("decode failed for \(Self.key(tile.uid))")
+                                recordError("decode failed for \(tile.uid.cacheKey)")
                             }
                         } else {
                             // Admission is O(1); the worker revalidates encrypted disk presence off actor
@@ -1460,11 +1460,11 @@ public actor ThumbnailFeedCore {
         guard let data = box.value else {
             if let reason = result.itemErrors[uid] {
                 scheduleRefusalLapseWake(unfetchable.insert(uid))
-                recordError("thumbnail refused for \(Self.key(uid)): \(reason)")
+                recordError("thumbnail refused for \(uid.cacheKey): \(reason)")
             } else if result.withheldUIDs.contains(uid) {
-                recordError("thumbnail withheld for \(Self.key(uid)) after an authorization change")
+                recordError("thumbnail withheld for \(uid.cacheKey) after an authorization change")
             } else if let reason = result.batchError {
-                recordError("thumbnail fetch failed for \(Self.key(uid)): \(reason)")
+                recordError("thumbnail fetch failed for \(uid.cacheKey): \(reason)")
             }
             return nil
         }
@@ -1492,7 +1492,7 @@ public actor ThumbnailFeedCore {
         cacheArrivalWake.call()
         guard let image else {
             diagnostics.increment("thumb.diskDecodeFailed")
-            recordError("decode failed for \(Self.key(uid))")
+            recordError("decode failed for \(uid.cacheKey)")
             return nil
         }
         return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels), access: access)
@@ -2440,7 +2440,7 @@ public actor ThumbnailFeedCore {
                     scheduleRefusalLapseWake(unfetchable.formUnion(refused))
                     if let first = refused.first, let reason = result.itemErrors[first] {
                         recordError(
-                            "thumbnail refused for \(refused.count) item(s), e.g. \(Self.key(first)): \(reason)")
+                            "thumbnail refused for \(refused.count) item(s), e.g. \(first.cacheKey): \(reason)")
                     }
                     // Withheld after an authorization change: not the photo's fault. The crawl requests it again with
                     // a fresh authorization, a bounded number of times; a visible request always does.
@@ -2450,7 +2450,7 @@ public actor ThumbnailFeedCore {
                     prefetchFailedWithheld += withheld.filter(isReportedForPrefetch).count
                     if let first = withheld.first {
                         recordError(
-                            "thumbnail withheld for \(withheld.count) item(s) after an authorization change, e.g. \(Self.key(first))"
+                            "thumbnail withheld for \(withheld.count) item(s) after an authorization change, e.g. \(first.cacheKey)"
                         )
                     }
                     requeueWithheld(withheld)
@@ -3616,8 +3616,6 @@ public actor ThumbnailFeedCore {
                 ])
         #endif
     }
-
-    private static func key(_ uid: PhotoUID) -> NSString { uid.cacheKey }
 }
 
 #if DEBUG
