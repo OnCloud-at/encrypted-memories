@@ -34,3 +34,7 @@ extension MLVectorBlock {
 
     var vectors: [ContiguousArray<Float32>] { (0..<count).map(vector(at:)) }
 }
+
+func quantizedFloat16(_ value: Float32) -> Float32 {
+    MLFloat16Codec.float32(fromBits: MLFloat16Codec.float16Bits(from: value))
+}
