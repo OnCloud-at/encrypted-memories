@@ -56,14 +56,7 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
             .task(id: trigger) { await look() }
             .onAppear { if scenePhase == .active { asker.sceneBecameActive(at: .now) } }
             .onChange(of: scenePhase) { _, phase in
-                switch phase {
-                case .active: asker.sceneBecameActive(at: .now)
-                case .inactive: asker.sceneBecameInactive()
-                case .background:
-                    asker.sceneEnteredBackground()
-                    isPresented = false
-                @unknown default: asker.sceneBecameInactive()
-                }
+                if !Self.sceneChanged(to: phase, asker: asker, at: .now) { isPresented = false }
             }
             .onChange(of: isPresented) { _, shows in
                 // The alert went away without a button, for example with its place: no answer.
@@ -96,14 +89,38 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
             let bytes = await estimatedBytes(for: controller.status, of: controller)
             guard !Task.isCancelled else { return }
             asker.coverChanged(isCovered: probe.coversPlace(ownQuestionShows: false), at: .now)
-            switch asker.next(controller.status, estimatedBytes: bytes, isTaskActive: isTaskActive, at: .now) {
-            case .ask:
-                isPresented = true
-                return
-            case .wait(let calmIn): try? await Task.sleep(for: calmIn)
-            case .none: try? await Task.sleep(for: Self.coverCheckInterval)
-            }
+            let next = asker.next(controller.status, estimatedBytes: bytes, isTaskActive: isTaskActive, at: .now)
+            if next == .ask { isPresented = true }
+            guard let pause = Self.pause(after: next) else { return }
+            try? await Task.sleep(for: pause)
         }
+    }
+
+    /// How long the place sleeps before it looks again; nil when it stops looking because it asks, or because only a
+    /// change of the backup or the scene can let it ask. It sleeps through the calm time in steps, so a cover that comes
+    /// and goes within it is seen.
+    static func pause(after next: PhotoLibraryContinuedBackupPrompt.Asker.Next) -> Duration? {
+        switch next {
+        case .ask, .none: nil
+        case .wait(let calmIn): min(calmIn, coverCheckInterval)
+        case .held: coverCheckInterval
+        }
+    }
+
+    /// Reports the scene phase to the place's rules. Returns false when the question must close: leaving the app
+    /// counts as "Not Now". An inactive scene, as under Control Center, asks nothing and closes nothing.
+    static func sceneChanged(
+        to phase: ScenePhase, asker: PhotoLibraryContinuedBackupPrompt.Asker, at now: ContinuousClock.Instant
+    ) -> Bool {
+        switch phase {
+        case .active: asker.sceneBecameActive(at: now)
+        case .inactive: asker.sceneBecameInactive()
+        case .background:
+            asker.sceneEnteredBackground()
+            return false
+        @unknown default: asker.sceneBecameInactive()
+        }
+        return true
     }
 
     /// The volume only for a short list, read once for each count of photos left.

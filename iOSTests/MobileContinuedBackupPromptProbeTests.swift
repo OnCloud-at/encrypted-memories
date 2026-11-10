@@ -71,6 +71,20 @@ import UIKit
         #expect(!place.probe.coversPlace(ownQuestionShows: false))
     }
 
+    /// Only a field that still edits covers the place: a field whose end notification never came does not block it.
+    @Test func aFieldThatNoLongerEditsDoesNotCoverThePlace() throws {
+        let place = try makePlace()
+        defer { place.window.isHidden = true }
+        let field = UITextField()
+        place.root.view.addSubview(field)
+
+        NotificationCenter.default.post(name: UITextField.textDidBeginEditingNotification, object: field)
+
+        #expect(!field.isFirstResponder)
+        #expect(!place.probe.isEditingText)
+        #expect(!place.probe.coversPlace(ownQuestionShows: false))
+    }
+
     @Test func aPlaceWithoutAViewControllerCountsAsCovered() {
         let probe = MobileContinuedBackupPromptProbe()
         #expect(probe.presentationsOverPlace() == nil)
