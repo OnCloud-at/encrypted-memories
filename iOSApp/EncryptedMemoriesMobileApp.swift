@@ -328,6 +328,11 @@ private struct MobileMainTabView: View {
         return networkMonitor.isOnline || !libraryModel.items.isEmpty
     }
 
+    /// Settings or the viewer is shown over this scene, or the person searches: the continued backup question waits.
+    private var coversContinuedBackupPrompt: Bool {
+        sceneContext.settingsPresented || viewerRouter.presentation != nil || selection == .search
+    }
+
     private var suggestionsRevision: String {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: libraryModel.timelineRevision, favoriteUIDs: libraryModel.favoriteUIDs,
@@ -459,10 +464,8 @@ private struct MobileMainTabView: View {
             )
             // The root asks the continued backup question only while nothing of this scene covers it (#1108).
             .continuedBackupPrompt(
-                controller: libraryModel.photoBackup,
-                at: .root(
-                    isCovered: sceneContext.settingsPresented || viewerRouter.presentation != nil
-                        || selection == .search))
+                controller: libraryModel.photoBackup, at: .root(isCovered: coversContinuedBackupPrompt)
+            )
             // Settings is a scene-level presentation so the toolbar button and the command open it over any tab.
             .sheet(isPresented: $sceneContext.settingsPresented) {
                 MobileSettingsScreen(showsDismissButton: true)
