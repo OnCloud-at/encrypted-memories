@@ -18,18 +18,20 @@ final class MobileRevertToOriginalUITests: XCTestCase {
         let cancel: String
         let failure: String
         let ok: String
+        let close: String
 
         static let english = Copy(
             language: "en", showOriginal: "Show Original", command: "Revert to Original\u{2026}",
             title: "Revert to Original",
             message: "The original becomes a new photo. The edited version moves to the Trash.",
-            confirm: "Revert", cancel: "Cancel", failure: "The original couldn\u{2019}t be restored.", ok: "OK")
+            confirm: "Revert", cancel: "Cancel", failure: "The original couldn\u{2019}t be restored.", ok: "OK",
+            close: "Close")
         static let german = Copy(
             language: "de", showOriginal: "Original zeigen",
             command: "Zum Original zur\u{FC}ckkehren \u{2026}", title: "Zum Original zur\u{FC}ckkehren",
             message: "Das Original wird ein neues Foto. Die bearbeitete Version wandert in den Papierkorb.",
             confirm: "Zur\u{FC}ckkehren", cancel: "Abbrechen",
-            failure: "Das Original konnte nicht wiederhergestellt werden.", ok: "OK")
+            failure: "Das Original konnte nicht wiederhergestellt werden.", ok: "OK", close: "Schlie\u{DF}en")
     }
 
     override func setUp() {
@@ -39,13 +41,15 @@ final class MobileRevertToOriginalUITests: XCTestCase {
 
     override func tearDown() { app.terminate() }
 
-    private func launch(_ copy: Copy, refusing: Bool = false) {
+    /// `gateFile` holds every revert until the test creates that file; the revert then fails.
+    private func launch(_ copy: Copy, refusing: Bool = false, gateFile: URL? = nil) {
         app.launchArguments = [
             "-EncryptedMemoriesUITestFixture",
             "-AppleLanguages", "(\(copy.language))",
             "-AppleLocale", copy.language == "de" ? "de_DE" : "en_US",
         ]
         if refusing { app.launchArguments.append("-EncryptedMemoriesRevertFixtureFails") }
+        if let gateFile { app.launchArguments += ["-EncryptedMemoriesRevertFixtureFailsAfterFile", gateFile.path] }
         app.launch()
     }
 
@@ -174,5 +178,44 @@ final class MobileRevertToOriginalUITests: XCTestCase {
         XCTAssertTrue(more.exists, "die Ansicht bleibt offen")
         XCTAssertFalse(
             app.alerts[Copy.german.failure].waitForExistence(timeout: 3), "die Meldung kommt nicht zur\u{FC}ck")
+    }
+
+    // MARK: - A failure after the viewer closed
+
+    func testAFailureAfterTheViewerClosedShowsTheFrozenTextOnceInTheLibrary() throws {
+        try assertTheFailureShowsInTheLibraryAfterTheViewerClosed(.english)
+    }
+
+    func testGermanFailureAfterTheViewerClosedShowsTheFrozenTextOnceInTheLibrary() throws {
+        try assertTheFailureShowsInTheLibraryAfterTheViewerClosed(.german)
+    }
+
+    /// The fixture holds the revert until the test creates the gate file, so the viewer is closed before the failure
+    /// arrives. The library then shows the same alert once, with OK only.
+    private func assertTheFailureShowsInTheLibraryAfterTheViewerClosed(_ copy: Copy) throws {
+        let gate = FileManager.default.temporaryDirectory.appendingPathComponent("revert-gate-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: gate) }
+        launch(copy, gateFile: gate)
+        let (more, _) = try presentConfirmation(copy)
+        try app.tapDialogButton(copy.confirm)
+
+        let close = app.buttons[copy.close].firstMatch
+        XCTAssertTrue(close.waitForExistence(timeout: 10), "the viewer shows no \(copy.close) while the revert runs")
+        XCTAssertFalse(app.alerts[copy.failure].exists, "the revert is still held, so nothing failed yet")
+        close.tap()
+        XCTAssertTrue(isGone(more), "the viewer closed")
+
+        XCTAssertTrue(
+            FileManager.default.createFile(atPath: gate.path, contents: Data()), "the test could not open the gate")
+
+        let failure = app.alerts[copy.failure]
+        XCTAssertTrue(failure.waitForExistence(timeout: 30), "the failure did not appear in the library")
+        XCTAssertEqual(distinctButtons(of: failure), [copy.ok], "the failure offers OK and no retry")
+
+        try app.tapDialogButton(copy.ok)
+
+        XCTAssertTrue(isGone(failure, timeout: 10), "OK closes the failure")
+        // The failure shows once: it does not come back.
+        XCTAssertFalse(app.alerts[copy.failure].waitForExistence(timeout: 3), "the failure came back")
     }
 }
