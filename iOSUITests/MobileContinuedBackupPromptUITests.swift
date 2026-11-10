@@ -31,8 +31,7 @@ final class MobileContinuedBackupPromptUITests: XCTestCase {
 
         question.buttons["Not Now"].tap()
 
-        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: question)
-        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: 5), .completed)
+        XCTAssertEqual(question.waitUntilGone(timeout: 5), .completed)
         XCTAssertFalse(question.waitForExistence(timeout: 6), "the question comes back for the same photos")
     }
 
@@ -43,8 +42,7 @@ final class MobileContinuedBackupPromptUITests: XCTestCase {
 
         question.buttons["Continue"].tap()
 
-        let closed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: question)
-        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: 5), .completed)
+        XCTAssertEqual(question.waitUntilGone(timeout: 5), .completed)
         XCTAssertFalse(app.alerts.firstMatch.waitForExistence(timeout: 5), "no other alert follows the answer")
     }
 
