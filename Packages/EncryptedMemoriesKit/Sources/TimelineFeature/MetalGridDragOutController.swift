@@ -98,18 +98,6 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         }
     }
 
-    /// The on-demand staging directory for drag-out originals (matches the iOS controller).
-    private static var stagingDirectory: URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("DragOut", isDirectory: true)
-    }
-
-    /// A fresh per-session staging subdirectory keeps concurrent sessions from sweeping each
-    /// other's in-flight downloads: the stager's orphan sweep removes stale `.download` files,
-    /// and a second drag reusing the shared directory could delete the first session's files.
-    private static func makeSessionStagingDirectory() -> URL {
-        Self.stagingDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    }
-
     /// Delays session teardown after the drag visually ends: macOS resolves file promises only
     /// after `draggingSession(endedAt:)`, so an immediate cleanup would cancel in-flight staging
     /// (4K/2 GB videos) and fail late `writePromiseTo` deliveries. Bounded so plaintext staged
@@ -195,7 +183,7 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         let dragged = files.map(\.item)
 
         let stager = DragOutStager(
-            fileProvider: fileProvider, stagingDirectory: Self.makeSessionStagingDirectory())
+            fileProvider: fileProvider, stagingDirectory: DragOutStager.makeSessionStagingDirectory())
         self.stager = stager
         let dragSessionID = UUID()
         if let sessionID { PhotoDragPasteboard.endSession(sessionID) }

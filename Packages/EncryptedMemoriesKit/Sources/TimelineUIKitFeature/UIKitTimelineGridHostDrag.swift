@@ -54,18 +54,6 @@
             }
         }
 
-        /// The on-demand staging directory for drag-out originals.
-        private static var stagingDirectory: URL {
-            FileManager.default.temporaryDirectory.appendingPathComponent("DragOut", isDirectory: true)
-        }
-
-        /// A fresh per-session staging subdirectory keeps concurrent sessions from sweeping each
-        /// other's in-flight downloads: the stager's orphan sweep removes stale `.download` files,
-        /// and a second drag reusing the shared directory could delete the first session's files.
-        private static func makeSessionStagingDirectory() -> URL {
-            Self.stagingDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        }
-
         /// Delays session teardown after the drag ends: iOS can resolve item-provider loads shortly
         /// after `didEndWith`, so an immediate cleanup would cancel in-flight staging (4K/2 GB
         /// videos) and fail late load handlers. Bounded so plaintext staged files persist at most
@@ -126,7 +114,7 @@
         private func beginStagingIfNeeded(for items: [PhotoItem]) {
             guard stager == nil, let provider = host?.dragOutProvider, !items.isEmpty else { return }
             let stager = DragOutStager(
-                fileProvider: provider, stagingDirectory: Self.makeSessionStagingDirectory())
+                fileProvider: provider, stagingDirectory: DragOutStager.makeSessionStagingDirectory())
             self.stager = stager
             liftCount = items.count
             reportedFailure = false
@@ -506,7 +494,7 @@
                 return
             }
             let stager = DragOutStager(
-                fileProvider: provider, stagingDirectory: Self.makeSessionStagingDirectory())
+                fileProvider: provider, stagingDirectory: DragOutStager.makeSessionStagingDirectory())
             let action = ActionStagingLifetime(stager: stager)
             let files = OutboundMedia.files(for: items)
             let dragItems = files.map { makeDragItem(for: $0, stager: stager, action: action) }
@@ -528,7 +516,7 @@
         func copyToPasteboard(items: [PhotoItem], pasteboard: UIPasteboard = .general) {
             guard !items.isEmpty, let host, let provider = host.dragOutProvider else { return }
             let stager = DragOutStager(
-                fileProvider: provider, stagingDirectory: Self.makeSessionStagingDirectory())
+                fileProvider: provider, stagingDirectory: DragOutStager.makeSessionStagingDirectory())
             let action = ActionStagingLifetime(stager: stager)
             let files = OutboundMedia.files(for: items)
             let dragItems = files.map { makeDragItem(for: $0, stager: stager, action: action) }
