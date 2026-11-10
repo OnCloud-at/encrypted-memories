@@ -17,6 +17,11 @@ final class SharedFailureMappingTests: XCTestCase {
         XCTAssertEqual(MLModelInstallError.licenseProhibitsDistribution.failureCause, .unsupported)
         XCTAssertEqual(MLRuntimeFailure(category: .unknown).failureCause, .unknown)
         XCTAssertEqual(MLModelInstallError.notDownloadable.failureCause, .unknown)
+        XCTAssertEqual(MLModelInstallError.unsafeArtifactPath("x").failureCause, .unknown)
+        XCTAssertEqual(MLModelInstallError.sizeMismatch(artifact: "x", expected: 1, actual: 2).failureCause, .unknown)
+        XCTAssertEqual(MLModelInstallError.artifactMissing("x").failureCause, .unknown)
+        XCTAssertEqual(MLModelInstallError.ambiguousModelArtifact.failureCause, .unknown)
+        XCTAssertEqual(MLModelInstallError.installRecordUnreadable.failureCause, .unknown)
         XCTAssertEqual(
             MLModelInstallError.insufficientStorage(requiredBytes: 10, availableBytes: 1).failureCause, .deviceStorage)
         XCTAssertEqual(MLModelInstallError.cancelled.failureCause, .cancelled)

@@ -185,7 +185,7 @@ public struct ExactDuplicateRelatedFileTransfer: Sendable {
     }
 
     private func containsCancellation(_ error: any Error, depth: Int) -> Bool {
-        if error is CancellationError || transportCode(of: error) == NSURLErrorCancelled { return true }
+        if UploadError.isCancellation(error) { return true }
         guard depth < 8, let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? any Error else {
             return false
         }

@@ -8,7 +8,7 @@ public struct AlbumFailurePresentation: Sendable, Equatable {
     public let canRetry: Bool
 
     public static func read(_ error: any Error) -> Self? {
-        if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+        if Task.isCancelled || FailureCancellation.isCancellation(error) {
             return nil
         }
         if let albumError = error as? AlbumError {

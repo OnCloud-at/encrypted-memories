@@ -109,6 +109,10 @@ final class SharedFailureMappingTests: XCTestCase {
     }
     func testSeriesFailurePreservesAmbiguity() {
         XCTAssertEqual(SeriesDissolutionError.notOwnLibrary.failureCause, .unknown)
+        XCTAssertEqual(SeriesDissolutionError.alreadyRunning.failureCause, .unknown)
+        XCTAssertEqual(SeriesDissolutionError.blockedByForeignDraft("x").failureCause, .unknown)
+        XCTAssertEqual(SeriesDissolutionError.copyNotConfirmed.failureCause, .unknown)
+        XCTAssertEqual(SeriesDissolutionError.trashNotConfirmed.failureCause, .unknown)
         XCTAssertEqual(SeriesDissolutionError.invalidSelection.failureCause, .userDecision)
         XCTAssertEqual(SeriesDissolutionError.libraryUnavailable.failureCause, .localState)
     }
@@ -131,6 +135,10 @@ final class SharedFailureMappingTests: XCTestCase {
             UploadError.accountStorageFull("x", requiredBytes: 10, availableBytes: 1).failureCause, .accountStorage)
         XCTAssertEqual(UploadError.permissionDenied("x").failureCause, .permission)
         XCTAssertEqual(UploadError.retryableBackend(code: 503, message: "").failureCause, .serviceTemporary)
+        XCTAssertEqual(UploadError.retryableBackend(code: 429, message: "").failureCause, .rateLimited)
+        XCTAssertEqual(UploadError.fileMissing("x").failureCause, .unknown)
+        XCTAssertEqual(UploadError.sourceReportedMissing("x").failureCause, .unknown)
+        XCTAssertEqual(UploadError.albumStep("x").failureCause, .unknown)
         XCTAssertEqual(UploadError.sourceUnavailable("x").failureCause, .sourceTemporarilyUnavailable)
         XCTAssertEqual(
             UploadError.sourceNotReady("x", until: Date(timeIntervalSince1970: 0)).failureCause,

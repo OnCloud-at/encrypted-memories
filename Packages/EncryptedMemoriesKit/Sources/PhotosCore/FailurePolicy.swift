@@ -83,14 +83,18 @@ public protocol FailureClassifiable {
 /// Recognizes native cancellation without inspecting error descriptions.
 public enum FailureCancellation {
     public static func isCancellation(_ error: any Error) -> Bool {
-        error is CancellationError || (error as? URLError)?.code == .cancelled
+        if error is CancellationError { return true }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
     }
 }
 
 /// A policy recommendation for future consumers. Existing retry and presentation paths do not use it yet.
 /// The model supersedes VideoPlaybackError, BackupIssueKind and MLRuntimeFailure `isRetryable`, AlbumWriteCause
-/// `isTransient`, MLRuntimeFailure `isPermanent`, `offersUserRetry`, `canRetry`, `shouldRetry` and `canRetryMerge`.
-/// The situation is explicit for later presentation decisions; the current rules apply equally to all situations.
+/// `isTransient`, MLRuntimeFailure `isPermanent`, `offersUserRetry`, `canRetry`, and the follow-up replacement of
+/// `canRetryMerge` in ExactDuplicatesModel.
+/// `retriesExhausted` prevents automatic retries. Manual retry can remain for network and other transient reads,
+/// and for unknown and local-state reads.
 public struct FailurePolicy: Sendable, Equatable {
     public let retry: FailureRetryRule
     public let presentation: FailurePresentation
@@ -101,7 +105,7 @@ public struct FailurePolicy: Sendable, Equatable {
     ) -> Self {
         switch cause {
         case .protonRestriction:
-            Self(retry: .never, presentation: .silent)
+            Self(retry: .never, presentation: situation == .background ? .silent : .alert)
         case .cancelled:
             safety == .mutation
                 ? Self(retry: .afterReconciliation, presentation: .alert)

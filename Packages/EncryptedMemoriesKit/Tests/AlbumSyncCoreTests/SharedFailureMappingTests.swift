@@ -9,5 +9,6 @@ final class SharedFailureMappingTests: XCTestCase {
         XCTAssertEqual(AlbumSyncError.mappingStoreUnavailable.failureCause, .localState)
         XCTAssertEqual(AlbumSyncError.stopped.failureCause, .cancelled)
         XCTAssertEqual(AlbumSyncError.alreadyRunning.failureCause, .unknown)
+        XCTAssertEqual(AlbumSyncError.localAlbumMissing.failureCause, .unknown)
     }
 }

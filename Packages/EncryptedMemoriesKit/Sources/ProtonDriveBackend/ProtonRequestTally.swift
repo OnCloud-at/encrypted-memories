@@ -105,7 +105,7 @@ struct ProtonRequestLabel: Sendable, Equatable {
 enum ProtonRequestStatusClass: String, Sendable {
     /// A thrown cancellation, either Swift's or the one URLSession reports for a cancelled task.
     static func isCancellation(_ error: any Error) -> Bool {
-        error is CancellationError || (error as? URLError)?.code == .cancelled
+        FailureCancellation.isCancellation(error)
     }
 
     case success = "2xx"

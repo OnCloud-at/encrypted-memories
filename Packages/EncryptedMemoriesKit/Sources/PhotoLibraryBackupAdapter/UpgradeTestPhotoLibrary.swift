@@ -52,7 +52,7 @@
                 } catch {
                     // PhotoKit also returns no image when the feed cancels a retired pending identity.
                     if Task.isCancelled,
-                        error is CancellationError || (error as? URLError)?.code == .cancelled
+                        FailureCancellation.isCancellation(error)
                     {
                         return result
                     }

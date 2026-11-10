@@ -8,7 +8,7 @@ extension UploadError: FailureClassifiable {
         case .fileMissing, .sourceReportedMissing: .unknown
         case .permissionDenied: .permission
         case .transport: .network
-        case .retryableBackend: .serviceTemporary
+        case .retryableBackend(let code, _): code == 429 ? .rateLimited : .serviceTemporary
         case .cancelled: .cancelled
         case .accountStorageFull: .accountStorage
         case .tagAdderUnavailable: .localState
@@ -50,7 +50,7 @@ extension BackupIssueKind: FailureClassifiable {
         case .accountStorage: .accountStorage
         case .remoteDraftStale: .permanent
         // BackupSyncRunner.issueKind(for:) also maps generic backend and album errors to remoteService, so that
-        // persisted reason remains unknown even though UploadError.retryableBackend is serviceTemporary.
+        // persisted reason remains unknown even though UploadError.retryableBackend identifies temporary or rate-limited failures.
         case .remoteDraft, .sourceMissing, .remoteService, .unknown: .unknown
         }
     }
