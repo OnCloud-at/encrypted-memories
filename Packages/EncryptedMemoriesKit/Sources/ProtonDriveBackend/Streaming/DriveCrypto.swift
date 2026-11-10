@@ -6,7 +6,8 @@ import ProtonCoreDataModel
 
 /// A private key plus the passphrase that unlocks it - enough to build a decryption key ring on
 /// demand. (We rebuild rings per operation rather than holding live gopenpgp objects, so there's
-/// no shared mutable crypto state to guard.)
+/// no shared mutable crypto state to guard. The one exception is the parent ring of a run of links that a single
+/// task works through, which lives only for that run: see `DriveParentKeyRing`.)
 struct UnlockableKey: Sendable {
     let armored: String
     let passphrase: String
@@ -33,6 +34,8 @@ final class DriveCrypto: @unchecked Sendable {
     /// Serializes block decryption - AVFoundation can issue concurrent range requests, and a single
     /// gopenpgp session key isn't guaranteed safe to decrypt with from multiple threads at once.
     private let blockLock = NSLock()
+    let buildParentRing: (DriveCrypto, UnlockableKey) throws -> CryptoKeyRing
+    let clearParentRing: (CryptoKeyRing) -> Void
 
     init(account: AccountData, keyPassword: String) {
         var keys: [UnlockableKey] = []
@@ -54,13 +57,30 @@ final class DriveCrypto: @unchecked Sendable {
         }
         self.addressKeys = keys
         self.signers = signers
+        self.buildParentRing = Self.defaultParentRingBuilder
+        self.clearParentRing = Self.defaultParentRingClearer
     }
 
     /// Test seam: build directly from resolved keys (production always goes through `AccountData`).
-    init(addressKeys: [UnlockableKey], signers: [DriveCryptoSigner]) {
+    init(
+        addressKeys: [UnlockableKey], signers: [DriveCryptoSigner],
+        buildParentRing: @escaping (DriveCrypto, UnlockableKey) throws -> CryptoKeyRing =
+            DriveCrypto.defaultParentRingBuilder,
+        clearParentRing: @escaping (CryptoKeyRing) -> Void = DriveCrypto.defaultParentRingClearer
+    ) {
         self.addressKeys = addressKeys
         self.signers = signers
+        self.buildParentRing = buildParentRing
+        self.clearParentRing = clearParentRing
     }
+
+    private static func defaultParentRingBuilder(
+        _ crypto: DriveCrypto, _ parent: UnlockableKey
+    ) throws -> CryptoKeyRing {
+        try crypto.ring([parent])
+    }
+
+    private static func defaultParentRingClearer(_ ring: CryptoKeyRing) { ring.clearPrivateParams() }
 
     // MARK: - Ring building
 
