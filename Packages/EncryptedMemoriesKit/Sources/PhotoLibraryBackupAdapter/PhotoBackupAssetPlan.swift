@@ -202,7 +202,12 @@ public enum PhotoBackupAssetPlanner {
     public static func metadataRevision(for info: PhotoBackupAssetInfo) -> UploadBackupRevision {
         let date = UploadBackupRevision(date: info.modificationDate ?? info.creationDate ?? .distantPast)
         // One step earlier than the revision with the rendered file: revisions of one photo order by time.
-        let dateRevision = lacksRender(info) ? UploadBackupRevision(rawValue: date.rawValue - 1) : date
+        var dateRevision = date
+        if lacksRender(info) {
+            let (earlier, overflow) = date.rawValue.subtractingReportingOverflow(1)
+            dateRevision = UploadBackupRevision(
+                rawValue: overflow ? UploadBackupRevision(date: .distantPast).rawValue - 1 : earlier)
+        }
         guard info.resources.contains(where: { $0.role == .burstMember }) else { return dateRevision }
         return revision(hashing: "series#\(dateRevision.rawValue)#\(fingerprintRevision(for: info).rawValue)")
     }
@@ -252,8 +257,9 @@ public enum PhotoBackupAssetPlanner {
             .map { "\($0.role.rawValue):\($0.ordinal):\($0.originalFilename):\($0.mimeType ?? "")" }
             .sorted()
             .joined(separator: "|")
+        let duration = checkedBackupInteger(info.durationSeconds * 1000).map { String($0) } ?? "invalid-duration"
         let material =
-            "\(parts)#\(info.pixelWidth)x\(info.pixelHeight)#\(Int(info.durationSeconds * 1000))#live=\(info.isLivePhoto)"
+            "\(parts)#\(info.pixelWidth)x\(info.pixelHeight)#\(duration)#live=\(info.isLivePhoto)"
         return revision(hashing: material)
     }
 

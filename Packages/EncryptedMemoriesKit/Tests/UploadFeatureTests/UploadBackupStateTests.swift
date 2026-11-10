@@ -69,6 +69,31 @@ final class UploadBackupStateTests: XCTestCase {
         )
     }
 
+    func testDateRevisionsKeepTheirStoredQuantization() {
+        let cases: [(Double, Int64, Int64)] = [
+            (0, 0, 0),
+            (1.5, 1_500_000, 1_500_000),
+            (3_600, 3_600_000_000, 3_600_000_000),
+            (2_592_000, 2_592_000_000_000, 2_592_000_000_000),
+            (0.000_000_49, 0, 0),
+            (0.000_000_5, 1, 0),
+            (-0.000_000_5, -1, 0),
+            (0.000_499_9, 500, 0),
+            (0.000_5, 500, 1_000),
+            (-0.000_5, -500, -1_000),
+            (0.001_499_9, 1_500, 1_000),
+            (0.001_5, 1_500, 2_000),
+            (-0.001_5, -1_500, -2_000),
+        ]
+        for (seconds, microseconds, milliseconds) in cases {
+            let date = Date(timeIntervalSinceReferenceDate: seconds)
+            XCTAssertEqual(UploadBackupRevision(date: date).rawValue, microseconds, "\(seconds)")
+            XCTAssertEqual(
+                UploadBackupExternalIdentity(identifier: "asset", modificationDate: date).revision.rawValue,
+                milliseconds, "\(seconds)")
+        }
+    }
+
     func testNewAssetWhenSourceWasNeverSeen() async throws {
         let index = UploadBackupPreflightIndex(store: MemoryStore())
 

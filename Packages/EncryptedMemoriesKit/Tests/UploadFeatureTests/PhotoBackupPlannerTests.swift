@@ -31,6 +31,8 @@ final class PhotoBackupPlannerTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_700_001_000)
     private let original = PhotoBackupAssetInfo.Resource(
         role: .originalPhoto, originalFilename: "IMG_1.HEIC", mimeType: "image/heic")
+    private let originalVideo = PhotoBackupAssetInfo.Resource(
+        role: .originalVideo, originalFilename: "IMG_1.MOV", mimeType: "video/quicktime")
     private let render = PhotoBackupAssetInfo.Resource(
         role: .fullSizePhoto, originalFilename: "FullSizeRender.heic", mimeType: "image/heic")
 
@@ -335,6 +337,122 @@ final class PhotoBackupPlannerTests: XCTestCase {
             )
         )
     }
+
+    func testDurationFingerprintsKeepTheirStoredValues() {
+        let cases: [(Double, Int64)] = [
+            (0, 1_691_327_810_742_503_751),
+            (1.5, 5_639_002_300_573_972_744),
+            (3_600, 2_281_574_539_722_896_194),
+            (2_592_000, 992_550_294_405_172_117),
+            (0.001.nextDown, 1_691_327_810_742_503_751),
+            (0.001, 7_651_893_555_300_994_201),
+            (0.001.nextUp, 7_651_893_555_300_994_201),
+            (1.0.nextDown, 15_041_130_597_828_298),
+            (1.0, 2_891_045_156_756_225_173),
+            (1.0.nextUp, 2_891_045_156_756_225_173),
+            ((-0.001).nextUp, 1_691_327_810_742_503_751),
+            ((-0.001), 4_727_151_532_395_683_802),
+            ((-0.001).nextDown, 4_727_151_532_395_683_802),
+            (Double(Int64.max).nextDown / 1_000, 7_302_120_780_800_955_927),
+            (Double(Int64.min) / 1_000, 8_597_737_813_220_887_048),
+        ]
+        for (duration, expected) in cases {
+            let asset = info(duration: duration, video: true, resources: [originalVideo])
+            XCTAssertEqual(PhotoBackupAssetPlanner.fingerprintRevision(for: asset).rawValue, expected, "\(duration)")
+            XCTAssertEqual(
+                PhotoBackupAssetPlanner.editRevision(for: asset), .revision(.init(rawValue: expected)),
+                "\(duration)")
+        }
+    }
+
+    #if os(macOS)
+        func testInvalidDurationNanDoesNotTrap() async throws { try await assertFingerprintChild("duration-nan") }
+        func testInvalidDurationInfinityDoesNotTrap() async throws {
+            try await assertFingerprintChild("duration-infinity")
+        }
+        func testInvalidDurationHugeDoesNotTrap() async throws { try await assertFingerprintChild("duration-huge") }
+        func testInvalidRevisionDatesUseTheMissingDateFallback() async throws {
+            try await assertFingerprintChild("dates")
+        }
+        func testInvalidExternalDateScalingUsesTheMissingDateFallback() async throws {
+            try await assertFingerprintChild("external-overflow")
+        }
+
+        private func assertFingerprintChild(_ scenario: String) async throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "fingerprint-conversion-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let log = root.appendingPathComponent("\(scenario).log")
+            XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+            let output = try FileHandle(forWritingTo: log)
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            child.arguments = [
+                "xctest", "-XCTest", "UploadFeatureTests.PhotoBackupPlannerTests/testFingerprintConversionWorker",
+                Bundle(for: Self.self).bundleURL.path,
+            ]
+            var environment = ProcessInfo.processInfo.environment
+            environment["ENCRYPTED_MEMORIES_FINGERPRINT_CASE"] = scenario
+            child.environment = environment
+            child.standardOutput = output
+            child.standardError = output
+            let finished = expectation(description: "fingerprint child \(scenario) ended")
+            child.terminationHandler = { _ in finished.fulfill() }
+            try child.run()
+            await fulfillment(of: [finished], timeout: 30)
+            if child.isRunning {
+                kill(child.processIdentifier, SIGKILL)
+                child.waitUntilExit()
+            }
+            try output.close()
+            let text = try String(contentsOf: log, encoding: .utf8)
+            XCTAssertEqual(child.terminationStatus, 0, "\(scenario): \(text)")
+            XCTAssertTrue(
+                text.contains("Verified fingerprint conversion: \(scenario)"),
+                "\(scenario): the child must reach its conversion assertions")
+        }
+
+        func testFingerprintConversionWorker() {
+            guard let scenario = ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_FINGERPRINT_CASE"] else {
+                return
+            }
+            switch scenario {
+            case "duration-nan", "duration-infinity", "duration-huge":
+                let duration: Double =
+                    scenario == "duration-nan" ? .nan : scenario == "duration-infinity" ? .infinity : 1e20
+                let asset = info(duration: duration, video: true, resources: [originalVideo])
+                XCTAssertEqual(
+                    PhotoBackupAssetPlanner.fingerprintRevision(for: asset).rawValue, 8_204_214_674_275_067_163)
+            case "dates":
+                let missing = UploadBackupRevision(date: .distantPast)
+                for seconds in [Double.nan, .infinity, 1e20] {
+                    let date = Date(timeIntervalSinceReferenceDate: seconds)
+                    XCTAssertEqual(UploadBackupRevision(date: date), missing)
+                    XCTAssertEqual(
+                        UploadBackupExternalIdentity(identifier: "asset", modificationDate: date).revision, missing)
+                    var asset = info(modified: date, resources: [original])
+                    asset.hasAdjustments = true
+                    XCTAssertEqual(PhotoBackupAssetPlanner.metadataRevision(for: asset).rawValue, missing.rawValue - 1)
+                }
+                let minimumDate = Date(timeIntervalSinceReferenceDate: Double(Int64.min) / UploadBackupRevision.scale)
+                XCTAssertEqual(UploadBackupRevision(date: minimumDate).rawValue, Int64.min)
+                var asset = info(modified: minimumDate, resources: [original])
+                XCTAssertEqual(PhotoBackupAssetPlanner.metadataRevision(for: asset).rawValue, Int64.min)
+                asset.hasAdjustments = true
+                XCTAssertEqual(PhotoBackupAssetPlanner.metadataRevision(for: asset).rawValue, missing.rawValue - 1)
+            case "external-overflow":
+                XCTAssertEqual(
+                    UploadBackupExternalIdentity(
+                        identifier: "asset", modificationDate: Date(timeIntervalSinceReferenceDate: 1e13)
+                    ).revision,
+                    UploadBackupRevision(date: .distantPast))
+            default:
+                return XCTFail("unknown fingerprint child case")
+            }
+            print("Verified fingerprint conversion: \(scenario)")
+        }
+    #endif
 
     func testUneditedAssetGetsStableFingerprintEvidence() {
         let resources: [PhotoBackupAssetInfo.Resource] = [
