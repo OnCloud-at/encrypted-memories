@@ -44,6 +44,10 @@ public actor DragOutStager {
     private var didBeginPrefetch = false
     /// True after `cancelAll`/`finishAndCleanup`; ends pre-prefetch parking in `awaitStaged`.
     private var isCancelled = false
+    /// The still of each Live Photo motion of this session, by the motion's UID; the motion takes the name that its
+    /// still received (`OriginalFileNaming.livePhotoMotionFilename`).
+    private var stillOfMotion: [PhotoUID: PhotoUID] = [:]
+    private let stillNames = OutboundStillNames()
 
     public init(
         fileProvider: any OriginalFileProvider,
@@ -99,6 +103,7 @@ public actor DragOutStager {
         // Directory must exist before the first .download file appears.
         try? FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
 
+        stillOfMotion.merge(OutboundMedia.stillsByMotion(in: items)) { first, _ in first }
         for item in items {
             guard jobs[item.uid] == nil else { continue }
             jobs[item.uid] = .pending
@@ -173,6 +178,8 @@ public actor DragOutStager {
         queue.removeAll()
         deliveredUIDs.removeAll()
         removeOrphanDownloadFiles()
+        // Last: this await lets finishing jobs into the actor, and the registry is already empty then.
+        await stillNames.abandonAll()
     }
 
     /// Cancel everything (drag cancelled) and delete all staged files.
@@ -190,6 +197,8 @@ public actor DragOutStager {
         jobs.removeAll()
         queue.removeAll()
         removeOrphanDownloadFiles()
+        // Last: this await lets finishing jobs into the actor, and the registry is already empty then.
+        await stillNames.abandonAll()
     }
 
     // MARK: - Internals
@@ -204,6 +213,8 @@ public actor DragOutStager {
     }
 
     private func pumpQueue() {
+        // A stopped session starts nothing, even when a cancelled job finishes into the actor.
+        guard !isCancelled else { return }
         while runningCount < maxConcurrentWrites, !queue.isEmpty {
             let uid = queue.removeFirst()
             guard let destination = uniqueDownloadURL() else {
@@ -216,6 +227,12 @@ public actor DragOutStager {
     }
 
     private func runJob(uid: PhotoUID, destination: URL) async {
+        let staged = await stage(uid: uid, destination: destination)
+        await stillNames.record(staged?.lastPathComponent, for: uid)
+    }
+
+    /// Stages one item and returns its file, or nil when it failed or was cancelled.
+    private func stage(uid: PhotoUID, destination: URL) async -> URL? {
         let activity = runtimeState.beginActivity(.userTransfer)
         defer { activity.end() }
         do {
@@ -238,6 +255,7 @@ public actor DragOutStager {
                     deliveredURL = finalURL
                 }
                 await self.finishJob(uid: uid, finalURL: deliveredURL, failure: nil)
+                return deliveredURL
             } catch {
                 try? FileManager.default.removeItem(at: destination)
                 try? FileManager.default.removeItem(at: finalURL)
@@ -246,19 +264,25 @@ public actor DragOutStager {
                     finalURL: nil,
                     failure: .writeFailed("rename failed: \(error)")
                 )
+                return nil
             }
         } catch is CancellationError {
             try? FileManager.default.removeItem(at: destination)
             await self.finishJob(uid: uid, finalURL: nil, failure: .cancelled)
+            return nil
         } catch {
             try? FileManager.default.removeItem(at: destination)
             await self.finishJob(uid: uid, finalURL: nil, failure: .writeFailed(String(describing: error)))
+            return nil
         }
     }
 
     /// Atomic same-volume rename `X.download` → final unique name, reserving the target first.
     private func reserveFinalName(for uid: PhotoUID, downloadURL: URL, removesLocation: Bool) async -> URL {
-        let original = await Self.desiredFilename(for: uid, provider: fileProvider)
+        var original = await Self.desiredFilename(for: uid, provider: fileProvider)
+        if let still = stillOfMotion[uid], let stillName = await stillNames.name(of: still) {
+            original = OriginalFileNaming.livePhotoMotionFilename(original, stillName: stillName)
+        }
         // A location-free copy of a RAW photo is a JPEG; reserve that name so it never replaces another file.
         let desired = removesLocation ? LocationSanitizedCopy.outputFilename(forOriginalName: original) : original
         let reserved = await names.unique(desired)
@@ -360,15 +384,15 @@ public protocol SizedOriginalFileProvider: Sendable {
 
 // MARK: - Unique naming
 
-/// Serialises on-disk name assignment so two items resolving to the same original name
-/// (`IMG_0001.HEIC` twice) get `IMG_0001 2.HEIC` etc. Case-insensitive to match the typical
-/// filesystem.
-public actor UniqueNames {
+/// Name assignment for one export, so two items resolving to the same original name (`IMG_0001.HEIC` twice) get
+/// `IMG_0001 2.HEIC` and so on. Case-insensitive to match the typical filesystem.
+struct UniqueNameSet: Sendable {
     private var used: Set<String> = []
 
-    public init() {}
+    init() {}
 
-    public func unique(_ name: String) -> String {
+    /// Returns `name`, or `name 2`, `name 3` and so on before the extension, and reserves it.
+    mutating func unique(_ name: String) -> String {
         if reserve(name) { return name }
         let ns = name as NSString
         let base = ns.deletingPathExtension
@@ -381,9 +405,16 @@ public actor UniqueNames {
         }
     }
 
-    private func reserve(_ name: String) -> Bool {
-        guard !used.contains(name.lowercased()) else { return false }
-        used.insert(name.lowercased())
-        return true
+    private mutating func reserve(_ name: String) -> Bool {
+        used.insert(name.lowercased()).inserted
     }
+}
+
+/// Serialises `UniqueNameSet` for exports whose items finish concurrently.
+public actor UniqueNames {
+    private var names = UniqueNameSet()
+
+    public init() {}
+
+    public func unique(_ name: String) -> String { names.unique(name) }
 }

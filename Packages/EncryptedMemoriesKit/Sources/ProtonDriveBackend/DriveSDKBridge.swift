@@ -1387,20 +1387,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
     }
 
-    /// The MIME type and the decrypted name of each link that a `fetch_metadata` batch names, by link ID. A name that
-    /// does not decrypt stays unknown.
+    /// The MIME type and the decrypted name of each link that a `fetch_metadata` batch names, by link ID
+    /// (`RelatedFileRead.files`). The photos root key decrypts the names.
     private static func relatedFiles(
-        in links: [AlbumPhotoLinkBody], rootKey: UnlockableKey?, crypto: DriveCrypto
-    ) -> [String: BurstFrameVerdicts.RelatedFile] {
-        Dictionary(
-            links.compactMap { link -> (String, BurstFrameVerdicts.RelatedFile)? in
-                guard let linkID = link.linkID else { return nil }
-                var name: String?
-                if let armored = link.name, let rootKey { name = try? crypto.decryptName(armored, parent: rootKey) }
-                return (linkID, BurstFrameVerdicts.RelatedFile(mimeType: link.mimeType, name: name))
-            },
-            uniquingKeysWith: { first, _ in first }
-        )
+        in links: [AlbumPhotoLinkBody], rootKey: () async throws -> UnlockableKey, crypto: DriveCrypto
+    ) async throws -> [String: BurstFrameVerdicts.RelatedFile] {
+        try await RelatedFileRead.files(
+            in: links, rootKey: rootKey, decrypt: { try crypto.decryptName($0, parent: $1) })
     }
 
     /// The original of an edited photo of the own library, or nil. Each answer is kept for the session. A photo of
@@ -1431,9 +1424,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         for batch in Self.metadataBatches([item.uid.nodeID] + related) {
             links += try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
         }
-        // Photos are children of the photos root, whose key decrypts their names.
-        let rootKey = try await keySource.nodeKey(ofLinkID: root.nodeID)
-        let files = Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
+        let files = try await Self.relatedFiles(
+            in: links, rootKey: { try await keySource.nodeKey(ofLinkID: root.nodeID) }, crypto: crypto)
         guard let mainName = files[item.uid.nodeID]?.name else { return nil }
         let linkID = EditedPhotoOriginal.linkID(
             mainName: mainName, isVideo: item.isVideo,
@@ -1463,9 +1455,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         else { return nil }
         let links = try await driveSession.fetchPhotoLinksMetadata(
             shareID: shareID, linkIDs: [main.nodeID, original.nodeID])
-        // Photos are children of the photos root, whose key decrypts their names.
-        let rootKey = try await keySource.nodeKey(ofLinkID: root.nodeID)
-        let files = Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
+        let files = try await Self.relatedFiles(
+            in: links, rootKey: { try await keySource.nodeKey(ofLinkID: root.nodeID) }, crypto: crypto)
         guard let mainName = files[main.nodeID]?.name, let originalName = files[original.nodeID]?.name else {
             return nil
         }
@@ -2366,8 +2357,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    /// Sections of a tag filter or an album. A failed type read leaves a Live Photo with several related files without
-    /// its motion; the next open reads again.
+    /// Sections of a tag filter or an album. A failed type or name read leaves a Live Photo with several related files
+    /// without its motion; the next open reads again.
     private func filteredSections(_ entries: [PhotosListEntry], volumeID: String) async throws -> [TimelineSection] {
         let read = timelineStore?.mediaTypeEvidenceForDisplay(volumeID: volumeID) ?? (types: [:], canRefine: true)
         let evidence = read.types
@@ -2385,9 +2376,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     /// The motion of each of these Live Photos (`LivePhotoMotionLinks.motions`). A motion that this rule stored with the
-    /// timeline holds without a read; the related files that still need a type are read in metadata batches, a few at a
-    /// time. A failed read leaves those motions unknown without holding back the timeline cache: an unknown motion saves
-    /// no related video, so the next refresh reads exactly those photos again.
+    /// timeline holds without a read; the related files that still need a type or a name are read in metadata batches,
+    /// a few at a time, and only the names that the rule asks for are decrypted. A failed read leaves those motions
+    /// unknown without holding back the timeline cache: an unknown motion saves no related video, so the next refresh
+    /// reads exactly those photos again.
     private func livePhotoMotions(
         of livePhotos: [String: [String]], volumeID: String, evidence: [String: String],
         allowMetadataRequests: Bool
@@ -2396,16 +2388,22 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let answer = try await livePhotoMotionLinks.motions(
             of: livePhotos, stored: stored, evidence: evidence, allowFetch: allowMetadataRequests
         ) {
-            [driveSession, photosShareID] linkIDs in
+            [driveSession, photosShareID, crypto] linkIDs, nameLinkIDs in
             guard let shareID = photosShareID else { throw DriveBridgeError.noPhotosShare }
             let start = Date()
             let batches = try await Self.concurrentMetadataBatches(linkIDs) { batch in
-                Self.mimeTypes(in: try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch))
+                try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
             }
+            // The stream source caches the root key.
+            let answer = try await LivePhotoMotionLinks.answer(
+                links: batches.flatMap { $0 }, nameLinkIDs: nameLinkIDs,
+                rootKey: { try await self.fileSource().nodeKey(ofLinkID: try await self.resolvePhotosRoot().nodeID) },
+                decrypt: { try crypto.decryptName($0, parent: $1) })
             DebugLog.log(
                 "timeline: read the type of \(linkIDs.count) Live Photo related files in \(batches.count) requests, "
-                    + "\(Int(Date().timeIntervalSince(start) * 1000)) ms; \(stored.count) stored motions held")
-            return batches.reduce(into: [:]) { types, batch in types.merge(batch) { first, _ in first } }
+                    + "\(Int(Date().timeIntervalSince(start) * 1000)) ms, names read \(answer.namesRead); "
+                    + "\(stored.count) stored motions held")
+            return answer
         }
         livePhotoMotionLinks.record(answer.read)
         return answer.motions
@@ -2539,14 +2537,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
                 }
             }
-            // Photos are children of the photos root, whose key decrypts their names. The stream source caches it.
-            var rootKey: UnlockableKey?
-            if links.contains(where: { $0.name != nil }) {
-                rootKey = try await ProtonRequestContext.$priority.withValue(.userInitiated) {
-                    try await keySource.nodeKey(ofLinkID: rootLinkID)
-                }
-            }
-            return Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
+            // The stream source caches the root key.
+            return try await Self.relatedFiles(
+                in: links,
+                rootKey: {
+                    try await ProtonRequestContext.$priority.withValue(.userInitiated) {
+                        try await keySource.nodeKey(ofLinkID: rootLinkID)
+                    }
+                }, crypto: crypto)
         }
         burstFrameVerdicts.merge(checked.verdicts)
         return Self.seriesAnswer(
@@ -2706,7 +2704,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         if burstMemberIDs.count > 1 { tags.insert(.bursts) }
         let motion: LivePhotoMotion =
             entry.isLivePhoto
-            ? motion ?? LivePhotoMotionLinks.motion(among: entry.relatedLinkIDs, mimeTypes: [:]) : .noVideo
+            ? motion ?? LivePhotoMotionLinks.motion(among: entry.relatedLinkIDs, mimeTypes: [:], names: [:]) : .noVideo
         return PhotoItem(
             uid: PhotoUID(volumeID: volumeID, nodeID: entry.linkID),
             captureTime: Date(timeIntervalSince1970: entry.captureTime),

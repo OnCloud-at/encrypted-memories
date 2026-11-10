@@ -39,4 +39,32 @@ final class OutboundMediaTests: XCTestCase {
         XCTAssertEqual(files.map(\.item.uid.nodeID), ["still", "motion", "unresolved", "self"])
         XCTAssertNil(OutboundMedia.livePhotoMotion(of: photo("regular")))
     }
+
+    func testAMotionPairsOnlyWithAStillThatComesBeforeIt() {
+        let first = photo("first", live: "first-motion")
+        let second = photo("second", live: "second-motion")
+        let motionFirst = PhotoItem(
+            uid: PhotoUID(volumeID: "vol", nodeID: "second-motion"), captureTime: capture, mediaType: "video/quicktime")
+        let items = OutboundMedia.files(for: [first]).map(\.item) + [motionFirst, second]
+
+        XCTAssertEqual(
+            OutboundMedia.stillsByMotion(in: items),
+            [PhotoUID(volumeID: "vol", nodeID: "first-motion"): first.uid],
+            "a motion listed before its still exports under its own name instead of waiting")
+    }
+
+    func testDragNamesStayUniqueAndKeepEachMotionWithItsStill() {
+        let items = OutboundMedia.files(for: [photo("a", live: "a-motion"), photo("b", live: "b-motion"), photo("c")])
+            .map(\.item)
+        var names = OutboundFileNames(items: items)
+        let own: (PhotoUID) -> String = { $0.nodeID.hasSuffix("motion") ? "FullSizeRender.mov" : "IMG_1.HEIC" }
+        func name(_ node: String) -> String { names.name(for: PhotoUID(volumeID: "vol", nodeID: node), own: own) }
+
+        XCTAssertEqual(name("b-motion"), "IMG_1.mov", "a motion asked first names its still first")
+        XCTAssertEqual(name("b"), "IMG_1.HEIC")
+        XCTAssertEqual(name("a"), "IMG_1 2.HEIC")
+        XCTAssertEqual(name("a-motion"), "IMG_1 2.mov")
+        XCTAssertEqual(name("c"), "IMG_1 3.HEIC")
+        XCTAssertEqual(name("b-motion"), "IMG_1.mov", "the first name holds for the drag")
+    }
 }

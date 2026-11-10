@@ -34,9 +34,11 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
     private var stager: DragOutStager?
     private var reportedFailure = false
     /// Filenames resolved from metadata during the drag; a promise whose name is requested before
-    /// its async lookup lands uses the synchronous fallback instead (Finder renames collisions).
+    /// its async lookup lands uses the synchronous fallback instead.
     private var cachedFilenames: [PhotoUID: String] = [:]
     private var items: [PhotoUID: PhotoItem] = [:]
+    /// The promise names of this drag: unique in the drag, and a Live Photo motion named after its still.
+    private var promiseNames = OutboundFileNames(items: [])
     /// Identity of the running drag session, carried in every photo reference it puts on the pasteboard.
     private var sessionID: UUID?
     /// The session that ended last and its stager, until the grace cleanup runs.
@@ -203,6 +205,7 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         PhotoDragPasteboard.beginSession(dragSessionID)
         reportedFailure = false
         items = Dictionary(uniqueKeysWithValues: dragged.map { ($0.uid, $0) })
+        promiseNames = OutboundFileNames(items: dragged)
         cachedFilenames.removeAll()
 
         // Kick the disk-space preflight + staging now. The system's promise callbacks can arrive
@@ -215,7 +218,7 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
             }
         }
         // Resolve real filenames while the user is still holding the drag; a fast delivery can
-        // still race this and get the fallback name (benign - Finder deduplicates collisions).
+        // still race this and get the fallback name, which stays unique in the drag.
         prefetchFilenames(for: dragged)
 
         let providers = files.map { file in
@@ -289,9 +292,14 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         UTType(mimeType: item.mediaType)?.identifier ?? UTType.data.identifier
     }
 
-    /// The synchronous promise filename. Uses the metadata-resolved original name when the async
-    /// prefetch has landed; otherwise a deterministic fallback so AppKit can name the promise file.
+    /// The synchronous promise filename, unique in this drag (`OutboundFileNames`).
     private func promiseFilename(for uid: PhotoUID) -> String {
+        promiseNames.name(for: uid, own: ownPromiseFilename(for:))
+    }
+
+    /// The promise filename of one file on its own: the metadata-resolved original name when the async prefetch has
+    /// landed; otherwise a deterministic fallback so AppKit can name the promise file.
+    private func ownPromiseFilename(for uid: PhotoUID) -> String {
         if let cached = cachedFilenames[uid] { return cached }
         let item = items[uid]
         let ext = OriginalFileNaming.resolvedExtension(
@@ -403,6 +411,7 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         sessionID = nil
         self.stager = nil
         items.removeAll()
+        promiseNames = OutboundFileNames(items: [])
         cachedFilenames.removeAll()
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.teardownGraceNanoseconds)
