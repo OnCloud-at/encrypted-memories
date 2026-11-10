@@ -406,6 +406,30 @@ final class BackgroundWindowLedgerTests: XCTestCase {
             ledger.records(), [BackgroundWindowRecord(kind: .photoBackup, outcome: .notNeeded, startedAt: minute(0))])
     }
 
+    /// A continued backup task records its own kind in the photo backup log, and its result can differ from the
+    /// outcome's default: a settled goal with new problems ran, but reports no success (#1108).
+    func testAContinuedBackupTaskRecordsItsKindAndItsOwnResult() {
+        let lines = BackgroundLogLines()
+        let ledger = makeLedger(log: BackgroundWorkLog { lines.append("\($0.rawValue) \($1)") })
+        let reports = LockedValue<[Bool]>()
+        reports.set([])
+        let completion = BackgroundWindowCompletion(kind: .continuedBackup, ledger: ledger, startedAt: minute(0)) {
+            success in reports.set((reports.value ?? []) + [success])
+        }
+
+        completion.finish(.ran, reportsSuccess: false)
+
+        XCTAssertEqual(reports.value, [false])
+        XCTAssertEqual(
+            ledger.records(), [BackgroundWindowRecord(kind: .continuedBackup, outcome: .ran, startedAt: minute(0))])
+        XCTAssertEqual(
+            lines.values,
+            [
+                "PhotoBackupBackground window.began kind=continuedBackup",
+                "PhotoBackupBackground window.ended kind=continuedBackup outcome=ran",
+            ])
+    }
+
     func testAnExpiredWindowTellsTheOSItFailed() {
         let ledger = makeLedger()
         let reports = LockedValue<[Bool]>()
