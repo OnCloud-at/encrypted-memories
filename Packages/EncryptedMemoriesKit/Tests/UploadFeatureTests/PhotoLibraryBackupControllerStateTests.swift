@@ -3681,12 +3681,26 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(carried, "the task protects the person's pass from the short grace")
             XCTAssertTrue(probe.results.isEmpty, "no result while the pass runs")
 
+            // Instant work outlasts the bounded retirement wait, so the pass ends before it settles.
+            let writer = NonCooperativeWriterLatch()
+            let writerTask = makeNonCooperativeWriter(writer)
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(writerTask))
+            await writer.waitUntilBlocked()
             manual.fixture.scan.open.value = true
-            await probe.task?.value
+            _ = await waitUntil { controller.isRetiringInstantWorkForTesting }
+            try await Task.sleep(for: PhotoLibraryBackupController.instantWorkRetirementTimeout + .milliseconds(150))
+            XCTAssertTrue(probe.results.isEmpty, "no result while the pass has not settled")
+
+            await writer.release()
+            await writerTask.value
+            let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
+            XCTAssertTrue(ended)
             XCTAssertEqual(probe.results.count, 1, "the OS hears one result")
             XCTAssertEqual(probe.settledAtResult, [true], "the result is chosen after the pass settled")
+            XCTAssertEqual(manual.fixture.scan.starts.count, 1, "a pass without backed-up photos starts no next pass")
             XCTAssertFalse(probe.protection.isProtected(owner: controller, runID: manual.runID), "protection released")
             XCTAssertEqual(probe.ledger.records().map(\.kind), [.continuedBackup])
+            probe.task?.cancel()
             await controller.shutdown()
         }
 
