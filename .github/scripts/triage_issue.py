@@ -8,15 +8,14 @@ import os
 import re
 import sys
 from typing import Any
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 
 from github_llm_client import (
     MAX_LLM_REQUEST_BYTES,
-    TRUNCATION_MARKER,
     RequestFailure,
-    bounded_text,
     github_paginated_list,
     github_request,
+    llm_configuration,
     redact_text,
     request_validated_llm_result,
 )
@@ -69,24 +68,6 @@ def has_disclosure_acknowledgement(issue: dict[str, Any]) -> bool:
         if match and match.group(1).casefold() == "x" and expected in _normalized_text(match.group(2)):
             return True
     return False
-
-
-def _bounded_text(value: object, limit: int) -> str:
-    return bounded_text(value, limit)
-
-
-def llm_configuration() -> tuple[str, str, str | None]:
-    api_url = os.environ.get("LLM_API_URL", "").strip()
-    model = os.environ.get("LLM_MODEL", "").strip()
-    reasoning_effort = os.environ.get("LLM_REASONING_EFFORT", "").strip() or None
-    parsed_url = urlsplit(api_url)
-    if parsed_url.scheme != "https" or not parsed_url.netloc:
-        raise RuntimeError("LLM_API_URL must be an absolute HTTPS URL")
-    if parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
-        raise RuntimeError("LLM_API_URL must not contain credentials, a query, or a fragment")
-    if not model:
-        raise RuntimeError("LLM_MODEL must identify a compatible chat model")
-    return api_url, model, reasoning_effort
 
 
 def related_search_terms(issue: dict[str, Any]) -> list[str]:

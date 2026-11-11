@@ -4,10 +4,8 @@ on:
   push:
     branches:
       - main
-      - master
     paths:
       - .github/workflows/pages.yml
-      - Branding/EncryptedMemories.svg
       - Branding/app-store-badge.svg
       - Branding/icon/icon_512.png
       - LICENSE
@@ -45,7 +43,6 @@ jobs:
           cp -R site/. _site/
           cp Branding/app-store-badge.svg _site/assets/app-store-badge.svg
           cp Branding/icon/icon_512.png _site/assets/app-icon.png
-          cp LICENSE _site/LICENSE.txt
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4

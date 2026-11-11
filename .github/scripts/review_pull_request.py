@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import groupby
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 from github_llm_client import (
     LLMContextLimitError,
@@ -27,6 +27,7 @@ from github_llm_client import (
     bounded_text,
     github_paginated_list,
     github_request,
+    llm_configuration,
     redact_text,
     request_validated_llm_result,
 )
@@ -151,20 +152,6 @@ def same_pull_request_snapshot(expected: PullRequestSnapshot, actual: dict[str, 
         return expected == pull_request_snapshot(actual)
     except RuntimeError:
         return False
-
-
-def llm_configuration() -> tuple[str, str, str | None]:
-    api_url = os.environ.get("LLM_API_URL", "").strip()
-    model = os.environ.get("LLM_MODEL", "").strip()
-    reasoning_effort = os.environ.get("LLM_REASONING_EFFORT", "").strip() or None
-    parsed_url = urlsplit(api_url)
-    if parsed_url.scheme != "https" or not parsed_url.netloc:
-        raise RuntimeError("LLM_API_URL must be an absolute HTTPS URL")
-    if parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
-        raise RuntimeError("LLM_API_URL must not contain credentials, a query, or a fragment")
-    if not model:
-        raise RuntimeError("LLM_MODEL must identify a compatible chat model")
-    return api_url, model, reasoning_effort
 
 
 def load_event(path: str) -> PullRequestSnapshot:
@@ -1349,14 +1336,6 @@ def request_review_with_retries(
             )
             time.sleep(delay)
     raise AssertionError("Review provider retry loop ended unexpectedly")
-
-
-def changed_new_lines(patch: str) -> set[int]:
-    return {
-        int(line.new_line)
-        for line in parse_patch_lines(patch, "file-compat")
-        if isinstance(line.new_line, int)
-    }
 
 
 def parse_review(

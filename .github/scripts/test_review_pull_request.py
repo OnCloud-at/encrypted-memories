@@ -32,6 +32,15 @@ def stream_bytes(events: list[dict[str, object]], *, done: bool = True) -> bytes
     return b"".join(chunks)
 
 
+def changed_new_lines(patch: str) -> set[int]:
+    """The new-side line numbers that `parse_patch_lines` reports for one patch."""
+    return {
+        int(line.new_line)
+        for line in review_pull_request.parse_patch_lines(patch, "file-compat")
+        if isinstance(line.new_line, int)
+    }
+
+
 class FragmentedResponse:
     def __init__(self, chunks: list[bytes], *, terminal_error: Exception | None = None) -> None:
         self.chunks = list(chunks)
@@ -513,7 +522,7 @@ class ParsingAndRenderingTests(unittest.TestCase):
     def test_changed_lines_include_only_lines_present_in_the_supplied_patch(self) -> None:
         patch_text = "@@ -10,3 +20,4 @@\n context\n-removed\n+added\n final"
 
-        self.assertEqual(review_pull_request.changed_new_lines(patch_text), {20, 21, 22})
+        self.assertEqual(changed_new_lines(patch_text), {20, 21, 22})
 
     def test_paths_are_redacted_before_they_reach_the_model(self) -> None:
         _, payload, changed_lines, _ = single_batch(
@@ -1274,225 +1283,117 @@ class LLMStreamTests(unittest.TestCase):
         self.assertEqual(open_request.call_count, 2)
 
 
+@contextlib.contextmanager
+def review_event(*, head: str = "abc123", base: str = "base123", state: str = "open", **environment: str):
+    """Write the pull-request event file and set the environment that `main` reads: the GitHub token, the repository,
+    the event path, and `environment`."""
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
+        json.dump(
+            {
+                "pull_request": {
+                    "number": 42,
+                    "head": {"sha": head},
+                    "base": {"ref": "main", "sha": base},
+                    "draft": False,
+                    "state": state,
+                }
+            },
+            event_file,
+        )
+        event_file.flush()
+        with patch.dict(
+            "os.environ",
+            {
+                "GH_TOKEN": "github-token",
+                "GITHUB_REPOSITORY": "example/repo",
+                "GITHUB_EVENT_PATH": event_file.name,
+                **environment,
+            },
+            clear=True,
+        ):
+            yield
+
+
 class MainFlowTests(unittest.TestCase):
     def test_missing_llm_key_skips_without_github_requests(self) -> None:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
-            json.dump(
-                {
-                    "pull_request": {
-                        "number": 42,
-                        "head": {"sha": "abc123"},
-                        "base": {"ref": "main", "sha": "base123"},
-                        "draft": False,
-                        "state": "open",
-                    }
-                },
-                event_file,
-            )
-            event_file.flush()
-            with (
-                patch.dict(
-                    "os.environ",
-                    {
-                        "GH_TOKEN": "github-token",
-                        "GITHUB_REPOSITORY": "example/repo",
-                        "GITHUB_EVENT_PATH": event_file.name,
-                    },
-                    clear=True,
-                ),
-                patch.object(review_pull_request, "github_request") as request,
-            ):
-                result = review_pull_request.main()
+        with (
+            review_event(),
+            patch.object(review_pull_request, "github_request") as request,
+        ):
+            result = review_pull_request.main()
 
         self.assertEqual(result, 0)
         request.assert_not_called()
 
     def test_stale_event_commit_is_skipped(self) -> None:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
-            json.dump(
-                {
-                    "pull_request": {
-                        "number": 42,
-                        "head": {"sha": "old"},
-                        "base": {"ref": "main", "sha": "base123"},
-                        "draft": False,
-                        "state": "open",
-                    }
-                },
-                event_file,
-            )
-            event_file.flush()
-            with (
-                patch.dict(
-                    "os.environ",
-                    {
-                        "GH_TOKEN": "github-token",
-                        "LLM_API_KEY": "llm-token",
-                        "GITHUB_REPOSITORY": "example/repo",
-                        "GITHUB_EVENT_PATH": event_file.name,
-                    },
-                    clear=True,
-                ),
-                patch.object(review_pull_request, "fetch_pull_request", return_value=pull_request()),
-                patch.object(review_pull_request, "fetch_changed_files") as fetch_files,
-            ):
-                result = review_pull_request.main()
+        with (
+            review_event(head="old", LLM_API_KEY="llm-token"),
+            patch.object(review_pull_request, "fetch_pull_request", return_value=pull_request()),
+            patch.object(review_pull_request, "fetch_changed_files") as fetch_files,
+        ):
+            result = review_pull_request.main()
 
         self.assertEqual(result, 0)
         fetch_files.assert_not_called()
 
     def test_changed_base_snapshot_is_skipped_before_file_fetch(self) -> None:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
-            json.dump(
-                {
-                    "pull_request": {
-                        "number": 42,
-                        "head": {"sha": "abc123"},
-                        "base": {"ref": "main", "sha": "event-base"},
-                        "draft": False,
-                        "state": "open",
-                    }
-                },
-                event_file,
-            )
-            event_file.flush()
-            with (
-                patch.dict(
-                    "os.environ",
-                    {
-                        "GH_TOKEN": "github-token",
-                        "LLM_API_KEY": "llm-token",
-                        "GITHUB_REPOSITORY": "example/repo",
-                        "GITHUB_EVENT_PATH": event_file.name,
-                    },
-                    clear=True,
-                ),
-                patch.object(
-                    review_pull_request,
-                    "fetch_pull_request",
-                    return_value=pull_request(base={"ref": "main", "sha": "live-base"}),
-                ),
-                patch.object(review_pull_request, "fetch_changed_files") as fetch_files,
-            ):
-                result = review_pull_request.main()
+        with (
+            review_event(base="event-base", LLM_API_KEY="llm-token"),
+            patch.object(
+                review_pull_request,
+                "fetch_pull_request",
+                return_value=pull_request(base={"ref": "main", "sha": "live-base"}),
+            ),
+            patch.object(review_pull_request, "fetch_changed_files") as fetch_files,
+        ):
+            result = review_pull_request.main()
 
         self.assertEqual(result, 0)
         fetch_files.assert_not_called()
 
     def test_closed_event_is_skipped_without_fetching_pull_request(self) -> None:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
-            json.dump(
-                {
-                    "pull_request": {
-                        "number": 42,
-                        "head": {"sha": "abc123"},
-                        "base": {"ref": "main", "sha": "base123"},
-                        "draft": False,
-                        "state": "closed",
-                    }
-                },
-                event_file,
-            )
-            event_file.flush()
-            with (
-                patch.dict(
-                    "os.environ",
-                    {
-                        "GH_TOKEN": "github-token",
-                        "LLM_API_KEY": "llm-token",
-                        "GITHUB_REPOSITORY": "example/repo",
-                        "GITHUB_EVENT_PATH": event_file.name,
-                    },
-                    clear=True,
-                ),
-                patch.object(review_pull_request, "fetch_pull_request") as fetch_pull_request,
-            ):
-                result = review_pull_request.main()
+        with (
+            review_event(state="closed", LLM_API_KEY="llm-token"),
+            patch.object(review_pull_request, "fetch_pull_request") as fetch_pull_request,
+        ):
+            result = review_pull_request.main()
 
         self.assertEqual(result, 0)
         fetch_pull_request.assert_not_called()
 
     def test_new_commit_after_file_fetch_skips_before_llm_request(self) -> None:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
-            json.dump(
-                {
-                    "pull_request": {
-                        "number": 42,
-                        "head": {"sha": "abc123"},
-                        "base": {"ref": "main", "sha": "base123"},
-                        "draft": False,
-                        "state": "open",
-                    }
-                },
-                event_file,
-            )
-            event_file.flush()
-            with (
-                patch.dict(
-                    "os.environ",
-                    {
-                        "GH_TOKEN": "github-token",
-                        "LLM_API_KEY": "llm-token",
-                        "GITHUB_REPOSITORY": "example/repo",
-                        "GITHUB_EVENT_PATH": event_file.name,
-                    },
-                    clear=True,
-                ),
-                patch.object(
-                    review_pull_request,
-                    "fetch_pull_request",
-                    side_effect=[pull_request(), pull_request(head={"sha": "new"})],
-                ),
-                patch.object(review_pull_request, "fetch_changed_files", return_value=[changed_file()]),
-                patch.object(review_pull_request, "request_validated_llm_result") as llm_request,
-            ):
-                result = review_pull_request.main()
+        with (
+            review_event(LLM_API_KEY="llm-token"),
+            patch.object(
+                review_pull_request,
+                "fetch_pull_request",
+                side_effect=[pull_request(), pull_request(head={"sha": "new"})],
+            ),
+            patch.object(review_pull_request, "fetch_changed_files", return_value=[changed_file()]),
+            patch.object(review_pull_request, "request_validated_llm_result") as llm_request,
+        ):
+            result = review_pull_request.main()
 
         self.assertEqual(result, 0)
         llm_request.assert_not_called()
 
     def test_new_commit_before_publish_discards_the_review(self) -> None:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
-            json.dump(
-                {
-                    "pull_request": {
-                        "number": 42,
-                        "head": {"sha": "abc123"},
-                        "base": {"ref": "main", "sha": "base123"},
-                        "draft": False,
-                        "state": "open",
-                    }
-                },
-                event_file,
-            )
-            event_file.flush()
-            with (
-                patch.dict(
-                    "os.environ",
-                    {
-                        "GH_TOKEN": "github-token",
-                        "LLM_API_KEY": "llm-token",
-                        "LLM_API_URL": "https://api.example.test/v1/chat/completions",
-                        "LLM_MODEL": "review-model",
-                        "GITHUB_REPOSITORY": "example/repo",
-                        "GITHUB_EVENT_PATH": event_file.name,
-                    },
-                    clear=True,
-                ),
-                patch.object(
-                    review_pull_request,
-                    "fetch_pull_request",
-                    side_effect=[pull_request(), pull_request(), pull_request(head={"sha": "new"})],
-                ),
-                patch.object(review_pull_request, "fetch_changed_files", return_value=[changed_file()]),
-                patch.object(
-                    review_pull_request,
-                    "request_validated_llm_result",
-                    return_value=valid_review(),
-                ),
-                patch.object(review_pull_request, "upsert_review_comment") as upsert_review,
-            ):
-                result = review_pull_request.main()
+        with (
+            review_event(LLM_API_KEY="llm-token", LLM_API_URL="https://api.example.test/v1/chat/completions", LLM_MODEL="review-model"),
+            patch.object(
+                review_pull_request,
+                "fetch_pull_request",
+                side_effect=[pull_request(), pull_request(), pull_request(head={"sha": "new"})],
+            ),
+            patch.object(review_pull_request, "fetch_changed_files", return_value=[changed_file()]),
+            patch.object(
+                review_pull_request,
+                "request_validated_llm_result",
+                return_value=valid_review(),
+            ),
+            patch.object(review_pull_request, "upsert_review_comment") as upsert_review,
+        ):
+            result = review_pull_request.main()
 
         self.assertEqual(result, 0)
         upsert_review.assert_not_called()
@@ -1548,43 +1449,18 @@ def run_review_main(files, *, pull_requests=None, llm=None):
         if pull_requests is not None
         else {"return_value": pull_request(changed_files=len(files), head=snapshot)}
     )
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as event_file:
-        json.dump(
-            {
-                "pull_request": {
-                    "number": 42,
-                    "head": snapshot,
-                    "base": {"ref": "main", "sha": "base123"},
-                    "draft": False,
-                    "state": "open",
-                }
-            },
-            event_file,
-        )
-        event_file.flush()
-        with (
-            patch.dict(
-                "os.environ",
-                {
-                    "GH_TOKEN": "github-token",
-                    "LLM_API_KEY": "llm-token",
-                    "LLM_API_URL": "https://api.example.test/v1/chat/completions",
-                    "LLM_MODEL": "review-model",
-                    "GITHUB_REPOSITORY": "example/repo",
-                    "GITHUB_EVENT_PATH": event_file.name,
-                },
-                clear=True,
-            ),
-            patch.object(review_pull_request, "fetch_pull_request", **fetch),
-            patch.object(review_pull_request, "fetch_changed_files", return_value=files),
-            patch.object(review_pull_request, "request_validated_llm_result", side_effect=provider),
-            patch.object(review_pull_request, "upsert_review_comment", return_value=True) as upsert,
-            # Evidence verification reads head and base source; `None` makes that source unavailable.
-            patch.object(review_pull_request, "github_request", return_value=None),
-            contextlib.redirect_stdout(io.StringIO()),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            result = review_pull_request.main()
+    with (
+        review_event(head=snapshot["sha"], LLM_API_KEY="llm-token", LLM_API_URL="https://api.example.test/v1/chat/completions", LLM_MODEL="review-model"),
+        patch.object(review_pull_request, "fetch_pull_request", **fetch),
+        patch.object(review_pull_request, "fetch_changed_files", return_value=files),
+        patch.object(review_pull_request, "request_validated_llm_result", side_effect=provider),
+        patch.object(review_pull_request, "upsert_review_comment", return_value=True) as upsert,
+        # Evidence verification reads head and base source; `None` makes that source unavailable.
+        patch.object(review_pull_request, "github_request", return_value=None),
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        result = review_pull_request.main()
     return result, payloads, upsert
 
 
@@ -1668,7 +1544,7 @@ class BatchPlanningTests(unittest.TestCase):
         self.assertEqual(entry["patch"], patch_text)
         self.assertTrue(entry["patch_complete"])
         self.assertNotIn("segment", entry)
-        self.assertEqual(changed_lines["file-001"], review_pull_request.changed_new_lines(patch_text))
+        self.assertEqual(changed_lines["file-001"], changed_new_lines(patch_text))
 
     def test_file_larger_than_one_request_is_split_at_hunk_boundaries(self) -> None:
         patch_text = synthetic_patch("big", 180_000, 3_000, 13)
@@ -1737,7 +1613,7 @@ class BatchPlanningTests(unittest.TestCase):
         parsed = review_pull_request.parse_patch_lines(patch_text, "file-001")
 
         self.assertEqual([line.new_line for line in parsed], [None, 1, 2, 3])
-        self.assertEqual(review_pull_request.changed_new_lines(patch_text), {1, 2, 3})
+        self.assertEqual(changed_new_lines(patch_text), {1, 2, 3})
 
     def test_files_beyond_the_file_limit_count_as_unreviewed_text(self) -> None:
         files = [changed_file(filename=f"Sources/File{index:03d}.swift") for index in range(82)]

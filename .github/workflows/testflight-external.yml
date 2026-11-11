@@ -25,13 +25,9 @@ jobs:
       - name: Validate workflow source
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          # No checkout has run yet, so the helper file is absent.
+          release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+          retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
           [[ "$GITHUB_REF" == "refs/heads/main" ]] || release_fail configuration \
             "External TestFlight workflow used ref '$GITHUB_REF'; expected refs/heads/main." \
             "Run the workflow from main."
@@ -61,13 +57,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           [[ -n "$RELEASE_TAG" ]] || release_fail configuration \
             "The release_tag input was empty; expected a published GitHub release tag." \
             "Publish the release, then run this workflow with its tag."
@@ -118,13 +108,7 @@ jobs:
           RELEASE_BUILD_NUMBER: ${{ steps.build.outputs.build_number }}
         run: |
           set -euo pipefail
-          # The helper is absent before checkout and in release tags older than the helper.
-          if [[ -f .github/scripts/release_failure.sh ]]; then
-            source .github/scripts/release_failure.sh
-          else
-            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
-            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
-          fi
+          source .github/scripts/release_failure.sh
           for secret_name in APP_STORE_CONNECT_APP_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64; do
             [[ -n "${!secret_name:-}" ]] || release_fail configuration \
               "Secret or variable $secret_name was empty." \

@@ -277,7 +277,7 @@ class DisclosureAndRedactionTests(unittest.TestCase):
             len(comparison["new_issue"]["body"]),
             triage_issue.MAX_ISSUE_BODY_CHARS,
         )
-        self.assertIn(triage_issue.TRUNCATION_MARKER, comparison["new_issue"]["body"])
+        self.assertIn(github_llm_client.TRUNCATION_MARKER, comparison["new_issue"]["body"])
         self.assertLessEqual(
             len(json.dumps(payload).encode("utf-8")), triage_issue.MAX_LLM_REQUEST_BYTES
         )
