@@ -2021,90 +2021,6 @@ public actor ThumbnailFeedCore {
         interactionState.activeOwnerCount()
     }
 
-    public struct PrefetchStatus: Sendable, Equatable {
-        public let enabled: Bool
-        public let paused: Bool
-        public let diskThumbnailCoverageFraction: Double
-        public let diskThumbnailTotal: Int
-        public let diskCoverageVerified: Bool
-        public let currentQueueLength: Int
-        public let downloadsInFlight: Int
-        public let decodesInFlight: Int
-        public let lastErrors: [String]
-        public let cacheSizeBytes: Int64
-        public let diskFileCount: Int
-        public let ramDecodedCount: Int
-        public let ramDecodedBytes: Int
-        public let activeJobs: Int
-        public let completed: Int
-        public let failed: Int
-        /// Classified breakdown of `failed` (their sum equals `failed`).
-        public let failedTimeout: Int
-        public let failedBatchError: Int
-        public let failedItemError: Int
-        public let failedUnreported: Int
-        /// Withheld because the photo's read authorization changed during the download; retried, never quarantined.
-        public let failedWithheld: Int
-        public let diskHit: Int
-        public let downloadStarted: Int
-        public let downloadCompleted: Int
-        public let decodeStarted: Int
-        public let decodeCompleted: Int
-        /// Items currently quarantined because the backend refused them per item this crawl.
-        public let unfetchableCount: Int
-        public let skippedUnfetchable: Int
-        public let pausedReason: String
-    }
-
-    public func prefetchStatus() -> PrefetchStatus {
-        let coverage = diskPresence.coverage()
-        let decodedMetrics = decoded.metrics()
-        let reportedSequentialRemaining = sequential.dropFirst(min(sequentialIndex, sequential.count)).reduce(into: 0) {
-            count, uid in
-            if isReportedForPrefetch(uid) { count += 1 }
-        }
-        let pausedReason: String
-        if !prefetchEnabled {
-            pausedReason = "disabled"
-        } else if prefetchPaused {
-            pausedReason = "manual"
-        } else {
-            pausedReason = "none"
-        }
-        return PrefetchStatus(
-            enabled: prefetchEnabled,
-            paused: prefetchPaused,
-            diskThumbnailCoverageFraction: coverage.percent,
-            diskThumbnailTotal: coverage.total,
-            diskCoverageVerified: coverageSettled,
-            currentQueueLength: priority.count + reportedSequentialRemaining
-                + withheldRetry.filter(isReportedForPrefetch).count,
-            downloadsInFlight: downloadInFlight,
-            decodesInFlight: decodeInFlight,
-            lastErrors: lastErrors,
-            cacheSizeBytes: 0,
-            diskFileCount: coverage.present,
-            ramDecodedCount: decodedMetrics.entryCount,
-            ramDecodedBytes: decodedMetrics.byteCost,
-            activeJobs: downloadInFlight + decodeInFlight,
-            completed: prefetchCompleted,
-            failed: prefetchFailed,
-            failedTimeout: prefetchFailedTimeout,
-            failedBatchError: prefetchFailedBatchError,
-            failedItemError: prefetchFailedItemError,
-            failedUnreported: prefetchFailedUnreported,
-            failedWithheld: prefetchFailedWithheld,
-            diskHit: prefetchDiskHit,
-            downloadStarted: prefetchDownloadStarted,
-            downloadCompleted: prefetchDownloadCompleted,
-            decodeStarted: prefetchDecodeStarted,
-            decodeCompleted: prefetchDecodeCompleted,
-            unfetchableCount: unfetchable.count(intersecting: prefetchReportingUIDs),
-            skippedUnfetchable: skippedUnfetchable,
-            pausedReason: pausedReason
-        )
-    }
-
     private func startWorkers() {
         guard !workersRunning else { return }
         workersRunning = true
@@ -4023,15 +3939,10 @@ private final class UnfetchableThumbnailBox: @unchecked Sendable {
     }
 
     var count: Int {
-        count(intersecting: nil)
-    }
-
-    func count(intersecting allowed: Set<PhotoUID>?) -> Int {
         let now = clock()
         return lock.withLock {
             let held = lapseAt.isEmpty ? ids : ids.filter { lapseAt[$0].map { now < $0 } ?? true }
-            guard let allowed else { return held.count }
-            return held.intersection(allowed).count
+            return held.count
         }
     }
 

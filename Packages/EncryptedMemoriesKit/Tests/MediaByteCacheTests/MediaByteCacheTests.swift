@@ -84,11 +84,11 @@ struct MediaByteCacheTests {
         #expect(
             thumbnail.storeToDisk(png(), for: uid("critical"), ifCurrent: thumbnail.captureWriterGeneration())
                 == .storagePaused)
-        for _ in 0..<100 where preview.diskFileCount() != 0 || original.diskFileCount() != 0 {
+        for _ in 0..<100 where preview.diskSizeBytes() != 0 || original.diskSizeBytes() != 0 {
             try await Task.sleep(for: .milliseconds(10))
         }
-        #expect(preview.diskFileCount() == 0)
-        #expect(original.diskFileCount() == 0)
+        #expect(preview.diskSizeBytes() == 0)
+        #expect(original.diskSizeBytes() == 0)
         #expect(thumbnail.diskData(for: photo) == png())
         await thumbnail.store(png(), for: uid("ram"))
         #expect(await thumbnail.data(for: uid("ram")) == png())

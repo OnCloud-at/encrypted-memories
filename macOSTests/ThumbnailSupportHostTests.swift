@@ -15,14 +15,20 @@ final class ThumbnailSupportHostTests: XCTestCase {
         }
     }
 
+    @MainActor private func makeManager(
+        root: URL, defaults: UserDefaults
+    ) -> (OfflineLibraryManager, SupportDiagnosticsSources) {
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        return (OfflineLibraryManager(testRoot: root, testSources: sources, testDefaults: defaults), sources)
+    }
+
     @MainActor func testPrepareRejectsInFlightRetiringSource() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let suite = "issue919-host-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
-        let manager = OfflineLibraryManager(testRoot: root, testSources: sources, testDefaults: defaults)
+        let (manager, sources) = makeManager(root: root, defaults: defaults)
         await manager.previewCache.flushAutomaticDiskCap()
         let source = CallbackSource { await MainActor.run { manager.prepareForAccountTeardown() } }
         manager.installSupportSourceForTesting(source)
@@ -39,8 +45,7 @@ final class ThumbnailSupportHostTests: XCTestCase {
         let suite = "issue919-host-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
-        let manager = OfflineLibraryManager(testRoot: root, testSources: sources, testDefaults: defaults)
+        let (manager, sources) = makeManager(root: root, defaults: defaults)
         await manager.previewCache.flushAutomaticDiskCap()
         let old = CallbackSource {}
         let replacement = CallbackSource {}
@@ -63,8 +68,7 @@ final class ThumbnailSupportHostTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: AppSettingsKey.offlineOriginalsCapUnlimited)
-        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
-        let manager = OfflineLibraryManager(testRoot: root, testSources: sources, testDefaults: defaults)
+        let (manager, sources) = makeManager(root: root, defaults: defaults)
         await manager.previewCache.flushAutomaticDiskCap()
         let blob = root.appendingPathComponent("media/thumbnails.enc/probe.blob")
         try Data([0x41]).write(to: blob)
@@ -89,8 +93,7 @@ final class ThumbnailSupportHostTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: AppSettingsKey.offlineOriginalsCapUnlimited)
-        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
-        let manager = OfflineLibraryManager(testRoot: root, testSources: sources, testDefaults: defaults)
+        let (manager, _) = makeManager(root: root, defaults: defaults)
         manager.configure(
             session: ProtonSession(
                 uid: "fixture", accessToken: "fixture", refreshToken: "fixture", keyPassword: "fixture"))

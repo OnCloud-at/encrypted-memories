@@ -420,7 +420,7 @@ final class OfflineLibraryManager {
         await refreshStatus()
     }
 
-    /// Recomputes `status` from the cache actors, the feed, and the diagnostics counters.
+    /// Recomputes `status` from the sizes of the three media caches.
     @discardableResult
     func refreshStatus() async -> OfflineCacheStatus {
         guard !accountTeardownInProgress,
