@@ -61,6 +61,16 @@ public actor DragOutStager {
         self.removeLocationWhenSharing = removeLocationWhenSharing
     }
 
+    /// A fresh staging directory for one drag session, below the shared `DragOut` folder of the temporary
+    /// directory. A per-session subdirectory keeps concurrent sessions from sweeping each other's in-flight
+    /// downloads: the orphan sweep removes stale `.download` files, and a second drag that reused the shared
+    /// directory could delete the files of the first session.
+    public static func makeSessionStagingDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("DragOut", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    }
+
     // MARK: - Public API
 
     /// Sums known item sizes, checks the staging volume, then starts staging every item

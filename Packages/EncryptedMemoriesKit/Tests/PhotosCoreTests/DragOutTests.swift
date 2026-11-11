@@ -25,6 +25,23 @@ final class DragOutTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
     }
 
+    func testEachSessionStagesInAFreshSubfolderOfTheSharedDragOutFolder() {
+        let first = DragOutStager.makeSessionStagingDirectory()
+        let second = DragOutStager.makeSessionStagingDirectory()
+
+        XCTAssertNotEqual(first, second, "two sessions must never share a directory")
+        for directory in [first, second] {
+            let shared = directory.deletingLastPathComponent()
+            XCTAssertEqual(shared.lastPathComponent, "DragOut")
+            XCTAssertEqual(
+                shared.deletingLastPathComponent().standardizedFileURL,
+                FileManager.default.temporaryDirectory.standardizedFileURL)
+            XCTAssertNotNil(UUID(uuidString: directory.lastPathComponent))
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: directory.path), "the helper names the directory only")
+        }
+    }
+
     /// These byte-staging fixtures explicitly keep location; their payloads are not decodable images.
     /// Fake `OriginalFileProvider`: writes a temp file at the given destination, records
     /// concurrent-write peaks, and reports progress in bounded chunks.
