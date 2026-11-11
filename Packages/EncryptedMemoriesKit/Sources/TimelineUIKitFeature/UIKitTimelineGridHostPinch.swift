@@ -109,7 +109,7 @@
             pinchSettling = false
             pinchBuiltSegment = nil
             pinchChainBand = GridPinchRoutePolicy.chainBand(around: ctx.level, engine: ctx.engine)
-            pinchDriver = PinchLiveZoomDriver(tuning: .init(from: gridTransition.tuning))
+            pinchDriver = PinchLiveZoomDriver(tuning: gridTransition.tuning)
             pinchPrevSampleTime = CACurrentMediaTime()
             pinchAdvancePrevTime = 0
             userHasScrolledTimeline = true
@@ -137,7 +137,7 @@
             case .undecided:
                 guard let start = pinchStartLevel else { return }
                 let delta = Double(rawLevel) - Double(start)
-                guard abs(delta) >= pinchDriver.tuning.directionResolveQ else { return }
+                guard abs(delta) >= pinchDriver.tuning.pinchDirectionResolveQ else { return }
                 switch GridPinchRoutePolicy.candidate(
                     startLevel: start,
                     direction: rawLevel < CGFloat(start) ? -1 : 1,

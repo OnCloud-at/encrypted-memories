@@ -19,6 +19,35 @@ import Testing
         return d
     }
 
+    @Test func customTransitionTuningControlsPinch() {
+        var tuning = GridTransitionTuning.default
+        tuning.pinchDirectionResolveQ = 0.2
+        tuning.pinchDetentHysteresisQ = 0.3
+        tuning.pinchReleaseCommitQ = 0.8
+        tuning.pinchVelocityEmaAlpha = 0.5
+        tuning.pinchAutoCompleteMinQPerSecond = 0.3
+        tuning.pinchAutoCompleteMaxQPerSecond = 0.4
+        tuning.clickDurationMs = 2000
+        var driver = PinchLiveZoomDriver(tuning: tuning)
+        driver.begin(startLevel: 3, chainLo: 0, chainHi: 3)
+        #expect(!driver.update(continuousLevel: 2.9, dt: 1).hasSegment)
+        #expect(driver.update(continuousLevel: 2.4, dt: 1).hasSegment)
+        #expect(abs(driver.velocityQPerSecond - 0.275) < 1e-9)
+        #expect(driver.release() == 3)
+        driver.advance(dt: 1)
+        #expect(abs(driver.segmentQ - 0.3) < 1e-9)
+
+        driver.begin(startLevel: 3, chainLo: 0, chainHi: 3)
+        _ = driver.releaseTowardAdjacent(direction: -1)
+        #expect(abs(driver.velocityQPerSecond - 0.5) < 1e-9)
+
+        driver.begin(startLevel: 3, chainLo: 0, chainHi: 3)
+        let held = driver.update(continuousLevel: 1.75, dt: 1)
+        #expect(held.segmentSource == 3 && held.segmentTarget == 2)
+        let crossed = driver.update(continuousLevel: 1.6, dt: 1)
+        #expect(crossed.segmentSource == 2 && crossed.segmentTarget == 1)
+    }
+
     @discardableResult
     private func settle(_ d: inout PinchLiveZoomDriver, maxTicks: Int = 600) -> Int {
         var ticks = 0
@@ -223,7 +252,14 @@ import Testing
             _ = expected.release(cancelled: cancelled)
             var actual = initial
             let update = actual.releaseTowardAdjacent(direction: direction, cancelled: cancelled)
-            #expect(actual == expected)
+            #expect(actual.phase == expected.phase)
+            #expect(actual.startLevel == expected.startLevel)
+            #expect(actual.chainLo == expected.chainLo && actual.chainHi == expected.chainHi)
+            #expect(actual.seg == expected.seg && actual.segmentQ == expected.segmentQ)
+            #expect(actual.directionResolved == expected.directionResolved)
+            #expect(actual.velocityQPerSecond == expected.velocityQPerSecond)
+            #expect(actual.settleTargetQ == expected.settleTargetQ && actual.finalLevel == expected.finalLevel)
+            #expect(actual.chainable == expected.chainable && actual.tuning == expected.tuning)
             #expect(!update.hasSegment)
             #expect(update.segmentSource == actual.segmentSource)
             #expect(update.segmentTarget == actual.segmentTarget)

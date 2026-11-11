@@ -1,36 +1,7 @@
 // Continuous pinch across adjacent detents. `continuousLevel` is authoritative; the active segment follows
 // the finger and settles to the nearest detent on release. The host clamps the driver to the eligible band.
 
-package struct PinchLiveZoomDriver: Equatable, Sendable {
-    package struct Tunables: Equatable, Sendable {
-        /// Release decision (fingers up): the active segment settles to its target if `segmentQ ≥` this, else
-        /// back to its source - i.e. the nearest detent to the global position.
-        package var releaseCommitQ: Double = 0.50
-        /// Settle ramp speed floor / cap (q per second) - never stalls, never an instant snap.
-        package var autoCompleteMinQPerSecond: Double = 1.8
-        package var autoCompleteMaxQPerSecond: Double = 8.0
-        /// A very short directional pinch that never clears the live-scrub dead-band should still behave like
-        /// a discrete +/- step: complete one adjacent segment at the click duration.
-        package var shortStepQPerSecond: Double = 1000.0 / 420.0
-        /// EMA weight for the recent pinch velocity (drives the settle speed). 0…1.
-        package var velocityEmaAlpha: Double = 0.25
-        /// |continuousLevel − startLevel| (level units) needed before the first segment engages (rest dead-band).
-        package var directionResolveQ: Double = 0.02
-        /// Hysteresis (level units) around an integer detent before the active interval switches - prevents
-        /// rebuild thrash when the finger holds right on a detent.
-        package var detentHysteresisQ: Double = 0.02
-        package init() {}
-        package init(from t: GridTransitionTuning) {
-            releaseCommitQ = t.pinchReleaseCommitQ
-            autoCompleteMinQPerSecond = t.pinchAutoCompleteMinQPerSecond
-            autoCompleteMaxQPerSecond = t.pinchAutoCompleteMaxQPerSecond
-            shortStepQPerSecond = 1000.0 / max(1.0, t.clickDurationMs)
-            velocityEmaAlpha = t.pinchVelocityEmaAlpha
-            directionResolveQ = t.pinchDirectionResolveQ
-            detentHysteresisQ = t.pinchDetentHysteresisQ
-        }
-    }
-
+package struct PinchLiveZoomDriver: Sendable {
     package enum Phase: Equatable, Sendable {
         case idle
         case scrub  // fingers down, segmentQ follows the finger 1:1 across detents
@@ -67,9 +38,9 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
 
     private var lastX: Double = 0
 
-    package var tuning = Tunables()
+    package var tuning = GridTransitionTuning.default
 
-    package init(tuning: Tunables = Tunables()) { self.tuning = tuning }
+    package init(tuning: GridTransitionTuning = .default) { self.tuning = tuning }
 
     package var segmentSource: Int { seg + 1 }
     package var segmentTarget: Int { seg }
@@ -109,12 +80,12 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
         // recent pinch velocity from the GLOBAL position (continuous across detent crossings, unlike segmentQ).
         if dt > 1e-6 {
             let inst = abs(x - lastX) / dt
-            velocityQPerSecond += tuning.velocityEmaAlpha * (inst - velocityQPerSecond)
+            velocityQPerSecond += tuning.pinchVelocityEmaAlpha * (inst - velocityQPerSecond)
         }
         lastX = x
 
         if !directionResolved {
-            if abs(x - Double(startLevel)) < tuning.directionResolveQ {
+            if abs(x - Double(startLevel)) < tuning.pinchDirectionResolveQ {
                 // rest dead-band: hold the start detent, no segment engaged yet
                 return Update(
                     segmentSource: segmentSource, segmentTarget: segmentTarget, segmentQ: segmentQ, hasSegment: false)
@@ -125,12 +96,12 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
         // Move the active interval toward x with hysteresis, one detent at a time (handles a fast multi-level
         // flick: x can jump several intervals in one update).
         var guardIter = 0
-        while seg > chainLo, Double(seg) - x > tuning.detentHysteresisQ {
+        while seg > chainLo, Double(seg) - x > tuning.pinchDetentHysteresisQ {
             seg -= 1
             guardIter += 1
             if guardIter > 64 { break }
         }
-        while seg < chainHi - 1, x - Double(seg + 1) > tuning.detentHysteresisQ {
+        while seg < chainHi - 1, x - Double(seg + 1) > tuning.pinchDetentHysteresisQ {
             seg += 1
             guardIter += 1
             if guardIter > 64 { break }
@@ -145,7 +116,8 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
     @discardableResult
     package mutating func advance(dt: Double) -> Double {
         guard dt > 0, phase == .settling else { return segmentQ }
-        let speed = max(tuning.autoCompleteMinQPerSecond, min(tuning.autoCompleteMaxQPerSecond, velocityQPerSecond))
+        let speed = max(
+            tuning.pinchAutoCompleteMinQPerSecond, min(tuning.pinchAutoCompleteMaxQPerSecond, velocityQPerSecond))
         if segmentQ < settleTargetQ {
             segmentQ = min(settleTargetQ, segmentQ + speed * dt)
         } else if segmentQ > settleTargetQ {
@@ -169,7 +141,7 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
         if !directionResolved {
             settleTargetQ = segmentQ  // An unmoved gesture stays at its start detent.
             finalLevel = startLevel
-        } else if segmentQ >= tuning.releaseCommitQ {
+        } else if segmentQ >= tuning.pinchReleaseCommitQ {
             settleTargetQ = 1
             finalLevel = segmentTarget
         } else {
@@ -209,7 +181,7 @@ package struct PinchLiveZoomDriver: Equatable, Sendable {
         }
         directionResolved = true
         finalLevel = target
-        velocityQPerSecond = max(velocityQPerSecond, tuning.shortStepQPerSecond)
+        velocityQPerSecond = max(velocityQPerSecond, 1000.0 / max(1.0, tuning.clickDurationMs))
         phase = .settling
         return Update(segmentSource: segmentSource, segmentTarget: segmentTarget, segmentQ: segmentQ, hasSegment: true)
     }

@@ -434,7 +434,7 @@ final class MetalGridScrollHost: NSView {
             pinchMode = .undecided
             pinchBuiltSegment = nil
             pinchChainBand = coordinator.eligiblePinchChainBand()
-            pinchDriver = PinchLiveZoomDriver(tuning: .init(from: coordinator.gridTransition.tuning))
+            pinchDriver = PinchLiveZoomDriver(tuning: coordinator.gridTransition.tuning)
             pinchPrevMagnifyTime = CACurrentMediaTime()
             scrollLockOrigin = scrollView.contentView.bounds.origin  // freeze scroll for the gesture
             lastMagnifyEventTime = CACurrentMediaTime()  // arm the post-pinch scroll grace
@@ -476,7 +476,7 @@ final class MetalGridScrollHost: NSView {
             if pinchMode == .reflow { coordinator.updateLiveZoom(continuousLevel: pos) }
         case .undecided:
             let start = pinchBaseLevel
-            guard abs(Double(pos) - Double(start)) >= pinchDriver.tuning.directionResolveQ else { return }
+            guard abs(Double(pos) - Double(start)) >= pinchDriver.tuning.pinchDirectionResolveQ else { return }
             switch GridPinchRoutePolicy.candidate(
                 startLevel: start,
                 direction: pos < CGFloat(start) ? -1 : 1,
