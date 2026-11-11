@@ -140,15 +140,7 @@ extension DriveSessionStubSuite {
                         $0.message = "fixture"
                         $0.primaryCode = -999
                     }
-                    if wrapped {
-                        let inner = proto
-                        proto = Proton_Drive_Sdk_Error.with {
-                            $0.type = "fixture-outer"
-                            $0.domain = .api
-                            $0.message = "fixture"
-                            $0.innerError = inner
-                        }
-                    }
+                    if wrapped { proto = ProtonFailureTestFixture.wrapped(proto, domain: .api) }
                     errors.append((ProtonDriveSDKError(protoError: proto), true))
                 }
             }

@@ -11,23 +11,8 @@ struct ProtonFailureCharacterizationTests {
     @Test func apiHTTPBoundariesAndNestedErrors() {
         for code in [407, 408, 409, 429, 499, 500, 599, 600] {
             for wrapped in [false, true] {
-                var proto = Proton_Drive_Sdk_Error.with {
-                    $0.type = "fixture-api"
-                    $0.domain = .api
-                    $0.message = "fixture"
-                    $0.primaryCode = 1
-                    $0.secondaryCode = Int64(code)
-                }
-                if wrapped {
-                    let inner = proto
-                    proto = Proton_Drive_Sdk_Error.with {
-                        $0.type = "fixture-outer"
-                        $0.domain = .undefined
-                        $0.message = "fixture"
-                        $0.innerError = inner
-                    }
-                }
-                let mapped = DriveSDKBridge.uploadError(from: ProtonDriveSDKError(protoError: proto), filename: "a")
+                let failure = ProtonFailureTestFixture.api(httpCode: code, wrapped: wrapped)
+                let mapped = ProtonFailureClassifier.uploadError(from: failure, filename: "a")
                 if code == 408 || code == 429 || (500...599).contains(code) {
                     guard case .retryableBackend(let actual, _) = mapped as? UploadCore.UploadError else {
                         Issue.record("Expected retryable backend for HTTP \(code), wrapped: \(wrapped)")
@@ -51,7 +36,7 @@ struct ProtonFailureCharacterizationTests {
     }
 
     @Test func urlCancellationRemainsATransportFailure() {
-        let mapped = DriveSDKBridge.uploadError(from: URLError(.cancelled), filename: "a")
+        let mapped = ProtonFailureClassifier.uploadError(from: URLError(.cancelled), filename: "a")
         guard case .transport(let code, _) = mapped as? UploadCore.UploadError else {
             Issue.record("Expected transport failure")
             return
@@ -71,16 +56,10 @@ struct ProtonFailureCharacterizationTests {
                 }
                 for wrapped in [false, true] {
                     if wrapped {
-                        let inner = proto
-                        proto = Proton_Drive_Sdk_Error.with {
-                            $0.type = "fixture-outer"
-                            $0.domain = .undefined
-                            $0.message = "fixture"
-                            $0.innerError = inner
-                        }
+                        proto = ProtonFailureTestFixture.wrapped(proto)
                     }
                     let mapped =
-                        DriveSDKBridge.uploadError(
+                        ProtonFailureClassifier.uploadError(
                             from: ProtonDriveSDKError(protoError: proto), filename: "a") as? UploadCore.UploadError
                     if code == 408 || code == 429 || (500...599).contains(code) {
                         guard case .retryableBackend(let actual, _) = mapped else {
@@ -106,11 +85,7 @@ struct ProtonFailureCharacterizationTests {
     }
 
     @Test func relatedTransferSignalPreservesFirstRecognizedSDKError() {
-        let cancelled = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-cancel"
-            $0.domain = .successfulCancellation
-            $0.message = "fixture"
-        }
+        let cancelled = ProtonFailureTestFixture.cancelled
         let network = Proton_Drive_Sdk_Error.with {
             $0.type = NSURLErrorDomain
             $0.domain = .network
@@ -118,12 +93,7 @@ struct ProtonFailureCharacterizationTests {
             $0.primaryCode = Int64(NSURLErrorTimedOut)
             $0.innerError = cancelled
         }
-        let outer = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-outer"
-            $0.domain = .undefined
-            $0.message = "fixture"
-            $0.innerError = network
-        }
+        let outer = ProtonFailureTestFixture.wrapped(network)
         let result = ProtonFailureClassifier.relatedTransferSignal(ProtonDriveSDKError(protoError: outer))
         #expect((result as? URLError)?.code == .timedOut)
         #expect(
@@ -133,11 +103,7 @@ struct ProtonFailureCharacterizationTests {
     }
 
     @Test func sdkCancellationSearchesPastNonCancelledNetworkErrors() {
-        let cancelled = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-cancel"
-            $0.domain = .successfulCancellation
-            $0.message = "fixture"
-        }
+        let cancelled = ProtonFailureTestFixture.cancelled
         let outer = Proton_Drive_Sdk_Error.with {
             $0.type = NSURLErrorDomain
             $0.domain = .network
@@ -157,17 +123,8 @@ struct ProtonFailureCharacterizationTests {
     }
 
     @Test func uploadCancellationChecksOnlyTheSDKRoot() {
-        let cancelled = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-cancel"
-            $0.domain = .successfulCancellation
-            $0.message = "fixture"
-        }
-        let outer = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-outer"
-            $0.domain = .undefined
-            $0.message = "fixture"
-            $0.innerError = cancelled
-        }
+        let cancelled = ProtonFailureTestFixture.cancelled
+        let outer = ProtonFailureTestFixture.wrapped(cancelled)
         #expect(ProtonFailureClassifier.isSDKCancellation(ProtonDriveSDKError(protoError: cancelled)))
         #expect(!ProtonFailureClassifier.isSDKCancellation(ProtonDriveSDKError(protoError: outer)))
         #expect(!ProtonFailureClassifier.isSDKCancellation(CancellationError()))
@@ -181,6 +138,14 @@ struct ProtonFailureCharacterizationTests {
                     == ((400...499).contains(code) && code != 408 && code != 429))
         }
         #expect(!ProtonFailureClassifier.isFinal(URLError(.timedOut)))
+    }
+
+    @Test func libraryOpenUnauthorizedMatchesTheExistingPolicy() {
+        for code in [400, 401, 403, 408, 409, 429, 500] {
+            let error = ProtonAuthError.apiError(code: code, message: "fixture")
+            #expect(ProtonFailureClassifier.isUnauthorized(error) == LibraryOpenFailurePermanence.isPermanent(error))
+        }
+        #expect(!ProtonFailureClassifier.isUnauthorized(URLError(.userAuthenticationRequired)))
     }
 
     @Test func pendingEffectKeepsFinalAndRetryableHTTPOutcomes() async {
@@ -251,32 +216,16 @@ struct ProtonFailureCharacterizationTests {
     }
 
     @Test func deviceRootOnlyReadsTheOuterSDKAPIStatus() {
-        let api = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-api"
-            $0.domain = .api
-            $0.message = "fixture"
-            $0.primaryCode = 1
-            $0.secondaryCode = 404
-        }
-        let outer = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-outer"
-            $0.domain = .undefined
-            $0.message = "fixture"
-            $0.innerError = api
-        }
-        #expect(ProtonFailureClassifier.rootAPIHTTPCode(ProtonDriveSDKError(protoError: api)) == 404)
-        #expect(ProtonFailureClassifier.rootAPIHTTPCode(ProtonDriveSDKError(protoError: outer)) == nil)
+        let api = ProtonFailureTestFixture.api(httpCode: 404, wrapped: false)
+        let outer = ProtonFailureTestFixture.api(httpCode: 404, wrapped: true)
+        #expect(ProtonFailureClassifier.rootAPIHTTPCode(api) == 404)
+        #expect(ProtonFailureClassifier.rootAPIHTTPCode(outer) == nil)
         #expect(ProtonFailureClassifier.rootAPIHTTPCode(NSError(domain: "foreign", code: 404)) == nil)
     }
 
     @Test func sdkFilesystemLookupFindsNestedStoragePressure() {
         let full = Proton_Drive_Sdk_Error.from(nsError: POSIXError(.ENOSPC) as NSError)
-        let outer = Proton_Drive_Sdk_Error.with {
-            $0.type = "fixture-outer"
-            $0.domain = .undefined
-            $0.message = "fixture"
-            $0.innerError = full
-        }
+        let outer = ProtonFailureTestFixture.wrapped(full)
         #expect(ProtonFailureClassifier.fileSystemError(ProtonDriveSDKError(protoError: outer)) == .outOfSpace)
         #expect(ProtonFailureClassifier.fileSystemError(POSIXError(.ENOSPC)) == nil)
     }

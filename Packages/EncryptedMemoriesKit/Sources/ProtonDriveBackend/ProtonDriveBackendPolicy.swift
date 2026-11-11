@@ -134,7 +134,6 @@ public enum LibraryOpenFailurePermanence {
     public static func isPermanent(_ error: Error) -> Bool {
         if error is DriveBridgeError { return true }
         if error is any LibraryChangeTerminalError { return true }
-        if case ProtonAuthError.apiError(let code, _) = error { return code == 401 }
-        return false
+        return ProtonFailureClassifier.isUnauthorized(error)
     }
 }

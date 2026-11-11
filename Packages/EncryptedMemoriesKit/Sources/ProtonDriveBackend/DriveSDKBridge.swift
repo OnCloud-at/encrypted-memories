@@ -3030,7 +3030,7 @@ extension DriveSDKBridge: PhotoUploading {
             }
             // The related-file boundary maps typed codes; never format an SDK/filesystem message for it.
             guard logging.logFileDetails else { throw error }
-            throw Self.uploadError(from: error, filename: request.name)
+            throw ProtonFailureClassifier.uploadError(from: error, filename: request.name)
         }
     }
 
@@ -3050,11 +3050,6 @@ extension DriveSDKBridge: PhotoUploading {
             tags.remove(LibraryPhotoTag.videos.rawValue)
         }
         return tags.sorted()
-    }
-
-    /// Preserves the classifier's typed failure domain at the Core boundary.
-    nonisolated static func uploadError(from error: Error, filename: String) -> any Error {
-        ProtonFailureClassifier.uploadError(from: error, filename: filename)
     }
 
     func cancel(token: UUID) async {

@@ -3,8 +3,7 @@ import ProtonAuth
 import ProtonDriveSDK
 import UploadCore
 
-/// Classifies Proton failures in one place, so every call site reads the same rule. Further call sites join this type
-/// instead of adding another classifier.
+/// Shares Proton failure classification across backend call sites.
 enum ProtonFailureClassifier {
     /// What an HTTP status of a Proton answer proves about a repeat of the same request.
     enum HTTPStatus: Equatable, Sendable {
@@ -51,15 +50,20 @@ enum ProtonFailureClassifier {
         } ?? false
     }
 
-    /// Batch writes treat every 4xx except 408 and 429 as final, including statuses unproven for backup.
+    /// Every 4xx except 408 and 429 is final for batch writes and pending remote effects.
     static func isFinal(_ error: any Error) -> Bool {
         guard case .apiError(let code, _)? = error as? ProtonAuthError else { return false }
         return (400...499).contains(code) && httpStatus(code) != .temporary
     }
 
-    /// Upload cancellation has always inspected only the outer SDK error.
+    /// Only the outer SDK error counts as cancellation.
     static func isSDKCancellation(_ error: any Error) -> Bool {
         (error as? ProtonDriveSDKError)?.domain == .successfulCancellation
+    }
+
+    static func isUnauthorized(_ error: any Error) -> Bool {
+        guard case .apiError(let code, _)? = error as? ProtonAuthError else { return false }
+        return code == 401
     }
 
     /// Device enumeration only accepts a status from the outer SDK API error.
