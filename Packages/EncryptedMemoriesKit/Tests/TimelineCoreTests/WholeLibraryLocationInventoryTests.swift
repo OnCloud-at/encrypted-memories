@@ -1360,6 +1360,9 @@ import Testing
         @Test(.timeLimit(.minutes(1)))
         func aCancelledTakeoverStillStartsTheOwedScanOnce() async throws {
             let fixture = try await LocationInventoryFixture.make()
+            let probeGate = InventoryGate()
+            defer { probeGate.open() }
+            fixture.probeGate = probeGate
             fixture.seed(["b", "d"])
             await fixture.reconcile(nil)
             let publicationRelease = InventoryGate()
@@ -1386,12 +1389,36 @@ import Testing
             await publication.value
 
             #expect(projections.value == 2)
+            let eventStream = fixture.events.stream
+            let probeArrived = await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    var probeEvents = eventStream.makeAsyncIterator()
+                    while let event = await probeEvents.next() {
+                        if event == .probe { return true }
+                    }
+                    return false
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(30))
+                    return false
+                }
+                let arrived = await group.next() ?? false
+                group.cancelAll()
+                return arrived
+            }
+            guard probeArrived else {
+                Issue.record("The owed location scan did not reach its first probe within 30 seconds")
+                probeGate.open()
+                await fixture.close()
+                return
+            }
             #expect(
                 fixture.persistedUIDs() == [inventoryUID("b"), inventoryUID("d")],
                 "G684_CANCELLED_TAKEOVER_PENDING: the cancelled request must leave the waiting work")
             #expect(
                 fixture.session.startingTask != nil,
                 "G684_CANCELLED_TAKEOVER_STARTS: the cancelled taker must not drop the owed scan start")
+            probeGate.open()
             await fixture.finishAdmittedCrawl()
             #expect(fixture.session.crawlStartsForTesting == 1, "G684_CANCELLED_TAKEOVER_ONE_START")
             #expect(!fixture.probes.values.contains(inventoryUID("c")))
