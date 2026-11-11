@@ -232,7 +232,6 @@ private actor RecordingLoader: ThumbnailBatchLoader {
     private let batchError: String?
     private let failAll: Bool
     private let delayMilliseconds: Int
-    private let onWithheld: @Sendable () -> Void
     /// Withheld on the first request, as after an authorization change during the download; delivered afterwards.
     private var withheldOnce: Set<PhotoUID>
     /// Refused on the first request, as for a node committed seconds ago; delivered afterwards.
@@ -245,7 +244,6 @@ private actor RecordingLoader: ThumbnailBatchLoader {
         failAll: Bool = false,
         delayMilliseconds: Int = 0,
         withheldOnce: Set<PhotoUID> = [],
-        onWithheld: @escaping @Sendable () -> Void = {},
         refusedOnce: [PhotoUID: String] = [:]
     ) {
         self.payloads = payloads
@@ -254,7 +252,6 @@ private actor RecordingLoader: ThumbnailBatchLoader {
         self.failAll = failAll
         self.delayMilliseconds = delayMilliseconds
         self.withheldOnce = withheldOnce
-        self.onWithheld = onWithheld
         self.refusedOnce = refusedOnce
     }
 
@@ -281,7 +278,6 @@ private actor RecordingLoader: ThumbnailBatchLoader {
                 errors[uid] = reason
             }
         }
-        if !withheld.isEmpty { onWithheld() }
         return ThumbnailBatchLoadResult(itemErrors: errors, withheldUIDs: withheld)
     }
 
@@ -317,36 +313,6 @@ private actor CancellationAwareLoader: ThumbnailBatchLoader {
 
     func requestCount() -> Int { requested.count }
     func cancellations() -> Int { cancellationCount }
-}
-
-private actor NonCooperativeLoader: ThumbnailBatchLoader {
-    private var requested: [PhotoUID] = []
-    private var cancelled = 0
-    private let delay: Duration
-
-    init(delay: Duration) {
-        self.delay = delay
-    }
-
-    func loadThumbnails(
-        for uids: [PhotoUID],
-        onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult {
-        requested.append(contentsOf: uids)
-        let detachedDelay = Task.detached { [delay] in
-            try? await Task.sleep(for: delay)
-        }
-        await withTaskCancellationHandler {
-            await detachedDelay.value
-        } onCancel: {
-            Task { await self.recordCancellation() }
-        }
-        return .delivered
-    }
-
-    func requestCount() -> Int { requested.count }
-    func cancellations() -> Int { cancelled }
-    private func recordCancellation() { cancelled += 1 }
 }
 
 private actor ControlledLateLoader: ThumbnailBatchLoader {
@@ -2067,8 +2033,9 @@ struct ThumbnailFeedCoreTests {
 
         // The next process opens the same cache: the saved photo is whole, only the other photo loads.
         let next = RecordingLoader(payloads: [unsaved: Self.pngData(width: 24, height: 24)])
+        let nextCache = cache()
         let nextFeed = ThumbnailFeedCore(
-            cache: cache(), loader: next,
+            cache: nextCache, loader: next,
             configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
             resourceCoordinator: await Self.coordinator(runtimeState)
         )
@@ -2076,7 +2043,8 @@ struct ThumbnailFeedCoreTests {
         try await Self.waitUntil { await next.requestCount() == 1 }
         try await Self.waitForCrawl(nextFeed)
         #expect(await next.requestOrder() == [unsaved], "the saved photo is not downloaded again")
-        #expect(cache().hasUsableDiskData(saved), "the saved photo remains in the cache")
+        #expect(nextCache.hasUsableDiskData(saved), "the saved photo remains in the cache")
+        #expect(nextCache.hasUsableDiskData(unsaved), "the remaining photo is saved to disk")
         await nextFeed.stopPrefetchAndWait()
     }
 
@@ -2516,10 +2484,10 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetch()
         coverage.release.signal()
         await bootstrap.value
-        try await Task.sleep(for: .milliseconds(100))
-
+        // Start a worker after the stale bootstrap returns; it must have no old crawl to run.
+        await feed.resumePrefetch()
+        try await Self.waitForCrawl(feed)
         #expect(await loader.requestCount() == 0)
-        #expect(await !feed.hasPendingThumbnailWork())
     }
 
     @Test func diskOnlyBytesWarmIntoDecodedRamWithoutNetwork() async throws {
@@ -2979,7 +2947,7 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.requestCount() == 4, "refused items stay quarantined")
     }
 
-    @Test func zeroResultBatchRecordsClassifiedFailureAndBacksOff() async throws {
+    @Test func zeroResultBatchBacksOff() async throws {
         let uids = (0..<2).map { Self.uid("zero-\($0)") }
         let frozen = Date(timeIntervalSince1970: 5000)
         let loader = RecordingLoader(batchError: "simulated 429")
@@ -4657,9 +4625,9 @@ struct ThumbnailFeedCoreTests {
             let uid = Self.uid(name)
             let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .foregroundActive))
             let cache = Self.cache(name, runtimeState: runtime)
-            let loader = RecordingLoader(
-                payloads: [uid: Self.pngData(width: 8, height: 8)], withheldOnce: [uid],
-                onWithheld: { runtime.update { $0.executionOpportunity = .suspended } })
+            let loader = WithheldOnceLoader(payload: Self.pngData(width: 8, height: 8)) {
+                runtime.update { $0.executionOpportunity = .suspended }
+            }
             let feed = ThumbnailFeedCore(
                 cache: cache, loader: loader,
                 configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, crawlBackoffSeconds: 0)
@@ -4667,22 +4635,20 @@ struct ThumbnailFeedCoreTests {
 
             await feed.startPrefetch([uid])
             try await Self.waitForCrawl(feed)
-            #expect(await loader.requestCount() == 1)
+            #expect(await loader.requests(for: uid) == 1)
             #expect(!cache.has(uid))
 
             if disable { await feed.setPrefetchEnabled(false) }
             runtime.update { $0.executionOpportunity = .foregroundActive }
-            if disable {
-                await feed.setPrefetchEnabled(true)
-                await feed.resumePrefetch()
-            }
+            if disable { await feed.setPrefetchEnabled(true) }
+            await feed.resumePrefetch()
             if disable {
                 try await Self.waitForCrawl(feed)
-                #expect(await loader.requestCount() == 1, "disabling clears the pending retry")
+                #expect(await loader.requests(for: uid) == 1, "disabling clears the pending retry")
                 #expect(!cache.has(uid))
             } else {
                 try await Self.waitUntil { cache.has(uid) }
-                #expect(await loader.requestCount() == 2, "the held retry reaches the loader")
+                #expect(await loader.requests(for: uid) == 2, "the held retry reaches the loader")
             }
             await feed.stopPrefetchAndWait()
         }

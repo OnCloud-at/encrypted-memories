@@ -60,7 +60,7 @@ final class OfflineLibraryManager {
         return Int64(max(0, gb) * 1_073_741_824)  // Convert GiB to bytes.
     }
 
-    /// Latest computed status for the Developer/Cache surface (refreshed on demand).
+    /// Latest computed cache sizes for Settings (refreshed on demand).
     private(set) var status = OfflineCacheStatus()
 
     /// True only while thumbnails for newly discovered authoritative assets remain unresolved.

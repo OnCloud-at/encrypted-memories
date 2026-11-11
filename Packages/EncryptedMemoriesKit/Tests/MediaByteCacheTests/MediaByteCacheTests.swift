@@ -80,15 +80,34 @@ struct MediaByteCacheTests {
             #expect(cache.diskData(for: photo) == png())
         }
 
+        for cache in [preview, original] {
+            #expect(cache.trackedDiskSizeBytes() > 0)
+            let directory = cache.diskURL(for: photo).deletingLastPathComponent()
+            try Data().write(to: directory.appendingPathComponent("empty.blob"))
+            try Data().write(to: directory.appendingPathComponent(".hidden"))
+            #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 3)
+        }
+
         runtime.update { $0.storagePressure = .critical }
         #expect(
             thumbnail.storeToDisk(png(), for: uid("critical"), ifCurrent: thumbnail.captureWriterGeneration())
                 == .storagePaused)
-        for _ in 0..<100 where preview.diskSizeBytes() != 0 || original.diskSizeBytes() != 0 {
+        for _ in 0..<100 {
+            let previewFiles = try? FileManager.default.contentsOfDirectory(
+                atPath: preview.diskURL(for: photo).deletingLastPathComponent().path)
+            let originalFiles = try? FileManager.default.contentsOfDirectory(
+                atPath: original.diskURL(for: photo).deletingLastPathComponent().path)
+            if previewFiles?.isEmpty == true && originalFiles?.isEmpty == true { break }
             try await Task.sleep(for: .milliseconds(10))
         }
-        #expect(preview.diskSizeBytes() == 0)
-        #expect(original.diskSizeBytes() == 0)
+        for cache in [preview, original] {
+            #expect(
+                try FileManager.default.contentsOfDirectory(
+                    atPath: cache.diskURL(for: photo).deletingLastPathComponent().path
+                ).isEmpty)
+            #expect(cache.diskSizeBytes() == 0)
+            #expect(cache.trackedDiskSizeBytes() == 0)
+        }
         #expect(thumbnail.diskData(for: photo) == png())
         await thumbnail.store(png(), for: uid("ram"))
         #expect(await thumbnail.data(for: uid("ram")) == png())

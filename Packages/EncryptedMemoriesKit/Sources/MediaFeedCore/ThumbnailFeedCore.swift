@@ -363,7 +363,6 @@ public actor ThumbnailFeedCore {
     /// Explicit user interaction (scroll/pinch/drag), separate from viewport warm requests. Stored
     /// outside actor isolation so shared workload governors can make a synchronous scheduling decision.
     private nonisolated let interactionState = InteractionStateBox()
-    private var decodeInFlight = 0
     /// Feed-wide admission for decrypt + image decode. The actual blocking Foundation/CryptoKit/ImageIO work
     /// runs on `decodeExecutor`, never on Swift's cooperative executor.
     private let decodePermits: DecodePermitPool
@@ -3497,7 +3496,7 @@ public actor ThumbnailFeedCore {
             }
             let now = clock()
             let queueDepth = priority.count + max(0, sequential.count - sequentialIndex)
-            let isActive = queueDepth > 0 || downloadInFlight + decodeInFlight > 0
+            let isActive = queueDepth > 0 || downloadInFlight > 0
             let intervalElapsed = lastPrefetchSummaryAt.map { now.timeIntervalSince($0) >= 1 } ?? true
             let shouldEmit =
                 intervalElapsed
@@ -3512,7 +3511,7 @@ public actor ThumbnailFeedCore {
                 [
                     "enabled": "\(prefetchEnabled)",
                     "queueDepth": "\(queueDepth)",
-                    "activeJobs": "\(downloadInFlight + decodeInFlight)",
+                    "activeJobs": "\(downloadInFlight)",
                     "completed": "\(prefetchCompleted)",
                     "failed": "\(prefetchFailed)",
                     "failedTimeout": "\(prefetchFailedTimeout)",
