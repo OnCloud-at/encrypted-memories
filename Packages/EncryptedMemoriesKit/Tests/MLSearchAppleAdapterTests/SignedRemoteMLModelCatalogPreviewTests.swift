@@ -25,46 +25,7 @@ import Testing
         let signature: String
     }
 
-    private final class StubProtocol: URLProtocol {
-        private static let lock = NSLock()
-        nonisolated(unsafe) private static var responses: [URL: Data] = [:]
-        nonisolated(unsafe) private static var requests: [URLRequest] = []
-
-        static func configure(_ responses: [URL: Data]) {
-            lock.withLock {
-                self.responses = responses
-                requests = []
-            }
-        }
-
-        static var recordedRequests: [URLRequest] { lock.withLock { requests } }
-
-        override class func canInit(with request: URLRequest) -> Bool { true }
-        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-        override func startLoading() {
-            let responseData = Self.lock.withLock { () -> Data? in
-                Self.requests.append(request)
-                guard let url = request.url else { return nil }
-                return Self.responses[url]
-            }
-            guard let responseData, let url = request.url else {
-                client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
-                return
-            }
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: ["Content-Length": String(responseData.count)]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: responseData)
-            client?.urlProtocolDidFinishLoading(self)
-        }
-
-        override func stopLoading() {}
-    }
+    private final class StubProtocol: CatalogStubProtocol, @unchecked Sendable {}
 
     @Test func previewForcesEveryResolvedEntryToDeveloperOnly() async throws {
         let endpoint = try AppleSmartSearchCatalogEndpoint(
@@ -138,7 +99,7 @@ import Testing
         for (name, data) in objectsData {
             responses[endpoint.catalogRootURL.appendingPathComponent("catalog-history/\(pairID)/\(name)")] = data
         }
-        StubProtocol.configure(responses)
+        StubProtocol.configure(responses: responses)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubProtocol.self]
         let provider = SignedRemoteMLModelCatalogProvider(
@@ -163,7 +124,7 @@ import Testing
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ml-preview-no-legacy-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        StubProtocol.configure([endpoint.activePairURL: Data("invalid".utf8)])
+        StubProtocol.configure(responses: [endpoint.activePairURL: Data("invalid".utf8)])
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubProtocol.self]
         let provider = SignedRemoteMLModelCatalogProvider(

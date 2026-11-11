@@ -22,24 +22,6 @@ import Testing
         ("sunset", "a photo of a sunset", "Sonnenuntergang"),
     ]
 
-    private struct FileImageSource: CoreMLImageSource {
-        let urlsByUID: [PhotoUID: URL]
-
-        func image(for uid: PhotoUID) async -> CoreMLImageSourceOutcome {
-            guard let url = urlsByUID[uid],
-                let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-            else {
-                return .permanentFailure(reason: "unreadable reference image")
-            }
-            return .image(CoreMLSourceImage(cgImage: image))
-        }
-    }
-
-    private struct EmptyImageSource: CoreMLImageSource {
-        func image(for uid: PhotoUID) async -> CoreMLImageSourceOutcome { .transientFailure }
-    }
-
     private func normalizedDot(_ a: ContiguousArray<Float32>, _ b: ContiguousArray<Float32>) -> Float {
         guard let na = MLVectorNormalization.normalized(a), let nb = MLVectorNormalization.normalized(b) else {
             return 0

@@ -20,50 +20,7 @@ private struct TestActivePointerPayload: Codable {
 }
 
 @Suite(.serialized) struct SignedRemoteMLModelCatalogProviderTests {
-    private final class StubProtocol: URLProtocol {
-        private static let lock = NSLock()
-        nonisolated(unsafe) private static var responses: [URL: Data] = [:]
-        nonisolated(unsafe) private static var requests: [URLRequest] = []
-
-        static func configure(responses: [URL: Data]) {
-            lock.withLock {
-                self.responses = responses
-                requests = []
-            }
-        }
-
-        static func replaceResponse(_ data: Data, for url: URL) {
-            lock.withLock { responses[url] = data }
-        }
-
-        static var recordedRequests: [URLRequest] { lock.withLock { requests } }
-
-        override class func canInit(with request: URLRequest) -> Bool { true }
-        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-        override func startLoading() {
-            let data = Self.lock.withLock { () -> Data? in
-                Self.requests.append(request)
-                guard let url = request.url else { return nil }
-                return Self.responses[url]
-            }
-            guard let data, let url = request.url else {
-                client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
-                return
-            }
-            let response = HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: ["Content-Length": String(data.count)]
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocolDidFinishLoading(self)
-        }
-
-        override func stopLoading() {}
-    }
+    private final class StubProtocol: CatalogStubProtocol, @unchecked Sendable {}
 
     @Test func verifiesSignatureResolvesTrustedModelAndFallsBackToVerifiedCache() async throws {
         let root = FileManager.default.temporaryDirectory
