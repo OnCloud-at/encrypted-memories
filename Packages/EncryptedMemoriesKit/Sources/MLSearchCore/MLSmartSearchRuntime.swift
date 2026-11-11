@@ -147,6 +147,9 @@ public protocol MLSmartSearchSession: Sendable {
         shouldContinue: @escaping @Sendable () -> Bool,
         observer: MLIndexPassObserver
     ) async -> MLIndexPassOutcome
+    /// Assets of `assets` with a permanent failure and no embedding. The lifecycle skips this query after a pass
+    /// whose `progress.permanentFailure` is zero, so a session must include every such asset, also from earlier
+    /// passes and earlier runs, in `progress.permanentFailure`.
     func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async throws -> Set<PhotoUID>
     func search(_ text: String, limit: Int) async throws -> MLSearchResults
     func search(

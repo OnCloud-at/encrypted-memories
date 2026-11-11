@@ -427,6 +427,9 @@ import Testing
 
     private final class FixedSemanticSession: WholePassSession, @unchecked Sendable {
         let descriptor: MLModelDescriptor
+        private let readLock = NSLock()
+        private var suppressionReads = 0
+        var suppressionReadCount: Int { readLock.withLock { suppressionReads } }
         private let permanentlyUnavailable: Set<PhotoUID>
         private let suppressionRead: BlockingSuppressionRead?
         private let duringBatch: @Sendable () -> Void
@@ -467,6 +470,7 @@ import Testing
         }
 
         func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async throws -> Set<PhotoUID> {
+            readLock.withLock { suppressionReads += 1 }
             if let suppressionRead {
                 return try await suppressionRead.read()
             }
@@ -3361,6 +3365,91 @@ import Testing
                 guard case .failed(let failure) = snapshot.indexingState else { return false }
                 return failure.debugDescription == "native analysis suppression state unavailable"
             }, "Even a briefly published retired storage failure violates the session boundary")
+    }
+
+    @Test func semanticPassWithoutPermanentFailuresSkipsTheSuppressionQuery() async throws {
+        let payload = Data("semantic-suppression-model".utf8)
+        let (entry, url) = downloadableEntry(id: "no-failures", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("a"), uid("b")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let session = FixedSemanticSession(descriptor: entry.descriptor)
+        harness.provider.sessionOverride = { _ in session }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+        #expect(await waitForCompleteIndex(harness, total: 2))
+
+        #expect(session.suppressionReadCount == 0)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func semanticPassWithAPermanentFailureStillReadsTheSuppressionQuery() async throws {
+        let payload = Data("semantic-suppression-model".utf8)
+        let (entry, url) = downloadableEntry(id: "one-failure", payload: payload)
+        let failing = uid("b")
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("a"), failing]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let session = FixedSemanticSession(descriptor: entry.descriptor, permanentlyUnavailable: [failing])
+        harness.provider.sessionOverride = { _ in session }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+        #expect(await waitForCompleteIndex(harness, total: 2))
+
+        #expect(session.suppressionReadCount >= 1)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func realSemanticSessionRetainsEarlierPermanentFailuresAcrossQuanta() async throws {
+        let payload = Data("semantic-suppression-model".utf8)
+        let (entry, url) = downloadableEntry(id: "persisted-failure", payload: payload)
+        let semanticFailure = uid("semantic-failure")
+        let nativeFailure = uid("native-failure")
+        let assets = [semanticFailure, nativeFailure]
+        let native = RecordingNativeSearch(results: [], permanentlyUnavailable: [nativeFailure])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: assets, nativeSearch: native
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let store = harness.storeProvider.store
+        #expect(
+            store.recordFailures([
+                MLIndexFailureRecord(
+                    uid: semanticFailure, descriptor: entry.descriptor, kind: .permanent,
+                    reason: "unsupported", attempts: 1)
+            ]))
+        let service = MLSearchService(
+            descriptor: entry.descriptor, store: store, assetEmbedder: harness.provider.embedder,
+            textEncoder: FixedTextEncoder(), scorer: ReferenceDotProductScorer()
+        )
+        let first = await service.indexQuantum(
+            assets, libraryGeneration: 1, maximumAssets: 1, shouldContinue: { true }, observer: MLIndexPassObserver()
+        )
+        let second = await service.indexQuantum(
+            assets, libraryGeneration: 1, maximumAssets: 1, shouldContinue: { true }, observer: MLIndexPassObserver()
+        )
+        #expect(first.progress.permanentFailure == 1)
+        #expect(second.progress.permanentFailure == 1)
+        #expect(try await service.permanentlyUnavailableAssetUIDs(assets) == [semanticFailure])
+        harness.provider.sessionOverride = { _ in service }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+        #expect(
+            await waitUntil {
+                guard case .ready(let progress) = await harness.lifecycle.currentSnapshot().indexingState else {
+                    return false
+                }
+                return progress.permanentlyUnavailableAssets == 2
+            })
+        await harness.lifecycle.shutdown()
     }
 
     @Test func replacedSemanticSessionCannotPublishRetiredSuppressionFailure() async throws {

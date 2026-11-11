@@ -1871,15 +1871,22 @@ public actor MLSmartSearchLifecycle {
                     await parkAfterStorageFailure("semantic index store unavailable", since: observedKickGeneration)
                     continue
                 }
-                do {
-                    let unavailableAssetUIDs = try await session.permanentlyUnavailableAssetUIDs(scheduledAssets)
-                    guard generation == sessionGeneration, !Task.isCancelled else { return }
-                    semanticUnavailableAssetUIDs = unavailableAssetUIDs
-                } catch {
-                    guard generation == sessionGeneration, !Task.isCancelled else { return }
-                    await parkAfterStorageFailure(
-                        "semantic suppression state unavailable", since: observedKickGeneration)
-                    continue
+                // The set only suppresses assets with a terminal failure, and each of them is a permanent failure
+                // that the pass counts (planned rows plus the ones it persisted). A zero count therefore means an
+                // empty set: skip the two library-wide store queries, as the native path does.
+                if outcome.progress.permanentFailure == 0 {
+                    semanticUnavailableAssetUIDs = []
+                } else {
+                    do {
+                        let unavailableAssetUIDs = try await session.permanentlyUnavailableAssetUIDs(scheduledAssets)
+                        guard generation == sessionGeneration, !Task.isCancelled else { return }
+                        semanticUnavailableAssetUIDs = unavailableAssetUIDs
+                    } catch {
+                        guard generation == sessionGeneration, !Task.isCancelled else { return }
+                        await parkAfterStorageFailure(
+                            "semantic suppression state unavailable", since: observedKickGeneration)
+                        continue
+                    }
                 }
                 lastCoverage = outcome.coverage
                 if outcome.ranToCompletion {
