@@ -526,7 +526,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         )
 
         let report = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(report["schemaVersion"] as? Int, 4)
+        XCTAssertEqual(report["schemaVersion"] as? Int, 5)
         let section = try XCTUnwrap(report["backgroundWindows"] as? [String: Any])
         XCTAssertEqual(Set(section.keys), ["counts", "records"])
         let records = try XCTUnwrap(section["records"] as? [[String: Any]])
