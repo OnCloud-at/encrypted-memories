@@ -399,6 +399,8 @@ public actor ThumbnailFeedCore {
     private var lastSelectedScope: SelectedDerivedDataScope?
     private var lastAnalysisScope: AnalysisDerivedDataScope?
     private var lastRetentionScope: ThumbnailRetentionDerivedDataScope?
+    /// The cache could not finish the cleanup of the last scope and committed nothing (`.ioFailure`).
+    private var lastCacheReconciliationFailed = false
     private var sourceReconciliationInFlight = false
     private var highestSourceReconciliationRevision: UInt64?
     private struct SourceReconciliationRequest {
@@ -1843,17 +1845,30 @@ public actor ThumbnailFeedCore {
         }
         let incomingRevision = selectedScope.revision
         var request = incomingRequest
+        // Set once this call stopped the crawl. A later pass of the loop then takes the full path: the stopped crawl's
+        // position, checkpoints and withheld lists belong to the scope before the one that stopped it.
+        var stopped = false
 
         while true {
-            // Join the previous crawl before removing its coverage checkpoint. No retired worker can recreate
-            // old cache or checkpoint state after cleanup.
-            await stopPrefetchAndWait(preservingVisibleDemand: true)
+            // A scope that only grows keeps the crawl (see `scopeOnlyGrows`). Every other change joins the previous
+            // crawl before removing its coverage checkpoint, so no retired worker can recreate old cache or
+            // checkpoint state after cleanup.
+            var keepsCrawl = !stopped && scopeOnlyGrows(request)
+            if !keepsCrawl {
+                await stopPrefetchAndWait(preservingVisibleDemand: true)
+                stopped = true
+            }
 
             if let pending = pendingSourceReconciliation,
                 pending.selectedScope.revision >= request.selectedScope.revision
             {
                 request = pending
                 pendingSourceReconciliation = nil
+            }
+            if keepsCrawl, !scopeOnlyGrows(request) {
+                keepsCrawl = false
+                await stopPrefetchAndWait(preservingVisibleDemand: true)
+                stopped = true
             }
 
             // Reconciliation can unlink many encrypted blobs after a source is removed. Keep that bounded local
@@ -1888,22 +1903,29 @@ public actor ThumbnailFeedCore {
             lastSelectedScope = request.selectedScope
             lastAnalysisScope = request.analysisScope
             lastRetentionScope = request.retentionScope
+            // A failed cleanup commits nothing in the cache; its retry must take the full path again.
+            lastCacheReconciliationFailed = cacheResult == .ioFailure
 
-            // Join first, then remove only plaintext which lost thumbnail access. The source and cache
-            // fences already reject a cancellation-ignoring loader, so retained tiles stay immediately usable.
-            decoded.retainOnly(
-                request.retentionScope.uids.union(localAuthorization.snapshot).union(adoptedAuthorization.snapshot))
-            checkpointPresent.removeAll(keepingCapacity: true)
-            checkpointHints.removeAll(keepingCapacity: true)
-            pendingCheckpointUpdates.removeAll(keepingCapacity: true)
-            unfetchable.removeAll()
-            withheldRetry.removeAll()
-            withheldRequeues.removeAll()
-            visibleDiskDemand.cancelAll()
-            diskProbeBatchesInFlight = 0
-            sequential = []
-            sequentialIndex = 0
-            resetGenerationStatistics()
+            if keepsCrawl {
+                extendCrawl(with: request)
+            } else {
+                // Join first, then remove only plaintext which lost thumbnail access. The source and cache
+                // fences already reject a cancellation-ignoring loader, so retained tiles stay immediately usable.
+                decoded.retainOnly(
+                    request.retentionScope.uids.union(localAuthorization.snapshot)
+                        .union(adoptedAuthorization.snapshot))
+                checkpointPresent.removeAll(keepingCapacity: true)
+                checkpointHints.removeAll(keepingCapacity: true)
+                pendingCheckpointUpdates.removeAll(keepingCapacity: true)
+                unfetchable.removeAll()
+                withheldRetry.removeAll()
+                withheldRequeues.removeAll()
+                visibleDiskDemand.cancelAll()
+                diskProbeBatchesInFlight = 0
+                sequential = []
+                sequentialIndex = 0
+                resetGenerationStatistics()
+            }
 
             guard lastSelectedScope?.revision == request.selectedScope.revision else {
                 if let pendingSourceReconciliation {
@@ -1918,7 +1940,7 @@ public actor ThumbnailFeedCore {
                 return .staleScope
             }
 
-            if prefetchEnabled, !request.analysisScope.orderedUIDs.isEmpty {
+            if !keepsCrawl, prefetchEnabled, !request.analysisScope.orderedUIDs.isEmpty {
                 await startPrefetch(
                     Self.crawlOrder(
                         selected: request.selectedScope,
@@ -1944,6 +1966,44 @@ public actor ThumbnailFeedCore {
             resumeVisibleDemand = true
             return incomingRevision == request.selectedScope.revision ? cacheResult : .staleScope
         }
+    }
+
+    /// True when `request` only adds photos to the scopes this feed applied last, with the same authority, and the
+    /// cache committed that last scope. Such a change keeps the crawl: its position, its disk knowledge and its memory
+    /// of refused thumbnails, and the cache reconciliation removes nothing. A smaller scope, an authority change, a
+    /// first scope and the retry of a failed cleanup take the full path with a fresh crawl. Every scope here has the
+    /// bound epoch; `reconcile` refuses another one before this point.
+    ///
+    /// This assumes that the cache's committed scope is the feed's last scope: only this method changes either, and
+    /// a cache that resets its scope (`configure`, `clearForSignOut`) starts a new session, which a new feed and a new
+    /// first scope follow.
+    private func scopeOnlyGrows(_ request: SourceReconciliationRequest) -> Bool {
+        guard !lastCacheReconciliationFailed, let lastSelectedScope, let lastAnalysisScope, let lastRetentionScope
+        else { return false }
+        return request.selectedScope.isAuthoritative == lastSelectedScope.isAuthoritative
+            && request.analysisScope.isAuthoritative == lastAnalysisScope.isAuthoritative
+            && request.retentionScope.isAuthoritative == lastRetentionScope.isAuthoritative
+            && request.selectedScope.uids.isSuperset(of: lastSelectedScope.uids)
+            && request.analysisScope.uids.isSuperset(of: lastAnalysisScope.uids)
+            && request.retentionScope.uids.isSuperset(of: lastRetentionScope.uids)
+    }
+
+    /// Adds the photos of a grown scope to the end of the crawl and starts the workers when the crawl had finished.
+    private func extendCrawl(with request: SourceReconciliationRequest) {
+        guard prefetchEnabled, ownerLeaseIsCurrent(), !request.analysisScope.orderedUIDs.isEmpty else { return }
+        var queued = Set(sequential)
+        let added = Self.crawlOrder(
+            selected: request.selectedScope, analysis: request.analysisScope, retention: request.retentionScope
+        ).filter { readAllowed($0) && queued.insert($0).inserted }
+        // A stop outside reconciliation empties the crawl list but leaves its position; a new list starts at its head.
+        if sequential.isEmpty { sequentialIndex = 0 }
+        sequential.append(contentsOf: added)
+        // The library count follows the selected scope also when no photo is new, as when a photo returns from
+        // Recently Deleted that the crawl already holds.
+        prefetchReportingUIDs = request.selectedScope.uids
+        diskPresence.beginTracking(sequential, reporting: request.selectedScope.uids, knownPresent: [])
+        guard !added.isEmpty else { return }
+        if crawlWakeTask == nil { startWorkers() }
     }
 
     private func resumeSourceReconciliationWaiters(
