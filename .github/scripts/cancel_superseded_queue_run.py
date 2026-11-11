@@ -2,15 +2,14 @@
 """Stop a merge-queue run whose entry is no longer in the merge queue of main (issue #717).
 
 The job that runs this script has no checkout and runs no code of the pull request: the job
-reads this script from the base commit of the merge group, which is the tip of main, and calls
-it with the job token. The decision itself is a pure function, `decide`, so that every rule can
-be tested without GitHub:
+reads this script from the base commit of the merge group, which may be the entry ahead, and
+calls it with the job token. The decision function and watch are tested without GitHub:
 
 - KEEP: the head commit of the run is one of the entries of the queue, or every worker job of
   the run is complete (the run then merged or is finishing; there is nothing left to stop).
-- CANCEL: the queue read succeeded, the answer is well formed, the head commit is absent from
-  every entry, every worker job is listed and not complete, and the run is at least
-  MINIMUM_RUN_AGE_SECONDS old.
+- CANCEL: two complete queue reads at least ABSENCE_CONFIRMATION_SECONDS apart lack the head,
+  the head was seen earlier, every worker job is listed and at least one is unfinished, and
+  the run is at least MINIMUM_RUN_AGE_SECONDS old.
 - UNKNOWN: everything else, for example a failed read, an empty or malformed answer, a
   rate-limit answer, a missing field, or a young run. Do nothing and read again later.
 
@@ -36,6 +35,8 @@ UNKNOWN = "UNKNOWN"
 # so an absent entry alone proves nothing in the first minutes of a run.
 MINIMUM_RUN_AGE_SECONDS = 600
 POLL_INTERVAL_SECONDS = 60
+# Require 60 seconds of monotonic time between two complete reads that both lack the head.
+ABSENCE_CONFIRMATION_SECONDS = 60
 # The loop ends before the job limit, which stays below the 360 minute check timeout of the queue,
 # exactly like the failure watchdog of the workflow.
 LOOP_DEADLINE_SECONDS = 14100
@@ -94,14 +95,14 @@ def queue_head_oids(answer):
     """The head commit oid of every entry of the merge queue, or None.
 
     None means that the answer is not a usable, complete queue read: a page with GraphQL errors,
-    a missing field, an empty entry list, or an oid that is not a full 40 character sha. An empty
-    or truncated list is also what a failed read can look like, so it is not usable either.
+    a missing field, an empty entry list, incomplete pagination, or an invalid non-null oid.
+    A null head contributes no oid; an empty or truncated response is not usable.
     """
     pages = answer_pages(answer)
     if pages is None:
         return None
     oids = []
-    for page in pages:
+    for index, page in enumerate(pages):
         if not isinstance(page, dict) or "errors" in page:
             return None
         data = page.get("data")
@@ -109,10 +110,22 @@ def queue_head_oids(answer):
         merge_queue = repository.get("mergeQueue") if isinstance(repository, dict) else None
         entries = merge_queue.get("entries") if isinstance(merge_queue, dict) else None
         nodes = entries.get("nodes") if isinstance(entries, dict) else None
+        page_info = entries.get("pageInfo") if isinstance(entries, dict) else None
         if not isinstance(nodes, list) or not nodes:
             return None
+        if not isinstance(page_info, dict):
+            return None
+        has_next = page_info.get("hasNextPage")
+        if type(has_next) is not bool or has_next != (index < len(pages) - 1):
+            return None
+        if has_next and (not isinstance(page_info.get("endCursor"), str) or not page_info["endCursor"]):
+            return None
         for node in nodes:
-            head_commit = node.get("headCommit") if isinstance(node, dict) else None
+            if not isinstance(node, dict) or "headCommit" not in node:
+                return None
+            head_commit = node["headCommit"]
+            if head_commit is None:
+                continue
             oid = head_commit.get("oid") if isinstance(head_commit, dict) else None
             if not is_full_sha(oid):
                 return None
@@ -241,6 +254,7 @@ def watch(head_sha, run_id, worker_names, repository, gh, sleep=time.sleep,
     owner, _, name = repository.partition("/")
     run_started_epoch = None
     entry_seen = False
+    previous_absence_at = None
     deadline = monotonic() + LOOP_DEADLINE_SECONDS
     while monotonic() < deadline:
         if run_started_epoch is None:
@@ -253,12 +267,19 @@ def watch(head_sha, run_id, worker_names, repository, gh, sleep=time.sleep,
         queue_answer = gh.queue_answer(owner, name)
         jobs_answer = gh.jobs_answer(run_id)
         if all_workers_complete(jobs_answer, worker_names):
-            print("All worker jobs finished without a failure.")
+            print("Poll: KEEP; all worker jobs finished without a failure.", flush=True)
             return 0
         oids = queue_head_oids(queue_answer)
         entry_seen = entry_seen or (oids is not None and head_sha in oids)
+        now = monotonic()
+        absent = oids is not None and head_sha not in oids
+        confirmed = absent and previous_absence_at is not None and now - previous_absence_at >= ABSENCE_CONFIRMATION_SECONDS
+        previous_absence_at = now if absent else None
         run_state = {"run_age_seconds": age, "jobs_answer": jobs_answer, "entry_seen": entry_seen}
         decision = decide(head_sha, queue_answer, run_state, worker_names)
+        if decision == CANCEL and not confirmed:
+            decision = UNKNOWN
+        print("Poll: {}.".format(decision), flush=True)
         if decision == CANCEL:
             print("The previously seen entry {} of run {} is no longer in the merge queue of {}.".format(
                 head_sha, run_id, QUEUE_BRANCH))

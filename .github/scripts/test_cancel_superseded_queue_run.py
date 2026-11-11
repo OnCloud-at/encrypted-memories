@@ -63,22 +63,20 @@ class Clock:
     """A fake clock that lets the watch loop run for a few iterations, then ends it."""
 
     def __init__(self, iterations=6, epochs=None):
-        self.calls = 0
         self.limit = iterations
         self.epochs = list(epochs or [])
         self.sleeps = []
+        self.now = 0
 
     def monotonic(self):
-        self.calls += 1
-        if self.calls <= self.limit:
-            return 0.0
-        return float(script.LOOP_DEADLINE_SECONDS + 1)
+        return self.now if len(self.sleeps) < self.limit else float(script.LOOP_DEADLINE_SECONDS + 1)
 
     def epoch(self):
         return next_answer(self.epochs) if self.epochs else script.parse_epoch(STARTED_AT) + 7200
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
+        self.now += seconds
 
 
 class FakeGh(script.Gh):
@@ -139,8 +137,10 @@ class DecideTests(unittest.TestCase):
         )
 
     def test_entry_present_in_a_later_page_keeps_the_run(self):
+        first = queue_page([OTHER_SHA])
+        first['data']['repository']['mergeQueue']['entries']['pageInfo'] = {'endCursor': 'cursor', 'hasNextPage': True}
         self.assertEqual(
-            script.KEEP, self.decide(HEAD_SHA, [queue_page([OTHER_SHA]), queue_page([HEAD_SHA])], 7200, jobs_answer("in_progress"))
+            script.KEEP, self.decide(HEAD_SHA, [first, queue_page([HEAD_SHA])], 7200, jobs_answer("in_progress"))
         )
 
     def test_entry_gone_and_old_run_cancels(self):
@@ -185,8 +185,8 @@ class DecideTests(unittest.TestCase):
         page = dict(queue_page([OTHER_SHA]), errors=[{"message": "partial answer"}])
         self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [page], 7200, jobs_answer("in_progress")))
 
-    def test_a_null_node_or_head_commit_stays(self):
-        for node in (None, {"state": "BUILDABLE", "headCommit": None}, {"state": "BUILDABLE"}):
+    def test_a_malformed_node_stays(self):
+        for node in (None, {"state": "BUILDABLE"}):
             page = queue_page([OTHER_SHA])
             page["data"]["repository"]["mergeQueue"]["entries"]["nodes"].append(node)
             self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [page], 7200, jobs_answer("in_progress")))
@@ -242,7 +242,60 @@ class WatchTests(unittest.TestCase):
         status, clock = self.watch(gh)
         self.assertEqual(0, status)
         self.assertEqual([["run", "cancel", "4242"]], gh.cancel_calls)
-        self.assertEqual([script.POLL_INTERVAL_SECONDS], clock.sleeps)
+        self.assertEqual([script.POLL_INTERVAL_SECONDS] * 2, clock.sleeps)
+
+    def test_superseded_1293_with_queued_null_heads_cancels_after_confirmation(self):
+        # The replacement head and queued null heads were observed after run 42937364862.
+        # Its earlier queue responses were not logged; the first poll here is synthetic.
+        old = 'fd9439449a22101643e388d31e8b6909b4217581'
+        new = 'b76aa49f88deeb59174a763143417f1e2fce5bc2'
+        def page(head):
+            answer = queue_page([head])
+            answer['data']['repository']['mergeQueue']['entries']['nodes'].append(
+                {'state': 'QUEUED', 'headCommit': None})
+            return answer
+        gh = FakeGh([[page(old)], [page(new)]], [jobs_answer('in_progress')])
+        clock = Clock()
+        status = script.watch(old, 42937364862, WORKERS, 'owner/repo', gh,
+                              sleep=clock.sleep, monotonic=clock.monotonic, epoch=clock.epoch)
+        self.assertEqual(0, status)
+        self.assertEqual([['run', 'cancel', '42937364862']], gh.cancel_calls)
+        self.assertEqual([60, 60], clock.sleeps)
+        self.assertEqual([old], script.queue_head_oids([page(old)]))
+        self.assertEqual([new], script.queue_head_oids([page(new)]))
+
+    def test_live_head_with_queued_null_node_never_cancels(self):
+        page = queue_page([HEAD_SHA])
+        page['data']['repository']['mergeQueue']['entries']['nodes'].append({'state': 'QUEUED', 'headCommit': None})
+        gh = FakeGh([[page]], [jobs_answer('in_progress')])
+        self.watch(gh)
+        self.assertEqual([], gh.cancel_calls)
+
+    def test_each_poll_logs_its_decision_without_payload(self):
+        gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.watch(gh)
+        self.assertEqual(['Poll: KEEP.', 'Poll: UNKNOWN.', 'Poll: CANCEL.'],
+                         [line for line in output.getvalue().splitlines() if line.startswith('Poll:')])
+        self.assertNotIn(OTHER_SHA, output.getvalue())
+
+    def test_interrupted_absence_confirmation_does_not_cancel(self):
+        incomplete = queue_page([OTHER_SHA])
+        incomplete['data']['repository']['mergeQueue']['entries']['pageInfo'] = {'endCursor': 'next', 'hasNextPage': True}
+        for interruption in ([incomplete], (False, 'HTTP 502'), [queue_page([HEAD_SHA])]):
+            with self.subTest(interruption=interruption):
+                gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])], interruption,
+                             [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
+                self.watch(gh, Clock(iterations=4))
+                self.assertEqual([], gh.cancel_calls)
+
+    def test_two_absences_less_than_sixty_seconds_apart_do_not_cancel(self):
+        gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
+        clock = Clock(iterations=3)
+        clock.sleep = lambda seconds: (clock.sleeps.append(seconds), setattr(clock, 'now', clock.now + 1))
+        self.watch(gh, clock)
+        self.assertEqual([], gh.cancel_calls)
 
     def test_cancel_log_identifies_the_run_and_why_it_was_cancelled(self):
         gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer("in_progress")])
