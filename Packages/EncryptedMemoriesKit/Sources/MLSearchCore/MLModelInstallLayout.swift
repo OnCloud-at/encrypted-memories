@@ -89,6 +89,33 @@ public struct MLModelInstallLayout: Sendable, Equatable {
         return components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
     }
 
+    static func isModelExtension(_ value: String) -> Bool {
+        ["mlmodelc", "mlpackage"].contains(value.lowercased())
+    }
+
+    static func modelRootPath(in paths: [String]) -> String? {
+        let roots = Set(
+            paths.compactMap { path -> String? in
+                guard let component = path.split(separator: "/", maxSplits: 1).first,
+                    let dot = component.lastIndex(of: "."),
+                    isModelExtension(String(component[component.index(after: dot)...]))
+                else { return nil }
+                return String(component)
+            })
+        guard roots.count == 1, let root = roots.first,
+            paths.contains(where: { $0.hasPrefix(root + "/") })
+        else { return nil }
+        return root
+    }
+
+    static func artifactPathsArePermitted(_ paths: Set<String>, root: String, sidecars: Set<String>) -> Bool {
+        paths.allSatisfy { $0 == root || $0.hasPrefix(root + "/") || sidecars.contains($0) }
+    }
+
+    static func firstMissingSidecar(_ sidecars: [String], in paths: Set<String>) -> String? {
+        sidecars.first { !paths.contains($0) }
+    }
+
     /// Flattens an identifier into one path component. Dots are not preserved because `.` and
     /// `..` have path semantics even when Foundation receives them as one component.
     private func safePathComponent(_ raw: String) -> String {
