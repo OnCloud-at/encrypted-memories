@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import UploadCore
 
 public extension AlbumSyncBackupReport {
@@ -32,10 +33,11 @@ public extension AlbumSyncBackupReport {
             if row.state == .skippedRemoteDeletion,
                 problems[id] == nil || row.source.resource == .primary
             {
-                guard let entry = (try? queue.entry(for: row.source, revision: row.revision)) else {
-                    throw AlbumSyncError.mappingStoreUnavailable
+                switch StoreLookup(catching: { try queue.entry(for: row.source, revision: row.revision) }) {
+                case .found(let entry): problems[id] = BackupFailedItem(entry: entry)
+                // An absent row left the queue after the state read, so the report would miss its problem.
+                case .absent, .unknown: throw AlbumSyncError.mappingStoreUnavailable
                 }
-                problems[id] = BackupFailedItem(entry: entry)
             }
             if !row.originalFilename.isEmpty, row.source.resource == .primary || filenames[id] == nil {
                 filenames[id] = row.originalFilename

@@ -209,15 +209,6 @@ public struct UploadManualSettlementRecord: Codable, Sendable, Equatable {
     public var isProvenTerminal: Bool { stage == .terminal && terminalState != nil }
 }
 
-/// The result of one settlement-record read. `unreadable` separates a failed read from an
-/// absent row (#1104): a caller must never mistake a store it could not read for an empty one,
-/// even when a later operation has already healed the recorded failure.
-public enum UploadManualSettlementReadOutcome: Sendable {
-    case found(UploadManualSettlementRecord)
-    case absent
-    case unreadable
-}
-
 /// The result of one settlement-table sweep. An unreadable sweep is never an empty table (#1104).
 public enum UploadManualSettlementListReadOutcome: Sendable {
     case records([UploadManualSettlementRecord])
@@ -238,7 +229,7 @@ public protocol UploadManualSettlementStoreProtocol: Sendable {
     func hasLastingFailure() -> Bool
     @discardableResult
     func upsert(_ record: UploadManualSettlementRecord) -> Bool
-    func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome
+    func readOutcome(for queueItemID: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord>
     func readAllOutcome() -> UploadManualSettlementListReadOutcome
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool
@@ -345,14 +336,14 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
         }
     }
 
-    public func readOutcome(for queueItemID: UploadQueueItemID) -> UploadManualSettlementReadOutcome {
+    public func readOutcome(for queueItemID: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord> {
         allowTransientRecovery()
         return connection.withLock {
             guard let db, sqlite3_get_autocommit(db) != 0 else {
                 connection.markFailed()
-                return .unreadable
+                return .unknown
             }
-            guard !connection.operationFailed else { return .unreadable }
+            guard !connection.operationFailed else { return .unknown }
             var statement: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -364,16 +355,16 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                 ) == SQLITE_OK
             else {
                 connection.markFailed(resultCode: sqlite3_extended_errcode(db))
-                return .unreadable
+                return .unknown
             }
             defer { sqlite3_finalize(statement) }
             // A key that does not bind is no proof that the row is absent (#1194).
-            do { try connection.bindText(statement, 1, queueItemID.uuidString) } catch { return .unreadable }
+            do { try connection.bindText(statement, 1, queueItemID.uuidString) } catch { return .unknown }
             let result = sqlite3_step(statement)
             guard result == SQLITE_ROW else {
                 if result != SQLITE_DONE {
                     connection.markFailed(resultCode: sqlite3_extended_errcode(db))
-                    return .unreadable
+                    return .unknown
                 }
                 return .absent
             }
@@ -382,7 +373,7 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                 let record = try? decoder.decode(UploadManualSettlementRecord.self, from: data)
             else {
                 connection.markFailed()
-                return .unreadable
+                return .unknown
             }
             return .found(record)
         }
