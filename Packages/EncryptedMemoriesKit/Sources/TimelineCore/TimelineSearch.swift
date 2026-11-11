@@ -143,9 +143,12 @@ public struct TimelineSearchQuery: Equatable, Sendable {
     public var isEmpty: Bool { terms.isEmpty }
 
     func matches(item: PhotoItem, in section: TimelineSection, context: TimelineSearchContext) -> Bool {
-        var haystack = Self.searchText(for: item, in: section)
         let name = context.photoNames?.normalizedName(of: item.uid)
-        if let name { haystack += " " + name }
+        lazy var haystack: String = {
+            var text = Self.searchText(for: item, in: section)
+            if let name { text += " " + name }
+            return text
+        }()
         return terms.allSatisfy { term in
             switch term {
             case .text(let token):
@@ -199,7 +202,7 @@ public struct TimelineSearchQuery: Equatable, Sendable {
 
     private static func matches(
         _ smart: SmartKind, item: PhotoItem, section: TimelineSection,
-        haystack: String, context: TimelineSearchContext
+        haystack: @autoclosure () -> String, context: TimelineSearchContext
     ) -> Bool {
         if item.tags.contains(smart.photoTag) { return true }
         if case .tag(let activeTag) = context.activeFilter, activeTag == smart.photoTag { return true }
@@ -212,10 +215,10 @@ public struct TimelineSearchQuery: Equatable, Sendable {
         case .raw:
             return isRawMediaType(item.mediaType)
         case .screenshots:
-            return haystack.contains("screenshot") || haystack.contains("bildschirmfoto")
+            return haystack().contains("screenshot") || haystack().contains("bildschirmfoto")
                 || item.mediaType == "image/png"
         case .selfies:
-            return haystack.contains("selfie")
+            return haystack().contains("selfie")
         }
     }
 
