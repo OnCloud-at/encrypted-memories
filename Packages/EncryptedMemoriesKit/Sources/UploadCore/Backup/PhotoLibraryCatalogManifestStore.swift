@@ -532,7 +532,9 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         }
     }
 
-    /// Returns nil when the page could not be read; nil means unknown, not the end of the snapshot (#1004).
+    /// Returns nil when the page could not be read; nil means unknown, not the end of the snapshot (#1004). A key that
+    /// is not exact text is unknown too: a repaired key names no photo, so the photo at that position would go unread
+    /// and the removal sweep would mark its catalog row removed (#1241).
     public func fullScanSnapshotIdentifiers(startingAt position: Int, limit: Int) -> [String]? {
         connection.withLock {
             var stmt: OpaquePointer?
@@ -555,7 +557,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             identifiers.reserveCapacity(max(1, limit))
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
-                guard let identifier = columnText(stmt, 0) else {
+                guard let identifier = exactKeyText(stmt, 0) else {
                     connection.markFailed()
                     return nil
                 }

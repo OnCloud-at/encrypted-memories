@@ -410,6 +410,61 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertNil(try store.fullScanProgress())
     }
 
+    /// A NULL snapshot key cannot name a photo (#1241).
+    func testASnapshotKeyStoredAsNullLeavesItsPageUnknown() throws {
+        try assertDamagedSnapshotKeyLeavesItsPageUnknown(.null)
+    }
+
+    /// An INTEGER snapshot key would come back as its decimal text, which names no photo (#1241).
+    func testASnapshotKeyStoredAsAnIntegerLeavesItsPageUnknown() throws {
+        try assertDamagedSnapshotKeyLeavesItsPageUnknown(.integer)
+    }
+
+    /// A REAL snapshot key would come back as its decimal text, which names no photo (#1241).
+    func testASnapshotKeyStoredAsARealLeavesItsPageUnknown() throws {
+        try assertDamagedSnapshotKeyLeavesItsPageUnknown(.real)
+    }
+
+    /// A BLOB snapshot key would come back as its bytes read as text (#1241).
+    func testASnapshotKeyStoredAsABlobLeavesItsPageUnknown() throws {
+        try assertDamagedSnapshotKeyLeavesItsPageUnknown(.blob)
+    }
+
+    /// A snapshot key that is not valid UTF-8 would come back with a replacement character (#1241).
+    func testASnapshotKeyWithInvalidUTF8LeavesItsPageUnknown() throws {
+        try assertDamagedSnapshotKeyLeavesItsPageUnknown(.invalidUTF8)
+    }
+
+    /// A snapshot key with a NUL byte would come back cut short at the NUL (#1241).
+    func testASnapshotKeyWithANULLeavesItsPageUnknown() throws {
+        try assertDamagedSnapshotKeyLeavesItsPageUnknown(.nulByte)
+    }
+
+    /// The snapshot pages by position, so a damaged key cannot make a page repeat. A repaired key names no photo, so
+    /// the page with a damaged key is unknown and the store records the failure. A page without it still reads.
+    private func assertDamagedSnapshotKeyLeavesItsPageUnknown(
+        _ damage: DamagedKey, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        do {
+            let store = try makeStore()
+            XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+            XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["A", "B", "C"]))
+            XCTAssertTrue(store.finishFullScanSnapshot())
+            store.close()
+        }
+        try storeDamagedSnapshotKey(damage, atPosition: 1, inClosedCatalogAt: url)
+        let store = try makeStore()
+        defer { store.close() }
+
+        XCTAssertEqual(store.fullScanSnapshotIdentifiers(startingAt: 2, limit: 10), ["C"], file: file, line: line)
+        XCTAssertTrue(store.isOperational(), file: file, line: line)
+        XCTAssertNil(
+            store.fullScanSnapshotIdentifiers(startingAt: 0, limit: 10),
+            "a damaged key is unknown, never a repaired identifier", file: file, line: line)
+        XCTAssertFalse(store.isOperational(), "the damaged key keeps the store failed", file: file, line: line)
+    }
+
     func testResumedSnapshotCannotSkipWhenEarlierLiveAssetWasDeleted() async throws {
         let store = try makeStore()
         let epoch = Date(timeIntervalSince1970: 100)
@@ -647,12 +702,7 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
 
     /// Runs `sql` on the catalog file through a second connection, as damage from outside the store would.
     private func updateCatalogFile(_ sql: String) throws {
-        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
-        var handle: OpaquePointer?
-        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
-        let database = try XCTUnwrap(handle)
-        defer { sqlite3_close(database) }
-        XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
+        try runSQL(sql, inStoreAt: tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName))
     }
 
     func testSnapshotAppendRejectsEmptyIdentifiersWithoutAppendingOrRecordingFailure() throws {
