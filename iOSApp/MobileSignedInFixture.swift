@@ -124,9 +124,17 @@ import os
             }
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesFixture") {
                 let items = sections.prefix(2).flatMap { $0.items.prefix(2) }
+                let groups = sections.prefix(2).map { $0.items.prefix(2).map(\.uid) }
+                // The second copy of the last group, or of every group, has other details, so those groups list as
+                // differing copies.
+                let differing =
+                    ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesOnlyDifferingDetails")
+                    ? groups
+                    : ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesDifferingDetails")
+                        ? Array(groups.suffix(1)) : []
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(
-                        groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) },
+                        groups: groups,
                         captureDates: Dictionary(
                             items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
                         rescanDropsLastGroup: ProcessInfo.processInfo.arguments.contains(
@@ -139,7 +147,9 @@ import os
                             "-EncryptedMemoriesDuplicatesPermanentMergeFailure")
                             ? .userAuthenticationRequired
                             : ProcessInfo.processInfo.arguments.contains(
-                                "-EncryptedMemoriesDuplicatesMergeFailure") ? .timedOut : nil))
+                                "-EncryptedMemoriesDuplicatesMergeFailure") ? .timedOut : nil,
+                        fingerprints: Dictionary(
+                            uniqueKeysWithValues: differing.map { ($0[1], ExactDuplicateFingerprint(pixelWidth: 1)) })))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesWideFixture") {
                 // One group with more copies than fit on the screen, and one whose two copies fit.
                 let wide = Array(sections[0].items.prefix(12))
@@ -458,6 +468,8 @@ import os
         private var indexComplete = false
         /// One failed group on the first merge, so the real alert can retry it.
         private var mergeFailure: URLError.Code?
+        /// The details of copies that differ from the others. Every other copy has a fingerprint without values.
+        private let fingerprints: [PhotoUID: ExactDuplicateFingerprint]
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
@@ -465,7 +477,8 @@ import os
             mergeDelay: Duration? = nil,
             confirmsNoPendingMerges: Bool = true, onConfirmNoPendingMerges: (@Sendable () -> Void)? = nil,
             beforeMerge: (@Sendable () async -> Void)? = nil, invalidatingMergeReloadFails: Bool = false,
-            buildInterruptions: Int = 0, mergeFailure: URLError.Code? = nil
+            buildInterruptions: Int = 0, mergeFailure: URLError.Code? = nil,
+            fingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -482,6 +495,7 @@ import os
             self.invalidatingMergeReloadFails = invalidatingMergeReloadFails
             self.buildInterruptions = buildInterruptions
             self.mergeFailure = mergeFailure
+            self.fingerprints = fingerprints
         }
 
         func confirmNoPendingMerges() async -> Bool {
@@ -539,9 +553,15 @@ import os
                 }
                 return (group.id, Dictionary(memberFacts, uniquingKeysWith: { first, _ in first }))
             }
-            // The copies of a group share their metadata, so every group stays whole.
+            // The copies of a group share their metadata unless `fingerprints` gives a copy other details.
             let fingerprints = groups.map { group in
-                (group.id, Dictionary(uniqueKeysWithValues: group.members.map { ($0, ExactDuplicateFingerprint()) }))
+                (
+                    group.id,
+                    Dictionary(
+                        uniqueKeysWithValues: group.members.map {
+                            ($0, self.fingerprints[$0] ?? ExactDuplicateFingerprint())
+                        })
+                )
             }
             await ranked(
                 ExactDuplicateRankingPage(

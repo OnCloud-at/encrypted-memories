@@ -419,6 +419,104 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertEqual(element.wait(until: predicate, timeout: 10), .completed, message)
     }
 
+    func testDifferingCopiesOpenInTheLibraryViewerAndLeaveAfterTheTrash() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesDifferingDetails"])
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay a group")
+        XCTAssertFalse(group(1).exists, "copies with other details are no duplicates")
+        let row = app.buttons["duplicates.differing"]
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        XCTAssertEqual(row.label, "Same Photo, Different Details · 1")
+        keepScreenshot("duplicates-ios-differing-row")
+
+        row.tap()
+
+        let message = app.staticTexts["duplicates.differing.message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        XCTAssertEqual(app.staticTexts["duplicates.differing.line.0"].label, "Differs in dimensions")
+        let copy = app.buttons["duplicates.differing.member.0.1"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 10))
+        keepScreenshot("duplicates-ios-differing-list")
+        copy.tap()
+
+        let trash = app.buttons["Move to Trash"].firstMatch
+        XCTAssertTrue(trash.waitForExistence(timeout: 10), "the library viewer offers Move to Trash")
+        XCTAssertFalse(app.buttons["duplicates.viewer.keep"].exists, "no merge tool for differing copies")
+        XCTAssertFalse(app.buttons["duplicates.viewer.merge"].exists, "no merge tool for differing copies")
+        keepScreenshot("duplicates-ios-differing-viewer")
+        trash.tap()
+        let confirm = app.alerts.buttons["Move to Trash"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10), "the existing confirmation asks first")
+        confirm.tap()
+
+        waitUntilGone(message, "the list closes once its last group has one copy left")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay")
+        XCTAssertFalse(row.exists, "no differing copies are left")
+
+        // The fixture lists the deleted copy again on the next scan; the list stays closed until the person opens it.
+        let top = app.staticTexts["duplicates.copyCount"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 400)))
+        XCTAssertTrue(row.waitForExistence(timeout: 20), "the rescan lists the differing copies again")
+        XCTAssertEqual(message.wait(until: "exists == true", timeout: 4), .timedOut, "the list does not open by itself")
+    }
+
+    func testLeavingDuplicatesFromTheDifferingCopiesClosesThemAndTheNextVisitLoadsAgain() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture",
+            extra: ["-EncryptedMemoriesDuplicatesDifferingDetails", "-EncryptedMemoriesDuplicatesRescanDropsGroup"])
+        let row = app.buttons["duplicates.differing"]
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.tap()
+        let message = app.staticTexts["duplicates.differing.message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+
+        // A tap on the shown tab goes back to Collections at once, past the Duplicates screen.
+        app.buttons["Collections"].firstMatch.tap()
+
+        let entry = app.buttons["duplicates.entry"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 10), "Collections shows again")
+        XCTAssertFalse(message.exists)
+        entry.tap()
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10))
+        XCTAssertFalse(message.exists, "the next visit starts on the duplicates")
+        // The next visit loads again; this fixture's second scan leaves out the differing copies.
+        XCTAssertEqual(row.waitUntilGone(timeout: 20), .completed, "the next visit scans the library again")
+    }
+
+    func testOnlyDifferingCopiesOpenFromTheEmptyState() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesOnlyDifferingDetails"])
+        XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 10), "no identical copies are left")
+        let button = app.buttons["duplicates.differing"]
+        XCTAssertTrue(button.waitForExistence(timeout: 10), "the empty state offers the differing copies")
+        XCTAssertEqual(button.label, "Same Photo, Different Details · 2")
+
+        button.tap()
+
+        XCTAssertTrue(app.staticTexts["duplicates.differing.line.0"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["duplicates.differing.line.1"].exists)
+    }
+
+    func testGoingBackFromTheDifferingCopiesKeepsTheDuplicatesWithoutAScan() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture",
+            extra: ["-EncryptedMemoriesDuplicatesDifferingDetails", "-EncryptedMemoriesDuplicatesRescanDropsGroup"])
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10))
+        let row = app.buttons["duplicates.differing"]
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.tap()
+        let message = app.staticTexts["duplicates.differing.message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+
+        app.navigationBars.firstMatch.buttons.element(boundBy: 0).tap()
+
+        waitUntilGone(message, "Back shows the duplicates")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay")
+        XCTAssertFalse(app.activityIndicators["duplicates.loading"].exists, "Back does not check the library again")
+        // A scan would drop the last group of this fixture, the differing copies, and with them the row.
+        XCTAssertEqual(row.waitUntilGone(timeout: 4), .timedOut, "Back did not scan again")
+    }
+
     func testTappingAPhotoOpensItWithItsGroupAndKeepsItThere() {
         openDuplicates()
         let ranked = member(0, 0)

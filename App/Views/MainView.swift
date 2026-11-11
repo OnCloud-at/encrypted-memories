@@ -69,6 +69,8 @@ struct MainView: View {
     /// The Duplicates route of this account. Nil while the account cannot merge duplicates.
     @State private var duplicates: ExactDuplicatesModel?
     @State private var confirmsDuplicateMergeAll = false
+    /// Whether the Duplicates route shows the copies with the same bytes whose details differ.
+    @State private var duplicatesRoute = ExactDuplicatesRoute()
     /// The group of duplicates whose photos the open viewer shows, with the merge tools below them.
     @State private var duplicateViewerGroup: DuplicateViewerGroup?
     @State private var mapClusterPageIndex = 0
@@ -298,6 +300,9 @@ struct MainView: View {
                 if newValue != .map {
                     mapClusterPresentation = nil
                 }
+                if newValue != .duplicates {
+                    duplicatesRoute.back()
+                }
                 // Switching sidebar route while a photo/video is open: close the viewer INSTANTLY so the new tab's
                 // grid (or Map) just shows. No zoom-back-to-cell - the photo's cell usually isn't in the new
                 // route, and the expectation is simply "tab switches, photo closes."
@@ -418,10 +423,14 @@ struct MainView: View {
                     thumbnailFeed: feed,
                     topInset: topBarInset,
                     confirmsMergeAll: $confirmsDuplicateMergeAll,
-                    canOpen: { timelineModel.allLibraryItem(matching: $0) != nil },
+                    item: { timelineModel.allLibraryItem(matching: $0) },
                     libraryRevision: timelineModel.wholeLibraryRevision,
-                    onOpen: { openDuplicate($0, inGroup: $1) }
+                    showsDiffering: showsDifferingList,
+                    onOpen: { openDuplicate($0, inGroup: $1) },
+                    onShowDiffering: { duplicatesRoute.showDiffering(of: duplicates) },
+                    onOpenDiffering: { openDifferingCopy($0, contentHash: $1) }
                 )
+                .onChange(of: duplicates.differingGroups.isEmpty) { duplicatesRoute.follow(duplicates) }
                 .padding(.leading, leadingObstructionInset)
                 .animation(Self.sidebarAnimation, value: leadingObstructionInset)
                 .ignoresSafeArea()
@@ -1298,8 +1307,14 @@ struct MainView: View {
         case .sharedAlbum(_, _, let name): return name
         case .trash: return String(localized: "sidebar.recently_deleted")
         case .map: return String(localized: "sidebar.map")
-        case .duplicates: return L10n.string("duplicates.title")
+        case .duplicates:
+            return L10n.string(showsDifferingList ? "duplicates.differing_title" : "duplicates.title")
         }
+    }
+
+    /// The Duplicates route shows the copies whose details differ.
+    private var showsDifferingList: Bool {
+        selection == .duplicates && duplicates.map { duplicatesRoute.showsDiffering(of: $0) } == true
     }
 
     private enum NavigationChromeState: Equatable {
@@ -1717,16 +1732,35 @@ struct MainView: View {
 
     /// Opens `uid` in the viewer with the other photos of its group of duplicates, without the zoom from a grid cell.
     private func openDuplicate(_ uid: PhotoUID, inGroup groupID: String) {
-        guard let members = duplicates?.group(withID: groupID)?.members else { return }
+        openDuplicateCopies(duplicates?.group(withID: groupID)?.members, asGroup: true) { item in
+            duplicates?.viewerItems(opening: uid, inGroup: groupID, item: item)
+        }
+    }
+
+    /// Opens `uid` in the library viewer with the other copies of its bytes whose details differ. The viewer offers
+    /// Move to Trash and no merge tools.
+    private func openDifferingCopy(_ uid: PhotoUID, contentHash: String) {
+        let members = duplicates?.differingGroup(withContentHash: contentHash)?.members
+        openDuplicateCopies(members, asGroup: false) { item in
+            duplicates?.viewerItems(opening: uid, inDiffering: contentHash, item: item)
+        }
+    }
+
+    /// Opens the copies that `opened` picks among `members`. Only a group of duplicates gets the merge tools.
+    private func openDuplicateCopies(
+        _ members: [PhotoUID]?, asGroup: Bool,
+        opened: ((PhotoUID) -> PhotoItem?) -> (items: [PhotoItem], index: Int)?
+    ) {
+        guard let members else { return }
         let found = Dictionary(
             timelineModel.allLibraryItems(matching: Set(members)).map { ($0.uid, $0) },
             uniquingKeysWith: { first, _ in first })
-        guard let opened = duplicates?.viewerItems(opening: uid, inGroup: groupID, item: { found[$0] }) else { return }
-        let viewer = makeViewer(opened.items[opened.index], opened.items, allowsVisibleDuplicateThumbnails: true)
+        guard let opened = opened({ found[$0] }) else { return }
+        let viewer = makeViewer(opened.items[opened.index], opened.items, allowsVisibleDuplicateThumbnails: asGroup)
         viewerFollowsReplacements = false
         zoom = nil
         viewerModel = viewer
-        duplicateViewerGroup = DuplicateViewerGroup(viewer: viewer)
+        duplicateViewerGroup = asGroup ? DuplicateViewerGroup(viewer: viewer) : nil
     }
 
     /// The group of duplicates that `viewer` shows. Nil for a viewer opened anywhere else, also after the viewer of a
@@ -2281,15 +2315,19 @@ struct MainView: View {
             Button {
                 if viewerModel != nil {
                     closePhoto()
+                } else if showsDifferingList {
+                    duplicatesRoute.back()
                 } else {
                     closeMapCluster()
                 }
             } label: {
                 Label("toolbar.back", systemImage: "chevron.left")
             }
-            .help("toolbar.back_to_library")
+            .help(
+                viewerModel == nil && showsDifferingList
+                    ? L10n.string("duplicates.title") : String(localized: "toolbar.back_to_library"))
         }
-        .hidden(viewerModel == nil && !(selection == .map && mapClusterPresentation != nil))
+        .hidden(viewerModel == nil && !(selection == .map && mapClusterPresentation != nil) && !showsDifferingList)
         .sharedBackgroundVisibility(.visible)
 
         if let viewerModel {
@@ -2433,7 +2471,7 @@ struct MainView: View {
                 ToolbarItem(placement: .primaryAction) { albumActionsToolbarMenu }
                 ToolbarSpacer(.fixed, placement: .primaryAction)
             }
-            if selection == .duplicates, let duplicates {
+            if selection == .duplicates, let duplicates, duplicatesRoute.offersMergeAll(of: duplicates) {
                 ToolbarItem(placement: .primaryAction) {
                     Button(L10n.string("duplicates.merge_all")) { confirmsDuplicateMergeAll = true }
                         .disabled(!duplicates.canMerge)
