@@ -11,6 +11,8 @@ let storageFaultCases: [any StorageFaultCase] = [
     CatalogUpsertBatchCase(),
     CatalogScanCase(id: "catalog.fullScan", identifiers: nil),
     CatalogScanCase(id: "catalog.changeScan", identifiers: ["asset-2", "asset-3", "asset-4"]),
+    EditReplacementJournalUpdateCase(),
+    EditReplacementJournalCreateCase(),
 ]
 
 /// The photo library before the operation (`seed`) and when it runs: asset-2 is edited, asset-3 is deleted, asset-4
@@ -144,5 +146,134 @@ struct CatalogScanCase: StorageFaultCase {
     ) -> PhotoLibraryCatalogSync {
         PhotoLibraryCatalogSync(
             store: store, enumerator: library, chunkSize: 2, now: { Date(timeIntervalSince1970: seconds) })
+    }
+}
+
+/// One change of the edit replacement journal (`EditReplacementJournalFileStore.addSuperseded`): one line appended to
+/// its log through the durable file writer (#1149). The state is the journal as a new store reads it, so a log that a
+/// restart rewrote compares by its entries, not by its line order.
+struct EditReplacementJournalUpdateCase: StorageFaultCase {
+    struct World {
+        let journal: EditReplacementJournalFileStore
+        let files: StorageFaultFiles
+    }
+
+    let id = "journal.editReplacement.update"
+    let atomicity = StorageFaultAtomicity.allOrNothing
+    private static let sources = ["asset-1", "asset-2"].map {
+        UploadSourceIdentity(kind: .photoLibraryAsset, identifier: $0)
+    }
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "a"), for: Self.sources[0])
+        try journal.recordUpload(edited: true, for: Self.sources[1])
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        let files = StorageFaultFiles()
+        return World(
+            journal: try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory, fileSystem: files)),
+            files: files)
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.files] }
+
+    func run(_ world: World) async -> Bool {
+        do {
+            try world.journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "b"), for: Self.sources[0])
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func close(_ world: World) {}
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        var state = StorageFaultState()
+        guard let journal = EditReplacementJournalFileStore(accountDataDirectory: directory) else {
+            state.tables["journal"] = ["unreadable"]
+            return state
+        }
+        let entries = try Self.sources.map { source -> String in
+            let entry = String(decoding: try JSONEncoder().encode(journal.entry(for: source)), as: UTF8.self)
+            return "\(source.identifier): \(canonicalJSON(entry))"
+        }
+        state.tables["journal"] = entries
+        state.records["superseded link"] = Set(
+            Self.sources.flatMap { source in
+                journal.entry(for: source).superseded.map { "\(source.identifier)#\($0.nodeID)" }
+            })
+        return state
+    }
+}
+
+/// The first change of a new edit replacement journal: the log is created with its first line in one atomic
+/// replacement, then the barrier for earlier builds is written. Two files, so a restart must complete what a crash
+/// between them leaves. The state reads the barrier file before a new store opens the journal and places it.
+///
+/// Accepted (`acceptsIgnoredBarrierFailure`): today the journal ignores a failed barrier write after the first line, so
+/// the change reports success without a barrier (I5 at that write); an earlier app build could read "no journal" until
+/// the next launch places the barrier. Whether this should throw is an owner decision, kept open on #1149.
+struct EditReplacementJournalCreateCase: StorageFaultCase {
+    struct World {
+        let journal: EditReplacementJournalFileStore
+        let files: StorageFaultFiles
+    }
+
+    let id = "journal.editReplacement.create"
+    let atomicity = StorageFaultAtomicity.convergesAfterRestart
+    /// False only in the self-test that shows the acceptance is needed.
+    var acceptsIgnoredBarrierFailure = true
+    private let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-1")
+
+    var acceptances: [StorageFaultAcceptance] {
+        guard acceptsIgnoredBarrierFailure else { return [] }
+        return [
+            StorageFaultAcceptance(
+                rule: .honestOutcome, phase: .failedRun,
+                point: "replace \(EditReplacementJournalFileStore.fileName)",
+                reason: "A failed barrier write after the first line is ignored today; owner decision on #1149.")
+        ]
+    }
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {}
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        let files = StorageFaultFiles()
+        return World(
+            journal: try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory, fileSystem: files)),
+            files: files)
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.files] }
+
+    func run(_ world: World) async -> Bool {
+        do {
+            try world.journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "a"), for: source)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func close(_ world: World) {}
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let barrier = try? Data(contentsOf: directory.appendingPathComponent(EditReplacementJournalFileStore.fileName))
+        var state = StorageFaultState()
+        state.tables["barrier"] = [
+            barrier == nil
+                ? "absent" : barrier == EditReplacementJournalFileStore.earlierBuildBarrier ? "barrier" : "other"
+        ]
+        guard let journal = EditReplacementJournalFileStore(accountDataDirectory: directory) else {
+            state.tables["journal"] = ["unreadable"]
+            return state
+        }
+        let entry = journal.entry(for: source)
+        state.tables["journal"] = [canonicalJSON(String(decoding: try JSONEncoder().encode(entry), as: UTF8.self))]
+        state.records["superseded link"] = Set(entry.superseded.map(\.nodeID))
+        return state
     }
 }

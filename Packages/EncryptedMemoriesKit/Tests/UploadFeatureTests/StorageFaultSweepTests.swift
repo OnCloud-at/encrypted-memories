@@ -1,11 +1,12 @@
 import Foundation
+import UploadCore
 import XCTest
 
 /// Runs the fault-injection sweep over every registered storage operation (#1141), and proves with deliberately flawed
 /// probe operations that each fixed rule catches its class of defect.
 final class StorageFaultSweepTests: XCTestCase {
     /// One assertion over all cases, so a failing case never hides behind an earlier one in the test log.
-    func testEveryRegisteredOperationKeepsTheRulesAtEveryStatement() async throws {
+    func testEveryRegisteredOperationKeepsTheRulesAtEveryPoint() async throws {
         XCTAssertFalse(storageFaultCases.isEmpty)
         let findings = try await sweepFindings(storageFaultCases)
         XCTAssertTrue(findings.isEmpty, "\n" + findings.joined(separator: "\n"))
@@ -27,9 +28,10 @@ final class StorageFaultSweepTests: XCTestCase {
             do {
                 let report = try await StorageFaultSweep.run(faultCase)
                 print(
-                    "storage-fault-sweep \(faultCase.id): \(report.statements.count) statements, "
-                        + String(format: "%.2f s", report.seconds))
-                if report.statements.isEmpty { findings.append("\(faultCase.id) runs no statement on its stores") }
+                    "storage-fault-sweep \(faultCase.id): \(report.points.count) points, "
+                        + "\(report.accepted.count) accepted, " + String(format: "%.2f s", report.seconds))
+                for accepted in report.accepted { print("  \(accepted)") }
+                if report.points.isEmpty { findings.append("\(faultCase.id) runs no point on its stores") }
                 if !report.violations.isEmpty {
                     findings.append(
                         "\(faultCase.id) violates the rules:\n"
@@ -96,12 +98,75 @@ final class StorageFaultSweepTests: XCTestCase {
             violates: [.restartConverges: [.restartAfterFailure, .restartFromCrashImage]])
     }
 
+    func testTheCreateCaseNeedsItsAcceptedBarrierOutcomeAndKeepsItVisible() async throws {
+        var withoutAcceptance = EditReplacementJournalCreateCase()
+        withoutAcceptance.acceptsIgnoredBarrierFailure = false
+
+        let strict = try await StorageFaultSweep.run(withoutAcceptance)
+        let accepting = try await StorageFaultSweep.run(EditReplacementJournalCreateCase())
+
+        XCTAssertEqual(
+            strict.violatedChecks,
+            ["\(StorageFaultRule.honestOutcome.rawValue), \(StorageFaultPhase.failedRun.rawValue)"])
+        XCTAssertEqual(strict.violations.map(\.statement), ["replace \(EditReplacementJournalFileStore.fileName)"])
+        XCTAssertTrue(accepting.violations.isEmpty, accepting.violations.map(\.description).joined(separator: "\n"))
+        XCTAssertEqual(
+            accepting.accepted.map(\.description),
+            strict.violations.map {
+                "accepted: \($0) — A failed barrier write after the first line is ignored today; owner decision on #1149."
+            },
+            "still reported, with its reason")
+    }
+
+    func testAnAcceptanceCoversOnlyItsOwnPointAndMustOccur() async throws {
+        let points = try await StorageFaultSweep.run(ProbeCase(flaw: .ignoresFailure)).points
+        XCTAssertEqual(points.count, 3, "BEGIN, UPDATE and COMMIT")
+        let probe = ProbeCase(
+            flaw: .ignoresFailure,
+            acceptances: [
+                StorageFaultAcceptance(rule: .honestOutcome, phase: .failedRun, point: points[1], reason: "test"),
+                StorageFaultAcceptance(rule: .honestOutcome, phase: .failedRun, point: "no such point", reason: "test"),
+            ])
+
+        let report = try await StorageFaultSweep.run(probe)
+
+        XCTAssertEqual(report.accepted.map(\.violation.statement), [points[1]])
+        XCTAssertEqual(
+            Set(report.violations.map { "\($0.rule.rawValue) \($0.statement)" }),
+            [
+                "\(StorageFaultRule.honestOutcome.rawValue) \(points[0])",
+                "\(StorageFaultRule.honestOutcome.rawValue) \(points[2])",
+                "\(StorageFaultRule.acceptanceMismatch.rawValue) no such point",
+            ])
+    }
+
+    func testAnAcceptanceThatCoversTwoViolationsAcceptsNeither() async throws {
+        let points = try await StorageFaultSweep.run(ProbeCase(flaw: .ignoresFailureOfARepeatedStatement)).points
+        XCTAssertEqual(points.count, 2, "the same UPDATE twice")
+        XCTAssertEqual(points.first, points.last)
+        let probe = ProbeCase(
+            flaw: .ignoresFailureOfARepeatedStatement,
+            acceptances: [
+                StorageFaultAcceptance(rule: .honestOutcome, phase: .failedRun, point: points[0], reason: "test")
+            ])
+
+        let report = try await StorageFaultSweep.run(probe)
+
+        XCTAssertTrue(report.accepted.isEmpty)
+        XCTAssertEqual(
+            report.violations.filter { $0.rule == .honestOutcome && $0.phase == .failedRun }.count, 2,
+            "both violations stay")
+        XCTAssertEqual(
+            report.violations.filter { $0.rule == .acceptanceMismatch }.map(\.detail),
+            ["\(StorageFaultRule.honestOutcome.rawValue) is accepted here and occurred 2 times"])
+    }
+
     private func assertSweep(
         of flaw: ProbeCase.Flaw, violates expected: [StorageFaultRule: [StorageFaultPhase]],
         file: StaticString = #filePath, line: UInt = #line
     ) async throws {
         let report = try await StorageFaultSweep.run(ProbeCase(flaw: flaw))
-        XCTAssertGreaterThan(report.statements.count, 0, "the probe runs statements", file: file, line: line)
+        XCTAssertGreaterThan(report.points.count, 0, "the probe runs points", file: file, line: line)
         let checks = expected.flatMap { rule, phases in phases.map { "\(rule.rawValue), \($0.rawValue)" } }
         XCTAssertEqual(
             report.violatedChecks, Set(checks), report.violations.map(\.description).joined(separator: "\n"),
@@ -129,6 +194,8 @@ private struct ProbeCase: StorageFaultCase {
         case failsWhenAlreadyDone
         /// An operation that reports success after a failed write.
         case ignoresFailure
+        /// An operation that reports success after a failed write, whose two writes have the same text.
+        case ignoresFailureOfARepeatedStatement
         /// An operation whose first run ends with a read that later runs leave out.
         case changesItsStatements
         /// An operation whose later runs write the same two rows in the opposite order.
@@ -148,11 +215,14 @@ private struct ProbeCase: StorageFaultCase {
     }
 
     let flaw: Flaw
+    var acceptances: [StorageFaultAcceptance] = []
     private let runs = RunCounter()
     var id: String { "probe.\(flaw)" }
     var atomicity: StorageFaultAtomicity {
         switch flaw {
-        case .correct, .splitTransaction, .compensatesWhileRunning, .ignoresFailure: return .allOrNothing
+        case .correct, .splitTransaction, .compensatesWhileRunning, .ignoresFailure,
+            .ignoresFailureOfARepeatedStatement:
+            return .allOrNothing
         case .deleteBeforeReplace, .uploadWithoutReceiptCheck, .notIdempotent, .failsWhenAlreadyDone,
             .changesItsStatements, .reordersItsStatements, .cannotOpenAfterCrash, .marksDoneBeforeQueueing,
             .failsWithoutAFault:
@@ -210,6 +280,10 @@ private struct ProbeCase: StorageFaultCase {
             return store.execute("INSERT INTO item VALUES('c','2');") && store.execute("SELECT count(*) FROM item;")
         case .ignoresFailure:
             store.execute("BEGIN IMMEDIATE; UPDATE item SET value='2'; COMMIT;")
+            return true
+        case .ignoresFailureOfARepeatedStatement:
+            store.execute("UPDATE item SET value=value||'+' WHERE key='a';")
+            store.execute("UPDATE item SET value=value||'+' WHERE key='a';")
             return true
         case .changesItsStatements:
             let first = runs.next() == 0
