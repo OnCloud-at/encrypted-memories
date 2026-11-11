@@ -149,6 +149,10 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [first, queue_page([OTHER_SHA])],
                                                        7200, jobs_answer('in_progress')))
 
+    def test_extra_page_after_a_terminal_page_is_unknown(self):
+        self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [queue_page([OTHER_SHA]), queue_page([OTHER_SHA])],
+                                                       7200, jobs_answer('in_progress')))
+
     def test_entry_gone_and_old_run_cancels(self):
         self.assertEqual(
             script.CANCEL, self.decide(HEAD_SHA, [queue_page([OTHER_SHA])], 7200, jobs_answer("in_progress"))
@@ -250,8 +254,8 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([["run", "cancel", "4242"]], gh.cancel_calls)
         self.assertEqual([script.POLL_INTERVAL_SECONDS] * 2, clock.sleeps)
 
-    def test_superseded_1293_with_queued_null_heads_cancels_after_confirmation(self):
-        # The replacement head and queued null heads were observed after run 42937364862.
+    def test_seen_head_replaced_with_queued_null_heads_cancels_after_confirmation(self):
+        # The replacement head and queued null heads were observed after the run.
         # Its earlier queue responses were not logged; the first poll here is synthetic.
         old = 'fd9439449a22101643e388d31e8b6909b4217581'
         new = 'b76aa49f88deeb59174a763143417f1e2fce5bc2'
@@ -307,6 +311,17 @@ class WatchTests(unittest.TestCase):
         gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
         clock = Clock(iterations=3)
         clock.sleep = lambda seconds: (clock.sleeps.append(seconds), setattr(clock, 'now', clock.now + 1))
+        self.watch(gh, clock)
+        self.assertEqual([], gh.cancel_calls)
+
+    def test_absent_reads_fifty_nine_seconds_apart_do_not_confirm(self):
+        gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
+        clock = Clock(iterations=3)
+        intervals = iter([60, 59, 60])
+        def sleep(seconds):
+            clock.sleeps.append(seconds)
+            clock.now += next(intervals)
+        clock.sleep = sleep
         self.watch(gh, clock)
         self.assertEqual([], gh.cancel_calls)
 
