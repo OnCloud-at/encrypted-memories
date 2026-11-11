@@ -355,6 +355,43 @@ final class PendingBackupStoreBindingFailureTests: XCTestCase {
         try assertBindFailureRecorded()
     }
 
+    func testFailedActionIdentityBindStopsEveryWriterAndKeepsTheStoredAction() throws {
+        let short = PendingSourceKey(kind: key.kind, identifier: "short")
+        let variants = [("source_id", key, "album"), ("album_id", short, key.identifier)]
+        let operations: [(String, String, (PendingAction) -> Bool)] = [
+            ("retry", "UPDATE pending_action SET attempts=attempts+1", { self.store.retryAction($0, at: self.date) }),
+            ("fail", "UPDATE pending_action SET failed=1", { self.store.failAction($0) }),
+            ("complete", "DELETE FROM pending_action", { self.store.completeAction($0) }),
+        ]
+        for (column, source, album) in variants {
+            for (operation, statement, write) in operations {
+                let context = "\(column), \(operation)"
+                XCTAssertTrue(store.addAlbumIntent(source, albumID: album, at: date), context)
+                let before = store.actionsRead()
+                XCTAssertTrue(before.complete, context)
+                XCTAssertEqual(before.actions.count, 1, context)
+                let action = try XCTUnwrap(before.actions.first, context)
+                do {
+                    let fault = BindFailureUntilStep(
+                        on: try connection(), statement: statement, after: nil, limit: Self.limit)
+                    defer { fault.remove() }
+
+                    XCTAssertFalse(write(action), context)
+                    XCTAssertTrue(fault.lowered, context)
+                    XCTAssertFalse(fault.stepped, "The failed identity bind must stop the statement: \(context)")
+                    fault.remove()
+                    try assertBindFailureRecorded()
+                    XCTAssertEqual(store.actionsRead(), before, context)
+                }
+                store.close()
+                store = try XCTUnwrap(PendingBackupManifestStore(url: databaseURL))
+                XCTAssertEqual(store.actionsRead(), before, "Reopening must keep the complete action: \(context)")
+                XCTAssertTrue(store.completeAction(action), context)
+                XCTAssertEqual(store.actions(), [], context)
+            }
+        }
+    }
+
     func testFailedAlbumIdentifierBindDoesNotStoreAnAction() throws {
         let short = PendingSourceKey(kind: .photoLibraryAsset, identifier: "short")
         let fault = BindFailureUntilStep(

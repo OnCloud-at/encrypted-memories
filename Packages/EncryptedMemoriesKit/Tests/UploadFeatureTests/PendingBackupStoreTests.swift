@@ -1444,6 +1444,76 @@ final class PendingBackupStoreTests: XCTestCase {
 
     // MARK: - Deferred actions
 
+    func testEachActionKeyColumnKeepsTheOtherActionUnchanged() throws {
+        let actionKey = PendingSourceKey(kind: .photoLibraryAsset, identifier: "/fixture/action")
+        let variants: [(String, PendingSourceKey, PendingActionKind, String)] = [
+            ("source_kind", PendingSourceKey(kind: .fileURL, identifier: actionKey.identifier), .favorite, ""),
+            ("source_id", PendingSourceKey(kind: actionKey.kind, identifier: "other"), .favorite, ""),
+            ("kind", actionKey, .addToAlbum, ""),
+            ("album_id", actionKey, .addToAlbum, "album-2"),
+        ]
+        let operations: [(String, (PendingAction) -> Bool)] = [
+            ("retry", { self.store.retryAction($0, at: self.date) }),
+            ("fail", { self.store.failAction($0) }),
+            ("complete", { self.store.completeAction($0) }),
+        ]
+        for (column, otherKey, otherKind, otherAlbum) in variants {
+            let selectedKind: PendingActionKind = column == "album_id" ? .addToAlbum : .favorite
+            let selectedAlbum = column == "album_id" ? "album-1" : ""
+            for (operation, write) in operations {
+                let context = "\(column), \(operation)"
+                XCTAssertEqual(store.actions(), [], context)
+                for (source, kind, album) in [
+                    (actionKey, selectedKind, selectedAlbum), (otherKey, otherKind, otherAlbum),
+                ] {
+                    switch kind {
+                    case .favorite:
+                        XCTAssertTrue(store.setFavoriteIntent(source, favorite: true, at: date), context)
+                    case .addToAlbum:
+                        XCTAssertTrue(store.addAlbumIntent(source, albumID: album, at: date), context)
+                    }
+                }
+                let before = store.actionsRead()
+                XCTAssertTrue(before.complete, context)
+                XCTAssertEqual(before.actions.count, 2, context)
+                let selected = try XCTUnwrap(
+                    before.actions.first {
+                        $0.key == actionKey && $0.kind == selectedKind && $0.albumID == selectedAlbum
+                    }, context)
+                let other = try XCTUnwrap(before.actions.first { $0 != selected }, context)
+                let differences = [
+                    ("source_kind", selected.key.kind != other.key.kind),
+                    ("source_id", selected.key.identifier != other.key.identifier),
+                    ("kind", selected.kind != other.kind),
+                    ("album_id", selected.albumID != other.albumID),
+                    ("desired", selected.desired != other.desired),
+                    ("created_at", selected.createdAt != other.createdAt),
+                ].filter { $0.1 }.map { $0.0 }
+                XCTAssertEqual(differences, [column], context)
+
+                XCTAssertTrue(write(selected), context)
+
+                let after = store.actionsRead()
+                XCTAssertTrue(after.complete, context)
+                XCTAssertTrue(after.actions.contains(other), "The complete other action must survive: \(context)")
+                if operation == "complete" {
+                    XCTAssertEqual(after.actions, [other], context)
+                } else {
+                    let expected = PendingAction(
+                        key: selected.key, kind: selected.kind, albumID: selected.albumID,
+                        desired: selected.desired, createdAt: selected.createdAt,
+                        attempts: operation == "retry" ? 1 : 0,
+                        nextAttemptAt: operation == "retry" ? date.addingTimeInterval(60) : date,
+                        failed: operation == "fail")
+                    XCTAssertEqual(after.actions.count, 2, context)
+                    XCTAssertTrue(after.actions.contains(expected), context)
+                }
+                for action in store.actions() { XCTAssertTrue(store.completeAction(action), context) }
+                XCTAssertEqual(store.actions(), [], context)
+            }
+        }
+    }
+
     func testFavoriteToggleReplacesTheEarlierRequest() throws {
         XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
         let first = try XCTUnwrap(store.actions().first)
@@ -1467,16 +1537,24 @@ final class PendingBackupStoreTests: XCTestCase {
     }
 
     func testStaleActionOutcomeNeverTouchesTheNewerRequest() throws {
-        XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
-        let first = try XCTUnwrap(store.actions().first)
-        XCTAssertTrue(store.setFavoriteIntent(key, favorite: false, at: date.addingTimeInterval(1)))
+        // Change each identity condition alone, then both, so neither can mask a missing check of the other.
+        for (favorite, offset) in [(false, 0.0), (true, 1.0), (false, 1.0)] {
+            XCTAssertTrue(store.setFavoriteIntent(key, favorite: true, at: date))
+            let first = try XCTUnwrap(store.actions().first)
+            XCTAssertTrue(store.setFavoriteIntent(key, favorite: favorite, at: date.addingTimeInterval(offset)))
+            let expected = try XCTUnwrap(store.actions().first)
 
-        XCTAssertTrue(store.failAction(first))
-        XCTAssertTrue(store.retryAction(first, at: date))
-        let current = try XCTUnwrap(store.actions().first)
-        XCTAssertFalse(current.failed)
-        XCTAssertEqual(current.attempts, 0)
-        XCTAssertFalse(current.desired)
+            XCTAssertTrue(store.failAction(first))
+            XCTAssertEqual(store.actions(), [expected], "A stale failure must preserve the complete newer request")
+            XCTAssertTrue(store.retryAction(first, at: date))
+            XCTAssertEqual(store.actions(), [expected], "A stale retry must preserve the complete newer request")
+            let current = try XCTUnwrap(store.actions().first)
+            XCTAssertFalse(current.failed)
+            XCTAssertEqual(current.attempts, 0)
+            XCTAssertEqual(current.desired, favorite)
+            XCTAssertTrue(store.completeAction(first), "completing a replaced request is harmless")
+            XCTAssertEqual(store.actions(), [expected], "A stale completion must preserve the complete newer request")
+        }
     }
 
     func testHandoffOfAnUnfinishedActionSurvivesPruning() throws {
