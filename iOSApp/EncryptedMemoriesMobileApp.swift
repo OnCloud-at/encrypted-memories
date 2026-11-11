@@ -11,7 +11,6 @@ import MapUIKitAdapter
 import Metal
 import PhotoLibraryBackupAdapter
 import PhotosCore
-import ProtonCoreCryptoPatchedGoImplementation
 import SwiftUI
 import TimelineCore
 import TimelineUIKitAdapter

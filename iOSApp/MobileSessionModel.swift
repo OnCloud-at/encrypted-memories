@@ -1,7 +1,6 @@
 import MediaByteCache
 import PhotosCore
 import ProtonAuth
-import ProtonCoreCryptoPatchedGoImplementation
 import ProtonDriveBackend
 import SwiftUI
 import UIKit
@@ -46,7 +45,7 @@ final class MobileSessionModel: ObservableObject {
     }
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
-        injectDefaultCryptoImplementation()
+        ProtonRuntime.prepareProcess()
         sessionStore = SessionKeychainStore(accessibility: .afterFirstUnlockThisDeviceOnly)
         let authentication = AuthenticationFactory().make(store: sessionStore, sessionReads: .shared)
         authController = authentication.controller

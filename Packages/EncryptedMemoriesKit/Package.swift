@@ -140,6 +140,7 @@ let package = Package(
                 .product(name: "ProtonCoreDataModel", package: "protoncore_ios"),
                 .product(name: "ProtonCoreCrypto", package: "protoncore_ios"),
                 .product(name: "ProtonCoreCryptoGoInterface", package: "protoncore_ios"),
+                .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
             ],
             swiftSettings: sdkBackendSwiftSettings
         ),

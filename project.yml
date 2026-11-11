@@ -35,7 +35,7 @@ packages:
     path: Packages/EncryptedMemoriesKit
   ProtonCore:
     url: https://github.com/ProtonMail/protoncore_ios.git
-    # Proton Drive SDK 0.33.0 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
+    # No target references ProtonCore directly; the entry mirrors the exact pin in Package.swift for the update scripts.
     exactVersion: 37.3.0
 
 fileGroups:
@@ -56,7 +56,6 @@ targets:
       - {package: EncryptedMemoriesKit, product: ProtonAuth}
       - {package: EncryptedMemoriesKit, product: ProtonDriveBackend}
       - {package: EncryptedMemoriesKit, product: TimelineCore}
-      - {package: ProtonCore, product: ProtonCoreCryptoPatchedGoImplementation}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.macsupporttests
@@ -124,8 +123,6 @@ targets:
         product: MLSearchBackgroundAppleAdapter
       - package: EncryptedMemoriesKit
         product: MLSearchFeature
-      - package: ProtonCore
-        product: ProtonCoreCryptoPatchedGoImplementation
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories
@@ -234,8 +231,6 @@ targets:
         product: MLSearchBackgroundAppleAdapter
       - package: EncryptedMemoriesKit
         product: MLSearchFeature
-      - package: ProtonCore
-        product: ProtonCoreCryptoPatchedGoImplementation
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories
