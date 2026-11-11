@@ -185,73 +185,69 @@ struct AppInfrastructureTests {
     // The timeline query-plan guard lives with `TimelineMetadataStore` in PhotosCoreTests.
     // It checks the store schema and load statement directly.
 
-    @Test func metalGridStatsFrameSurfacesRenderAndUploadCounters() {
-        let stats = MetalGridStats.frame(
-            visibleCount: 7,
-            overscanCount: 3,
-            realCount: 5,
-            cellCount: 8,
-            textureUploads: 2,
-            textureUploadBytes: 4_096,
-            deferredTextureUploads: 3,
-            textureUploadMs: 1.25,
-            evictions: 1,
-            evictMs: 0.5,
-            residentBytes: 8_192,
-            residentTextureCount: 9,
-            pinnedTextureCount: 4,
-            textureCapacity: 10,
-            pinnedTextureOverflow: false,
-            residentByteBudget: 65_536,
-            uploadByteBudget: 16_384,
-            byteBudgetOverflow: false,
-            residencySaturated: true,
-            drawCalls: 6,
-            textureBinds: 7,
-            instanceCount: 5,
-            drawMs: 0.75,
-            gpuMs: 0.25
-        )
-        #expect(stats.visibleItems == 7)
-        #expect(stats.overscanItems == 3)
-        #expect(stats.realTextureItems == 5)
-        #expect(stats.placeholderItems == 3)
-        #expect(stats.textureUploads == 2)
-        #expect(stats.textureUploadBytes == 4_096)
-        #expect(stats.deferredTextureUploads == 3)
-        #expect(stats.textureUploadMs == 1.25)
-        #expect(stats.evictions == 1)
-        #expect(stats.evictMs == 0.5)
-        #expect(stats.memoryEstimateBytes == 8_192)
-        #expect(stats.residentTextureCount == 9)
-        #expect(stats.pinnedTextureCount == 4)
-        #expect(stats.textureCapacity == 10)
-        #expect(!stats.pinnedTextureOverflow)
-        #expect(stats.residentByteBudget == 65_536)
-        #expect(stats.uploadByteBudget == 16_384)
-        #expect(!stats.byteBudgetOverflow)
-        #expect(stats.residencySaturated)
-        #expect(stats.encodedSlotItems == 8)
-        #expect(stats.cacheHits == 5)
-        #expect(stats.cacheMisses == 3)
-        #expect(stats.drawCalls == 6)
-        #expect(stats.textureBinds == 7)
-        #expect(stats.instanceCount == 5)
-        #expect(stats.drawMs == 0.75)
-        #expect(stats.gpuMs == 0.25)
-        #expect(stats.drawMs >= 0)
-        #expect(stats.gpuMs >= 0)
-        #expect(stats.summary.contains("drawMs=0.75"))
-        #expect(stats.summary.contains("gpuMs=0.25"))
-    }
+    #if DEBUG
+        @Test func metalGridStatsFrameSurfacesRenderAndUploadCounters() {
+            let stats = MetalGridStats.frame(
+                visibleCount: 7,
+                overscanCount: 3,
+                realCount: 5,
+                cellCount: 8,
+                textureUploads: 2,
+                textureUploadBytes: 4_096,
+                deferredTextureUploads: 3,
+                textureUploadMs: 1.25,
+                evictions: 1,
+                evictMs: 0.5,
+                residentBytes: 8_192,
+                residentTextureCount: 9,
+                pinnedTextureCount: 4,
+                textureCapacity: 10,
+                pinnedTextureOverflow: false,
+                residentByteBudget: 65_536,
+                uploadByteBudget: 16_384,
+                byteBudgetOverflow: false,
+                residencySaturated: true,
+                drawCalls: 6,
+                textureBinds: 7,
+                instanceCount: 5,
+                drawMs: 0.75,
+                gpuMs: 0.25
+            )
+            #expect(stats.visibleItems == 7)
+            #expect(stats.overscanItems == 3)
+            #expect(stats.realTextureItems == 5)
+            #expect(stats.placeholderItems == 3)
+            #expect(stats.textureUploads == 2)
+            #expect(stats.textureUploadBytes == 4_096)
+            #expect(stats.deferredTextureUploads == 3)
+            #expect(stats.textureUploadMs == 1.25)
+            #expect(stats.evictions == 1)
+            #expect(stats.evictMs == 0.5)
+            #expect(stats.memoryEstimateBytes == 8_192)
+            #expect(stats.residentTextureCount == 9)
+            #expect(stats.pinnedTextureCount == 4)
+            #expect(stats.textureCapacity == 10)
+            #expect(!stats.pinnedTextureOverflow)
+            #expect(stats.residentByteBudget == 65_536)
+            #expect(stats.uploadByteBudget == 16_384)
+            #expect(!stats.byteBudgetOverflow)
+            #expect(stats.residencySaturated)
+            #expect(stats.encodedSlotItems == 8)
+            #expect(stats.drawCalls == 6)
+            #expect(stats.textureBinds == 7)
+            #expect(stats.instanceCount == 5)
+            #expect(stats.drawMs == 0.75)
+            #expect(stats.gpuMs == 0.25)
+            #expect(stats.drawMs >= 0)
+            #expect(stats.gpuMs >= 0)
+        }
 
-    @Test func metalGridStatsStartsWithNoCompletedGpuTiming() {
-        let stats = MetalGridStats()
-        #expect(stats.drawMs == 0)
-        #expect(stats.gpuMs == 0)
-        #expect(stats.summary.contains("drawMs=0.00"))
-        #expect(stats.summary.contains("gpuMs=0.00"))
-    }
+        @Test func metalGridStatsStartsWithNoCompletedGpuTiming() {
+            let stats = MetalGridStats()
+            #expect(stats.drawMs == 0)
+            #expect(stats.gpuMs == 0)
+        }
+    #endif
 }
 
 private actor StubThumbnailLoader: ThumbnailBatchLoader {

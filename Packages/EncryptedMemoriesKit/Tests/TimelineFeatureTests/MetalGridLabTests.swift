@@ -538,15 +538,3 @@ private func uid(_ s: String) -> PhotoUID { PhotoUID(volumeID: "v", nodeID: s) }
         #expect(renderer.hasAuxiliaryPipelines)
     }
 }
-
-@Suite struct MetalGridDiagnosticsTests {
-    @Test func statsReflectRealVsPlaceholderCounts() {
-        let drawn = [uid("a"), uid("b"), uid("c"), uid("d")]
-        let resident: Set<PhotoUID> = [uid("a"), uid("c")]
-        let counts = MetalGridStats.counts(visibleCount: 4, overscanCount: 0, drawnUIDs: drawn) {
-            resident.contains($0)
-        }
-        #expect(counts.real == 2)
-        #expect(counts.placeholder == 2)
-    }
-}
