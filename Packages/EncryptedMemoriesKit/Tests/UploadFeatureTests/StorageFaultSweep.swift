@@ -32,7 +32,9 @@ import XCTest
 // - Inspection: the sweep reads a state only from a copy of the files, never from the files that a restart opens.
 // - Records: the durable keys that the case declares, such as a photo's catalog row or its queue entry.
 // - State: every row of every table of the world's stores, compared for equality. A text column that holds JSON
-//   compares by content, because `JSONEncoder` writes keys in no fixed order.
+//   compares by content, because `JSONEncoder` writes keys in no fixed order. When a stored value differs between two
+//   equal runs, such as a random generation or a JSON blob, a case compares a projection of that table instead
+//   (`setSQLiteRows`).
 //
 // After every point the sweep checks these fixed rules. A case chooses only its atomicity. A case may also accept a
 // known violation of today's code at one named point (`StorageFaultAcceptance`), with its reason: the report prints it
@@ -153,6 +155,14 @@ struct StorageFaultState: Equatable {
                     database, "SELECT * FROM \"\(table)\";"
                 ).sorted()
             }
+        }
+    }
+
+    /// Sets the table `table` of the SQLite file at `url` to the rows that `sql` returns, for a table whose stored rows
+    /// differ between two equal runs, such as a random generation or bytes that `JSONEncoder` wrote.
+    mutating func setSQLiteRows(of table: String, in url: URL, sql: String) throws {
+        tables["\(url.lastPathComponent)/\(table)"] = try withSQLiteDatabase(at: url) {
+            try sqliteRows($0, sql).sorted()
         }
     }
 

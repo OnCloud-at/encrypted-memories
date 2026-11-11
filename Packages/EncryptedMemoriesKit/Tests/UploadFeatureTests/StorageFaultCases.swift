@@ -3,6 +3,7 @@ import PhotosCore
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
+@testable import ProtonDriveBackend
 @testable import UploadCore
 
 /// Every storage-changing operation in the fault-injection sweep (#1141). Add a new operation here once; the sweep
@@ -25,6 +26,11 @@ let storageFaultCases: [any StorageFaultCase] = [
     DeletionDecisionCase(keepDeleted: false, startsWithIntent: false),
     DeletionDecisionCase(keepDeleted: true, startsWithIntent: true),
     DeletionDecisionCase(keepDeleted: false, startsWithIntent: true),
+    FingerprintCacheCase(id: "fingerprints.store", step: .store),
+    FingerprintCacheCase(id: "fingerprints.advance", step: .advance),
+    FingerprintCacheCase(id: "fingerprints.discontinuity", step: .discontinuity),
+    TrashedSeriesRestoreCase(id: "trashedSeries.record", step: .record),
+    TrashedSeriesRestoreCase(id: "trashedSeries.update", step: .update),
 ]
 
 /// A deletion decision followed by launch replay, or launch replay of an already recorded intent. Both call the
@@ -549,5 +555,154 @@ struct PhotoJournalCase: StorageFaultCase {
             try SeriesDissolutionJournalFileStore(accountDataDirectory: directory, fileSystem: fileSystem).remove(
                 forSeries: photo)
         }
+    }
+}
+
+/// One transaction of the store under the exact duplicate details (`ExactDuplicateFingerprintStore`), each as
+/// `ExactDuplicateFingerprintCache` runs it:
+/// - `store`: the details of three photos saved under the cursor of the scan;
+/// - `advance`: the persisted cursor recovered as after a launch, then moved on with the details of two photos dropped;
+/// - `discontinuity`: the cursor of another key epoch, which drops every detail.
+/// Every write of the context holds a new random generation, so the state reads the context without it, and the
+/// details as text, because `JSONEncoder` writes their keys in no fixed order.
+struct FingerprintCacheCase: StorageFaultCase {
+    enum Step: Sendable {
+        case store
+        case advance
+        case discontinuity
+    }
+
+    let id: String
+    let step: Step
+    let atomicity = StorageFaultAtomicity.allOrNothing
+    private static let scope = ExactDuplicateFingerprintStore.Scope(
+        accountID: "account", volumeID: "volume", hashKeyEpoch: "epoch-1")
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let store = try open(directory, remote: remote)
+        defer { store.close() }
+        let snapshot = try XCTUnwrap(store.prepare(scope: Self.scope, eventID: "event-1"))
+        if case .store = step { return }
+        XCTAssertTrue(store.store(Self.details(of: ["a", "b", "c"]), for: snapshot))
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> ExactDuplicateFingerprintStore {
+        try XCTUnwrap(
+            ExactDuplicateFingerprintStore(
+                url: directory.appendingPathComponent(ExactDuplicateFingerprintStore.databaseFileName),
+                cacheDirectory: directory))
+    }
+
+    func faultTargets(of world: ExactDuplicateFingerprintStore) -> [Any] { [world] }
+
+    func run(_ store: ExactDuplicateFingerprintStore) async -> Bool {
+        switch step {
+        case .store:
+            guard let snapshot = store.prepare(scope: Self.scope, eventID: "event-1") else { return false }
+            return store.store(Self.details(of: ["a", "b", "c"]), for: snapshot)
+        case .advance:
+            guard let snapshot = store.prepare(scope: Self.scope, eventID: "event-1") else { return false }
+            return store.advance(from: snapshot, to: "event-2", invalidating: ["a", "b"]) != nil
+        case .discontinuity:
+            let epoch = ExactDuplicateFingerprintStore.Scope(
+                accountID: "account", volumeID: "volume", hashKeyEpoch: "epoch-2")
+            return store.prepare(scope: epoch, eventID: "event-2") != nil
+        }
+    }
+
+    func close(_ world: ExactDuplicateFingerprintStore) { world.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let url = directory.appendingPathComponent(ExactDuplicateFingerprintStore.databaseFileName)
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: url)
+        try state.setSQLiteRows(
+            of: "fingerprint", in: url, sql: "SELECT link_id, CAST(payload AS TEXT) FROM fingerprint;")
+        try state.setSQLiteRows(
+            of: "fingerprint_context", in: url,
+            sql: "SELECT json_remove(CAST(payload AS TEXT), '$.generation') FROM fingerprint_context;")
+        return state
+    }
+
+    private static func details(of nodes: [String]) -> [PhotoUID: ExactDuplicateFingerprint] {
+        Dictionary(
+            uniqueKeysWithValues: nodes.map {
+                (
+                    PhotoUID(volumeID: "volume", nodeID: $0),
+                    ExactDuplicateFingerprint(
+                        captureTime: Date(timeIntervalSince1970: 1_700_000_000), device: "camera-\($0)",
+                        pixelWidth: 100, pixelHeight: 100)
+                )
+            })
+    }
+}
+
+/// One transaction of the journal that restores the frames of a trashed series (`TrashedSeriesRestoreJournal`):
+/// - `record`: one duty replaced, a new one added, and the duty of a main photo that was trashed again dropped;
+/// - `update`: a response that settled one of the two frames of a duty.
+struct TrashedSeriesRestoreCase: StorageFaultCase {
+    enum Step: Sendable {
+        case record
+        case update
+    }
+
+    let id: String
+    let step: Step
+    let atomicity = StorageFaultAtomicity.allOrNothing
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let journal = try open(directory, remote: remote)
+        defer { journal.close() }
+        try journal.record([Self.duty(1, frames: ["f1", "f2"]), Self.duty(2, frames: ["f3"])])
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> TrashedSeriesRestoreJournal {
+        try XCTUnwrap(
+            TrashedSeriesRestoreJournal(url: directory.appendingPathComponent(TrashedSeriesRestoreJournal.fileName)))
+    }
+
+    func faultTargets(of world: TrashedSeriesRestoreJournal) -> [Any] { [world] }
+
+    func run(_ journal: TrashedSeriesRestoreJournal) async -> Bool {
+        do {
+            switch step {
+            case .record:
+                var later = Self.duty(1, frames: ["f1", "f2"])
+                later.attempts = 1
+                try journal.record(
+                    [later, Self.duty(3, frames: ["f4"])],
+                    mainTrashTimes: [PhotoUID(volumeID: "volume", nodeID: "main-2"): 2_000])
+            case .update:
+                try journal.update(Self.duty(1, frames: ["f2"]))
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func close(_ world: TrashedSeriesRestoreJournal) { world.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let url = directory.appendingPathComponent(TrashedSeriesRestoreJournal.fileName)
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: url)
+        // The payload is the JSON of the duty; compared as text, because `JSONEncoder` writes keys in no fixed order.
+        try state.setSQLiteRows(
+            of: "restore_duties", in: url,
+            sql: "SELECT volume, main, generation, CAST(payload AS TEXT) FROM restore_duties;")
+        return state
+    }
+
+    /// The duty of main photo `index`, with a fixed generation, so two runs write the same rows.
+    private static func duty(_ index: Int, frames: [String]) -> TrashedSeriesRestoreRecord {
+        let main = "main-\(index)"
+        return TrashedSeriesRestoreRecord(
+            generation: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, UInt8(index))),
+            main: PhotoUID(volumeID: "volume", nodeID: main), mainTrashTime: 1_000,
+            frames: frames.map {
+                .init(uid: PhotoUID(volumeID: "volume", nodeID: $0), mainPhotoLinkID: main, trashTime: 1_001)
+            },
+            retryAt: Date(timeIntervalSince1970: 100))
     }
 }
