@@ -23,7 +23,6 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     private let journalSizeLimitBytes: Int
     private let walCheckpointRowThreshold: Int
     private let lock = NSLock()
-    private let transient = SQLiteStoreSchemaGate.transientDestructor
     private var db: OpaquePointer?
     private var walRowsSinceCheckpoint = 0
 
@@ -122,8 +121,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             for asset in assets where seenUIDs.insert(asset.uid).inserted {
                 reset(selectAsset)
                 sqlite3_bind_int64(selectAsset, 1, accountKey)
-                bindText(selectAsset, 2, asset.uid.volumeID)
-                bindText(selectAsset, 3, asset.uid.nodeID)
+                guard bindText(selectAsset, 2, asset.uid.volumeID), bindText(selectAsset, 3, asset.uid.nodeID) else {
+                    return rollback()
+                }
 
                 let assetID: Int64
                 if sqlite3_step(selectAsset) == SQLITE_ROW {
@@ -141,20 +141,21 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                         guard sqlite3_step(invalidateWork) == SQLITE_DONE else { return rollback() }
 
                         reset(updateAsset)
-                        bindText(updateAsset, 1, asset.sourceRevision)
                         sqlite3_bind_int64(updateAsset, 2, accountKey)
                         sqlite3_bind_int64(updateAsset, 3, assetID)
-                        guard sqlite3_step(updateAsset) == SQLITE_DONE else { return rollback() }
+                        guard bindText(updateAsset, 1, asset.sourceRevision),
+                            sqlite3_step(updateAsset) == SQLITE_DONE
+                        else { return rollback() }
                         changed = true
                         invalidatedExistingPipelines = true
                     }
                 } else {
                     reset(insertAsset)
                     sqlite3_bind_int64(insertAsset, 1, accountKey)
-                    bindText(insertAsset, 2, asset.uid.volumeID)
-                    bindText(insertAsset, 3, asset.uid.nodeID)
-                    bindText(insertAsset, 4, asset.sourceRevision)
-                    guard sqlite3_step(insertAsset) == SQLITE_DONE else { return rollback() }
+                    guard bindText(insertAsset, 2, asset.uid.volumeID), bindText(insertAsset, 3, asset.uid.nodeID),
+                        bindText(insertAsset, 4, asset.sourceRevision),
+                        sqlite3_step(insertAsset) == SQLITE_DONE
+                    else { return rollback() }
                     assetID = sqlite3_last_insert_rowid(db)
                     changed = true
                 }
@@ -387,9 +388,11 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 guard let artifactID = artifactIDs[item.artifact.stableNamespace] else { continue }
                 reset(selectAsset)
                 sqlite3_bind_int64(selectAsset, 1, accountKey)
-                bindText(selectAsset, 2, item.asset.uid.volumeID)
-                bindText(selectAsset, 3, item.asset.uid.nodeID)
-                bindText(selectAsset, 4, item.asset.sourceRevision)
+                // A key that does not bind is no proof that the asset is gone, so it fails the commit.
+                guard bindText(selectAsset, 2, item.asset.uid.volumeID),
+                    bindText(selectAsset, 3, item.asset.uid.nodeID),
+                    bindText(selectAsset, 4, item.asset.sourceRevision)
+                else { return rollback() }
                 guard sqlite3_step(selectAsset) == SQLITE_ROW else { continue }
                 let assetID = sqlite3_column_int64(selectAsset, 0)
 
@@ -454,12 +457,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 } else {
                     sqlite3_bind_null(updateWork, 3)
                 }
-                if let terminalReason {
-                    bindText(updateWork, 4, terminalReason)
-                } else {
-                    sqlite3_bind_null(updateWork, 4)
+                guard bindText(updateWork, 4, terminalReason), bindBlob(updateWork, 5, ciphertext) else {
+                    return rollback()
                 }
-                if let ciphertext { bindBlob(updateWork, 5, ciphertext) } else { sqlite3_bind_null(updateWork, 5) }
                 sqlite3_bind_double(updateWork, 6, now.timeIntervalSince1970)
                 sqlite3_bind_int64(updateWork, 7, accountKey)
                 sqlite3_bind_int64(updateWork, 8, assetID)
@@ -484,8 +484,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     reset(insertToken)
                     sqlite3_bind_int64(insertToken, 1, assetID)
                     sqlite3_bind_int64(insertToken, 2, artifactID)
-                    bindBlob(insertToken, 3, digest)
-                    guard sqlite3_step(insertToken) == SQLITE_DONE else { return rollback() }
+                    guard bindBlob(insertToken, 3, digest), sqlite3_step(insertToken) == SQLITE_DONE else {
+                        return rollback()
+                    }
                 }
                 changed = true
                 changedRows += 1
@@ -528,7 +529,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             var index: Int32 = 1
             sqlite3_bind_int64(stmt, index, accountKey)
             index += 1
-            bindText(stmt, index, key.pipelineID.rawValue)
+            guard bindText(stmt, index, key.pipelineID.rawValue) else {
+                throw MLDerivedPipelineStoreError.storageUnavailable
+            }
             index += 1
             sqlite3_bind_int64(stmt, index, Int64(key.schemaVersion))
             index += 1
@@ -632,10 +635,10 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             else { return nil }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_int64(stmt, 1, accountKey)
-            bindText(stmt, 2, uid.volumeID)
-            bindText(stmt, 3, uid.nodeID)
-            bindText(stmt, 4, artifact.stableNamespace)
-            guard sqlite3_step(stmt) == SQLITE_ROW, let ciphertext = columnBlob(stmt, 0) else { return nil }
+            guard bindText(stmt, 2, uid.volumeID), bindText(stmt, 3, uid.nodeID),
+                bindText(stmt, 4, artifact.stableNamespace),
+                sqlite3_step(stmt) == SQLITE_ROW, let ciphertext = columnBlob(stmt, 0)
+            else { return nil }
             let context = MLDerivedDataCipherContext(
                 accountIdentifier: accountIdentifier,
                 uid: uid,
@@ -704,7 +707,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 for pair in group {
                     sqlite3_bind_int64(stmt, index, pair.artifactID)
                     index += 1
-                    bindBlob(stmt, index, pair.digest)
+                    guard bindBlob(stmt, index, pair.digest) else { return [] }
                     index += 1
                 }
             }
@@ -1052,13 +1055,14 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         for artifact in key.artifacts {
             if create {
                 reset(insert)
-                bindText(insert, 1, key.pipelineID.rawValue)
                 sqlite3_bind_int64(insert, 2, Int64(key.schemaVersion))
-                bindText(insert, 3, artifact.stableNamespace)
-                guard sqlite3_step(insert) == SQLITE_DONE else { return nil }
+                guard bindText(insert, 1, key.pipelineID.rawValue), bindText(insert, 3, artifact.stableNamespace),
+                    sqlite3_step(insert) == SQLITE_DONE
+                else { return nil }
             }
             reset(select)
-            bindText(select, 1, artifact.stableNamespace)
+            // A namespace that does not bind is no proof that the artifact is missing.
+            guard bindText(select, 1, artifact.stableNamespace) else { return nil }
             guard sqlite3_step(select) == SQLITE_ROW,
                 columnText(select, 1) == key.pipelineID.rawValue,
                 sqlite3_column_int64(select, 2) == Int64(key.schemaVersion)
@@ -1086,7 +1090,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         result.reserveCapacity(key.artifacts.count)
         for artifact in key.artifacts {
             reset(select)
-            bindText(select, 1, artifact.stableNamespace)
+            guard bindText(select, 1, artifact.stableNamespace) else {
+                throw MLDerivedPipelineStoreError.storageUnavailable
+            }
             switch sqlite3_step(select) {
             case SQLITE_ROW:
                 guard columnText(select, 1) == key.pipelineID.rawValue,
@@ -1114,8 +1120,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         }
         defer { sqlite3_finalize(insert) }
         if create {
-            bindText(insert, 1, identifier)
-            guard sqlite3_step(insert) == SQLITE_DONE else { return nil }
+            guard bindText(insert, 1, identifier), sqlite3_step(insert) == SQLITE_DONE else { return nil }
         }
 
         var select: OpaquePointer?
@@ -1126,8 +1131,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             )
         else { return nil }
         defer { sqlite3_finalize(select) }
-        bindText(select, 1, identifier)
-        guard sqlite3_step(select) == SQLITE_ROW else { return nil }
+        guard bindText(select, 1, identifier), sqlite3_step(select) == SQLITE_ROW else { return nil }
         return sqlite3_column_int64(select, 0)
     }
 
@@ -1140,7 +1144,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             )
         else { throw MLDerivedPipelineStoreError.storageUnavailable }
         defer { sqlite3_finalize(select) }
-        bindText(select, 1, identifier)
+        guard bindText(select, 1, identifier) else { throw MLDerivedPipelineStoreError.storageUnavailable }
         switch sqlite3_step(select) {
         case SQLITE_ROW:
             return sqlite3_column_int64(select, 0)
@@ -1157,7 +1161,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             return nil
         }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, namespace)
+        guard bindText(stmt, 1, namespace) else { return nil }
         return sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : nil
     }
 
@@ -1165,7 +1169,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         var stmt: OpaquePointer?
         guard prepare("SELECT artifact_id FROM ml_derived_artifacts WHERE pipeline_id=?;", &stmt) else { return [] }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, pipelineID)
+        guard bindText(stmt, 1, pipelineID) else { return [] }
         var ids: [Int64] = []
         while sqlite3_step(stmt) == SQLITE_ROW { ids.append(sqlite3_column_int64(stmt, 0)) }
         return ids
@@ -1206,19 +1210,17 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         var index: Int32 = 1
         sqlite3_bind_int64(stmt, index, accountKey)
         index += 1
-        bindText(stmt, index, key.pipelineID.rawValue)
+        var bound = bindText(stmt, index, key.pipelineID.rawValue)
         index += 1
         for namespace in namespaces {
-            bindText(stmt, index, namespace)
+            bound = bound && bindText(stmt, index, namespace)
             index += 1
         }
         for prefix in stagePrefixes {
-            bindText(stmt, index, prefix)
-            index += 1
-            bindText(stmt, index, prefix)
-            index += 1
+            bound = bound && bindText(stmt, index, prefix) && bindText(stmt, index + 1, prefix)
+            index += 2
         }
-        guard sqlite3_step(stmt) == SQLITE_DONE else { return nil }
+        guard bound, sqlite3_step(stmt) == SQLITE_DONE else { return nil }
         let changed = sqlite3_changes(db) > 0
         guard !changed || deleteOrphanAssetsLocked(accountKey: accountKey) else {
             return nil
@@ -1363,9 +1365,8 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         else { return false }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, accountKey)
-        bindText(stmt, 2, key.pipelineID.rawValue)
         sqlite3_bind_int64(stmt, 3, Int64(key.schemaVersion))
-        return sqlite3_step(stmt) == SQLITE_DONE
+        return bindText(stmt, 2, key.pipelineID.rawValue) && sqlite3_step(stmt) == SQLITE_DONE
     }
 
     private func bumpAllGenerationsLocked(accountKey: Int64) -> Bool {
@@ -1391,8 +1392,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         else { return false }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, accountKey)
-        bindText(stmt, 2, pipelineID)
-        return sqlite3_step(stmt) == SQLITE_DONE
+        return bindText(stmt, 2, pipelineID) && sqlite3_step(stmt) == SQLITE_DONE
     }
 
     private func generationLocked(
@@ -1408,8 +1408,8 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         else { throw MLDerivedPipelineStoreError.storageUnavailable }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, accountKey)
-        bindText(stmt, 2, key.pipelineID.rawValue)
         sqlite3_bind_int64(stmt, 3, Int64(key.schemaVersion))
+        guard bindText(stmt, 2, key.pipelineID.rawValue) else { throw MLDerivedPipelineStoreError.storageUnavailable }
         switch sqlite3_step(stmt) {
         case SQLITE_ROW:
             return UInt64(max(0, sqlite3_column_int64(stmt, 0)))
@@ -1489,14 +1489,17 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         for statement in statements { sqlite3_finalize(statement) }
     }
 
-    private func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String) {
-        sqlite3_bind_text(statement, index, value, -1, transient)
+    // Both bind helpers return false when the bind fails. A failed bind leaves its parameter NULL, so the caller must not
+    // step the statement and gives the answer of a failed statement.
+
+    /// Binds TEXT, or SQL NULL for nil.
+    private func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String?) -> Bool {
+        SQLiteBinding.text(statement, index, value) == SQLITE_OK
     }
 
-    private func bindBlob(_ statement: OpaquePointer?, _ index: Int32, _ value: Data) {
-        _ = value.withUnsafeBytes { buffer in
-            sqlite3_bind_blob(statement, index, buffer.baseAddress, Int32(buffer.count), transient)
-        }
+    /// Binds a BLOB, or SQL NULL for nil.
+    private func bindBlob(_ statement: OpaquePointer?, _ index: Int32, _ value: Data?) -> Bool {
+        SQLiteBinding.blob(statement, index, value) == SQLITE_OK
     }
 
     private func columnText(_ statement: OpaquePointer?, _ index: Int32) -> String {

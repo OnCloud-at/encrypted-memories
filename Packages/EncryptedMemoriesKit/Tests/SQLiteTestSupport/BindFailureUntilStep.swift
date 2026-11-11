@@ -71,6 +71,14 @@ public final class BindFailureUntilStep {
         }
     }
 
+    /// Nil when the limit was lowered for the target statement and that statement never started to step, so its failed
+    /// bind stopped the call before the statement ran with a NULL parameter. Otherwise the reason, for the test message.
+    public var failedBeforeStepProblem: String? {
+        if !lowered { return "The fault must reach the target statement" }
+        if stepped { return "The statement must not step after a failed bind" }
+        return nil
+    }
+
     public var effectiveLimit: Int32 {
         var effective: Int32 = 0
         withLock { effective = sqlite3_limit(database(), SQLITE_LIMIT_LENGTH, -1) }

@@ -47,27 +47,20 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         return fault
     }
 
-    private func assertFailedBeforeStep(
-        _ fault: BindFailureUntilStep, file: StaticString = #filePath, line: UInt = #line
-    ) {
-        XCTAssertTrue(fault.lowered, "The fault must reach the target statement", file: file, line: line)
-        XCTAssertFalse(fault.stepped, "A value that does not bind must not reach the statement", file: file, line: line)
-    }
-
     func testSynchronizeWithAKeyThatDoesNotBindFailsBeforeTheScratchInsert() {
         let fault = failBinds(of: "INSERT OR IGNORE INTO incoming_order", after: "CREATE TEMP TABLE incoming_order")
         defer { fault.remove() }
         XCTAssertFalse(
             store.synchronize([photo(Self.long)], classifiedUIDs: []),
             "INSERT OR IGNORE skips a scratch row without its key, so the sweep would remove the photo's row")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testSynchronizeWithAKeyThatDoesNotBindFailsBeforeTheOrderUpsert() {
         let fault = failBinds(of: "INSERT INTO photo_order", after: "INSERT OR IGNORE INTO incoming_order")
         defer { fault.remove() }
         XCTAssertFalse(store.synchronize([photo(Self.long)], classifiedUIDs: []))
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     /// The limit drops after the sweep page read: a lowered limit also fails a read of the long key.
@@ -77,7 +70,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         defer { fault.remove() }
         XCTAssertFalse(
             store.synchronize([photo(Self.long)], classifiedUIDs: []), "A sweep that removed nothing is not complete")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testSweepPageWithACursorThatDoesNotBindFailsTheSynchronization() {
@@ -87,7 +80,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertFalse(
             store.synchronize([photo(Self.long)], classifiedUIDs: []),
             "A sweep page that does not bind is no proof that the sweep reached the end")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testNextPageWithACursorThatDoesNotBindIsAReadFailure() {
@@ -95,7 +88,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         let fault = failBinds(of: "SELECT vol,node,t,")
         defer { fault.remove() }
         XCTAssertThrowsError(try store.nextPage(after: Self.long), "A cursor that does not bind is no end of the work")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testRecordWithAKeyThatDoesNotBindFailsBeforeTheMetadataLookup() {
@@ -105,7 +98,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertFalse(
             store.record([Self.long: TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: 501))]),
             "A key that does not bind is no proof that the row needs no write")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testRecordWithAKeyThatDoesNotBindFailsBeforeTheClassificationLookup() {
@@ -115,7 +108,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertFalse(
             store.record([:], classifiedUIDs: [Self.long]),
             "A key that does not bind is no proof that the row needs no write")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testRecordWithAKeyThatDoesNotBindFailsBeforeTheMetadataUpdate() {
@@ -125,7 +118,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertFalse(
             store.record([Self.long: TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: 501))]),
             "An update that matched no row recorded nothing")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testRecordWithAStableIdentityThatDoesNotBindFailsInsteadOfStoringNull() {
@@ -135,7 +128,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertFalse(
             store.record([Self.short: TimelineOrderMetadata(stableIdentity: String(repeating: "i", count: 512))]),
             "A stable identity that does not bind must not be stored as NULL")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testRecordWithAKeyThatDoesNotBindFailsBeforeTheClassificationUpdate() {
@@ -143,7 +136,7 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         let fault = failBinds(of: "UPDATE photo_order SET mime_seen", after: "SELECT inspected,mime_seen")
         defer { fault.remove() }
         XCTAssertFalse(store.record([:], classifiedUIDs: [Self.long]), "An update that matched no row recorded nothing")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testResolvedMetadataWithAKeyThatDoesNotBindFailsItsPublication() {
@@ -155,6 +148,6 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
                 for: Self.long, metadata: TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: 501)),
                 isClassified: false),
             "A publication that matched no second published nothing")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 }
