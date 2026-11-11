@@ -30,26 +30,12 @@ final class ManualUploadSettlementBindingFailureTests: XCTestCase {
 
     private var databaseURL: URL { directory.appendingPathComponent(UploadManualSettlementStore.databaseFileName) }
 
-    private func connection() throws -> SQLiteStoreConnection {
-        try XCTUnwrap(
-            Mirror(reflecting: store!).children.first(where: { $0.label == "connection" })?.value
-                as? SQLiteStoreConnection)
-    }
+    private func connection() throws -> SQLiteStoreConnection { try storeConnection(store!) }
 
-    private func lowerLengthLimit() throws {
-        let connection = try connection()
-        connection.withLock { _ = sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, Self.limit) }
-        let effective = connection.withLock { sqlite3_limit(connection.database, SQLITE_LIMIT_LENGTH, -1) }
-        XCTAssertEqual(effective, Self.limit, "The lowered length limit must apply")
-    }
+    private func lowerLengthLimit() throws { lowerSQLiteLengthLimit(on: try connection(), to: Self.limit) }
 
     private func assertBindFailureRecorded(file: StaticString = #filePath, line: UInt = #line) throws {
-        let connection = try connection()
-        connection.withLock {
-            XCTAssertTrue(connection.operationFailed, "The failed bind must be recorded", file: file, line: line)
-            XCTAssertFalse(
-                connection.failuresAreTransient, "SQLITE_TOOBIG is a lasting failure", file: file, line: line)
-        }
+        assertRecordedBindFailure(on: try connection(), file: file, line: line)
     }
 
     /// The stored keys, read through a separate connection.
