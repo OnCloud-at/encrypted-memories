@@ -2389,6 +2389,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.retryUserResolvableWork()
             let waiting = await waitUntil { scans.count == 1 && !controller.isSyncing }
             XCTAssertTrue(waiting)
+            await controller.waitForSyncRunCompletionForTesting()
             XCTAssertEqual(controller.status.phase, .waitingForWiFi)
 
             try await assertNoAutomaticResume(controller, "The initial Wi-Fi pass has settled")
