@@ -433,6 +433,26 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         XCTAssertEqual(reopened.fingerprints(for: [first], in: snapshot), [first: details()])
     }
 
+    /// A context that cannot be read is no missing context. The recovery of a launch grants no snapshot, so the scan
+    /// reads its nodes, and it keeps every saved detail for the next launch instead of discarding them.
+    func testAContextThatCannotBeReadKeepsTheSavedDetailsAndGrantsNoSnapshot() throws {
+        let store = try open()
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        XCTAssertTrue(store.store([first: details(), second: details()], for: snapshot))
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT payload FROM fingerprint_context")
+
+        XCTAssertNil(store.prepare(scope: scope, eventID: "event"), "no snapshot without a readable context")
+        XCTAssertTrue(fault.fired)
+        fault.stop()
+        store.close()
+
+        let reopened = try open()
+        defer { reopened.close() }
+        let recovered = try XCTUnwrap(reopened.prepare(scope: scope, eventID: "event"))
+        XCTAssertEqual(recovered, snapshot, "the context stays")
+        XCTAssertEqual(reopened.fingerprints(ofGroups: [group], in: recovered).count, 2, "the details stay")
+    }
+
     func testFingerprintReadStepFailureIsRecordedAndKeepsTheRankingPath() throws {
         let store = try open()
         defer { store.close() }
