@@ -15,9 +15,10 @@ import XCTest
 //   lists every store it writes, so that a crash between the writes of two stores is a point too.
 // - Statement: one SQLite statement that starts on the connection of a SQLite fault target (SQLITE_TRACE_STMT),
 //   including BEGIN, COMMIT, ROLLBACK, PRAGMA and reads.
-// - File write: one atomic replacement, one removal, one append write or one truncation through `StorageFaultFiles`.
-//   A truncation runs only after a failed append write, on the error path, so the sweep never fails one; the writer's
-//   unit tests do.
+// - File write: one atomic replacement, one removal, one sync, one append write or one truncation through
+//   `StorageFaultFiles`. A truncation runs only after a failed append write, on the error path, so the sweep never fails
+//   one; the writer's unit tests do. A sync of a directory is named "sync directory", because each point runs in a copy
+//   of the world under another name.
 // - Point k: the k-th statement or file write of the fault-free reference run, counted across all fault targets in
 //   the order they start. The sweep visits every point once.
 // - Failure at point k: statement k fails with SQLITE_INTERRUPT; file write k fails as a full disk does, and an append
@@ -486,6 +487,14 @@ final class StorageFaultFiles: DurableFileSystem, @unchecked Sendable {
 
     func openForAppending(_ url: URL) throws -> any DurableFileAppending {
         FaultAppender(url: url, file: try local.openForAppending(url), files: self)
+    }
+
+    func synchronize(_ url: URL, isDirectory: Bool) throws {
+        if start("sync", isDirectory ? URL(fileURLWithPath: "directory") : url) {
+            fire()
+            throw Full()
+        }
+        try local.synchronize(url, isDirectory: isDirectory)
     }
 
     func remove(_ url: URL) throws {

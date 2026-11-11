@@ -1,8 +1,8 @@
 import Foundation
 
-/// The file writes under a durable file: an atomic replacement, a removal and appends to an open file. Production
-/// writes to the local disk (`LocalDurableFileSystem`). A journal keeps its records through this seam, so every write
-/// it makes can be replaced, for example to make one of them fail.
+/// The file writes under a durable file: an atomic replacement, a removal, a full sync of a file or a directory,
+/// and appends to an open file. Production writes to the local disk (`LocalDurableFileSystem`). A journal keeps its
+/// records through this seam, so every write it makes can be replaced, for example to make one of them fail.
 public protocol DurableFileSystem: Sendable {
     /// Replaces the file at `url` with `data` in one atomic step: a process that ends during the replacement leaves
     /// either the earlier bytes or `data`. No sync to disk is made, so a power loss can still lose a recent write.
@@ -11,6 +11,8 @@ public protocol DurableFileSystem: Sendable {
     func openForAppending(_ url: URL) throws -> any DurableFileAppending
     /// Removes the file at `url`. A file that does not exist throws, as `FileManager.removeItem` does.
     func remove(_ url: URL) throws
+    /// Makes the file or the directory at `url` survive a power loss: a full sync to the storage device.
+    func synchronize(_ url: URL, isDirectory: Bool) throws
 }
 
 /// An open file that a durable writer appends to.
@@ -24,8 +26,8 @@ public protocol DurableFileAppending: AnyObject {
     func close() throws
 }
 
-/// The local disk: `Data.write(to:options: .atomic)` for a replacement, `FileManager.removeItem` for a removal and a
-/// `FileHandle` for appends.
+/// The local disk: `Data.write(to:options: .atomic)` for a replacement, `FileManager.removeItem` for a removal,
+/// `fcntl(F_FULLFSYNC)` for a sync and a `FileHandle` for appends.
 public struct LocalDurableFileSystem: DurableFileSystem {
     public init() {}
 
@@ -39,6 +41,14 @@ public struct LocalDurableFileSystem: DurableFileSystem {
 
     public func remove(_ url: URL) throws {
         try FileManager.default.removeItem(at: url)
+    }
+
+    public func synchronize(_ url: URL, isDirectory: Bool) throws {
+        let flags = (isDirectory ? O_RDONLY | O_DIRECTORY : O_RDONLY | O_NOFOLLOW) | O_CLOEXEC
+        let descriptor = open(url.path, flags)
+        guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { _ = close(descriptor) }
+        guard fcntl(descriptor, F_FULLFSYNC) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
     }
 }
 

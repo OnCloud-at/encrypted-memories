@@ -1,6 +1,7 @@
 import Darwin
 import DeviceRootCore
 import Foundation
+import PhotosCore
 
 /// Account-scoped enrollment intent. Constructing this actor does not create a file.
 public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
@@ -64,26 +65,20 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
     private let fileURL: URL
     private let lockURL: URL
     private let onBeforeFileLock: (@Sendable () -> Void)?
-    private let synchronize: @Sendable (Int32, Int32) throws -> Int32
+    /// Writes and syncs the journal file. Reads and the lock file use the file manager and Darwin directly.
+    private let fileSystem: any DurableFileSystem
 
     public init(accountDataDirectory: URL) {
-        directory = accountDataDirectory
-        fileURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.json")
-        lockURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.lock")
-        onBeforeFileLock = nil
-        synchronize = Self.systemSync
+        self.init(
+            accountDataDirectory: accountDataDirectory, onBeforeFileLock: nil, fileSystem: LocalDurableFileSystem())
     }
 
-    init(
-        accountDataDirectory: URL,
-        onBeforeFileLock: (@Sendable () -> Void)?,
-        synchronize: (@Sendable (Int32, Int32) throws -> Int32)?
-    ) {
+    init(accountDataDirectory: URL, onBeforeFileLock: (@Sendable () -> Void)?, fileSystem: any DurableFileSystem) {
         directory = accountDataDirectory
         fileURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.json")
         lockURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.lock")
         self.onBeforeFileLock = onBeforeFileLock
-        self.synchronize = synchronize ?? Self.systemSync
+        self.fileSystem = fileSystem
     }
 
     public func selectedRoot() throws -> DeviceRootIdentity? {
@@ -311,21 +306,10 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
         if upgraded.selectedDeviceUID != nil, upgraded.selectedLocation == nil {
             upgraded.selectedLocation = .computer
         }
-        try JSONEncoder().encode(upgraded).write(to: fileURL, options: .atomic)
+        try fileSystem.replace(fileURL, with: JSONEncoder().encode(upgraded))
         // The dispatch reservation must survive power loss before a remote create starts.
-        try fullSync(fileURL, flags: O_RDONLY | O_NOFOLLOW)
-        try fullSync(directory, flags: O_RDONLY | O_DIRECTORY)
-    }
-
-    static func systemSync(_ descriptor: Int32, command: Int32) -> Int32 {
-        Darwin.fcntl(descriptor, command)
-    }
-
-    private func fullSync(_ url: URL, flags: Int32) throws {
-        let descriptor = Darwin.open(url.path, flags | O_CLOEXEC)
-        guard descriptor >= 0 else { throw posixError() }
-        defer { _ = Darwin.close(descriptor) }
-        guard try synchronize(descriptor, F_FULLFSYNC) == 0 else { throw posixError() }
+        try fileSystem.synchronize(fileURL, isDirectory: false)
+        try fileSystem.synchronize(directory, isDirectory: true)
     }
 
     private func posixError() -> NSError {

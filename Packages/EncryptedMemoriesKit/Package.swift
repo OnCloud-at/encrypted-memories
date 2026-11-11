@@ -313,9 +313,11 @@ let package = Package(
         .testTarget(name: "AccountStateCoreTests", dependencies: ["AccountStateCore", "PhotosCore"]),
         .target(name: "DeviceRootCore"),
         .testTarget(name: "DeviceRootCoreTests", dependencies: ["DeviceRootCore"]),
-        .target(name: "DeviceRootAppleAdapter", dependencies: ["DeviceRootCore"]),
+        // PhotosCore: the journal writes and syncs its file through the durable file seam.
+        .target(name: "DeviceRootAppleAdapter", dependencies: ["DeviceRootCore", "PhotosCore"]),
         .testTarget(
-            name: "DeviceRootAppleAdapterTests", dependencies: ["DeviceRootAppleAdapter", "DeviceRootCore"]),
+            name: "DeviceRootAppleAdapterTests",
+            dependencies: ["DeviceRootAppleAdapter", "DeviceRootCore", "PhotosCore"]),
         .target(name: "UploadCore", dependencies: ["PhotosCore"]),
         .target(
             name: "UploadTestSupport", dependencies: ["UploadCore"], path: "Tests/UploadTestSupport"),
@@ -334,6 +336,8 @@ let package = Package(
                 "UploadTestSupport", "SQLiteTestSupport",
                 // The Duplicates screenshots render the shared viewer with its merge tools.
                 "PhotoViewerFeature", "MediaCache", "MediaByteCache", "ProtonDriveBackend",
+                // The fault-injection sweep fails the writes of the device root enrollment journal.
+                "DeviceRootAppleAdapter", "DeviceRootCore",
                 .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
             ]),
         .target(
