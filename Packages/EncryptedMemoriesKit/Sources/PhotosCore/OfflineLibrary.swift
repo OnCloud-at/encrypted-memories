@@ -10,6 +10,10 @@ public enum AppSettingsKey {
     public static let mapAndPlacesEnabled = "EncryptedMemories.mapAndPlacesEnabled"
     /// Covers app windows before the system captures an inactive preview.
     public static let blurAppPreview = "EncryptedMemories.blurAppPreview"
+    /// Asks for the device owner's authentication before the app shows content. Stored on this device only.
+    public static let appLockEnabled = "EncryptedMemories.appLockEnabled"
+    /// How long the app may stay in the background before the app lock asks again, in seconds.
+    public static let appLockGracePeriodSeconds = "EncryptedMemories.appLockGracePeriodSeconds"
     /// Offline Photo Library master switch. When on, full-resolution originals viewed in the photo viewer are
     /// persisted to the encrypted on-disk `originals` cache so reopening them (even after relaunch / offline) is
     /// instant. Grid thumbnails are mandatory infrastructure and crawl independently of this toggle.
@@ -48,6 +52,10 @@ public enum AppSettingsDefault {
     public static let mapAndPlacesEnabled = true
     /// Hide the iOS and iPadOS App Switcher preview unless explicitly disabled.
     public static let blurAppPreview = true
+    /// The app lock stays off until the person turns it on.
+    public static let appLockEnabled = false
+    /// The app lock asks again after 30 seconds in the background unless the person picks another time.
+    public static let appLockGracePeriodSeconds = 30
     /// Offline Photo Library is **on by default**: viewed originals are kept locally (encrypted) up to the cap.
     /// Thumbnails are always crawled while signed in, regardless of this value.
     public static let offlineLibraryEnabled = true
