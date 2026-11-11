@@ -175,13 +175,22 @@ import XCTest
                     try XCTUnwrap(fixture.pending.nextEffectDate()).timeIntervalSince(fixture.clock.now), 61,
                     accuracy: 0.001,
                     "The first recheck must register at the configured first delay, not at the production one")
-                fixture.clockGate.release()
+                let rechecked = expectation(description: "The restored source publishes its settled recheck")
+                fixture.session.onPendingChange = { _ in
+                    guard fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) else { return }
+                    fixture.session.onPendingChange = nil
+                    rechecked.fulfill()
+                }
+                defer { fixture.session.onPendingChange = nil }
+                // Keep the recheck parked while the queue drains; releasing fake time can run the whole ladder.
                 await assertEventually { fixture.session.excludedTiles.isEmpty }
                 await fixture.drain()
                 XCTAssertTrue(
                     try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision)).state
                         .isTerminalSuccess)
-                await assertEventually { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
+                fixture.clockGate.release()
+                await fulfillment(of: [rechecked], timeout: 10)
+                XCTAssertTrue(fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil))
             }
         }
 
