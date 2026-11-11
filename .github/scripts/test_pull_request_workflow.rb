@@ -319,7 +319,7 @@ class PullRequestWorkflowTests < Minitest::Test
 
   # Runs the real step of the superseded-run watchdog with a fake `gh`. The fetch and the decode of the
   # decision script run for real. The first queue read lists `entry_oids`, every later read lists `later_oids`.
-  # A `sitecustomize` makes the real script skip its 60 second waits, and every case ends by itself.
+  # A `sitecustomize` advances a bounded monotonic clock instead of waiting 60 seconds.
   def run_superseded_watchdog(entry_oids:, worker_status:, later_oids: nil, contents_ok: true, cancel_exit: 0,
                               cancel_message: "")
     step = @workflow.fetch("jobs").fetch(SUPERSEDED_WATCHDOG).fetch("steps").first
@@ -331,9 +331,20 @@ class PullRequestWorkflowTests < Minitest::Test
       [["queue.0.json", entry_oids], ["queue.1.json", later_oids || entry_oids]].each do |file, oids|
         nodes = oids.map { |oid| {"state" => "BUILDABLE", "headCommit" => {"oid" => oid}} }
         File.write(File.join(dir, file),
-                   JSON.generate([{"data" => {"repository" => {"mergeQueue" => {"entries" => {"nodes" => nodes}}}}}]))
+                   JSON.generate([{"data" => {"repository" => {"mergeQueue" => {"entries" => {
+                     "nodes" => nodes, "pageInfo" => {"endCursor" => nil, "hasNextPage" => false}
+                   }}}}}]))
       end
-      File.write(File.join(dir, "sitecustomize.py"), "import time\ntime.sleep = lambda seconds: None\n")
+      File.write(File.join(dir, "sitecustomize.py"), <<~PY)
+        import time
+        clock = [0]
+        time.monotonic = lambda: clock[0]
+        def sleep(seconds):
+            clock[0] += seconds
+            if clock[0] > 180:
+                raise RuntimeError("watchdog fixture did not finish")
+        time.sleep = sleep
+      PY
       rows = WORKER_JOBS.map do |id|
         {"name" => @workflow.fetch("jobs").fetch(id).fetch("name"), "status" => worker_status, "conclusion" => nil}
       end
@@ -379,11 +390,12 @@ class PullRequestWorkflowTests < Minitest::Test
     status, cancelled, out = run_superseded_watchdog(entry_oids: ["f" * 40], later_oids: ["e" * 40],
                                                     worker_status: "in_progress")
     assert_equal [0, ["4242"]], [status, cancelled]
+    assert_equal ["Poll: KEEP.", "Poll: UNKNOWN.", "Poll: CANCEL."], out.lines.map(&:strip).grep(/^Poll:/)
     assert_includes out, "The run is cancelled."
     # Every worker is complete: the run merged or is finishing, so nothing is cancelled.
     status, cancelled, out = run_superseded_watchdog(entry_oids: ["e" * 40, "f" * 40], worker_status: "completed")
     assert_equal [0, []], [status, cancelled]
-    assert_includes out, "All worker jobs finished without a failure."
+    assert_includes out, "Poll: KEEP; all worker jobs finished without a failure."
     # A cancel of an already ended run counts as a success.
     status, cancelled, = run_superseded_watchdog(entry_oids: ["f" * 40], later_oids: ["e" * 40],
                                                 worker_status: "in_progress",
