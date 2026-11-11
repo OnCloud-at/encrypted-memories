@@ -224,7 +224,7 @@ private let feedCacheTestKey = SymmetricKey(size: .bits256)
     #expect(!ranOnMainThread)
 }
 
-private actor RecordingLoader: ThumbnailBatchLoader {
+actor RecordingLoader: ThumbnailBatchLoader {
     private var order: [PhotoUID] = []
     private var finishedBatchCount = 0
     private let payloads: [PhotoUID: Data]
@@ -287,7 +287,7 @@ private actor RecordingLoader: ThumbnailBatchLoader {
     func finishedBatches() -> Int { finishedBatchCount }
 }
 
-private actor CancellationAwareLoader: ThumbnailBatchLoader {
+actor CancellationAwareLoader: ThumbnailBatchLoader {
     private var requested: [PhotoUID] = []
     private var cancellationCount = 0
     private let delay: Duration
@@ -315,7 +315,7 @@ private actor CancellationAwareLoader: ThumbnailBatchLoader {
     func cancellations() -> Int { cancellationCount }
 }
 
-private actor ControlledLateLoader: ThumbnailBatchLoader {
+actor ControlledLateLoader: ThumbnailBatchLoader {
     private let payloads: [PhotoUID: Data]
     private var requested: [PhotoUID] = []
     private var continuation: CheckedContinuation<Void, Never>?
@@ -501,7 +501,7 @@ private actor PriorityRecordingLoader: PriorityThumbnailBatchLoader {
 }
 
 /// Advanceable monotonic clock for deterministic demand-window tests (no real sleeps / wall-clock reliance).
-private final class MutableClock: @unchecked Sendable {
+final class MutableClock: @unchecked Sendable {
     private let lock = NSLock()
     private var current: Date
     init(_ start: Date) { current = start }
@@ -4416,7 +4416,7 @@ struct ThumbnailFeedCoreTests {
             await feed.stopPrefetchAndWait()
         }
 
-        private static func waitForLeaseTest(_ condition: @Sendable () async -> Bool) async -> Bool {
+        static func waitForLeaseTest(_ condition: @Sendable () async -> Bool) async -> Bool {
             let deadline = ContinuousClock.now.advanced(by: .seconds(10))
             while ContinuousClock.now < deadline {
                 if await condition() { return true }
@@ -4882,7 +4882,7 @@ struct ThumbnailFeedCoreTests {
 
     private enum CrawlWaitError: Error { case timedOut }
 
-    private static func waitForCrawl(_ feed: ThumbnailFeedCore) async throws {
+    static func waitForCrawl(_ feed: ThumbnailFeedCore) async throws {
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask { try await feed.waitForPrefetchToFinish() }
             group.addTask {
@@ -5111,7 +5111,7 @@ private func makeCGImage(width: Int, height: Int) -> CGImage {
     )!
 }
 
-private func makePNGData(width: Int, height: Int) -> Data {
+func makePNGData(width: Int, height: Int) -> Data {
     let image = makeCGImage(width: width, height: height)
     let data = NSMutableData()
     let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
