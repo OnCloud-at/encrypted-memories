@@ -105,6 +105,7 @@ private final class RecoveryIdentityRecorder: UploadIdentityResolving, @unchecke
     private var values: [Record] = []
     private var remainingFailures: Int
     private let preflight: UploadPreflightResult?
+    var onRecord: (@Sendable () -> Void)?
 
     init(failures: Int = 0, preflight: UploadPreflightResult? = nil) {
         remainingFailures = failures
@@ -124,6 +125,7 @@ private final class RecoveryIdentityRecorder: UploadIdentityResolving, @unchecke
         remoteVolumeID: String,
         remoteLinkID: String
     ) async throws {
+        onRecord?()
         let shouldFail = lock.withLock {
             if remainingFailures > 0 {
                 remainingFailures -= 1
@@ -243,6 +245,177 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: tempDirectory)
+    }
+
+    func testReceiptHandoffPrecedesIdentityOnRunnerAndRecovery() async throws {
+        for runsInRunner in [false, true] {
+            for secondary in [false, true] {
+                let name = "order-\(runsInRunner)-\(secondary)"
+                let primary = source(name)
+                let uploaded = secondary ? source(name, resource: .livePairedVideo) : primary
+                let descriptor = descriptor(source: uploaded, filename: "\(name).heic", fileExists: false)
+                let receipt = reconciliation(descriptor: descriptor, queueSource: primary)
+                let entry = seedEntry(source: primary, reconciliation: receipt)
+                let queue = try XCTUnwrap(
+                    UploadBackupSyncQueueManifestStore(url: tempDirectory.appendingPathComponent("\(name).sqlite")))
+                defer { queue.close() }
+                XCTAssertTrue(queue.upsert(entry))
+                let pending = try XCTUnwrap(
+                    PendingBackupManifestStore(url: tempDirectory.appendingPathComponent("\(name)-pending.sqlite")))
+                defer { pending.close() }
+                let events = PendingBackupEventRecorder(store: pending)
+                defer { events.finish() }
+                let identities = RecoveryIdentityRecorder()
+                identities.onRecord = {
+                    let handoffs = pending.unacknowledgedHandoffs()
+                    XCTAssertEqual(handoffs.map(\.key), secondary ? [] : [PendingSourceKey(primary)], name)
+                    XCTAssertEqual(handoffs.map(\.revision), secondary ? [] : [entry.revision], name)
+                    XCTAssertEqual(handoffs.map(\.kind), secondary ? [] : [.uploaded], name)
+                    XCTAssertEqual(
+                        handoffs.map(\.remote),
+                        secondary ? [] : [PhotoUID(volumeID: "remote-volume", nodeID: "remote-primary")], name)
+                    XCTAssertEqual(
+                        try? queue.entry(for: primary, revision: entry.revision)?.remoteCommitReconciliation,
+                        receipt, "The receipt remains while the manifest records \(name)")
+                }
+                let primaryDescriptor = self.descriptor(source: primary, filename: "\(name).heic", fileExists: false)
+                let resolver = RecoveryResourceResolver(
+                    .value(
+                        resolvedResource(
+                            queueSource: primary, revision: entry.revision, descriptor: primaryDescriptor,
+                            secondaries: secondary ? [.init(descriptor: descriptor, mediaType: "video/quicktime")] : [])
+                    ))
+                let uploader = MockUploader()
+                let state = try XCTUnwrap(
+                    UploadBackupStateManifestStore(
+                        url: tempDirectory.appendingPathComponent("\(name)-state.sqlite")))
+                defer { state.close() }
+                if runsInRunner {
+                    let runner = BackupSyncRunner(
+                        queue: queue, preflight: UploadBackupPreflightIndex(store: state),
+                        resolver: resolver, identityResolver: identities, uploader: uploader, events: events)
+                    _ = await runner.runUntilDrained(mode: .eligibleOnly)
+                } else {
+                    let settled = try await UploadRemoteCommitRecovery(
+                        queue: queue, resolver: resolver, identityResolver: identities, events: events
+                    ).settleAll()
+                    XCTAssertEqual(settled, 1, name)
+                }
+                XCTAssertEqual(
+                    identities.records.map(\.descriptor), [UploadResourceDescriptorSnapshot(descriptor)], name)
+                XCTAssertEqual(identities.records.map(\.identity), [receipt.identity], name)
+                XCTAssertEqual(identities.records.map(\.volumeID), [receipt.receipt.remoteVolumeID], name)
+                XCTAssertEqual(identities.records.map(\.linkID), [receipt.receipt.remoteLinkID], name)
+                XCTAssertTrue(uploader.requests.isEmpty, name)
+            }
+        }
+    }
+
+    func testRunnerRecordsHandoffBeforeParkingAMissingReceiptDescriptor() async throws {
+        let primary = source("missing-receipt-descriptor")
+        let descriptor = descriptor(source: primary, filename: "missing.heic", fileExists: false)
+        let receipt = reconciliation(descriptor: descriptor)
+        let entry = seedEntry(reconciliation: receipt)
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL()))
+        defer { queue.close() }
+        XCTAssertTrue(queue.upsert(entry))
+        let pending = try XCTUnwrap(
+            PendingBackupManifestStore(
+                url: tempDirectory.appendingPathComponent("pending.sqlite")))
+        defer { pending.close() }
+        let state = try XCTUnwrap(
+            UploadBackupStateManifestStore(
+                url: tempDirectory.appendingPathComponent("state.sqlite")))
+        defer { state.close() }
+        let events = PendingBackupEventRecorder(store: pending)
+        defer { events.finish() }
+        let identities = RecoveryIdentityRecorder()
+        let missing = self.descriptor(source: source("another-source"), filename: "other.heic", fileExists: false)
+        let resolver = RecoveryResourceResolver(
+            .value(
+                resolvedResource(
+                    queueSource: primary, revision: entry.revision, descriptor: missing)))
+        let runner = BackupSyncRunner(
+            queue: queue, preflight: UploadBackupPreflightIndex(store: state), resolver: resolver,
+            identityResolver: identities, uploader: MockUploader(), events: events)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let parked = try XCTUnwrap(queue.entry(for: primary, revision: entry.revision))
+        XCTAssertEqual(parked.state, .needsRemoteReconciliation)
+        XCTAssertEqual(parked.remoteCommitReconciliation, receipt)
+        XCTAssertEqual(
+            BackupIssueRecord.decode(parked.lastError)?.detail,
+            "Committed resource is not currently available for local reconciliation.")
+        XCTAssertEqual(
+            pending.unacknowledgedHandoffs().map(\.remote),
+            [PhotoUID(volumeID: "remote-volume", nodeID: "remote-primary")])
+        XCTAssertTrue(identities.records.isEmpty)
+    }
+
+    func testReceiptWriteFailuresParkTheRunnerAndThrowFromRecovery() async throws {
+        for runsInRunner in [false, true] {
+            for handoffFails in [false, true] {
+                let name = "failure-\(runsInRunner)-\(handoffFails)"
+                let source = source(name)
+                let descriptor = descriptor(source: source, filename: "\(name).heic", fileExists: false)
+                let receipt = reconciliation(descriptor: descriptor)
+                let entry = seedEntry(reconciliation: receipt)
+                let queue = try XCTUnwrap(
+                    UploadBackupSyncQueueManifestStore(url: tempDirectory.appendingPathComponent("\(name).sqlite")))
+                defer { queue.close() }
+                XCTAssertTrue(queue.upsert(entry))
+                let pendingURL = tempDirectory.appendingPathComponent("\(name)-pending.sqlite")
+                let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+                defer { pending.close() }
+                if handoffFails {
+                    try executeSQL(
+                        "CREATE TRIGGER refuse_receipt_handoff BEFORE INSERT ON handoff BEGIN SELECT RAISE(ABORT, 'refused handoff'); END;",
+                        at: pendingURL)
+                }
+                let events = PendingBackupEventRecorder(store: pending)
+                defer { events.finish() }
+                let identities = RecoveryIdentityRecorder(failures: handoffFails ? 0 : 1)
+                let resolver = RecoveryResourceResolver(
+                    .value(
+                        resolvedResource(
+                            queueSource: source, revision: entry.revision, descriptor: descriptor)))
+                let uploader = MockUploader()
+                let state = try XCTUnwrap(
+                    UploadBackupStateManifestStore(
+                        url: tempDirectory.appendingPathComponent("\(name)-state.sqlite")))
+                defer { state.close() }
+                if runsInRunner {
+                    let runner = BackupSyncRunner(
+                        queue: queue, preflight: UploadBackupPreflightIndex(store: state),
+                        resolver: resolver, identityResolver: identities, uploader: uploader, events: events)
+                    _ = await runner.runUntilDrained(mode: .eligibleOnly)
+                    let parked = try XCTUnwrap(queue.entry(for: source, revision: entry.revision))
+                    XCTAssertEqual(parked.state, .needsRemoteReconciliation, name)
+                    XCTAssertEqual(
+                        BackupIssueRecord.decode(parked.lastError)?.detail,
+                        handoffFails ? "Pending handoff could not be persisted." : "injected manifest failure", name)
+                } else {
+                    do {
+                        _ = try await UploadRemoteCommitRecovery(
+                            queue: queue, resolver: resolver, identityResolver: identities, events: events
+                        ).settleAll()
+                        XCTFail("The failed write must throw: \(name)")
+                    } catch let error as UploadRemoteCommitRecoveryError {
+                        XCTAssertTrue(handoffFails, name)
+                        XCTAssertEqual(error, .storeUnavailable, name)
+                    } catch let error as UploadError {
+                        XCTAssertFalse(handoffFails, name)
+                        guard case .backend(let message) = error else { return XCTFail("Unexpected error: \(error)") }
+                        XCTAssertEqual(message, "injected manifest failure", name)
+                    }
+                }
+                XCTAssertEqual(
+                    try queue.entry(for: source, revision: entry.revision)?.remoteCommitReconciliation,
+                    receipt, name)
+                XCTAssertTrue(identities.records.isEmpty, name)
+                XCTAssertEqual(pending.unacknowledgedHandoffs().count, handoffFails ? 0 : 1, name)
+                XCTAssertTrue(uploader.requests.isEmpty, name)
+            }
+        }
     }
 
     func testPersistedDescriptorRecoversCheckingPrimaryAfterReopenWithoutLocalRead() async throws {
