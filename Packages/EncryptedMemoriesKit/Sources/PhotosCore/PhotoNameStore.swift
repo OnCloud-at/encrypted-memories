@@ -41,17 +41,10 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
         key = HKDF<SHA256>.deriveKey(
             inputKeyMaterial: input, salt: salt, info: Data("photo-names".utf8), outputByteCount: 32)
         let url = directory.appendingPathComponent(Self.databaseFileName)
+        let version = SQLiteUserVersion(version: 1)
         db = SQLiteStoreSchemaGate.openRebuildableStore(
             at: url, schemaSQL: Self.schema, policy: policy,
-            verifyVersion: { handle in
-                var stmt: OpaquePointer?
-                guard sqlite3_prepare_v2(handle, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK else {
-                    return false
-                }
-                defer { sqlite3_finalize(stmt) }
-                return sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1
-            },
-            stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK })
+            verifyVersion: version.verify, stampVersion: version.stamp)
         guard db != nil else { return nil }
     }
 
