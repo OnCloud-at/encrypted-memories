@@ -654,18 +654,16 @@ public actor MLModelInstaller {
     ) throws -> MLModelInstallRecord {
         let fm = FileManager.default
         let normalizedSpecs = specs.sorted { $0.relativePath < $1.relativePath }
-        guard let modelRootPath = modelRootPath(in: normalizedSpecs) else {
+        guard let modelRootPath = MLModelInstallLayout.modelRootPath(in: normalizedSpecs.map(\.relativePath)) else {
             throw MLModelInstallError.ambiguousModelArtifact
         }
         let installedPaths = Set(normalizedSpecs.map(\.relativePath))
         let permittedSidecars = Set(entry.runtimeResourcePaths)
         guard
-            installedPaths.allSatisfy({ path in
-                path == modelRootPath
-                    || path.hasPrefix(modelRootPath + "/")
-                    || permittedSidecars.contains(path)
-            }),
-            permittedSidecars.isSubset(of: installedPaths),
+            MLModelInstallLayout.artifactPathsArePermitted(
+                installedPaths, root: modelRootPath, sidecars: permittedSidecars
+            ),
+            MLModelInstallLayout.firstMissingSidecar(entry.runtimeResourcePaths, in: installedPaths) == nil,
             validateInstallTree(
                 at: staging,
                 artifacts: normalizedSpecs,
@@ -758,7 +756,7 @@ public actor MLModelInstaller {
                     && artifact.byteCount > 0
             }),
             record.installedByteCount == record.artifacts.reduce(Int64(0), { $0 + $1.byteCount }),
-            record.modelRootPath == modelRootPath(in: record.artifacts),
+            record.modelRootPath == MLModelInstallLayout.modelRootPath(in: record.artifacts.map(\.relativePath)),
             expectedArtifacts.map({
                 $0.sorted { $0.relativePath < $1.relativePath } == record.artifacts
             }) ?? true,
@@ -773,24 +771,6 @@ public actor MLModelInstaller {
             guard verifyFile(at: url, against: artifact) == nil else { return nil }
         }
         return record
-    }
-
-    private static func modelRootPath(in artifacts: [MLModelArtifactSpec]) -> String? {
-        let roots = Set(
-            artifacts.compactMap { artifact -> String? in
-                let component = artifact.relativePath.split(separator: "/", maxSplits: 1).first.map(String.init)
-                guard let component,
-                    component.lowercased().hasSuffix(".mlmodelc")
-                        || component.lowercased().hasSuffix(".mlpackage")
-                else { return nil }
-                return component
-            })
-        guard roots.count == 1, let root = roots.first,
-            artifacts.contains(where: { $0.relativePath.hasPrefix(root + "/") })
-        else {
-            return nil
-        }
-        return root
     }
 
     private static func validateInstallTree(
@@ -880,7 +860,7 @@ public actor MLModelInstaller {
             options: [.skipsHiddenFiles]
         )
         let modelRoots = contents.filter { url in
-            guard ["mlmodelc", "mlpackage"].contains(url.pathExtension.lowercased()),
+            guard MLModelInstallLayout.isModelExtension(url.pathExtension),
                 let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             else {
                 return false

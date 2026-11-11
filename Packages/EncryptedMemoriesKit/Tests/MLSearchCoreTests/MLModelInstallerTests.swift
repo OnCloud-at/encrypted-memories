@@ -125,6 +125,7 @@ import Testing
     private func entry(
         id: String,
         plan: MLModelDownloadPlan?,
+        runtimeResourcePaths: [String] = [],
         track: MLModelReleaseTrack = .production,
         license: MLModelLicense = .mit,
         qualification: MLModelReleaseQualification? = nil
@@ -136,6 +137,7 @@ import Testing
             descriptor: MLModelDescriptor(identifier: id, version: 1, embeddingDimension: 4),
             tokenizerID: "test-tokenizer",
             preprocessingID: "test-preprocessing",
+            runtimeResourcePaths: runtimeResourcePaths,
             license: license,
             releaseTrack: track,
             estimatedInstalledBytes: 100,
@@ -237,7 +239,7 @@ import Testing
 
     @Test(arguments: [
         "missing", "checksum", "record", "record-directory", "record-symlink", "revision", "compatibility", "extra",
-        "symlink",
+        "symlink", "root",
     ])
     func interruptedUnverifiableRecordDiscardsStagingAndDownloadsEveryArtifact(damage: String) async throws {
         let root = try makeRoot()
@@ -269,10 +271,12 @@ import Testing
             try FileManager.default.removeItem(at: recordURL)
             try FileManager.default.createSymbolicLink(
                 at: recordURL, withDestinationURL: root.appendingPathComponent("absent-record.json"))
-        case "revision", "compatibility":
+        case "revision", "compatibility", "root":
             var json = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: recordURL)) as? [String: Any])
             if damage == "revision" {
                 json["revision"] = "another-revision"
+            } else if damage == "root" {
+                json["modelRootPath"] = "Other.mlmodelc"
             } else {
                 var compatibility = try #require(json["compatibility"] as? [String: Any])
                 compatibility["tokenizerID"] = "another-tokenizer"
@@ -421,6 +425,116 @@ import Testing
 
         await #expect(throws: MLModelInstallError.ambiguousModelArtifact) {
             _ = try await installer.install(testEntry) { _ in }
+        }
+    }
+
+    @Test(arguments: [
+        ["loose.bin"],
+        ["NotModel/weights.bin"],
+        ["First.mlmodelc/a", "Second.mlpackage/b"],
+        ["Model.mlmodelc/a", "unexpected.json"],
+        ["Model.mlmodelc/a", "Model.mlmodelc-extra/b"],
+        ["Model.MLMODELC/a", "tokenizer.json"],
+    ])
+    func downloadedInstallChecksModelLayout(paths: [String]) async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data("model".utf8)
+        let urls = paths.indices.map { URL(string: "https://example.test/\($0)")! }
+        let items = zip(paths, urls).map { path, url in
+            MLModelDownloadPlan.Item(
+                url: url, artifact: .init(relativePath: path, sha256: sha256(payload), byteCount: Int64(payload.count))
+            )
+        }
+        let installer = MLModelInstaller(
+            layout: MLModelInstallLayout(rootDirectory: root),
+            transport: ScriptedTransport(payloads: Dictionary(uniqueKeysWithValues: urls.map { ($0, payload) }))
+        )
+        // Declare both paths as sidecars in the two-root case so only root uniqueness rejects it.
+        let sidecars: [String]
+        if paths.first == "First.mlmodelc/a" {
+            sidecars = paths
+        } else {
+            sidecars = paths.contains("tokenizer.json") ? ["tokenizer.json"] : []
+        }
+        let testEntry = entry(
+            id: "layout-model", plan: .init(revision: "r1", items: items), runtimeResourcePaths: sidecars)
+        if paths.contains("tokenizer.json") {
+            let record = try await installer.install(testEntry) { _ in }
+            #expect(record.modelRootPath == "Model.MLMODELC")
+        } else {
+            await #expect(throws: MLModelInstallError.ambiguousModelArtifact) {
+                _ = try await installer.install(testEntry) { _ in }
+            }
+        }
+    }
+
+    @Test func downloadedInstallRequiresDeclaredSidecar() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data("model".utf8)
+        let url = URL(string: "https://example.test/model")!
+        let installer = MLModelInstaller(
+            layout: MLModelInstallLayout(rootDirectory: root),
+            transport: ScriptedTransport(payloads: [url: payload])
+        )
+        let testEntry = entry(
+            id: "missing-sidecar", plan: plan(files: [("weights.bin", payload, url)]),
+            runtimeResourcePaths: ["tokenizer.json"]
+        )
+        await #expect(throws: MLModelInstallError.ambiguousModelArtifact) {
+            _ = try await installer.install(testEntry) { _ in }
+        }
+    }
+
+    @Test(arguments: [
+        "file-root", "wrong-extension-root", "symlink-root", "symlink-child", "sidecar-directory", "sidecar-symlink",
+        "sidecar-unsafe",
+    ])
+    func localInstallRejectsUnsafeRootsAndSidecars(kind: String) async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let model = source.appendingPathComponent(kind == "wrong-extension-root" ? "Model.txt" : "Model.mlmodelc")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let sidecar = source.appendingPathComponent("tokenizer.json")
+        if kind == "file-root" {
+            try Data("model".utf8).write(to: model)
+        } else if kind == "symlink-root" {
+            let target = root.appendingPathComponent("target", isDirectory: true)
+            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: model, withDestinationURL: target)
+        } else {
+            try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+            let weights = model.appendingPathComponent("weights.bin")
+            try Data("model".utf8).write(to: weights)
+            if kind == "symlink-child" {
+                try FileManager.default.createSymbolicLink(
+                    at: model.appendingPathComponent("link"), withDestinationURL: weights)
+            } else if kind == "sidecar-directory" {
+                try FileManager.default.createDirectory(at: sidecar, withIntermediateDirectories: true)
+            } else if kind == "sidecar-symlink" {
+                try FileManager.default.createSymbolicLink(at: sidecar, withDestinationURL: weights)
+            }
+        }
+        let installer = MLModelInstaller(
+            layout: MLModelInstallLayout(rootDirectory: root.appendingPathComponent("install")),
+            transport: ScriptedTransport(payloads: [:])
+        )
+        let required =
+            kind == "sidecar-unsafe" ? ["../tokenizer.json"] : (kind.hasPrefix("sidecar-") ? ["tokenizer.json"] : [])
+        let expected: MLModelInstallError =
+            switch kind {
+            case "file-root", "wrong-extension-root", "symlink-root": .artifactMissing("*.mlmodelc or *.mlpackage")
+            case "symlink-child": .unsafeArtifactPath("link")
+            case "sidecar-unsafe": .unsafeArtifactPath("../tokenizer.json")
+            default: .artifactMissing("tokenizer.json")
+            }
+        await #expect(throws: expected) {
+            _ = try await installer.installFromLocalArtifact(
+                entry(id: "local-layout", plan: nil, runtimeResourcePaths: required, track: .developerOnly),
+                artifactDirectory: source
+            )
         }
     }
 
@@ -788,12 +902,13 @@ import Testing
         }
     #endif
 
-    @Test func localDeveloperInstallHashesAndInstallsContent() async throws {
+    @Test(arguments: ["Test.mlmodelc", "Test.MLPACKAGE", "model..mlmodelc", "model.v1.mlpackage"])
+    func localDeveloperInstallHashesAndInstallsContent(modelName: String) async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let layout = MLModelInstallLayout(rootDirectory: root)
         let source = root.appendingPathComponent("dev-artifact", isDirectory: true)
-        let model = source.appendingPathComponent("Test.mlmodelc", isDirectory: true)
+        let model = source.appendingPathComponent(modelName, isDirectory: true)
         try FileManager.default.createDirectory(
             at: model.appendingPathComponent("Weights"), withIntermediateDirectories: true)
         try Data("manifest".utf8).write(to: model.appendingPathComponent("Manifest.json"))
@@ -813,9 +928,30 @@ import Testing
         // A record whose files were tampered with (size change) is no longer trusted.
         try Data("weights-tampered".utf8).write(
             to: layout.installDirectory(for: testEntry.id, revision: record.revision)
-                .appendingPathComponent("Test.mlmodelc/Weights/weight.bin")
+                .appendingPathComponent(modelName + "/Weights/weight.bin")
         )
         #expect(installer.anyInstalledRecord(for: testEntry) == nil)
+    }
+
+    @Test(arguments: [
+        ".mlmodelc", "..mlmodelc", ".mlpackage", "model.mlmodelc.", "model.mlmodelc ", "model.mlmodelc.tar",
+        "model%2Emlmodelc",
+    ])
+    func localInstallRejectsNonModelNames(modelName: String) async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let model = source.appendingPathComponent(modelName, isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try Data("model".utf8).write(to: model.appendingPathComponent("weights.bin"))
+        let installer = MLModelInstaller(
+            layout: MLModelInstallLayout(rootDirectory: root.appendingPathComponent("install")),
+            transport: ScriptedTransport(payloads: [:])
+        )
+        await #expect(throws: MLModelInstallError.artifactMissing("*.mlmodelc or *.mlpackage")) {
+            _ = try await installer.installFromLocalArtifact(
+                entry(id: "local-name", plan: nil, track: .developerOnly), artifactDirectory: source)
+        }
     }
 
     @Test func localInstallRejectsMultipleModelRepresentations() async throws {

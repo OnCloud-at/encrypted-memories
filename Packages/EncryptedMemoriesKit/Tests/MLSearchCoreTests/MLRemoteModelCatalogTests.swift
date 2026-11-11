@@ -92,6 +92,85 @@ import Testing
         }
     }
 
+    @Test(arguments: [
+        ["loose.bin"],
+        ["NotModel/weights.bin"],
+        ["First.mlmodelc/a", "Second.mlpackage/b"],
+        ["Model.mlmodelc"],
+        ["Model.mlmodelc/a", "unexpected.json"],
+        ["Model.mlmodelc/a", "Model.mlmodelc-extra/b"],
+    ])
+    func rejectsInvalidArtifactLayouts(paths: [String]) {
+        let resolver = MLRemoteModelCatalogResolver(trustedCatalog: .builtIn, allowedBaseURL: baseURL)
+        #expect(throws: MLRemoteModelCatalogError.invalidModelLayout(MLModelID.tinyCLIPVit40M.rawValue)) {
+            _ = try resolver.resolve(
+                .init(models: [
+                    .init(id: .tinyCLIPVit40M, revision: "r1", artifacts: paths.map { artifact($0) })
+                ]))
+        }
+    }
+
+    @Test(arguments: [
+        ("Model.MLMODELC", true), ("model..mlmodelc", true), ("model.v1.mlpackage", true),
+        (".mlmodelc", true), ("..mlmodelc", true), (".mlpackage", true),
+        ("model.mlmodelc.", false), ("model.mlmodelc ", false), ("model.mlmodelc.tar", false),
+        ("model%2Emlmodelc", false),
+    ])
+    func catalogModelRootSuffixSemantics(root: String, accepted: Bool) throws {
+        let resolver = MLRemoteModelCatalogResolver(trustedCatalog: .builtIn, allowedBaseURL: baseURL)
+        let document = MLRemoteModelCatalogDocument(models: [
+            .init(id: .tinyCLIPVit40M, revision: "r1", artifacts: [artifact(root + "/weights.bin")])
+        ])
+        if accepted {
+            _ = try resolver.resolve(document)
+        } else {
+            #expect(throws: MLRemoteModelCatalogError.invalidModelLayout(MLModelID.tinyCLIPVit40M.rawValue)) {
+                _ = try resolver.resolve(document)
+            }
+        }
+    }
+
+    @Test func acceptsModelRootsAndRequiredSidecarsWithoutChangingErrors() throws {
+        let resolver = MLRemoteModelCatalogResolver(trustedCatalog: .builtIn, allowedBaseURL: baseURL)
+        for root in ["Model.MLMODELC", "Model.MLPACKAGE"] {
+            let catalog = try resolver.resolve(
+                .init(models: [
+                    .init(
+                        id: .sigLIP2Base256, revision: "r1",
+                        artifacts: [artifact(root + "/weights.bin"), artifact("tokenizer.json")]
+                    )
+                ]))
+            #expect(catalog.entry(for: .sigLIP2Base256)?.downloadPlan?.items.count == 2)
+        }
+        // Legacy compatibility: the catalog accepts both paths; root-first installation cannot create a child below a file.
+        let rootAndChild = try resolver.resolve(
+            .init(models: [
+                .init(
+                    id: .tinyCLIPVit40M, revision: "r1",
+                    artifacts: [artifact("Model.mlmodelc"), artifact("Model.mlmodelc/weights.bin")]
+                )
+            ]))
+        #expect(rootAndChild.entry(for: .tinyCLIPVit40M)?.downloadPlan?.items.count == 2)
+        #expect(throws: MLRemoteModelCatalogError.invalidModelLayout(MLModelID.sigLIP2Base256.rawValue)) {
+            _ = try resolver.resolve(
+                .init(models: [
+                    .init(
+                        id: .sigLIP2Base256, revision: "r1",
+                        artifacts: [artifact("Model.mlmodelc/weights.bin"), artifact("unexpected.json")]
+                    )
+                ]))
+        }
+        #expect(throws: MLRemoteModelCatalogError.unsafeArtifactPath("../tokenizer.json")) {
+            _ = try resolver.resolve(
+                .init(models: [
+                    .init(
+                        id: .sigLIP2Base256, revision: "r1",
+                        artifacts: [artifact("Model.mlmodelc/weights.bin"), artifact("../tokenizer.json")]
+                    )
+                ]))
+        }
+    }
+
     @Test func legacyCatalogRejectsUnsafeRevisionsAndRecipeSizeOverruns() {
         let resolver = MLRemoteModelCatalogResolver(trustedCatalog: .builtIn, allowedBaseURL: baseURL)
         for revision in [".", "..", "revision.1"] {

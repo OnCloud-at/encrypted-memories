@@ -357,7 +357,6 @@ public struct MLRemoteModelCatalogResolver: Sendable {
         recipe: MLModelCompatibilityRecipe
     ) throws -> MLModelDownloadPlan {
         var seenPaths: Set<String> = []
-        var modelRoots: Set<String> = []
         var items: [MLModelDownloadPlan.Item] = []
         for artifact in artifacts {
             guard seenPaths.insert(artifact.path).inserted else {
@@ -380,34 +379,22 @@ public struct MLRemoteModelCatalogResolver: Sendable {
             else {
                 throw MLRemoteModelCatalogError.artifactSizeExceeded(artifact.path)
             }
-            let firstComponent = artifact.path.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
-            if firstComponent.lowercased().hasSuffix(".mlmodelc")
-                || firstComponent.lowercased().hasSuffix(".mlpackage")
-            {
-                modelRoots.insert(firstComponent)
-            }
             items.append(
                 .init(
                     url: artifact.url,
                     artifact: .init(relativePath: artifact.path, sha256: hash, byteCount: artifact.bytes)
                 ))
         }
-        guard modelRoots.count == 1 else {
-            throw MLRemoteModelCatalogError.invalidModelLayout(id.rawValue)
-        }
-        let modelRoot = modelRoots.first!
-        guard seenPaths.contains(where: { $0.hasPrefix(modelRoot + "/") }) else {
+        guard let modelRoot = MLModelInstallLayout.modelRootPath(in: Array(seenPaths)) else {
             throw MLRemoteModelCatalogError.invalidModelLayout(id.rawValue)
         }
         let permittedSidecars = Set(recipe.runtimeResourcePaths)
         guard
-            seenPaths.allSatisfy({ path in
-                path == modelRoot || path.hasPrefix(modelRoot + "/") || permittedSidecars.contains(path)
-            })
+            MLModelInstallLayout.artifactPathsArePermitted(seenPaths, root: modelRoot, sidecars: permittedSidecars)
         else {
             throw MLRemoteModelCatalogError.invalidModelLayout(id.rawValue)
         }
-        for resource in recipe.runtimeResourcePaths where !seenPaths.contains(resource) {
+        if let resource = MLModelInstallLayout.firstMissingSidecar(recipe.runtimeResourcePaths, in: seenPaths) {
             throw MLRemoteModelCatalogError.missingRuntimeResource(resource)
         }
         let totalBytes = items.reduce(Int64(0)) { $0 + $1.artifact.byteCount }
