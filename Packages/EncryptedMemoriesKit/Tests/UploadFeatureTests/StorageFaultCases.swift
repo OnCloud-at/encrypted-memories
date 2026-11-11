@@ -23,6 +23,8 @@ let storageFaultCases: [any StorageFaultCase] = [
     PhotoJournalCase(id: "journal.revert.remove", journal: .revert, step: .remove),
     PhotoJournalCase(id: "journal.series.save", journal: .series, step: .save),
     PhotoJournalCase(id: "journal.series.remove", journal: .series, step: .remove),
+    ExactDuplicateMergeJournalCase(id: "journal.exactDuplicateMerge.record", step: .record),
+    ExactDuplicateMergeJournalCase(id: "journal.exactDuplicateMerge.clear", step: .clear),
     DeletionDecisionCase(keepDeleted: true, start: .noIntent),
     DeletionDecisionCase(keepDeleted: false, start: .noIntent),
     DeletionDecisionCase(keepDeleted: true, start: .ownIntent),
@@ -669,6 +671,63 @@ struct PhotoJournalCase: StorageFaultCase {
             try SeriesDissolutionJournalFileStore(accountDataDirectory: directory, fileSystem: fileSystem).remove(
                 forSeries: photo)
         }
+    }
+}
+
+/// One change of the exact duplicate merge journal through the file-system seam (#1149): `record` replaces its file
+/// with one more intent, `clear` removes the file with its last intent. The state is the file as JSON content, and the
+/// keys of the intents that a new store reads.
+struct ExactDuplicateMergeJournalCase: StorageFaultCase {
+    enum Step: Sendable {
+        case record
+        case clear
+    }
+
+    struct World {
+        let directory: URL
+        let files: StorageFaultFiles
+    }
+
+    let id: String
+    let step: Step
+    let atomicity = StorageFaultAtomicity.allOrNothing
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let journal = ExactDuplicateMergeJournalFileStore(accountDataDirectory: directory)
+        XCTAssertTrue(journal.record([Self.intent("kept")]))
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        World(directory: directory, files: StorageFaultFiles())
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.files] }
+
+    func run(_ world: World) async -> Bool {
+        let store = ExactDuplicateMergeJournalFileStore(accountDataDirectory: world.directory, fileSystem: world.files)
+        switch step {
+        case .record: return store.record([Self.intent("second")])
+        case .clear: return store.clear([Self.intent("kept")])
+        }
+    }
+
+    func close(_ world: World) {}
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let file = directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName)
+        var state = StorageFaultState()
+        state.tables["merge journal"] =
+            FileManager.default.fileExists(atPath: file.path)
+            ? [canonicalJSON(String(decoding: try Data(contentsOf: file), as: UTF8.self))] : ["absent"]
+        let intents = ExactDuplicateMergeJournalFileStore(accountDataDirectory: directory).pendingMerges() ?? []
+        state.records["merge intent"] = Set(intents.map(\.kept))
+        return state
+    }
+
+    private static func intent(_ kept: String) -> ExactDuplicateMergeIntent {
+        ExactDuplicateMergeIntent(
+            volumeID: "volume", kept: kept, contentHash: "main-hash", hashKeyEpoch: "epoch",
+            members: [.init(link: "duplicate-of-\(kept)", moves: [])], trashedAt: 1_720_000_000)
     }
 }
 
