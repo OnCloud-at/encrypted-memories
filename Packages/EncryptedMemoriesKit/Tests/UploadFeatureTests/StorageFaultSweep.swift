@@ -14,8 +14,9 @@ import XCTest
 //   lists every store it writes, so that a crash between the writes of two stores is a point too.
 // - Statement: one SQLite statement that starts on the connection of a SQLite fault target (SQLITE_TRACE_STMT),
 //   including BEGIN, COMMIT, ROLLBACK, PRAGMA and reads.
-// - File write: one atomic replacement, one append write or one truncation through `StorageFaultFiles`. A truncation
-//   runs only after a failed append write, on the error path, so the sweep never fails one; the writer's unit tests do.
+// - File write: one atomic replacement, one removal, one append write or one truncation through `StorageFaultFiles`.
+//   A truncation runs only after a failed append write, on the error path, so the sweep never fails one; the writer's
+//   unit tests do.
 // - Point k: the k-th statement or file write of the fault-free reference run, counted across all fault targets in
 //   the order they start. The sweep visits every point once.
 // - Failure at point k: statement k fails with SQLITE_INTERRUPT; file write k fails as a full disk does, and an append
@@ -416,9 +417,9 @@ private struct FaultPoints {
     }
 }
 
-/// The local disk as a fault target for file writes (#1149). Every atomic replacement, append write and truncation is
-/// a numbered write. A failing write throws as a full disk does: a replacement changes nothing, an append write leaves
-/// the first half of its bytes, and a truncation leaves the file as it is.
+/// The local disk as a fault target for file writes (#1149). Every atomic replacement, removal, append write and
+/// truncation is a numbered write. A failing write throws as a full disk does: a replacement or a removal changes
+/// nothing, an append write leaves the first half of its bytes, and a truncation leaves the file as it is.
 final class StorageFaultFiles: DurableFileSystem, @unchecked Sendable {
     struct Full: Error {}
 
@@ -465,6 +466,14 @@ final class StorageFaultFiles: DurableFileSystem, @unchecked Sendable {
 
     func openForAppending(_ url: URL) throws -> any DurableFileAppending {
         FaultAppender(url: url, file: try local.openForAppending(url), files: self)
+    }
+
+    func remove(_ url: URL) throws {
+        if start("remove", url) {
+            fire()
+            throw Full()
+        }
+        try local.remove(url)
     }
 }
 

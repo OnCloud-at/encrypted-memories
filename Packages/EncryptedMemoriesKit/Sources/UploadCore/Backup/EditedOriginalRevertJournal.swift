@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import PhotosCore
 
@@ -87,58 +86,35 @@ public protocol EditedOriginalRevertJournalStore: Sendable {
 public struct EditedOriginalRevertJournalFileStore: EditedOriginalRevertJournalStore {
     public static let directoryName = "edited-original-revert"
 
-    private let directory: URL
+    private let files: PhotoJournalDirectory
 
-    public init(accountDataDirectory: URL) {
-        directory = accountDataDirectory.appendingPathComponent(Self.directoryName, isDirectory: true)
+    public init(accountDataDirectory: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem()) {
+        files = PhotoJournalDirectory(
+            accountDataDirectory: accountDataDirectory, name: Self.directoryName, fileSystem: fileSystem)
     }
 
     public func journal(forEditedMain mainUID: PhotoUID) throws -> EditedOriginalRevertJournal? {
-        let url = fileURL(for: mainUID)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try JSONDecoder().decode(EditedOriginalRevertJournal.self, from: Data(contentsOf: url))
+        guard let data = try files.data(for: mainUID) else { return nil }
+        return try JSONDecoder().decode(EditedOriginalRevertJournal.self, from: data)
     }
 
     public func decodableJournal(forEditedMain mainUID: PhotoUID) throws -> EditedOriginalRevertJournal? {
-        let url = fileURL(for: mainUID)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         // A read error still throws: only a file that was read but cannot be decoded counts as missing.
-        let data = try Data(contentsOf: url)
+        guard let data = try files.data(for: mainUID) else { return nil }
         return try? JSONDecoder().decode(EditedOriginalRevertJournal.self, from: data)
     }
 
     public func save(_ journal: EditedOriginalRevertJournal) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try JSONEncoder().encode(journal).write(to: fileURL(for: journal.editedMainUID), options: .atomic)
+        try files.save(JSONEncoder().encode(journal), for: journal.editedMainUID)
     }
 
     public func remove(forEditedMain mainUID: PhotoUID) throws {
-        let url = fileURL(for: mainUID)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try FileManager.default.removeItem(at: url)
+        try files.remove(for: mainUID)
     }
 
     public func pendingJournals() throws -> [EditedOriginalRevertJournal] {
-        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
-        var pending: [EditedOriginalRevertJournal] = []
-        for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-            .filter({ $0.pathExtension == "json" })
-            .sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
-        {
-            let data = try Data(contentsOf: url)
-            // Undecodable but readable content skips only this journal: its edited photo stays untouched in
-            // the library. The photo is not stuck: `revert` starts a fresh run over the undecodable file, and
-            // `abandon` removes it.
-            if let journal = try? JSONDecoder().decode(EditedOriginalRevertJournal.self, from: data) {
-                pending.append(journal)
-            }
-        }
-        return pending
-    }
-
-    private func fileURL(for mainUID: PhotoUID) -> URL {
-        let digest = SHA256.hash(data: Data("\(mainUID.volumeID)/\(mainUID.nodeID)".utf8))
-        let name = digest.map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent("\(name).json")
+        // Undecodable but readable content skips only this journal: its edited photo stays untouched in the library.
+        // The photo is not stuck: `revert` starts a fresh run over the undecodable file, and `abandon` removes it.
+        try files.allData().compactMap { try? JSONDecoder().decode(EditedOriginalRevertJournal.self, from: $0) }
     }
 }

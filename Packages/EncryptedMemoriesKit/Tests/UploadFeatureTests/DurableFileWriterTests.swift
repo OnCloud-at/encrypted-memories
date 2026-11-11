@@ -96,6 +96,24 @@ final class DurableFileWriterTests: XCTestCase {
         XCTAssertEqual(writes, ["replace log.jsonl"])
     }
 
+    func testARemovalDeletesTheFileThroughTheSeamAndAFailedOneKeepsIt() throws {
+        try Data("a\n".utf8).write(to: url)
+        failWrites([1])
+        XCTAssertThrowsError(try files.remove(url))
+        XCTAssertEqual(bytes, Data("a\n".utf8), "a failed removal keeps the file")
+
+        failWrites([])
+        try files.remove(url)
+        XCTAssertEqual(writes, ["remove log.jsonl"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testTheLocalRemovalDeletesTheFile() throws {
+        try Data("a\n".utf8).write(to: url)
+        try LocalDurableFileSystem().remove(url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     /// An atomic replacement writes a new file and swaps it in, so a stop during the write leaves the earlier file
     /// whole. The swap shows as a new file number; a write in place keeps the number.
     func testTheLocalReplacementSwapsInANewFile() throws {
