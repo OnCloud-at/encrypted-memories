@@ -611,10 +611,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             let currentValidationToken = TimelineInventoryValidationTokenPolicy.persistedToken(
                 remoteEventToken: startEventToken
             )
-            let unmaterializedEvidenceNodeIDs =
-                timelineStore?.unmaterializedMediaTypeEvidenceNodeIDs(
-                    volumeID: root.volumeID
-                ) ?? []
+            // Nil for a failed evidence read, which is no proof that every upload is listed.
+            let unmaterializedEvidenceNodeIDs: Set<String>? =
+                timelineStore.map { $0.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: root.volumeID) } ?? []
+            let evidenceMayBeUnlisted = unmaterializedEvidenceNodeIDs.map { !$0.isEmpty } ?? true
             var enrichmentComplete = true
             // Only the local evidence changed since the last load for this server cursor: rebuild without a listing.
             let localSections = TimelineLocalRebuild.plan(
@@ -623,7 +623,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     currentEventToken: startEventToken,
                     currentRevisions: revisionsAtStart,
                     hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
-                    hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty,
+                    hasUnmaterializedLocalEvidence: evidenceMayBeUnlisted,
                     hasPhotosAwaitingLibrary: recentlyDeleted.hasPhotosAwaitingLibrary,
                     hasRestoredPhotos: recentlyDeleted.hasRestoredPhotos,
                     continuityRecoveryRequired: continuityRecoveryRequired),
@@ -642,7 +642,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     cachedEventToken: cachedValidationToken,
                     currentEventToken: currentValidationToken,
                     hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
-                    hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty,
+                    hasUnmaterializedLocalEvidence: evidenceMayBeUnlisted,
                     canRebuildLocally: localSections != nil
                 )
             var sections: [TimelineSection]
@@ -741,7 +741,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     }
                 }
                 pendingUploadedNodeIDs.subtract(representedNodeIDs)
-                let unresolvedEvidenceNodeIDs = unmaterializedEvidenceNodeIDs.subtracting(representedNodeIDs)
+                let unresolvedEvidenceNodeIDs = (unmaterializedEvidenceNodeIDs ?? []).subtracting(representedNodeIDs)
                 // An upload whose photo left the library before a listing showed it, such as an edit that a later
                 // edit replaced, never shows; only uploads that can still show hold the load back.
                 let unlistedUploads = pendingUploadedNodeIDs.union(unresolvedEvidenceNodeIDs)
@@ -944,7 +944,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     )
                 }
                 loadPersisted = cacheSaved
-                if source == .authoritativePhotosList, cacheSaved,
+                if source == .authoritativePhotosList, cacheSaved, unmaterializedEvidenceNodeIDs != nil,
                     timelineStore?.pruneUnmaterializedMediaTypeEvidence(volumeID: root.volumeID) == false
                 {
                     DebugLog.log("timeline: stale media-type evidence cleanup failed")

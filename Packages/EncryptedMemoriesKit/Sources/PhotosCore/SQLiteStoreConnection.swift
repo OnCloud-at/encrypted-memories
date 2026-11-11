@@ -11,6 +11,17 @@ public enum SQLiteBinding {
         return sqlite3_bind_text(statement, index, value, -1, SQLiteStoreSchemaGate.transientDestructor)
     }
 
+    /// Binds `value` as TEXT, or SQL NULL for nil, and tells whether the bind succeeded. A caller that gets false must
+    /// not step the statement: the parameter stayed NULL.
+    public static func bindText(_ statement: OpaquePointer?, _ index: Int32, _ value: String?) -> Bool {
+        text(statement, index, value) == SQLITE_OK
+    }
+
+    /// Binds `value` as a BLOB, or SQL NULL for nil, and tells whether the bind succeeded, as `bindText` does.
+    public static func bindBlob(_ statement: OpaquePointer?, _ index: Int32, _ value: Data?) -> Bool {
+        blob(statement, index, value) == SQLITE_OK
+    }
+
     /// Binds `value` as a BLOB, or SQL NULL for nil. SQLite copies the bytes before the call returns.
     public static func blob(_ statement: OpaquePointer?, _ index: Int32, _ value: Data?) -> Int32 {
         guard let value else { return sqlite3_bind_null(statement, index) }

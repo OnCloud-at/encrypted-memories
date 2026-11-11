@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import ProtonAuth
+import SQLiteTestSupport
 import Testing
 
 @testable import ProtonDriveBackend
@@ -189,6 +190,92 @@ extension DriveSessionStubSuite {
             }
         }
 
+        @Test func matchingTokensWithEmptyUploadEvidenceRebuildLocally() async throws {
+            try await withWarmEvidence([]) { bridge, store, volume, _ in
+                let before = StubURLProtocol.requests().count
+                StubURLProtocol.route(
+                    "GET /drive/volumes/\(volume)/photos", json: metadataResponse(prefix: "unexpected", count: 1))
+
+                let result = try await bridge.loadTimelineSnapshot()
+
+                #expect(result.sections.flatMap(\.items).map(\.uid.nodeID) == ["listed-0"])
+                #expect(StubURLProtocol.requests().dropFirst(before).allSatisfy { !$0.path.contains("/photos?") })
+                #expect(try store.load().map(\.uid.nodeID) == ["listed-0"])
+            }
+        }
+
+        @Test func matchingTokensWithUnlistedUploadEvidenceRequireAnAuthoritativeListing() async throws {
+            try await withWarmEvidence(["n"]) { bridge, store, volume, _ in
+                let before = StubURLProtocol.requests().count
+                StubURLProtocol.route(
+                    "GET /drive/volumes/\(volume)/photos",
+                    json: StubbedLibrary.listingBody(["listed-0", "n"]))
+
+                let result = try await bridge.loadTimelineSnapshot()
+
+                #expect(Set(result.sections.flatMap(\.items).map(\.uid.nodeID)) == ["listed-0", "n"])
+                #expect(StubURLProtocol.requests().dropFirst(before).contains { $0.path.contains("/photos?") })
+                #expect(Set(try store.load().map(\.uid.nodeID)) == ["listed-0", "n"])
+            }
+        }
+
+        @Test func anUnreadableUploadEvidenceReadListsAndKeepsEvidenceAfterSavingTheCache() async throws {
+            try await withWarmEvidence(nil) { bridge, store, volume, fault in
+                let before = StubURLProtocol.requests().count
+                StubURLProtocol.route(
+                    "GET /drive/volumes/\(volume)/photos", json: metadataResponse(prefix: "listed", count: 2))
+
+                let result = try await bridge.loadTimelineSnapshot()
+
+                #expect(Set(result.sections.flatMap(\.items).map(\.uid.nodeID)) == ["listed-0", "listed-1"])
+                #expect(StubURLProtocol.requests().dropFirst(before).contains { $0.path.contains("/photos?") })
+                #expect(fault?.lowered == true, "The display evidence read must arm the failed bind")
+                #expect(fault?.stepped == true, "The cache transaction must restore the limit and run")
+                fault?.remove()
+                #expect(Set(try store.load().map(\.uid.nodeID)) == ["listed-0", "listed-1"], "The new cache was saved")
+                #expect(
+                    store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: volume) == ["n"],
+                    "A failed evidence read must not authorize deletion of an upload's evidence")
+            }
+        }
+
+        /// Warms the real bridge for one cursor, then changes local evidence while keeping that cursor unchanged.
+        /// Nil injects a failed unmaterialized read after the complete display read. The next cache transaction
+        /// restores the length limit, so the load can save successfully and exercise evidence cleanup.
+        private func withWarmEvidence(
+            _ evidence: Set<String>?,
+            _ body: (DriveSDKBridge, TimelineMetadataStore, String, BindFailureUntilStep?) async throws -> Void
+        ) async throws {
+            let volume = String(repeating: "v", count: 3_000)
+            try await withFixture(volumeID: volume) { bridge, store, _, _ in
+                StubURLProtocol.route(
+                    "GET /drive/volumes/\(volume)/photos", json: metadataResponse(prefix: "listed", count: 1))
+                let first = try await bridge.loadTimelineSnapshot()
+                try #require(first.sections.flatMap(\.items).map(\.uid.nodeID) == ["listed-0"])
+                let token = TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-1")
+                try #require(store.validationToken() == token, "Warm the real cache with the matching cursor")
+                try #require(store.relatedVideosChosen(by: LivePhotoMotionLinks.rule))
+                let before = store.mediaTypeEvidenceRevision()
+                let nodes = (evidence ?? ["n"]).union(["listed-0"])
+                let types = Dictionary(
+                    uniqueKeysWithValues: nodes.map { (PhotoUID(volumeID: volume, nodeID: $0), "image/jpeg") })
+                try #require(store.recordMediaTypeEvidence(types).succeeded)
+                try #require(store.mediaTypeEvidenceRevision() > before, "Make the local rebuild eligible")
+                try #require(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: volume) == (evidence ?? ["n"]))
+                let fault: BindFailureUntilStep?
+                if evidence == nil {
+                    fault = try #require(
+                        BindFailureUntilStep(
+                            onStore: store, statement: "BEGIN IMMEDIATE",
+                            after: "SELECT node, mime FROM media_type_evidence WHERE vol=?", limit: 2_048))
+                } else {
+                    fault = nil
+                }
+                defer { fault?.remove() }
+                try await body(bridge, store, volume, fault)
+            }
+        }
+
         private func metadataResponse(prefix: String = "photo", count: Int = 500) -> String {
             StubbedLibrary.listingBody((0..<count).map { "\(prefix)-\($0)" })
         }
@@ -218,23 +305,24 @@ extension DriveSessionStubSuite {
         }
 
         private func withFixture(
+            volumeID: String = "vol1",
             _ body: (DriveSDKBridge, TimelineMetadataStore, PhotoItem, String) async throws -> Void
         ) async throws {
             StubURLProtocol.reset()
             HeldRequestGate.reset()
             HeldRequestGate.hold {
-                $0.url?.path == "/drive/volumes/vol1/photos"
+                $0.url?.path == "/drive/volumes/\(volumeID)/photos"
                     && $0.url?.query?.contains("PreviousPageLastLinkID=") == true
             }
             try await StubbedLibrary.withStore { directory, store in
                 let old = PhotoItem(
-                    uid: PhotoUID(volumeID: "vol1", nodeID: "old"),
+                    uid: PhotoUID(volumeID: volumeID, nodeID: "old"),
                     captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg")
                 let oldToken = TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-0")
                 #expect(store.save([old], validationToken: oldToken).succeeded)
-                StubbedLibrary.routeShare()
-                StubbedLibrary.routeEvents(from: 0)
-                StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: metadataResponse())
+                StubbedLibrary.routeShare(volumeID: volumeID)
+                StubbedLibrary.routeEvents(from: 0, volumeID: volumeID)
+                StubURLProtocol.route("GET /drive/volumes/\(volumeID)/photos", json: metadataResponse())
                 let (bridge, _) = try await StubbedLibrary.makeBridge(
                     directory: directory, store: store, uid: "page-fixture",
                     protocols: [HeldRequestGate.self, StubURLProtocol.self])

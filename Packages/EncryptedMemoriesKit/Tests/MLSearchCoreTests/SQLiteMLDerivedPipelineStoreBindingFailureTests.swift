@@ -70,20 +70,13 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
             outcome: .completed(MLDerivedPipelineOutput(payload: payload, normalizedSearchTokens: ["text"])))
     }
 
-    /// Fails the binds of the first statement whose SQL contains `statement` that starts after the first statement whose
-    /// SQL contains `earlier` finished, or at once without `earlier`.
-    private func failBinds(of statement: String, after earlier: String? = nil) throws -> BindFailureUntilStep {
-        let fault = BindFailureUntilStep(
-            onDatabase: try XCTUnwrap(storeDatabase(store!)), statement: statement, after: earlier, limit: Self.limit)
-        if earlier == nil { XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply") }
-        return fault
-    }
-
     // MARK: Enqueue
 
     func testEnqueueWithAnAccountThatDoesNotBindFailsBeforeTheAccountInsert() throws {
         let key = try key(account: Self.long, artifact())
-        let fault = try failBinds(of: "INSERT OR IGNORE INTO ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT OR IGNORE INTO ml_derived_accounts", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(shortUID)], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -91,8 +84,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithAnAccountThatDoesNotBindFailsBeforeTheAccountRead() throws {
         let key = try key(account: Self.long, artifact())
-        let fault = try failBinds(
-            of: "SELECT account_key FROM ml_derived_accounts", after: "INSERT OR IGNORE INTO ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT account_key FROM ml_derived_accounts",
+                after: "INSERT OR IGNORE INTO ml_derived_accounts", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(shortUID)], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -100,7 +95,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithANamespaceThatDoesNotBindFailsBeforeTheArtifactInsert() throws {
         let key = try key(longNamespaceArtifact())
-        let fault = try failBinds(of: "INSERT OR IGNORE INTO ml_derived_artifacts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT OR IGNORE INTO ml_derived_artifacts", after: nil, limit: Self.limit)
+        )
         defer { fault.remove() }
         XCTAssertFalse(
             store.enqueue([try asset(shortUID)], for: key), "An artifact that was never written cannot take work")
@@ -109,8 +107,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithANamespaceThatDoesNotBindFailsTheObsoleteWorkRemoval() throws {
         let key = try key(longNamespaceArtifact())
-        let fault = try failBinds(
-            of: "AND artifact_namespace NOT IN", after: "SELECT artifact_id, pipeline_id, schema_version")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "AND artifact_namespace NOT IN",
+                after: "SELECT artifact_id, pipeline_id, schema_version", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([], for: key), "A removal that matched no row is no complete removal")
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -118,7 +118,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithAKeyThatDoesNotBindFailsBeforeTheAssetRead() throws {
         let key = try key(artifact())
-        let fault = try failBinds(of: "SELECT asset_id, source_revision FROM ml_derived_assets")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT asset_id, source_revision FROM ml_derived_assets", after: nil,
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(longUID)], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -126,7 +129,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithANodeThatDoesNotBindFailsBeforeTheAssetRead() throws {
         let key = try key(artifact())
-        let fault = try failBinds(of: "SELECT asset_id, source_revision FROM ml_derived_assets")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT asset_id, source_revision FROM ml_derived_assets", after: nil,
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(PhotoUID(volumeID: "volume", nodeID: Self.long))], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -134,8 +140,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithANodeThatDoesNotBindFailsBeforeTheAssetInsert() throws {
         let key = try key(artifact())
-        let fault = try failBinds(
-            of: "INSERT INTO ml_derived_assets", after: "SELECT asset_id, source_revision FROM ml_derived_assets")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT INTO ml_derived_assets",
+                after: "SELECT asset_id, source_revision FROM ml_derived_assets", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(PhotoUID(volumeID: "volume", nodeID: Self.long))], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -143,8 +151,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithARevisionThatDoesNotBindFailsBeforeTheAssetInsert() throws {
         let key = try key(artifact())
-        let fault = try failBinds(
-            of: "INSERT INTO ml_derived_assets", after: "SELECT asset_id, source_revision FROM ml_derived_assets")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT INTO ml_derived_assets",
+                after: "SELECT asset_id, source_revision FROM ml_derived_assets", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(shortUID, revision: Self.long)], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -152,8 +162,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithAKeyThatDoesNotBindFailsBeforeTheAssetInsert() throws {
         let key = try key(artifact())
-        let fault = try failBinds(
-            of: "INSERT INTO ml_derived_assets", after: "SELECT asset_id, source_revision FROM ml_derived_assets")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT INTO ml_derived_assets",
+                after: "SELECT asset_id, source_revision FROM ml_derived_assets", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(longUID)], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -162,7 +174,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
     func testEnqueueWithARevisionThatDoesNotBindFailsBeforeTheRevisionUpdate() throws {
         let key = try key(artifact())
         XCTAssertTrue(store.enqueue([try asset(shortUID)], for: key))
-        let fault = try failBinds(of: "UPDATE ml_derived_assets SET source_revision")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "UPDATE ml_derived_assets SET source_revision", after: nil,
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(shortUID, revision: Self.long)], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -170,8 +185,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
 
     func testEnqueueWithAPipelineThatDoesNotBindFailsTheGenerationBump() throws {
         let key = try key(longPipelineArtifact(), pipelineID: longPipeline)
-        let fault = try failBinds(
-            of: "INSERT INTO ml_derived_generation", after: "INSERT OR IGNORE INTO ml_derived_work")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT INTO ml_derived_generation",
+                after: "INSERT OR IGNORE INTO ml_derived_work", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([try asset(shortUID)], for: key))
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -182,7 +199,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
     func testNextWorkBatchWithAnAccountThatDoesNotBindIsAReadFailure() throws {
         let key = try key(account: Self.long, artifact())
         XCTAssertTrue(store.enqueue([try asset(shortUID)], for: key))
-        let fault = try failBinds(of: "SELECT account_key FROM ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT account_key FROM ml_derived_accounts", after: nil, limit: Self.limit
+            ))
         defer { fault.remove() }
         XCTAssertThrowsError(
             try store.nextWorkBatch(for: key, limit: 8, now: .now), "An account that does not bind is no empty queue")
@@ -192,8 +212,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
     func testNextWorkBatchWithANamespaceThatDoesNotBindIsAReadFailure() throws {
         let key = try key(longNamespaceArtifact())
         XCTAssertTrue(store.enqueue([try asset(shortUID)], for: key))
-        let fault = try failBinds(
-            of: "SELECT artifact_id, pipeline_id, schema_version", after: "SELECT account_key FROM ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT artifact_id, pipeline_id, schema_version",
+                after: "SELECT account_key FROM ml_derived_accounts", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertThrowsError(
             try store.nextWorkBatch(for: key, limit: 8, now: .now), "A namespace that does not bind is no empty queue")
@@ -203,8 +225,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
     func testProgressWithAPipelineThatDoesNotBindIsAReadFailure() throws {
         let key = try key(longPipelineArtifact(), pipelineID: longPipeline)
         XCTAssertTrue(store.enqueue([try asset(shortUID)], for: key))
-        let fault = try failBinds(
-            of: "FROM ml_derived_progress", after: "SELECT artifact_id, pipeline_id, schema_version")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "FROM ml_derived_progress",
+                after: "SELECT artifact_id, pipeline_id, schema_version", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertThrowsError(try store.progress(for: key), "A pipeline that does not bind is no empty progress")
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -214,9 +238,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         XCTAssertTrue(
             store.enqueue([try asset(shortUID)], for: try key(longPipelineArtifact(), pipelineID: longPipeline)))
         let other = try key(longPipelineArtifact(revision: "r2"), pipelineID: longPipeline)
-        let fault = try failBinds(
-            of: "SELECT generation FROM ml_derived_generation",
-            after: "SELECT artifact_id, pipeline_id, schema_version")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT generation FROM ml_derived_generation",
+                after: "SELECT artifact_id, pipeline_id, schema_version", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertThrowsError(try store.progress(for: other), "A pipeline that does not bind is no first generation")
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -241,7 +266,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let asset = try asset(uid)
         XCTAssertTrue(store.enqueue([asset], for: key), file: file, line: line)
         XCTAssertTrue(store.commit([completed(asset, artifact)], for: key, now: .now), file: file, line: line)
-        let fault = try failBinds(of: "SELECT w.payload", after: "SELECT account_key FROM ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT w.payload", after: "SELECT account_key FROM ml_derived_accounts",
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertNil(store.output(for: uid, artifact: artifact, accountIdentifier: "account"), file: file, line: line)
         XCTAssertNil(fault.failedBeforeStepProblem, file: file, line: line)
@@ -255,8 +283,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let key = try key(artifact)
         let asset = try asset(shortUID)
         XCTAssertTrue(store.enqueue([asset], for: key))
-        let fault = try failBinds(
-            of: "SELECT artifact_id, pipeline_id, schema_version", after: "SELECT account_key FROM ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT artifact_id, pipeline_id, schema_version",
+                after: "SELECT account_key FROM ml_derived_accounts", limit: Self.limit))
         XCTAssertFalse(
             store.commit([completed(asset, artifact)], for: key, now: .now),
             "A namespace that does not bind is no proof that the artifact is missing")
@@ -285,7 +315,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let artifact = try artifact()
         let key = try key(artifact)
         XCTAssertTrue(store.enqueue([asset], for: key), file: file, line: line)
-        let fault = try failBinds(of: "SELECT asset_id FROM ml_derived_assets WHERE account_key=? AND volume_id")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT asset_id FROM ml_derived_assets WHERE account_key=? AND volume_id",
+                after: nil, limit: Self.limit))
         XCTAssertFalse(store.commit([completed(asset, artifact)], for: key, now: .now), file: file, line: line)
         XCTAssertNil(fault.failedBeforeStepProblem, file: file, line: line)
         fault.remove()
@@ -298,7 +331,9 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let key = try key(artifact)
         let asset = try asset(shortUID)
         XCTAssertTrue(store.enqueue([asset], for: key))
-        let fault = try failBinds(of: "UPDATE ml_derived_work SET state=?")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "UPDATE ml_derived_work SET state=?", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.commit([completed(asset, artifact, payload: Data(repeating: 7, count: 4_096))], for: key, now: .now),
@@ -313,9 +348,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let key = try key(artifact)
         let asset = try asset(shortUID)
         XCTAssertTrue(store.enqueue([asset], for: key))
-        let fault = BindFailureUntilStep(
-            onDatabase: try XCTUnwrap(storeDatabase(store)), statement: "INSERT OR IGNORE INTO ml_derived_tokens",
-            after: "UPDATE ml_derived_work SET state=?", limit: Self.limit)
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store, statement: "INSERT OR IGNORE INTO ml_derived_tokens",
+                after: "UPDATE ml_derived_work SET state=?", limit: Self.limit))
         XCTAssertFalse(
             store.commit([completed(asset, artifact)], for: key, now: .now),
             "A token that was never written must not leave the output unsearchable")
@@ -330,9 +366,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         defer { store.close() }
         let key = try key(artifact())
         XCTAssertTrue(store.enqueue([try asset(shortUID)], for: key))
-        let fault = BindFailureUntilStep(
-            onDatabase: try XCTUnwrap(storeDatabase(store)), statement: "SELECT a.volume_id, a.node_id",
-            after: "SELECT artifact_id, pipeline_id, schema_version", limit: Self.limit)
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store, statement: "SELECT a.volume_id, a.node_id",
+                after: "SELECT artifact_id, pipeline_id, schema_version", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertEqual(store.search(normalizedTokens: ["text"], in: key, limit: 10), [])
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -352,9 +389,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let key = try key(artifact)
         let asset = try asset(shortUID)
         XCTAssertTrue(store.enqueue([asset], for: key))
-        let fault = SQLiteStatementFaults(onDatabase: try XCTUnwrap(storeDatabase(store!)), failures: 1) {
-            $0.contains("SELECT asset_id FROM ml_derived_assets WHERE account_key=")
-        }
+        let fault = try XCTUnwrap(
+            SQLiteStatementFaults(onStore: store!, failures: 1) {
+                $0.contains("SELECT asset_id FROM ml_derived_assets WHERE account_key=")
+            })
         defer { fault.stop() }
         XCTAssertFalse(store.commit([completed(asset, artifact)], for: key, now: .now))
         XCTAssertEqual(fault.firedCount, 1, "The fault must reach the target statement")
@@ -368,9 +406,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let key = try key(artifact)
         let asset = try asset(shortUID)
         XCTAssertTrue(store.enqueue([asset], for: key))
-        let fault = SQLiteStatementFaults(onDatabase: try XCTUnwrap(storeDatabase(store!)), failures: 1) {
-            $0.contains("SELECT artifact_id, pipeline_id, schema_version")
-        }
+        let fault = try XCTUnwrap(
+            SQLiteStatementFaults(onStore: store!, failures: 1) {
+                $0.contains("SELECT artifact_id, pipeline_id, schema_version")
+            })
         defer { fault.stop() }
         XCTAssertFalse(store.commit([completed(asset, artifact)], for: key, now: .now))
         XCTAssertEqual(fault.firedCount, 1, "The fault must reach the target statement")
@@ -384,7 +423,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let key = try key(account: Self.long, artifact())
         let asset = try asset(shortUID)
         XCTAssertTrue(store.enqueue([asset], for: key))
-        let fault = try failBinds(of: "SELECT account_key FROM ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT account_key FROM ml_derived_accounts", after: nil, limit: Self.limit
+            ))
         XCTAssertFalse(
             store.reconcile(liveUIDs: [], for: key), "An account that does not bind is no proof that it has no rows")
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -396,8 +438,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let key = try key(longNamespaceArtifact())
         let asset = try asset(shortUID)
         XCTAssertTrue(store.enqueue([asset], for: key))
-        let fault = try failBinds(
-            of: "SELECT artifact_id, pipeline_id, schema_version", after: "SELECT account_key FROM ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT artifact_id, pipeline_id, schema_version",
+                after: "SELECT account_key FROM ml_derived_accounts", limit: Self.limit))
         XCTAssertFalse(
             store.reconcile(liveUIDs: [], for: key), "A namespace that does not bind is no proof that it has no rows")
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -414,8 +458,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
     /// prefix checks apart from the namespace check; those two checks stay without a test of their own.
     func testEnqueueWithAPipelineThatDoesNotBindFailsTheObsoleteWorkRemovalAtThePipelineBind() throws {
         let key = try key(longPipelineArtifact(), pipelineID: longPipeline)
-        let fault = try failBinds(
-            of: "AND artifact_namespace NOT IN", after: "SELECT artifact_id, pipeline_id, schema_version")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "AND artifact_namespace NOT IN",
+                after: "SELECT artifact_id, pipeline_id, schema_version", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.enqueue([], for: key), "A removal that matched no row is no complete removal")
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -427,9 +473,12 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
         let artifact = try longPipelineArtifact()
         let key = try key(artifact, pipelineID: longPipeline)
         XCTAssertTrue(store.enqueue([try asset(shortUID)], for: key))
-        let fault = try failBinds(
-            of: "UPDATE ml_derived_generation SET generation=generation+1 WHERE account_key=? AND pipeline_id",
-            after: "DELETE FROM ml_derived_assets WHERE account_key=? AND NOT EXISTS")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!,
+                statement:
+                    "UPDATE ml_derived_generation SET generation=generation+1 WHERE account_key=? AND pipeline_id",
+                after: "DELETE FROM ml_derived_assets WHERE account_key=? AND NOT EXISTS", limit: Self.limit))
         store.purge(artifact: artifact, accountIdentifier: "account")
         XCTAssertNil(fault.failedBeforeStepProblem)
         fault.remove()
@@ -440,9 +489,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
     func testPurgeWithANamespaceThatDoesNotBindDoesNotRunTheArtifactRead() throws {
         let artifact = try longNamespaceArtifact()
         XCTAssertTrue(store.enqueue([try asset(shortUID)], for: try key(artifact)))
-        let fault = try failBinds(
-            of: "SELECT artifact_id FROM ml_derived_artifacts WHERE artifact_namespace",
-            after: "SELECT account_key FROM ml_derived_accounts")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT artifact_id FROM ml_derived_artifacts WHERE artifact_namespace",
+                after: "SELECT account_key FROM ml_derived_accounts", limit: Self.limit))
         defer { fault.remove() }
         store.purge(artifact: artifact, accountIdentifier: "account")
         XCTAssertNil(fault.failedBeforeStepProblem)
@@ -451,7 +501,10 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
     func testPipelinePurgeWithAPipelineThatDoesNotBindDoesNotRunTheArtifactRead() throws {
         XCTAssertTrue(
             store.enqueue([try asset(shortUID)], for: try key(longPipelineArtifact(), pipelineID: longPipeline)))
-        let fault = try failBinds(of: "SELECT artifact_id FROM ml_derived_artifacts WHERE pipeline_id")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT artifact_id FROM ml_derived_artifacts WHERE pipeline_id",
+                after: nil, limit: Self.limit))
         defer { fault.remove() }
         store.purge(pipelineID: longPipeline, accountIdentifier: "account")
         XCTAssertNil(fault.failedBeforeStepProblem)

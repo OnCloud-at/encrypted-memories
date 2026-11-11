@@ -28,29 +28,25 @@ final class PhotoNameStoreBindingFailureTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    /// Fails the binds of the first statement whose SQL contains `statement`.
-    private func failBinds(of statement: String) throws -> BindFailureUntilStep {
-        let fault = BindFailureUntilStep(
-            onDatabase: try XCTUnwrap(storeDatabase(store!)), statement: statement, after: nil, limit: Self.limit)
-        XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
-        return fault
-    }
-
     func testNodeReadWithAVolumeThatDoesNotBindIsUnreadable() throws {
         XCTAssertEqual(store.record([PhotoUID(volumeID: Self.long, nodeID: "node"): "Trip"]), .written)
-        let fault = try failBinds(of: "SELECT node FROM photo_name WHERE")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT node FROM photo_name WHERE", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertNil(
             store.recordedNodeIDs(volumeID: Self.long), "A volume that does not bind is no proof that it has no names")
-        XCTAssertFalse(fault.stepped, "A volume that does not bind must not reach the read")
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     /// An empty name keeps the sealed value below the limit, so only the key binds fail.
     func testRecordWithAKeyThatDoesNotBindFailsBeforeTheWrite() throws {
-        let fault = try failBinds(of: "INSERT OR REPLACE INTO photo_name")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT OR REPLACE INTO photo_name", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertEqual(store.record([PhotoUID(volumeID: Self.long, nodeID: "node"): ""]), .failed)
-        XCTAssertFalse(fault.stepped, "A key that does not bind must not reach the write")
+        XCTAssertNil(fault.failedBeforeStepProblem)
         fault.remove()
         XCTAssertEqual(store.recordedNodeIDs(volumeID: Self.long), [])
     }
@@ -58,10 +54,11 @@ final class PhotoNameStoreBindingFailureTests: XCTestCase {
     func testForgetWithAKeyThatDoesNotBindFailsAndKeepsTheName() throws {
         let uid = PhotoUID(volumeID: Self.long, nodeID: "node")
         XCTAssertEqual(store.record([uid: "Trip"]), .written)
-        let fault = try failBinds(of: "DELETE FROM photo_name")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(onStore: store!, statement: "DELETE FROM photo_name", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.forget([uid]), "A key that does not bind removes nothing; that is no successful removal")
-        XCTAssertFalse(fault.stepped, "A key that does not bind must not reach the removal")
+        XCTAssertNil(fault.failedBeforeStepProblem)
         fault.remove()
         XCTAssertEqual(store.recordedNodeIDs(volumeID: Self.long), ["node"])
     }

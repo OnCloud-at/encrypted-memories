@@ -34,6 +34,14 @@ public final class BindFailureUntilStep {
             database: { handle }, withLock: { body in body() }, statement: statement, after: earlier, limit: limit)
     }
 
+    /// Acts on the `db` handle of a store that owns its database without `SQLiteStoreConnection`, read through
+    /// reflection, so the store needs no test hook. Nil when the store has no open `db` handle. Pass the store itself, not
+    /// an Optional. Create and remove it while the store runs no operation.
+    public convenience init?(onStore store: Any, statement: String, after earlier: String?, limit: Int32) {
+        guard let handle = storeDatabaseHandle(store) else { return nil }
+        self.init(onDatabase: handle, statement: statement, after: earlier, limit: limit)
+    }
+
     private init(
         database: @escaping () -> OpaquePointer?, withLock: @escaping (() -> Void) -> Void, statement: String,
         after earlier: String?, limit: Int32
@@ -46,7 +54,7 @@ public final class BindFailureUntilStep {
         withLock {
             if earlier == nil {
                 _ = sqlite3_limit(database(), SQLITE_LIMIT_LENGTH, limit)
-                lowered = true
+                lowered = sqlite3_limit(database(), SQLITE_LIMIT_LENGTH, -1) == limit
             }
             _ = sqlite3_trace_v2(
                 database(), UInt32(SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE),
@@ -73,6 +81,7 @@ public final class BindFailureUntilStep {
 
     /// Nil when the limit was lowered for the target statement and that statement never started to step, so its failed
     /// bind stopped the call before the statement ran with a NULL parameter. Otherwise the reason, for the test message.
+    /// The limit counts as lowered only when SQLite applies exactly `limit` (it raises a value below 30 to 30).
     public var failedBeforeStepProblem: String? {
         if !lowered { return "The fault must reach the target statement" }
         if stepped { return "The statement must not step after a failed bind" }
@@ -93,8 +102,7 @@ public final class BindFailureUntilStep {
     }
 }
 
-/// The SQLite handle of a store that keeps it in a stored property named `db`, read through reflection, so a test can
-/// act on the store's own handle without a test hook in the store. Pass the store itself, not an Optional.
-public func storeDatabase(_ store: Any) -> OpaquePointer? {
+/// The open `db` handle of a store that owns its database without `SQLiteStoreConnection`, read through reflection.
+func storeDatabaseHandle(_ store: Any) -> OpaquePointer? {
     Mirror(reflecting: store).children.first(where: { $0.label == "db" })?.value as? OpaquePointer
 }
