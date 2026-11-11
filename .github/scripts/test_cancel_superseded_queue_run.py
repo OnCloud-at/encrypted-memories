@@ -143,6 +143,12 @@ class DecideTests(unittest.TestCase):
             script.KEEP, self.decide(HEAD_SHA, [first, queue_page([HEAD_SHA])], 7200, jobs_answer("in_progress"))
         )
 
+    def test_pagination_requires_a_cursor_before_the_next_page(self):
+        first = queue_page([OTHER_SHA])
+        first['data']['repository']['mergeQueue']['entries']['pageInfo'] = {'endCursor': None, 'hasNextPage': True}
+        self.assertEqual(script.UNKNOWN, self.decide(HEAD_SHA, [first, queue_page([OTHER_SHA])],
+                                                       7200, jobs_answer('in_progress')))
+
     def test_entry_gone_and_old_run_cancels(self):
         self.assertEqual(
             script.CANCEL, self.decide(HEAD_SHA, [queue_page([OTHER_SHA])], 7200, jobs_answer("in_progress"))
@@ -294,6 +300,18 @@ class WatchTests(unittest.TestCase):
         gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
         clock = Clock(iterations=3)
         clock.sleep = lambda seconds: (clock.sleeps.append(seconds), setattr(clock, 'now', clock.now + 1))
+        self.watch(gh, clock)
+        self.assertEqual([], gh.cancel_calls)
+
+    def test_slow_jobs_read_does_not_count_as_time_between_queue_reads(self):
+        clock = Clock(iterations=3)
+        clock.sleep = lambda seconds: (clock.sleeps.append(seconds), setattr(clock, 'now', clock.now + 1))
+        class SlowJobsGh(FakeGh):
+            def jobs_answer(self, run_id):
+                if len(clock.sleeps) == 2:
+                    clock.now += 60
+                return super().jobs_answer(run_id)
+        gh = SlowJobsGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
         self.watch(gh, clock)
         self.assertEqual([], gh.cancel_calls)
 

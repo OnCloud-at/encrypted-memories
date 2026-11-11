@@ -265,13 +265,13 @@ def watch(head_sha, run_id, worker_names, repository, gh, sleep=time.sleep,
         # The queue first: when a merged entry is gone from this read, the jobs read after it
         # shows every worker complete, so the run of a merged pull request is never cancelled.
         queue_answer = gh.queue_answer(owner, name)
+        now = monotonic()
         jobs_answer = gh.jobs_answer(run_id)
         if all_workers_complete(jobs_answer, worker_names):
             print("Poll: KEEP; all worker jobs finished without a failure.", flush=True)
             return 0
         oids = queue_head_oids(queue_answer)
         entry_seen = entry_seen or (oids is not None and head_sha in oids)
-        now = monotonic()
         absent = oids is not None and head_sha not in oids
         confirmed = absent and previous_absence_at is not None and now - previous_absence_at >= ABSENCE_CONFIRMATION_SECONDS
         previous_absence_at = now if absent else None
