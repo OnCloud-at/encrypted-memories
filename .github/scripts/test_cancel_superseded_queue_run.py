@@ -277,6 +277,13 @@ class WatchTests(unittest.TestCase):
         self.watch(gh)
         self.assertEqual([], gh.cancel_calls)
 
+    def test_unbuilt_null_head_never_seen_as_this_run_does_not_cancel(self):
+        page = queue_page([])
+        page['data']['repository']['mergeQueue']['entries']['nodes'].append({'state': 'QUEUED', 'headCommit': None})
+        gh = FakeGh([[page]], [jobs_answer('in_progress')])
+        self.watch(gh)
+        self.assertEqual([], gh.cancel_calls)
+
     def test_each_poll_logs_its_decision_without_payload(self):
         gh = FakeGh([[queue_page([HEAD_SHA])], [queue_page([OTHER_SHA])]], [jobs_answer('in_progress')])
         output = io.StringIO()
