@@ -123,11 +123,8 @@ public struct EditedPhotoReplacement: Sendable {
                         localDate: localEditTime, remoteDate: target.modificationDate)
                 else { continue }
                 provenCompounds[linkID] = target
-            } catch is CancellationError {
-                throw CancellationError()
             } catch {
-                if UploadError.isCancellation(error) { throw error }
-                try Task.checkCancellation()
+                try UploadError.rethrowIfCancelled(error)
             }
         }
         try Task.checkCancellation()
@@ -189,11 +186,8 @@ public struct EditedPhotoReplacement: Sendable {
                         continue
                     }
                     linked = Set(earlier.related.map(\.linkID))
-                } catch is CancellationError {
-                    throw CancellationError()
                 } catch {
-                    if UploadError.isCancellation(error) { throw error }
-                    try Task.checkCancellation()
+                    try UploadError.rethrowIfCancelled(error)
                     kept.insert(target.nodeID)
                     continue
                 }
@@ -296,11 +290,8 @@ public struct EditedPhotoReplacement: Sendable {
     private func readCompound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
         do {
             return try await relations.compound(ofMainLink: linkID)
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            if UploadError.isCancellation(error) { throw error }
-            try Task.checkCancellation()
+            try UploadError.rethrowIfCancelled(error)
             if case UploadError.retryableBackend = error { throw error }
             if BackupSyncRunner.isTransientNetwork(error) { throw error }
             return nil

@@ -218,9 +218,12 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     }
     /// Errors that the next compound reads of a main link throw, one per read.
     var compoundErrorsByMainLinkID: [String: [Error]] = [:]
+    /// Runs before a compound read can fail.
+    var onCompoundRead: (@Sendable (String) -> Void)?
 
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
-        try lock.withLock {
+        lock.withLock { onCompoundRead }?(linkID)
+        return try lock.withLock {
             if let error = compoundErrorsByMainLinkID[linkID]?.first {
                 compoundErrorsByMainLinkID[linkID]?.removeFirst()
                 throw error

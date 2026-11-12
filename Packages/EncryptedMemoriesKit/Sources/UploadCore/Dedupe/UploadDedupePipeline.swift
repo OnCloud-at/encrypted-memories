@@ -636,11 +636,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             head = target
             ancestors = ancestry.links.subtracting(knownForeign)
             foreign = knownForeign
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            if UploadError.isCancellation(error) { throw error }
-            try Task.checkCancellation()
+            try UploadError.rethrowIfCancelled(error)
             return scope
         }
         guard replacesHead else {
@@ -687,11 +684,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     proven.append(linkID)
                 }
             }
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            if UploadError.isCancellation(error) { throw error }
-            try Task.checkCancellation()
+            try UploadError.rethrowIfCancelled(error)
             return scope
         }
         try Task.checkCancellation()
@@ -723,11 +717,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 if external.identifier.map({ $0 == identifier }) ?? true { inherited.append(ancestor) }
             }
             return inherited
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            if UploadError.isCancellation(error) { throw error }
-            try Task.checkCancellation()
+            try UploadError.rethrowIfCancelled(error)
             return []
         }
     }
