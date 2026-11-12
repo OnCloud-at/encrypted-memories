@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 import UploadCore
 
 /// PhotoKit-free description of one photo-library asset - the mapper translates `PHAsset` +
@@ -257,7 +258,8 @@ public enum PhotoBackupAssetPlanner {
             .map { "\($0.role.rawValue):\($0.ordinal):\($0.originalFilename):\($0.mimeType ?? "")" }
             .sorted()
             .joined(separator: "|")
-        let duration = checkedBackupInteger(info.durationSeconds * 1000).map { String($0) } ?? "invalid-duration"
+        let duration =
+            checkedInteger(info.durationSeconds * 1000, as: Int64.self).map { String($0) } ?? "invalid-duration"
         let material =
             "\(parts)#\(info.pixelWidth)x\(info.pixelHeight)#\(duration)#live=\(info.isLivePhoto)"
         return revision(hashing: material)

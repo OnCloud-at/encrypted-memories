@@ -442,11 +442,13 @@ final class PhotoBackupPlannerTests: XCTestCase {
                 asset.hasAdjustments = true
                 XCTAssertEqual(PhotoBackupAssetPlanner.metadataRevision(for: asset).rawValue, missing.rawValue - 1)
             case "external-overflow":
-                XCTAssertEqual(
-                    UploadBackupExternalIdentity(
-                        identifier: "asset", modificationDate: Date(timeIntervalSinceReferenceDate: 1e13)
-                    ).revision,
-                    UploadBackupRevision(date: .distantPast))
+                for seconds in [1e13, -1e13] {
+                    XCTAssertEqual(
+                        UploadBackupExternalIdentity(
+                            identifier: "asset", modificationDate: Date(timeIntervalSinceReferenceDate: seconds)
+                        ).revision,
+                        UploadBackupRevision(date: .distantPast))
+                }
             default:
                 return XCTFail("unknown fingerprint child case")
             }

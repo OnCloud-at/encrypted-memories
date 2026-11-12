@@ -66,13 +66,34 @@ import Testing
     }
 
     @Test func durationBoundsAndInvalidMetadataFallback() {
+        #expect(PhotoDuration.roundedSeconds(nil) == nil)
+        #expect(PhotoDuration.roundedSeconds(0) == nil)
+        #expect(PhotoDuration.roundedSeconds(-0.0) == nil)
         #expect(PhotoDuration.roundedSeconds(Double(Int.max)) == nil)
-        #expect(PhotoDuration.roundedSeconds(Double(Int.max).nextDown) != nil)
+        #expect(PhotoDuration.roundedSeconds(Double(Int.max).nextDown) == 9_223_372_036_854_774_784)
         #expect(PhotoDuration.roundedSeconds(-.infinity) == nil)
         #expect(PhotoDuration.roundedSeconds(-1) == nil)
         #expect(
             ViewerInfoFileFields(metadata: PhotoMetadata(durationSeconds: .nan), fallbackDuration: 9).duration
                 == "0:09")
+    }
+
+    @Test(arguments: [
+        (Double.leastNonzeroMagnitude, 0),
+        (0.49, 0),
+        ((0.5).nextDown, 0),
+        (0.5, 1),
+        ((0.5).nextUp, 1),
+        ((1.5).nextDown, 1),
+        (1.5, 2),
+        ((1.5).nextUp, 2),
+        (59.5, 60),
+        (3_600.49, 3_600),
+        (3_600.5, 3_601),
+        (2_592_000.5, 2_592_001),
+    ])
+    func durationRoundingKeepsBoundaryCases(value: (Double, Int)) {
+        #expect(PhotoDuration.roundedSeconds(value.0) == value.1)
     }
 
     @Test func mediaTypeUsesMetadataThenTheItem() {
