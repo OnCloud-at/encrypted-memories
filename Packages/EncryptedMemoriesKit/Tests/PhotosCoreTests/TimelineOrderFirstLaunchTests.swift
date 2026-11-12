@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import SQLite3
 import XCTest
@@ -97,6 +98,7 @@ final class TimelineOrderFirstLaunchTests: XCTestCase {
 
     func testASecondReaderRebuildDoesNotRestartTheSamePassAgain() async throws {
         let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
+        // The fixture's FIFO executor runs each probe before the next synchronization chunk.
         let task = await owner.start(Self.photos(10_000), action: .readerRebuildTwice)
         defer { task.cancel() }
         let taskResult = await boundedValue(of: task)
@@ -107,10 +109,13 @@ final class TimelineOrderFirstLaunchTests: XCTestCase {
         let probes = try XCTUnwrap(probeListResult, "reader probe list did not arrive within the test deadline")
         defer { probes.forEach { $0.cancel() } }
         XCTAssertEqual(probes.count, 2, "the fixture must schedule both reader probes")
+        var completed: [CacheOwner.Probe] = []
         for (index, probe) in probes.enumerated() {
             let result = await boundedValue(of: probe)
-            _ = try XCTUnwrap(result, "reader probe \(index + 1) did not finish within the test deadline")
+            completed.append(try XCTUnwrap(result, "reader probe \(index + 1) did not finish within the test deadline"))
         }
+        XCTAssertEqual(completed.first?.classified, 1_000)
+        XCTAssertEqual(completed.dropFirst().first?.classified, 2_000)
         let checks = Task {
             let rebuilds = await owner.rebuildCount()
             let rows = await owner.rowCount()
@@ -316,6 +321,10 @@ final class TimelineOrderFirstLaunchTests: XCTestCase {
 }
 
 private actor CacheOwner {
+    // FIFO runs probes scheduled during a chunk before the pass resumes after Task.yield().
+    private nonisolated let queue = DispatchSerialQueue(label: "TimelineOrderFirstLaunchTests.CacheOwner")
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
     enum Action: Sendable, Equatable {
         case observe, measure, cancel, replace, shutdown, readerRebuild, readerRebuildReplace, readerRebuildClose
         case readerRebuildTwice, readerRebuildCancel, readerRebuildThenReplace
@@ -375,7 +384,8 @@ private actor CacheOwner {
                     }
                     self.probes.append(
                         Task(priority: .userInitiated) {
-                            await self.inspect(items[0], action: inspectionAction, queuedAt: queuedAt)
+                            _ = self.classified
+                            return await self.inspect(items[0], action: inspectionAction, queuedAt: queuedAt)
                         })
                 }
                 return true
