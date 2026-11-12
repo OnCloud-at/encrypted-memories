@@ -834,8 +834,8 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         }
     }
 
-    /// The healthy answers of the decision reads equal the legacy answers.
-    func testDecisionQueueReadsAnswerLikeTheLegacyReadsWhenHealthy() throws {
+    /// Healthy decision reads preserve dates, state filters, runtime issues and ordered problem rows.
+    func testHealthyDecisionQueueReadsReturnExpectedValuesAndOrderedProblems() throws {
         store = try makeStore()
         XCTAssertNil(try store!.decisionNextRunnableDate(excludingSourcesOf: []), "nothing runnable is nil")
         XCTAssertNil(try store!.decisionRuntimeIssue(for: .remoteIndexPreparation))
@@ -859,13 +859,8 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
             strict.append($0)
             return true
         }
-        var legacy: [UploadBackupSyncQueueEntry] = []
-        store!.forEachProblemEntry {
-            legacy.append($0)
-            return true
-        }
-        XCTAssertEqual(strict, legacy)
-        XCTAssertFalse(strict.isEmpty)
+        XCTAssertEqual(
+            strict, [entry("failed", state: .failed, revision: 3), entry("draft", state: .blockedByDraft, revision: 2)])
     }
 
     /// A strict read checks its binds: a key longer than the length limit fails to bind instead of matching nothing.

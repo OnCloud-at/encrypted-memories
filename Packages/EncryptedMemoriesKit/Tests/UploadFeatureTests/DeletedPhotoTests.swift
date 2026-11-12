@@ -463,7 +463,8 @@ final class DeletedPhotoTests: XCTestCase {
             controller.setAccessStateForTesting(.full)
             // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
             controller.replacePassBodyForTesting {}
-            let item = try XCTUnwrap(controller.failedItems().first)
+            let capturedItems = try await photoBackupProblemItems(controller)
+            let item = try XCTUnwrap(capturedItems.first)
             XCTAssertFalse(controller.isSyncing)
             controller.backUpAgain(item)
             XCTAssertTrue(controller.isSyncing)
@@ -484,14 +485,16 @@ final class DeletedPhotoTests: XCTestCase {
             XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
             controller.setAccessStateForTesting(.full)
             controller.replacePassBodyForTesting {}
-            let item = try XCTUnwrap(controller.failedItems().first)
+            let capturedItems = try await photoBackupProblemItems(controller)
+            let item = try XCTUnwrap(capturedItems.first)
             let rejected = BackupFailedItem(
                 id: item.id, filename: item.filename, reason: item.reason, isPermanent: item.isPermanent,
                 issue: .remoteDraftStale, source: item.source, revision: item.revision)
             XCTAssertFalse(controller.backUpAgain(rejected))
             XCTAssertFalse(controller.isSyncing)
             XCTAssertNil(controller.activeExecutionRunID)
-            XCTAssertEqual(controller.failedItems(), [item])
+            let refreshedItems1 = try await photoBackupProblemItems(controller)
+            XCTAssertEqual(refreshedItems1, [item])
             XCTAssertTrue(journal.entry(for: try XCTUnwrap(item.source)).isEmpty)
             await controller.shutdown()
         }
@@ -591,7 +594,7 @@ final class DeletedPhotoTests: XCTestCase {
             UploadBackupSyncQueueManifestStore(
                 url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
         let revision = UploadBackupRevision(date: date)
-        func seed() throws -> BackupFailedItem {
+        func seed() async throws -> BackupFailedItem {
             XCTAssertTrue(
                 queue.upsert(
                     .init(
@@ -602,9 +605,10 @@ final class DeletedPhotoTests: XCTestCase {
                     source: source, revision: revision, state: .failedPermanent, attempts: nil,
                     lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
                     updatedAt: date))
-            return try XCTUnwrap(controller.failedItems().first)
+            let capturedItems = try await photoBackupProblemItems(controller)
+            return try XCTUnwrap(capturedItems.first)
         }
-        let item = try seed()
+        let item = try await seed()
         XCTAssertEqual(item.issue, .deletedElsewhere)
         XCTAssertTrue(item.isPermanent)
         XCTAssertFalse(item.isRetryable)
@@ -617,10 +621,11 @@ final class DeletedPhotoTests: XCTestCase {
         controller.keepDeleted(item)
         XCTAssertTrue(journal.entry(for: source).keptDeleted == true)
         XCTAssertEqual(try queue.entry(for: source, revision: revision)?.state, .skippedRemoteDeletion)
-        XCTAssertTrue(controller.failedItems().isEmpty)
+        let refreshedItems1 = try await photoBackupProblemItems(controller)
+        XCTAssertTrue(refreshedItems1.isEmpty)
         XCTAssertEqual(queue.summary()!.skippedRemoteDeletions, 1)
         XCTAssertEqual(queue.summary()!.uploaded, 0)
-        let again = try seed()
+        let again = try await seed()
         controller.backUpAgain(again)
         XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, revision)
         XCTAssertNil(journal.entry(for: source).keptDeleted)
@@ -740,8 +745,10 @@ final class DeletedPhotoTests: XCTestCase {
                 lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
                 updatedAt: date)
         }
-        for row in rows { XCTAssertTrue(queue.upsert(row)) }
-        let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision })
+        XCTAssertTrue(queue.upsert(rows[0]))
+        let capturedItems = try await photoBackupProblemItems(controller)
+        let olderItem = try XCTUnwrap(capturedItems.first { $0.revision == rows[0].revision })
+        for row in rows.dropFirst() { XCTAssertTrue(queue.upsert(row)) }
         let beforeJournal = journal.entry(for: source)
         let fault = try SQLiteReadInterrupt(
             in: queue, matching: matching, occurrence: occurrence, afterRows: afterRows)
@@ -1064,8 +1071,10 @@ final class DeletedPhotoTests: XCTestCase {
                     lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
                     updatedAt: date)
             }
-            for row in rows { XCTAssertTrue(queue.upsert(row), name) }
-            let item = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision }, name)
+            XCTAssertTrue(queue.upsert(rows[0]), name)
+            let capturedItems = try await photoBackupProblemItems(controller)
+            let item = try XCTUnwrap(capturedItems.first { $0.revision == rows[0].revision }, name)
+            for row in rows.dropFirst() { XCTAssertTrue(queue.upsert(row), name) }
             let journalBefore = journal.entry(for: source)
             let fault = try failingWrite.map {
                 try SQLiteReadInterrupt(
@@ -1113,8 +1122,10 @@ final class DeletedPhotoTests: XCTestCase {
                         lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
                         updatedAt: date)
                 }
-                for row in rows { XCTAssertTrue(queue.upsert(row)) }
-                let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == rows[0].revision })
+                XCTAssertTrue(queue.upsert(rows[0]))
+                let capturedItems = try await photoBackupProblemItems(controller)
+                let olderItem = try XCTUnwrap(capturedItems.first { $0.revision == rows[0].revision })
+                for row in rows.dropFirst() { XCTAssertTrue(queue.upsert(row)) }
                 let url = account.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)
                 var handle: OpaquePointer?
                 XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
@@ -1166,7 +1177,8 @@ final class DeletedPhotoTests: XCTestCase {
                 url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
         let older = UploadBackupRevision(date: date)
         let newer = UploadBackupRevision(date: date.addingTimeInterval(60))
-        func park() {
+        func park() async throws -> BackupFailedItem {
+            var captured: BackupFailedItem?
             for revision in [older, newer] {
                 XCTAssertTrue(
                     queue.upsert(
@@ -1178,22 +1190,27 @@ final class DeletedPhotoTests: XCTestCase {
                         source: source, revision: revision, state: .failedPermanent, attempts: nil,
                         lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
                         updatedAt: date))
+                if revision == older {
+                    let items = try await photoBackupProblemItems(controller)
+                    captured = try XCTUnwrap(items.first { $0.revision == older })
+                }
             }
+            return try XCTUnwrap(captured)
         }
-        park()
-        let olderItem = try XCTUnwrap(controller.failedItems().first { $0.revision == older })
+        let olderItem = try await park()
         controller.keepDeleted(olderItem)
         XCTAssertEqual(try queue.entry(for: source, revision: older)?.state, .skippedRemoteDeletion)
         XCTAssertEqual(try queue.entry(for: source, revision: newer)?.state, .skippedRemoteDeletion)
-        XCTAssertTrue(controller.failedItems().isEmpty)
+        let capturedItems = try await photoBackupProblemItems(controller)
+        XCTAssertTrue(capturedItems.isEmpty)
 
-        park()
-        let again = try XCTUnwrap(controller.failedItems().first { $0.revision == older })
+        let again = try await park()
         controller.backUpAgain(again)
         XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, newer, "consent covers the newest version")
         XCTAssertEqual(try queue.entry(for: source, revision: newer)?.state, .discovered)
         XCTAssertEqual(try queue.entry(for: source, revision: older)?.state, .dismissedFailure)
-        XCTAssertTrue(controller.failedItems().filter { $0.issue == .deletedElsewhere }.isEmpty)
+        let refreshedItems1 = try await photoBackupProblemItems(controller)
+        XCTAssertTrue(refreshedItems1.filter { $0.issue == .deletedElsewhere }.isEmpty)
         await controller.shutdown()
         queue.close()
     }

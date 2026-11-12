@@ -517,17 +517,14 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// Streams the rows that keep the backup incomplete, newest revision first, until `body` returns false.
     /// A waiting row counts only when its text is an issue record; an older build's message is no problem.
     /// `body` runs under the store's lock and must not call the store.
-    public func forEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) {
-        try? problemEntries(body, requireComplete: false)
-    }
-
-    private func problemEntries(_ body: (UploadBackupSyncQueueEntry) -> Bool, requireComplete: Bool) throws {
+    /// After a throw the caller must discard every row it received.
+    public func decisionForEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) throws {
         #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
             onProblemReadEvent?(.willLock)
             defer { onProblemReadEvent?(.didUnlock) }
         #endif
         try connection.withLock {
-            try beginReadLocked(requireComplete: requireComplete)
+            try beginReadLocked(requireComplete: true)
             #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
                 onProblemReadEvent?(.didLock)
                 onProblemReadEvent?(.statement)
@@ -546,7 +543,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK)
-            else { return try unknownRead(requireComplete: requireComplete, ()) }
+            else { throw SQLiteStoreUnknownReadError() }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_int64(stmt, 1, Int64(BackupIssueRecord.storagePrefix.count))
             try connection.bindText(stmt, 2, BackupIssueRecord.storagePrefix)
@@ -560,11 +557,11 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 #endif
                 guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
                     connection.markFailed()
-                    return try unknownRead(requireComplete: requireComplete, ())
+                    throw SQLiteStoreUnknownReadError()
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
                 guard let entry = row(stmt, source: source, revision: revision, offset: 4) else {
-                    return try unknownRead(requireComplete: requireComplete, ())
+                    throw SQLiteStoreUnknownReadError()
                 }
                 if !entry.isDismissedSourceRecheck, !body(entry) { return }
                 #if DEBUG || ENCRYPTED_MEMORIES_PROBLEM_LIST_BENCHMARK
@@ -573,7 +570,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 stepResult = sqlite3_step(stmt)
             }
             guard requireOperational(stepResult == SQLITE_DONE) else {
-                return try unknownRead(requireComplete: requireComplete, ())
+                throw SQLiteStoreUnknownReadError()
             }
         }
     }
@@ -2038,11 +2035,6 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
 
     public func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord? {
         try runtimeIssue(for: key, requireComplete: true)
-    }
-
-    /// Streams the problem rows as `forEachProblemEntry` does. After a throw the caller discards what it received.
-    public func decisionForEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) throws {
-        try problemEntries(body, requireComplete: true)
     }
 
     /// Every row of the given sources, from a complete read.

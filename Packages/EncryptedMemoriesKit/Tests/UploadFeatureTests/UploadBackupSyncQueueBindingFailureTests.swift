@@ -373,19 +373,6 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
                 return true
             },
             "A prefix that does not bind would hide every waiting problem")
-        XCTAssertFalse(fault.stepped, "A statement whose bind failed must not run")
-        try assertBindFailureRecorded()
-    }
-
-    func testProblemEntriesWithAPrefixLongerThanTheLimitDeliverNothingAndRecordIt() throws {
-        XCTAssertTrue(store.upsertBatch([entry("failed", state: .failed), entry("waiting", lastError: issue())]))
-        let fault = try failBinds(untilStepOf: "substr(last_error, 1, ?) = ?")
-        defer { fault.remove() }
-        var delivered: [String] = []
-        store.forEachProblemEntry {
-            delivered.append($0.source.identifier)
-            return true
-        }
         XCTAssertEqual(delivered, [], "A partial problem list must not look complete")
         XCTAssertFalse(fault.stepped, "A statement whose bind failed must not run")
         try assertBindFailureRecorded()

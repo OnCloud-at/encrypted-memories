@@ -1,8 +1,18 @@
+import PhotoLibraryBackupAdapter
 import PhotosCore
 import SQLite3
 import XCTest
 
 @testable import UploadCore
+
+/// Reads the same complete snapshot as the native backup sheets. An unknown read is a test failure.
+@MainActor
+func photoBackupProblemItems(
+    _ controller: PhotoLibraryBackupController, file: StaticString = #filePath, line: UInt = #line
+) async throws -> [BackupFailedItem] {
+    let snapshot = await controller.problemSnapshot()
+    return try XCTUnwrap(snapshot, file: file, line: line).rows.map(\.item)
+}
 
 /// The SQLite connection of a store, read through reflection, so a fixture can act on the store's own connection.
 /// Pass the store itself: an implicitly unwrapped property passed as `Any` reflects as an Optional and has no

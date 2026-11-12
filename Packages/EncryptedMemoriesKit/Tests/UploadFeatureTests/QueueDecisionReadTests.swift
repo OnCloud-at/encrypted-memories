@@ -1,6 +1,7 @@
 import AlbumSyncCore
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
@@ -84,7 +85,8 @@ final class QueueDecisionReadTests: XCTestCase {
                 "missing", state: .sourceMissing,
                 lastError: BackupIssueRecord(kind: .sourceMissing, detail: "gone").persistedValue)
             XCTAssertTrue(queue.upsert(missing))
-            let item = try XCTUnwrap(controller.failedItems().first { $0.source == missing.source })
+            let capturedItems = try await photoBackupProblemItems(controller)
+            let item = try XCTUnwrap(capturedItems.first { $0.source == missing.source })
             XCTAssertTrue(item.isPermanent)
             // The dismissal reads the row twice: its own check, then the record that the dismissed row keeps.
             let fault = try SQLiteReadInterrupt(
@@ -95,6 +97,109 @@ final class QueueDecisionReadTests: XCTestCase {
             let observer = try makeQueue(PhotoLibraryBackupController.queueDatabaseFileName)
             defer { observer.close() }
             XCTAssertEqual(try observer.entry(for: missing.source, revision: missing.revision), missing)
+            await controller.shutdown()
+        }
+    #endif
+
+    func testTheProblemVisitorThrowsWhenPreparingItsStatementFails() throws {
+        let queue = try makeQueue()
+        defer { queue.close() }
+        try withDeniedSQLiteSelect(in: queue) {
+            XCTAssertThrowsError(
+                try queue.decisionForEachProblemEntry { _ in
+                    XCTFail("a failed prepare delivers no rows")
+                    return true
+                })
+        }
+    }
+
+    func testTheProblemVisitorThrowsForAnUndecodableSourceOrReceipt() throws {
+        for column in ["source_kind='invalid'", "remote_commit_reconciliation=X'7B'"] {
+            let queue = try makeQueue(column.contains("source_kind") ? "source.sqlite" : "receipt.sqlite")
+            defer { queue.close() }
+            let rows = [row("valid", state: .failed, revision: 2), row("invalid", state: .failed, revision: 1)]
+            XCTAssertTrue(queue.upsertBatch(rows))
+            let connection = try storeConnection(queue)
+            connection.withLock {
+                XCTAssertEqual(
+                    sqlite3_exec(
+                        connection.database, "UPDATE backup_sync_queue SET \(column) WHERE source_id='invalid';", nil,
+                        nil, nil),
+                    SQLITE_OK)
+            }
+            var delivered: [UploadBackupSyncQueueEntry] = []
+            XCTAssertThrowsError(
+                try queue.decisionForEachProblemEntry {
+                    delivered.append($0)
+                    return true
+                }, column)
+            XCTAssertEqual(delivered, [rows[0]], "the valid prefix is not a complete answer: \(column)")
+            XCTAssertFalse(queue.isOperational(), "undecodable metadata records a lasting failure: \(column)")
+        }
+    }
+
+    /// A strict visitor can deliver a prefix, but must throw before its caller accepts it as complete.
+    func testAPartialProblemVisitorThrowsAfterDeliveringOneRow() throws {
+        let queue = try makeQueue()
+        defer { queue.close() }
+        let rows = (1...3).map { row("photo-\($0)", state: .failed, revision: Int64($0)) }
+        XCTAssertTrue(queue.upsertBatch(rows))
+        let fault = try SQLiteReadInterrupt(in: queue, matching: Self.problemSQL, afterRows: 2)
+        defer { fault.stop() }
+        var delivered: [UploadBackupSyncQueueEntry] = []
+        XCTAssertThrowsError(
+            try queue.decisionForEachProblemEntry {
+                delivered.append($0)
+                return true
+            })
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(fault.tracedRows, 2)
+        XCTAssertEqual(delivered, [rows[2]], "the first row was delivered before the next step failed")
+        fault.stop()
+        let connection = try storeConnection(queue)
+        connection.withLock {
+            XCTAssertNil(sqlite3_next_stmt(connection.database, nil), "the failed read finalized its statement")
+        }
+        var recovered: [UploadBackupSyncQueueEntry] = []
+        try queue.decisionForEachProblemEntry {
+            recovered.append($0)
+            return true
+        }
+        XCTAssertEqual(recovered, rows.reversed())
+        var stopped: [UploadBackupSyncQueueEntry] = []
+        try queue.decisionForEachProblemEntry {
+            stopped.append($0)
+            return false
+        }
+        XCTAssertEqual(stopped, [rows[2]], "the visitor can stop after its first accepted row")
+        connection.withLock {
+            XCTAssertNil(sqlite3_next_stmt(connection.database, nil), "early stop finalized its statement")
+        }
+    }
+
+    #if DEBUG
+        @MainActor
+        func testTheControllerDoesNotTurnAnUnknownSnapshotIntoAnEmptyList() async throws {
+            let suite = "unknown-problem-snapshot-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader())
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            XCTAssertTrue(queue.upsert(row("failed", state: .failed)))
+            let faults = try SQLiteStatementFaults(in: queue) { $0.contains(Self.problemSQL) }
+            defer { faults.stop() }
+            controller.problemListExpectationForTesting = { true }
+            let clock = BackupTestClock()
+            let captured = await controller.problemSnapshot(clock: clock)
+            XCTAssertNil(captured, "unknown storage is not a successful empty snapshot")
+            XCTAssertEqual(faults.firedCount, 6, "the first read and all five bounded rereads failed")
+            XCTAssertEqual(clock.sleeps, [0.25, 0.5, 1, 2, 4])
+            faults.stop()
+            let recovered = try await photoBackupProblemItems(controller)
+            XCTAssertEqual(recovered.map(\.source), [row("failed", state: .failed).source])
             await controller.shutdown()
         }
     #endif

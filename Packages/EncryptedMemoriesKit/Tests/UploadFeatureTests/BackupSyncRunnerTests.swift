@@ -1952,7 +1952,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4, "the backed-up photo is not read again")
         XCTAssertEqual(uploader.requests.count, 1)
         var listed: [UploadBackupSyncQueueEntry] = []
-        queue.forEachProblemEntry {
+        try queue.decisionForEachProblemEntry {
             listed.append($0)
             return true
         }
@@ -4409,7 +4409,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             XCTAssertNil(BackupIssueRecord.decode(kept.lastError), "waiting is no problem")
         }
         var problems = 0
-        queueStore.forEachProblemEntry { _ in
+        try queueStore.decisionForEachProblemEntry { _ in
             problems += 1
             return true
         }
@@ -5017,7 +5017,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             XCTAssertEqual(progress.skippedRemoteDeletions, 1)
             XCTAssertEqual(progress.needsAttention, 0)
             var problems = 0
-            queueStore.forEachProblemEntry { _ in
+            try queueStore.decisionForEachProblemEntry { _ in
                 problems += 1
                 return true
             }

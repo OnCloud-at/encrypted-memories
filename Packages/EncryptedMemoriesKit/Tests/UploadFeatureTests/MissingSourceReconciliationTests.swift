@@ -811,7 +811,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(waiting.waiting, 0, "A deferred check is not another pending upload")
         XCTAssertEqual(availability.calls, 0)
         var problems: [UploadBackupSyncQueueEntry] = []
-        queue.forEachProblemEntry {
+        try queue.decisionForEachProblemEntry {
             problems.append($0)
             return true
         }
@@ -1515,7 +1515,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 queueDate: projection.progress.outstanding.nextAttemptAt,
                 consecutiveNoProgressRuns: 16, now: clock.now, retryPolicy: BackupRetryPolicy()), due)
         var problems: [UploadBackupSyncQueueEntry] = []
-        queue.forEachProblemEntry {
+        try queue.decisionForEachProblemEntry {
             problems.append($0)
             return true
         }

@@ -51,37 +51,21 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempDir)
     }
 
-    /// Backs up the album's assets with the real runner, then reports like `PhotoAlbumBackupExecutor`.
+    /// Backs up the album's assets with the real runner and report reader.
     private final class BackupReportExecutor: AlbumSyncBackupExecuting, @unchecked Sendable {
         let runner: BackupSyncRunner
         let queue: UploadBackupSyncQueueManifestStore
-        let entries: [UploadBackupSyncQueueEntry]
 
-        init(runner: BackupSyncRunner, queue: UploadBackupSyncQueueManifestStore, entries: [UploadBackupSyncQueueEntry])
-        {
+        init(runner: BackupSyncRunner, queue: UploadBackupSyncQueueManifestStore) {
             self.runner = runner
             self.queue = queue
-            self.entries = entries
         }
 
         func ensureBackedUp(
             localIdentifiers: [String], onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
         ) async throws -> AlbumSyncBackupReport {
             _ = await runner.runUntilDrained(workIntent: .userInitiated)
-            let summary = queue.summary()!
-            var problems: [String: BackupFailedItem] = [:]
-            queue.forEachProblemEntry { entry in
-                if entry.source.kind == .photoLibraryAsset, problems[entry.source.identifier] == nil {
-                    problems[entry.source.identifier] = BackupFailedItem(entry: entry)
-                }
-                return true
-            }
-            var filenames: [String: String] = [:]
-            for entry in entries { filenames[entry.source.identifier] = entry.originalFilename }
-            return AlbumSyncBackupReport(
-                total: summary.total, backedUp: summary.resolved, failed: summary.failed,
-                sourceMissing: summary.sourceMissing, skippedRemoteDeletion: summary.skippedRemoteDeletions,
-                problems: problems, filenames: filenames)
+            return try AlbumSyncBackupReport.read(from: queue, localIdentifiers: localIdentifiers)
         }
 
         func stop() async {}
@@ -136,7 +120,7 @@ final class AlbumSyncBlockedVideoTests: XCTestCase {
         let lookup = try XCTUnwrap(UploadManifestRemoteLinkLookup(manifestURL: manifestURL, policy: .conservative))
         let albumRunner = AlbumSyncRunner(
             localSource: LocalAlbum(identifiers: entries.map(\.source.identifier)),
-            backup: BackupReportExecutor(runner: runner, queue: queueStore, entries: entries),
+            backup: BackupReportExecutor(runner: runner, queue: queueStore),
             remoteOps: remote, linkLookup: lookup, mappingStore: mappingStore)
         let report = try await albumRunner.sync(album: LocalAlbumSummary(id: "album-1", title: "Trip", assetCount: 1))
         await lookup.shutdown()
