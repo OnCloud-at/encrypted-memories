@@ -210,6 +210,12 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var lineageReadError: any Error = UploadError.backend("The scenario lineage read failed")
 
     private var ancestryReadError: (any Error)?
+    var onLineageRead: (@Sendable (LineageRead) -> Void)?
+
+    private func observeLineageRead(_ read: LineageRead) {
+        lock.withLock { onLineageRead }?(read)
+    }
+
     func configureLineageFailureAtAncestry(_ error: (any Error)?) {
         lock.withLock { ancestryReadError = error }
     }
@@ -335,7 +341,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
-        try lock.withLock {
+        observeLineageRead(.identity)
+        return try lock.withLock {
             if failLineageRead { throw lineageReadError }
             return (
                 Set(
@@ -347,7 +354,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
-        try lock.withLock {
+        observeLineageRead(.successors)
+        return try lock.withLock {
             if failLineageRead { throw lineageReadError }
             return (
                 Set(
@@ -359,7 +367,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
-        try lock.withLock {
+        observeLineageRead(.external)
+        return try lock.withLock {
             if failLineageRead { throw lineageReadError }
             let link = table[linkID]
             let identifier =
@@ -369,7 +378,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
-        try lock.withLock {
+        observeLineageRead(.ancestry)
+        return try lock.withLock {
             if let ancestryReadError { throw ancestryReadError }
             if failLineageRead { throw lineageReadError }
             let link = table[linkID]

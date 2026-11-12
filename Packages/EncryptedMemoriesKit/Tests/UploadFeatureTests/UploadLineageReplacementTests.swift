@@ -7,6 +7,7 @@ import XCTest
 
 /// The pipeline and guarded executor read the same server links, including lineage and external identity.
 final class UploadLineageReplacementTests: XCTestCase {
+    private var rootDirectory: URL!
     private var directory: URL!
     private var library: EditScenarioLibrary!
     private var server: EditScenarioServer!
@@ -16,7 +17,12 @@ final class UploadLineageReplacementTests: XCTestCase {
     private let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-1")
 
     override func setUpWithError() throws {
-        directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        rootDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try prepareFixture(in: rootDirectory)
+    }
+
+    private func prepareFixture(in directory: URL) throws {
+        self.directory = directory
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         library = EditScenarioLibrary(directory: directory)
         library.add()
@@ -27,7 +33,7 @@ final class UploadLineageReplacementTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        try FileManager.default.removeItem(at: directory)
+        try FileManager.default.removeItem(at: rootDirectory)
     }
 
     private func descriptor(
@@ -731,6 +737,52 @@ final class UploadLineageReplacementTests: XCTestCase {
                 XCTAssertEqual(localJournal.entry(for: source), before)
                 server.configureLineageFailureAtAncestry(nil)
             }
+        }
+    }
+
+    func testCancellationPriorityAndIdentityAtDiscovery() async throws {
+        try await assertCancellationPriority(at: .discovery)
+    }
+
+    func testCancellationPriorityAndIdentityAtForeignLookup() async throws {
+        try await assertCancellationPriority(at: .foreign)
+    }
+
+    func testCancellationPriorityAndIdentityAtAncestry() async throws {
+        try await assertCancellationPriority(at: .ancestry)
+    }
+
+    private enum CancellationRoute: String { case discovery, foreign, ancestry }
+
+    private func assertCancellationPriority(at route: CancellationRoute) async throws {
+        for scenario in CancellationReadFault.Scenario.allCases {
+            let context = "\(route.rawValue)/\(scenario.rawValue)"
+            try prepareFixture(in: rootDirectory.appendingPathComponent(UUID().uuidString))
+            let head = try seed("head")
+            if route != .discovery { try journal.addSuperseded(head, for: source) }
+            let fault = CancellationReadFault(scenario)
+            let faultedRead: EditScenarioServer.LineageRead
+            if route == .ancestry {
+                server.configureLineageFailureAtAncestry(fault.error)
+                faultedRead = .ancestry
+            } else {
+                server.configureLineageIndex(failing: true, error: fault.error)
+                faultedRead = route == .discovery ? .identity : .external
+            }
+            server.onLineageRead = { read in if read == faultedRead { fault.read() } }
+            let before = journal.entry(for: source)
+            let localPipeline = try XCTUnwrap(pipeline)
+            let next = descriptor("next", edited: route != .foreign)
+            let operation = Task { try await localPipeline.resolve(next) }
+            do {
+                let result = try await operation.value
+                XCTFail("\(context): cancellation must propagate: \(result.decision)")
+                await localPipeline.uploadDidFail(next)
+            } catch {
+                fault.assertCaught(error, context: context)
+            }
+            fault.assertRead(context)
+            XCTAssertEqual(journal.entry(for: source), before, context)
         }
     }
 

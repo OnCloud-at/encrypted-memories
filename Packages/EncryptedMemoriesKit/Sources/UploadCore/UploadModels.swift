@@ -617,6 +617,15 @@ public enum UploadError: LocalizedError, Equatable {
         }
     }
 
+    /// Recreates native cancellation, including NSError boxes that bridge to CancellationError.
+    /// Rethrows other reported cancellations unchanged.
+    /// Otherwise checks task cancellation before the caller handles an ordinary failure.
+    package static func rethrowIfCancelled(_ error: any Error) throws {
+        if error is CancellationError { throw CancellationError() }
+        if isCancellation(error) { throw error }
+        try Task.checkCancellation()
+    }
+
     public var errorDescription: String? {
         switch self {
         case .unsupportedFile(let name): L10n.string("error.upload_unsupported_file \(name)")

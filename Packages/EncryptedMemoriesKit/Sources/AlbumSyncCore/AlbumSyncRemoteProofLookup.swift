@@ -47,11 +47,8 @@ public enum AlbumSyncRemoteProofLookup {
         let proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]
         do {
             proofs = try await resolver.remoteAssetProofs(for: snapshots.compactMap(\.externalIdentity))
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            if UploadError.isCancellation(error) { throw error }
-            try Task.checkCancellation()
+            try UploadError.rethrowIfCancelled(error)
             return [:]
         }
         try Task.checkCancellation()

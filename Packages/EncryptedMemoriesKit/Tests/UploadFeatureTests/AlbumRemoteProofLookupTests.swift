@@ -232,6 +232,33 @@ final class AlbumRemoteProofLookupTests: XCTestCase {
         }
     }
 
+    func testCancellationPriorityAndIdentityDuringProofLookup() async throws {
+        for scenario in CancellationReadFault.Scenario.allCases {
+            try await withQueue { queue in
+                let context = scenario.rawValue
+                let asset = self.candidate("asset")
+                self.seed(asset, in: queue)
+                let before = try queue.entry(for: asset.snapshot.source, revision: asset.snapshot.revision)
+                let fault = CancellationReadFault(scenario)
+                let resolver = ScriptedAlbumProofResolver(fault: fault)
+                let operation = Task {
+                    try await AlbumSyncRemoteProofLookup.remoteLinks(
+                        for: ["asset"], catalog: ProofTestCatalog(assets: [asset]), queue: queue, resolver: resolver)
+                }
+                do {
+                    _ = try await operation.value
+                    XCTFail("\(context): cancellation cannot become an ordinary proof miss")
+                } catch {
+                    fault.assertCaught(error, context: context)
+                }
+                fault.assertRead(context)
+                XCTAssertEqual(resolver.requests.count, 1, context)
+                XCTAssertEqual(
+                    try queue.entry(for: asset.snapshot.source, revision: asset.snapshot.revision), before, context)
+            }
+        }
+    }
+
     func testTransportCancellationDuringProofLookupPropagates() async throws {
         try await withQueue { queue in
             let asset = self.candidate("asset")
@@ -283,14 +310,23 @@ private final class ScriptedAlbumProofResolver: UploadIdentityResolving, @unchec
     var requests: [[UploadBackupExternalIdentity]] { lock.withLock { recorded } }
     let override: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]?
     let failure: Failure?
-    init(override: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]? = nil, failure: Failure? = nil) {
+    private let fault: CancellationReadFault?
+    init(
+        override: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]? = nil,
+        failure: Failure? = nil, fault: CancellationReadFault? = nil
+    ) {
         self.override = override
         self.failure = failure
+        self.fault = fault
     }
     func remoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
         lock.withLock { recorded.append(identities) }
+        if let fault {
+            fault.read()
+            throw fault.error
+        }
         if failure == .cancelAfterProof || failure == .cancelWithUnavailable {
             withUnsafeCurrentTask { $0?.cancel() }
         }
