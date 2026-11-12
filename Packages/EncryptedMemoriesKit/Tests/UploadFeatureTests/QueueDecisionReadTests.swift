@@ -184,7 +184,8 @@ final class QueueDecisionReadTests: XCTestCase {
             let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             defer { defaults.removePersistentDomain(forName: suite) }
             let controller = PhotoLibraryBackupController(
-                configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
                 identityResolver: nil, uploader: MockUploader())
             let queue = try XCTUnwrap(controller.queueStoreForTesting)
             XCTAssertTrue(queue.upsert(row("failed", state: .failed)))
