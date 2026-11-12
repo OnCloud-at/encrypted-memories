@@ -845,22 +845,24 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     }
 
-    @MainActor private final class ShownProblemLists {
-        var lists: [[BackupFailedItem]] = []
-        var ended = false
+    #if DEBUG
+        @MainActor private final class ShownProblemLists {
+            var lists: [[BackupFailedItem]] = []
+            var ended = false
 
-        func follow(_ controller: PhotoLibraryBackupController) -> (BackupProblemListSession, Task<Void, Never>) {
-            let session = controller.makeProblemListSession()
-            session.onPublicationEvent = { [weak session] event in
-                if event == .didApply, let session { self.lists.append(session.rows.map(\.item)) }
+            func follow(_ controller: PhotoLibraryBackupController) -> (BackupProblemListSession, Task<Void, Never>) {
+                let session = controller.makeProblemListSession()
+                session.onPublicationEvent = { [weak session] event in
+                    if event == .didApply, let session { self.lists.append(session.rows.map(\.item)) }
+                }
+                let task = Task {
+                    await controller.followProblemList(session: session)
+                    self.ended = true
+                }
+                return (session, task)
             }
-            let task = Task {
-                await controller.followProblemList(session: session)
-                self.ended = true
-            }
-            return (session, task)
         }
-    }
+    #endif
 
     func testAUserRetryLeavesARowThatTheRunnerClaimedMeanwhile() throws {
         let fixture = try makeControllerFixture(prefix: "backup-retry-race")

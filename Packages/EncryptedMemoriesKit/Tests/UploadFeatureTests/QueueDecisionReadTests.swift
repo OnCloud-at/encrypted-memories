@@ -177,29 +177,31 @@ final class QueueDecisionReadTests: XCTestCase {
         }
     }
 
-    @MainActor
-    func testTheControllerDoesNotTurnAnUnknownSnapshotIntoAnEmptyList() async throws {
-        let suite = "unknown-problem-snapshot-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: nil, uploader: MockUploader())
-        let queue = try XCTUnwrap(controller.queueStoreForTesting)
-        XCTAssertTrue(queue.upsert(row("failed", state: .failed)))
-        let faults = try SQLiteStatementFaults(in: queue) { $0.contains(Self.problemSQL) }
-        defer { faults.stop() }
-        controller.problemListExpectationForTesting = { true }
-        let clock = BackupTestClock()
-        let captured = await controller.problemSnapshot(clock: clock)
-        XCTAssertNil(captured, "unknown storage is not a successful empty snapshot")
-        XCTAssertEqual(faults.firedCount, 6, "the first read and all five bounded rereads failed")
-        XCTAssertEqual(clock.sleeps, [0.25, 0.5, 1, 2, 4])
-        faults.stop()
-        let recovered = try await photoBackupProblemItems(controller)
-        XCTAssertEqual(recovered.map(\.source), [row("failed", state: .failed).source])
-        await controller.shutdown()
-    }
+    #if DEBUG
+        @MainActor
+        func testTheControllerDoesNotTurnAnUnknownSnapshotIntoAnEmptyList() async throws {
+            let suite = "unknown-problem-snapshot-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader())
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            XCTAssertTrue(queue.upsert(row("failed", state: .failed)))
+            let faults = try SQLiteStatementFaults(in: queue) { $0.contains(Self.problemSQL) }
+            defer { faults.stop() }
+            controller.problemListExpectationForTesting = { true }
+            let clock = BackupTestClock()
+            let captured = await controller.problemSnapshot(clock: clock)
+            XCTAssertNil(captured, "unknown storage is not a successful empty snapshot")
+            XCTAssertEqual(faults.firedCount, 6, "the first read and all five bounded rereads failed")
+            XCTAssertEqual(clock.sleeps, [0.25, 0.5, 1, 2, 4])
+            faults.stop()
+            let recovered = try await photoBackupProblemItems(controller)
+            XCTAssertEqual(recovered.map(\.source), [row("failed", state: .failed).source])
+            await controller.shutdown()
+        }
+    #endif
 
     /// A problem list that a failed read cut short is no snapshot, also after the failure is forgotten.
     func testAPartialProblemReadYieldsNoSnapshotAfterRecovery() throws {
