@@ -1109,6 +1109,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
+    private static let actionIdentityWhere =
+        "source_kind=? AND source_id=? AND kind=? AND album_id=? AND desired=? AND created_at=?"
+
     @discardableResult
     public func retryAction(_ action: PendingAction, at date: Date) -> Bool {
         standaloneWrite(refusing: false) {
@@ -1117,13 +1120,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             return execute(
                 """
                 UPDATE pending_action SET attempts=attempts+1, next_attempt_at=?
-                WHERE source_kind=? AND source_id=? AND kind=? AND album_id=? AND desired=? AND created_at=?;
+                WHERE \(Self.actionIdentityWhere);
                 """
             ) { stmt in
                 sqlite3_bind_double(stmt, 1, next.timeIntervalSince1970)
-                try bindActionKey(stmt, action, from: 2)
-                sqlite3_bind_int(stmt, 6, action.desired ? 1 : 0)
-                sqlite3_bind_double(stmt, 7, action.createdAt.timeIntervalSince1970)
+                try bindActionIdentity(stmt, action, from: 2)
             }
         }
     }
@@ -1134,12 +1135,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             execute(
                 """
                 UPDATE pending_action SET failed=1
-                WHERE source_kind=? AND source_id=? AND kind=? AND album_id=? AND desired=? AND created_at=?;
+                WHERE \(Self.actionIdentityWhere);
                 """
             ) { stmt in
-                try bindActionKey(stmt, action, from: 1)
-                sqlite3_bind_int(stmt, 5, action.desired ? 1 : 0)
-                sqlite3_bind_double(stmt, 6, action.createdAt.timeIntervalSince1970)
+                try bindActionIdentity(stmt, action, from: 1)
             }
         }
     }
@@ -1151,12 +1150,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             execute(
                 """
                 DELETE FROM pending_action
-                WHERE source_kind=? AND source_id=? AND kind=? AND album_id=? AND desired=? AND created_at=?;
+                WHERE \(Self.actionIdentityWhere);
                 """
             ) { stmt in
-                try bindActionKey(stmt, action, from: 1)
-                sqlite3_bind_int(stmt, 5, action.desired ? 1 : 0)
-                sqlite3_bind_double(stmt, 6, action.createdAt.timeIntervalSince1970)
+                try bindActionIdentity(stmt, action, from: 1)
             }
         }
     }
@@ -1482,10 +1479,12 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         try connection.bindText(stmt, index + 1, key.identifier)
     }
 
-    private func bindActionKey(_ stmt: OpaquePointer?, _ action: PendingAction, from index: Int32) throws {
+    private func bindActionIdentity(_ stmt: OpaquePointer?, _ action: PendingAction, from index: Int32) throws {
         try bindKey(stmt, action.key, from: index)
         try connection.bindText(stmt, index + 2, action.kind.rawValue)
         try connection.bindText(stmt, index + 3, action.albumID)
+        sqlite3_bind_int(stmt, index + 4, action.desired ? 1 : 0)
+        sqlite3_bind_double(stmt, index + 5, action.createdAt.timeIntervalSince1970)
     }
 
     /// Binds capture_time, media_type, is_live, duration, display_name starting at `index`.
