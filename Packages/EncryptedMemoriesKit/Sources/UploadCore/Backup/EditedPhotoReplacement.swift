@@ -58,8 +58,8 @@ public struct EditedPhotoReplacement: Sendable {
         secondaries: [UploadSourceIdentity.Resource]
     ) -> Bool {
         if case .revision = editRevision { return true }
-        let originals = ["originalPhoto", "originalVideo"].map { "photoKit.\($0)." }
-        return secondaries.contains { resource in originals.contains { resource.rawValue.hasPrefix($0) } }
+        let originals = ["originalPhoto", "originalVideo"]
+        return secondaries.contains { $0.hasPhotoKitRole(in: originals) }
     }
 
     /// True while an edit of `source` waits to replace its earlier upload, or while a gone earlier photo of it can be
@@ -339,7 +339,7 @@ public struct EditedPhotoReplacement: Sendable {
     static func isOriginal(_ resource: UploadSourceIdentity.Resource, carriedByPrimary: Bool) -> Bool {
         if resource == .livePairedVideo { return true }
         let roles = ["alternatePhoto", "pairedVideo"] + (carriedByPrimary ? [] : ["originalPhoto", "originalVideo"])
-        return roles.contains { resource.rawValue.hasPrefix("photoKit.\($0).") }
+        return resource.hasPhotoKitRole(in: roles)
     }
 }
 
@@ -428,6 +428,6 @@ enum UploadRemoteReplacementSafety {
             "adjustmentData", "adjustmentBasePhoto", "adjustmentBaseVideo", "adjustmentBasePairedVideo",
             "fullSizePhoto", "fullSizeVideo", "fullSizePairedVideo",
         ]
-        return roles.contains { resource.rawValue.hasPrefix("photoKit.\($0).") }
+        return resource.hasPhotoKitRole(in: roles)
     }
 }
