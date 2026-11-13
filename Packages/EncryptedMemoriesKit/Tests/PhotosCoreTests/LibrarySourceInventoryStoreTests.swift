@@ -66,6 +66,42 @@ final class LibrarySourceInventoryStoreTests: XCTestCase {
         )
     }
 
+    func testRoundTripKeepsCanonicalSourceAndItemOrder() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = makeStore(directory)
+        let session = try await activate(store)
+        func entry(_ volume: String, _ node: String, _ time: TimeInterval, known: Bool = true) -> LibrarySourceItem {
+            LibrarySourceItem(
+                item: PhotoItem(
+                    uid: PhotoUID(volumeID: volume, nodeID: node),
+                    captureTime: Date(timeIntervalSince1970: time), mediaType: "image/heic"),
+                knownFields: known ? [.captureTime, .mediaType] : [.mediaType])
+        }
+        let ordered = [
+            entry("z", "early", 1), entry("a", "a", 3), entry("a", "z", 3),
+            entry("b", "a", 3), entry("a", "unknown", 0, known: false),
+        ]
+        let inventories = [
+            LibrarySourceInventory(
+                source: source("é"), accessState: .available, authority: .authoritative,
+                items: [], validationToken: nil),
+            LibrarySourceInventory(
+                source: source("z"), accessState: .available, authority: .authoritative,
+                items: Array(ordered.reversed()), validationToken: nil),
+            LibrarySourceInventory(
+                source: source("A"), accessState: .available, authority: .authoritative,
+                items: [], validationToken: nil),
+        ]
+        try await save(inventories, to: store, session: session)
+        let restored = try await store.load(using: session)
+        XCTAssertEqual(restored.map(\.source.id), [SourceID("A"), SourceID("z"), SourceID("é")])
+        XCTAssertEqual(restored[1].items.map(\.uid), ordered.map(\.uid))
+        let graph = try LibrarySourceGraph(restoring: restored)
+        XCTAssertEqual(graph.inventories().map(\.source.id), restored.map(\.source.id))
+        XCTAssertEqual(graph.inventory(for: SourceID("z"))?.items.map(\.uid), ordered.map(\.uid))
+    }
+
     func testRoundTripPreservesPartialMetadataAndTombstonesWithoutRestoringAuthority() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -280,9 +280,7 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
                             validationToken: stored.value.validationToken
                         ))
                 }.sorted { lhs, rhs in
-                    lhs.source.id.rawValue.utf8.lexicographicallyPrecedes(
-                        rhs.source.id.rawValue.utf8
-                    )
+                    LibrarySourceGraph.sourceIDPrecedes(lhs.source.id, rhs.source.id)
                 }
                 try LibrarySourceInventoryValidator.validate(inventories)
                 return inventories
@@ -328,9 +326,7 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
                 inventories
                 .map(Self.canonicalInventory)
                 .sorted { lhs, rhs in
-                    lhs.source.id.rawValue.utf8.lexicographicallyPrecedes(
-                        rhs.source.id.rawValue.utf8
-                    )
+                    LibrarySourceGraph.sourceIDPrecedes(lhs.source.id, rhs.source.id)
                 }
             // Encode, hash, and encrypt before acquiring SQLite's write lock. The transaction then
             // performs only indexed probes and changed-row writes.
@@ -996,20 +992,7 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
     private static func canonicalInventory(
         _ inventory: LibrarySourceInventory
     ) -> LibrarySourceInventory {
-        let orderedItems = inventory.items.sorted { lhs, rhs in
-            let lhsHasTime = lhs.knownFields.contains(.captureTime)
-            let rhsHasTime = rhs.knownFields.contains(.captureTime)
-            if lhsHasTime != rhsHasTime { return lhsHasTime }
-            if lhsHasTime {
-                let lhsTime = lhs.item.captureTime.timeIntervalSince1970
-                let rhsTime = rhs.item.captureTime.timeIntervalSince1970
-                if lhsTime != rhsTime { return lhsTime < rhsTime }
-            }
-            if lhs.uid.volumeID != rhs.uid.volumeID {
-                return lhs.uid.volumeID.utf8.lexicographicallyPrecedes(rhs.uid.volumeID.utf8)
-            }
-            return lhs.uid.nodeID.utf8.lexicographicallyPrecedes(rhs.uid.nodeID.utf8)
-        }
+        let orderedItems = inventory.items.sorted(by: LibrarySourceGraph.sourceItemPrecedes)
         return LibrarySourceInventory(
             source: inventory.source,
             accessState: inventory.accessState,
