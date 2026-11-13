@@ -1865,6 +1865,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             }
             return page
         }
+        func presence(for ids: [String]) -> PhotoLibraryCatalogPresence { inner.presence(for: ids) }
         func isOperational() -> Bool { inner.isOperational() }
         func reconciledMissingSourceGeneration() -> Int64? { inner.reconciledMissingSourceGeneration() }
         func missingSourceSweepProgress() -> PhotoLibraryMissingSourceSweepProgress? {

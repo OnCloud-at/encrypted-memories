@@ -541,7 +541,7 @@ final class CatalogReadFailClosedTests: XCTestCase {
         let counted = PhotoDiagnostics.shared.counter("backup.catalogReplay.undecodableRow")
 
         try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
-            catalogStore: store, queueStore: queue, engine: engine)
+            catalogStore: store, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
 
         XCTAssertEqual(queue.count(), 2, "the replay queues the rows around the undecodable one")
         XCTAssertEqual(
@@ -552,11 +552,11 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
         try corrupt("broken", in: store, repair: true)
         try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
-            catalogStore: store, queueStore: queue, engine: engine)
+            catalogStore: store, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
         XCTAssertEqual(queue.count(), 3)
         XCTAssertEqual(queue.catalogReplayState(), .completed)
         try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
-            catalogStore: store, queueStore: queue, engine: engine)
+            catalogStore: store, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
         XCTAssertEqual(queue.count(), 3, "a converged replay writes no duplicate queue rows")
     }
 
@@ -569,7 +569,7 @@ final class CatalogReadFailClosedTests: XCTestCase {
         let (queue, engine) = try await makeReplayQueue()
 
         try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
-            catalogStore: store, queueStore: queue, engine: engine)
+            catalogStore: store, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
 
         XCTAssertEqual(queue.count(), 500, "the replay queues every row on both pages but the undecodable one")
         XCTAssertEqual(queue.catalogReplayState(), .inProgress, "the clean second page does not finish the replay")

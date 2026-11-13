@@ -201,6 +201,7 @@ public final class PhotoLibraryBackupController {
     private let queueStore: UploadBackupSyncQueueManifestStore?
     private let stateStore: UploadBackupStateManifestStore?
     private let catalogStore: PhotoLibraryCatalogManifestStore?
+    private nonisolated let catalogRetryRows = PhotoLibraryCatalogRetryRows()
     private let lockStore: BackupExecutionLockManifestStore?
     private let statusProjector: BackupStatusProjector?
     private let statusProjectionGeneration = UUID()
@@ -1368,7 +1369,10 @@ public final class PhotoLibraryBackupController {
         if let refreshScan {
             // A refresh window: the scan alone. Without the reconcile loop the runner never drains, so nothing uploads.
             let task = Task {
-                [weak self, monitor, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody] in
+                [
+                    weak self, monitor, engine, runner, queueStore, catalogStore, catalogRetryRows, statusSetupTask,
+                    scanBody
+                ] in
                 await statusSetupTask?.value
                 self?.refreshFromQueue()
                 self?.beginScanPhase()
@@ -1376,7 +1380,7 @@ public final class PhotoLibraryBackupController {
                 do {
                     try await Self.scanLibrary(
                         by: self, scanBody: scanBody, monitor: monitor, engine: engine, runner: runner,
-                        queueStore: queueStore, catalogStore: catalogStore)
+                        queueStore: queueStore, catalogStore: catalogStore, retryRows: catalogRetryRows)
                     end = .scanned
                 } catch is CancellationError {
                 } catch {
@@ -1405,7 +1409,8 @@ public final class PhotoLibraryBackupController {
         #endif
         let task = Task {
             [
-                weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody,
+                weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, catalogRetryRows,
+                statusSetupTask, scanBody,
                 identityResolver
             ] in
             await statusSetupTask?.value
@@ -1428,7 +1433,7 @@ public final class PhotoLibraryBackupController {
             do {
                 try await Self.scanLibrary(
                     by: self, scanBody: scanBody, monitor: monitor, engine: engine, runner: runner,
-                    queueStore: queueStore, catalogStore: catalogStore)
+                    queueStore: queueStore, catalogStore: catalogStore, retryRows: catalogRetryRows)
                 scanFinished = true
             } catch is CancellationError {
                 // The one-shot completion signal below releases the reconcile loop cleanly.
@@ -1447,7 +1452,7 @@ public final class PhotoLibraryBackupController {
             do {
                 // Requeue drops after the runner stops. The next pass retries them without looping in this pass.
                 try await Self.reconcileMissingSources(
-                    PhotoLibraryCatalogSync(store: catalogStore), engine: engine)
+                    PhotoLibraryCatalogSync(store: catalogStore, retryRows: catalogRetryRows), engine: engine)
             } catch is CancellationError {
             } catch {
                 self?.reportSyncMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -1466,13 +1471,15 @@ public final class PhotoLibraryBackupController {
     private nonisolated static func scanLibrary(
         by controller: PhotoLibraryBackupController?, scanBody: (@Sendable () async throws -> Void)?,
         monitor: PhotoLibraryChangeMonitor, engine: UploadBackupSyncEngine, runner: BackupSyncRunner,
-        queueStore: UploadBackupSyncQueueManifestStore, catalogStore: PhotoLibraryCatalogManifestStore
+        queueStore: UploadBackupSyncQueueManifestStore, catalogStore: PhotoLibraryCatalogManifestStore,
+        retryRows: PhotoLibraryCatalogRetryRows
     ) async throws {
         if let scanBody {
             try await scanBody()
             return
         }
-        try await replayCatalogIfQueueNeedsRecovery(catalogStore: catalogStore, queueStore: queueStore, engine: engine)
+        try await replayCatalogIfQueueNeedsRecovery(
+            catalogStore: catalogStore, queueStore: queueStore, engine: engine, retryRows: retryRows)
         let preparedChanges = await prepareChangesOffMainActor(monitor)
         try await controller?.runScanPass(
             engine: engine,
@@ -1488,7 +1495,8 @@ public final class PhotoLibraryBackupController {
     nonisolated static func replayCatalogIfQueueNeedsRecovery(
         catalogStore: PhotoLibraryCatalogManifestStore,
         queueStore: UploadBackupSyncQueueManifestStore,
-        engine: UploadBackupSyncEngine
+        engine: UploadBackupSyncEngine,
+        retryRows: PhotoLibraryCatalogRetryRows
     ) async throws {
         guard let queueCount = queueStore.count(), queueStore.isOperational(), catalogStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
@@ -1521,15 +1529,16 @@ public final class PhotoLibraryBackupController {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
 
-        var progress = PhotoLibraryCatalogPassProgress()
+        var progress = PhotoLibraryCatalogPassProgress(retrying: retryRows.identifiers(for: .replay))
         while true {
             try Task.checkCancellation()
-            guard let page = catalogStore.presentEntries(afterLocalIdentifier: progress.cursor, limit: 500),
+            guard let page = progress.readPage(from: catalogStore, limit: 500),
                 catalogStore.isOperational()
             else {
                 throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
             }
             guard case .advanced = progress.advance(past: page) else {
+                retryRows.remember(progress, for: .replay)
                 // While a row is unknown, the replay stays in progress and retries the row on the next event (#1160).
                 guard progress.mayComplete(countingUnknownRowsAs: "backup.catalogReplay.undecodableRow") else {
                     return
@@ -1676,7 +1685,7 @@ public final class PhotoLibraryBackupController {
         commitChanges: @escaping @Sendable () -> Void
     ) async throws {
         let sync = PhotoLibraryCatalogSync(
-            store: catalogStore,
+            store: catalogStore, retryRows: catalogRetryRows,
             onProgress: { [weak self] progress in
                 Task { @MainActor in self?.lastCatalogProgress = progress }
             },
@@ -2489,14 +2498,14 @@ public final class PhotoLibraryBackupController {
         else { return }
         startPreparedInstantWork(
             prepare: { await Self.prepareChangesOffMainActor(monitor) },
-            consume: { [weak self] prepared in
+            consume: { [weak self, catalogRetryRows] prepared in
                 // An expired token is covered by the current pass's full scan. This path never
                 // commits a token; the active pass remains its sole owner.
                 guard !prepared.changes.requiresFullRescan else { return }
                 let targeted = Array(Set(prepared.changes.changedIdentifiers + prepared.changes.deletedIdentifiers))
                 guard !targeted.isEmpty else { return }
                 let sync = PhotoLibraryCatalogSync(
-                    store: catalogStore,
+                    store: catalogStore, retryRows: catalogRetryRows,
                     onRemoved: { identifiers in
                         _ = await runner.removePhotoLibraryAssets(identifiers)
                     }

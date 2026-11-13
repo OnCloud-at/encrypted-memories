@@ -143,6 +143,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
     private let store: any PhotoLibraryCatalogStore
     private let enumerator: any PhotoLibraryAssetEnumerator
     private let chunkSize: Int
+    private let retryRows: PhotoLibraryCatalogRetryRows
     private let now: @Sendable () -> Date
     private let onProgress: (@Sendable (PhotoLibraryCatalogProgress) -> Void)?
     private let onRemoved: (@Sendable ([String]) async -> Void)?
@@ -151,6 +152,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         store: any PhotoLibraryCatalogStore,
         enumerator: any PhotoLibraryAssetEnumerator = PhotoKitAssetEnumerator(),
         chunkSize: Int = 200,
+        retryRows: PhotoLibraryCatalogRetryRows = PhotoLibraryCatalogRetryRows(),
         now: @Sendable @escaping () -> Date = { Date() },
         onProgress: (@Sendable (PhotoLibraryCatalogProgress) -> Void)? = nil,
         onRemoved: (@Sendable ([String]) async -> Void)? = nil
@@ -158,6 +160,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         self.store = store
         self.enumerator = enumerator
         self.chunkSize = max(1, chunkSize)
+        self.retryRows = retryRows
         self.now = now
         self.onProgress = onProgress
         self.onRemoved = onRemoved
@@ -401,11 +404,12 @@ public struct PhotoLibraryCatalogSync: Sendable {
     public func reconcileLateRendersOnce(engine: any UploadBackupCandidateEnqueueing) async throws {
         guard !store.hasReconciledLateRenders() else { return }
         // A failed read leaves the store not operational, and the first page below throws.
-        var progress = PhotoLibraryCatalogPassProgress(after: store.lateRenderSweepResumePoint())
+        var progress = PhotoLibraryCatalogPassProgress(
+            after: store.lateRenderSweepResumePoint(), retrying: retryRows.identifiers(for: .lateRenders))
         while true {
             try Task.checkCancellation()
             // An unknown page is not the end of the catalog; the pass stays owed (#1004).
-            guard let page = store.presentEntries(afterLocalIdentifier: progress.cursor, limit: chunkSize),
+            guard let page = progress.readPage(from: store, limit: chunkSize),
                 store.isOperational()
             else {
                 throw UploadError.backend("Photo library catalog could not be read")
@@ -429,14 +433,15 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 }
                 if !pending.isEmpty { _ = try await engine.enqueueBatch(pending) }
             }
-            // After a page with an unknown row, the saved resume point stays before it, so the next pass reads it
-            // again and retries the row (#1160).
+            // The durable resume point stays before the first unknown page for the next launch. This controller
+            // retries the unknown rows through its memory after the walk finishes (#1201).
             if let resumePoint {
                 guard store.recordLateRenderSweepResumePoint(resumePoint) else {
                     throw UploadError.backend("Photo library catalog could not be updated")
                 }
             }
         }
+        retryRows.remember(progress, for: .lateRenders)
         // While a row is unknown, the pass cannot be recorded as reconciled; it stays owed (#1160).
         guard progress.mayComplete(countingUnknownRowsAs: "backup.lateRenders.undecodableRow") else { return }
         guard store.markLateRendersReconciled() else {
@@ -453,7 +458,13 @@ public struct PhotoLibraryCatalogSync: Sendable {
         let savedProgress = store.missingSourceSweepProgress()
         guard store.isOperational() else { throw UploadError.backend("Photo library catalog could not be read") }
         var sweep: PhotoLibraryMissingSourceSweepProgress
-        if let savedProgress {
+        if retryRows.needsMissingSourceRestart(for: generation) {
+            sweep = PhotoLibraryMissingSourceSweepProgress(generation: generation)
+            guard store.recordMissingSourceSweepProgress(sweep) else {
+                throw UploadError.backend("Photo library catalog could not be updated")
+            }
+            retryRows.forgetMissingSources()
+        } else if let savedProgress {
             sweep = savedProgress
         } else {
             guard completed != generation else { return }
@@ -462,11 +473,12 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 throw UploadError.backend("Photo library catalog could not be updated")
             }
         }
-        var progress = PhotoLibraryCatalogPassProgress(after: sweep.afterLocalIdentifier)
+        var progress = PhotoLibraryCatalogPassProgress(
+            after: sweep.afterLocalIdentifier, retrying: retryRows.identifiers(for: .missingSources))
         while true {
             try Task.checkCancellation()
             // An unknown page is not the end of the catalog; the sweep stays owed (#1004).
-            guard let page = store.presentEntries(afterLocalIdentifier: progress.cursor, limit: chunkSize),
+            guard let page = progress.readPage(from: store, limit: chunkSize),
                 store.isOperational()
             else { throw UploadError.backend("Photo library catalog could not be read") }
             guard case .advanced(let resumePoint) = progress.advance(past: page) else { break }
@@ -474,8 +486,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
             }
             try await engine.enqueueMissingSources(candidates)
-            // After a page with an unknown row, the saved progress stays before it, so the next sweep reads it
-            // again and retries the row (#1160).
+            // The durable progress stays before the first unknown page for the next launch. This controller
+            // retries the unknown rows through its memory after the walk finishes (#1201).
             if let resumePoint {
                 sweep.afterLocalIdentifier = resumePoint
                 guard store.recordMissingSourceSweepProgress(sweep) else {
@@ -484,6 +496,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             }
             await Task.yield()
         }
+        retryRows.remember(progress, for: .missingSources, generation: sweep.generation)
         // While a row is unknown, the sweep cannot record itself complete; it stays owed (#1160).
         guard progress.mayComplete(countingUnknownRowsAs: "backup.missingSources.undecodableRow") else {
             // A discard since this sweep began can drop photos on pages before the saved progress. The next sweep
