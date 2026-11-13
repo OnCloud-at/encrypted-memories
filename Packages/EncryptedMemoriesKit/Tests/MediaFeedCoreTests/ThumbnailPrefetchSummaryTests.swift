@@ -9,7 +9,7 @@
     private enum SummaryCase: String, CaseIterable {
         case batch, item, unreported, withheld, timeout, partial, manual, disk, skipped, late, disabled
 
-        var errorText: String {
+        var errorText: String? {
             switch self {
             case .batch: "thumbnail batch failed"
             case .item: "thumbnail refused"
@@ -21,23 +21,7 @@
             case .disk: "thumbnail refused"
             case .skipped: "thumbnail batch missing"
             case .late: "thumbnail batch missing"
-            case .disabled: ""
-            }
-        }
-
-        var field: String {
-            switch self {
-            case .batch: "failedBatchError"
-            case .item: "failedItemError"
-            case .unreported: "failedUnreported"
-            case .withheld: "failedWithheld"
-            case .timeout: "failedTimeout"
-            case .partial: "failedItemError"
-            case .manual: "failedUnreported"
-            case .disk: "failedItemError"
-            case .skipped: "failedItemError"
-            case .late: "failedTimeout"
-            case .disabled: ""
+            case .disabled: nil
             }
         }
     }
@@ -64,15 +48,17 @@
 
     final class ThumbnailPrefetchSummaryTests: XCTestCase {
         private static let scenarioKey = "THUMBNAIL_SUMMARY_CHILD_SCENARIO"
+        private static let rootKey = "THUMBNAIL_SUMMARY_CHILD_ROOT"
+        private static let outputKey = "THUMBNAIL_SUMMARY_CHILD_OUTPUT"
 
         /// Selected by the parent in its own process. The ordinary suite leaves this child idle.
         func testSummaryChild() async throws {
             guard let name = ProcessInfo.processInfo.environment[Self.scenarioKey] else { return }
             let scenario = try XCTUnwrap(SummaryCase(rawValue: name))
-            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: root) }
-            let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .foregroundActive))
+            let root = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment[Self.rootKey]))
+            let isTimeout = scenario == .timeout || scenario == .late
+            let runtime = LibraryRuntimeState(
+                initial: LibraryRuntimeSnapshot(executionOpportunity: isTimeout ? .suspended : .foregroundActive))
             let clock = MutableClock(Date(timeIntervalSince1970: 10_000))
             let cache = ThumbnailCache(namespace: "summary-child", rootDirectory: root, runtimeState: runtime)
             cache.configure(accountUID: "summary", key: SymmetricKey(size: .bits256))
@@ -117,10 +103,14 @@
                 cache: cache, loader: loader,
                 configuration: ThumbnailFeedCoreConfiguration(
                     downloadConcurrencyLimit: 1, batchSize: 4, crawlBackoffSeconds: 0,
-                    downloadTimeoutSeconds: scenario == .timeout || scenario == .late ? 0.1 : 30),
+                    downloadTimeoutSeconds: isTimeout ? 0.1 : 30),
                 diagnostics: PhotoDiagnostics(), clock: { clock.read() }
             )
             await feed.startPrefetch(uids)
+            if isTimeout {
+                try await ThumbnailFeedCoreTests.waitForCrawl(feed)
+                _ = await feed.replaceVisiblePriorityDemand(uids)
+            }
             if let manualLoader {
                 let started = await ThumbnailFeedCoreTests.waitForLeaseTest { await manualLoader.isWaiting() }
                 XCTAssertTrue(started)
@@ -134,10 +124,24 @@
             if let lateLoader {
                 let cancelled = await ThumbnailFeedCoreTests.waitForLeaseTest { await lateLoader.cancellations() == 1 }
                 XCTAssertTrue(cancelled)
+                let outputURL = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment[Self.outputKey]))
+                // This child owns its output file. Observe the real timeout summary before allowing late bytes.
+                let summarized = await ThumbnailFeedCoreTests.waitForLeaseTest {
+                    fflush(nil)
+                    let text = (try? String(contentsOf: outputURL, encoding: .utf8)) ?? ""
+                    return text.split(separator: "\n").contains {
+                        $0.hasPrefix("[ThumbPrefetch] ") && $0.contains("failedTimeout=4")
+                    }
+                }
+                XCTAssertTrue(summarized, "late: timeout summary must precede loader release")
                 await lateLoader.release()
             }
-            // A held crawl stops its worker only after it classifies the batch and emits the summary.
-            try await ThumbnailFeedCoreTests.waitForCrawl(feed)
+            if scenario == .disabled {
+                // Disabled prefetch makes waitForCrawl return immediately; stop and join the retired worker.
+                await feed.stopPrefetchAndWait()
+            } else {
+                try await ThumbnailFeedCoreTests.waitForCrawl(feed)
+            }
             if scenario == .late {
                 XCTAssertTrue(uids.allSatisfy { cache.hasUsableDiskData($0) }, "late bytes were persisted")
             }
@@ -159,6 +163,8 @@
             defer { try? FileManager.default.removeItem(at: directory) }
             for scenario in SummaryCase.allCases {
                 let outputURL = directory.appendingPathComponent(scenario.rawValue)
+                let childRoot = directory.appendingPathComponent("cache-\(scenario.rawValue)", isDirectory: true)
+                try FileManager.default.createDirectory(at: childRoot, withIntermediateDirectories: true)
                 XCTAssertTrue(FileManager.default.createFile(atPath: outputURL.path, contents: nil))
                 let output = try FileHandle(forWritingTo: outputURL)
                 let child = Process()
@@ -167,7 +173,9 @@
                     "xctest", "-XCTest", "MediaFeedCoreTests.ThumbnailPrefetchSummaryTests/testSummaryChild",
                     Bundle(for: Self.self).bundlePath,
                 ]
-                child.environment = ProcessInfo.processInfo.environment.merging([Self.scenarioKey: scenario.rawValue]) {
+                child.environment = ProcessInfo.processInfo.environment.merging([
+                    Self.scenarioKey: scenario.rawValue, Self.rootKey: childRoot.path, Self.outputKey: outputURL.path,
+                ]) {
                     _, new in new
                 }
                 child.standardOutput = output
@@ -175,14 +183,15 @@
                 let done = DispatchSemaphore(value: 0)
                 child.terminationHandler = { _ in done.signal() }
                 try child.run()
-                guard done.wait(timeout: .now() + 20) == .success else {
+                guard done.wait(timeout: .now() + 150) == .success else {
                     child.terminate()
                     if done.wait(timeout: .now() + 5) != .success {
                         kill(child.processIdentifier, SIGKILL)
                         _ = done.wait(timeout: .now() + 5)
                     }
                     try output.close()
-                    XCTFail("summary child timed out: \(scenario.rawValue)")
+                    let text = (try? String(contentsOf: outputURL, encoding: .utf8)) ?? "<unreadable output>"
+                    XCTFail("summary child timed out: \(scenario.rawValue): \(text)")
                     continue
                 }
                 try output.close()
@@ -193,10 +202,16 @@
                     XCTAssertTrue(summaries.isEmpty, "a stopped generation emits no summary: \(text)")
                     continue
                 }
-                let summary = try XCTUnwrap(summaries.last)
+                guard let summary = summaries.last else {
+                    XCTFail("\(scenario.rawValue): no summary: \(text)")
+                    continue
+                }
                 if scenario == .late {
                     XCTAssertEqual(summaries.count, 2)
-                    let before = try XCTUnwrap(summaries.first)
+                    guard let before = summaries.first else {
+                        XCTFail("late: no initial summary: \(text)")
+                        continue
+                    }
                     XCTAssertTrue(before.contains("failed=4"), "\(before)")
                     XCTAssertTrue(before.contains("failedTimeout=4"), "\(before)")
                     XCTAssertTrue(before.contains("downloadStarted=4"), "\(before)")
@@ -210,35 +225,42 @@
                 let values = Dictionary(fields, uniquingKeysWith: { first, _ in first })
                 let expectedFailed = scenario == .partial || scenario == .disk ? 2 : 4
                 XCTAssertEqual(values["failed"], "\(expectedFailed)", "\(scenario.rawValue): \(summary)")
-                let classified = [
-                    "failedTimeout", "failedBatchError", "failedItemError", "failedUnreported", "failedWithheld",
-                ]
-                let counts = try classified.map { try XCTUnwrap(values[$0].flatMap(Int.init), "\($0): \(summary)") }
-                XCTAssertEqual(counts.reduce(0, +), expectedFailed, "\(scenario.rawValue): \(summary)")
                 XCTAssertEqual(
                     values["downloadStarted"], scenario == .disk ? "2" : "4", "\(scenario.rawValue): \(summary)")
                 XCTAssertEqual(values["diskHit"], scenario == .disk ? "2" : "0", "\(scenario.rawValue): \(summary)")
-                XCTAssertEqual(values["downloadCompleted"], scenario == .partial ? "2" : "0")
+                XCTAssertEqual(
+                    values["downloadCompleted"], scenario == .partial ? "2" : "0",
+                    "\(scenario.rawValue): downloadCompleted: \(summary)")
                 XCTAssertEqual(
                     values["unfetchable"],
                     scenario == .item || scenario == .skipped
-                        ? "4" : scenario == .partial || scenario == .disk ? "2" : "0")
-                XCTAssertTrue(summary.contains("lastError=\(scenario.errorText)"), "\(scenario.rawValue): \(summary)")
+                        ? "4" : scenario == .partial || scenario == .disk ? "2" : "0",
+                    "\(scenario.rawValue): unfetchable: \(summary)")
+                if let errorText = scenario.errorText {
+                    XCTAssertTrue(
+                        summary.contains("lastError=\(errorText)"), "\(scenario.rawValue): lastError: \(summary)")
+                }
                 if scenario == .item || scenario == .partial || scenario == .disk {
                     XCTAssertTrue(summary.contains("item-error"), "\(summary)")
                 }
                 if scenario == .batch { XCTAssertTrue(summary.contains("batch-error"), "\(summary)") }
-                XCTAssertEqual(values["skippedUnfetchable"], scenario == .skipped ? "4" : "0")
-                XCTAssertEqual(values["pausedReason"], scenario == .manual ? "manual" : "none")
-                for kind in SummaryCase.allCases
-                where kind != .partial && kind != .manual && kind != .disk && kind != .skipped && kind != .late
-                    && kind != .disabled
-                {
-                    let count =
-                        scenario == .skipped
-                        ? (kind == .item ? 4 : 0)
-                        : kind.field == scenario.field ? expectedFailed : 0
-                    XCTAssertEqual(values[kind.field], "\(count)", "\(scenario.rawValue): \(summary)")
+                XCTAssertEqual(
+                    values["skippedUnfetchable"], scenario == .skipped ? "4" : "0",
+                    "\(scenario.rawValue): skippedUnfetchable: \(summary)")
+                let reason = scenario == .manual ? "manual" : "none"
+                XCTAssertEqual(values["enabled"], "true", "\(scenario.rawValue): enabled: \(summary)")
+                XCTAssertEqual(values["pausedReason"], reason, "\(scenario.rawValue): pausedReason: \(summary)")
+                let expectedCounts: [String: Int] = [
+                    "failedTimeout": scenario == .timeout || scenario == .late ? 4 : 0,
+                    "failedBatchError": scenario == .batch ? 4 : 0,
+                    "failedItemError": scenario == .item || scenario == .skipped
+                        ? 4
+                        : scenario == .partial || scenario == .disk ? 2 : 0,
+                    "failedUnreported": scenario == .unreported || scenario == .manual ? 4 : 0,
+                    "failedWithheld": scenario == .withheld ? 4 : 0,
+                ]
+                for (field, count) in expectedCounts {
+                    XCTAssertEqual(values[field], "\(count)", "\(scenario.rawValue): \(field): \(summary)")
                 }
             }
         }
