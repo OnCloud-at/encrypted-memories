@@ -854,7 +854,6 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertTrue(
             reopened.applyRemoteContentIndexChanges(
                 upserting: [],
-                upsertingRemoteAssetRecords: [],
                 unresolvedIssues: [],
                 removingRemoteLinkIDs: ["paired"],
                 hashKeyEpoch: "epoch-1",
@@ -894,7 +893,6 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertTrue(
             store.applyRemoteContentIndexChanges(
                 upserting: [changed],
-                upsertingRemoteAssetRecords: [],
                 unresolvedIssues: [],
                 removingRemoteLinkIDs: [],
                 hashKeyEpoch: "epoch-1",
@@ -908,6 +906,48 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertEqual(
             store.remoteAssetRecords(for: [identity], hashKeyEpoch: "epoch-1")[identity], proof,
             "a link that is only upserted keeps its proof row with its resource count and its links")
+        XCTAssertTrue(store.hasRemoteAssetIndexCheckpoint(hashKeyEpoch: "epoch-1"))
+    }
+
+    /// An updated link is included in the removal list and invalidates its compound proof.
+    func testTheStoreInvalidatesProofRowsForUpdatedLinks() throws {
+        let store = try makeStore()
+        let identity = UploadBackupExternalIdentity(
+            identifier: "icloud-asset",
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000.123)
+        )
+        let proof = UploadRemoteAssetIndexRecord(
+            externalIdentity: identity,
+            resourceCount: 2,
+            remoteLinkIDs: ["primary", "paired"],
+            hashKeyEpoch: "epoch-1"
+        )
+        XCTAssertTrue(
+            store.seedRemoteContentIndex(
+                [], remoteAssetRecords: [proof], unresolvedIssues: [], hashKeyEpoch: "epoch-1",
+                checkpoint: UploadRemoteContentIndexCheckpoint(
+                    eventID: "event-100", refreshedAt: Date(timeIntervalSince1970: 1_700_000_100))
+            ))
+
+        // The event names "primary" as changed and includes it in the removal list.
+        let changed = UploadRemoteContentIndexRecord(
+            contentHash: "changed-content", hashKeyEpoch: "epoch-1", remoteLinkID: "primary")
+        XCTAssertTrue(
+            store.applyRemoteContentIndexChanges(
+                upserting: [changed],
+                unresolvedIssues: [],
+                removingRemoteLinkIDs: ["primary"],
+                hashKeyEpoch: "epoch-1",
+                expectedEventID: "event-100",
+                checkpoint: UploadRemoteContentIndexCheckpoint(
+                    eventID: "event-101", refreshedAt: Date(timeIntervalSince1970: 1_700_000_200))
+            ))
+
+        XCTAssertEqual(store.remoteContentRecord(contentHash: "changed-content", hashKeyEpoch: "epoch-1"), changed)
+        XCTAssertEqual(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch-1")?.eventID, "event-101")
+        XCTAssertNil(
+            store.remoteAssetRecords(for: [identity], hashKeyEpoch: "epoch-1")[identity],
+            "an updated link invalidates its compound proof")
         XCTAssertTrue(store.hasRemoteAssetIndexCheckpoint(hashKeyEpoch: "epoch-1"))
     }
 
@@ -1027,6 +1067,82 @@ final class UploadIdentityManifestTests: XCTestCase {
             persisted.refreshedAt.timeIntervalSince1970,
             current.refreshedAt.timeIntervalSince1970,
             accuracy: 0.000_001)
+    }
+
+    func testRemoteContentDeltaInvalidatesAnInProgressBuild() throws {
+        let store = try makeStore()
+        let epoch = "epoch-1"
+        let checkpoint = UploadRemoteContentIndexCheckpoint(eventID: "event-100", refreshedAt: Date())
+        XCTAssertTrue(
+            store.seedRemoteContentIndex([], unresolvedIssues: [], hashKeyEpoch: epoch, checkpoint: checkpoint))
+        let build = try XCTUnwrap(
+            store.beginRemoteContentIndexBuild(
+                hashKeyEpoch: epoch, eventID: "event-100", sourceFingerprint: "source", total: 1, updatedAt: Date()))
+        XCTAssertTrue(
+            store.applyRemoteContentIndexChanges(
+                upserting: [], unresolvedIssues: [], removingRemoteLinkIDs: [], hashKeyEpoch: epoch,
+                expectedEventID: "event-100", checkpoint: .init(eventID: "event-101", refreshedAt: Date())))
+        XCTAssertNil(store.remoteContentIndexBuildCheckpoint(hashKeyEpoch: epoch))
+        XCTAssertFalse(
+            store.appendRemoteContentIndexBuild(
+                records: [.init(contentHash: "old", hashKeyEpoch: epoch, remoteLinkID: "old")],
+                unresolvedIssues: [], externalIdentities: [], hashKeyEpoch: epoch, buildID: build.buildID,
+                nextCursor: 1, updatedAt: Date()))
+    }
+
+    func testRemoteContentDeltaRecordsUnresolvedIssues() throws {
+        let store = try makeStore()
+        let epoch = "epoch-1"
+        let checkpoint = UploadRemoteContentIndexCheckpoint(eventID: "event-100", refreshedAt: Date())
+        XCTAssertTrue(
+            store.seedRemoteContentIndex([], unresolvedIssues: [], hashKeyEpoch: epoch, checkpoint: checkpoint))
+        XCTAssertTrue(
+            store.applyRemoteContentIndexChanges(
+                upserting: [], unresolvedIssues: [remoteIssue("missing", generation: "event-101", observedAt: Date())],
+                removingRemoteLinkIDs: [], hashKeyEpoch: epoch, expectedEventID: "event-100",
+                checkpoint: .init(eventID: "event-101", refreshedAt: Date())))
+        XCTAssertEqual(store.remoteContentIndexHealth(hashKeyEpoch: epoch).unresolvedCount, 1)
+        XCTAssertEqual(store.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID, "event-101")
+    }
+
+    func testRemoteContentDeltaRejectsAnEmptyPredecessorEvenIfStoredCheckpointIsDamaged() throws {
+        let url = tempDir.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
+        let initial = try XCTUnwrap(UploadIdentityManifestStore(url: url))
+        XCTAssertTrue(
+            initial.seedRemoteContentIndex(
+                [], unresolvedIssues: [], hashKeyEpoch: "epoch-1",
+                checkpoint: .init(eventID: "event-100", refreshedAt: Date())))
+        initial.close()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        let connection = try XCTUnwrap(db)
+        XCTAssertEqual(
+            sqlite3_exec(connection, "UPDATE remote_content_index_checkpoint SET event_id='';", nil, nil, nil),
+            SQLITE_OK)
+        XCTAssertEqual(sqlite3_close(connection), SQLITE_OK)
+        let store = try XCTUnwrap(UploadIdentityManifestStore(url: url))
+        XCTAssertFalse(
+            store.applyRemoteContentIndexChanges(
+                upserting: [], unresolvedIssues: [], removingRemoteLinkIDs: [], hashKeyEpoch: "epoch-1",
+                expectedEventID: "", checkpoint: .init(eventID: "event-101", refreshedAt: Date())))
+        XCTAssertEqual(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch-1")?.eventID, "")
+    }
+
+    func testRemoteContentDeltaRejectsRecordsFromAnotherEpoch() throws {
+        let store = try makeStore()
+        let checkpoint = UploadRemoteContentIndexCheckpoint(eventID: "event-100", refreshedAt: Date())
+        XCTAssertTrue(
+            store.seedRemoteContentIndex(
+                [], unresolvedIssues: [], hashKeyEpoch: "epoch-1", checkpoint: checkpoint))
+        let wrongEpoch = UploadRemoteContentIndexRecord(
+            contentHash: "foreign", hashKeyEpoch: "epoch-2", remoteLinkID: "link")
+        XCTAssertFalse(
+            store.applyRemoteContentIndexChanges(
+                upserting: [wrongEpoch], unresolvedIssues: [], removingRemoteLinkIDs: [],
+                hashKeyEpoch: "epoch-1", expectedEventID: "event-100",
+                checkpoint: .init(eventID: "event-101", refreshedAt: Date())))
+        XCTAssertNil(store.remoteContentRecord(contentHash: "foreign", hashKeyEpoch: "epoch-2"))
+        XCTAssertEqual(store.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch-1")?.eventID, "event-100")
     }
 
     func testInvalidRemoteContentDeltaRollsBackRowsAndCheckpoint() throws {

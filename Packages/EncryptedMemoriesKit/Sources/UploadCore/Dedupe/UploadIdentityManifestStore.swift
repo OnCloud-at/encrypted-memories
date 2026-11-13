@@ -839,15 +839,11 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
     /// Applies one page of volume events to the remote content index.
     ///
-    /// Asset proof rows (`remote_asset_index`): the store deletes every proof row that names a link of
-    /// `removingRemoteLinkIDs`, with all its link rows, in the same transaction, and it writes the rows of
-    /// `upsertingRemoteAssetRecords` (it deletes no row for a link that is only upserted). The production caller,
-    /// `ProtonUploadDedupeService.applyRemoteEvents`, passes EVERY link of every relevant event in
-    /// `removingRemoteLinkIDs`, updated links included, and passes no proof rows. So in production an event on any
-    /// link of a compound deletes the proof row of the whole compound, and the event path writes none. The production
-    /// rebuild writes the rows (`finishRemoteContentIndexBuild`). One case keeps an old row: a compound whose listed
-    /// links get no event, for example a related file added later. A reader accepts a proof only when identity and
-    /// resource count of the local asset match, so such a row cannot prove an asset with another resource count.
+    /// Asset proof rows (`remote_asset_index`): the store deletes every proof row that names a link in
+    /// `removingRemoteLinkIDs`, with all its link rows, in the same transaction. The event path writes no proof rows;
+    /// the full rebuild writes them (`finishRemoteContentIndexBuild`). The production caller includes every link of
+    /// every relevant event, including updates. A compound whose listed links get no event can keep an old row.
+    /// Backup and album proof readers compare the local identity and resource count before accepting a proof.
     /// The asset checkpoint moves with the content checkpoint in this transaction: it says that the events up to it
     /// are applied, not that every asset has a proof row.
     ///
@@ -856,7 +852,6 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     @discardableResult
     public func applyRemoteContentIndexChanges(
         upserting records: [UploadRemoteContentIndexRecord],
-        upsertingRemoteAssetRecords: [UploadRemoteAssetIndexRecord] = [],
         unresolvedIssues: [UploadRemoteContentIndexIssue],
         removingRemoteLinkIDs: [String],
         hashKeyEpoch: String,
@@ -864,7 +859,6 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         checkpoint: UploadRemoteContentIndexCheckpoint
     ) -> Bool {
         guard records.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch }),
-            upsertingRemoteAssetRecords.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch }),
             !expectedEventID.isEmpty
         else { return false }
         return connection.withLock {
@@ -886,7 +880,6 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             let didWrite =
                 didDelete
                 && writeRemoteContentRecordsLocked(records)
-                && writeRemoteAssetRecordsLocked(upsertingRemoteAssetRecords)
                 && writeUnresolvedRemoteIssuesLocked(
                     unresolvedIssues,
                     hashKeyEpoch: hashKeyEpoch

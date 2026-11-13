@@ -4,8 +4,8 @@ import Testing
 
 @testable import UploadCore
 
-struct IOSPhotosModificationTimeParserTests {
-    private let parser = IOSPhotosModificationTimeParser()
+struct InternetDateParserTests {
+    private let parser = InternetDateParser()
 
     @Test func parserAndCaptureDateReaderKeepTheSamePinnedResults() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

@@ -751,7 +751,6 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     @discardableResult
     func applyRemoteContentIndexChanges(
         upserting records: [UploadRemoteContentIndexRecord],
-        upsertingRemoteAssetRecords: [UploadRemoteAssetIndexRecord],
         unresolvedIssues: [UploadRemoteContentIndexIssue],
         removingRemoteLinkIDs: [String],
         hashKeyEpoch: String,

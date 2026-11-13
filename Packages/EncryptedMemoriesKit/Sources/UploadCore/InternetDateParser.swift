@@ -2,7 +2,7 @@ import Foundation
 
 /// Parses internet date-time strings with or without fractional seconds.
 /// Each instance reuses its fractional and whole-second formatters for every call.
-package struct IOSPhotosModificationTimeParser {
+package struct InternetDateParser {
     private let fractional = ISO8601DateFormatter()
     private let standard = ISO8601DateFormatter()
 

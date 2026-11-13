@@ -4,7 +4,7 @@ import UploadCore
 
 /// Reads independent optional sections. Unsupported client metadata cannot break the existing MIME reconciliation.
 struct TimelineOrderMetadataDecoder {
-    private let dates = IOSPhotosModificationTimeParser()
+    private let dates = InternetDateParser()
 
     func decode(_ data: Data) -> TimelineOrderMetadata {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
