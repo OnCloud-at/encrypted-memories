@@ -84,7 +84,7 @@ public struct TimelineTemporalMonthGroup: Equatable, Sendable {
     public var photoUIDs: [PhotoUID] { itemUIDs }
     public var placeLabel: String? { placeLabels.count == 1 ? placeLabels[0] : nil }
 
-    /// A stable editorial subset for the Apple-style month overview.
+    /// A stable editorial subset for the month overview.
     ///
     /// The representative day becomes the hero. Up to three supporting days span the remaining
     /// month, so a dense month does not collapse into several adjacent dates.

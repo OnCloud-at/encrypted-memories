@@ -1,6 +1,6 @@
 import CoreGraphics
 
-/// Photos-style swipe selection over a flat grid order.
+/// Swipe selection over a flat grid order.
 ///
 /// The photo under the first touch is the anchor. The anchor's membership before the gesture chooses the mode:
 /// an unselected anchor adds the swept range, a selected anchor removes it. The swept range is always the

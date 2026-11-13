@@ -33,7 +33,7 @@ public struct GridViewportResizeInput: Sendable {
     public let committedPhase: Int?
     public let itemCount: Int
     public let wasBottomPinned: Bool
-    public let anchorFractionY: CGFloat  // normalized viewport anchor; 0.5 = centre (Apple-like default)
+    public let anchorFractionY: CGFloat  // normalized viewport anchor; 0.5 = centre
 
     public init(
         oldViewportFrame: CGRect, newViewportFrame: CGRect, oldScrollY: CGFloat, level: Int,
