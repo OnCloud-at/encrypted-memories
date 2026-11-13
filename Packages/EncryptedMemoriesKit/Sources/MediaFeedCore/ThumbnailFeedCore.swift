@@ -1845,18 +1845,18 @@ public actor ThumbnailFeedCore {
         }
         let incomingRevision = selectedScope.revision
         var request = incomingRequest
-        // Set once this call stopped the crawl. A later pass of the loop then takes the full path: the stopped crawl's
-        // position, checkpoints and withheld lists belong to the scope before the one that stopped it.
-        var stopped = false
+        // A stop retires crawl state; a superseded cache commit can leave the cache ahead of the feed's published scope.
+        // Both require the full path on later loop iterations.
+        var needsFullReconciliation = false
 
         while true {
             // A scope that only grows keeps the crawl (see `scopeOnlyGrows`). Every other change joins the previous
             // crawl before removing its coverage checkpoint, so no retired worker can recreate old cache or
             // checkpoint state after cleanup.
-            var keepsCrawl = !stopped && scopeOnlyGrows(request)
+            var keepsCrawl = !needsFullReconciliation && scopeOnlyGrows(request)
             if !keepsCrawl {
                 await stopPrefetchAndWait(preservingVisibleDemand: true)
-                stopped = true
+                needsFullReconciliation = true
             }
 
             if let pending = pendingSourceReconciliation,
@@ -1868,20 +1868,28 @@ public actor ThumbnailFeedCore {
             if keepsCrawl, !scopeOnlyGrows(request) {
                 keepsCrawl = false
                 await stopPrefetchAndWait(preservingVisibleDemand: true)
-                stopped = true
+                needsFullReconciliation = true
             }
 
             // Reconciliation can unlink many encrypted blobs after a source is removed. Keep that bounded local
             // maintenance off this actor so visible thumbnail requests remain responsive while it completes.
             let cache = self.cache
             let retentionScope = request.retentionScope
+            #if DEBUG
+                let testingHooks = self.testingHooks
+            #endif
             let cacheResult = await Task.detached(priority: .utility) {
-                cache.reconcile(with: retentionScope)
+                let result = cache.reconcile(with: retentionScope)
+                #if DEBUG
+                    testingHooks.afterSourceCacheReconciliation(retentionScope.revision, result: result)
+                #endif
+                return result
             }.value
 
             if let pending = pendingSourceReconciliation,
                 pending.selectedScope.revision > request.selectedScope.revision
             {
+                needsFullReconciliation = true
                 request = pending
                 pendingSourceReconciliation = nil
                 continue
@@ -1974,9 +1982,9 @@ public actor ThumbnailFeedCore {
     /// first scope and the retry of a failed cleanup take the full path with a fresh crawl. Every scope here has the
     /// bound epoch; `reconcile` refuses another one before this point.
     ///
-    /// This assumes that the cache's committed scope is the feed's last scope: only this method changes either, and
-    /// a cache that resets its scope (`configure`, `clearForSignOut`) starts a new session, which a new feed and a new
-    /// first scope follow.
+    /// Only this method changes either committed scope. A superseded cache result can leave the cache ahead of the
+    /// feed's published scope, so the loop forces full reconciliation after that boundary. A cache that resets its
+    /// scope (`configure`, `clearForSignOut`) starts a new session, followed by a new feed and first scope.
     private func scopeOnlyGrows(_ request: SourceReconciliationRequest) -> Bool {
         guard !lastCacheReconciliationFailed, let lastSelectedScope, let lastAnalysisScope, let lastRetentionScope
         else { return false }
@@ -3600,6 +3608,18 @@ public actor ThumbnailFeedCore {
         private var workersStoppedHook: (@Sendable () -> Void)?
         private var permitWaitHook: (@Sendable () -> Void)?
         private var coverageStepHook: (@Sendable () -> Void)?
+        private var sourceCacheReconciliationHook: (@Sendable (UInt64, MediaCacheReconciliationResult) -> Void)?
+
+        func setAfterSourceCacheReconciliation(
+            _ hook: (@Sendable (UInt64, MediaCacheReconciliationResult) -> Void)?
+        ) {
+            lock.withLock { sourceCacheReconciliationHook = hook }
+        }
+
+        func afterSourceCacheReconciliation(_ revision: UInt64, result: MediaCacheReconciliationResult) {
+            let hook = lock.withLock { sourceCacheReconciliationHook }
+            hook?(revision, result)
+        }
 
         func setAfterWindowPermitWait(_ hook: (@Sendable () -> Void)?) {
             lock.withLock { permitWaitHook = hook }
@@ -3639,6 +3659,13 @@ public actor ThumbnailFeedCore {
     }
 
     extension ThumbnailFeedCore {
+        /// Debug-only gate after the cache commits, before its detached operation returns to the feed actor.
+        nonisolated func setSourceCacheReconciliationHookForTesting(
+            _ hook: (@Sendable (UInt64, MediaCacheReconciliationResult) -> Void)?
+        ) {
+            testingHooks.setAfterSourceCacheReconciliation(hook)
+        }
+
         /// Debug-only seam for installing a synchronous gate before a disk probe starts.
         nonisolated func setDiskProbeHookForTesting(_ hook: (@Sendable () -> Void)?) {
             testingHooks.setBeforeDiskProbe(hook)

@@ -160,6 +160,110 @@ import Testing
         }
 
         @Test(.timeLimit(.minutes(1)))
+        func aShrinkAfterASupersededGrowthJoinsWorkersAndPrunesDecodedPhotos() async throws {
+            let fixture = try await CrawlFixture.loaded(photoCount: 12, withSources: true)
+            let feed = fixture.feed
+            let cache = fixture.cache
+            let loader = fixture.loader
+            let gate = SourceCacheReturnGate()
+            let stoppedWorkers = ProbeCounter()
+            let cacheReturnsBeforeJoin = ProbeCounter()
+            var growthTask: Task<MediaCacheReconciliationResult, Never>?
+            var shrinkTask: Task<MediaCacheReconciliationResult, Never>?
+            // Release a detached wait even when a requirement throws, then join all owned tasks below.
+            defer {
+                gate.release()
+                feed.setSourceCacheReconciliationHookForTesting(nil)
+                feed.setWorkersStoppedHookForTesting(nil)
+            }
+            func close() async {
+                gate.release()
+                await loader.releaseHeld()
+                _ = await growthTask?.value
+                _ = await shrinkTask?.value
+                await fixture.close()
+            }
+            do {
+                let sources = try #require(fixture.sources)
+                let original = fixture.timeline.wholeLibraryItemsForViewer
+                let joined = crawlItem("superseded-growth")
+                func commit(_ items: [PhotoItem]) throws -> LibrarySourceChange {
+                    let lease = try #require(sources.graph.beginRefresh(sources.source.id))
+                    return try #require(
+                        sources.graph.commit(items.map(LibrarySourceItem.complete), validationToken: nil, using: lease))
+                }
+                let growth = try commit(original + [joined])
+                let shrink = try commit(original)
+                feed.setSourceCacheReconciliationHookForTesting { revision, result in
+                    if revision == growth.selectedScope.revision {
+                        gate.pause(result: result)
+                    } else if revision == shrink.selectedScope.revision, stoppedWorkers.value == 0 {
+                        cacheReturnsBeforeJoin.increment()
+                    }
+                }
+                feed.setWorkersStoppedHookForTesting { stoppedWorkers.increment() }
+
+                // Keep a retained-photo loader running across the add-only cache commit.
+                await cache.clear()
+                let retained = try #require(original.first?.uid)
+                let previousRequests = await loader.requests(for: retained)
+                await loader.hold(retained)
+                #expect(await feed.requestPriority(retained))
+                try #require(await waitUntil { await loader.requests(for: retained) > previousRequests })
+                growthTask = Task {
+                    await feed.reconcile(
+                        selected: growth.selectedScope, analysis: growth.analysisScope,
+                        retention: growth.thumbnailRetentionScope)
+                }
+                try #require(await waitUntil { gate.entered })
+                #expect(gate.result == .reconciled(removedEntries: 0))
+
+                // The cache has committed A+B. Decode B so resident pruning and the authorization fence are visible.
+                let png = try #require(
+                    Data(
+                        base64Encoded:
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aE3sAAAAASUVORK5CYII="
+                    ))
+                await cache.store(png, for: joined.uid)
+                _ = try #require(await feed.cachedDecoded(for: joined.uid))
+                #expect(await feed.prefetchStatus().ramDecodedCount == 1)
+                let generation = cache.captureWriterGeneration()
+                shrinkTask = Task {
+                    await feed.reconcile(
+                        selected: shrink.selectedScope, analysis: shrink.analysisScope,
+                        retention: shrink.thumbnailRetentionScope)
+                }
+                // Admission applies authorization before queueing, without another suspension in between.
+                try #require(await waitUntil { feed.memoryDecoded(for: joined.uid) == nil })
+                #expect(!(await feed.requestPriority(joined.uid)))
+                #expect(await feed.prefetchStatus().ramDecodedCount == 1)
+                gate.release()
+                try #require(
+                    await waitUntil {
+                        let counters = await feed.downloadCountersForTesting()
+                        return !counters.workersRunning || !cache.isCurrentWriterGeneration(generation)
+                    })
+                #expect(
+                    cache.isCurrentWriterGeneration(generation),
+                    "Destructive shrink must wait for the held retained-photo worker")
+                await loader.releaseHeld()
+                #expect(await growthTask?.value == .staleScope)
+                _ = await shrinkTask?.value
+                #expect(stoppedWorkers.value > 0)
+                #expect(cacheReturnsBeforeJoin.value == 0, "The cache shrink returns only after the worker joins")
+                #expect(await feed.prefetchStatus().ramDecodedCount == 0, "The removed decoded photo is pruned")
+                #expect(feed.memoryDecoded(for: joined.uid) == nil)
+                #expect(!(await feed.requestPriority(joined.uid)))
+                #expect(!cache.hasUsableDiskData(joined.uid))
+                #expect(!gate.timedOut)
+                await close()
+            } catch {
+                await close()
+                throw error
+            }
+        }
+
+        @Test(.timeLimit(.minutes(1)))
         func theRetryOfAFailedCleanupTakesTheFullPath() async throws {
             let fixture = try await CrawlFixture.loaded(photoCount: 12)
             let graph = LibrarySourceGraph()
@@ -326,6 +430,40 @@ import Testing
             }
             #expect(rows["refresh without change"]!.requests == 0)
             await fixture.close()
+        }
+    }
+
+    /// Holds only the detached cache return, with a bounded wait and an idempotent release for every exit.
+    private final class SourceCacheReturnGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private let semaphore = DispatchSemaphore(value: 0)
+        private var didEnter = false
+        private var released = false
+        private var timeout = false
+        private var cacheResult: MediaCacheReconciliationResult?
+
+        var entered: Bool { lock.withLock { didEnter } }
+        var timedOut: Bool { lock.withLock { timeout } }
+        var result: MediaCacheReconciliationResult? { lock.withLock { cacheResult } }
+
+        func pause(result: MediaCacheReconciliationResult) {
+            let shouldWait = lock.withLock {
+                didEnter = true
+                cacheResult = result
+                return !released
+            }
+            if shouldWait, semaphore.wait(timeout: .now() + 10) == .timedOut {
+                lock.withLock { timeout = true }
+            }
+        }
+
+        func release() {
+            let shouldSignal = lock.withLock {
+                guard !released else { return false }
+                released = true
+                return true
+            }
+            if shouldSignal { semaphore.signal() }
         }
     }
 

@@ -371,6 +371,8 @@ import Testing
 
         func requests(for uid: PhotoUID) -> Int { perPhoto[uid, default: 0] }
 
+        func hold(_ uid: PhotoUID) { holding = uid }
+
         func releaseHeld() {
             holding = nil
             held.forEach { $0.resume() }
