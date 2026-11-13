@@ -65,7 +65,7 @@ public enum UploadCaptureDateReader {
                     continue
                 }
                 if let raw = try await item.load(.stringValue),
-                    let parsed = IOSPhotosModificationTimeParser().date(from: raw) ?? parseExifDate(raw, offset: nil)
+                    let parsed = InternetDateParser().date(from: raw) ?? parseExifDate(raw, offset: nil)
                 {
                     return parsed
                 }
@@ -90,7 +90,7 @@ public enum UploadCaptureDateReader {
         }
 
         return dateFormatter(format: "yyyy:MM:dd HH:mm:ss", timeZone: .current).date(from: trimmed)
-            ?? IOSPhotosModificationTimeParser().date(from: trimmed)
+            ?? InternetDateParser().date(from: trimmed)
     }
 
     private static func dateFormatter(format: String, timeZone: TimeZone?) -> DateFormatter {

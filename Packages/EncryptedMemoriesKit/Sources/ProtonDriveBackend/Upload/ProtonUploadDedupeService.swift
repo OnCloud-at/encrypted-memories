@@ -299,7 +299,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             let tags = main.photo?.tags
         else { return nil }
         let attributes = try attributes(of: currentMain, material: material)
-        let date = attributes?.iOSPhotos?.modificationTime.flatMap(IOSPhotosModificationTimeParser().date(from:))
+        let date = attributes?.iOSPhotos?.modificationTime.flatMap(InternetDateParser().date(from:))
         let captureDate = main.photo?.captureTime.flatMap { value -> Date? in
             value.isFinite ? Date(timeIntervalSince1970: value) : nil
         }
@@ -877,8 +877,6 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             guard
                 store.applyRemoteContentIndexChanges(
                     upserting: rows.records,
-                    // The event path writes no proof rows; it only removes them (see the store).
-                    upsertingRemoteAssetRecords: [],
                     unresolvedIssues: rows.unresolvedIssues,
                     removingRemoteLinkIDs: removedIDs,
                     hashKeyEpoch: material.epoch,
@@ -1063,7 +1061,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         observedAt: Date = Date(),
         measurement: SupportWorkMeasurementPass? = nil
     ) throws -> RemoteContentIndexRows {
-        let modificationTimes = IOSPhotosModificationTimeParser()
+        let modificationTimes = InternetDateParser()
 
         var records: [UploadRemoteContentIndexRecord] = []
         records.reserveCapacity(expectedActiveFileIDs.count)
