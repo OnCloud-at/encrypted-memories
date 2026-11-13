@@ -33,6 +33,11 @@ public struct UploadSourceIdentity: Sendable, Hashable, Codable {
             Resource(rawValue: "photoKit.\(role).\(max(0, ordinal))")
         }
 
+        /// Matches the open role prefix without interpreting the ordinal suffix.
+        func hasPhotoKitRole(in roles: [String]) -> Bool {
+            roles.contains { rawValue.hasPrefix("photoKit.\($0).") }
+        }
+
         private static let burstMemberRole = "burstMember"
 
         /// One additional photo of a burst (series), uploaded as a related photo of the burst's main photo.
@@ -41,7 +46,7 @@ public struct UploadSourceIdentity: Sendable, Hashable, Codable {
         }
 
         public var isBurstMember: Bool {
-            rawValue.hasPrefix("photoKit.\(Self.burstMemberRole).")
+            hasPhotoKitRole(in: [Self.burstMemberRole])
         }
     }
 
