@@ -425,6 +425,7 @@ public actor PendingBackupCoordinator {
         let excluded = requests.map(\.key)
         for key in excluded { restoreRecheckCounts.removeValue(forKey: key) }
         recorder?.replacementLedger.dropSources(requests.map { ($0.key, $0.revision) })
+        for key in excluded { replacements[key] = nil }
         for state in states { sourceStates[state.key] = state }
         dirty.formUnion(excluded)
         excludedMissing.subtract(excluded)
@@ -945,7 +946,9 @@ public actor PendingBackupCoordinator {
         guard !closed else { return }
         switch event {
         case .evidence(let record):
-            remember(record)
+            // Buffered events can predate settlement or removal from the live replacement ledger.
+            let current = recorder?.replacementLedger.evidence(for: record.key, revision: record.revision)
+            remember(current ?? PendingUploadEvidence(key: record.key, revision: record.revision, replaces: nil))
             dirty.insert(record.key)
             await refreshMetadata()
             scheduleMembershipPublish()
@@ -1286,12 +1289,12 @@ public actor PendingBackupCoordinator {
                 isSettled: true,
                 badge: settledBadge(key, revision: handoff.revision),
                 displayName: metadata.displayName,
-                replaces: replacements[key]?[handoff.revision] ?? []
+                replaces: currentReplacements(for: key, revision: handoff.revision) ?? []
             )
         }
         let handoff = handoffs[key].flatMap { $0.revision == row.revision ? $0.remote : nil }
         let settled = Self.isBackedUp(row.state)
-        let replaces = replacements[key]?[row.revision] ?? (settled ? [] : earlierUploads(of: key))
+        let replaces = currentReplacements(for: key, revision: row.revision) ?? (settled ? [] : earlierUploads(of: key))
         let badge: PendingUploadBadge =
             switch row.state {
             case .completed, .alreadyBackedUp: settledBadge(key, revision: row.revision)
@@ -1308,6 +1311,14 @@ public actor PendingBackupCoordinator {
             displayName: metadata.displayName,
             replaces: replaces
         )
+    }
+
+    private func currentReplacements(for key: PendingSourceKey, revision: UploadBackupRevision) -> [PhotoUID]? {
+        if let current = recorder?.replacementLedger.evidence(for: key, revision: revision)?.replaces {
+            replacements[key, default: [:]][revision] = current
+            return current
+        }
+        return replacements[key]?[revision]
     }
 
     private func earlierUploads(of key: PendingSourceKey) -> [PhotoUID] {

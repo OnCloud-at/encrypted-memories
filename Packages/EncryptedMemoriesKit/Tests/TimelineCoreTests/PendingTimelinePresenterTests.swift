@@ -467,6 +467,98 @@ import Testing
         await harness.coordinator.close()
     }
 
+    @Test(arguments: [false, true])
+    func bufferedEvidenceDoesNotWidenSettledReplacementAtStartup(settleAfterEventRead: Bool) async throws {
+        let gate = EditMetadataGate(date: base)
+        let linger = EditMembershipGate()
+        let harness = try EditPendingHarness(
+            date: base, doneLinger: .seconds(60), metadataProvider: gate,
+            sleep: { duration in
+                if duration == .seconds(60) { await linger.wait(duration) } else { try await Task.sleep(for: duration) }
+            })
+        var mayCloseStores = false
+        defer { if mayCloseStores { harness.closeStores() } }
+        let original = remote("original", second: 10)
+        let previous = remote("previous", second: 10)
+        let newest = remote("newest", second: 10)
+        harness.recorder.recordUploadEvidence(
+            source: harness.source, revision: UploadBackupRevision(rawValue: 3), replaces: [original.uid, previous.uid])
+        harness.handoff(revision: 3, remote: newest.uid)
+        if !settleAfterEventRead {
+            harness.recorder.settleUploadEvidence(
+                source: harness.source, revision: UploadBackupRevision(rawValue: 3), retired: [previous.uid.nodeID])
+        }
+        harness.enqueue(revision: 2, state: .completed)
+        harness.enqueue(revision: 3, state: .completed)
+
+        let start = Task { await harness.coordinator.start() }
+        for call in 1...2 {
+            let arrived = await gate.waitForCall(call)
+            #expect(arrived, "metadata call \(call) must arrive")
+            if !arrived {
+                await gate.releaseAll()
+                let finished = await gate.finish(start)
+                #expect(finished, "startup must finish after releasing metadata")
+                if finished {
+                    await harness.coordinator.close()
+                    mayCloseStores = true
+                } else {
+                    start.cancel()
+                }
+                return
+            }
+        }
+        if settleAfterEventRead {
+            harness.recorder.settleUploadEvidence(
+                source: harness.source, revision: UploadBackupRevision(rawValue: 3), retired: [previous.uid.nodeID])
+        }
+        // The buffered evidence is held after it was read; startup now publishes that state.
+        await gate.release(1)
+        let finished = await gate.finish(start)
+        #expect(finished, "startup must finish after metadata is released")
+        guard finished else {
+            start.cancel()
+            return
+        }
+        let snapshot = await harness.coordinator.currentSnapshot()
+        #expect(snapshot.tiles.first?.revision == UploadBackupRevision(rawValue: 3))
+        #expect(snapshot.tiles.first?.isSettled == true)
+        #expect(snapshot.tiles.first?.replaces == [previous.uid])
+        await harness.coordinator.noteRemotePresence([harness.key])
+        #expect(
+            harness.recorder.replacementLedger.evidence(
+                for: harness.key, revision: UploadBackupRevision(rawValue: 3)) == nil)
+        #expect(await harness.coordinator.restore([harness.key.localUID]))
+        let duringLinger = await harness.coordinator.currentSnapshot()
+        #expect(duringLinger.tiles.first?.replaces == [previous.uid])
+        await gate.releaseAll()
+        await linger.release()
+        await harness.coordinator.close()
+        mayCloseStores = true
+    }
+
+    @Test func excludedAndReadmittedSourceDoesNotReuseOldReplacement() async throws {
+        let harness = try EditPendingHarness(date: base)
+        defer { harness.closeStores() }
+        let original = remote("original", second: 10)
+        let revision = UploadBackupRevision(rawValue: 2)
+        harness.enqueue(revision: 2, state: .uploading)
+        harness.recorder.recordUploadEvidence(source: harness.source, revision: revision, replaces: [original.uid])
+        await harness.coordinator.start()
+        let before = await harness.wait { $0.tiles.first?.replaces == [original.uid] }
+        #expect(before.tiles.first?.replaces == [original.uid])
+        #expect(await harness.coordinator.exclude([harness.key.localUID]))
+        #expect(harness.recorder.replacementLedger.evidence(for: harness.key, revision: revision) == nil)
+        #expect(await harness.coordinator.restore([harness.key.localUID]))
+        let restored = await harness.wait { $0.tiles.first?.revision == revision }
+        #expect(restored.tiles.first?.replaces == [])
+        let replacement = remote("replacement", second: 10)
+        harness.recorder.recordUploadEvidence(source: harness.source, revision: revision, replaces: [replacement.uid])
+        let readmitted = await harness.wait { $0.tiles.first?.replaces == [replacement.uid] }
+        #expect(readmitted.tiles.first?.replaces == [replacement.uid])
+        await harness.coordinator.close()
+    }
+
     @Test func unsettledOlderAncestorShowsAfterNewerSettledEditIsAcknowledged() async throws {
         let harness = try EditPendingHarness(date: base)
         defer { harness.closeStores() }
@@ -1456,7 +1548,8 @@ import Testing
     private let date: Date
 
     init(
-        date: Date, membershipInterval: Duration = .zero,
+        date: Date, membershipInterval: Duration = .zero, doneLinger: Duration = .zero,
+        metadataProvider: (any PendingSourceMetadataProviding)? = nil,
         sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) throws {
         self.date = date
@@ -1472,10 +1565,11 @@ import Testing
             store: store, replacementLedger: .shared(accountDataDirectory: directory), replacementJournal: journal,
             now: { date })
         coordinator = PendingBackupCoordinator(
-            store: store, queues: [.photoLibraryAsset: queue], metadataProvider: EditPendingMetadata(date: date),
+            store: store, queues: [.photoLibraryAsset: queue],
+            metadataProvider: metadataProvider ?? EditPendingMetadata(date: date),
             effects: EditPendingEffects(), recorder: recorder, replacementJournal: journal,
             configuration: .init(
-                membershipInterval: membershipInterval, doneLinger: .zero, checkmarkDuration: .seconds(3600)),
+                membershipInterval: membershipInterval, doneLinger: doneLinger, checkmarkDuration: .seconds(3600)),
             now: { date }, sleep: sleep)
     }
 
@@ -1545,6 +1639,65 @@ import Testing
         queue.close()
         store.close()
         try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private actor EditMetadataGate: PendingSourceMetadataProviding {
+    // Startup enqueues its metadata request before the buffered event can request metadata.
+    private nonisolated let queue = DispatchSerialQueue(label: "PendingTimelinePresenterTests.EditMetadataGate")
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+    let date: Date
+    private var calls = 0
+    private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var open = false
+
+    init(date: Date) { self.date = date }
+
+    func metadataAnswer(for keys: [PendingSourceKey]) async -> PendingSourceMetadataAnswer {
+        PendingSourceMetadataAnswer(metadata: await metadata(for: keys))
+    }
+
+    func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
+        calls += 1
+        let call = calls
+        if !open { await withCheckedContinuation { waiters[call] = $0 } }
+        return Dictionary(
+            uniqueKeysWithValues: keys.map {
+                ($0, PendingPresentationMetadata(captureTime: date, mediaType: "image/heic", displayName: "p.heic"))
+            })
+    }
+
+    func waitForCall(_ count: Int) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while calls < count && ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(2)) }
+        return calls >= count
+    }
+
+    func release(_ call: Int) { waiters.removeValue(forKey: call)?.resume() }
+    func finish(_ task: Task<Void, Never>) async -> Bool {
+        let (results, continuation) = AsyncStream.makeStream(of: Bool.self, bufferingPolicy: .bufferingNewest(1))
+        let observer = Task {
+            await task.value
+            continuation.yield(true)
+        }
+        let timer = Task {
+            do {
+                try await Task.sleep(for: .seconds(10))
+                continuation.yield(false)
+            } catch {}
+        }
+        var iterator = results.makeAsyncIterator()
+        let finished = await iterator.next() ?? false
+        if !finished { releaseAll() }
+        observer.cancel()
+        timer.cancel()
+        continuation.finish()
+        return finished
+    }
+    func releaseAll() {
+        open = true
+        for waiter in waiters.values { waiter.resume() }
+        waiters.removeAll()
     }
 }
 
