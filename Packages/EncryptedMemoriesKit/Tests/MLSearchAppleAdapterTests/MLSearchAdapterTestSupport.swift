@@ -73,7 +73,13 @@ class CatalogStubProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@Suite struct CatalogStubProtocolIsolationTests {
+func catalogStubSession(for protocolClass: CatalogStubProtocol.Type) -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [protocolClass]
+    return URLSession(configuration: configuration)
+}
+
+@Suite(.serialized) struct CatalogStubProtocolIsolationTests {
     private final class First: CatalogStubProtocol, @unchecked Sendable {}
     private final class Second: CatalogStubProtocol, @unchecked Sendable {}
 
@@ -81,12 +87,8 @@ class CatalogStubProtocol: URLProtocol, @unchecked Sendable {
         let url = URL(string: "https://catalog-fixture.test/data")!
         First.configure(responses: [url: Data("first".utf8)])
         Second.configure(responses: [url: Data("second".utf8)])
-        let firstConfiguration = URLSessionConfiguration.ephemeral
-        firstConfiguration.protocolClasses = [First.self]
-        let secondConfiguration = URLSessionConfiguration.ephemeral
-        secondConfiguration.protocolClasses = [Second.self]
-        let firstSession = URLSession(configuration: firstConfiguration)
-        let secondSession = URLSession(configuration: secondConfiguration)
+        let firstSession = catalogStubSession(for: First.self)
+        let secondSession = catalogStubSession(for: Second.self)
         defer {
             firstSession.invalidateAndCancel()
             secondSession.invalidateAndCancel()
@@ -98,5 +100,51 @@ class CatalogStubProtocol: URLProtocol, @unchecked Sendable {
         #expect(b.0 == Data("second".utf8))
         #expect(First.recordedRequests.map(\.url) == [url])
         #expect(Second.recordedRequests.map(\.url) == [url])
+    }
+
+    @Test func reconfigurationAndReplacementStayIsolated() async throws {
+        let url = URL(string: "https://catalog-fixture.test/reset")!
+        First.configure(responses: [url: Data("first".utf8)])
+        Second.configure(responses: [url: Data("second".utf8)])
+        let first = catalogStubSession(for: First.self)
+        let second = catalogStubSession(for: Second.self)
+        defer {
+            first.invalidateAndCancel()
+            second.invalidateAndCancel()
+        }
+        #expect(try await first.data(from: url).0 == Data("first".utf8))
+        #expect(try await second.data(from: url).0 == Data("second".utf8))
+        First.replaceResponse(Data("updated".utf8), for: url)
+        #expect(try await first.data(from: url).0 == Data("updated".utf8))
+        #expect(try await second.data(from: url).0 == Data("second".utf8))
+        #expect(First.recordedRequests.count == 2)
+        #expect(Second.recordedRequests.count == 2)
+        First.configure(responses: [url: Data("reset".utf8)])
+        #expect(First.recordedRequests.isEmpty)
+        #expect(Second.recordedRequests.count == 2)
+        #expect(try await first.data(from: url).0 == Data("reset".utf8))
+        #expect(try await second.data(from: url).0 == Data("second".utf8))
+        #expect(First.recordedRequests.count == 1)
+        #expect(Second.recordedRequests.count == 3)
+    }
+
+    @Test func concurrentRequestsOnOneSubclassAreAllRecorded() async throws {
+        let url = URL(string: "https://catalog-fixture.test/concurrent")!
+        let payload = Data("payload".utf8)
+        First.configure(responses: [url: payload])
+        let session = catalogStubSession(for: First.self)
+        defer { session.invalidateAndCancel() }
+        let results = try await withThrowingTaskGroup(of: Data.self) { group in
+            for _ in 0..<16 {
+                group.addTask { try await session.data(from: url).0 }
+            }
+            var data: [Data] = []
+            for try await value in group { data.append(value) }
+            return data
+        }
+        #expect(results.count == 16)
+        #expect(results.allSatisfy { $0 == payload })
+        #expect(First.recordedRequests.count == 16)
+        #expect(First.recordedRequests.allSatisfy { $0.url == url })
     }
 }

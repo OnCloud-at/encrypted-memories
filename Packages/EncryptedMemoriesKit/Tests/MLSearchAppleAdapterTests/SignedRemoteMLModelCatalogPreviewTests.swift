@@ -100,13 +100,11 @@ import Testing
             responses[endpoint.catalogRootURL.appendingPathComponent("catalog-history/\(pairID)/\(name)")] = data
         }
         StubProtocol.configure(responses: responses)
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [StubProtocol.self]
         let provider = SignedRemoteMLModelCatalogProvider(
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             endpoint: endpoint,
-            session: URLSession(configuration: configuration),
+            session: catalogStubSession(for: StubProtocol.self),
             publicKey: key.publicKey.rawRepresentation
         )
 
@@ -125,13 +123,11 @@ import Testing
             .appendingPathComponent("ml-preview-no-legacy-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         StubProtocol.configure(responses: [endpoint.activePairURL: Data("invalid".utf8)])
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [StubProtocol.self]
         let provider = SignedRemoteMLModelCatalogProvider(
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             endpoint: endpoint,
-            session: URLSession(configuration: configuration)
+            session: catalogStubSession(for: StubProtocol.self)
         )
 
         await #expect(throws: (any Error).self) {

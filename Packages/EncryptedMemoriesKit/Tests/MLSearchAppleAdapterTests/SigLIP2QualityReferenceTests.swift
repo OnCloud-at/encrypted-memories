@@ -48,7 +48,10 @@ import Testing
         CGImageDestinationAddImage(destination, image, nil)
         #expect(CGImageDestinationFinalize(destination))
         let uid = PhotoUID(volumeID: "fixture", nodeID: "image")
-        let source = FileImageSource(urlsByUID: [uid: url])
+        let invalidURL = directory.appendingPathComponent("invalid.png")
+        try Data("not an image".utf8).write(to: invalidURL)
+        let invalidUID = PhotoUID(volumeID: "fixture", nodeID: "invalid")
+        let source = FileImageSource(urlsByUID: [uid: url, invalidUID: invalidURL])
         guard case .image(let loaded) = await source.image(for: uid) else {
             Issue.record("Expected the reference image to load")
             return
@@ -62,6 +65,11 @@ import Testing
             return
         }
         #expect(reason == "unreadable reference image")
+        guard case .permanentFailure(let invalidReason) = await source.image(for: invalidUID) else {
+            Issue.record("Expected an invalid image file to fail permanently")
+            return
+        }
+        #expect(invalidReason == "unreadable reference image")
         guard case .transientFailure = await EmptyImageSource().image(for: uid) else {
             Issue.record("Expected the empty source to fail transiently")
             return

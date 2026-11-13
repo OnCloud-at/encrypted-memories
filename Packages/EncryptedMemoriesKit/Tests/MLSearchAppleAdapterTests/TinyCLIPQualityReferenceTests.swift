@@ -1,6 +1,4 @@
-import CoreGraphics
 import Foundation
-import ImageIO
 import PhotosCore
 import Testing
 

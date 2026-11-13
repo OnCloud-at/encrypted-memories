@@ -62,12 +62,10 @@ private struct TestActivePointerPayload: Codable {
             catalogURL: documentData,
             signatureURL: signature,
         ])
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [StubProtocol.self]
         let provider = SignedRemoteMLModelCatalogProvider(
             trustedCatalog: .builtIn,
             cacheDirectory: root,
-            session: URLSession(configuration: configuration),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: catalogURL,
             signatureURL: signatureURL,
             artifactBaseURL: artifactBaseURL,
@@ -102,7 +100,7 @@ private struct TestActivePointerPayload: Codable {
             catalogURL: current.data,
             signatureURL: try key.signature(for: current.data),
         ])
-        let session = stubSession()
+        let session = catalogStubSession(for: StubProtocol.self)
         let provider = SignedRemoteMLModelCatalogProvider(
             trustedCatalog: .builtIn,
             cacheDirectory: root,
@@ -156,7 +154,7 @@ private struct TestActivePointerPayload: Codable {
             catalogURL: current.data,
             signatureURL: try key.signature(for: current.data),
         ])
-        let session = stubSession()
+        let session = catalogStubSession(for: StubProtocol.self)
         let provider = SignedRemoteMLModelCatalogProvider(
             trustedCatalog: .builtIn,
             cacheDirectory: root,
@@ -226,7 +224,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: catalogURL,
             signatureURL: signatureURL,
             artifactBaseURL: artifactBaseURL,
@@ -275,7 +273,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: v2URL,
             signatureURL: v2SignatureURL,
             legacyCatalogURL: v1URL,
@@ -326,7 +324,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: v2URL,
             signatureURL: v2SignatureURL,
             legacyCatalogURL: v1URL,
@@ -388,7 +386,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: catalogRoot,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: pairURL,
             signatureURL: v2SignatureURL,
             legacyCatalogURL: v1URL,
@@ -475,7 +473,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: pointerURL,
             signatureURL: URL(string: "https://catalog.test/catalog-v2.sig")!,
             artifactBaseURL: artifactBaseURL,
@@ -553,7 +551,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: pointerURL,
             signatureURL: URL(string: "https://catalog.test/catalog-v2.sig")!,
             artifactBaseURL: artifactBaseURL,
@@ -579,7 +577,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: failureRoot,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: pointerURL,
             signatureURL: URL(string: "https://catalog.test/catalog-v2.sig")!,
             artifactBaseURL: artifactBaseURL,
@@ -650,7 +648,7 @@ private struct TestActivePointerPayload: Codable {
             trustedCatalog: .builtIn,
             cacheDirectory: root,
             version: .v2,
-            session: stubSession(),
+            session: catalogStubSession(for: StubProtocol.self),
             catalogURL: pointerURL,
             signatureURL: URL(string: "https://catalog.test/catalog-v2.sig")!,
             artifactBaseURL: URL(string: "https://catalog.test/models/")!,
@@ -661,12 +659,6 @@ private struct TestActivePointerPayload: Codable {
             _ = try await provider.catalog()
         }
         #expect(StubProtocol.recordedRequests.count == 1)
-    }
-
-    private func stubSession() -> URLSession {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [StubProtocol.self]
-        return URLSession(configuration: configuration)
     }
 
     private func encodedV2(
