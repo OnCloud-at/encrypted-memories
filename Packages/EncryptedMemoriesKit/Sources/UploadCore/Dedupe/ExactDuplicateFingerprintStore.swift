@@ -91,7 +91,12 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
             return nil
         }
         return transaction { db in
-            if let current = self.current(db), current.scope == scope, current.eventID == eventID { return current }
+            switch self.context(db) {
+            // A context that cannot be read is not absent: discarding would lose details that a later launch reads.
+            case .unknown: return nil
+            case .found(let current) where current.scope == scope && current.eventID == eventID: return current
+            case .found, .absent: break
+            }
             let next = Snapshot(scope: scope, eventID: eventID, generation: UUID().uuidString)
             guard self.execute(db, "DELETE FROM fingerprint;"), self.writeContext(next, db: db) else { return nil }
             return next
@@ -104,7 +109,7 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
     ) -> Snapshot? {
         guard !eventID.isEmpty else { return nil }
         return transaction { db in
-            guard self.current(db) == snapshot else { return nil }
+            guard case .found(snapshot) = self.context(db) else { return nil }
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             for linkID in linkIDs {
@@ -128,7 +133,7 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
             rows.append((uid.nodeID, data))
         }
         return transaction { db -> Bool? in
-            guard self.current(db) == snapshot else { return nil }
+            guard case .found(snapshot) = self.context(db) else { return nil }
             for (linkID, data) in rows {
                 guard self.execute(db, "INSERT OR REPLACE INTO fingerprint VALUES(?,?);", text: linkID, data: data)
                 else {
@@ -145,7 +150,7 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         ofGroups groups: [ExactDuplicateGroup], in snapshot: Snapshot
     ) -> [PhotoUID: ExactDuplicateFingerprint] {
         transaction(writing: false) { db in
-            guard self.current(db) == snapshot else { return nil }
+            guard case .found(snapshot) = self.context(db) else { return nil }
             var result: [PhotoUID: ExactDuplicateFingerprint] = [:]
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
@@ -181,12 +186,22 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         }
     }
 
-    private func current(_ db: OpaquePointer) -> Snapshot? {
-        guard let data = read(db, "SELECT payload FROM fingerprint_context WHERE id=1;"),
-            let current = try? JSONDecoder().decode(Snapshot.self, from: data),
+    private enum Context {
+        case found(Snapshot)
+        /// No row, or a row that was read and does not decode: the next prepare starts a new snapshot.
+        case absent
+        /// The read failed. Nothing may treat it as absent.
+        case unknown
+    }
+
+    private func context(_ db: OpaquePointer) -> Context {
+        guard let data = read(db, "SELECT payload FROM fingerprint_context WHERE id=1;") else {
+            return connection.operationFailed ? .unknown : .absent
+        }
+        guard let current = try? JSONDecoder().decode(Snapshot.self, from: data),
             UUID(uuidString: current.generation) != nil
-        else { return nil }
-        return current
+        else { return .absent }
+        return .found(current)
     }
 
     private func writeContext(_ snapshot: Snapshot, db: OpaquePointer) -> Bool {
