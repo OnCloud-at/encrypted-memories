@@ -225,9 +225,6 @@ public actor EditedOriginalRevert {
             try journalStore.save(journal)
         }
 
-        // Device side: forget earlier backup states of the edited source and re-point the manifest at the copy.
-        // TODO (step 6): integration with UploadBackupState.forgetEarlierStates and UploadIdentityManifestStore.sources
-        // Reserved for commit 3; the saved `.repointingDevice` phase above is the crash-recovery contract for it.
         try journalStore.remove(forEditedMain: mainUID)
         await relations.invalidateCachedRemoteState()
         return try copyUID(of: journal)
