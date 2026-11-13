@@ -324,7 +324,6 @@ struct MainView: View {
             .onChange(of: timelineModel.wholeLibraryContentRevision) { _, _ in
                 model.pendingGrid?.setRemote(timelineModel.wholeLibraryTimeline)
                 let items = timelineModel.wholeLibraryItemsForViewer
-                OfflineLibraryManager.shared.liveAssetCount = items.count
                 // New/removed assets flow into the Smart Search index on its next background pass.
                 model.updateSmartSearchAssets(
                     items,
@@ -1201,8 +1200,7 @@ struct MainView: View {
     /// independent of the Offline Photo Library toggle.
     private func attachOfflineManager() {
         let manager = OfflineLibraryManager.shared
-        manager.attach(feed: feed, stats: backend)
-        manager.liveAssetCount = timelineModel.wholeLibraryUIDs.count
+        manager.attach(feed: feed)
         model.configureSmartSearch(
             feedCore: feed.feedCore,
             primaryItems: timelineModel.wholeLibraryItemsForViewer,

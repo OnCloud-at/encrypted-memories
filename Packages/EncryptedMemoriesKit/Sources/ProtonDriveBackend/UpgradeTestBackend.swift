@@ -63,7 +63,6 @@
         func trash(_ uids: [PhotoUID]) async throws { throw URLError(.unsupportedURL) }
         func restore(_ uids: [PhotoUID]) async throws { throw URLError(.unsupportedURL) }
         func emptyTrash() async throws { throw URLError(.unsupportedURL) }
-        func metadataRowCount() async -> Int { 8 }
         func addTags(_ tags: [Int], to uid: PhotoUID) async throws {}
 
         struct Link: Codable {

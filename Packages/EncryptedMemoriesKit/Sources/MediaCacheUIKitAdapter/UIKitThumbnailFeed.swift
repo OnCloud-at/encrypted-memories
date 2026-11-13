@@ -12,8 +12,6 @@
     /// `ThumbnailFeedCore` remains the universal cache/feed implementation. This facade only adapts decoded
     /// `CGImage` residency to `UIImage` and injects conservative mobile RAM/concurrency policy.
     public actor UIKitThumbnailFeed {
-        public typealias PrefetchStatus = ThumbnailFeedCore.PrefetchStatus
-
         private nonisolated let core: ThumbnailFeedCore
         private nonisolated let imageWrappers: WrapperImageCache<UIImage>
 
@@ -188,10 +186,6 @@
 
         public nonisolated func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
             core.setUserInteractionActive(active, owner: owner)
-        }
-
-        public func prefetchStatus() async -> PrefetchStatus {
-            await core.prefetchStatus()
         }
 
         private nonisolated func currentImage(

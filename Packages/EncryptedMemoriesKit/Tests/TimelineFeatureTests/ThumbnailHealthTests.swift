@@ -254,9 +254,7 @@ struct ThumbnailHealthTests {
         await feed.startPrefetch([uid])
         try await Task.sleep(for: .milliseconds(350))
 
-        let status = await feed.prefetchStatus()
-        #expect(status.diskFileCount >= 1)
-        #expect(status.diskThumbnailCoverageFraction >= 1)
+        #expect(cache.hasUsableDiskData(uid))
     }
 
     @Test func priorityUpgradeTest() async throws {

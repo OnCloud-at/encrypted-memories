@@ -1,4 +1,5 @@
 import CoreGraphics
+import CryptoKit
 import Foundation
 import MediaByteCache
 import MediaCache
@@ -97,15 +98,12 @@ struct AppInfrastructureTests {
         #expect(restored == finalFrame)
     }
 
-    @Test func cacheCoverageMath() {
+    @Test func cacheSizeMath() {
         var status = OfflineCacheStatus()
-        #expect(status.thumbnailCoverage == 0)  // no authoritative inventory yet
-        status.totalAssets = 200
-        status.thumbnailsOnDisk = 50
-        #expect(abs(status.thumbnailCoverage - 0.25) < 1e-9)
         status.cacheSizeBytes = 10
         status.previewCacheSizeBytes = 7
-        #expect(status.totalCacheSizeBytes == 17)
+        status.originalsCacheSizeBytes = 3
+        #expect(status.totalCacheSizeBytes == 20)
     }
 
     @Test func videoStateMachineTransitions() {
@@ -154,31 +152,27 @@ struct AppInfrastructureTests {
         #expect(order.max() == .idleLibraryCrawl)
     }
 
-    @Test func prefetchPauseReasons() async {
+    @Test func manualPauseHoldsCrawlUntilResumed() async throws {
         let namespace = "tests-pause-\(UUID().uuidString)"
         let root = timelineFeatureTestCacheRoot("pause")
+        let loader = StubThumbnailLoader()
+        let cache = ThumbnailCache(namespace: namespace, rootDirectory: root)
+        cache.configure(accountUID: "fixture", key: SymmetricKey(size: .bits256))
         let feed = ThumbnailFeed(
-            cache: ThumbnailCache(namespace: namespace, rootDirectory: root),
-            loader: StubThumbnailLoader(),
+            cache: cache,
+            loader: loader,
             concurrency: 1, batch: 1)
-        await feed.startPrefetch([PhotoUID(volumeID: "v", nodeID: "a")])
-
-        let grid = ThumbnailInteractionOwner()
-        feed.setUserInteractionActive(true, owner: grid)
-        var status = await feed.prefetchStatus()
-        #expect(!status.paused)
-        #expect(status.pausedReason == "none")  // interaction must not starve visible thumbnails
-
-        feed.setUserInteractionActive(false, owner: grid)
         await feed.pausePrefetch()
-        status = await feed.prefetchStatus()
-        #expect(status.pausedReason == "manual")
-
+        await feed.startPrefetch([PhotoUID(volumeID: "v", nodeID: "a")])
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await loader.requestCount == 0)
         await feed.resumePrefetch()
+        for _ in 0..<600 where await loader.requestCount == 0 {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(await loader.requestCount == 1)
         await feed.setPrefetchEnabled(false)
-        status = await feed.prefetchStatus()
-        #expect(!status.enabled)
-        #expect(status.pausedReason == "disabled")  // offline toggle off
+        await feed.stopPrefetch()
     }
 
     //
@@ -255,7 +249,11 @@ struct AppInfrastructureTests {
 }
 
 private actor StubThumbnailLoader: ThumbnailBatchLoader {
+    private(set) var requestCount = 0
     func loadThumbnails(
         for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult { .delivered }
+    ) async -> ThumbnailBatchLoadResult {
+        requestCount += uids.count
+        return .delivered
+    }
 }

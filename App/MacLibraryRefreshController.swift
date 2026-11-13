@@ -81,7 +81,6 @@ final class MacLibraryRefreshController {
             banner.finishRemoteRefresh(succeeded: false)
             return .terminal
         }
-        OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
         await host.loadAlbums()
         host.model.refreshLibrarySources()
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
@@ -111,7 +110,6 @@ final class MacLibraryRefreshController {
         if attempt == 0 { banner.beginBackupUploadRefresh() }
         let result = await host.timelineModel.refreshLibrary()
         if await recoverBackendAfterScopeAccessLoss(ifNeeded: result, host: host) { return .cancelled }
-        OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
         logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
         return result.contentUnchanged ? .unchanged : result.failureReason
@@ -133,7 +131,6 @@ final class MacLibraryRefreshController {
             let result = await host.timelineModel.refreshAfterUpload(uploadedUID: event.uploadedUID)
             guard generation == uploadGeneration, !Task.isCancelled else { return }
             if await recoverBackendAfterScopeAccessLoss(ifNeeded: result, host: host) { return }
-            OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
             reconcileNewAssetThumbnails(result.addedUIDs, host: host)
             if event.destination.usesAlbum {
                 await host.loadAlbums()
@@ -152,7 +149,6 @@ final class MacLibraryRefreshController {
         guard banner.beginManualRefresh() else { return }
         let result = await host.timelineModel.refreshLibrary()
         if await recoverBackendAfterScopeAccessLoss(ifNeeded: result, host: host) { return }
-        OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
         await host.loadAlbums()
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
         logUploadRefresh(uploadedNode: "-", attempt: 0, result: result)

@@ -42,10 +42,9 @@ final class OfflineLibraryStatsCoordinatorTests: XCTestCase {
 
     private static func status(_ value: Int) -> OfflineCacheStatus {
         OfflineCacheStatus(
-            totalAssets: value,
-            metadataRows: value,
-            thumbnailsOnDisk: value,
-            cacheSizeBytes: Int64(value)
+            cacheSizeBytes: Int64(value),
+            previewCacheSizeBytes: Int64(value * 2),
+            originalsCacheSizeBytes: Int64(value * 3)
         )
     }
 

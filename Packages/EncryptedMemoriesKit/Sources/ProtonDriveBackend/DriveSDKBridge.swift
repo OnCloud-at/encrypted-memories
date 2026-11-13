@@ -17,7 +17,7 @@ private typealias LibraryPhotoTag = PhotosCore.PhotoTag
 actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailProvider, ThumbnailBatchLoader,
     PriorityThumbnailBatchLoader, FullMediaProvider, OriginalByteStreamProvider, OriginalFileProvider,
     VideoStreamProvider, PhotoMetadataProvider, BurstGroupProvider, PhotoLibraryProvider, FavoritesProvider,
-    PhotoLibrarySaving, TrashProvider, LibraryStatsProvider, EditedPhotoOriginalProviding, PhotoNameSearchProvider
+    PhotoLibrarySaving, TrashProvider, EditedPhotoOriginalProviding, PhotoNameSearchProvider
 {
     private let photosClient: EncryptedMemoriesClient
     private let uploadClientUID: String
@@ -1605,15 +1605,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         } catch {
             DebugLog.log("timeline: file name read paused after a recoverable failure; the next pass resumes it")
         }
-    }
-
-    // MARK: - LibraryStatsProvider
-
-    /// Rows persisted in the local SQLite timeline store for offline cache status.
-    func metadataRowCount() async -> Int {
-        (try? await withOpenSession(cause: .local) { bridge in
-            bridge.timelineStore?.count() ?? 0
-        }) ?? 0
     }
 
     // MARK: - ThumbnailProvider
