@@ -356,7 +356,7 @@ public final class TimelineMetadataStore {
 
     // MARK: Load
 
-    /// Cheap indexed count for the cache-status surface.
+    /// Cheap indexed count for the library sync support snapshot.
     public func count() -> Int {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM photos;", -1, &stmt, nil) == SQLITE_OK else { return 0 }

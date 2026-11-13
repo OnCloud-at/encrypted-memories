@@ -224,7 +224,7 @@ private let feedCacheTestKey = SymmetricKey(size: .bits256)
     #expect(!ranOnMainThread)
 }
 
-private actor RecordingLoader: ThumbnailBatchLoader {
+actor RecordingLoader: ThumbnailBatchLoader {
     private var order: [PhotoUID] = []
     private var finishedBatchCount = 0
     private let payloads: [PhotoUID: Data]
@@ -287,7 +287,7 @@ private actor RecordingLoader: ThumbnailBatchLoader {
     func finishedBatches() -> Int { finishedBatchCount }
 }
 
-private actor CancellationAwareLoader: ThumbnailBatchLoader {
+actor CancellationAwareLoader: ThumbnailBatchLoader {
     private var requested: [PhotoUID] = []
     private var cancellationCount = 0
     private let delay: Duration
@@ -315,35 +315,13 @@ private actor CancellationAwareLoader: ThumbnailBatchLoader {
     func cancellations() -> Int { cancellationCount }
 }
 
-private actor NonCooperativeLoader: ThumbnailBatchLoader {
-    private var requested: [PhotoUID] = []
-    private let delay: Duration
-
-    init(delay: Duration) {
-        self.delay = delay
-    }
-
-    func loadThumbnails(
-        for uids: [PhotoUID],
-        onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult {
-        requested.append(contentsOf: uids)
-        let detachedDelay = Task.detached { [delay] in
-            try? await Task.sleep(for: delay)
-        }
-        await detachedDelay.value
-        return .delivered
-    }
-
-    func requestCount() -> Int { requested.count }
-}
-
-private actor ControlledLateLoader: ThumbnailBatchLoader {
+actor ControlledLateLoader: ThumbnailBatchLoader {
     private let payloads: [PhotoUID: Data]
     private var requested: [PhotoUID] = []
     private var continuation: CheckedContinuation<Void, Never>?
     private var released = false
     private var finishedBatchCount = 0
+    private var cancelled = 0
 
     init(payloads: [PhotoUID: Data]) {
         self.payloads = payloads
@@ -355,7 +333,11 @@ private actor ControlledLateLoader: ThumbnailBatchLoader {
     ) async -> ThumbnailBatchLoadResult {
         requested.append(contentsOf: uids)
         if !released {
-            await withCheckedContinuation { continuation = $0 }
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation = $0 }
+            } onCancel: {
+                Task { await self.recordCancellation() }
+            }
         }
         for uid in uids {
             if let data = payloads[uid] { onLoaded(uid, data) }
@@ -374,6 +356,8 @@ private actor ControlledLateLoader: ThumbnailBatchLoader {
     func requestedOrder() -> [PhotoUID] { requested }
     func finishedBatches() -> Int { finishedBatchCount }
     func isWaiting() -> Bool { continuation != nil }
+    func cancellations() -> Int { cancelled }
+    private func recordCancellation() { cancelled += 1 }
 }
 
 private actor PerUIDControlledLateLoader: ThumbnailBatchLoader {
@@ -517,7 +501,7 @@ private actor PriorityRecordingLoader: PriorityThumbnailBatchLoader {
 }
 
 /// Advanceable monotonic clock for deterministic demand-window tests (no real sleeps / wall-clock reliance).
-private final class MutableClock: @unchecked Sendable {
+final class MutableClock: @unchecked Sendable {
     private let lock = NSLock()
     private var current: Date
     init(_ start: Date) { current = start }
@@ -866,7 +850,7 @@ struct ThumbnailFeedCoreTests {
         _ = await feed.reconcile(
             selected: change.selectedScope, analysis: change.analysisScope,
             retention: change.thumbnailRetentionScope)
-        #expect(cache.diskFileCount() == 1, "partial inventory must keep the encrypted thumbnail")
+        #expect(FileManager.default.fileExists(atPath: cache.diskURL(for: duplicate).path))
         #expect(!change.thumbnailRetentionScope.uids.contains(duplicate))
         #expect(await feed.requestPriority(duplicate) == false, "the library grid must stay fail-closed")
         #expect(await feed.decoded(for: duplicate) == nil, "without an access the tile stays blank (#439)")
@@ -912,7 +896,7 @@ struct ThumbnailFeedCoreTests {
         _ = await feed.reconcile(
             selected: change.selectedScope, analysis: change.analysisScope,
             retention: change.thumbnailRetentionScope)
-        #expect(cache.diskFileCount() == 1)
+        #expect(FileManager.default.fileExists(atPath: cache.diskURL(for: remote).path))
         await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
         await feed.setLocalAuthorization([local])
         _ = await feed.decoded(for: local)
@@ -1002,7 +986,9 @@ struct ThumbnailFeedCoreTests {
         await feed.setPrefetchEnabled(false)
         #expect(await feed.requestPriority(duplicate))
         _ = await feed.replaceVisiblePriorityDemand([])
-        #expect(await feed.prefetchStatus().currentQueueLength == 0, "the grid drops unowned visible priority")
+        await feed.setPrefetchEnabled(true)
+        #expect(await !feed.hasPendingThumbnailWork(), "the grid drops unowned visible priority")
+        await feed.setPrefetchEnabled(false)
         let tile = Task { await feed.visibleDecoded(for: duplicate) }
         // The deadline is only a guard against a hang: a loaded runner cannot promise a speed.
         let deadline = ContinuousClock.now + .seconds(10)
@@ -2047,16 +2033,18 @@ struct ThumbnailFeedCoreTests {
 
         // The next process opens the same cache: the saved photo is whole, only the other photo loads.
         let next = RecordingLoader(payloads: [unsaved: Self.pngData(width: 24, height: 24)])
+        let nextCache = cache()
         let nextFeed = ThumbnailFeedCore(
-            cache: cache(), loader: next,
+            cache: nextCache, loader: next,
             configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
             resourceCoordinator: await Self.coordinator(runtimeState)
         )
         await nextFeed.startPrefetch([saved, unsaved])
         try await Self.waitUntil { await next.requestCount() == 1 }
-        try await Self.waitUntil { await nextFeed.prefetchStatus().currentQueueLength == 0 }
+        try await Self.waitForCrawl(nextFeed)
         #expect(await next.requestOrder() == [unsaved], "the saved photo is not downloaded again")
-        #expect(await nextFeed.prefetchStatus().diskHit >= 1, "the saved photo is read from the cache")
+        #expect(nextCache.hasUsableDiskData(saved), "the saved photo remains in the cache")
+        #expect(nextCache.hasUsableDiskData(unsaved), "the remaining photo is saved to disk")
         await nextFeed.stopPrefetchAndWait()
     }
 
@@ -2444,7 +2432,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
 
         #expect(store.snapshot == Set(uids))
         #expect(store.writeCount <= 3)
@@ -2496,10 +2484,10 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetch()
         coverage.release.signal()
         await bootstrap.value
-        try await Task.sleep(for: .milliseconds(100))
-
+        // Start a worker after the stale bootstrap returns; it must have no old crawl to run.
+        await feed.resumePrefetch()
+        try await Self.waitForCrawl(feed)
         #expect(await loader.requestCount() == 0)
-        #expect(await feed.prefetchStatus().currentQueueLength == 0)
     }
 
     @Test func diskOnlyBytesWarmIntoDecodedRamWithoutNetwork() async throws {
@@ -2543,8 +2531,8 @@ struct ThumbnailFeedCoreTests {
         )
         await feed.startPrefetch([uid])
         try await Self.waitUntil { await loader.isWaiting() }
-        #expect(await feed.prefetchStatus().currentQueueLength == 0)
-        #expect(await feed.prefetchStatus().downloadsInFlight == 1)
+        #expect(await !feed.hasPendingThumbnailWork())
+        #expect(await loader.isWaiting())
 
         let completed = Counter()
         let waiter = Task {
@@ -2578,7 +2566,7 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.isWaiting())
         await loader.release()
         try await feed.waitForPrefetchToFinish()
-        #expect(await feed.prefetchStatus().downloadCompleted == 1)
+        #expect(await loader.requestCount() == 1)
         await feed.stopPrefetchAndWait()
     }
 
@@ -2947,12 +2935,9 @@ struct ThumbnailFeedCoreTests {
         let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration(batchSize: 4))
 
         await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.prefetchStatus().downloadCompleted == 3 }
+        try await Self.waitForCrawl(feed)
 
-        let status = await feed.prefetchStatus()
-        #expect(status.downloadStarted == 3)
-        #expect(status.downloadCompleted == 3)
-        #expect(status.failed == 0)
+        #expect(await loader.requestCount() == 3)
         #expect(uids.allSatisfy { cache.has($0) })
     }
 
@@ -2967,23 +2952,16 @@ struct ThumbnailFeedCoreTests {
         let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration(batchSize: 4))
 
         await feed.startPrefetch(served + refused)
-        try await Self.waitUntil {
-            let status = await feed.prefetchStatus()
-            return status.downloadCompleted == 2 && status.failed == 2
-        }
-
-        let status = await feed.prefetchStatus()
-        #expect(status.downloadStarted == 4)
-        #expect(status.downloadCompleted == 2)
-        #expect(status.failed == 2)
-        #expect(status.failedItemError == 2)
-        #expect(status.failedTimeout == 0)
-        #expect(status.failedBatchError == 0)
-        #expect(status.unfetchableCount == 2)
-        #expect(status.lastErrors.joined().contains("no thumbnail for node"))
+        try await Self.waitForCrawl(feed)
+        #expect(await loader.requestCount() == 4)
+        #expect(served.allSatisfy { cache.hasUsableDiskData($0) })
+        #expect(refused.allSatisfy { !cache.has($0) })
+        for uid in refused { await feed.requestPriority(uid) }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await loader.requestCount() == 4, "refused items stay quarantined")
     }
 
-    @Test func zeroResultBatchRecordsClassifiedFailureAndBacksOff() async throws {
+    @Test func zeroResultBatchBacksOff() async throws {
         let uids = (0..<2).map { Self.uid("zero-\($0)") }
         let frozen = Date(timeIntervalSince1970: 5000)
         let loader = RecordingLoader(batchError: "simulated 429")
@@ -2995,18 +2973,12 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.prefetchStatus().failedBatchError == 2 }
+        try await Self.waitUntil { await loader.requestCount() == 2 }
 
         // With a frozen clock, the crawl backoff never expires; no further attempts may happen.
         try await Task.sleep(for: .milliseconds(300))
         #expect(await loader.requestCount() == 2)
 
-        let status = await feed.prefetchStatus()
-        #expect(status.downloadStarted == 2)
-        #expect(status.downloadCompleted == 0)
-        #expect(status.failed == 2)
-        #expect(status.failedBatchError == 2)
-        #expect(status.lastErrors.joined().contains("simulated 429"))
         await feed.stopPrefetch()  // frozen clock never expires the backoff; don't leave the worker looping
     }
 
@@ -3059,7 +3031,7 @@ struct ThumbnailFeedCoreTests {
 
             #expect(await feed.coverageRefreshStartCountForTesting() == 1)  // one refresh, not one per worker
             #expect(await feed.coverageFullScanCountForTesting() == 0)  // Known state means no redundant full sweep.
-            #expect(await feed.prefetchStatus().diskThumbnailCoverageFraction >= 1.0)  // and coverage is correct
+            #expect(uids.allSatisfy { cache.hasUsableDiskData($0) })
             await feed.stopPrefetch()
         }
 
@@ -3551,17 +3523,10 @@ struct ThumbnailFeedCoreTests {
             analysis: change.analysisScope,
             retention: change.thumbnailRetentionScope
         )
-        try await Self.waitUntil {
-            let status = await feed.prefetchStatus()
-            let requestCount = await loader.requestCount()
-            return status.diskCoverageVerified && requestCount >= 2
-        }
-
-        let status = await feed.prefetchStatus()
-        #expect(status.diskThumbnailTotal == 1)
-        #expect(status.diskFileCount == 1)
-        #expect(status.downloadCompleted == 1)
-        #expect(cache.diskFileCount() == 2)
+        try await Self.waitForCrawl(feed)
+        #expect(await loader.requestCount() >= 2)
+        #expect(FileManager.default.fileExists(atPath: cache.diskURL(for: primaryUID).path))
+        #expect(FileManager.default.fileExists(atPath: cache.diskURL(for: analysisUID).path))
         #expect(feed.memoryDecoded(for: analysisUID) == nil, "the background crawl must not decode into the grid LRU")
         #expect(await feed.backgroundCachedDecoded(for: analysisUID) != nil)
         #expect(feed.memoryDecoded(for: analysisUID) == nil, "background analysis must remain cache-only")
@@ -3845,11 +3810,8 @@ struct ThumbnailFeedCoreTests {
         let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
 
         await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.prefetchStatus().diskHit >= 3 }
-
-        let status = await feed.prefetchStatus()
-        #expect(status.downloadStarted == 0)
-        #expect(status.failed == 0)
+        try await Self.waitForCrawl(feed)
+        #expect(uids.allSatisfy { cache.hasUsableDiskData($0) })
         #expect(await loader.requestCount() == 0)
     }
 
@@ -3885,20 +3847,22 @@ struct ThumbnailFeedCoreTests {
         let cache = Self.cache("disk-checkpoint")
         for uid in uids { cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid) }
 
-        let firstFeed = ThumbnailFeedCore(cache: cache, loader: RecordingLoader(), configuration: Self.configuration())
+        let firstFeed = ThumbnailFeedCore(
+            cache: cache, loader: RecordingLoader(), configuration: Self.configuration(),
+            coverageStore: Self.checkpointStore(for: cache))
         await firstFeed.startPrefetch(uids)
-        try await Self.waitUntil { await firstFeed.prefetchStatus().currentQueueLength == 0 }
-        try await Self.waitUntil { await firstFeed.prefetchStatus().diskCoverageVerified }
-        #expect(await firstFeed.prefetchStatus().diskHit >= uids.count)
+        try await Self.waitForCrawl(firstFeed)
+        #expect(uids.allSatisfy { cache.hasUsableDiskData($0) })
         await firstFeed.stopPrefetch()
+        #expect(Self.checkpointStore(for: cache).loadPresent(uids, for: "thumbnail-coverage-v1") == Set(uids))
 
         let relaunchedFeed = ThumbnailFeedCore(
-            cache: cache, loader: RecordingLoader(), configuration: Self.configuration())
+            cache: cache, loader: RecordingLoader(), configuration: Self.configuration(),
+            coverageStore: Self.checkpointStore(for: cache))
         await relaunchedFeed.startPrefetch(uids)
-        try await Self.waitUntil { await relaunchedFeed.prefetchStatus().diskCoverageVerified }
-        let relaunched = await relaunchedFeed.prefetchStatus()
-        #expect(relaunched.currentQueueLength == 0)
-        #expect(relaunched.diskFileCount == uids.count)
+        try await Self.waitForCrawl(relaunchedFeed)
+        #expect(await !relaunchedFeed.hasPendingThumbnailWork())
+        #expect(uids.allSatisfy { cache.hasUsableDiskData($0) })
         await relaunchedFeed.stopPrefetch()
     }
 
@@ -3919,7 +3883,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await firstFeed.startPrefetch(cached)
-        try await Self.waitUntil { await firstFeed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(firstFeed)
         #expect(await firstLoader.requestCount() == cached.count)
         await firstFeed.stopPrefetch()
 
@@ -3938,7 +3902,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await relaunchedFeed.startPrefetch([newFirst] + cached + [newLast])
-        try await Self.waitUntil { await relaunchedFeed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(relaunchedFeed)
 
         #expect(await relaunchedLoader.requestCount() == 2)
         #expect(await relaunchedLoader.fetched(newFirst))
@@ -3965,7 +3929,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await firstFeed.startPrefetch(uids)
-        try await Self.waitUntil { await firstFeed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(firstFeed)
         await firstFeed.stopPrefetch()
 
         await cache.clear()
@@ -3981,7 +3945,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await afterClearFeed.startPrefetch(uids)
-        try await Self.waitUntil { await afterClearFeed.prefetchStatus().downloadCompleted == uids.count }
+        try await Self.waitForCrawl(afterClearFeed)
         #expect(await afterClearLoader.requestCount() == uids.count)
         await afterClearFeed.stopPrefetch()
     }
@@ -4000,15 +3964,15 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
         #expect(await loader.requestCount() == uids.count)
 
         await feed.clearCacheAndRestartPrefetch()
         try await Self.waitUntil { await loader.requestCount() == uids.count * 2 }
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
 
         for uid in uids { #expect(cache.hasUsableDiskData(uid)) }
-        #expect(await feed.prefetchStatus().diskFileCount == uids.count)
+        #expect(uids.allSatisfy { cache.hasUsableDiskData($0) })
         await feed.stopPrefetch()
     }
 
@@ -4059,7 +4023,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch([present, missing])
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
 
         #expect(await loader.requestCount() == 1)
         #expect(await loader.fetched(missing))
@@ -4080,7 +4044,7 @@ struct ThumbnailFeedCoreTests {
         // Keep the directory file count unchanged while removing one checkpoint member.
         try FileManager.default.removeItem(at: cache.diskURL(for: removed))
         cache.storeToDisk(Self.pngData(width: 8, height: 8), for: replacement)
-        #expect(cache.diskFileCount() == 2)
+        #expect(try Self.diskFileCount(cache, referencing: present) == 2)
 
         let loader = RecordingLoader(payloads: [removed: Self.pngData(width: 8, height: 8)])
         let feed = ThumbnailFeedCore(
@@ -4091,7 +4055,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch([present, removed])
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
 
         #expect(await loader.requestCount() == 1)
         #expect(await loader.fetched(removed))
@@ -4111,7 +4075,7 @@ struct ThumbnailFeedCoreTests {
         // `storeToDisk` memoizes both blobs as authenticated. Corrupt one afterward while retaining
         // the same filename and directory count; checkpoint bootstrap must authenticate it again.
         try Data(repeating: 0xA5, count: 64).write(to: cache.diskURL(for: corrupted), options: .atomic)
-        #expect(cache.diskFileCount() == 2)
+        #expect(try Self.diskFileCount(cache, referencing: present) == 2)
 
         let loader = RecordingLoader(payloads: [corrupted: Self.pngData(width: 8, height: 8)])
         let feed = ThumbnailFeedCore(
@@ -4122,7 +4086,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch([present, corrupted])
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
 
         #expect(await loader.requestCount() == 1)
         #expect(await loader.fetched(corrupted))
@@ -4143,13 +4107,13 @@ struct ThumbnailFeedCoreTests {
             configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 2)
         )
         await feed.startPrefetch([first, second])
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
 
         // A source change (for example after an upload) restarts the crawl. The first crawl authenticated both
         // blobs, so the restart only looks them up. A blob changed in place shows whether the restart read it.
         try Data(repeating: 0xA5, count: 64).write(to: cache.diskURL(for: second), options: .atomic)
         await feed.startPrefetch([first, second])
-        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+        try await Self.waitForCrawl(feed)
 
         #expect(await loader.requestCount() == 0)
         await feed.stopPrefetch()
@@ -4166,7 +4130,7 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch([uid])
-        try await Self.waitUntil { await feed.prefetchStatus().failedTimeout == 1 }
+        try await Self.waitUntil { await loader.cancellations() == 1 }
         await feed.stopPrefetch()
         await cache.clear()
         await loader.release()
@@ -4425,7 +4389,7 @@ struct ThumbnailFeedCoreTests {
 
             #expect(await feed.requestPriority(uid))
             #expect(
-                await feed.prefetchStatus().currentQueueLength == 0,
+                await !feed.hasPendingThumbnailWork(),
                 "old probe cleanup must preserve the replacement generation's active reservation")
             #expect(await loader.requestCount() == 1)
             await loader.release()
@@ -4458,7 +4422,7 @@ struct ThumbnailFeedCoreTests {
 
             #expect(await feed.requestPriority(uid, priority: requestedPriority))
             #expect(
-                await feed.prefetchStatus().currentQueueLength == 0,
+                await !feed.hasPendingThumbnailWork(),
                 "a batch handed to the download keeps its reservation, so a repeated request queues nothing")
             await loader.release()
             #expect(await Self.waitForLeaseTest { cache.has(uid) })
@@ -4466,7 +4430,7 @@ struct ThumbnailFeedCoreTests {
             await feed.stopPrefetchAndWait()
         }
 
-        private static func waitForLeaseTest(_ condition: @Sendable () async -> Bool) async -> Bool {
+        static func waitForLeaseTest(_ condition: @Sendable () async -> Bool) async -> Bool {
             let deadline = ContinuousClock.now.advanced(by: .seconds(10))
             while ContinuousClock.now < deadline {
                 if await condition() { return true }
@@ -4493,8 +4457,8 @@ struct ThumbnailFeedCoreTests {
             // The configuration allows one download at a time. The first worker holds that slot inside the
             // loader; the second one has taken its batch and polls for a free slot.
             try await Self.waitUntil {
-                let queueLength = await feed.prefetchStatus().currentQueueLength
-                return await loader.requestCount() == 1 && queueLength == 0
+                let pending = await feed.hasPendingThumbnailWork()
+                return await loader.requestCount() == 1 && !pending
             }
             try await Task.sleep(for: .milliseconds(300))
             let waiting = await feed.downloadCountersForTesting()
@@ -4510,14 +4474,11 @@ struct ThumbnailFeedCoreTests {
             #expect(!stopped.workersRunning)
             #expect(stopped.activeDownloaders == 0, "a worker that stops on a lost lease must not keep a download slot")
             #expect(stopped.downloadInFlight == 0, "a worker that stops on a lost lease must not keep in-flight items")
-            let status = await feed.prefetchStatus()
-            #expect(status.downloadsInFlight == 0)
-            #expect(status.activeJobs == 0)
             await feed.stopPrefetch()
         }
     #endif
 
-    @Test func prefetchStatusReportsIncrementalDiskCoverage() async throws {
+    @Test func crawlKeepsCachedThumbnailsAndDoesNotCacheRefusedItems() async throws {
         let cached = (0..<2).map { Self.uid("coverage-cached-\($0)") }
         let missing = Self.uid("coverage-missing")
         let cache = Self.cache("coverage")
@@ -4530,19 +4491,13 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch(cached + [missing])
-        try await Self.waitUntil {
-            let status = await feed.prefetchStatus()
-            return status.diskHit >= cached.count && status.failedItemError == 1
-        }
-
-        let status = await feed.prefetchStatus()
-        #expect(status.diskThumbnailTotal == 3)
-        #expect(status.diskFileCount == 2)
-        #expect(status.diskThumbnailCoverageFraction == 2.0 / 3.0)
+        try await Self.waitForCrawl(feed)
+        #expect(cached.allSatisfy { cache.hasUsableDiskData($0) })
+        #expect(!cache.has(missing))
         #expect(await loader.requestCount() == 1)
     }
 
-    @Test func timeoutDoesNotDoubleCountCompletionOrFailure() async throws {
+    @Test func lateTimedOutDeliveryIsReusedWithoutAnotherDownload() async throws {
         let uid = Self.uid("timeout")
         let cache = Self.cache("timeout")
         let loader = ControlledLateLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
@@ -4553,24 +4508,16 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch([uid])
-        try await Self.waitUntil { await feed.prefetchStatus().failedTimeout == 1 }
-
-        let atTimeout = await feed.prefetchStatus()
-        #expect(atTimeout.downloadStarted == 1)
-        #expect(atTimeout.downloadCompleted == 0)
-        #expect(atTimeout.failed == 1)
+        try await Self.waitUntil { await loader.cancellations() == 1 }
+        #expect(await loader.requestCount() == 1)
 
         // The uncancellable loader finishes only after the test explicitly releases it. This avoids racing a
         // real-time loader delay against the timeout task when the complete package suite is under heavy load.
         await loader.release()
-        // Its bytes land on disk, but the batch was
-        // already accounted: failed stays 1, completed stays 0 (never both for one item).
+        // The late bytes can land on disk even after the timeout.
         try await Self.waitUntil { await loader.finishedBatches() >= 1 }
         try await Self.waitUntil { cache.has(uid) }
-        let afterLateDelivery = await feed.prefetchStatus()
-        #expect(afterLateDelivery.downloadCompleted == 0)
-        #expect(afterLateDelivery.failed == 1)
-        #expect(afterLateDelivery.downloadStarted == 1)
+        #expect(await loader.requestCount() == 1)
 
         // The late-delivered blob is now a disk hit: a new visible request must not re-download.
         await feed.requestPriority(uid, priority: .visibleNow)
@@ -4580,7 +4527,7 @@ struct ThumbnailFeedCoreTests {
 
     @Test func timedOutSDKLoaderKeepsItsConcurrencySlotUntilItReturns() async throws {
         let uids = (0..<6).map { Self.uid("timeout-bound-\($0)") }
-        let loader = NonCooperativeLoader(delay: .seconds(1))
+        let loader = ControlledLateLoader(payloads: [:])
         let feed = ThumbnailFeedCore(
             cache: Self.cache("timeout-bound"),
             loader: loader,
@@ -4593,11 +4540,12 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.prefetchStatus().failedTimeout == 1 }
+        try await Self.waitUntil { await loader.cancellations() == 1 }
         try await Task.sleep(for: .milliseconds(350))
 
         #expect(await loader.requestCount() == 1)
-        #expect(await feed.prefetchStatus().downloadsInFlight == 1)
+        #expect(await loader.isWaiting())
+        await loader.release()
         await feed.stopPrefetch()
     }
 
@@ -4619,7 +4567,6 @@ struct ThumbnailFeedCoreTests {
         try await Self.waitUntil { await loader.cancellations() >= 2 }
 
         #expect(await loader.requestCount() >= 2)
-        #expect(await feed.prefetchStatus().failedTimeout >= 2)
         await feed.stopPrefetch()
     }
 
@@ -4632,10 +4579,7 @@ struct ThumbnailFeedCoreTests {
         let grid = ThumbnailInteractionOwner()
         feed.setUserInteractionActive(true, owner: grid)
         await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.prefetchStatus().downloadCompleted == 2 }
-        let status = await feed.prefetchStatus()
-        #expect(!status.paused)
-        #expect(status.pausedReason == "none")
+        try await Self.waitForCrawl(feed)
         #expect(await loader.requestCount() == 2)
         feed.setUserInteractionActive(false, owner: grid)
     }
@@ -4650,12 +4594,12 @@ struct ThumbnailFeedCoreTests {
         )
 
         await feed.startPrefetch([uid])
-        try await Self.waitUntil { await feed.prefetchStatus().failedItemError == 1 }
+        try await Self.waitUntil { feed.isKnownUnfetchable(uid) }
         #expect(await loader.requestCount() == 1)
 
         // Same crawl: the refused uid is quarantined - a new priority request must not re-download.
         await feed.requestPriority(uid, priority: .visibleNow)
-        try await Self.waitUntil { await feed.prefetchStatus().skippedUnfetchable >= 1 }
+        try await Self.waitForCrawl(feed)
         #expect(await loader.requestCount() == 1)
 
         // A fresh crawl start clears the quarantine and retries exactly once.
@@ -4684,33 +4628,44 @@ struct ThumbnailFeedCoreTests {
         try await Self.waitUntil { await loader.requestOrder().filter { $0 == withheld }.count == 2 }
 
         #expect(await loader.requestOrder().filter { $0 == withheld }.count == 2)
-        let status = await feed.prefetchStatus()
-        #expect(status.failedWithheld == 1)
-        #expect(status.unfetchableCount == 0, "an authorization change during the download is not the photo's fault")
-        #expect(status.failedUnreported == 0, "and no transport problem either")
         try await Self.waitUntil { cache.diskData(for: withheld) != nil }
         #expect(cache.diskData(for: withheld) != nil, "the crawl stored it without any visible request")
     }
 
     @Test func turningPrefetchOffDropsPendingWithheldRetries() async throws {
-        let uid = Self.uid("withheld-then-off")
-        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)], withheldOnce: [uid])
-        let feed = ThumbnailFeedCore(
-            cache: Self.cache("withheld-then-off"),
-            loader: loader,
-            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, crawlBackoffSeconds: 30)
-        )
+        // The control proves the held crawl has a retry that can reach the loader.
+        for disable in [false, true] {
+            let name = disable ? "withheld-then-off" : "withheld-control"
+            let uid = Self.uid(name)
+            let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .foregroundActive))
+            let cache = Self.cache(name, runtimeState: runtime)
+            let loader = WithheldOnceLoader(payload: Self.pngData(width: 8, height: 8)) {
+                runtime.update { $0.executionOpportunity = .suspended }
+            }
+            let feed = ThumbnailFeedCore(
+                cache: cache, loader: loader,
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, crawlBackoffSeconds: 0)
+            )
 
-        await feed.startPrefetch([uid])
-        try await Self.waitUntil { await feed.prefetchStatus().failedWithheld == 1 }
-        // The retry waits behind the crawl backoff and shows in the queue.
-        #expect(await feed.prefetchStatus().currentQueueLength == 1)
+            await feed.startPrefetch([uid])
+            try await Self.waitForCrawl(feed)
+            #expect(await loader.requests(for: uid) == 1)
+            #expect(!cache.has(uid))
 
-        await feed.setPrefetchEnabled(false)
-
-        // Nothing would take the retry now, and a pending retry would keep the workers polling.
-        #expect(await feed.prefetchStatus().currentQueueLength == 0)
-        #expect(await loader.requestCount() == 1)
+            if disable { await feed.setPrefetchEnabled(false) }
+            runtime.update { $0.executionOpportunity = .foregroundActive }
+            if disable { await feed.setPrefetchEnabled(true) }
+            await feed.resumePrefetch()
+            if disable {
+                try await Self.waitForCrawl(feed)
+                #expect(await loader.requests(for: uid) == 1, "disabling clears the pending retry")
+                #expect(!cache.has(uid))
+            } else {
+                try await Self.waitUntil { cache.has(uid) }
+                #expect(await loader.requests(for: uid) == 2, "the held retry reaches the loader")
+            }
+            await feed.stopPrefetchAndWait()
+        }
     }
 
     @Test func visiblePathDoesNotRefetchBackendRefusedItems() async throws {
@@ -4861,28 +4816,6 @@ struct ThumbnailFeedCoreTests {
         return feed
     }
 
-    @Test func diagnosticsExplainEveryFailure() async throws {
-        let refused = Self.uid("diag-refused")
-        let loader = RecordingLoader(itemErrors: [refused: "decrypt failed"])
-        let feed = ThumbnailFeedCore(
-            cache: Self.cache("diag"),
-            loader: loader,
-            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
-        )
-
-        await feed.startPrefetch([refused])
-        try await Self.waitUntil { await feed.prefetchStatus().failed == 1 }
-
-        let status = await feed.prefetchStatus()
-        // failed=N must decompose into the classified buckets…
-        #expect(
-            status.failed == status.failedTimeout + status.failedBatchError + status.failedItemError
-                + status.failedUnreported + status.failedWithheld)
-        #expect(status.failedItemError == 1)
-        // …and the human-readable reason must be surfaced.
-        #expect(status.lastErrors.joined().contains("decrypt failed"))
-    }
-
     private static func configuration(
         targetPixels: CGFloat = 16,
         downloadConcurrencyLimit: Int = 2,
@@ -4922,6 +4855,12 @@ struct ThumbnailFeedCoreTests {
         return cache
     }
 
+    private static func diskFileCount(_ cache: ThumbnailCache, referencing uid: PhotoUID) throws -> Int {
+        try FileManager.default.contentsOfDirectory(
+            atPath: cache.diskURL(for: uid).deletingLastPathComponent().path
+        ).count
+    }
+
     private static func checkpointStore(for cache: ThumbnailCache) -> FileThumbnailCoverageCheckpointStore {
         FileThumbnailCoverageCheckpointStore(
             directory: cache.coverageCheckpointDirectory(),
@@ -4953,6 +4892,20 @@ struct ThumbnailFeedCoreTests {
     /// cost/eviction assertions.
     private static func decodedThumb(_ width: Int, _ height: Int) -> DecodedThumbnail {
         DecodedThumbnail(image: makeCGImage(width: width, height: height))
+    }
+
+    private enum CrawlWaitError: Error { case timedOut }
+
+    static func waitForCrawl(_ feed: ThumbnailFeedCore) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await feed.waitForPrefetchToFinish() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(30))
+                throw CrawlWaitError.timedOut
+            }
+            defer { group.cancelAll() }
+            try await group.next()
+        }
     }
 
     /// Waits up to thirty seconds and records an issue when the condition never holds.
@@ -5172,7 +5125,7 @@ private func makeCGImage(width: Int, height: Int) -> CGImage {
     )!
 }
 
-private func makePNGData(width: Int, height: Int) -> Data {
+func makePNGData(width: Int, height: Int) -> Data {
     let image = makeCGImage(width: width, height: height)
     let data = NSMutableData()
     let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!

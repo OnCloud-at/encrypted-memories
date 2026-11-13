@@ -132,68 +132,21 @@ public enum BackupDisplayWakePolicy {
     }
 }
 
-/// Optional backend capability: report how many photo rows the local metadata store (the SQLite
-/// timeline cache) currently holds. The offline manager stores it in `OfflineCacheStatus.metadataRows`;
-/// no screen shows it.
-public protocol LibraryStatsProvider: Sendable {
-    func metadataRowCount() async -> Int
-}
-
 /// Aggregated, displayable state of the on-disk offline cache. All fields are plain values so the view layer
 /// and tests can use them without touching the cache actors.
 public struct OfflineCacheStatus: Sendable, Equatable {
-    public var offlineEnabled: Bool
-    public var totalAssets: Int
-    public var metadataRows: Int
-    public var thumbnailsOnDisk: Int
-    public var thumbnailsMissing: Int
-    public var ramDecodedEstimate: Int
-    public var prefetchQueueDepth: Int
-    public var activePrefetchJobs: Int
-    public var prefetchPausedReason: String
-    public var failedThumbnailCount: Int
     public var cacheSizeBytes: Int64
     public var previewCacheSizeBytes: Int64
     /// On-disk size of the encrypted full-resolution originals cache (0 when the offline library is off / empty).
     public var originalsCacheSizeBytes: Int64
-    public var lastError: String?
-
     public init(
-        offlineEnabled: Bool = false,
-        totalAssets: Int = 0,
-        metadataRows: Int = 0,
-        thumbnailsOnDisk: Int = 0,
-        thumbnailsMissing: Int = 0,
-        ramDecodedEstimate: Int = 0,
-        prefetchQueueDepth: Int = 0,
-        activePrefetchJobs: Int = 0,
-        prefetchPausedReason: String = "none",
-        failedThumbnailCount: Int = 0,
         cacheSizeBytes: Int64 = 0,
         previewCacheSizeBytes: Int64 = 0,
-        originalsCacheSizeBytes: Int64 = 0,
-        lastError: String? = nil
+        originalsCacheSizeBytes: Int64 = 0
     ) {
-        self.offlineEnabled = offlineEnabled
-        self.totalAssets = totalAssets
-        self.metadataRows = metadataRows
-        self.thumbnailsOnDisk = thumbnailsOnDisk
-        self.thumbnailsMissing = thumbnailsMissing
-        self.ramDecodedEstimate = ramDecodedEstimate
-        self.prefetchQueueDepth = prefetchQueueDepth
-        self.activePrefetchJobs = activePrefetchJobs
-        self.prefetchPausedReason = prefetchPausedReason
-        self.failedThumbnailCount = failedThumbnailCount
         self.cacheSizeBytes = cacheSizeBytes
         self.previewCacheSizeBytes = previewCacheSizeBytes
         self.originalsCacheSizeBytes = originalsCacheSizeBytes
-        self.lastError = lastError
-    }
-
-    /// Disk thumbnail coverage as a 0…1 fraction. An empty or hydrating library reports zero.
-    public var thumbnailCoverage: Double {
-        guard totalAssets > 0 else { return 0 }
-        return min(1, Double(thumbnailsOnDisk) / Double(totalAssets))
     }
 
     public var totalCacheSizeBytes: Int64 { cacheSizeBytes + previewCacheSizeBytes + originalsCacheSizeBytes }

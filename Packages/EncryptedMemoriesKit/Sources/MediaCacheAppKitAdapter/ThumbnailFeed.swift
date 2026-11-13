@@ -12,8 +12,6 @@ import PhotosCore
 /// concurrency, decoded `CGImage` residency, and diagnostics. This facade preserves the existing macOS `NSImage`
 /// API for Timeline, Viewer, and Filmstrip while keeping AppKit outside the shared feed core.
 public actor ThumbnailFeed {
-    public typealias PrefetchStatus = ThumbnailFeedCore.PrefetchStatus
-
     private nonisolated let core: ThumbnailFeedCore
     private nonisolated let imageWrappers: WrapperImageCache<NSImage>
 
@@ -217,10 +215,6 @@ public actor ThumbnailFeed {
 
     public nonisolated func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
         core.setUserInteractionActive(active, owner: owner)
-    }
-
-    public func prefetchStatus() async -> PrefetchStatus {
-        await core.prefetchStatus()
     }
 
     private nonisolated func currentImage(

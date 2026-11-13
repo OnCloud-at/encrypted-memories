@@ -905,10 +905,6 @@ public actor ThumbnailCache {
         diskUsage.exactBytes()
     }
 
-    public nonisolated func diskFileCount() -> Int {
-        (try? FileManager.default.contentsOfDirectory(atPath: directory.path).count) ?? 0
-    }
-
     public nonisolated func diskSizeBytes() -> Int64 {
         guard
             let urls = try? FileManager.default.contentsOfDirectory(

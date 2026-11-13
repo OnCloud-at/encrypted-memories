@@ -205,7 +205,7 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
             _ = await feed.feedCore.reconcile(
                 selected: change.selectedScope, analysis: change.analysisScope,
                 retention: change.thumbnailRetentionScope)
-            XCTAssertEqual(cache.diskFileCount(), 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: cache.diskURL(for: item.uid).path))
             XCTAssertNil(feed.memoryImage(for: item.uid))
             let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
             let scene = try XCTUnwrap(scenes.first { $0.activationState == .foregroundActive } ?? scenes.first)

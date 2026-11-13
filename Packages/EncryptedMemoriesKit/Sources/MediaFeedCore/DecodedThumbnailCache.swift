@@ -4,10 +4,6 @@ import PhotosCore
 
 /// Thread-safe LRU cache keyed by photo ID and evicted by decoded byte count.
 final class DecodedThumbnailCache: @unchecked Sendable {
-    struct Metrics: Sendable, Equatable {
-        let entryCount: Int
-        let byteCost: Int
-    }
     private final class Node {
         let uid: PhotoUID
         var image: DecodedThumbnail
@@ -135,12 +131,6 @@ final class DecodedThumbnailCache: @unchecked Sendable {
         head = nil
         tail = nil
         totalCost = 0
-    }
-
-    func metrics() -> Metrics {
-        lock.lock()
-        defer { lock.unlock() }
-        return Metrics(entryCount: map.count, byteCost: totalCost)
     }
 
     // MARK: - LRU List
