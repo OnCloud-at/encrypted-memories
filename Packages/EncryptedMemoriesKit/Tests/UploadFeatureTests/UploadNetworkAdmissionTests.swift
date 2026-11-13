@@ -120,9 +120,7 @@ struct UploadNetworkAdmissionTests {
     }
 
     private func waitUntil(_ condition: @Sendable () -> Bool) async throws {
-        let clock = ContinuousClock()
-        let start = clock.now
-        while !condition(), clock.now - start < .seconds(5) { try await Task.sleep(for: .milliseconds(5)) }
+        try await pollWhileFalse(condition)
         #expect(condition(), "the condition holds within 5 s")
     }
 }
